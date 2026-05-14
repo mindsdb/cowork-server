@@ -1,7 +1,7 @@
-from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
 class DatabaseSettings(Settings):
     uri: str = Field(
-        default="sqlite:///cowork.db", description="The database connection URI"
+        default=f"sqlite:///{str(Path.home() / ".cowork") / "cowork.db"}", description="The database connection URI"
     )  # DATABASE__URI
 
     # Connection pool configurations
@@ -35,12 +35,21 @@ class DatabaseSettings(Settings):
     )  # DATABASE__STATEMENT_TIMEOUT
 
 
+class ProjectSettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "projects"),
+        validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECT__ROOT_DIR"),
+        description="Root directory where project folders are stored",
+    )
+
+
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE__*
+    project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT__*
 
 
 @lru_cache
