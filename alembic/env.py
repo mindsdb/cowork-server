@@ -1,10 +1,21 @@
 from logging.config import fileConfig
+from pathlib import Path
 
 from sqlalchemy import create_engine, pool
+from sqlalchemy.engine import make_url
 from sqlmodel import SQLModel
 
 from alembic import context
 from cowork.common.settings import get_app_settings
+
+
+def _ensure_sqlite_dir(url: str) -> None:
+    parsed = make_url(url)
+    if not parsed.drivername.startswith("sqlite"):
+        return
+    db_path = parsed.database
+    if db_path and db_path != ":memory:":
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
 
 # this is the Alembic Config object, which provides
@@ -43,6 +54,7 @@ def run_migrations_offline() -> None:
     """
     database_uri = get_app_settings().database.uri
     url = database_uri or config.get_main_option("sqlalchemy.url", database_uri)
+    _ensure_sqlite_dir(url)
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -62,9 +74,9 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    # Use the PostgreSQL URI directly, falling back to config if needed
     database_uri = get_app_settings().database.uri
     url = database_uri or config.get_main_option("sqlalchemy.url", database_uri)
+    _ensure_sqlite_dir(url)
     connectable = create_engine(url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
