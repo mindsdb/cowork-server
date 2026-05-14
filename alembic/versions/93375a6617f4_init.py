@@ -10,6 +10,8 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
+
 
 # revision identifiers, used by Alembic.
 revision: str = '93375a6617f4'
@@ -31,11 +33,23 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
 
+    op.execute(
+        sa.text(
+            "INSERT INTO projects (id, name, path, is_active, created_at, modified_at) "
+            "VALUES (:id, :name, :path, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ).bindparams(
+            id=str(GENERAL_PROJECT_ID),
+            name=GENERAL_PROJECT,
+            path="",
+            is_active=True,
+        )
+    )
+
     op.create_table(
         "conversations",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("topic", sa.String(255), nullable=False),
-        sa.Column("project_id", sa.Uuid(), nullable=False),
+        sa.Column("project_id", sa.Uuid(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
         sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
         sa.ForeignKeyConstraint(["project_id"], ["projects.id"]),
@@ -74,4 +88,5 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_messages_conversation_id"), table_name="messages")
     op.drop_table("messages")
     op.drop_table("conversations")
+    op.execute(sa.text("DELETE FROM projects WHERE id = :id").bindparams(id=str(GENERAL_PROJECT_ID)))
     op.drop_table("projects")

@@ -12,6 +12,7 @@ from cowork.models.project import Project
 
 
 GENERAL_PROJECT = "general"
+GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
 
 _NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_HYPHEN_RUNS = re.compile(r"-{2,}")
@@ -66,25 +67,6 @@ class ProjectService:
         if cleaned.lower() in _WIN_RESERVED:
             cleaned = f"{cleaned}-x"
         return cleaned
-
-    def ensure_general_project(self) -> Project:
-        project = self.session.exec(
-            select(Project).where(Project.name == GENERAL_PROJECT)
-        ).first()
-        if project is None:
-            path = self._project_path(GENERAL_PROJECT)
-            path.mkdir(parents=True, exist_ok=True)
-            self._scaffold(path)
-            project = Project(name=GENERAL_PROJECT, path=str(path), is_active=True)
-            self.session.add(project)
-            self.session.commit()
-            self.session.refresh(project)
-        else:
-            path = Path(project.path)
-            if not path.exists():
-                path.mkdir(parents=True, exist_ok=True)
-                self._scaffold(path)
-        return project
 
     def list_projects(self) -> list[Project]:
         return list(self.session.exec(select(Project)).all())
@@ -156,10 +138,7 @@ class ProjectService:
         self.session.delete(project)
         self.session.commit()
         if was_active:
-            self.ensure_general_project()
-            general = self.session.exec(
-                select(Project).where(Project.name == GENERAL_PROJECT)
-            ).first()
+            general = self.session.get(Project, GENERAL_PROJECT_ID)
             if general is not None and not general.is_active:
                 general.is_active = True
                 self.session.add(general)
