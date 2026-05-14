@@ -1,0 +1,49 @@
+from enum import Enum
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
+
+
+class DatabaseSettings(Settings):
+    uri: str = Field(
+        default="sqlite:///cowork.db", description="The database connection URI"
+    )  # DATABASE__URI
+
+    # Connection pool configurations
+    max_overflow: int = Field(
+        default=20, description="The maximum overflow size of the database connection pool"
+    )  # DATABASE__MAX_OVERFLOW
+    pool_pre_ping: bool = Field(default=True, description="Whether to enable pool pre-ping")  # DATABASE__POOL_PRE_PING
+    pool_recycle: int = Field(default=300, description="The pool recycle time in seconds")  # DATABASE__POOL_RECYCLE
+    pool_size: int = Field(default=20, description="The size of the database connection pool")  # DATABASE__POOL_SIZE
+    pool_timeout: int = Field(default=300, description="The pool timeout in seconds")  # DATABASE__POOL_TIMEOUT
+
+    # Query timeout configurations
+    query_timeout: int = Field(default=300, description="The query timeout in seconds")  # DATABASE__QUERY_TIMEOUT
+    statement_timeout: int = Field(
+        default=300000, description="The statement timeout in milliseconds"
+    )  # DATABASE__STATEMENT_TIMEOUT
+
+
+class AppSettings(Settings):
+    env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
+
+    log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
+
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE__*
+
+
+@lru_cache
+def get_app_settings() -> AppSettings:
+    """Get cached application settings."""
+    return AppSettings()

@@ -1,0 +1,34 @@
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+from pydantic import BaseModel
+from sqlalchemy import JSON
+from sqlmodel import Column, Field, Relationship
+
+from cowork.models.base import BaseSQLModel
+from cowork.schemas.responses import Role
+
+
+if TYPE_CHECKING:
+    from cowork.models.message_event import MessageEvent
+
+
+class Message(BaseSQLModel, table=True):
+    __tablename__ = "messages"
+
+    conversation_id: UUID = Field(
+        ...,
+        foreign_key="conversations.id",
+        description="ID of the conversation that this message belongs to",
+        index=True,
+    )
+    role: Role = Field(description="Role of the message")
+    content: dict[str, Any] | BaseModel | str | list[Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON),
+        description="Content of the message as JSON",
+    )
+
+    message_events: list["MessageEvent"] = Relationship(
+        sa_relationship_kwargs={"order_by": "MessageEvent.sequence_number"}
+    )
