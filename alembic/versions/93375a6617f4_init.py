@@ -35,8 +35,10 @@ def upgrade() -> None:
         "conversations",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("topic", sa.String(255), nullable=False),
+        sa.Column("project_id", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
         sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.ForeignKeyConstraint(["project_id"], ["projects.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
 
