@@ -14,7 +14,7 @@ class Conversation(BaseSQLModel, table=True):
     __tablename__ = "conversations"
 
     topic: str = Field(description="Topic of the conversation", max_length=255)
-    project_id: UUID | None = Field(default=None, foreign_key="projects.id", nullable=True, description="Project this conversation belongs to")
+    project_id: UUID = Field(foreign_key="projects.id", description="Project this conversation belongs to")
 
     project: "Project" = Relationship()
     messages: list["Message"] = Relationship()
