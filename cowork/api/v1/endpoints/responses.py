@@ -5,17 +5,23 @@ This module contains endpoints for handling OpenAI-compatible Responses API requ
 including both streaming and non-streaming responses.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 from starlette.responses import JSONResponse
 
 from cowork.common.logger import setup_logging
+from cowork.db.session import get_session
+from cowork.handlers.responses import ResponsesHandler
 from cowork.schemas.responses import ResponsesRequest
 
 
 logger = setup_logging()
 
 router = APIRouter()
+SessionDep = Annotated[Session, Depends(get_session)]
 
 
 @router.options("/")
@@ -39,6 +45,7 @@ async def options_handler():
 @router.post("/")
 async def responses(
     responses_request: ResponsesRequest,
+    session: SessionDep,
 ):
     """
     Handle Responses API requests (API v1).
@@ -57,5 +64,10 @@ async def responses(
         HTTPException: 429 if usage limit exceeded.
         HTTPException: 500 if there's an error processing the request.
     """
-    # Extract user context from request
-    ...
+    handler = ResponsesHandler(session)
+    result = await handler.handle(responses_request)
+
+    if responses_request.stream:
+        return StreamingResponse(result, media_type="text/event-stream")
+
+    return result

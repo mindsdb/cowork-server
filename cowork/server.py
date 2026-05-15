@@ -5,8 +5,6 @@ This module sets up the FastAPI application with middleware, routing,
 and all necessary configurations for the Minds service.
 """
 
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 

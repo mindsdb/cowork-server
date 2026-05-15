@@ -82,7 +82,7 @@ class ProjectService:
         final_name = self._unique_name(sanitized)
         path = self._project_path(final_name)
         path.mkdir(parents=True)
-        self._scaffold(path)
+        # self._scaffold(path)
         project = Project(name=final_name, path=str(path), is_active=False)
         self.session.add(project)
         self.session.commit()

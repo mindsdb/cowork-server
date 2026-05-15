@@ -3,17 +3,19 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from cowork.common.logger import get_logger
-from cowork.models.conversation import Conversation
+from cowork.harnesses.base import register
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+from cowork.models.conversation import Conversation
 
 
 logger = get_logger(__name__)
 
 
+@register
 class AntonHarness:
     id: str = "anton"
     label: str = "Anton"
-    formatter = format_responses_stream
+    formatter = staticmethod(format_responses_stream)
     
     
     async def stream_response(
@@ -25,7 +27,7 @@ class AntonHarness:
     ) -> AsyncIterator[str]:
         session = await self._build_chat_session(conversation, model)
         
-        for event in session.turn_stream(prompt):
+        async for event in session.turn_stream(prompt):
             yield event
         
     async def _build_chat_session(
@@ -69,7 +71,7 @@ class AntonHarness:
         except Exception:  # pragma: no cover
             LocalDataVault = None
 
-        base = conversation.project.path
+        base = Path(conversation.project.path)
         # Reload ~/.anton/.env into os.environ before building settings.
         # AntonSettings caches its env_file list at module import time — if the
         # server started before ~/.anton/.env existed (first-run onboarding),
