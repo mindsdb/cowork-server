@@ -1,16 +1,46 @@
 import time
+from typing import Any
 import uuid
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 
 class Role(str, Enum):
     system = "system"
     user = "user"
     assistant = "assistant"
-    function = "function"
-    tool = "tool"
+    # Thought events (tool activity visible to client)
+    thought_scratchpad_start = "thought.scratchpad.start"
+    thought_scratchpad_progress = "thought.scratchpad.progress"
+    thought_scratchpad_result = "thought.scratchpad.result"
+    thought_scratchpad_end = "thought.scratchpad.end"
+    thought_memorize_start = "thought.memorize.start"
+    thought_memorize_end = "thought.memorize.end"
+    thought_recall_start = "thought.recall.start"
+    thought_recall_end = "thought.recall.end"
+    thought_progress = "thought.progress"
+    thought_context_compacted = "thought.context_compacted"
+    
+
+class Message(BaseModel):
+    role: Role
+    content: dict | BaseModel | str | list[Any] | None = None
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
+
+    @model_serializer
+    def _serialize(self) -> dict[str, Any]:
+        """Omit None tool fields from serialization."""
+        data: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.tool_calls is not None:
+            data["tool_calls"] = self.tool_calls
+        if self.tool_call_id is not None:
+            data["tool_call_id"] = self.tool_call_id
+        if self.name is not None:
+            data["name"] = self.name
+        return data
 
 
 class ResponseOutputContent(BaseModel):
@@ -64,3 +94,19 @@ class StreamingResponse(BaseModel):
     type: StreamingResponseEvent
     sequence_number: int
     response: Response | ResponseDelta
+
+
+class ResponsesRequest(BaseModel):
+    input: str | list[Message] | None = Field(
+        default=None, description="Input for the responses request, either a string or a list of messages"
+    )
+    # TODO: The OpenAI API also supports a conversation object?
+    conversation: str | None = Field(
+        default=None,
+        description="Conversation ID for the responses request, if not provided, a new conversation will be created",
+    )
+    model: str = Field(description="Model name for the chat completion request")
+    stream: bool | None = Field(
+        default=False,
+        description="Whether the chat completion request is streaming or not",
+    )
