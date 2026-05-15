@@ -6,7 +6,7 @@ from sqlalchemy import JSON
 from sqlmodel import Column, Field, Relationship
 
 from cowork.models.base import BaseSQLModel
-from cowork.schemas.responses import Role
+from cowork.schemas.responses import Role, Message as OpenAIMessage
 
 
 if TYPE_CHECKING:
@@ -32,3 +32,10 @@ class Message(BaseSQLModel, table=True):
     message_events: list["MessageEvent"] = Relationship(
         sa_relationship_kwargs={"order_by": "MessageEvent.sequence_number"}
     )
+
+    def to_openai_message(self) -> OpenAIMessage:
+        """Convert to the OpenAI-compatible message format used in the API."""
+        return OpenAIMessage(
+            role=self.role.value,
+            content=self.content,
+        )

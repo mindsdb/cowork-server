@@ -1,5 +1,7 @@
 from typing import AsyncIterator, Protocol
 
+from cowork.schemas.responses import Message
+
 
 class HarnessProvider(Protocol):
     id: str
@@ -8,7 +10,7 @@ class HarnessProvider(Protocol):
     async def stream_response(
         self,
         *,
-        messages: list[dict[str, str]],
+        messages: list[Message],
         model: str,
     ) -> AsyncIterator[str]:
         ...

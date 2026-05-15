@@ -5,9 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anton",
     "fastapi>=0.136.1",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.1",
     "sqlmodel>=0.0.38",
     "uvicorn>=0.47.0",
 ]
+
+[tool.uv.sources]
+anton = { git = "https://github.com/mindsdb/anton.git" }
