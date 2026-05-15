@@ -27,6 +27,7 @@ class RuntimePrimitiveTests(unittest.TestCase):
         self.assertEqual(event.type, "message.delta")
         payload = iter_sse_payloads(cowork_event_to_legacy_sse(event))[0][1]
         self.assertEqual(payload["type"], "response.output_text.delta")
+        self.assertEqual(payload["at_ms"], event.at_ms)
         self.assertEqual(payload["cowork_event_type"], "message.delta")
 
     def test_event_schema_rejects_unknown_types(self) -> None:
