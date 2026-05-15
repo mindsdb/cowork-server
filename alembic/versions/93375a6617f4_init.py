@@ -10,6 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from cowork.common.settings import get_app_settings
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 
 
@@ -22,6 +23,11 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    from pathlib import Path
+    _settings = get_app_settings()
+    _general_dir = Path(_settings.project.root_dir) / GENERAL_PROJECT
+    _general_dir.mkdir(parents=True, exist_ok=True)
+
     op.create_table(
         "projects",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -38,9 +44,9 @@ def upgrade() -> None:
             "INSERT INTO projects (id, name, path, is_active, created_at, modified_at) "
             "VALUES (:id, :name, :path, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
         ).bindparams(
-            id=str(GENERAL_PROJECT_ID),
+            id=GENERAL_PROJECT_ID.hex,
             name=GENERAL_PROJECT,
-            path="",
+            path=str(_general_dir),
             is_active=True,
         )
     )
