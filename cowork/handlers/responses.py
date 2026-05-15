@@ -23,7 +23,7 @@ class ResponsesHandler:
     def __init__(self, session: Session) -> None:
         self.session = session
         # TODO: Get the harness from settings? Request context?
-        self.harness = get_harness("anton")
+        self.harness = get_harness("hermes")
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         conversation_service = ConversationService(self.session)
