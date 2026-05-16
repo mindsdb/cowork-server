@@ -8,8 +8,9 @@ that can be included in the main FastAPI application.
 from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
-    projects,
     conversations,
+    files,
+    projects,
     responses,
 )
 
@@ -21,4 +22,5 @@ api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
 api_router.include_router(responses.router, prefix="/responses", tags=["responses"])
+api_router.include_router(files.router, prefix="/files", tags=["files"])
 

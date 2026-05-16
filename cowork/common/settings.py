@@ -41,6 +41,14 @@ class ProjectSettings(Settings):
         validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECT__ROOT_DIR"),
         description="Root directory where project folders are stored",
     )  # COWORK_PROJECTS_DIR or PROJECT__ROOT_DIR
+    
+
+class FileSettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "files"),
+        validation_alias=AliasChoices("COWORK_FILES_DIR", "FILES__ROOT_DIR"),
+        description="Root directory where uploaded files are stored",
+    )  # COWORK_FILES_DIR or FILES__ROOT_DIR
 
 
 class AppSettings(Settings):
@@ -50,6 +58,7 @@ class AppSettings(Settings):
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
+    file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
 
 
 @lru_cache

@@ -87,9 +87,23 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
 
+    op.create_table(
+        "files",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("filename", sa.String(255), nullable=False),
+        sa.Column("content_type", sa.String(127), nullable=False),
+        sa.Column("size", sa.Integer(), nullable=False),
+        sa.Column("purpose", sa.String(64), nullable=False),
+        sa.Column("path", sa.String(1024), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+    )
+
 
 def downgrade() -> None:
     """Downgrade schema."""
+    op.drop_table("files")
     op.drop_table("message_events")
     op.drop_index(op.f("ix_messages_conversation_id"), table_name="messages")
     op.drop_table("messages")
