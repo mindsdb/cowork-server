@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import register
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
 from cowork.models.conversation import Conversation
 
@@ -22,13 +22,28 @@ class AntonHarness:
         self,
         *,
         conversation: Conversation,
-        prompt: str,
+        input: list[TextInputBlock | FileInputBlock],
         model: str,
     ) -> AsyncIterator[str]:
         session = await self._build_chat_session(conversation, model)
-        
-        async for event in session.turn_stream(prompt):
+
+        async for event in session.turn_stream(self._to_anton_input(input)):
             yield event
+
+    @staticmethod
+    def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
+        if len(input_blocks) == 1 and input_blocks[0].get("type") == "text":
+            return input_blocks[0]["text"]
+        anton_blocks = []
+        for block in input_blocks:
+            if block.get("type") == "text":
+                anton_blocks.append({"type": "text", "text": block["text"]})
+            elif block.get("type") == "file":
+                anton_blocks.append({
+                    "type": "text",
+                    "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
+                })
+        return anton_blocks
         
     async def _build_chat_session(
         self,

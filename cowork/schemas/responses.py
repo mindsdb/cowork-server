@@ -21,11 +21,22 @@ class Role(str, Enum):
     thought_recall_end = "thought.recall.end"
     thought_progress = "thought.progress"
     thought_context_compacted = "thought.context_compacted"
-    
+
+
+class ContentType(str, Enum):
+    text = "input_text"
+    file = "input_file"
+
+
+class Content(BaseModel):
+    type: ContentType
+    text: str | None = None
+    file_id: str | None = None
+
 
 class Message(BaseModel):
     role: Role
-    content: dict | BaseModel | str | list[Any] | None = None
+    content: dict | BaseModel | str | list[Content] | None = None
     tool_calls: list[dict] | None = None
     tool_call_id: str | None = None
     name: str | None = None

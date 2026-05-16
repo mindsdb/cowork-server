@@ -1,6 +1,18 @@
-from typing import AsyncIterator, Protocol
+from typing import AsyncIterator, Literal, Protocol
+from typing_extensions import TypedDict
 
 from cowork.models.conversation import Conversation
+
+
+class TextInputBlock(TypedDict):
+    type: Literal["text"]
+    text: str
+
+
+class FileInputBlock(TypedDict):
+    type: Literal["file"]
+    path: str
+    filename: str
 
 
 class HarnessProvider(Protocol):
@@ -12,7 +24,7 @@ class HarnessProvider(Protocol):
         self,
         *,
         conversation: Conversation,
-        prompt: str,
+        input: list[TextInputBlock | FileInputBlock],
         model: str,
     ) -> AsyncIterator[str]:
         ...

@@ -35,7 +35,15 @@ class Message(BaseSQLModel, table=True):
 
     def to_openai_message(self) -> OpenAIMessage:
         """Convert to the OpenAI-compatible message format used in the API."""
+        content = self.content
+        if isinstance(content, list):
+            text_parts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "input_text"
+            ]
+            content = "\n\n".join(text_parts) if text_parts else ""
         return OpenAIMessage(
             role=self.role.value,
-            content=self.content,
+            content=content,
         )

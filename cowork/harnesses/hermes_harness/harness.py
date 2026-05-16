@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 import os
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import register
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
 
@@ -23,7 +23,7 @@ class HermesHarness:
         self,
         *,
         conversation: Conversation,
-        prompt: str,
+        input: list[TextInputBlock | FileInputBlock],
         model: str,
     ) -> AsyncIterator[dict]:
         history = [
@@ -35,11 +35,21 @@ class HermesHarness:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             self._run,
-            prompt,
+            self._to_prompt_string(input),
             model,
             history,
         )
         yield result
+
+    @staticmethod
+    def _to_prompt_string(input_blocks: list[dict]) -> str:
+        parts = []
+        for block in input_blocks:
+            if block.get("type") == "text":
+                parts.append(block["text"])
+            elif block.get("type") == "file":
+                parts.append(f"[Attached file '{block['filename']}': {block['path']}]")
+        return "\n\n".join(parts)
 
     @staticmethod
     def _run(prompt: str, model: str, history: list[dict]) -> dict:

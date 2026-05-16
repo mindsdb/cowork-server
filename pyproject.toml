@@ -10,6 +10,7 @@ dependencies = [
     "hermes-agent",
     "pydantic==2.12.5",
     "pydantic-settings>=2.14.1",
+    "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "uvicorn>=0.47.0",
 ]
