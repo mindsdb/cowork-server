@@ -100,9 +100,51 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
 
+    op.create_table(
+        "schedules",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("title", sa.String(), nullable=False),
+        sa.Column("prompt", sa.Text(), nullable=False),
+        sa.Column("cadence", sa.String(16), nullable=False),
+        sa.Column("timezone", sa.String(64), nullable=False, server_default=sa.text("'UTC'")),
+        sa.Column("next_run_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("project_id", sa.Uuid(), nullable=False),
+        sa.Column("model", sa.String(), nullable=False),
+        sa.Column("last_run_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_result_conversation_id", sa.Uuid(), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("missed_runs", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.ForeignKeyConstraint(["project_id"], ["projects.id"]),
+        sa.ForeignKeyConstraint(["last_result_conversation_id"], ["conversations.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+
+    op.create_table(
+        "schedule_runs",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("schedule_id", sa.Uuid(), nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("duration_ms", sa.Integer(), nullable=True),
+        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("error", sa.Text(), nullable=True),
+        sa.Column("conversation_id", sa.Uuid(), nullable=True),
+        sa.Column("is_manual", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.ForeignKeyConstraint(["schedule_id"], ["schedules.id"]),
+        sa.ForeignKeyConstraint(["conversation_id"], ["conversations.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+
 
 def downgrade() -> None:
     """Downgrade schema."""
+    op.drop_table("schedule_runs")
+    op.drop_table("schedules")
     op.drop_table("files")
     op.drop_table("message_events")
     op.drop_index(op.f("ix_messages_conversation_id"), table_name="messages")
