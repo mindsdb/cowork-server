@@ -46,7 +46,7 @@ def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.get("/{conversation_id}/messages")
+@router.get("/{conversation_id}/items")
 def get_messages(conversation_id: UUID, session: SessionDep):
     try:
         return ConversationService(session).get_messages(conversation_id)
