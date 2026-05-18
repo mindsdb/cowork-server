@@ -5,7 +5,7 @@
 Given below is a high-level architectural overview of the Cowork Server API, specifically outlining how it differs from the implementation already available in the [mindsdb/cowork](https://github.com/mindsdb/cowork) repository. Some of these decisions have been made in order to simplify the onboarding of other agents (harnesses) such as Hermes.
 
 Here is a breakdown:
-1. ### App Vs Harness Components
+### App Vs Harness Components
 At the moment, most components of the existing Cowork server including projects, conversations, attachments etc., are closely coupled with the Anton agent. This means that when other agents (e.g., Hermes) are onboarded, they will have to either adhere to the structure Anton has defined for these components or implement their own versions. 
 
 A good example is the the work that has been done [here](https://github.com/mindsdb/cowork/compare/main...hermes-mvp); the base abstraction for harnesses here has been defined in such a way that conversation management and other aspects need to be implemented separately for each agent. This is not ideal as it leads to code duplication and makes maintenance harder.
@@ -19,7 +19,7 @@ The implementation available here aims to achieve this by taking parts of the bo
 ### Database Design
 This implementation has also been designed to allow for database storage rather than relying on a file-based storage system. A lightweight SQLite database can be used here, but it is also able to support more robust databases such as Postgres if needed. This allows for better scalability and performance, especially as the number of users and conversations grows.
 
-## API Design
+### API Design
 The design of the API has also been hardened by removing several unusued endpoints and improving on the existing ones.
 
 For example, the Responses API has been updated to allow for file inputs along with support for an OpenAI-compatible Files API. This alleviates the need for maintaining the /attachments endpoints defined in the orignial server defines a standard way for handling file uploads and attachments across different agents. More information regarding these design updates can be found in the design document linked below.
@@ -33,3 +33,4 @@ The following are some aspects of the server that are yet to be implemented. Sev
 - [ ] Data Sources and Connectors: Similar to the above, Anton comes with certain strict requirements for how connections to external data sources and apps are handled including the use of the data vault and predefined registry of inherently supported connection types.
 - [ ] Memory: Most agents come with their own implementations of memory management. This should be factroed in when exposing memory management capabilities in the API.
 - [ ] Skills: Similar to memory, skills are also implemented differently across different agents. 
+- [ ] Wiring up the Hermes agent end-to-end: To make it so that the Hermes agent works across all of the components described here.
