@@ -56,6 +56,11 @@ class AppSettings(Settings):
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
+    master_key_path: str = Field(
+        default=str(Path.home() / ".cowork" / ".master_key"),
+        description="Path to the Fernet master key file used to encrypt sensitive settings",
+    )  # MASTER_KEY_PATH
+
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*

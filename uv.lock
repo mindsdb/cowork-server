@@ -352,6 +352,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "anton" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "hermes-agent" },
     { name = "pydantic" },
@@ -364,6 +365,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "anton", git = "https://github.com/mindsdb/anton.git" },
+    { name = "cryptography", specifier = ">=48.0.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
     { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git" },
     { name = "pydantic", specifier = "==2.12.5" },
