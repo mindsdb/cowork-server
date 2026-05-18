@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from cowork.api.v1.endpoints import (
     conversations,
     files,
+    pins,
     projects,
     responses,
     schedules,
@@ -25,4 +26,5 @@ api_router.include_router(conversations.router, prefix="/conversations", tags=["
 api_router.include_router(responses.router, prefix="/responses", tags=["responses"])
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
+api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
 

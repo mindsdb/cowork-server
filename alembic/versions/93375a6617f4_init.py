@@ -123,6 +123,18 @@ def upgrade() -> None:
     )
 
     op.create_table(
+        "pins",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("item_type", sa.String(64), nullable=False),
+        sa.Column("item_id", sa.String(64), nullable=False),
+        sa.Column("title", sa.String(255), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("item_type", "item_id"),
+    )
+
+    op.create_table(
         "schedule_runs",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("schedule_id", sa.Uuid(), nullable=False),
@@ -145,6 +157,7 @@ def downgrade() -> None:
     """Downgrade schema."""
     op.drop_table("schedule_runs")
     op.drop_table("schedules")
+    op.drop_table("pins")
     op.drop_table("files")
     op.drop_table("message_events")
     op.drop_index(op.f("ix_messages_conversation_id"), table_name="messages")
