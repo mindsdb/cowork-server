@@ -49,10 +49,13 @@ class ResponsesHandler:
         self.session.commit()
         self.session.refresh(user_message)
 
+        # The model provided as part of the request is ignored for now, because the Cowork
+        # UI does not currently provide a way to specify it when making each request.
+        # It is only extracted from the values specified in the settings.
         stream = self.harness.stream_response(
             conversation=conversation,
             input=harness_input,
-            model=request.model,
+            # model=request.model,
         )
 
         if request.stream:
