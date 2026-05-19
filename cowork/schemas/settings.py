@@ -1,7 +1,7 @@
 from enum import Enum
-from typing import ClassVar, get_args
+from typing import Annotated, Callable, ClassVar, get_args
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 from cowork.common.settings.app_settings import Settings
 
@@ -9,6 +9,21 @@ from cowork.common.settings.app_settings import Settings
 class Provider(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
+
+
+class _DynamicOptions:
+    """Annotated metadata marker for fields whose valid options are resolved lazily from a callable."""
+
+    def __init__(self, fn: Callable[[], list[str]]) -> None:
+        self._fn = fn
+
+    def get(self) -> list[str]:
+        return self._fn()
+
+
+def _harness_options() -> list[str]:
+    from cowork.harnesses.base import _registry
+    return list(_registry.keys())
 
 
 class UserSettings(Settings):
@@ -51,6 +66,20 @@ class UserSettings(Settings):
         title="Coding Model",
         description="The coding model. Defaults to the recommended model for the selected provider.",
     )
+    harness: Annotated[str, _DynamicOptions(_harness_options)] = Field(
+        default="anton",
+        title="Harness",
+        description="The AI harness used to generate responses.",
+    )
+
+    @field_validator("harness")
+    @classmethod
+    def validate_harness(cls, v: str) -> str:
+        options = _harness_options()
+        if v not in options:
+            available = ", ".join(options) or "none"
+            raise ValueError(f"Unknown harness '{v}'. Available: {available}")
+        return v
 
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
@@ -67,7 +96,11 @@ def field_is_sensitive(field_name: str) -> bool:
 
 
 def field_options(field_name: str) -> list[str] | None:
-    annotation = UserSettings.model_fields[field_name].annotation
+    field_info = UserSettings.model_fields[field_name]
+    for meta in field_info.metadata:
+        if isinstance(meta, _DynamicOptions):
+            return meta.get()
+    annotation = field_info.annotation
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         return [e.value for e in annotation]
     for arg in get_args(annotation):

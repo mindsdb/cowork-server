@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import HTTPException
 from sqlmodel import Session
 
+from cowork.common.settings.user_settings import get_user_settings
 from cowork.harnesses.base import get_harness
 from cowork.models.message import Message as DBMessage
 from cowork.models.message_event import MessageEvent
@@ -26,8 +27,7 @@ from cowork.services.files import FileService
 class ResponsesHandler:
     def __init__(self, session: Session) -> None:
         self.session = session
-        # TODO: Get the harness from settings? Request context?
-        self.harness = get_harness("anton")
+        self.harness = get_harness(get_user_settings().harness)
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         conversation_service = ConversationService(self.session)
