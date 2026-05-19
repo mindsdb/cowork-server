@@ -23,9 +23,9 @@ class AntonHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        model: str,
+        # model: str,
     ) -> AsyncIterator[str]:
-        session = await self._build_chat_session(conversation, model)
+        session = await self._build_chat_session(conversation)
 
         async for event in session.turn_stream(self._to_anton_input(input)):
             yield event
@@ -48,7 +48,7 @@ class AntonHarness:
     async def _build_chat_session(
         self,
         conversation: Conversation,
-        model: str,
+        # model: str,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -109,23 +109,23 @@ class AntonHarness:
 
         settings = AntonSettings()
         settings.resolve_workspace(str(base))
-        if model:
-            # Minds Cloud sentinels (`_reason_`, `_code_`) only resolve at
-            # the openai-compatible router. If the active provider is
-            # something else (e.g. anthropic, after the user switched off
-            # Minds), an old cowork preference can keep sending these on
-            # every request. Drop the override and stay with the env's
-            # `ANTON_PLANNING_MODEL` instead of forwarding `_reason_` to
-            # api.anthropic.com (which 404s).
-            is_minds_sentinel = model.startswith("_") and model.endswith("_")
-            if is_minds_sentinel and settings.planning_provider != "openai-compatible":
-                logger.warning(
-                    "Ignoring Minds sentinel model %r — active planning_provider is %r. "
-                    "Falling back to env ANTON_PLANNING_MODEL=%r.",
-                    model, settings.planning_provider, settings.planning_model,
-                )
-            else:
-                settings.planning_model = model
+        # if model:
+        #     # Minds Cloud sentinels (`_reason_`, `_code_`) only resolve at
+        #     # the openai-compatible router. If the active provider is
+        #     # something else (e.g. anthropic, after the user switched off
+        #     # Minds), an old cowork preference can keep sending these on
+        #     # every request. Drop the override and stay with the env's
+        #     # `ANTON_PLANNING_MODEL` instead of forwarding `_reason_` to
+        #     # api.anthropic.com (which 404s).
+        #     is_minds_sentinel = model.startswith("_") and model.endswith("_")
+        #     if is_minds_sentinel and settings.planning_provider != "openai-compatible":
+        #         logger.warning(
+        #             "Ignoring Minds sentinel model %r — active planning_provider is %r. "
+        #             "Falling back to env ANTON_PLANNING_MODEL=%r.",
+        #             model, settings.planning_provider, settings.planning_model,
+        #         )
+        #     else:
+        #         settings.planning_model = model
 
         workspace = Workspace(base)
         workspace.initialize()
@@ -147,7 +147,7 @@ class AntonHarness:
         for directory in (artifacts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = LLMClient.from_settings(settings)
+        llm_client = self._build_llm_client()
         self_awareness = SelfAwarenessContext(context_dir)
         global_memory_dir = Path.home() / ".anton" / "memory"
         global_memory_dir.mkdir(parents=True, exist_ok=True)
@@ -235,3 +235,32 @@ class AntonHarness:
             ],
         )
         return ChatSession(config)
+
+    def _build_llm_client(self):
+        from anton.core.llm.client import LLMClient
+        from anton.core.llm.anthropic import AnthropicProvider
+        from anton.core.llm.openai import OpenAIProvider
+        
+        from cowork.common.settings.user_settings import get_user_settings
+        
+        settings = get_user_settings()
+        provider_map = {
+            "anthropic": AnthropicProvider,
+            "openai": OpenAIProvider,
+        }
+        planning_provider_cls = provider_map.get(settings.planning_provider)
+        planning_provider = planning_provider_cls(
+            api_key=getattr(settings, f"{settings.planning_provider.value}_api_key").get_secret_value()
+        )
+
+        coding_provider_cls = provider_map.get(settings.coding_provider)
+        coding_provider = coding_provider_cls(
+            api_key=getattr(settings, f"{settings.coding_provider.value}_api_key").get_secret_value()
+        )
+        
+        return LLMClient(
+            planning_provider=planning_provider,
+            planning_model=settings.planning_model,
+            coding_provider=coding_provider,
+            coding_model=settings.coding_model,
+        )

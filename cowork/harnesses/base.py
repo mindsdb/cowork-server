@@ -25,7 +25,7 @@ class HarnessProvider(Protocol):
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        model: str,
+        # model: str,
     ) -> AsyncIterator[str]:
         ...
 

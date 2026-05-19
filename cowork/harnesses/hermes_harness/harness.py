@@ -24,7 +24,7 @@ class HermesHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        model: str,
+        # model: str,
     ) -> AsyncIterator[dict]:
         history = [
             msg.to_openai_message().model_dump()
@@ -36,7 +36,6 @@ class HermesHarness:
             None,
             self._run,
             self._to_prompt_string(input),
-            model,
             history,
         )
         yield result

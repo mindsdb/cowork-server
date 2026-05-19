@@ -83,7 +83,7 @@ class Response(BaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     status: ResponseStatus
     error: str | None = None
-    model: str
+    model: str | None = None  # The model can be set to None here because of the reasons mentioned in the request schema.
     output: list[ResponseOutput] = Field(default_factory=list)
     # TODO: There are some other that have not been included here. Are they needed?
 
@@ -116,7 +116,13 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Conversation ID for the responses request, if not provided, a new conversation will be created",
     )
-    model: str = Field(description="Model name for the chat completion request")
+    # In OpenAI's Responses API, the model is required.
+    # However, we currently do not allow this to be specified at the time of making the request,
+    # via the Cowork UI. Instead, the model is retrieved from the user provided settings.
+    model: str | None = Field(
+        default=None,
+        description="Model name for the chat completion request"
+    )
     stream: bool | None = Field(
         default=False,
         description="Whether the chat completion request is streaming or not",
