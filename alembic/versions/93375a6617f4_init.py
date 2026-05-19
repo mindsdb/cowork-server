@@ -164,9 +164,23 @@ def upgrade() -> None:
     )
     op.create_index("ix_settings_key", "settings", ["key"], unique=True)
 
+    op.create_table(
+        "skills",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("when_to_use", sa.Text(), nullable=True),
+        sa.Column("instructions", sa.Text(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("name"),
+    )
+
 
 def downgrade() -> None:
     """Downgrade schema."""
+    op.drop_table("skills")
     op.drop_index("ix_settings_key", table_name="settings")
     op.drop_table("settings")
     op.drop_table("schedule_runs")

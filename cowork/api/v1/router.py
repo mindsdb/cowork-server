@@ -15,6 +15,7 @@ from cowork.api.v1.endpoints import (
     responses,
     schedules,
     settings,
+    skills,
 )
 
 # Create the v1 API router
@@ -29,4 +30,5 @@ api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
+api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 
