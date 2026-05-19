@@ -16,15 +16,11 @@ def invalidate_user_settings_cache() -> None:
 
 
 def _load_from_db() -> UserSettings:
-    from sqlmodel import select
-
     from cowork.db.session import get_open_session
-    from cowork.models.setting import Setting
     from cowork.services.settings import SettingService
 
     session = get_open_session()
     try:
-        rows = list(session.exec(select(Setting)).all())
-        return SettingService._load(rows)
+        return SettingService(session).load()
     finally:
         session.close()

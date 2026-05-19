@@ -58,6 +58,9 @@ class SettingService:
             options=field_options(key),
         )
 
+    def load(self) -> UserSettings:
+        return self._load(self._fetch_all_rows())
+
     def list_settings(self) -> list[SettingResponse]:
         rows = self._fetch_all_rows()
         settings = self._load(rows)
@@ -67,8 +70,8 @@ class SettingService:
     def get_setting(self, key: str) -> SettingResponse:
         self._validate_key(key)
         row = self._fetch_row(key)
-        data = {key: (decrypt(row.value) if field_is_sensitive(key) else row.value)} if row else {}
-        return self._to_response(key, UserSettings(**data), row is not None)
+        settings = self._load([row] if row else [])
+        return self._to_response(key, settings, row is not None)
 
     def upsert_setting(self, key: str, value: str) -> SettingResponse:
         self._validate_key(key)
@@ -107,16 +110,3 @@ class SettingService:
         invalidate_user_settings_cache()
         return True
 
-    def get_raw_value(self, key: str) -> str | None:
-        """Return the decrypted/effective value for internal use by harness/service layers."""
-        self._validate_key(key)
-        row = self._fetch_row(key)
-        data = {key: (decrypt(row.value) if field_is_sensitive(key) else row.value)} if row else {}
-        field_val = getattr(UserSettings(**data), key)
-        if field_val is None:
-            return None
-        if isinstance(field_val, SecretStr):
-            return field_val.get_secret_value()
-        if isinstance(field_val, Enum):
-            return field_val.value
-        return str(field_val)
