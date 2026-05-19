@@ -10,7 +10,8 @@ class Role(str, Enum):
     system = "system"
     user = "user"
     assistant = "assistant"
-    # Thought events (tool activity visible to client)
+    # Thought events (tool activity visible to client).
+    # These are specific to the Anton harness at the moment.
     thought_scratchpad_start = "thought.scratchpad.start"
     thought_scratchpad_progress = "thought.scratchpad.progress"
     thought_scratchpad_result = "thought.scratchpad.result"
@@ -21,6 +22,10 @@ class Role(str, Enum):
     thought_recall_end = "thought.recall.end"
     thought_progress = "thought.progress"
     thought_context_compacted = "thought.context_compacted"
+    # General tool call events (relevant to other harnesses).
+    thought_tool_call_start = "thought.tool_call.start"
+    thought_tool_call_progress = "thought.tool_call.progress"
+    thought_tool_call_end = "thought.tool_call.end"
 
 
 class ContentType(str, Enum):

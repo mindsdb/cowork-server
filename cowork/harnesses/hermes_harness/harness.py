@@ -29,8 +29,26 @@ class HermesHarness:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
+        def _put(item: dict) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+
         def stream_callback(delta: str) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, {"type": "delta", "delta": delta})
+            _put({"type": "delta", "delta": delta})
+
+        def tool_start_callback(tool_call_id: str, name: str, args: dict) -> None:
+            _put({"type": "thought.tool_call.start", "tool_call_id": tool_call_id, "name": name, "args": args})
+
+        def tool_complete_callback(tool_call_id: str, name: str, args: dict, result: str) -> None:
+            _put({"type": "thought.tool_call.end", "tool_call_id": tool_call_id, "name": name, "result": result})
+
+        def tool_progress_callback(event_type: str, name: str, preview=None, args=None, **kwargs) -> None:
+            _put({"type": "thought.tool_call.progress", "event": event_type, "name": name, "preview": preview})
+
+        def reasoning_callback(text: str) -> None:
+            _put({"type": "thought.progress", "subtype": "reasoning", "content": text})
+
+        def thinking_callback(text: str) -> None:
+            _put({"type": "thought.progress", "subtype": "thinking", "content": text})
 
         history = [
             msg.to_openai_message().model_dump()
@@ -40,7 +58,16 @@ class HermesHarness:
 
         def run_sync() -> dict:
             try:
-                return self._run(self._to_prompt_string(input), history, stream_callback)
+                return self._run(
+                    self._to_prompt_string(input),
+                    history,
+                    stream_callback=stream_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    reasoning_callback=reasoning_callback,
+                    thinking_callback=thinking_callback,
+                )
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
@@ -65,7 +92,16 @@ class HermesHarness:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _run(prompt: str, history: list[dict], stream_callback=None) -> dict:
+    def _run(
+        prompt: str,
+        history: list[dict],
+        stream_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
+        tool_progress_callback=None,
+        reasoning_callback=None,
+        thinking_callback=None,
+    ) -> dict:
         from run_agent import AIAgent
 
         from cowork.common.settings.user_settings import get_user_settings
@@ -80,6 +116,11 @@ class HermesHarness:
             model=model,
             api_key=api_key,
             quiet_mode=True,
+            tool_start_callback=tool_start_callback,
+            tool_complete_callback=tool_complete_callback,
+            # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
+            reasoning_callback=reasoning_callback,
+            thinking_callback=thinking_callback,
         )
         return agent.run_conversation(
             user_message=prompt,

@@ -13,6 +13,8 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Callable, Optional
 
+from cowork.schemas.responses import Role
+
 
 async def format_hermes_stream(
     event_stream: AsyncIterator,
@@ -42,7 +44,9 @@ async def format_hermes_stream(
 
     accumulated: list[str] = []
     async for item in event_stream:
-        if item.get("type") == "delta":
+        item_type = item.get("type", "")
+
+        if item_type == "delta":
             delta = item["delta"]
             if delta:
                 accumulated.append(delta)
@@ -53,6 +57,49 @@ async def format_hermes_stream(
                     "item_id": msg_id,
                     "delta": delta,
                 })
+
+        elif item_type == "thought.tool_call.start":
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_start.value,
+                "content": item["name"],
+                "args": item.get("args"),
+                "tool_use_id": item["tool_call_id"],
+            })
+
+        elif item_type == "thought.tool_call.end":
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_end.value,
+                "content": item.get("result", "")[:65536],
+                "tool_use_id": item["tool_call_id"],
+            })
+
+        elif item_type == "thought.tool_call.progress":
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_progress.value,
+                "content": item.get("preview") or item.get("name", ""),
+                "event": item.get("event"),
+                "tool_name": item.get("name"),
+            })
+
+        elif item_type == "thought.progress":
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_progress.value,
+                "content": item["content"],
+                "subtype": item.get("subtype"),
+            })
+
         else:
             # Final result dict — fallback if stream_callback was never fired
             fallback = item.get("final_response", "")
