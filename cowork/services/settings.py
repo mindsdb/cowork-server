@@ -4,6 +4,7 @@ from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.encryption import decrypt, encrypt
+from cowork.common.settings.user_settings import invalidate_user_settings_cache
 from cowork.models.setting import Setting
 from cowork.schemas.settings import (
     SettingResponse,
@@ -92,6 +93,7 @@ class SettingService:
             row.value = store_val
         self.session.add(row)
         self.session.commit()
+        invalidate_user_settings_cache()
 
         return self._to_response(key, validated, True)
 
@@ -102,6 +104,7 @@ class SettingService:
             return False
         self.session.delete(row)
         self.session.commit()
+        invalidate_user_settings_cache()
         return True
 
     def get_raw_value(self, key: str) -> str | None:

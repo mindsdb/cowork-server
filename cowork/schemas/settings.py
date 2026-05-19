@@ -3,7 +3,7 @@ from typing import ClassVar, get_args
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 
-from cowork.common.settings import Settings
+from cowork.common.settings.app_settings import Settings
 
 
 class Provider(str, Enum):

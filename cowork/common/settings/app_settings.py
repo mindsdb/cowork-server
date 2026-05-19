@@ -41,7 +41,7 @@ class ProjectSettings(Settings):
         validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECT__ROOT_DIR"),
         description="Root directory where project folders are stored",
     )  # COWORK_PROJECTS_DIR or PROJECT__ROOT_DIR
-    
+
 
 class FileSettings(Settings):
     root_dir: str = Field(

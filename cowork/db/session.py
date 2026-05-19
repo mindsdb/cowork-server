@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
 
 from cowork.common.logger import setup_logging
-from cowork.common.settings import get_app_settings
+from cowork.common.settings.app_settings import get_app_settings
 
 logger = setup_logging()
 settings = get_app_settings()

@@ -6,7 +6,7 @@ from sqlalchemy.engine import make_url
 from sqlmodel import SQLModel
 
 from alembic import context
-from cowork.common.settings import get_app_settings
+from cowork.common.settings.app_settings import get_app_settings
 
 
 def _ensure_sqlite_dir(url: str) -> None:

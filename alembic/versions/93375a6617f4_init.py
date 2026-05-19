@@ -10,7 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-from cowork.common.settings import get_app_settings
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 
 

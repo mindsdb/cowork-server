@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import UploadFile
 from sqlmodel import Session, select
 
-from cowork.common.settings import get_app_settings
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 

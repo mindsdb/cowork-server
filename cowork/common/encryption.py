@@ -5,7 +5,7 @@ from cryptography.fernet import Fernet
 
 
 def _load_or_create_master_key() -> bytes:
-    from cowork.common.settings import get_app_settings
+    from cowork.common.settings.app_settings import get_app_settings
     key_path = Path(get_app_settings().master_key_path)
     if key_path.exists():
         return key_path.read_bytes().strip()
