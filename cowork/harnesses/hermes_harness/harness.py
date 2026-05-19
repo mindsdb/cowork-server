@@ -51,13 +51,20 @@ class HermesHarness:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _run(prompt: str, model: str, history: list[dict]) -> dict:
+    def _run(prompt: str, history: list[dict]) -> dict:
         from run_agent import AIAgent
 
+        from cowork.common.settings.user_settings import get_user_settings
+
+        settings = get_user_settings()
+        provider = settings.planning_provider.value
+        model = settings.planning_model
+        api_key = getattr(settings, f"{provider}_api_key").get_secret_value()
+
         agent = AIAgent(
-            provider="anthropic",  # TODO: Fix this.
+            provider=provider,
             model=model,
-            api_key=os.getenv("ANTHROPIC_API_KEY"),  # TODO: Fix this.
+            api_key=api_key,
             quiet_mode=True,
         )
         return agent.run_conversation(
