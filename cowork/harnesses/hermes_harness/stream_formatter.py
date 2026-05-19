@@ -40,18 +40,33 @@ async def format_hermes_stream(
         "response": {"id": resp_id, "model": model, "status": "created"},
     })
 
-    final_text = ""
-    async for result in event_stream:
-        final_text = result.get("final_response", "")
+    accumulated: list[str] = []
+    async for item in event_stream:
+        if item.get("type") == "delta":
+            delta = item["delta"]
+            if delta:
+                accumulated.append(delta)
+                seq += 1
+                yield _event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "sequence_number": seq,
+                    "item_id": msg_id,
+                    "delta": delta,
+                })
+        else:
+            # Final result dict — fallback if stream_callback was never fired
+            fallback = item.get("final_response", "")
+            if fallback and not accumulated:
+                accumulated.append(fallback)
+                seq += 1
+                yield _event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "sequence_number": seq,
+                    "item_id": msg_id,
+                    "delta": fallback,
+                })
 
-    if final_text:
-        seq += 1
-        yield _event("response.output_text.delta", {
-            "type": "response.output_text.delta",
-            "sequence_number": seq,
-            "item_id": msg_id,
-            "delta": final_text,
-        })
+    final_text = "".join(accumulated)
 
     seq += 1
     yield _event("response.completed", {

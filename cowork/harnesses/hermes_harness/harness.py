@@ -26,19 +26,33 @@ class HermesHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
     ) -> AsyncIterator[dict]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+        def stream_callback(delta: str) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, {"type": "delta", "delta": delta})
+
         history = [
             msg.to_openai_message().model_dump()
             for msg in conversation.messages
             if msg.role in {"user", "assistant"}
         ]
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            self._run,
-            self._to_prompt_string(input),
-            history,
-        )
-        yield result
+        def run_sync() -> dict:
+            try:
+                return self._run(self._to_prompt_string(input), history, stream_callback)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        task = loop.run_in_executor(None, run_sync)
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+
+        yield await task
 
     @staticmethod
     def _to_prompt_string(input_blocks: list[dict]) -> str:
@@ -51,7 +65,7 @@ class HermesHarness:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _run(prompt: str, history: list[dict]) -> dict:
+    def _run(prompt: str, history: list[dict], stream_callback=None) -> dict:
         from run_agent import AIAgent
 
         from cowork.common.settings.user_settings import get_user_settings
@@ -70,4 +84,5 @@ class HermesHarness:
         return agent.run_conversation(
             user_message=prompt,
             conversation_history=history,
+            stream_callback=stream_callback,
         )
