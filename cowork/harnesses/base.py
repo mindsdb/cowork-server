@@ -2,6 +2,7 @@ from typing import AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
 
 from cowork.models.conversation import Conversation
+from cowork.models.skill import Skill
 
 
 class TextInputBlock(TypedDict):
@@ -27,6 +28,9 @@ class HarnessProvider(Protocol):
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
     ) -> AsyncIterator[str]:
+        ...
+
+    async def sync_skills(self, skills: list[Skill]) -> None:
         ...
 
 
