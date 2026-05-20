@@ -267,27 +267,25 @@ class AntonHarness:
         from anton.core.llm.client import LLMClient
         from anton.core.llm.anthropic import AnthropicProvider
         from anton.core.llm.openai import OpenAIProvider
-        
-        from cowork.common.settings.user_settings import get_user_settings
-        
-        settings = get_user_settings()
-        provider_map = {
-            "anthropic": AnthropicProvider,
-            "openai": OpenAIProvider,
-        }
-        planning_provider_cls = provider_map.get(settings.planning_provider)
-        planning_provider = planning_provider_cls(
-            api_key=getattr(settings, f"{settings.planning_provider.value}_api_key").get_secret_value()
-        )
 
-        coding_provider_cls = provider_map.get(settings.coding_provider)
-        coding_provider = coding_provider_cls(
-            api_key=getattr(settings, f"{settings.coding_provider.value}_api_key").get_secret_value()
-        )
-        
+        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.schemas.settings import Provider
+
+        settings = get_user_settings()
+
+        def _make_provider(role: Provider):
+            if role == Provider.MINDS_CLOUD:
+                return OpenAIProvider(
+                    api_key=settings.minds_api_key.get_secret_value(),
+                    base_url=settings.minds_url,
+                )
+            provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
+            cls = provider_map[role.value]
+            return cls(api_key=getattr(settings, f"{role.value}_api_key").get_secret_value())
+
         return LLMClient(
-            planning_provider=planning_provider,
+            planning_provider=_make_provider(settings.planning_provider),
             planning_model=settings.planning_model,
-            coding_provider=coding_provider,
+            coding_provider=_make_provider(settings.coding_provider),
             coding_model=settings.coding_model,
         )

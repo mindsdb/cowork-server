@@ -9,6 +9,7 @@ from cowork.common.settings.app_settings import Settings
 class Provider(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
+    MINDS_CLOUD = "minds_cloud"
 
 
 class _DynamicOptions:
@@ -30,10 +31,12 @@ class UserSettings(Settings):
     PLANNING_MODEL_DEFAULTS: ClassVar[dict[Provider, str]] = {
         Provider.ANTHROPIC: "claude-sonnet-4-6",
         Provider.OPENAI: "gpt-4o",
+        Provider.MINDS_CLOUD: "_reason_",
     }
     CODING_MODEL_DEFAULTS: ClassVar[dict[Provider, str]] = {
         Provider.ANTHROPIC: "claude-haiku-4-5-20251001",
         Provider.OPENAI: "gpt-5.3-codex",
+        Provider.MINDS_CLOUD: "_code_",
     }
 
     anthropic_api_key: SecretStr | None = Field(
@@ -45,6 +48,16 @@ class UserSettings(Settings):
         default=None,
         title="OpenAI API Key",
         description="API key for OpenAI models. Required if not using Anthropic.",
+    )
+    minds_api_key: SecretStr | None = Field(
+        default=None,
+        title="MindsHub API Key",
+        description="API key for MindsHub. Required if using MindsHub as a provider.",
+    )
+    minds_url: str = Field(
+        default="https://api.mindshub.ai/v1",
+        title="MindsHub URL",
+        description="Base URL for the MindsHub API.",
     )
     planning_provider: Provider = Field(
         default=Provider.ANTHROPIC,

@@ -148,23 +148,39 @@ class HermesHarness:
         from run_agent import AIAgent
 
         from cowork.common.settings.user_settings import get_user_settings
+        from cowork.schemas.settings import Provider
 
         settings = get_user_settings()
-        provider = settings.planning_provider.value
         model = settings.planning_model
-        api_key = getattr(settings, f"{provider}_api_key").get_secret_value()
 
-        agent = AIAgent(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            quiet_mode=True,
-            tool_start_callback=tool_start_callback,
-            tool_complete_callback=tool_complete_callback,
-            # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
-            reasoning_callback=reasoning_callback,
-            thinking_callback=thinking_callback,
-        )
+        if settings.planning_provider == Provider.MINDS_CLOUD:
+            agent = AIAgent(
+                provider="openai",
+                base_url=settings.minds_url,
+                model=model,
+                api_key=settings.minds_api_key.get_secret_value(),
+                quiet_mode=True,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
+                reasoning_callback=reasoning_callback,
+                thinking_callback=thinking_callback,
+            )
+        else:
+            provider = settings.planning_provider.value
+            api_key = getattr(settings, f"{provider}_api_key").get_secret_value()
+            agent = AIAgent(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                quiet_mode=True,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
+                reasoning_callback=reasoning_callback,
+                thinking_callback=thinking_callback,
+            )
+
         return agent.run_conversation(
             user_message=prompt,
             conversation_history=history,
