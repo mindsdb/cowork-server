@@ -30,7 +30,7 @@ class HermesHarness:
         import yaml
 
         settings = HermesHarnessSettings()
-        skills_dir = Path(settings.hermes_home) / "skills" / "cowork"
+        skills_dir = Path(settings.hermes_home) / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
 
         active_labels: set[str] = set()
