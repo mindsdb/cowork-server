@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 
 class SkillCreateRequest(BaseModel):
+    label: str
     name: str
     description: str | None = None
     when_to_use: str | None = None
@@ -12,6 +13,7 @@ class SkillCreateRequest(BaseModel):
 
 
 class SkillUpdateRequest(BaseModel):
+    label: str | None = None
     name: str | None = None
     description: str | None = None
     when_to_use: str | None = None
@@ -20,6 +22,7 @@ class SkillUpdateRequest(BaseModel):
 
 class SkillResponse(BaseModel):
     id: UUID
+    label: str
     name: str
     description: str | None
     when_to_use: str | None

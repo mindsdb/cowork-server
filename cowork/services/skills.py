@@ -22,15 +22,17 @@ class SkillService:
 
     def create_skill(
         self,
+        label: str,
         name: str,
         instructions: str,
         description: str | None = None,
         when_to_use: str | None = None,
     ) -> Skill:
-        existing = self.session.exec(select(Skill).where(Skill.name == name)).first()
-        if existing:
+        if self.session.exec(select(Skill).where(Skill.label == label)).first():
+            raise ValueError(f"A skill with label '{label}' already exists.")
+        if self.session.exec(select(Skill).where(Skill.name == name)).first():
             raise ValueError(f"A skill named '{name}' already exists.")
-        skill = Skill(name=name, instructions=instructions, description=description, when_to_use=when_to_use)
+        skill = Skill(label=label, name=name, instructions=instructions, description=description, when_to_use=when_to_use)
         self.session.add(skill)
         self.session.commit()
         self.session.refresh(skill)
@@ -39,12 +41,15 @@ class SkillService:
     def update_skill(
         self,
         skill_id: UUID,
+        label: str | None = None,
         name: str | None = None,
         description: str | None = None,
         when_to_use: str | None = None,
         instructions: str | None = None,
     ) -> Skill:
         skill = self.get_skill(skill_id)
+        if label is not None:
+            skill.label = label
         if name is not None:
             skill.name = name
         if description is not None:

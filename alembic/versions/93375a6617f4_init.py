@@ -167,6 +167,7 @@ def upgrade() -> None:
     op.create_table(
         "skills",
         sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("label", sa.String(80), nullable=False),
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("when_to_use", sa.Text(), nullable=True),
@@ -174,6 +175,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
         sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("label"),
         sa.UniqueConstraint("name"),
     )
 

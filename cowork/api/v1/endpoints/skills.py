@@ -21,6 +21,7 @@ def list_skills(session: SessionDep):
 def create_skill(body: SkillCreateRequest, session: SessionDep):
     try:
         skill = SkillService(session).create_skill(
+            label=body.label,
             name=body.name,
             instructions=body.instructions,
             description=body.description,
@@ -44,6 +45,7 @@ def update_skill(skill_id: UUID, body: SkillUpdateRequest, session: SessionDep):
     try:
         skill = SkillService(session).update_skill(
             skill_id,
+            label=body.label,
             name=body.name,
             description=body.description,
             when_to_use=body.when_to_use,
