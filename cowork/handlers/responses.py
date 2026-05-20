@@ -22,6 +22,7 @@ from cowork.schemas.responses import (
 )
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
+from cowork.services.skills import SkillService
 
 
 class ResponsesHandler:
@@ -30,6 +31,8 @@ class ResponsesHandler:
         self.harness = get_harness(get_user_settings().harness)
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
+        await self.harness.sync_skills(SkillService(self.session).list_skills())
+
         conversation_service = ConversationService(self.session)
 
         harness_input = self._build_harness_input(request)
