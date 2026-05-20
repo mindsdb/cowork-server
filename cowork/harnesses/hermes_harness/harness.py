@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 import os
+from collections.abc import AsyncIterator
+from pathlib import Path
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
+from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
+from cowork.models.skill import Skill
 
+# Redirect all Hermes data (skills, sessions, config) to ~/.cowork/hermes before
+# run_agent is first imported, so its module-level get_hermes_home() call lands here.
+os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().hermes_home)
 
 logger = get_logger(__name__)
 
@@ -18,6 +24,43 @@ class HermesHarness:
     id: str = "hermes"
     label: str = "Hermes"
     formatter = staticmethod(format_hermes_stream)
+
+    async def sync_skills(self, skills: list[Skill]) -> None:
+        import shutil
+        import yaml
+
+        settings = HermesHarnessSettings()
+        skills_dir = Path(settings.hermes_home) / "skills" / "cowork"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+
+        active_labels: set[str] = set()
+        for skill in skills:
+            skill_dir = skills_dir / skill.label
+            skill_dir.mkdir(parents=True, exist_ok=True)
+
+            frontmatter: dict = {"name": skill.name or skill.label}
+            if skill.description:
+                frontmatter["description"] = skill.description
+            if skill.when_to_use:
+                frontmatter["when_to_use"] = [
+                    line.strip()
+                    for line in skill.when_to_use.splitlines()
+                    if line.strip()
+                ]
+
+            content = (
+                f"---\n"
+                f"{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True)}"
+                f"---\n\n"
+                f"{skill.instructions or ''}"
+            )
+            (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+            active_labels.add(skill.label)
+
+        # Delete skills that no longer exist in cowork.
+        for existing_dir in skills_dir.iterdir():
+            if existing_dir.is_dir() and existing_dir.name not in active_labels:
+                shutil.rmtree(existing_dir)
 
     async def stream_response(
         self,
