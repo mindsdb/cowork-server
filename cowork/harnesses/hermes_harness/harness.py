@@ -102,6 +102,7 @@ class HermesHarness:
         def run_sync() -> dict:
             try:
                 return self._run(
+                    str(conversation.id),
                     self._to_prompt_string(input),
                     history,
                     stream_callback=stream_callback,
@@ -136,6 +137,7 @@ class HermesHarness:
 
     @staticmethod
     def _run(
+        session_id: str,
         prompt: str,
         history: list[dict],
         stream_callback=None,
@@ -155,6 +157,7 @@ class HermesHarness:
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
             agent = AIAgent(
+                session_id=session_id,
                 provider="openai",
                 base_url=settings.minds_url,
                 model=model,
