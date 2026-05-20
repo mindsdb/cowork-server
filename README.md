@@ -28,8 +28,8 @@ Further details regarding this design can be found in this document: [Cowork Ser
 
 ## Remaining Work
 
-### MindsHub Wiring
-The MindsHub wiring still needs to be completed. This mainly includes running inference through the Minds API. There are also certain settings that are currently maintained in the existing implementation of the Cowork server such as the name of a Mind and data source that do not seem to be relevant any further.
+### ~~MindsHub Wiring~~
+~~The MindsHub wiring still needs to be completed. This mainly includes running inference through the Minds API. There are also certain settings that are currently maintained in the existing implementation of the Cowork server such as the name of a Mind and data source that do not seem to be relevant any further.~~
 
 ### Artifacts
 At the moment, the creation and management of artifacts are tied to the Anton agent including how metadata for each artifact is maintained and how they are published to the web. A common contract for artifacts should be defined that can be implemented across different agents.
@@ -42,5 +42,5 @@ Most agents come with their own implementations of memory management. This shoul
 
 If external implementations of memory management such as gbrain are to be supported, that should be taken into account as well.
 
-### Skills
-Similar to memory, skills are also implemented differently across different agents. 
+### ~~Skills~~
+~~Similar to memory, skills are also implemented differently across different agents.~~
