@@ -43,6 +43,10 @@ class ResponsesHandler:
         else:
             conversation = conversation_service.create_conversation(topic=self._prompt_text(harness_input)[:80])
 
+        # Pre-load messages before committing the new user message so the ORM
+        # cache doesn't include it when _build_chat_session reads history.
+        _ = conversation.messages
+
         user_message = DBMessage(
             conversation_id=conversation.id,
             role=Role.user,
