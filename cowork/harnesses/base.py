@@ -1,7 +1,11 @@
 from typing import AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
+from uuid import UUID
+
+from pydantic import BaseModel
 
 from cowork.models.conversation import Conversation
+from cowork.schemas.memory import MemoryScope
 from cowork.models.skill import Skill
 
 
@@ -14,6 +18,14 @@ class FileInputBlock(TypedDict):
     type: Literal["file"]
     path: str
     filename: str
+
+
+# This is the same model as the MemoryCreateRequest.
+class MemoryItem(BaseModel):
+    scope: MemoryScope
+    category: str
+    content: str
+    project_id: UUID | None = None
 
 
 class HarnessProvider(Protocol):
@@ -31,6 +43,17 @@ class HarnessProvider(Protocol):
         ...
 
     async def sync_skills(self, skills: list[Skill]) -> None:
+        ...
+
+    async def memorize(self, item: MemoryItem) -> None:
+        ...
+
+    async def retrieve_memory(
+        self,
+        scope: MemoryScope,
+        category: str,  # Each harness will define the categories it supports.
+        project_id: UUID | None = None
+    ) -> list[MemoryItem]:
         ...
 
 
