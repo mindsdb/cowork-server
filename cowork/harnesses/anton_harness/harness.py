@@ -168,7 +168,6 @@ class AntonHarness:
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
-        from anton.core.llm.client import LLMClient
         from anton.core.memory.cortex import Cortex
         # from anton.core.memory.episodes import EpisodicMemory
         from anton.core.memory.hippocampus import Hippocampus
@@ -199,6 +198,8 @@ class AntonHarness:
             from anton.core.datasources.data_vault import LocalDataVault
         except Exception:  # pragma: no cover
             LocalDataVault = None
+            
+        from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
         base = Path(conversation.project.path)
         # Reload ~/.anton/.env into os.environ before building settings.
@@ -263,7 +264,7 @@ class AntonHarness:
 
         llm_client = self._build_llm_client()
         self_awareness = SelfAwarenessContext(context_dir)
-        global_memory_dir = Path(settings.global_memory_root_dir)
+        global_memory_dir = Path(AntonHarnessSettings().global_memory_root_dir)
         global_memory_dir.mkdir(parents=True, exist_ok=True)
         cortex = Cortex(
             global_hc=Hippocampus(global_memory_dir),
