@@ -252,7 +252,7 @@ class AntonHarness:
 
         llm_client = self._build_llm_client()
         self_awareness = SelfAwarenessContext(context_dir)
-        global_memory_dir = Path.home() / ".anton" / "memory"
+        global_memory_dir = Path(settings.global_memory_root_dir)
         global_memory_dir.mkdir(parents=True, exist_ok=True)
         cortex = Cortex(
             global_hc=Hippocampus(global_memory_dir),
