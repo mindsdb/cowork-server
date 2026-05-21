@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from cowork.models.conversation import Conversation
 from cowork.schemas.memory import MemoryScope
+from cowork.models.project import Project
 from cowork.models.skill import Skill
 
 
@@ -25,7 +26,7 @@ class MemoryItem(BaseModel):
     scope: MemoryScope
     category: str
     content: str
-    project_id: UUID | None = None
+    project: Project | None = None
 
 
 class HarnessProvider(Protocol):
@@ -45,14 +46,20 @@ class HarnessProvider(Protocol):
     async def sync_skills(self, skills: list[Skill]) -> None:
         ...
 
-    async def memorize(self, item: MemoryItem) -> None:
+    async def edit_memory(
+        self,
+        scope: MemoryScope,
+        category: str,
+        content: str,
+        project: Project | None = None
+    ) -> None:
         ...
 
     async def retrieve_memory(
         self,
         scope: MemoryScope,
         category: str,  # Each harness will define the categories it supports.
-        project_id: UUID | None = None
+        project: Project | None = None
     ) -> list[MemoryItem]:
         ...
 
