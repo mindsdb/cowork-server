@@ -2,7 +2,6 @@
 from collections.abc import AsyncIterator
 from enum import Enum
 from pathlib import Path
-from uuid import UUID
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import (
@@ -58,7 +57,7 @@ class AntonHarness:
             if existing.provenance == "cowork" and existing.label not in active_labels:
                 store.delete(existing.label)
     
-    async def edit_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
+    async def overwrite_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
         # Validate provided category.
         # This is not done at the schema (request) level because each harness supports different categories.
         category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
@@ -97,7 +96,7 @@ class AntonHarness:
         }
         return scope_to_path[category]
     
-    async def retrieve_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> list[MemoryItem]:
+    async def retrieve_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> str:
         category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
 
         if scope == MemoryScope.global_:

@@ -13,7 +13,14 @@ class AntonHarnessSettings(Settings):
         default=True,
         description="Whether to verify SSL certificates when publishing artifacts to the publish URL",
     )  # ANTON_SSL_VERIFY
+    # Skills are global, they are not scoped to any particular project.
     skills_root_dir: str = Field(
         default=str(Path.home() / ".cowork" / "anton" / "skills"),
         description="The root directory where the Anton harness will store skill-related files",
     )  # ANTON_SKILLS_ROOT_DIR
+    # This is for memory scoped at the global level.
+    # Project specific memory will be stored in the relevant project dir.
+    global_memory_root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "anton" / "memory"),
+        description="The root directory where the Anton harness will store memory files for global scope",
+    )  # ANTON_GLOBAL_MEMORY_ROOT_DIR

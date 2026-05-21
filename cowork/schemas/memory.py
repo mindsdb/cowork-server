@@ -14,7 +14,7 @@ class MemoryScope(str, Enum):
 class MemoryUpdateRequest(BaseModel):
     scope: MemoryScope
     category: str
-    content: str  # Only the content can be updated, the scope and category are used to identify the memory to be updated.
+    content: str  # Only the content can be updated, the scope and category are used to identify what to update.
     project_id: UUID | None = None
 
 
