@@ -32,4 +32,4 @@ api_router.include_router(schedules.router, prefix="/schedules", tags=["schedule
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
-
+api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
