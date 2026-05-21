@@ -1,13 +1,11 @@
-
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
-
 
 logger = get_logger(__name__)
 
@@ -20,8 +18,10 @@ class AntonHarness:
 
     async def sync_skills(self, skills: list[Skill]) -> None:
         from datetime import datetime, timezone
-        from anton.core.memory.skills import Skill as AntonSkill, SkillStore
-        
+
+        from anton.core.memory.skills import Skill as AntonSkill
+        from anton.core.memory.skills import SkillStore
+
         from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
         settings = AntonHarnessSettings()
@@ -34,7 +34,9 @@ class AntonHarness:
                 description=skill.description or "",
                 when_to_use=skill.when_to_use or "",
                 declarative_md=skill.instructions,
-                created_at=skill.created_at.isoformat() if skill.created_at else datetime.now(timezone.utc).isoformat(),
+                created_at=skill.created_at.isoformat()
+                if skill.created_at
+                else datetime.now(timezone.utc).isoformat(),
                 provenance="cowork",  # Helps track which skills originated from cowork.
             )
             store.save(anton_skill)
@@ -66,12 +68,14 @@ class AntonHarness:
             if block.get("type") == "text":
                 anton_blocks.append({"type": "text", "text": block["text"]})
             elif block.get("type") == "file":
-                anton_blocks.append({
-                    "type": "text",
-                    "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
-                })
+                anton_blocks.append(
+                    {
+                        "type": "text",
+                        "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
+                    }
+                )
         return anton_blocks
-        
+
     async def _build_chat_session(
         self,
         conversation: Conversation,
@@ -83,12 +87,19 @@ class AntonHarness:
         from anton.context.self_awareness import SelfAwarenessContext
         from anton.core.llm.client import LLMClient
         from anton.core.memory.cortex import Cortex
+
         # from anton.core.memory.episodes import EpisodicMemory
         from anton.core.memory.hippocampus import Hippocampus
-        from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
+        from anton.core.session import (
+            ChatSession,
+            ChatSessionConfig,
+            SystemPromptContext,
+        )
+
         # from anton.memory.history_store import HistoryStore
         from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
+
         # Cowork override — anton's stock PUBLISH_TOOL prints to a Rich
         # Console and pops a webbrowser, both of which die in the FastAPI
         # process. The wrapper exposes the same schema to the LLM but
@@ -101,6 +112,7 @@ class AntonHarness:
             # build_cowork_lookup_connector_tool,
             # build_list_conversation_datasources_tool,
         )
+
         PUBLISH_TOOL = build_cowork_publish_tool()
         # REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
@@ -168,7 +180,9 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
-        context_dir = _settings_path(getattr(settings, "context_dir", None), anton_dir / "context")
+        context_dir = _settings_path(
+            getattr(settings, "context_dir", None), anton_dir / "context"
+        )
         episodes_dir = anton_dir / "episodes"
         project_memory_dir = anton_dir / "memory"
         for directory in (artifacts_dir, context_dir, episodes_dir, project_memory_dir):
@@ -218,7 +232,7 @@ class AntonHarness:
             "  2. To MODIFY an existing artifact, call `list_artifacts()` to find its slug, "
             "then `open_artifact(slug)` to get the path again.\n"
             "  3. Use absolute paths from a scratchpad cell so the file always lands in the right place: "
-            "`with open(f\"{path}/dashboard.html\", \"w\") as f: ...`\n"
+            '`with open(f"{path}/dashboard.html", "w") as f: ...`\n'
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
         )
 
@@ -226,7 +240,11 @@ class AntonHarness:
 
         # TODO: Add guidance for integrations
 
-        history = [message.to_openai_message() for message in conversation.messages if message.role in {"user", "assistant"}]
+        history = [
+            message.to_openai_message()
+            for message in conversation.messages
+            if message.role in {"user", "assistant"}
+        ]
         config = ChatSessionConfig(
             llm_client=llm_client,
             settings=settings,
@@ -236,10 +254,10 @@ class AntonHarness:
             system_prompt_context=SystemPromptContext(
                 runtime_context=build_runtime_context(settings),
                 suffix=(
-                    "The Anton CoWork desktop UI displays progress, tool usage, and actions "
+                    "The Anton Cowork desktop UI displays progress, tool usage, and actions "
                     "as separate structured activity rows. Keep assistant text focused on the "
                     "user-facing answer; do not narrate internal work with status phrases like "
-                    "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
+                    '"I\'ll check", "let me query", or "I have access" unless that wording '
                     "is itself the final answer the user needs."
                     f"{project_context}"
                 ),
@@ -264,8 +282,8 @@ class AntonHarness:
         return ChatSession(config)
 
     def _build_llm_client(self):
-        from anton.core.llm.client import LLMClient
         from anton.core.llm.anthropic import AnthropicProvider
+        from anton.core.llm.client import LLMClient
         from anton.core.llm.openai import OpenAIProvider
 
         from cowork.common.settings.user_settings import get_user_settings
@@ -281,7 +299,9 @@ class AntonHarness:
                 )
             provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
             cls = provider_map[role.value]
-            return cls(api_key=getattr(settings, f"{role.value}_api_key").get_secret_value())
+            return cls(
+                api_key=getattr(settings, f"{role.value}_api_key").get_secret_value()
+            )
 
         return LLMClient(
             planning_provider=_make_provider(settings.planning_provider),

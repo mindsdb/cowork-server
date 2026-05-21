@@ -46,7 +46,9 @@ def _read_published_state(file_path: Path) -> dict[str, str]:
                 "last_md5": str(entry.get("last_md5") or ""),
             }
     except Exception:
-        logger.debug("Could not read .published.json next to %s", file_path, exc_info=True)
+        logger.debug(
+            "Could not read .published.json next to %s", file_path, exc_info=True
+        )
     return {}
 
 
@@ -254,8 +256,8 @@ def build_cowork_publish_tool():
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
     """
-    from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
+    from anton.tools import PUBLISH_TOOL
 
     return ToolDef(
         name=PUBLISH_TOOL.name,
@@ -773,7 +775,7 @@ def build_cowork_publish_tool():
 #     if not cid:
 #         return json.dumps({
 #             "error": "no_conversation_id",
-#             "message": "This session is not scoped to a CoWork conversation yet.",
+#             "message": "This session is not scoped to a Cowork conversation yet.",
 #         })
 #     payload = cm.conversation_datasource_scope_for_id(cid)
 #     return json.dumps(payload, indent=2)
