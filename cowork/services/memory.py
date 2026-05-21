@@ -31,7 +31,7 @@ class MemoryService:
     async def delete_memory(self, scope: MemoryScope, category: str, project_id: UUID | None = None) -> None:
         harness = get_harness(settings.harness)
         project = self._resolve_project(scope, project_id)
-        await harness.overwrite_memory(scope, category, "", project)
+        await harness.delete_memory(scope, category, project)
 
     def _resolve_project(self, scope: MemoryScope, project_id: UUID | None) -> Project | None:
         if scope == MemoryScope.project:

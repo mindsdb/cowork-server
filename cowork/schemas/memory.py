@@ -49,4 +49,3 @@ class MemoryResponse(BaseModel):
     @model_validator(mode="before")
     def validate_project_id(cls, values):
         return validate_project_id(values)
-

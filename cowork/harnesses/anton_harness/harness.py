@@ -66,8 +66,7 @@ class AntonHarness:
             await self._write_to_global_memory(category_enum, content)
         elif scope == MemoryScope.project:
             if project is None:
-                raise ValueError("Project must be provided for project-scoped memory.")
-            await self._write_to_project_memory(project, category_enum, content)
+                await self._write_to_project_memory(project, category_enum, content)
 
     async def _write_to_global_memory(self, category: AntonMemoryCategory, content: str) -> None:
         global_memory_dir = Path(settings.global_memory_root_dir)
@@ -79,12 +78,6 @@ class AntonHarness:
     async def _write_to_project_memory(self, project: Project, category: AntonMemoryCategory, content: str) -> None:
         project_memory_dir = Path(project.path) / ".anton" / "memory"
         project_memory_dir.mkdir(parents=True, exist_ok=True)
-
-        # TODO: Include topics.
-        scope_to_path = {
-            AntonMemoryCategory.lesson: project_memory_dir / "lessons.md",
-            AntonMemoryCategory.rule: project_memory_dir / "rules.md",
-        }
 
         memory_file = self._resolve_memory_path(project_memory_dir, category)
         memory_file.write_text(content + "\n", encoding="utf-8")
@@ -103,8 +96,7 @@ class AntonHarness:
             return await self._read_from_global_memory(category_enum)
         elif scope == MemoryScope.project:
             if project is None:
-                raise ValueError("Project must be provided for project-scoped memory.")
-            return await self._read_from_project_memory(project, category_enum)
+                return await self._read_from_project_memory(project, category_enum)
         
     async def _read_from_global_memory(self, category: AntonMemoryCategory) -> str:
         global_memory_dir = Path(settings.global_memory_root_dir)
@@ -119,6 +111,26 @@ class AntonHarness:
         if not memory_file.is_file():
             return ""
         return memory_file.read_text(encoding="utf-8")
+
+    async def delete_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> None:
+        category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
+
+        if scope == MemoryScope.global_:
+            await self._delete_global_memory(category_enum)
+        elif scope == MemoryScope.project:
+            await self._delete_project_memory(project, category_enum)
+
+    async def _delete_global_memory(self, category: AntonMemoryCategory) -> None:
+        global_memory_dir = Path(settings.global_memory_root_dir)
+        memory_file = self._resolve_memory_path(global_memory_dir, category)
+        if memory_file.is_file():
+            memory_file.unlink()
+
+    async def _delete_project_memory(self, project: Project, category: AntonMemoryCategory) -> None:
+        project_memory_dir = Path(project.path) / ".anton" / "memory"
+        memory_file = self._resolve_memory_path(project_memory_dir, category)
+        if memory_file.is_file():
+            memory_file.unlink()
 
     async def stream_response(
         self,

@@ -56,6 +56,14 @@ class HarnessProvider(Protocol):
         project: Project | None = None
     ) -> str:
         ...
+        
+    async def delete_memory(
+        self,
+        scope: MemoryScope,
+        category: str,
+        project: Project | None = None
+    ) -> None:
+        ...
 
 
 _registry: dict[str, type[HarnessProvider]] = {}
