@@ -65,8 +65,7 @@ class AntonHarness:
         if scope == MemoryScope.global_:
             await self._write_to_global_memory(category_enum, content)
         elif scope == MemoryScope.project:
-            if project is None:
-                await self._write_to_project_memory(project, category_enum, content)
+            await self._write_to_project_memory(project, category_enum, content)
 
     async def _write_to_global_memory(self, category: AntonMemoryCategory, content: str) -> None:
         global_memory_dir = Path(settings.global_memory_root_dir)
@@ -95,8 +94,7 @@ class AntonHarness:
         if scope == MemoryScope.global_:
             return await self._read_from_global_memory(category_enum)
         elif scope == MemoryScope.project:
-            if project is None:
-                return await self._read_from_project_memory(project, category_enum)
+            return await self._read_from_project_memory(project, category_enum)
         
     async def _read_from_global_memory(self, category: AntonMemoryCategory) -> str:
         global_memory_dir = Path(settings.global_memory_root_dir)
