@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from cowork.api.v1.endpoints import (
     conversations,
     files,
+    memory,
     pins,
     projects,
     responses,

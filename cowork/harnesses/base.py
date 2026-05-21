@@ -38,7 +38,9 @@ class HarnessProvider(Protocol):
     async def sync_skills(self, skills: list[Skill]) -> None:
         ...
 
-    async def edit_memory(
+    # Requests will be made to overwrite memory content in the harness,
+    # by including both new and existing content.
+    async def overwrite_memory(
         self,
         scope: MemoryScope,
         category: str,
