@@ -21,14 +21,6 @@ class FileInputBlock(TypedDict):
     filename: str
 
 
-# This is the same model as the MemoryCreateRequest.
-class MemoryItem(BaseModel):
-    scope: MemoryScope
-    category: str
-    content: str
-    project: Project | None = None
-
-
 class HarnessProvider(Protocol):
     id: str
     label: str
@@ -60,7 +52,7 @@ class HarnessProvider(Protocol):
         scope: MemoryScope,
         category: str,  # Each harness will define the categories it supports.
         project: Project | None = None
-    ) -> list[MemoryItem]:
+    ) -> str:
         ...
 
 
