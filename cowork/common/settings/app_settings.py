@@ -32,23 +32,23 @@ class DatabaseSettings(Settings):
     query_timeout: int = Field(default=300, description="The query timeout in seconds")  # DATABASE_QUERY_TIMEOUT
     statement_timeout: int = Field(
         default=300000, description="The statement timeout in milliseconds"
-    )  # DATABASE__STATEMENT_TIMEOUT
+    )  # DATABASE_STATEMENT_TIMEOUT
 
 
 class ProjectSettings(Settings):
     root_dir: str = Field(
         default=str(Path.home() / ".cowork" / "projects"),
-        validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECT__ROOT_DIR"),
+        validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECTS_ROOT_DIR"),
         description="Root directory where project folders are stored",
-    )  # COWORK_PROJECTS_DIR or PROJECT__ROOT_DIR
+    )  # PROJECT_ROOT_DIR or COWORK_PROJECTS_DIR or PROJECTS_ROOT_DIR
 
 
 class FileSettings(Settings):
     root_dir: str = Field(
         default=str(Path.home() / ".cowork" / "files"),
-        validation_alias=AliasChoices("COWORK_FILES_DIR", "FILES__ROOT_DIR"),
+        validation_alias=AliasChoices("COWORK_FILES_DIR", "FILES_ROOT_DIR"),
         description="Root directory where uploaded files are stored",
-    )  # COWORK_FILES_DIR or FILES__ROOT_DIR
+    )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
 class AppSettings(Settings):

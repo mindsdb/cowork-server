@@ -18,7 +18,9 @@ def validate_project_id(values):
 
 
 # An endpoint for creating memory does not exist,
-# because users will only update the content of the existig memory (files).
+# because users will only update the content of the existing memory (files).
+# The relevant file will be created, however, if it does not exist.
+# TODO: Do we want to allow users to create these files? Or should only edits be allowed?
 class MemoryUpdateRequest(BaseModel):
     scope: MemoryScope
     category: str
