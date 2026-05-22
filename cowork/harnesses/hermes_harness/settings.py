@@ -8,6 +8,6 @@ from cowork.common.settings import Settings
 class HermesHarnessSettings(Settings):
     root_dir: str = Field(
         default=str(Path.home() / ".cowork" / "hermes"),
-        validation_alias=AliasChoices("HERMES_HOME", "hermes_home"),
+        validation_alias=AliasChoices("HERMES_ROOT_DIR", "HERMES_HOME"),
         description="Root directory for all Hermes data (skills, memory, sessions, config)",
-    )  # ROOT_DIR
+    )  # HERMES_ROOT_DIR or HERMES_HOME

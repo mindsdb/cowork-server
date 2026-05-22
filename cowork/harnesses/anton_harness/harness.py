@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 settings = AntonHarnessSettings()
 
 
+# TODO: Handle topics.
 class AntonMemoryCategory(str, Enum):
     lesson = "lesson"
     rule = "rule"
@@ -82,6 +83,8 @@ class AntonHarness:
         memory_file.write_text(content + "\n", encoding="utf-8")
 
     def _resolve_memory_path(self, root_dir: Path, category: AntonMemoryCategory) -> Path:
+        # TODO: Topics are not handled at the moment because there are some discrepancies in
+        # how they are handled in Cowork Vs what Anton actually expects.
         scope_to_path = {
             AntonMemoryCategory.lesson: root_dir / "lessons.md",
             AntonMemoryCategory.rule: root_dir / "rules.md",
