@@ -21,6 +21,13 @@ class FileInputBlock(TypedDict):
     filename: str
 
 
+class MemoryItem(TypedDict):
+    scope: MemoryScope
+    category: str
+    content: str
+    project: Project | None
+
+
 class HarnessProvider(Protocol):
     id: str
     label: str
@@ -63,6 +70,12 @@ class HarnessProvider(Protocol):
         category: str,
         project: Project | None = None
     ) -> None:
+        ...
+
+    async def list_memory(
+        self,
+        projects: list[Project],
+    ) -> list[MemoryItem]:
         ...
 
 

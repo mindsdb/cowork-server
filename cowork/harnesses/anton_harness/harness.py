@@ -113,6 +113,19 @@ class AntonHarness:
             return ""
         return memory_file.read_text(encoding="utf-8")
 
+    async def list_memory(self, projects: list[Project]) -> list:
+        from cowork.harnesses.base import MemoryItem
+        supported = [AntonMemoryCategory.lesson, AntonMemoryCategory.rule]
+        results = []
+        for category in supported:
+            content = await self._read_from_global_memory(category)
+            results.append(MemoryItem(scope=MemoryScope.global_, category=category.value, content=content, project=None))
+        for project in projects:
+            for category in supported:
+                content = await self._read_from_project_memory(project, category)
+                results.append(MemoryItem(scope=MemoryScope.project, category=category.value, content=content, project=project))
+        return results
+
     async def delete_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> None:
         category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
 
