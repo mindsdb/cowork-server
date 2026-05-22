@@ -1,22 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+from enum import Enum
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, MemoryScope, register
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
+from cowork.models.project import Project
 from cowork.models.skill import Skill
 
 # Redirect all Hermes data (skills, sessions, config) to ~/.cowork/hermes before
 # run_agent is first imported, so its module-level get_hermes_home() call lands here.
-os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().hermes_home)
+os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().root_dir)
 
 logger = get_logger(__name__)
+
+
+class HermesMemoryCategory(str, Enum):
+    user = "user"
+    memory = "memory"
 
 
 @register
@@ -30,7 +37,7 @@ class HermesHarness:
         import yaml
 
         settings = HermesHarnessSettings()
-        skills_dir = Path(settings.hermes_home) / "skills"
+        skills_dir = Path(settings.root_dir) / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
 
         active_labels: set[str] = set()
@@ -61,6 +68,37 @@ class HermesHarness:
         for existing_dir in skills_dir.iterdir():
             if existing_dir.is_dir() and existing_dir.name not in active_labels:
                 shutil.rmtree(existing_dir)
+
+    async def overwrite_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
+        if scope == MemoryScope.project:
+            raise ValueError("Project-scoped memory is not supported for the Hermes harness.")
+        category_enum = HermesMemoryCategory(category)
+        memory_dir = Path(HermesHarnessSettings().root_dir) / "memories"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        self._resolve_memory_path(memory_dir, category_enum).write_text(content + "\n", encoding="utf-8")
+
+    async def retrieve_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> str:
+        if scope == MemoryScope.project:
+            raise ValueError("Project-scoped memory is not supported for the Hermes harness.")
+        category_enum = HermesMemoryCategory(category)
+        memory_file = self._resolve_memory_path(Path(HermesHarnessSettings().root_dir) / "memories", category_enum)
+        if not memory_file.is_file():
+            return ""
+        return memory_file.read_text(encoding="utf-8")
+
+    async def delete_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> None:
+        if scope == MemoryScope.project:
+            raise ValueError("Project-scoped memory is not supported for the Hermes harness.")
+        category_enum = HermesMemoryCategory(category)
+        memory_file = self._resolve_memory_path(Path(HermesHarnessSettings().root_dir) / "memories", category_enum)
+        if memory_file.is_file():
+            memory_file.unlink()
+
+    def _resolve_memory_path(self, root_dir: Path, category: HermesMemoryCategory) -> Path:
+        return root_dir / {
+            HermesMemoryCategory.user: "USER.md",
+            HermesMemoryCategory.memory: "MEMORY.md",
+        }[category]
 
     async def stream_response(
         self,
