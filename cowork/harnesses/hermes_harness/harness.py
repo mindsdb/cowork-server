@@ -94,6 +94,16 @@ class HermesHarness:
         if memory_file.is_file():
             memory_file.unlink()
 
+    async def list_memory(self, projects: list[Project]) -> list:
+        from cowork.harnesses.base import MemoryItem
+        memory_dir = Path(HermesHarnessSettings().root_dir) / "memories"
+        results = []
+        for category in HermesMemoryCategory:
+            memory_file = self._resolve_memory_path(memory_dir, category)
+            content = memory_file.read_text(encoding="utf-8") if memory_file.is_file() else ""
+            results.append(MemoryItem(scope=MemoryScope.global_, category=category.value, content=content, project=None))
+        return results
+
     def _resolve_memory_path(self, root_dir: Path, category: HermesMemoryCategory) -> Path:
         return root_dir / {
             HermesMemoryCategory.user: "USER.md",

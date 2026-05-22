@@ -12,6 +12,12 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
+# TODO: Refine these two endpoints. Is there a need to list one memory item?
+@router.get("/list", response_model=list[MemoryResponse])
+async def list_memory(session: SessionDep):
+    return await MemoryService(session).list_memory()
+
+
 @router.get("/", response_model=MemoryResponse)
 async def get_memory(
     session: SessionDep,

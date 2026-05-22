@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.harnesses.base import get_harness
@@ -30,6 +30,20 @@ class MemoryService:
         harness = get_harness(get_user_settings().harness)
         project = self._resolve_project(scope, project_id)
         await harness.delete_memory(scope, category, project)
+
+    async def list_memory(self) -> list[MemoryResponse]:
+        harness = get_harness(get_user_settings().harness)
+        projects = list(self.session.exec(select(Project)).all())
+        items = await harness.list_memory(projects)
+        return [
+            MemoryResponse(
+                scope=item["scope"],
+                category=item["category"],
+                content=item["content"],
+                project_id=item["project"].id if item["project"] else None,
+            )
+            for item in items
+        ]
 
     def _resolve_project(self, scope: MemoryScope, project_id: UUID | None) -> Project | None:
         if scope == MemoryScope.project:
