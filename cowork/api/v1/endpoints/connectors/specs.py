@@ -13,7 +13,7 @@ router = APIRouter()
 
 @router.get("/", response_model=list[ConnectorMetadataResponse])
 def list_connector_specs():
-    return registry.list_summaries()
+    return registry.list_connectors()
 
 
 @router.get("/{connector_id}", response_model=ConnectorSpecResponse)
