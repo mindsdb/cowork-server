@@ -195,17 +195,17 @@ class AntonHarness:
         # routes through a server-aware handler.
         from .tools import (
             build_cowork_publish_tool,
-            # build_cowork_request_credentials_tool,
+            build_cowork_lookup_connector_tool,
+            build_cowork_request_credentials_tool,
             # build_cowork_fetch_submission_tool,
             # build_cowork_update_form_tool,
-            # build_cowork_lookup_connector_tool,
             # build_list_conversation_datasources_tool,
         )
         PUBLISH_TOOL = build_cowork_publish_tool()
-        # REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
+        LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
+        REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
         # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
-        # LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         # LIST_CONVERSATION_DATASOURCES_TOOL = build_list_conversation_datasources_tool()
 
         try:
@@ -356,8 +356,8 @@ class AntonHarness:
             tools=[
                 CONNECT_DATASOURCE_TOOL,
                 PUBLISH_TOOL,
-                # LOOKUP_CONNECTOR_TOOL,
-                # REQUEST_CREDENTIALS_TOOL,
+                LOOKUP_CONNECTOR_TOOL,
+                REQUEST_CREDENTIALS_TOOL,
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
                 # LIST_CONVERSATION_DATASOURCES_TOOL,
