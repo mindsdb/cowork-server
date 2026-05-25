@@ -656,14 +656,14 @@ def build_cowork_publish_tool():
 #                     f"handcraft the form spec — see the request_credentials "
 #                     f"schema for the OAuth/how_to/help_url fields."
 #                 ),
-#                 "available_ids": sorted(registry.all_connectors().keys()),
+#                 "available_ids": sorted(registry.get_connectors().keys()),
 #             })
 #         # If both were given and id missed, treat the id as part of the query.
 #         query = f"{cid} {query}".strip()
 
 #     # Stage 1 — exact match (id or alias) on the query.
 #     nq = _lookup_normalize(query)
-#     for c in registry.all_connectors().values():
+#     for c in registry.get_connectors().values():
 #         if _lookup_normalize(c.get("id", "")) == nq:
 #             return _present(c, 1.0, "exact-id")
 #         for alias in c.get("aliases", []):
@@ -672,7 +672,7 @@ def build_cowork_publish_tool():
 
 #     # Stage 2 — token-overlap. Return up to 3 candidates with confidence.
 #     scored: list[tuple[float, dict]] = []
-#     for c in registry.all_connectors().values():
+#     for c in registry.get_connectors().values():
 #         s = _lookup_score(query, c)
 #         if s > 0:
 #             scored.append((s, c))
@@ -688,7 +688,7 @@ def build_cowork_publish_tool():
 #                 "request_credentials schema for the OAuth/how_to/help_url "
 #                 "fields you should fill in when you know the auth shape."
 #             ),
-#             "available_ids": sorted(registry.all_connectors().keys()),
+#             "available_ids": sorted(registry.get_connectors().keys()),
 #         })
 
 #     top_score, top_c = scored[0]

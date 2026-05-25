@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
-
-from cowork.schemas.connectors import MatchCandidate, MatchResponse
+from cowork.schemas.connectors import (
+    ConnectorMetadataResponse,
+    ConnectorSpecResponse,
+    MatchCandidate,
+    MatchResponse,
+)
 
 
 class ConnectorSpecRegistry:
@@ -29,30 +32,49 @@ class ConnectorSpecRegistry:
             out[cid] = data
         return out
 
-    def all_connectors(self) -> dict[str, dict]:
+    def get_connectors(self) -> dict[str, dict]:
         if self._cache is None:
             self._cache = self._load_all()
         return self._cache
 
-    def get_connector(self, cid: str) -> dict | None:
-        return self.all_connectors().get(cid)
+    def get_connector(self, connector_id: str) -> ConnectorSpecResponse | None:
+        c = self.get_connectors().get(connector_id)
+        if c is None:
+            return None
+        return self._to_connector_spec_response(c)
 
-    def list_summaries(self) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for c in self.all_connectors().values():
-            out.append({
-                "id": c.get("id"),
-                "label": c.get("label", c.get("id")),
-                "description": c.get("description", ""),
-                "category": c.get("category", "other"),
-                "logo": c.get("logo"),
-                "logo_url": c.get("logo_url"),
-                "logo_color": c.get("logo_color"),
-                "aliases": c.get("aliases", []),
-                "featured": c.get("featured", False),
-            })
-        out.sort(key=lambda x: (x.get("label") or "").lower())
-        return out
+    def list_connectors(self) -> list[ConnectorMetadataResponse]:
+        items = [
+            ConnectorMetadataResponse(
+                id=c.get("id"),
+                label=c.get("label", c.get("id", "")),
+                description=c.get("description", ""),
+                category=c.get("category", "other"),
+                logo=c.get("logo"),
+                logo_url=c.get("logo_url"),
+                logo_color=c.get("logo_color"),
+                aliases=c.get("aliases", []),
+                featured=c.get("featured", False),
+            )
+            for c in self.get_connectors().values()
+        ]
+        items.sort(key=lambda x: (x.label or "").lower())
+        return items
+
+    def _to_connector_spec_response(self, c: dict) -> ConnectorSpecResponse:
+        return ConnectorSpecResponse(
+            id=c.get("id"),
+            label=c.get("label", c.get("id", "")),
+            description=c.get("description", ""),
+            category=c.get("category", "other"),
+            logo=c.get("logo"),
+            logo_url=c.get("logo_url"),
+            logo_color=c.get("logo_color"),
+            aliases=c.get("aliases", []),
+            featured=c.get("featured", False),
+            keywords=c.get("keywords", []),
+            form=c.get("form", {}),
+        )
 
     def reload(self) -> None:
         self._cache = None
@@ -65,7 +87,7 @@ class ConnectorSpecRegistry:
         nq = self._normalize(query)
         if not nq:
             return None
-        for c in self.all_connectors().values():
+        for c in self.get_connectors().values():
             if self._normalize(c.get("id", "")) == nq:
                 return c["id"]
             for alias in c.get("aliases", []):
@@ -102,7 +124,7 @@ class ConnectorSpecRegistry:
             )
 
         scored: list[tuple[float, str]] = []
-        for c in self.all_connectors().values():
+        for c in self.get_connectors().values():
             s = self._token_score(query, c)
             if s > 0:
                 scored.append((s, c["id"]))
