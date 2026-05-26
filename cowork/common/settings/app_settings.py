@@ -59,6 +59,28 @@ class ConnectorSettings(Settings):
     )
 
 
+class OAuthSettings(Settings):
+    google_client_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_CLIENT_ID"),
+        description="Google OAuth client ID",
+    )
+    google_client_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_CLIENT_SECRET"),
+        description="Google OAuth client secret",
+    )
+    server_origin: str = Field(
+        default="http://127.0.0.1:8000",
+        validation_alias=AliasChoices("COWORK_SERVER_ORIGIN"),
+        description="Public base URL of this server, used to build OAuth redirect URIs",
+    )
+    state_path: str = Field(
+        default=str(Path.home() / ".cowork" / "oauth_state.json"),
+        description="Path to the file used to persist pending OAuth state",
+    )
+
+
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
