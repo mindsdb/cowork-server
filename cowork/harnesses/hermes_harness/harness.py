@@ -20,6 +20,17 @@ os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().root_dir)
 
 logger = get_logger(__name__)
 
+_VAULT_ENV_PROMPT = (
+    "Connected datasource credentials are injected as namespaced environment "
+    "variables in the form DS_<ENGINE>_<NAME>__<FIELD> "
+    "(e.g. DS_POSTGRES_PROD_DB__HOST, DS_POSTGRES_PROD_DB__PASSWORD, "
+    "DS_HUBSPOT_MAIN__ACCESS_TOKEN). Use those variables directly in scratchpad "
+    "code and never read ~/.cowork/data-vault/ files directly. "
+    "Flat variables like DS_HOST or DS_PASSWORD are used only temporarily "
+    "during internal connection test snippets — do not assume they exist "
+    "during normal chat/runtime execution."
+)
+
 
 class HermesMemoryCategory(str, Enum):
     user = "user"
@@ -195,12 +206,21 @@ class HermesHarness:
         reasoning_callback=None,
         thinking_callback=None,
     ) -> dict:
-        from run_agent import AIAgent
+        from pathlib import Path
 
+        from run_agent import AIAgent
+        from anton.core.datasources.data_vault import LocalDataVault
+
+        from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import get_user_settings
         from cowork.harnesses.hermes_harness.tools import register_connector_tools
-        register_connector_tools()
         from cowork.schemas.settings import Provider
+
+        register_connector_tools()
+
+        vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+        for conn in vault.list_connections():
+            vault.inject_env(conn["engine"], conn["name"])
 
         settings = get_user_settings()
         model = settings.planning_model
@@ -213,6 +233,7 @@ class HermesHarness:
                 model=model,
                 api_key=settings.minds_api_key.get_secret_value(),
                 quiet_mode=True,
+                ephemeral_system_prompt=_VAULT_ENV_PROMPT,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
@@ -227,6 +248,7 @@ class HermesHarness:
                 model=model,
                 api_key=api_key,
                 quiet_mode=True,
+                ephemeral_system_prompt=_VAULT_ENV_PROMPT,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
@@ -234,8 +256,11 @@ class HermesHarness:
                 thinking_callback=thinking_callback,
             )
 
-        return agent.run_conversation(
-            user_message=prompt,
-            conversation_history=history,
-            stream_callback=stream_callback,
-        )
+        try:
+            return agent.run_conversation(
+                user_message=prompt,
+                conversation_history=history,
+                stream_callback=stream_callback,
+            )
+        finally:
+            vault.clear_ds_env()
