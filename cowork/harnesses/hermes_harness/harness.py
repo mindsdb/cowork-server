@@ -214,7 +214,7 @@ class HermesHarness:
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import get_user_settings
         from cowork.harnesses.hermes_harness.tools import register_connector_tools
-        from cowork.schemas.settings import Provider
+        from cowork.common.settings.user_settings import Provider
 
         register_connector_tools()
 

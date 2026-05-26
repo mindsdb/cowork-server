@@ -372,8 +372,7 @@ class AntonHarness:
         from anton.core.llm.anthropic import AnthropicProvider
         from anton.core.llm.openai import OpenAIProvider
 
-        from cowork.common.settings.user_settings import get_user_settings
-        from cowork.schemas.settings import Provider
+        from cowork.common.settings.user_settings import get_user_settings, Provider
 
         settings = get_user_settings()
 
