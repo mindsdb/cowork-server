@@ -113,3 +113,9 @@ class ConnectionDetailResponse(BaseModel):
     connector_id: str | None = None
     method: str | None = None
     fields: dict[str, Any] = Field(default_factory=dict)
+
+
+class OAuthStartResponse(BaseModel):
+    auth_url: str
+    redirect_uri: str
+    started_at: str
