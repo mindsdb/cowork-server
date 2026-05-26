@@ -324,7 +324,9 @@ class AntonHarness:
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
         )
 
-        data_vault = LocalDataVault() if LocalDataVault is not None else None
+        from cowork.common.settings.app_settings import get_app_settings
+
+        data_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir)) if LocalDataVault is not None else None
 
         # TODO: Add guidance for integrations
 
