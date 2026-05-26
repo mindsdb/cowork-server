@@ -51,6 +51,14 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class ConnectorSettings(Settings):
+    vault_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "data-vault"),
+        validation_alias=AliasChoices("COWORK_VAULT_DIR", "CONNECTOR_VAULT_DIR"),
+        description="Root directory for the local data vault (saved connector credentials)",
+    )
+
+
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
@@ -64,6 +72,7 @@ class AppSettings(Settings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
+    connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
 
 
 @lru_cache
