@@ -94,3 +94,22 @@ class SaveConnectionResponse(BaseModel):
     engine: str
     name: str
     method: str | None
+
+
+class ConnectionSummaryResponse(BaseModel):
+    engine: str
+    name: str
+    created_at: str | None = None
+    label: str | None = None
+    logo: str | None = None
+    logo_color: str | None = None
+
+
+class ConnectionDetailResponse(BaseModel):
+    engine: str
+    name: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    connector_id: str | None = None
+    method: str | None = None
+    fields: dict[str, Any] = Field(default_factory=dict)

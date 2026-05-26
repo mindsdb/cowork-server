@@ -31,6 +31,7 @@ class SubmissionStore:
             "created_at": time.time(),
             "status": "received",
         }
+        # TODO: Is it necessary to return this?
         return submission_id
 
     def get(self, submission_id: str) -> dict[str, Any] | None:

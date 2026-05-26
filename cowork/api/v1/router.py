@@ -8,6 +8,7 @@ that can be included in the main FastAPI application.
 from fastapi import APIRouter
 
 from cowork.api.v1.endpoints.connectors import (
+    connections,
     specs,
     submissions,
 )
@@ -30,6 +31,7 @@ api_router = APIRouter(prefix="/api/v1")
 # api_router.include_router(health.router, prefix="/health", tags=["health"])
 api_router.include_router(specs.router, prefix="/connectors/specs", tags=["connectors"])
 api_router.include_router(submissions.router, prefix="/connectors/submissions", tags=["connectors"])
+api_router.include_router(connections.router, prefix="/connectors/connections", tags=["connectors"])
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
 api_router.include_router(responses.router, prefix="/responses", tags=["responses"])
