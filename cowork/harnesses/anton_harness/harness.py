@@ -333,6 +333,8 @@ class AntonHarness:
         # TODO: Add guidance for integrations
 
         cells = extract_scratchpad_cells_from_message_events(conversation.messages)
+        os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
+
         history = [message.to_openai_message() for message in conversation.messages if message.role in {"user", "assistant"}]
 
         config = ChatSessionConfig(
