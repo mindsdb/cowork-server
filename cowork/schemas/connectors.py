@@ -77,3 +77,20 @@ class MatchResponse(BaseModel):
     needs_clarification: bool
     stage: str
     question: str | None = None
+
+
+class SubmitFormRequest(BaseModel):
+    connector_id: str
+    method: str | None = None
+    name: str = ""
+    conversation_id: str | None = None
+    values: dict[str, Any] = Field(default_factory=dict)
+    skipped: list[str] = Field(default_factory=list)
+
+
+class SaveConnectionResponse(BaseModel):
+    status: str
+    submission_id: str
+    engine: str
+    name: str
+    method: str | None
