@@ -1,3 +1,8 @@
+"""
+DISCLAIMER: The probe for connectors will always run through Anton regardless of the harness used.
+"""
+
+
 from __future__ import annotations
 
 from typing import Annotated
