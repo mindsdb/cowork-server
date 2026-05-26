@@ -12,23 +12,23 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-# TODO: Refine these two endpoints. Is there a need to list one memory item?
-@router.get("/list", response_model=list[MemoryResponse])
+@router.get("/", response_model=list[MemoryResponse])
 async def list_memory(session: SessionDep):
     return await MemoryService(session).list_memory()
 
 
-@router.get("/", response_model=MemoryResponse)
-async def get_memory(
-    session: SessionDep,
-    scope: MemoryScope,
-    category: str,
-    project_id: UUID | None = None,
-):
-    try:
-        return await MemoryService(session).get_memory(scope, category, project_id)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+# TODO: This does not seem to be required.
+# @router.get("/", response_model=MemoryResponse)
+# async def get_memory(
+#     session: SessionDep,
+#     scope: MemoryScope,
+#     category: str,
+#     project_id: UUID | None = None,
+# ):
+#     try:
+#         return await MemoryService(session).get_memory(scope, category, project_id)
+#     except ValueError as e:
+#         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 @router.put("/", response_model=MemoryResponse)
