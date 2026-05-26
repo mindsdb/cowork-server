@@ -198,6 +198,8 @@ class HermesHarness:
         from run_agent import AIAgent
 
         from cowork.common.settings.user_settings import get_user_settings
+        from cowork.harnesses.hermes_harness.tools import register_connector_tools
+        register_connector_tools()
         from cowork.schemas.settings import Provider
 
         settings = get_user_settings()

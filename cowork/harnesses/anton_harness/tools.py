@@ -364,7 +364,7 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
     if cid:
         c = registry.get_connector(cid)
         if c:
-            return _present(c, 1.0, "id")
+            return _present(c.model_dump(), 1.0, "id")
         # Fall through to query-style lookup if the id didn't match.
         if not query:
             return json.dumps({
