@@ -1,6 +1,7 @@
 
 from collections.abc import AsyncIterator
 from enum import Enum
+import os
 from pathlib import Path
 
 from cowork.common.logger import get_logger
@@ -11,6 +12,7 @@ from cowork.harnesses.anton_harness.stream_formatter import format_responses_str
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.models.project import Project
+from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
 
@@ -330,7 +332,9 @@ class AntonHarness:
 
         # TODO: Add guidance for integrations
 
+        cells = extract_scratchpad_cells_from_message_events(conversation.messages)
         history = [message.to_openai_message() for message in conversation.messages if message.role in {"user", "assistant"}]
+
         config = ChatSessionConfig(
             llm_client=llm_client,
             settings=settings,
@@ -364,6 +368,7 @@ class AntonHarness:
                 # UPDATE_FORM_TOOL,
                 # LIST_CONVERSATION_DATASOURCES_TOOL,
             ],
+            cells=cells
         )
         return ChatSession(config)
 
