@@ -3,6 +3,8 @@ from collections.abc import AsyncIterator
 from enum import Enum
 import os
 from pathlib import Path
+import shutil
+import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import (
@@ -18,6 +20,16 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
+    disabled_keys = {(d["engine"], d["name"]) for d in disabled_connections}
+    filtered = LocalDataVault(temp_dir)
+    for conn in source_vault.list_connections():
+        if (conn["engine"], conn["name"]) not in disabled_keys:
+            creds = source_vault.load(conn["engine"], conn["name"]) or {}
+            filtered.save(conn["engine"], conn["name"], creds)
+    return filtered
 
 
 # TODO: Handle topics.
@@ -154,11 +166,18 @@ class AntonHarness:
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
+        disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
-        session = await self._build_chat_session(conversation)
-
-        async for event in session.turn_stream(self._to_anton_input(input)):
-            yield event
+        temp_vault_dir: Path | None = None
+        try:
+            session, temp_vault_dir = await self._build_chat_session(
+                conversation, disabled_connections=disabled_connections or []
+            )
+            async for event in session.turn_stream(self._to_anton_input(input)):
+                yield event
+        finally:
+            if temp_vault_dir:
+                shutil.rmtree(temp_vault_dir, ignore_errors=True)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -179,6 +198,7 @@ class AntonHarness:
         self,
         conversation: Conversation,
         # model: str,
+        disabled_connections: list[dict] | None = None,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -328,9 +348,19 @@ class AntonHarness:
 
         from cowork.common.settings.app_settings import get_app_settings
 
-        data_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir)) if LocalDataVault is not None else None
-        for conn in data_vault.list_connections() if data_vault else []:
-            data_vault.inject_env(conn["engine"], conn["name"])
+        data_vault = None
+        temp_vault_dir: Path | None = None
+        if LocalDataVault is not None:
+            source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+            if disabled_connections:
+                _tmp_base = Path.home() / ".cowork" / "tmp"
+                _tmp_base.mkdir(parents=True, exist_ok=True)
+                temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
+                data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
+            else:
+                data_vault = source_vault
+            for conn in data_vault.list_connections():
+                data_vault.inject_env(conn["engine"], conn["name"])
 
         # TODO: Add guidance for integrations
 
@@ -374,7 +404,7 @@ class AntonHarness:
             ],
             cells=cells
         )
-        return ChatSession(config)
+        return ChatSession(config), temp_vault_dir
 
     def _build_llm_client(self):
         from anton.core.llm.client import LLMClient
