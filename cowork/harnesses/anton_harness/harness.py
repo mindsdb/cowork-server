@@ -221,14 +221,13 @@ class AntonHarness:
             build_cowork_request_credentials_tool,
             # build_cowork_fetch_submission_tool,
             # build_cowork_update_form_tool,
-            # build_list_conversation_datasources_tool,
         )
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
+        # TODO: Determine if these two tools are really needed.
         # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
         # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
-        # LIST_CONVERSATION_DATASOURCES_TOOL = build_list_conversation_datasources_tool()
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -400,7 +399,6 @@ class AntonHarness:
                 REQUEST_CREDENTIALS_TOOL,
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
-                # LIST_CONVERSATION_DATASOURCES_TOOL,
             ],
             cells=cells
         )
