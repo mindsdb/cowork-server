@@ -44,28 +44,35 @@ def _missing_required(fields: list, values: dict, skipped: list[str]) -> list[st
 
 @router.post("/")
 async def submit_form(req: SubmitFormRequest, session: SessionDep) -> StreamingResponse:
-    spec = registry.get_connector(req.connector_id)
+    try:
+        connector_id = req.resolve_connector_id()
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    method = req.resolve_method()
+
+    spec = registry.get_connector(connector_id)
     if not spec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
 
     form = spec.form
     methods = form.methods or []
 
-    if methods and not req.method:
+    if methods and not method:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="`method` is required for connectors with multiple auth methods.",
         )
 
-    if methods and req.method:
-        method_def = next((m for m in methods if m.id == req.method), None)
+    if methods and method:
+        method_def = next((m for m in methods if m.id == method), None)
         if not method_def:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown method: {req.method!r}",
+                detail=f"Unknown method: {method!r}",
             )
 
-    fields = _resolve_fields(spec, req.method)
+    fields = _resolve_fields(spec, method)
     missing = _missing_required(fields, req.values, req.skipped)
     if missing:
         raise HTTPException(
@@ -75,7 +82,7 @@ async def submit_form(req: SubmitFormRequest, session: SessionDep) -> StreamingR
 
     submission_id = store.stage(
         form_id=form.form_id,
-        connector_id=req.connector_id,
+        connector_id=connector_id,
         conversation_id=req.conversation_id,
         values=req.values,
         skipped=req.skipped,
@@ -83,6 +90,6 @@ async def submit_form(req: SubmitFormRequest, session: SessionDep) -> StreamingR
 
     handler = ProbeHandler(session)
     return StreamingResponse(
-        handler.run(submission_id, req.connector_id, req.method, req.name, req.conversation_id),
+        handler.run(submission_id, connector_id, method, req.name, req.conversation_id),
         media_type="text/event-stream",
     )

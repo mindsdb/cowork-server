@@ -82,6 +82,7 @@ def _handle_missed_runs(session) -> None:
 
 
 async def execute_schedule(schedule_id: UUID, is_manual: bool = False) -> None:
+    from cowork.api.v1.endpoints.responses import mark_stream_active, mark_stream_finished
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
@@ -102,6 +103,10 @@ async def execute_schedule(schedule_id: UUID, is_manual: bool = False) -> None:
             project_id=schedule.project_id,
         )
         conversation_id = conversation.id
+
+        # Mark as in-flight so the client doesn't inject synthetic
+        # continuation prompts while the LLM is still generating.
+        mark_stream_active(str(conversation_id))
 
         request = ResponsesRequest(
             input=schedule.prompt,
@@ -135,6 +140,8 @@ async def execute_schedule(schedule_id: UUID, is_manual: bool = False) -> None:
         except Exception:
             pass
     finally:
+        if conversation_id:
+            mark_stream_finished(str(conversation_id))
         try:
             run_service.finish_run(run.id, conversation_id=conversation_id, error=error)
         except Exception:

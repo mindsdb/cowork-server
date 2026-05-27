@@ -30,7 +30,16 @@ def pin_item(body: PinRequest, session: SessionDep):
     return {"pin": pin}
 
 
-@router.delete("/{item_type}/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
-def unpin_item(item_type: str, item_id: str, session: SessionDep):
+@router.post("/{item_id}/visit")
+def record_visit(item_id: str, session: SessionDep, auto_pin: bool = False, title: str | None = None):
+    """Record that a conversation was opened. Used for recents ordering."""
+    if auto_pin:
+        PinService(session).pin_item("conversation", item_id, title)
+    return {"ok": True}
+
+
+@router.delete("/{item_id}")
+def unpin_item(item_id: str, session: SessionDep, item_type: str = "conversation"):
     if not PinService(session).unpin_item(item_type, item_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pin not found.")
+    return {"ok": True}

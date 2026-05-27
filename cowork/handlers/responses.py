@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import json
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -25,12 +28,19 @@ from cowork.services.files import FileService
 from cowork.services.skills import SkillService
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 class ResponsesHandler:
     def __init__(self, session: Session) -> None:
         self.session = session
         self.harness = get_harness(get_user_settings().harness)
+        self.last_conversation_id: str | None = None
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
+        logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
         await self.harness.sync_skills(SkillService(self.session).list_skills())
 
         conversation_service = ConversationService(self.session)
@@ -39,9 +49,22 @@ class ResponsesHandler:
         original_content = self._extract_original_content(request)
 
         if request.conversation:
-            conversation = conversation_service.get_conversation(UUID(request.conversation))
+            try:
+                conv_id = UUID(request.conversation)
+            except ValueError:
+                conv_id = None
+            if conv_id is not None:
+                conversation = conversation_service.get_conversation(conv_id)
+            else:
+                # Client sent a non-UUID id (e.g. legacy name-based format) —
+                # treat as a new conversation since it won't exist in the DB.
+                conversation = conversation_service.create_conversation(
+                    topic=self._prompt_text(harness_input)[:80]
+                )
         else:
             conversation = conversation_service.create_conversation(topic=self._prompt_text(harness_input)[:80])
+
+        self.last_conversation_id = str(conversation.id)
 
         # Pre-load messages before committing the new user message so the ORM
         # cache doesn't include it when _build_chat_session reads history.
@@ -86,9 +109,25 @@ class ResponsesHandler:
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
+        event_count = 0
         async for sse_string in self.harness.formatter(stream, model, event_sink):
+            event_count += 1
+            if event_count <= 3 or "response.completed" in sse_string:
+                logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
+            # Inject conversation_id into the response.created event so the
+            # client learns the canonical (UUID) id for this conversation.
+            if "response.created" in sse_string and "conversation_id" not in sse_string:
+                try:
+                    lines = sse_string.strip().split("\n")
+                    data_line = next(l for l in lines if l.startswith("data:"))
+                    payload = json.loads(data_line[5:])
+                    payload["conversation_id"] = str(conversation_id)
+                    sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
+                except Exception:
+                    pass
             yield sse_string
 
+        logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
         self._save_assistant_turn(conversation_id, "".join(collected_text), collected_events)
 
     async def _collect(
@@ -145,15 +184,30 @@ class ResponsesHandler:
             self.session.commit()
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
+        blocks: list[dict] = []
+
+        # Resolve attachment_ids to image/file blocks
+        if request.attachment_ids:
+            file_svc = FileService(self.session)
+            for aid in request.attachment_ids:
+                try:
+                    content_type, filename, filepath = file_svc.get_file_content(UUID(aid))
+                except (ValueError, Exception):
+                    continue
+                if content_type and content_type.startswith("image/"):
+                    blocks.append(self._image_block(filepath, content_type))
+                else:
+                    blocks.append({"type": "file", "path": str(filepath), "filename": filename})
+
+        # Extract text input
         if isinstance(request.input, str):
-            return [{"type": "text", "text": request.input}]
-        if isinstance(request.input, list):
+            blocks.append({"type": "text", "text": request.input})
+        elif isinstance(request.input, list):
             for msg in reversed(request.input):
                 if msg.role == Role.user and msg.content:
                     if isinstance(msg.content, str):
-                        return [{"type": "text", "text": msg.content}]
-                    if isinstance(msg.content, list):
-                        blocks: list[dict] = []
+                        blocks.append({"type": "text", "text": msg.content})
+                    elif isinstance(msg.content, list):
                         for item in msg.content:
                             if isinstance(item, Content):
                                 if item.type == ContentType.text and item.text:
@@ -163,8 +217,21 @@ class ResponsesHandler:
                                     if file is None:
                                         raise HTTPException(status_code=404, detail=f"File {item.file_id!r} not found")
                                     blocks.append({"type": "file", "path": file.path, "filename": file.filename})
-                        return blocks
-        return [{"type": "text", "text": ""}]
+                    break
+
+        return blocks or [{"type": "text", "text": ""}]
+
+    @staticmethod
+    def _image_block(filepath: Path, media_type: str) -> dict:
+        data = filepath.read_bytes()
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64.standard_b64encode(data).decode("ascii"),
+            },
+        }
 
     @staticmethod
     def _prompt_text(harness_input: list[dict]) -> str:

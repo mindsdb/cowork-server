@@ -134,6 +134,14 @@ class ResponsesRequest(BaseModel):
         default=False,
         description="Whether the chat completion request is streaming or not",
     )
+    # TODO(migration): Per MIGRATION.md, attachment_ids should be removed.
+    # The client should instead send input_file content blocks in the input
+    # field (the handler already supports this path). This field is a compat
+    # bridge for the current client which uploads via /v1/attachments/.
+    attachment_ids: list[str] | None = Field(
+        default=None,
+        description="IDs of uploaded attachments (images, files) to include with this message",
+    )
     disabled_connections: list[DisabledConnection] | None = Field(
         default=None,
         description="Connections to exclude from this turn (client sends on every request)",
