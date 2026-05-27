@@ -347,6 +347,8 @@ class AntonHarness:
 
         from cowork.common.settings.app_settings import get_app_settings
 
+        # When connections are disabled, a temporary data vault is created because within Anton,
+        # the vault is used to inject a prompt related to the connected data sources.
         data_vault = None
         temp_vault_dir: Path | None = None
         if LocalDataVault is not None:
