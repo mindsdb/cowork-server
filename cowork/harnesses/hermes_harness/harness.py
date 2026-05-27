@@ -20,16 +20,34 @@ os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().root_dir)
 
 logger = get_logger(__name__)
 
-_VAULT_ENV_PROMPT = (
-    "Connected datasource credentials are injected as namespaced environment "
-    "variables in the form DS_<ENGINE>_<NAME>__<FIELD> "
-    "(e.g. DS_POSTGRES_PROD_DB__HOST, DS_POSTGRES_PROD_DB__PASSWORD, "
-    "DS_HUBSPOT_MAIN__ACCESS_TOKEN). Use those variables directly in scratchpad "
-    "code and never read ~/.cowork/data-vault/ files directly. "
-    "Flat variables like DS_HOST or DS_PASSWORD are used only temporarily "
-    "during internal connection test snippets — do not assume they exist "
-    "during normal chat/runtime execution."
-)
+def _build_datasource_context(vault, disabled_keys: set[tuple[str, str]]) -> str:
+    """Build a system-prompt section listing connected data sources and their DS_* env var names."""
+    try:
+        conns = [c for c in vault.list_connections() if (c["engine"], c["name"]) not in disabled_keys]
+    except Exception:
+        conns = []
+
+    lines = [
+        "## Connected Data Sources",
+        "Credentials are pre-injected as namespaced DS_<ENGINE>_<NAME>__<FIELD> environment variables "
+        "(e.g. DS_POSTGRES_PROD_DB__HOST). Use them directly in scratchpad code and never read the "
+        "data vault files directly. "
+        "Flat variables like DS_HOST or DS_PASSWORD are only used temporarily during internal "
+        "connection test snippets — do not assume they exist during normal execution.\n",
+    ]
+
+    for c in conns:
+        fields = vault.load(c["engine"], c["name"]) or {}
+        prefix = (
+            "DS_"
+            + c["engine"].upper().replace("-", "_")
+            + "_"
+            + c["name"].upper().replace("-", "_")
+        )
+        var_names = ", ".join(f"{prefix}__{k.upper()}" for k in fields) if fields else "(no fields)"
+        lines.append(f"- `{c['engine']}-{c['name']}` ({c['engine']}) → {var_names}")
+
+    return "\n".join(lines)
 
 
 class HermesMemoryCategory(str, Enum):
@@ -227,6 +245,8 @@ class HermesHarness:
             if (conn["engine"], conn["name"]) not in disabled_keys:
                 vault.inject_env(conn["engine"], conn["name"])
 
+        datasource_context = _build_datasource_context(vault, disabled_keys)
+
         settings = get_user_settings()
         model = settings.planning_model
 
@@ -238,7 +258,7 @@ class HermesHarness:
                 model=model,
                 api_key=settings.minds_api_key.get_secret_value(),
                 quiet_mode=True,
-                ephemeral_system_prompt=_VAULT_ENV_PROMPT,
+                ephemeral_system_prompt=datasource_context,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
@@ -253,7 +273,7 @@ class HermesHarness:
                 model=model,
                 api_key=api_key,
                 quiet_mode=True,
-                ephemeral_system_prompt=_VAULT_ENV_PROMPT,
+                ephemeral_system_prompt=datasource_context,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
