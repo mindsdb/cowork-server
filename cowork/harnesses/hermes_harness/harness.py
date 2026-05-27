@@ -127,6 +127,7 @@ class HermesHarness:
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
+        disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict | None] = asyncio.Queue()
@@ -170,6 +171,7 @@ class HermesHarness:
                     tool_progress_callback=tool_progress_callback,
                     reasoning_callback=reasoning_callback,
                     thinking_callback=thinking_callback,
+                    disabled_connections=disabled_connections or [],
                 )
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -205,6 +207,7 @@ class HermesHarness:
         tool_progress_callback=None,
         reasoning_callback=None,
         thinking_callback=None,
+        disabled_connections: list[dict] | None = None,
     ) -> dict:
         from pathlib import Path
 
@@ -219,8 +222,10 @@ class HermesHarness:
         register_connector_tools()
 
         vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+        disabled_keys = {(d["engine"], d["name"]) for d in (disabled_connections or [])}
         for conn in vault.list_connections():
-            vault.inject_env(conn["engine"], conn["name"])
+            if (conn["engine"], conn["name"]) not in disabled_keys:
+                vault.inject_env(conn["engine"], conn["name"])
 
         settings = get_user_settings()
         model = settings.planning_model

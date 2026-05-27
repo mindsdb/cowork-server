@@ -5,6 +5,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field, model_serializer
 
+from cowork.schemas.connectors import DisabledConnection
+
 
 class Role(str, Enum):
     system = "system"
@@ -131,4 +133,8 @@ class ResponsesRequest(BaseModel):
     stream: bool | None = Field(
         default=False,
         description="Whether the chat completion request is streaming or not",
+    )
+    disabled_connections: list[DisabledConnection] | None = Field(
+        default=None,
+        description="Connections to exclude from this turn (client sends on every request)",
     )
