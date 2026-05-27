@@ -63,6 +63,8 @@ class ResponsesHandler:
             conversation=conversation,
             input=harness_input,
             # model=request.model,
+            disabled_connections=[dc.model_dump() for dc in request.disabled_connections]
+            if request.disabled_connections else None,
         )
 
         if request.stream:
