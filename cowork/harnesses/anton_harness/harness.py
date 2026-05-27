@@ -329,6 +329,8 @@ class AntonHarness:
         from cowork.common.settings.app_settings import get_app_settings
 
         data_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir)) if LocalDataVault is not None else None
+        for conn in data_vault.list_connections() if data_vault else []:
+            data_vault.inject_env(conn["engine"], conn["name"])
 
         # TODO: Add guidance for integrations
 
