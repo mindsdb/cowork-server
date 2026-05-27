@@ -39,6 +39,7 @@ class HarnessProvider(Protocol):
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
+        disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         ...
 

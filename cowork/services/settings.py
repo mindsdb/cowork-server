@@ -4,14 +4,12 @@ from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.encryption import decrypt, encrypt
-from cowork.common.settings.user_settings import invalidate_user_settings_cache
-from cowork.models.setting import Setting
-from cowork.schemas.settings import (
-    SettingResponse,
+from cowork.common.settings.user_settings import (
     UserSettings,
-    field_is_sensitive,
-    field_options,
+    invalidate_user_settings_cache,
 )
+from cowork.models.setting import Setting
+from cowork.schemas.settings import SettingResponse
 
 
 class SettingService:
@@ -32,7 +30,7 @@ class SettingService:
     @staticmethod
     def _load(rows: list[Setting]) -> UserSettings:
         data = {
-            row.key: (decrypt(row.value) if field_is_sensitive(row.key) else row.value)
+            row.key: (decrypt(row.value) if UserSettings.field_is_sensitive(row.key) else row.value)
             for row in rows
             if row.key in UserSettings.model_fields
         }
@@ -41,7 +39,7 @@ class SettingService:
     @staticmethod
     def _to_response(key: str, settings: UserSettings, is_set: bool) -> SettingResponse:
         field_info = UserSettings.model_fields[key]
-        is_sensitive = field_is_sensitive(key)
+        is_sensitive = UserSettings.field_is_sensitive(key)
         field_val = getattr(settings, key)
 
         value = None
@@ -55,7 +53,7 @@ class SettingService:
             is_sensitive=is_sensitive,
             is_set=is_set,
             value=value,
-            options=field_options(key),
+            options=UserSettings.field_options(key),
         )
 
     def load(self) -> UserSettings:
@@ -81,7 +79,7 @@ class SettingService:
             raise ValueError(str(e))
 
         field_val = getattr(validated, key)
-        if field_is_sensitive(key):
+        if UserSettings.field_is_sensitive(key):
             raw = field_val.get_secret_value() if isinstance(field_val, SecretStr) else str(field_val)
             store_val = encrypt(raw)
         elif isinstance(field_val, Enum):

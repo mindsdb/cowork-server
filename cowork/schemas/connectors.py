@@ -119,3 +119,8 @@ class OAuthStartResponse(BaseModel):
     auth_url: str
     redirect_uri: str
     started_at: str
+
+
+class DisabledConnection(BaseModel):
+    engine: str
+    name: str
