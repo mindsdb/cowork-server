@@ -20,42 +20,46 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-@router.get("/", response_model=list[ScheduleResponse])
+@router.get("/")
 def list_schedules(session: SessionDep, project_id: UUID | None = None):
-    return ScheduleService(session).list_schedules(project_id=project_id)
+    schedules = ScheduleService(session).list_schedules(project_id=project_id)
+    return {"schedules": [ScheduleResponse.serialize(s) for s in schedules]}
 
 
-@router.post("/", response_model=ScheduleResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", status_code=status.HTTP_201_CREATED)
 def create_schedule(body: ScheduleCreateRequest, session: SessionDep):
-    return ScheduleService(session).create_schedule(
+    schedule = ScheduleService(session).create_schedule(
         title=body.title,
         prompt=body.prompt,
         cadence=body.cadence,
         next_run_at=body.next_run_at,
-        model=body.model,
+        model=body.model or "default",
         timezone=body.timezone,
         project_id=body.project_id,
         enabled=body.enabled,
     )
+    return ScheduleResponse.serialize(schedule)
 
 
-@router.get("/{schedule_id}", response_model=ScheduleResponse)
+@router.get("/{schedule_id}")
 def get_schedule(schedule_id: UUID, session: SessionDep):
     try:
-        return ScheduleService(session).get_schedule(schedule_id)
+        return ScheduleResponse.serialize(ScheduleService(session).get_schedule(schedule_id))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.patch("/{schedule_id}", response_model=ScheduleResponse)
+@router.put("/{schedule_id}")
+@router.patch("/{schedule_id}")
 def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, session: SessionDep):
     try:
-        return ScheduleService(session).update_schedule(
+        schedule = ScheduleService(session).update_schedule(
             schedule_id,
             **body.model_dump(exclude_none=True),
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return ScheduleResponse.serialize(schedule)
 
 
 @router.delete("/{schedule_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -65,18 +69,18 @@ def delete_schedule(schedule_id: UUID, session: SessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
 
 
-@router.post("/{schedule_id}/pause", response_model=ScheduleResponse)
+@router.post("/{schedule_id}/pause")
 def pause_schedule(schedule_id: UUID, session: SessionDep):
     try:
-        return ScheduleService(session).pause_schedule(schedule_id)
+        return ScheduleResponse.serialize(ScheduleService(session).pause_schedule(schedule_id))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{schedule_id}/resume", response_model=ScheduleResponse)
+@router.post("/{schedule_id}/resume")
 def resume_schedule(schedule_id: UUID, session: SessionDep):
     try:
-        return ScheduleService(session).resume_schedule(schedule_id)
+        return ScheduleResponse.serialize(ScheduleService(session).resume_schedule(schedule_id))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -93,10 +97,11 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: B
     return {"detail": "Run triggered"}
 
 
-@router.get("/{schedule_id}/runs", response_model=list[ScheduleRunResponse])
+@router.get("/{schedule_id}/runs")
 def list_schedule_runs(schedule_id: UUID, session: SessionDep, limit: int = 100):
     try:
         ScheduleService(session).get_schedule(schedule_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return ScheduleRunService(session).list_runs(schedule_id, limit=limit)
+    runs = ScheduleRunService(session).list_runs(schedule_id, limit=limit)
+    return {"runs": [ScheduleRunResponse.serialize(r) for r in runs]}

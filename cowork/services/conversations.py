@@ -18,15 +18,13 @@ class ConversationService:
         self,
         project_id: UUID | None = None,
         limit: int = 50,
+        all_projects: bool = False,
     ) -> list[Conversation]:
-        effective_project_id = project_id or GENERAL_PROJECT_ID
-        return list(
-            self.session.exec(
-                select(Conversation)
-                .where(Conversation.project_id == effective_project_id)
-                .limit(limit)
-            ).all()
-        )
+        stmt = select(Conversation)
+        if not all_projects:
+            stmt = stmt.where(Conversation.project_id == (project_id or GENERAL_PROJECT_ID))
+        stmt = stmt.order_by(Conversation.created_at.desc()).limit(limit)  # type: ignore[union-attr]
+        return list(self.session.exec(stmt).all())
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self.session.get(Conversation, conversation_id)
@@ -82,6 +80,47 @@ class ConversationService:
         self.session.delete(conversation)
         self.session.commit()
         return True
+
+    def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
+        """Delete a turn and everything after it.
+
+        turn_index is 0-based counting only assistant messages. The turn's
+        preceding user message (if any) and all subsequent messages are
+        removed. Returns the number of messages deleted.
+        """
+        self.get_conversation(conversation_id)  # raises if not found
+        messages = list(
+            self.session.exec(
+                select(Message)
+                .where(Message.conversation_id == conversation_id)
+                .order_by(Message.created_at)
+            ).all()
+        )
+        # Find the Nth assistant message (0-based).
+        assistant_count = -1
+        cut_from = None
+        for i, m in enumerate(messages):
+            if m.role.value == "assistant":
+                assistant_count += 1
+                if assistant_count == turn_index:
+                    # Include the preceding user message in the cut if it
+                    # exists and is immediately before this assistant msg.
+                    if i > 0 and messages[i - 1].role.value == "user":
+                        cut_from = i - 1
+                    else:
+                        cut_from = i
+                    break
+        if cut_from is None:
+            raise ValueError(f"Turn {turn_index} not found")
+        to_delete = messages[cut_from:]
+        for msg in to_delete:
+            for event in self.session.exec(
+                select(MessageEvent).where(MessageEvent.message_id == msg.id)
+            ).all():
+                self.session.delete(event)
+            self.session.delete(msg)
+        self.session.commit()
+        return len(to_delete)
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found

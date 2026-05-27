@@ -187,6 +187,8 @@ class AntonHarness:
         for block in input_blocks:
             if block.get("type") == "text":
                 anton_blocks.append({"type": "text", "text": block["text"]})
+            elif block.get("type") == "image":
+                anton_blocks.append(block)
             elif block.get("type") == "file":
                 anton_blocks.append({
                     "type": "text",
@@ -417,13 +419,21 @@ class AntonHarness:
 
         def _make_provider(role: Provider):
             if role == Provider.MINDS_CLOUD:
+                key = settings.minds_api_key
+                if key is None:
+                    raise ValueError("MindsHub API key is not configured")
                 return OpenAIProvider(
-                    api_key=settings.minds_api_key.get_secret_value(),
+                    api_key=key.get_secret_value(),
                     base_url=settings.minds_url,
                 )
             provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
-            cls = provider_map[role.value]
-            return cls(api_key=getattr(settings, f"{role.value}_api_key").get_secret_value())
+            cls = provider_map.get(role.value)
+            if cls is None:
+                raise ValueError(f"Unknown provider: {role.value}")
+            key = getattr(settings, f"{role.value}_api_key")
+            if key is None:
+                raise ValueError(f"{role.value} API key is not configured")
+            return cls(api_key=key.get_secret_value())
 
         return LLMClient(
             planning_provider=_make_provider(settings.planning_provider),

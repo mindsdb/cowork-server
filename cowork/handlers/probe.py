@@ -389,7 +389,7 @@ class ProbeHandler:
         from anton.core.llm.client import LLMClient
         from anton.core.llm.openai import OpenAIProvider
 
-        from cowork.schemas.settings import Provider
+        from cowork.common.settings.user_settings import Provider
 
         settings = get_user_settings()
 
