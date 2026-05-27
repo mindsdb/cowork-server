@@ -79,6 +79,7 @@ class ProbeHandler:
             # Resolve conversation + workspace
             db_conversation_id: UUID | None = None
             workspace = None
+            workspace_path: Path | None = None
 
             if conversation_id:
                 try:
@@ -87,26 +88,6 @@ class ProbeHandler:
                     workspace_path = Path(conversation.project.path)
                 except Exception:
                     logger.warning("Could not resolve conversation %s", conversation_id)
-                    workspace_path = None
-            else:
-                workspace_path = None
-
-            if workspace_path is None:
-                _temp_workspace_dir = tempfile.mkdtemp(prefix="cowork-probe-")
-                workspace_path = Path(_temp_workspace_dir)
-
-            try:
-                from anton.workspace import Workspace
-                workspace = Workspace(workspace_path)
-            except Exception:
-                logger.exception("Could not build workspace for probe")
-
-            # Build LLM client
-            llm_client = None
-            try:
-                llm_client = self._build_llm_client()
-            except Exception:
-                logger.exception("Could not build LLM client for probe")
 
             # response.created — opens the SSE turn
             yield _push("response.created", {
@@ -151,6 +132,58 @@ class ProbeHandler:
             form_spec = spec.form.model_dump()
             if method:
                 form_spec["selected_method"] = method
+
+            # No conversation context — save without probe
+            if db_conversation_id is None:
+                try:
+                    from anton.core.datasources.data_vault import LocalDataVault
+                    vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+                    slug = (name or "").strip() or f"{connector_id}-{uuid.uuid4().hex[:6]}"
+                    payload_to_save = {**credentials, "_connector_id": connector_id}
+                    if method:
+                        payload_to_save["_method"] = method
+                    vault.save(connector_id, slug, payload_to_save)
+                except Exception as exc:
+                    yield _delta(f"Could not save: `{exc}`.")
+                    yield _push("response.completed", {
+                        "type": "response.completed",
+                        "response": {"id": response_id, "status": "failed"},
+                    })
+                    self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                    return
+                yield _delta(f"Saved as `{slug}` (no live probe — no conversation context).\n\n")
+                yield _patch_delta({
+                    "form_id": form_id,
+                    "title": f"Saved — {slug}",
+                    "subtitle": "Stored in the vault. No live verification was performed.",
+                    "status_text": None,
+                    "_is_probing": False,
+                    "_is_success": True,
+                    "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
+                })
+                yield _push("response.completed", {
+                    "type": "response.completed",
+                    "response": {"id": response_id, "status": "success"},
+                })
+                self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                return
+
+            # Probe path: build workspace + LLM client
+            if workspace_path is None:
+                _temp_workspace_dir = tempfile.mkdtemp(prefix="cowork-probe-")
+                workspace_path = Path(_temp_workspace_dir)
+
+            try:
+                from anton.workspace import Workspace
+                workspace = Workspace(workspace_path)
+            except Exception:
+                logger.exception("Could not build workspace for probe")
+
+            llm_client = None
+            try:
+                llm_client = self._build_llm_client()
+            except Exception:
+                logger.exception("Could not build LLM client for probe")
 
             # Workspace / LLM client availability
             if workspace is None or llm_client is None:
