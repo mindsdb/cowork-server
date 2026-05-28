@@ -112,7 +112,9 @@ class AntonHarness:
             return await self._read_from_global_memory(category_enum)
         elif scope == MemoryScope.project:
             return await self._read_from_project_memory(project, category_enum)
-        
+        else:
+            raise ValueError(f"Unsupported memory scope: {scope}")
+
     async def _read_from_global_memory(self, category: AntonMemoryCategory) -> str:
         global_memory_dir = Path(settings.global_memory_root_dir)
         memory_file = self._resolve_memory_path(global_memory_dir, category)
@@ -187,6 +189,8 @@ class AntonHarness:
         for block in input_blocks:
             if block.get("type") == "text":
                 anton_blocks.append({"type": "text", "text": block["text"]})
+            elif block.get("type") == "image":
+                anton_blocks.append(block)
             elif block.get("type") == "file":
                 anton_blocks.append({
                     "type": "text",
@@ -406,28 +410,7 @@ class AntonHarness:
         )
         return ChatSession(config), temp_vault_dir
 
-    def _build_llm_client(self):
-        from anton.core.llm.client import LLMClient
-        from anton.core.llm.anthropic import AnthropicProvider
-        from anton.core.llm.openai import OpenAIProvider
-
-        from cowork.common.settings.user_settings import get_user_settings, Provider
-
-        settings = get_user_settings()
-
-        def _make_provider(role: Provider):
-            if role == Provider.MINDS_CLOUD:
-                return OpenAIProvider(
-                    api_key=settings.minds_api_key.get_secret_value(),
-                    base_url=settings.minds_url,
-                )
-            provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
-            cls = provider_map[role.value]
-            return cls(api_key=getattr(settings, f"{role.value}_api_key").get_secret_value())
-
-        return LLMClient(
-            planning_provider=_make_provider(settings.planning_provider),
-            planning_model=settings.planning_model,
-            coding_provider=_make_provider(settings.coding_provider),
-            coding_model=settings.coding_model,
-        )
+    @staticmethod
+    def _build_llm_client():
+        from cowork.services.providers import build_llm_client
+        return build_llm_client()

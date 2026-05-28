@@ -10,8 +10,9 @@ _SENTINEL = "ANTON_VAULT_KEEP"
 
 class ConnectionsService:
     def _vault(self):
+        from pathlib import Path
         from anton.core.datasources.data_vault import LocalDataVault
-        return LocalDataVault(ConnectorSettings().vault_dir)
+        return LocalDataVault(Path(ConnectorSettings().vault_dir))
 
     def list(self) -> list[ConnectionSummaryResponse]:
         items = self._vault().list_connections()

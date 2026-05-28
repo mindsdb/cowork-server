@@ -77,6 +77,15 @@ class ProjectService:
             raise ValueError("Project not found")
         return project
 
+    def get_project_by_name(self, name: str) -> Project:
+        project = self.session.exec(select(Project).where(Project.name == name)).first()
+        if project is None:
+            raise ValueError("Project not found")
+        return project
+
+    def get_project_by_name_or_none(self, name: str) -> Project | None:
+        return self.session.exec(select(Project).where(Project.name == name)).first()
+
     def create_project(self, name: str) -> Project:
         sanitized = self._sanitize_name(name)
         final_name = self._unique_name(sanitized)
@@ -144,3 +153,9 @@ class ProjectService:
                 self.session.add(general)
                 self.session.commit()
         return True
+
+    def get_active_project(self) -> Project:
+        project = self.session.exec(select(Project).where(Project.is_active)).first()
+        if project is None:
+            raise ValueError("No active project")
+        return project
