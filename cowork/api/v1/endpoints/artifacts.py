@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -57,7 +57,7 @@ async def preview_artifact(path: str = Query(...)):
 
 
 @router.post("/preview-mount")
-async def preview_mount_endpoint(req: _PathBody):
+async def preview_mount_endpoint(req: _PathBody, request: Request):
     try:
         artifact = resolve_artifact_path(req.path)
     except FileNotFoundError as e:
@@ -65,9 +65,21 @@ async def preview_mount_endpoint(req: _PathBody):
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return mount_preview(artifact)
+        payload = await mount_preview(artifact)
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
+
+    if payload.get("kind") == "proxy":
+        # Build the absolute proxy URL from the incoming request. Using
+        # scheme+netloc means the iframe loads through the same host
+        # the client used to reach us — works equally for desktop
+        # (127.0.0.1:port) and cloud (reverse-proxy origin).
+        token = payload["token"]
+        payload["proxyUrl"] = (
+            f"{request.url.scheme}://{request.url.netloc}"
+            f"/api/v1/artifacts/proxy/{token}/"
+        )
+    return payload
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}")
@@ -137,3 +149,18 @@ async def reveal_artifact(req: _PathBody, session: SessionDep):
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Could not reveal artifact") from exc
     return {"status": "ok", "path": str(target)}
+
+
+@router.api_route(
+    "/proxy/{token}/{rel_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def proxy(token: str, rel_path: str, request: Request):
+    """HTTP forwarder for fullstack-artifact previews.
+
+    Streams the request to the artifact's backend running on
+    `127.0.0.1:<metadata.json port>`, injects CORS, strips hop-by-hop
+    headers. See `cowork.services.preview_proxy` for the body.
+    """
+    from cowork.services.preview_proxy import proxy_artifact_request
+    return await proxy_artifact_request(token, rel_path, request)
