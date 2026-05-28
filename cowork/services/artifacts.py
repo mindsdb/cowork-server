@@ -9,10 +9,12 @@ replaced by the DB-backed project service.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import mimetypes
+import socket
 import subprocess
 import sys
 import time
@@ -25,8 +27,20 @@ from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
 
-# In-memory registry: deterministic token → parent dir of an HTML artifact.
+# In-memory registry: deterministic token → parent dir of an artifact.
+# Used for both static (HTML asset) and proxy (fullstack backend) mounts;
+# `kind` field on the preview-mount response payload discriminates.
 _PREVIEW_MOUNTS: dict[str, Path] = {}
+
+# Launched-by-cowork-server backend tracking, keyed by artifact slug.
+# Shape matches anton's launcher: {"proc", "port", "pid", "log_path"}.
+# Used to avoid double-launching and to reap on shutdown.
+_LAUNCHED_BACKENDS: dict[str, dict] = {}
+
+# Per-slug mutex so two parallel `preview-mount` requests (React
+# StrictMode double-effects, a double-click) can't both decide the port
+# is dead and spawn two backends side by side.
+_BACKEND_LAUNCH_LOCKS: dict[str, asyncio.Lock] = {}
 
 # ─── Type / kind mapping ──────────────────────────────────────────
 
@@ -383,12 +397,57 @@ def preview_artifact(path: Path) -> dict:
     }
 
 
-def mount_preview(path: Path) -> dict:
-    """Register an HTML artifact's parent dir for iframe preview."""
-    if path.suffix.lower() != ".html":
-        raise ValueError("Preview mount is only available for HTML artifacts")
+async def mount_preview(path: Path) -> dict:
+    """Register an artifact for iframe preview.
+
+    Two payload shapes share a `kind` discriminator:
+      - `kind: "static"` (HTML asset bundles) — token + relUrl that
+        the client loads against `/artifacts/preview-asset/`.
+      - `kind: "proxy"` (fullstack apps with a `port` in metadata.json)
+        — token + artifactDir + backend status; the route layer builds
+        the absolute proxyUrl pointing at our forwarder.
+    """
     parent = path.parent.resolve()
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
+
+    # Backend+frontend artifacts: detect them by a `port` field in
+    # metadata.json. The iframe will load through our proxy endpoint
+    # instead of preview-asset.
+    backend_port: int | None = None
+    metadata_path = parent / "metadata.json"
+    if metadata_path.is_file():
+        try:
+            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+            raw_port = meta.get("port")
+            if isinstance(raw_port, int) and 0 < raw_port < 65536:
+                backend_port = raw_port
+        except Exception:
+            backend_port = None
+
+    if backend_port is not None:
+        # Proxy mode. Register the dir so the proxy endpoint can look
+        # it up by token, then auto-launch the backend if dead. Returns
+        # without `proxyUrl` — the route layer fills it in using the
+        # incoming Request URL so the absolute URL matches whatever
+        # host/scheme the client used to reach us.
+        _PREVIEW_MOUNTS[token] = parent
+        running, launch_detail, current_port = await _ensure_backend_running(
+            parent, backend_port
+        )
+        return {
+            "kind": "proxy",
+            "token": token,
+            "artifactDir": str(parent),
+            "port": current_port if running else backend_port,
+            "backendRunning": running,
+            "launchError": "" if running else launch_detail,
+            "publishedUrl": "",
+        }
+
+    # Static (HTML) branch — same behaviour as before, with an explicit
+    # `kind` discriminator so the client doesn't have to infer.
+    if path.suffix.lower() != ".html":
+        raise ValueError("Preview mount is only available for HTML artifacts")
     _PREVIEW_MOUNTS[token] = parent
 
     published_url = ""
@@ -403,6 +462,7 @@ def mount_preview(path: Path) -> dict:
             pass
 
     return {
+        "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
@@ -441,3 +501,164 @@ def html_artifacts() -> list[dict]:
                 "publishedUrl": published.get("url", "") if isinstance(published, dict) else "",
             })
     return out[:40]
+
+
+# ─── Backend-artifact auto-launch ─────────────────────────────────
+#
+# When the user opens preview for a `fullstack-stateful-app` artifact,
+# its `metadata.json` records the TCP port the backend bound to. That
+# backend may or may not still be alive — the session that launched it
+# could be gone, the server might have been restarted, the process
+# might have crashed. Rather than refuse to preview, we probe the port
+# and try to bring the backend back up if it's down: delegate to anton's
+# `launch_artifact_backend` so the spawn semantics (slug-keyed venv,
+# requirements.txt install, `--port` flag, HTTP+TCP readiness probe)
+# match Anton's own `launch_backend` tool exactly. The new port is
+# persisted back to metadata.json so the proxy and future opens see it.
+
+def _launch_lock(key: str) -> asyncio.Lock:
+    lock = _BACKEND_LAUNCH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _BACKEND_LAUNCH_LOCKS[key] = lock
+    return lock
+
+
+def _probe_port(port: int, *, timeout: float = 0.3) -> bool:
+    """True iff something is accepting TCP connections on 127.0.0.1:<port>."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _resolve_project_root(artifact_dir: Path) -> Path | None:
+    """The registered project root that owns this artifact dir, if any.
+
+    `artifact_dir` is the parent of the primary file (e.g.
+    `<project>/.anton/artifacts/<slug>/`). We walk back to the registered
+    project root by checking ancestors against `_registered_project_dirs()`.
+    Returns None when the dir isn't under any registered project — in
+    which case auto-launch is a non-starter anyway.
+    """
+    try:
+        artifact_resolved = artifact_dir.resolve()
+    except OSError:
+        return None
+    registered = _registered_project_dirs()
+    for parent in (artifact_resolved, *artifact_resolved.parents):
+        if parent in registered:
+            return parent
+    return None
+
+
+async def _ensure_backend_running(
+    artifact_dir: Path, port: int
+) -> tuple[bool, str, int]:
+    """Bring up the artifact's backend if it isn't already listening.
+
+    Returns `(running, detail, port)`:
+      - `running=True`  → port is alive; `detail` is a short label
+        ("already_running" or "launched"); `port` may differ from the
+        input when the helper had to allocate a fresh free port.
+      - `running=False` → backend is down and we couldn't start it;
+        `detail` carries the reason; `port` echoes the input port.
+    """
+    slug = artifact_dir.name
+    if _probe_port(port):
+        return True, "already_running", port
+
+    # Serialize launches per-slug. Whichever request wins the lock does
+    # the actual work; the rest just re-probe after it releases.
+    async with _launch_lock(slug):
+        if _probe_port(port):
+            return True, "already_running", port
+        return await _launch_backend_locked(artifact_dir, slug)
+
+
+async def _launch_backend_locked(
+    artifact_dir: Path, slug: str
+) -> tuple[bool, str, int]:
+    """Spawn the artifact's backend via anton's shared launcher.
+
+    The slug-keyed scratchpad venv (provisioned by Anton when the agent
+    built the artifact) is the python interpreter; `requirements.txt`
+    in the artifact folder is installed before spawn; the launcher
+    picks a free port and passes `--port <port>` to the script. New
+    port is persisted into `metadata.json` so the proxy reads a current
+    value on its next request.
+    """
+    from anton.core.artifacts.backend_launcher import launch_artifact_backend
+
+    from cowork.services.scratchpad_runtime import WorkspaceScopedPool
+
+    project_root = _resolve_project_root(artifact_dir)
+    if project_root is None:
+        return False, "Artifact is not in a registered project.", 0
+
+    pool = WorkspaceScopedPool(str(project_root))
+    # anton's default health_timeout is 10s — too short for artifacts
+    # that do slow IO (HTTP fetches with retry/backoff, large model
+    # loads, etc.) before binding their port. The launcher would
+    # otherwise terminate a perfectly healthy backend just because it
+    # didn't finish startup yet. 45s leaves room for retries without
+    # making the user wait forever on a truly stuck script — anton
+    # terminates the proc on timeout.
+    result = await launch_artifact_backend(
+        slug=slug,
+        artifact_folder=artifact_dir,
+        scratchpad_pool=pool,
+        tracked_backends=_LAUNCHED_BACKENDS,
+        health_timeout=45.0,
+    )
+    if isinstance(result, str):
+        # Helper returned an error string. Strip the redundant "Error: "
+        # prefix so the message reads naturally in the preview pane.
+        detail = result[len("Error: "):] if result.startswith("Error: ") else result
+        return False, detail, 0
+
+    new_port = int(result["port"])
+    # Persist the new port directly to metadata.json. The proxy reads
+    # metadata.json on every request — without this write it would keep
+    # dialing the stale port even though the backend is healthy on a
+    # different one.
+    try:
+        meta_path = artifact_dir / "metadata.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["port"] = new_port
+        meta_path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        # Metadata write failure shouldn't abort an otherwise-working
+        # relaunch — the backend is up and we return the new port. But
+        # the proxy will keep dialing the stale port until the next
+        # successful write.
+        logger.warning("Could not persist backend port to metadata: %s", exc)
+
+    logger.info(
+        "Auto-launched artifact backend via anton helper: slug=%s port=%d pid=%s",
+        slug, new_port, result.get("pid"),
+    )
+    return True, "launched", new_port
+
+
+def shutdown_launched_backends() -> None:
+    """Terminate every backend cowork-server itself launched.
+
+    Synchronous: we schedule `proc.terminate()` (which is non-blocking on
+    `asyncio.subprocess.Process`) without awaiting `proc.wait()`. The
+    server is exiting anyway, and PR_SET_PDEATHSIG on Linux already makes
+    the kernel SIGTERM the backends when we go. macOS relies on the
+    explicit `terminate()` call.
+    """
+    for slug, entry in list(_LAUNCHED_BACKENDS.items()):
+        proc = entry.get("proc")
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+        _LAUNCHED_BACKENDS.pop(slug, None)
