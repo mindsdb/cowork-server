@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from urllib.parse import quote
+
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -207,6 +209,47 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
     return ""
 
 
+def _project_artifacts_base(project_name: str) -> Path | None:
+    """Resolve a project name to its `.anton/artifacts` dir, only when it
+    maps to a registered project. Returns None for unknown projects or
+    path-traversal attempts."""
+    if (not project_name or "\x00" in project_name
+            or "/" in project_name or "\\" in project_name
+            or project_name in (".", "..")):
+        return None
+    registered = set(_registered_project_dirs())
+    root = _projects_root().resolve(strict=False)
+    try:
+        candidate = (root / project_name).resolve(strict=False)
+    except (OSError, ValueError):
+        return None
+    if candidate not in registered:
+        return None
+    base = candidate / ".anton" / "artifacts"
+    return base if base.is_dir() else None
+
+
+def serve_url_for(path: str | Path) -> str:
+    """Origin-relative `/v1/artifacts/serve/...` URL for a file under a
+    project's `.anton/artifacts` tree. Returns "" when the path isn't
+    inside such a tree."""
+    try:
+        p = Path(path).resolve(strict=False)
+    except (OSError, ValueError):
+        return ""
+    for project_dir in _registered_project_dirs():
+        base = project_dir / ".anton" / "artifacts"
+        try:
+            rel = p.relative_to(base.resolve())
+        except (ValueError, OSError):
+            continue
+        if not rel.parts:
+            return ""
+        rel_str = "/".join(quote(part) for part in rel.parts)
+        return f"/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
+    return ""
+
+
 def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
@@ -315,6 +358,7 @@ def list_artifacts(project_path: str | None = None) -> list[dict]:
             "path": primary_path,
             "primary": meta.get("primary") or None,
             "publishedUrl": _published_url_for(folder, primary),
+            "serveUrl": serve_url_for(primary_path),
             "_sortTs": sort_ts,
         })
 
@@ -362,6 +406,7 @@ def mount_preview(path: Path) -> dict:
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
+        "serveUrl": serve_url_for(path),
         "publishedUrl": published_url,
     }
 
