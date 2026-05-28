@@ -25,7 +25,16 @@ logger = setup_logging()
 async def lifespan(app: FastAPI):
     run_dev_setup()
     start_scheduler()
-    yield
+    try:
+        yield
+    finally:
+        from cowork.common.http_client import close_proxy_client
+        from cowork.services.artifacts import shutdown_launched_backends
+        from cowork.services.scratchpad_runtime import close_all as close_scratchpads
+
+        shutdown_launched_backends()
+        await close_scratchpads()
+        await close_proxy_client()
 
 
 def create_app() -> FastAPI:

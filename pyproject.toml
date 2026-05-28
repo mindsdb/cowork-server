@@ -9,6 +9,7 @@ dependencies = [
     "cryptography>=48.0.0",
     "fastapi>=0.136.1",
     "hermes-agent",
+    "httpx>=0.27",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
     "python-multipart>=0.0.28",
