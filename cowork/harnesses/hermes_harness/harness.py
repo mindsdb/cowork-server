@@ -210,6 +210,8 @@ class HermesHarness:
         for block in input_blocks:
             if block.get("type") == "text":
                 parts.append(block["text"])
+            elif block.get("type") == "image":
+                parts.append("[Attached image — vision not supported in this mode]")
             elif block.get("type") == "file":
                 parts.append(f"[Attached file '{block['filename']}': {block['path']}]")
         return "\n\n".join(parts)
