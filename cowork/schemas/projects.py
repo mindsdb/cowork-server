@@ -1,10 +1,12 @@
 from pydantic import BaseModel
 
+from cowork.schemas.base import CamelRequest
 
-class ProjectCreateRequest(BaseModel):
+
+class ProjectCreateRequest(CamelRequest):
     name: str
 
 
-class ProjectUpdateRequest(BaseModel):
+class ProjectUpdateRequest(CamelRequest):
     name: str | None = None
     is_active: bool | None = None

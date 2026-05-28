@@ -70,3 +70,13 @@ class SkillService:
         self.session.delete(skill)
         self.session.commit()
         return True
+
+    def delete_skill_by_name(self, name: str) -> bool:
+        skill = self.session.exec(
+            select(Skill).where((Skill.name == name) | (Skill.label == name))
+        ).first()
+        if skill is None:
+            return False
+        self.session.delete(skill)
+        self.session.commit()
+        return True

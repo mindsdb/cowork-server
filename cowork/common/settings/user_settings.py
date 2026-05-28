@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Annotated, Callable, ClassVar, get_args
+from typing import Annotated, Any, Callable, ClassVar, get_args
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 
@@ -9,7 +9,53 @@ from cowork.common.settings.app_settings import Settings
 class Provider(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
+    GEMINI = "gemini"
+    OPENAI_COMPATIBLE = "openai_compatible"
     MINDS_CLOUD = "minds_cloud"
+
+    @property
+    def label(self) -> str:
+        return PROVIDER_LABELS[self]
+
+    @property
+    def api_key_field(self) -> str:
+        return _PROVIDER_KEY_FIELDS[self]
+
+
+PROVIDER_LABELS: dict["Provider", str] = {
+    Provider.ANTHROPIC: "Anthropic",
+    Provider.OPENAI: "OpenAI",
+    Provider.GEMINI: "Gemini",
+    Provider.OPENAI_COMPATIBLE: "OpenAI-compatible",
+    Provider.MINDS_CLOUD: "MindsHub",
+}
+
+_PROVIDER_KEY_FIELDS: dict["Provider", str] = {
+    Provider.ANTHROPIC: "anthropic_api_key",
+    Provider.OPENAI: "openai_api_key",
+    Provider.GEMINI: "openai_api_key",
+    Provider.OPENAI_COMPATIBLE: "openai_api_key",
+    Provider.MINDS_CLOUD: "minds_api_key",
+}
+
+# Provider types as exposed to the UI (uses dashes, not underscores)
+UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
+
+UI_PROVIDER_TYPE_LABELS: dict[str, str] = {
+    "minds-cloud": "MindsHub",
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "gemini": "Gemini",
+    "openai-compatible": "OpenAI-compatible",
+}
+
+UI_TYPE_TO_PROVIDER: dict[str, "Provider"] = {
+    "anthropic": Provider.ANTHROPIC,
+    "openai": Provider.OPENAI,
+    "gemini": Provider.GEMINI,
+    "openai-compatible": Provider.OPENAI_COMPATIBLE,
+    "minds-cloud": Provider.MINDS_CLOUD,
+}
 
 
 class _DynamicOptions:
@@ -28,6 +74,22 @@ def _harness_options() -> list[str]:
 
 
 class UserSettings(Settings):
+    RECOMMENDED_MODELS: ClassVar[dict[str, list[str]]] = {
+        "minds-cloud": ["_reason_", "_code_"],
+        "anthropic": ["claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
+        "openai": ["gpt-5.4", "gpt-5.4-mini", "o3", "o4-mini"],
+        "gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-flash-preview"],
+        "openai-compatible": [],
+    }
+
+    RECOMMENDED_PAIR: ClassVar[dict[str, tuple[str, str]]] = {
+        "minds-cloud": ("_reason_", "_code_"),
+        "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
+        "openai": ("gpt-5.4", "gpt-5.4-mini"),
+        "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
+        "openai-compatible": ("", ""),
+    }
+
     PLANNING_MODEL_DEFAULTS: ClassVar[dict[Provider, str]] = {
         Provider.ANTHROPIC: "claude-sonnet-4-6",
         Provider.OPENAI: "gpt-4o",
@@ -38,6 +100,8 @@ class UserSettings(Settings):
         Provider.OPENAI: "gpt-5.3-codex",
         Provider.MINDS_CLOUD: "_code_",
     }
+
+    # ── Provider / model settings ──
 
     anthropic_api_key: SecretStr | None = Field(
         default=None,
@@ -85,6 +149,89 @@ class UserSettings(Settings):
         description="The AI harness used to generate responses.",
     )
 
+    # ── UI preferences ──
+
+    greeting: str = Field(
+        default="Let's knock something off your list",
+        title="Greeting",
+        description="The greeting message shown on the home screen.",
+    )
+    tone: str = Field(
+        default="balanced",
+        title="Tone",
+        description="The conversational tone for responses.",
+    )
+    auto_pin: bool = Field(
+        default=True,
+        title="Auto Pin",
+        description="Automatically pin important items.",
+    )
+    show_dots: bool = Field(
+        default=True,
+        title="Show Dots",
+        description="Show dot grid background.",
+    )
+    show_counters: bool = Field(
+        default=True,
+        title="Show Counters",
+        description="Show counters in the UI.",
+    )
+    accent_variant: str = Field(
+        default="aqua",
+        title="Accent Variant",
+        description="UI accent color variant.",
+    )
+    memory_enabled: bool = Field(
+        default=True,
+        title="Memory Enabled",
+        description="Enable conversation memory.",
+    )
+    memory_mode: str = Field(
+        default="autopilot",
+        title="Memory Mode",
+        description="How memory is managed (autopilot or manual).",
+    )
+    episodic_memory: bool = Field(
+        default=True,
+        title="Episodic Memory",
+        description="Enable episodic memory for conversations.",
+    )
+    proactive_dashboards: bool = Field(
+        default=False,
+        title="Proactive Dashboards",
+        description="Enable proactive dashboard suggestions.",
+    )
+    ui_update_mode: str = Field(
+        default="manual",
+        title="UI Update Mode",
+        description="How UI updates are applied (manual or auto).",
+    )
+    publish_url: str = Field(
+        default="https://4nton.ai",
+        title="Publish URL",
+        description="URL for publishing artifacts.",
+    )
+    openai_base_url: str = Field(
+        default="",
+        title="OpenAI Base URL",
+        description="Base URL for OpenAI-compatible providers.",
+    )
+    model_mode: str = Field(
+        default="default",
+        title="Model Mode",
+        description="Whether to use default or custom model assignments (default or custom).",
+    )
+    model_overrides: str = Field(
+        default="{}",
+        title="Model Overrides",
+        description="JSON-encoded per-role provider/model overrides when model_mode is custom.",
+    )
+    providers_json: str = Field(
+        default="[]",
+        title="Providers",
+        description="JSON-encoded list of configured provider entries for the settings UI.",
+    )
+
     @field_validator("harness")
     @classmethod
     def validate_harness(cls, v: str) -> str:
@@ -101,6 +248,21 @@ class UserSettings(Settings):
         if self.coding_model is None:
             self.coding_model = self.CODING_MODEL_DEFAULTS.get(self.coding_provider)
         return self
+
+    @property
+    def config_status(self) -> dict[str, Any]:
+        """Whether the active planning provider has an API key configured."""
+        p = self.planning_provider
+        key_field = p.api_key_field
+        has_key = getattr(self, key_field, None) is not None
+        label = p.label
+        return {
+            "config_ready": has_key,
+            "config_error": None if has_key else f"Configure {key_field} for {label}.",
+            "provider": p.value,
+            "provider_label": label,
+            "model": self.planning_model or "",
+        }
 
     @staticmethod
     def field_is_sensitive(field_name: str) -> bool:

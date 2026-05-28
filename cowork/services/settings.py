@@ -98,6 +98,44 @@ class SettingService:
 
         return self._to_response(key, validated, True)
 
+    def bulk_upsert(self, updates: dict[str, str]) -> list[str]:
+        """Upsert multiple settings in a single transaction.
+
+        Returns the list of keys that were actually written.
+        Skips None values and masked placeholders (``***``).
+        """
+        written: list[str] = []
+        for key, value in updates.items():
+            if value is None or value == "***":
+                continue
+            self._validate_key(key)
+            try:
+                validated = UserSettings.model_validate({key: value})
+            except ValidationError:
+                continue
+
+            field_val = getattr(validated, key)
+            if UserSettings.field_is_sensitive(key):
+                raw = field_val.get_secret_value() if isinstance(field_val, SecretStr) else str(field_val)
+                store_val = encrypt(raw)
+            elif isinstance(field_val, Enum):
+                store_val = field_val.value
+            else:
+                store_val = str(field_val) if field_val is not None else value
+
+            row = self._fetch_row(key)
+            if row is None:
+                row = Setting(key=key, value=store_val)
+            else:
+                row.value = store_val
+            self.session.add(row)
+            written.append(key)
+
+        if written:
+            self.session.commit()
+            invalidate_user_settings_cache()
+        return written
+
     def delete_setting(self, key: str) -> bool:
         self._validate_key(key)
         row = self._fetch_row(key)

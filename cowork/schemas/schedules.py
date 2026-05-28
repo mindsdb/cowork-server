@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from cowork.schemas.base import CamelRequest, CamelResponse
+
 
 class Cadence(str, Enum):
     once = "once"
@@ -20,18 +22,18 @@ class RunStatus(str, Enum):
     failed = "failed"
 
 
-class ScheduleCreateRequest(BaseModel):
+class ScheduleCreateRequest(CamelRequest):
     title: str
     prompt: str
     cadence: Cadence
     next_run_at: datetime
-    model: str
+    model: str | None = None
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
 
 
-class ScheduleUpdateRequest(BaseModel):
+class ScheduleUpdateRequest(CamelRequest):
     title: str | None = None
     prompt: str | None = None
     cadence: Cadence | None = None
@@ -42,7 +44,7 @@ class ScheduleUpdateRequest(BaseModel):
     enabled: bool | None = None
 
 
-class ScheduleResponse(BaseModel):
+class ScheduleResponse(CamelResponse):
     id: UUID
     title: str
     prompt: str
@@ -59,10 +61,8 @@ class ScheduleResponse(BaseModel):
     created_at: datetime | None
     modified_at: datetime | None
 
-    model_config = {"from_attributes": True}
 
-
-class ScheduleRunResponse(BaseModel):
+class ScheduleRunResponse(CamelResponse):
     id: UUID
     schedule_id: UUID
     started_at: datetime
@@ -73,5 +73,3 @@ class ScheduleRunResponse(BaseModel):
     conversation_id: UUID | None
     is_manual: bool
     created_at: datetime | None
-
-    model_config = {"from_attributes": True}

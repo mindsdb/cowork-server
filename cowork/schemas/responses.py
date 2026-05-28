@@ -2,6 +2,7 @@ import time
 from typing import Any
 import uuid
 from enum import Enum
+from uuid import UUID
 
 from pydantic import BaseModel, Field, model_serializer
 
@@ -123,6 +124,14 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Conversation ID for the responses request, if not provided, a new conversation will be created",
     )
+    project: str | None = Field(
+        default=None,
+        description="Project name for a new conversation",
+    )
+    project_id: UUID | None = Field(
+        default=None,
+        description="Project ID for a new conversation",
+    )
     # In OpenAI's Responses API, the model is required.
     # However, we currently do not allow this to be specified at the time of making the request,
     # via the Cowork UI. Instead, the model is retrieved from the user provided settings.
@@ -133,6 +142,14 @@ class ResponsesRequest(BaseModel):
     stream: bool | None = Field(
         default=False,
         description="Whether the chat completion request is streaming or not",
+    )
+    # TODO(migration): Per MIGRATION.md, attachment_ids should be removed.
+    # The client should instead send input_file content blocks in the input
+    # field (the handler already supports this path). This field is a compat
+    # bridge for the current client which uploads via /v1/attachments/.
+    attachment_ids: list[str] | None = Field(
+        default=None,
+        description="IDs of uploaded attachments (images, files) to include with this message",
     )
     disabled_connections: list[DisabledConnection] | None = Field(
         default=None,
