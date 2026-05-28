@@ -25,6 +25,7 @@ from cowork.schemas.responses import (
 )
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
+from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
 from cowork.services.skills import SkillService
 
 
@@ -44,6 +45,7 @@ class ResponsesHandler:
         await self.harness.sync_skills(SkillService(self.session).list_skills())
 
         conversation_service = ConversationService(self.session)
+        project_id = self._resolve_project_id(request)
 
         harness_input = self._build_harness_input(request)
         original_content = self._extract_original_content(request)
@@ -59,10 +61,14 @@ class ResponsesHandler:
                 # Client sent a non-UUID id (e.g. legacy name-based format) —
                 # treat as a new conversation since it won't exist in the DB.
                 conversation = conversation_service.create_conversation(
-                    topic=self._prompt_text(harness_input)[:80]
+                    topic=self._prompt_text(harness_input)[:80],
+                    project_id=project_id,
                 )
         else:
-            conversation = conversation_service.create_conversation(topic=self._prompt_text(harness_input)[:80])
+            conversation = conversation_service.create_conversation(
+                topic=self._prompt_text(harness_input)[:80],
+                project_id=project_id,
+            )
 
         self.last_conversation_id = str(conversation.id)
 
@@ -220,6 +226,16 @@ class ResponsesHandler:
                     break
 
         return blocks or [{"type": "text", "text": ""}]
+
+    def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
+        if request.project_id is not None:
+            return request.project_id
+        if request.project:
+            try:
+                return ProjectService(self.session).get_project_by_name(request.project).id
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=f"Project not found: {request.project}") from exc
+        return GENERAL_PROJECT_ID
 
     @staticmethod
     def _image_block(filepath: Path, media_type: str) -> dict:

@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
+from cowork.models.project import Project
 from cowork.services.projects import GENERAL_PROJECT_ID
 
 
@@ -46,6 +47,11 @@ class ConversationService:
         self.session.refresh(conversation)
         return conversation
 
+    def project_by_name(self, name: str | None) -> Project | None:
+        if not name:
+            return None
+        return self.session.exec(select(Project).where(Project.name == name)).first()
+
     def update_conversation(
         self,
         conversation_id: UUID,
@@ -69,7 +75,9 @@ class ConversationService:
         if conversation is None:
             return False
         messages = self.session.exec(
-            select(Message).where(Message.conversation_id == conversation_id)
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at)
         ).all()
         for message in messages:
             for event in self.session.exec(
@@ -139,13 +147,6 @@ class ConversationService:
                 "role": message.role,
                 "content": message.content,
                 "created_at": message.created_at,
-                "events": [
-                    {
-                        "id": e.id,
-                        "sequence_number": e.sequence_number,
-                        "event_data": e.event_data,
-                    }
-                    for e in events
-                ],
+                "events": [e.event_data for e in events],
             })
         return result

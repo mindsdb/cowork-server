@@ -7,13 +7,18 @@ from cowork.schemas.base import CamelRequest, CamelResponse
 
 
 class ConversationCreateRequest(CamelRequest):
-    topic: str
+    topic: str | None = None
+    title: str | None = None
+    project: str | None = None
     project_id: UUID | None = None
 
 
 class ConversationUpdateRequest(CamelRequest):
     topic: str | None = None
+    title: str | None = None
+    project: str | None = None
     project_id: UUID | None = None
+    disabled_connections: list[dict] | None = None
 
 
 class ConversationListItem(CamelResponse):
@@ -23,4 +28,5 @@ class ConversationListItem(CamelResponse):
     updated_at: datetime | None
     created_at: datetime | None
     project: str | None = None
+    project_path: str | None = None
     project_id: UUID | None
