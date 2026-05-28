@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import mimetypes
 import subprocess
+from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlmodel import Session
 
+from cowork.db.session import get_session
 from cowork.services.artifacts import (
     get_preview_mount,
     list_artifacts as _list_artifacts,
@@ -21,8 +25,10 @@ from cowork.services.artifacts import (
     resolve_artifact_path,
     reveal_in_file_manager,
 )
+from cowork.services.projects import ProjectService
 
 router = APIRouter()
+SessionDep = Annotated[Session, Depends(get_session)]
 
 
 class _PathBody(BaseModel):
@@ -100,16 +106,34 @@ async def open_artifact(req: _PathBody):
     return {"status": "ok", "path": str(artifact)}
 
 
-@router.post("/reveal")
-async def reveal_artifact(req: _PathBody):
+def _resolve_reveal_path(path: str, session: Session) -> Path:
     try:
-        artifact = resolve_artifact_path(req.path)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        return resolve_artifact_path(path)
+    except FileNotFoundError:
+        pass
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
     try:
-        reveal_in_file_manager(artifact)
+        requested = Path(path).expanduser().resolve()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
+    for project in ProjectService(session).list_projects():
+        project_dir = Path(project.path).resolve()
+        try:
+            requested.relative_to(project_dir)
+        except ValueError:
+            continue
+        if requested.exists():
+            return requested
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
+
+
+@router.post("/reveal")
+async def reveal_artifact(req: _PathBody, session: SessionDep):
+    target = _resolve_reveal_path(req.path, session)
+    try:
+        reveal_in_file_manager(target)
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Could not reveal artifact") from exc
-    return {"status": "ok", "path": str(artifact)}
+    return {"status": "ok", "path": str(target)}

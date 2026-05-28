@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from cowork.api.v1.router import api_router as v1_router
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
 
 
@@ -22,6 +23,7 @@ logger = setup_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    run_dev_setup()
     start_scheduler()
     yield
 

@@ -1,7 +1,8 @@
-"""Dev-only bootstrap helpers.
+"""Storage bootstrap helpers.
 
-This module intentionally keeps migration-like convenience logic out of
-application startup. Use it explicitly in local development and tests.
+Creates the current SQLModel schema and required base rows. This is safe to
+run at startup for the local SQLite deployment and remains exposed as a CLI
+helper for development/test environments.
 """
 
 from pathlib import Path

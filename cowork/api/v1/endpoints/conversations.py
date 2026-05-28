@@ -12,6 +12,19 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
+def _serialize_conversation(c):
+    return ConversationListItem.serialize({
+        "id": c.id,
+        "title": c.topic,
+        "preview": c.topic,
+        "updated_at": c.modified_at or c.created_at,
+        "created_at": c.created_at,
+        "project": c.project.name if c.project else None,
+        "project_path": c.project.path if c.project else None,
+        "project_id": c.project_id,
+    })
+
+
 @router.get("/")
 def list_conversations(
     session: SessionDep,
@@ -23,41 +36,46 @@ def list_conversations(
     convs = ConversationService(session).list_conversations(
         project_id=project_id, limit=limit, all_projects=all_projects,
     )
-    return {"conversations": [
-        ConversationListItem.serialize({
-            "id": c.id,
-            "title": c.topic,
-            "preview": c.topic,
-            "updated_at": c.modified_at or c.created_at,
-            "created_at": c.created_at,
-            "project": None,
-            "project_id": c.project_id,
-        })
-        for c in convs
-    ]}
+    return {"conversations": [_serialize_conversation(c) for c in convs]}
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_conversation(body: ConversationCreateRequest, session: SessionDep):
-    return ConversationService(session).create_conversation(
-        topic=body.topic, project_id=body.project_id
+    svc = ConversationService(session)
+    project_id = body.project_id
+    if project_id is None and body.project:
+        project = svc.project_by_name(body.project)
+        if project is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        project_id = project.id
+    conversation = svc.create_conversation(
+        topic=body.topic or body.title or "Untitled task", project_id=project_id
     )
+    return _serialize_conversation(conversation)
 
 
 @router.get("/{conversation_id}")
 def get_conversation(conversation_id: UUID, session: SessionDep):
     try:
-        return ConversationService(session).get_conversation(conversation_id)
+        return _serialize_conversation(ConversationService(session).get_conversation(conversation_id))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 @router.patch("/{conversation_id}")
 def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, session: SessionDep):
+    svc = ConversationService(session)
+    project_id = body.project_id
+    if project_id is None and body.project:
+        project = svc.project_by_name(body.project)
+        if project is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        project_id = project.id
     try:
-        return ConversationService(session).update_conversation(
-            conversation_id, topic=body.topic, project_id=body.project_id
+        conversation = svc.update_conversation(
+            conversation_id, topic=body.topic or body.title, project_id=project_id
         )
+        return _serialize_conversation(conversation)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 

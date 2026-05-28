@@ -2,6 +2,7 @@ import time
 from typing import Any
 import uuid
 from enum import Enum
+from uuid import UUID
 
 from pydantic import BaseModel, Field, model_serializer
 
@@ -122,6 +123,14 @@ class ResponsesRequest(BaseModel):
     conversation: str | None = Field(
         default=None,
         description="Conversation ID for the responses request, if not provided, a new conversation will be created",
+    )
+    project: str | None = Field(
+        default=None,
+        description="Project name for a new conversation",
+    )
+    project_id: UUID | None = Field(
+        default=None,
+        description="Project ID for a new conversation",
     )
     # In OpenAI's Responses API, the model is required.
     # However, we currently do not allow this to be specified at the time of making the request,

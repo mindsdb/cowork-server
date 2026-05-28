@@ -6,10 +6,15 @@ response. Replace with real implementations as they're ported over.
 """
 from __future__ import annotations
 
+import mimetypes
+import os
+import shutil
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlmodel import Session
 
 from cowork.db.session import get_session
@@ -75,6 +80,54 @@ def delete_attachment_scoped(project_name: str, session_id: str, attachment_id: 
     return {"ok": True}
 
 
+@attachments_router.get("/{project_name}/{session_id}/{attachment_id}/raw")
+def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep):
+    from cowork.services.files import FileService
+    try:
+        content_type, filename, path = FileService(session).get_file_content(attachment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return FileResponse(path, media_type=content_type, filename=filename)
+
+
+def _unique_project_target(project_dir: Path, filename: str) -> Path:
+    safe_name = os.path.basename(filename or "upload").strip() or "upload"
+    target = project_dir / safe_name
+    if not target.exists():
+        return target
+    stem = target.stem or "upload"
+    suffix = target.suffix
+    for i in range(2, 10_000):
+        candidate = project_dir / f"{stem}-{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(status_code=409, detail="Could not choose a unique project filename")
+
+
+@attachments_router.post("/{project_name}/{session_id}/{attachment_id}/move-to-project")
+def move_attachment_to_project(project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep):
+    from cowork.services.files import FileService
+    from cowork.services.projects import ProjectService
+
+    try:
+        project = ProjectService(session).get_project_by_name(project_name)
+        content_type, filename, source = FileService(session).get_file_content(attachment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    project_dir = Path(project.path)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    target = _unique_project_target(project_dir, filename)
+    shutil.copy2(source, target)
+    FileService(session).delete_file(attachment_id)
+    return {
+        "ok": True,
+        "project_path": target.name,
+        "absolute_path": str(target),
+        "content_type": content_type or mimetypes.guess_type(str(target))[0] or "application/octet-stream",
+    }
+
+
 # ── Scratchpad ───────────────────────────────────────────────────────
 
 scratchpad_router = APIRouter()
@@ -93,5 +146,4 @@ browse_router = APIRouter()
 @browse_router.get("/status")
 def browse_status():
     return {"available": False}
-
 
