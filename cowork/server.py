@@ -1,8 +1,8 @@
 """
-Minds FastAPI Application Server.
+Cowork Server — FastAPI Application.
 
 This module sets up the FastAPI application with middleware, routing,
-and all necessary configurations for the Minds service.
+and all necessary configurations for the Cowork service.
 """
 
 from contextlib import asynccontextmanager
@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from cowork.api.v1.router import api_router as v1_router
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
 
 
@@ -22,6 +23,7 @@ logger = setup_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    run_dev_setup()
     start_scheduler()
     yield
 
@@ -39,7 +41,7 @@ def create_app() -> FastAPI:
     # Create FastAPI app
     app = FastAPI(
         title="Cowork API",
-        description="FastAPI-based service providing OpenAI-compatible chat completions with MindsDB integration",
+        description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
         lifespan=lifespan,
     )
