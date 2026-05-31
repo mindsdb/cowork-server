@@ -19,3 +19,8 @@ dependencies = [
 [tool.uv.sources]
 anton = { git = "https://github.com/mindsdb/anton.git" }
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
+
+[dependency-groups]
+dev = [
+    "alembic>=1.18.4",
+]
