@@ -14,6 +14,13 @@ from cowork.channels.registry import (
     get_registry,
     load_first_party_plugins,
 )
+from cowork.channels.webhooks import (
+    SignatureError,
+    WebhookBridge,
+    WebhookHandshake,
+    build_channel_webhook_router,
+    drain_background_tasks,
+)
 
 ANTON_CHANNEL_AGENT_ID = "anton"
 
@@ -29,4 +36,9 @@ __all__ = [
     "default_registry",
     "get_registry",
     "load_first_party_plugins",
+    "SignatureError",
+    "WebhookBridge",
+    "WebhookHandshake",
+    "build_channel_webhook_router",
+    "drain_background_tasks",
 ]

@@ -86,10 +86,19 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_channel_events_channel_type"), "channel_events", ["channel_type"], unique=False)
     op.create_index(op.f("ix_channel_events_dedupe_key"), "channel_events", ["dedupe_key"], unique=False)
+    op.create_index(
+        "uq_channel_events_inbound_dedupe",
+        "channel_events",
+        ["channel_type", "dedupe_key"],
+        unique=True,
+        sqlite_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL"),
+        postgresql_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL"),
+    )
 
 
 def downgrade() -> None:
     """Downgrade schema."""
+    op.drop_index("uq_channel_events_inbound_dedupe", table_name="channel_events")
     op.drop_index(op.f("ix_channel_events_dedupe_key"), table_name="channel_events")
     op.drop_index(op.f("ix_channel_events_channel_type"), table_name="channel_events")
     op.drop_table("channel_events")
