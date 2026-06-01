@@ -14,6 +14,7 @@ from cowork.api.v1.endpoints.connectors import (
     submissions,
 )
 from cowork.api.v1.endpoints import (
+    channels,
     conversations,
     files,
     memory,
@@ -43,3 +44,4 @@ api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
+api_router.include_router(channels.router, prefix="/channels", tags=["channels"])

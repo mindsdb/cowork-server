@@ -23,6 +23,9 @@ logger = setup_logging()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_scheduler()
+    from cowork.channels.registry import load_first_party_plugins
+
+    load_first_party_plugins()
     yield
 
 
