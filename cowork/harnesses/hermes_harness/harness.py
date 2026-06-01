@@ -20,6 +20,49 @@ os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().root_dir)
 
 logger = get_logger(__name__)
 
+# Default base URLs for providers that use the OpenAI-compatible API.
+# AIAgent requires both api_key AND base_url to bypass its config.yaml
+# provider-resolution path. Anthropic is omitted because AIAgent
+# auto-detects provider="anthropic" and uses its native Messages API.
+_PROVIDER_BASE_URLS: dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+}
+
+# Map cowork provider names to the env var AIAgent checks at init time.
+_PROVIDER_ENV_KEY = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
+
+
+def _sync_hermes_config(provider: str, api_key: str | None) -> None:
+    """Write ~/.cowork/hermes/config.yaml and set the env var that AIAgent expects."""
+    import yaml
+
+    hermes_home = Path(os.environ.get("HERMES_HOME", HermesHarnessSettings().root_dir))
+    config_path = hermes_home / "config.yaml"
+
+    # Read existing config to preserve other fields
+    existing: dict = {}
+    if config_path.is_file():
+        try:
+            existing = yaml.safe_load(config_path.read_text()) or {}
+        except Exception:
+            existing = {}
+
+    if existing.get("provider") != provider:
+        existing["provider"] = provider
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.dump(existing, default_flow_style=False))
+
+    # Set the env var so AIAgent's init-time check passes
+    env_var = _PROVIDER_ENV_KEY.get(provider)
+    if env_var and api_key:
+        os.environ[env_var] = api_key
+
+
 def _build_datasource_context(vault, disabled_keys: set[tuple[str, str]]) -> str:
     """Build a system-prompt section listing connected data sources and their DS_* env var names."""
     try:
@@ -241,6 +284,23 @@ class HermesHarness:
 
         register_connector_tools()
 
+        # Sync Hermes config.yaml with the user's cowork provider/key settings.
+        # AIAgent validates config.yaml at init time (before using constructor
+        # args), so the file must reflect the active provider and the matching
+        # API key env var must be set.
+        settings = get_user_settings()
+        model = settings.planning_model
+        provider_value = settings.planning_provider.value if settings.planning_provider != Provider.MINDS_CLOUD else "openai"
+        api_key_value = (
+            settings.minds_api_key.get_secret_value()
+            if settings.planning_provider == Provider.MINDS_CLOUD
+            else getattr(settings, f"{provider_value}_api_key", None)
+        )
+        if api_key_value and hasattr(api_key_value, "get_secret_value"):
+            api_key_value = api_key_value.get_secret_value()
+
+        _sync_hermes_config(provider_value, api_key_value)
+
         vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
         disabled_keys = {(d["engine"], d["name"]) for d in (disabled_connections or [])}
         for conn in vault.list_connections():
@@ -248,9 +308,6 @@ class HermesHarness:
                 vault.inject_env(conn["engine"], conn["name"])
 
         datasource_context = _build_datasource_context(vault, disabled_keys)
-
-        settings = get_user_settings()
-        model = settings.planning_model
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
             agent = AIAgent(
@@ -269,8 +326,20 @@ class HermesHarness:
             )
         else:
             provider = settings.planning_provider.value
-            api_key = getattr(settings, f"{provider}_api_key").get_secret_value()
-            agent = AIAgent(
+            key_field = settings.planning_provider.api_key_field
+            api_key = getattr(settings, key_field).get_secret_value()
+
+            # AIAgent needs both api_key AND base_url to skip its config.yaml
+            # provider-resolution path.  For providers that use the OpenAI-
+            # compatible API (openai, gemini, openai_compatible), we must
+            # supply a base_url. Anthropic is handled separately by AIAgent
+            # (it detects provider="anthropic" and switches to the Anthropic
+            # Messages API internally).
+            base_url = _PROVIDER_BASE_URLS.get(provider)
+            if provider == "openai_compatible" and settings.openai_base_url:
+                base_url = settings.openai_base_url
+
+            kwargs = dict(
                 provider=provider,
                 model=model,
                 api_key=api_key,
@@ -278,10 +347,13 @@ class HermesHarness:
                 ephemeral_system_prompt=datasource_context,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
-                # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
                 reasoning_callback=reasoning_callback,
                 thinking_callback=thinking_callback,
             )
+            if base_url:
+                kwargs["base_url"] = base_url
+
+            agent = AIAgent(**kwargs)
 
         try:
             return agent.run_conversation(
