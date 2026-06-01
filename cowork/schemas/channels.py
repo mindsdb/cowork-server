@@ -108,12 +108,24 @@ class CredentialFieldSpec(BaseModel):
     description: str | None = None
 
 
+class PluginCapabilities(BaseModel):
+    """Capability flags the UI uses to decide which forms/buttons to show."""
+
+    supports_webhook_ingress: bool = False
+    supports_webhook_setup: bool = False
+    supports_teardown: bool = False
+    supports_oauth: bool = False
+    supports_direct_credentials: bool = True
+    supports_custom_ack: bool = False
+
+
 class PluginResponse(BaseModel):
     channel_type: str
     display_name: str
     credentials: list[CredentialFieldSpec]
     has_oauth: bool = False
     webhook_paths: list[str] = []
+    capabilities: PluginCapabilities
 
 
 class CredentialValue(BaseModel):

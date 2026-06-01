@@ -12,6 +12,7 @@ import httpx
 from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.plugin import (
+    ChannelCapabilities,
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
@@ -200,4 +201,12 @@ plugin = ChannelPlugin(
         )
     ),
     webhooks=(WebhookRoute(path="/webhook", methods=("GET", "POST"), needs_raw_body=True),),
+    capabilities=ChannelCapabilities(
+        supports_webhook_ingress=True,
+        supports_webhook_setup=False,
+        supports_teardown=False,
+        supports_oauth=False,
+        supports_direct_credentials=True,
+        supports_custom_ack=False,
+    ),
 )
