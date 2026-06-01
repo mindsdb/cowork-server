@@ -1,27 +1,107 @@
-# Cowork Server API
+# Cowork Server
 
-## Architectural Overview
+FastAPI backend for the [Anton](https://github.com/mindsdb/cowork) desktop app. Manages projects, conversations, files, scheduling, memory, and agent orchestration with a SQLite-backed data layer.
 
-Given below is a high-level architectural overview of the Cowork Server API, specifically outlining how it differs from the implementation already available in the [mindsdb/cowork](https://github.com/mindsdb/cowork) repository. Some of these decisions have been made in order to simplify the onboarding of other agents (harnesses) such as Hermes.
+## Quick Start
 
-Here is a breakdown:
-### App Vs Harness Components
-At the moment, most components of the existing Cowork server including projects, conversations, attachments etc., are closely coupled with the Anton agent. This means that when other agents (e.g., Hermes) are onboarded, they will have to either adhere to the structure Anton has defined for these components or implement their own versions. 
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
-A good example is the the work that has been done [here](https://github.com/mindsdb/cowork/compare/main...hermes-mvp); the base abstraction for harnesses here has been defined in such a way that conversation management and other aspects need to be implemented separately for each agent. This is not ideal as it leads to code duplication and makes maintenance harder.
+```sh
+# Install and run
+uv tool install cowork-server
+cowork-server
+```
 
-Furthermore, it is not entirely clear how harness-specific components such as memory and skills work here. It seems to be necessary to use the contract defined by Anton and it is not guaranteed that these will work as intended for other agents.
+The server starts on `http://127.0.0.1:26866`. Confirm with:
 
-A better way to approach this would be to have a clear separation between the app and harness components. The app components (e.g., projects, conversations, attachments) should be designed in a way that they are independent of any specific agent. We were already able to achieve in our implementation of the Minds API, where different implementations of agents could be onboarded with minimal changes to the core API.
+```sh
+curl http://127.0.0.1:26866/api/v1/health/
+```
 
-The implementation available here aims to achieve this by taking parts of the both the existing codebase and the Minds API.
+## Development
 
-### Database Design
-This implementation has also been designed to allow for database storage rather than relying on a file-based storage system. A lightweight SQLite database can be used here, but it is also able to support more robust databases such as Postgres if needed. This allows for better scalability and performance, especially as the number of users and conversations grows.
+```sh
+# Run from source (auto-manages virtualenv + deps)
+uv run cowork-server
+```
 
-### API Design
-The design of the API has also been hardened by removing several unusued endpoints and improving on the existing ones.
+When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed.
 
-For example, the Responses API has been updated to allow for file inputs along with support for an OpenAI-compatible Files API. This alleviates the need for maintaining the /attachments endpoints defined in the orignial server defines a standard way for handling file uploads and attachments across different agents. More information regarding these design updates can be found in the design document linked below.
+### Dev setup helper
 
-Further details regarding this design can be found in this document: [Cowork Server API for Agents](https://docs.google.com/document/d/1YBgr59GoO47wvLtZAO7wbNL8DKrigww_PYeUlcMDgos/edit?usp=sharing).
+```sh
+uv run cowork-dev-setup
+```
+
+Initializes the database and validates configuration.
+
+## Architecture
+
+```
+cowork/
+  api/v1/endpoints/   # FastAPI route handlers
+  services/           # Business logic
+  models/             # SQLModel / DB models
+  schemas/            # Pydantic request/response schemas
+  db/                 # Database session and migrations
+  common/             # Shared utilities, settings
+  harnesses/          # Agent adapters (Anton, Hermes, etc.)
+```
+
+The server is designed to be **agent-agnostic** — core features (projects, conversations, files) are shared across agents, while agent-specific behavior lives in harness adapters. See [docs/DESIGN.md](docs/DESIGN.md) for the full architectural rationale.
+
+## API
+
+All endpoints live under `/api/v1/`. Key resource groups:
+
+| Path | Description |
+|------|-------------|
+| `/health` | Readiness probe |
+| `/projects` | Project CRUD and working-folder management |
+| `/conversations` | Conversation threads and message history |
+| `/responses` | Streaming agent responses (SSE) |
+| `/files` | OpenAI-compatible file uploads |
+| `/schedules` | Recurring task scheduling |
+| `/skills` | Agent skill definitions |
+| `/memory` | Persistent agent memory |
+| `/artifacts` | Agent-produced file previews |
+| `/publish` | Publish HTML artifacts to 4nton.ai |
+| `/connectors` | Third-party service connections and OAuth |
+| `/settings` | User preferences and API keys |
+
+## Configuration
+
+Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
+
+Environment variables fall into two namespaces:
+
+**Server-level** (`COWORK_*`) — control the cowork-server process itself:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COWORK_SERVER_PORT` | `26866` | Server port |
+| `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
+| `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root |
+| `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root |
+| `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
+
+**Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
+
+| Variable | Harness | Description |
+|----------|---------|-------------|
+| `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint |
+| `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
+| `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
+| `HERMES_HOME` / `HERMES_ROOT_DIR` | Hermes | Hermes data root |
+
+In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
+
+## Docs
+
+- [docs/DESIGN.md](docs/DESIGN.md) — Architectural overview and design decisions
+- [docs/MIGRATION.md](docs/MIGRATION.md) — Migration guide from the legacy server
+- [docs/MIGRATION_PROGRESS.md](docs/MIGRATION_PROGRESS.md) — Migration status tracker
+
+## License
+
+See [LICENSE](LICENSE).

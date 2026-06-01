@@ -9,12 +9,23 @@ dependencies = [
     "cryptography>=48.0.0",
     "fastapi>=0.136.1",
     "hermes-agent",
-    "pydantic==2.12.5",
+    "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "uvicorn>=0.47.0",
 ]
+
+[project.scripts]
+cowork-server = "cowork.cli:main"
+cowork-dev-setup = "cowork.cli:dev_setup_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cowork"]
 
 [tool.uv.sources]
 anton = { git = "https://github.com/mindsdb/anton.git" }
