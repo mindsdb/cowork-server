@@ -156,3 +156,10 @@ class ChannelStatusResponse(BaseModel):
 class ChannelReloadResponse(BaseModel):
     channel_type: str
     active: bool
+
+
+class ChannelLifecycleResponse(BaseModel):
+    channel_type: str
+    action: str  # "setup" | "teardown"
+    active: bool
+    detail: str

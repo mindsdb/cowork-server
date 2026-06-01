@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import secrets
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -10,6 +11,12 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
 
+from cowork.channels.lifecycle import (
+    ChannelLifecycle,
+    LifecycleContext,
+    LifecycleError,
+    LifecycleResult,
+)
 from cowork.channels.plugin import (
     ChannelPlugin,
     CredentialField,
@@ -220,6 +227,49 @@ async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
     return TelegramBridge(credentials)
 
 
+async def _setup(ctx: LifecycleContext) -> LifecycleResult:
+    """Register the Telegram webhook: mint a secret_token if absent, call
+    setWebhook with it, then bring the live adapter online."""
+    bot_token = (ctx.credentials.get("bot_token") or "").strip()
+    if not bot_token:
+        raise LifecycleError(400, "telegram bot_token is required before setup")
+    if not ctx.webhook_url:
+        raise LifecycleError(409, "public base URL is not configured; cannot register a webhook")
+
+    secret_token = (ctx.credentials.get("secret_token") or "").strip()
+    if not secret_token:
+        secret_token = secrets.token_urlsafe(32)
+        ctx.persist_credentials({"secret_token": secret_token})
+
+    result = await TelegramBridge._call(
+        bot_token,
+        "setWebhook",
+        {
+            "url": ctx.webhook_url,
+            "secret_token": secret_token,
+            "allowed_updates": ["message"],
+        },
+    )
+    if not result.get("ok"):
+        raise LifecycleError(502, f"telegram setWebhook failed: {result.get('description', 'unknown')}")
+
+    active = await ctx.refresh_adapter()
+    return LifecycleResult(active=active, detail="telegram webhook registered")
+
+
+async def _teardown(ctx: LifecycleContext) -> LifecycleResult:
+    """Unregister the Telegram webhook and drop the live adapter. Credentials
+    are left intact — teardown stops ingress, it does not forget the channel."""
+    bot_token = (ctx.credentials.get("bot_token") or "").strip()
+    if bot_token:
+        try:
+            await TelegramBridge._call(bot_token, "deleteWebhook", {"drop_pending_updates": False})
+        except Exception:
+            log.warning("telegram deleteWebhook failed during teardown")
+    await ctx.remove_adapter()
+    return LifecycleResult(active=False, detail="telegram webhook removed")
+
+
 plugin = ChannelPlugin(
     channel_type=CHANNEL_TYPE,
     display_name="Telegram",
@@ -253,4 +303,5 @@ plugin = ChannelPlugin(
         )
     ),
     webhooks=(WebhookRoute(path="/webhook", methods=("POST",), needs_raw_body=True),),
+    lifecycle=ChannelLifecycle(setup=_setup, teardown=_teardown),
 )

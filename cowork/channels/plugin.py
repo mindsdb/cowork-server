@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from anton.core.dispatch import ChannelAdapter
 
+    from cowork.channels.lifecycle import ChannelLifecycle
+
 
 AdapterFactory = Callable[[Mapping[str, str]], Awaitable["ChannelAdapter | None"]]
 
@@ -79,3 +81,4 @@ class ChannelPlugin:
     webhooks: tuple[WebhookRoute, ...] = ()
     oauth: OAuthSpec | None = None
     connector_spec: dict[str, Any] | None = field(default=None)
+    lifecycle: ChannelLifecycle | None = field(default=None)
