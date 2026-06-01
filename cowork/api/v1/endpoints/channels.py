@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
 from cowork.db.session import get_session
 from cowork.schemas.channels import (
+    BindingCreateRequest,
+    BindingResponse,
+    BindingUpdateRequest,
     ChannelConfigResponse,
     ChannelConfigUpdateRequest,
     ChannelInstallationResponse,
     ChannelReloadResponse,
     ChannelStatusResponse,
     PluginResponse,
+)
+from cowork.services.channel_bindings import (
+    BindingConflictError,
+    BindingNotFoundError,
+    ChannelBindingService,
 )
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
 
@@ -97,3 +106,34 @@ async def reload_channel(channel_type: str, request: Request, session: SessionDe
     if adapters is not None:
         active = await adapters.refresh(channel_type, session=session)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
+
+
+@router.get("/bindings", response_model=list[BindingResponse])
+def list_bindings(session: SessionDep, channel_type: str | None = None) -> list[BindingResponse]:
+    return ChannelBindingService(session).list(channel_type=channel_type)
+
+
+@router.post("/bindings", response_model=BindingResponse, status_code=status.HTTP_201_CREATED)
+def create_binding(body: BindingCreateRequest, session: SessionDep) -> BindingResponse:
+    try:
+        return ChannelBindingService(session).create(body)
+    except BindingConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.patch("/bindings/{binding_id}", response_model=BindingResponse)
+def update_binding(binding_id: UUID, body: BindingUpdateRequest, session: SessionDep) -> BindingResponse:
+    try:
+        return ChannelBindingService(session).update(binding_id, body)
+    except BindingNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.delete("/bindings/{binding_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_binding(binding_id: UUID, session: SessionDep) -> None:
+    if not ChannelBindingService(session).delete(binding_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")
