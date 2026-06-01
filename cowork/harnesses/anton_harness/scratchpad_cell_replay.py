@@ -8,60 +8,41 @@ from typing import Any
 
 from anton.core.backends.base import Cell
 
-# Must match ``minds.schemas.chat.Role`` without importing ``minds.schemas`` (package
-# ``__init__`` pulls FastAPI and more — problematic for tight unit tests).
 _SCRATCHPAD_END = "thought.scratchpad.end"
 _SCRATCHPAD_RESULT = "thought.scratchpad.result"
 
 
-def _first_stream_output(event: dict | None) -> dict | None:
-    if not event:
-        return None
-    output = event.get("response", {}).get("output")
-    if not output:
-        return None
-    return output[0]
-
-
-def _parse_first_content_json(output: dict) -> dict[str, Any] | None:
-    """Parse JSON from the first text block in a streamed output item."""
-    content = output.get("content")
-    if not content:
-        return None
-    raw = (content[0] or {}).get("text")
+def _parse_json(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, str) or not (t := raw.strip()):
         return None
     try:
         data = json.loads(t)
-        if isinstance(data, dict):
-            return data
+        return data if isinstance(data, dict) else None
     except json.JSONDecodeError:
         return None
-    return None
 
 
 def extract_scratchpad_cells_from_message_events(messages: list[Any]) -> list[Cell]:
     """Rebuild `Cell` instances from persisted assistant streaming events.
 
-    Streaming emits ``thought.scratchpad.end`` (tool JSON) *before* progress chunks,
-    then ``thought.scratchpad.result``. Pairing uses pending tool action, not
-    event adjacency (progress breaks ``previous_event`` pairing).
+    Each stored event_data dict has a flat structure with a `thought_role` key
+    and a `content` key carrying the JSON payload for scratchpad events.
     """
     cells: list[Cell] = []
     pending_action: str | None = None
 
     for message in messages:
-        events = getattr(message, "events", None) or []
+        events = getattr(message, "message_events", None) or []
         for event in events:
-            output = _first_stream_output(event)
-            if not output:
+            data = event.event_data if hasattr(event, "event_data") else event
+            if not isinstance(data, dict):
                 continue
-            role = output.get("role")
+            role = data.get("thought_role")
 
             if role == _SCRATCHPAD_END:
-                data = _parse_first_content_json(output)
-                if data:
-                    act = data.get("action")
+                parsed = _parse_json(data.get("content"))
+                if parsed:
+                    act = parsed.get("action")
                     if act == "reset":
                         cells.clear()
                         pending_action = None
@@ -70,7 +51,7 @@ def extract_scratchpad_cells_from_message_events(messages: list[Any]) -> list[Ce
 
             elif role == _SCRATCHPAD_RESULT:
                 if pending_action == "exec":
-                    payload = _parse_first_content_json(output)
+                    payload = _parse_json(data.get("content"))
                     if payload is not None:
                         with contextlib.suppress(TypeError, ValueError):
                             cells.append(Cell(**payload))

@@ -80,12 +80,32 @@ class MatchResponse(BaseModel):
 
 
 class SubmitFormRequest(BaseModel):
-    connector_id: str
+    connector_id: str | None = None
     method: str | None = None
     name: str = ""
     conversation_id: str | None = None
     values: dict[str, Any] = Field(default_factory=dict)
     skipped: list[str] = Field(default_factory=list)
+    # Compat: the current client sends form_id + form_spec instead of
+    # connector_id + method. Derive from these if connector_id is absent.
+    form_id: str | None = None
+    form_spec: dict[str, Any] | None = None
+
+    def resolve_connector_id(self) -> str:
+        if self.connector_id:
+            return self.connector_id
+        if self.form_spec and self.form_spec.get("_connector_id"):
+            return self.form_spec["_connector_id"]
+        if self.form_id:
+            return self.form_id.removesuffix("-connector")
+        raise ValueError("connector_id is required")
+
+    def resolve_method(self) -> str | None:
+        if self.method:
+            return self.method
+        if self.form_spec:
+            return self.form_spec.get("selected_method") or self.form_spec.get("auth_method")
+        return None
 
 
 class SaveConnectionResponse(BaseModel):
@@ -119,3 +139,8 @@ class OAuthStartResponse(BaseModel):
     auth_url: str
     redirect_uri: str
     started_at: str
+
+
+class DisabledConnection(BaseModel):
+    engine: str
+    name: str

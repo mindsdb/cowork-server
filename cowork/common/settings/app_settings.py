@@ -3,6 +3,7 @@ from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
 
 
 class Settings(BaseSettings):
@@ -83,6 +84,15 @@ class OAuthSettings(Settings):
 
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
+
+    port: int = Field(
+        default=int(os.environ.get("COWORK_SERVER_PORT", os.environ.get("SERVER_PORT", 26866))),
+        description="The port to run the server on"
+    )
+    host: str = Field(
+        default=os.environ.get("COWORK_SERVER_HOST", os.environ.get("SERVER_HOST", "127.0.0.1")),
+        description="The host to run the server on"
+    )
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
