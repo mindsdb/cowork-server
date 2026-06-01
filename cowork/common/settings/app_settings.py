@@ -101,6 +101,16 @@ class AppSettings(Settings):
         description="Path to the Fernet master key file used to encrypt sensitive settings",
     )  # MASTER_KEY_PATH
 
+    public_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUBLIC_BASE_URL", "COWORK_SERVER_ORIGIN"),
+        description=(
+            "Public HTTPS base URL of this server (e.g. https://cowork.example.com), "
+            "used to build channel webhook URLs for setWebhook-style registration. "
+            "Empty when the server is not publicly reachable."
+        ),
+    )  # COWORK_PUBLIC_BASE_URL
+
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*

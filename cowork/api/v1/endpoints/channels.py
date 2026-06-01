@@ -14,14 +14,20 @@ from cowork.schemas.channels import (
     ChannelConfigResponse,
     ChannelConfigUpdateRequest,
     ChannelInstallationResponse,
+    ChannelLifecycleResponse,
     ChannelReloadResponse,
     ChannelStatusResponse,
     PluginResponse,
 )
+from cowork.channels.lifecycle import LifecycleError
 from cowork.services.channel_bindings import (
     BindingConflictError,
     BindingNotFoundError,
     ChannelBindingService,
+)
+from cowork.services.channel_lifecycle import (
+    ChannelLifecycleService,
+    LifecycleNotImplementedError,
 )
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
 
@@ -137,3 +143,47 @@ def update_binding(binding_id: UUID, body: BindingUpdateRequest, session: Sessio
 def delete_binding(binding_id: UUID, session: SessionDep) -> None:
     if not ChannelBindingService(session).delete(binding_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")
+
+
+def _lifecycle_service(request: Request, session: Session) -> ChannelLifecycleService:
+    adapters = _live_adapters(request)
+    if adapters is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="channels runtime not initialized",
+        )
+    return ChannelLifecycleService(session, adapters)
+
+
+@router.post("/{channel_type}/setup", response_model=ChannelLifecycleResponse)
+async def setup_channel(channel_type: str, request: Request, session: SessionDep) -> ChannelLifecycleResponse:
+    svc = _lifecycle_service(request, session)
+    try:
+        result = await svc.setup(channel_type)
+    except UnknownChannelError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
+    except LifecycleNotImplementedError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=f"setup not implemented for channel: {channel_type}",
+        )
+    except LifecycleError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    return ChannelLifecycleResponse(channel_type=channel_type, action="setup", active=result.active, detail=result.detail)
+
+
+@router.post("/{channel_type}/teardown", response_model=ChannelLifecycleResponse)
+async def teardown_channel(channel_type: str, request: Request, session: SessionDep) -> ChannelLifecycleResponse:
+    svc = _lifecycle_service(request, session)
+    try:
+        result = await svc.teardown(channel_type)
+    except UnknownChannelError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
+    except LifecycleNotImplementedError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=f"teardown not implemented for channel: {channel_type}",
+        )
+    except LifecycleError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    return ChannelLifecycleResponse(channel_type=channel_type, action="teardown", active=result.active, detail=result.detail)
