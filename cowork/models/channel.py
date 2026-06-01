@@ -39,11 +39,6 @@ class ChannelBinding(BaseSQLModel, table=True):
         default=None,
         description="Optional sub-context (Slack thread, forum post); None = the conversation as a whole",
     )
-    # Non-null mirror of external_thread_id used solely for the uniqueness
-    # constraint: SQLite treats NULLs as distinct, so a nullable
-    # external_thread_id can't stop two whole-channel bindings for the same
-    # group. Derived server-side as ``external_thread_id or "__default__"``;
-    # callers should not set it directly.
     external_thread_key: str = Field(
         default="__default__",
         index=True,
@@ -87,6 +82,16 @@ class ChannelSession(BaseSQLModel, table=True):
 
 class ChannelEvent(BaseSQLModel, table=True):
     __tablename__ = "channel_events"
+    __table_args__ = (
+        sa.Index(
+            "uq_channel_events_inbound_dedupe",
+            "channel_type",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL"),
+            postgresql_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL"),
+        ),
+    )
 
     channel_type: str = Field(index=True, description="Stable adapter name")
     external_message_id: str | None = Field(
