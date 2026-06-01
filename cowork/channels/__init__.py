@@ -16,6 +16,7 @@ from cowork.channels.registry import (
 )
 from cowork.channels.webhooks import (
     SignatureError,
+    WebhookAck,
     WebhookBridge,
     WebhookHandshake,
     build_channel_webhook_router,
@@ -37,6 +38,7 @@ __all__ = [
     "get_registry",
     "load_first_party_plugins",
     "SignatureError",
+    "WebhookAck",
     "WebhookBridge",
     "WebhookHandshake",
     "build_channel_webhook_router",
