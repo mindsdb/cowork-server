@@ -1,16 +1,3 @@
-"""Channel config service — plugins, installations, and credential storage.
-
-Generic over the plugin registry: every channel's config surface is derived
-from its :class:`ChannelPlugin.credentials` schema, so there is no per-channel
-config code. Credentials are stored in the shared ``settings`` key/value table
-under a ``channel.{channel_type}.{field}`` namespace, encrypted when the field
-is marked secret — the same secret mechanism the settings layer uses. Secret
-values are NEVER returned; reads surface ``is_set`` only.
-
-This layer is intentionally Anton-only and harness-agnostic at the data level —
-it knows nothing about which runtime consumes the channel; do not add agent /
-harness selection here.
-"""
 from __future__ import annotations
 
 from sqlmodel import Session, select
@@ -30,8 +17,6 @@ from cowork.schemas.channels import (
     PluginResponse,
 )
 
-# Settings-table namespace for channel credentials. Keeping it distinct from
-# UserSettings keys avoids collisions and makes per-channel cleanup a prefix scan.
 _KEY_PREFIX = "channel."
 
 
@@ -48,7 +33,6 @@ class ChannelConfigService:
         self.session = session
         self.registry = registry if registry is not None else get_registry()
 
-    # -- plugin / installation listing ------------------------------------
 
     def list_plugins(self) -> list[PluginResponse]:
         return [self._plugin_dto(p) for p in self.registry.all()]
@@ -77,11 +61,21 @@ class ChannelConfigService:
             channels=items,
         )
 
-    # -- per-channel config ------------------------------------------------
-
     def get_config(self, channel_type: str) -> ChannelConfigResponse:
         plugin = self._require_plugin(channel_type)
         return self._config_dto(plugin)
+
+    def load_credentials(self, channel_type: str) -> dict[str, str]:
+        """Decrypted credential values for internal runtime use only — building
+        the live adapter. NEVER exposed via the API (get_config masks secrets)."""
+        plugin = self._require_plugin(channel_type)
+        creds: dict[str, str] = {}
+        for field in plugin.credentials.fields:
+            row = self._fetch_setting(_cred_key(channel_type, field.name))
+            if row is None:
+                continue
+            creds[field.name] = decrypt(row.value) if field.secret else row.value
+        return creds
 
     def set_config(self, channel_type: str, values: dict[str, str]) -> ChannelConfigResponse:
         plugin = self._require_plugin(channel_type)
@@ -115,8 +109,6 @@ class ChannelConfigService:
         if removed:
             self.session.commit()
         return removed
-
-    # -- internals ---------------------------------------------------------
 
     def _require_plugin(self, channel_type: str) -> ChannelPlugin:
         plugin = self.registry.get(channel_type)

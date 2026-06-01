@@ -97,6 +97,7 @@ class ChannelEventResponse(BaseModel):
     error: str | None = None
     created_at: datetime | None = None
 
+
 class CredentialFieldSpec(BaseModel):
     """A plugin credential field, as advertised to the UI. No values here."""
 
@@ -150,3 +151,8 @@ class ChannelStatusResponse(BaseModel):
     plugin_count: int
     installation_count: int
     channels: list[ChannelStatusItem]
+
+
+class ChannelReloadResponse(BaseModel):
+    channel_type: str
+    active: bool

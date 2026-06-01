@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+from sqlmodel import select
+
+from anton.core.dispatch import OutboundMessage
+from cowork.channels.registry import PluginRegistry, get_registry
+from cowork.db.session import get_open_session
+from cowork.harnesses.base import get_harness
+from cowork.models.channel import ChannelBinding, ChannelSession
+from cowork.models.conversation import Conversation
+from cowork.models.message import Message as DBMessage
+from cowork.services.channels import ChannelConfigService
+from cowork.services.conversations import ConversationService
+from cowork.services.projects import GENERAL_PROJECT_ID
+
+if TYPE_CHECKING:
+    from sqlmodel import Session
+
+log = logging.getLogger(__name__)
+
+CHANNEL_HARNESS_ID = "anton"
+_FORMATTER_MODEL = "anton"
+_DEFAULT_THREAD_KEY = "__default__"
+
+
+class _KeyedLocks:
+    """Per-key async locks with refcounted cleanup.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._refcounts: dict[str, int] = {}
+        self._guard = asyncio.Lock()
+
+    @asynccontextmanager
+    async def acquire(self, key: str) -> AsyncIterator[None]:
+        async with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            self._refcounts[key] = self._refcounts.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            async with self._guard:
+                self._refcounts[key] -= 1
+                if self._refcounts[key] <= 0:
+                    self._refcounts.pop(key, None)
+                    self._locks.pop(key, None)
+
+
+class LiveAdapterRegistry:
+    """Process-wide cache of live channel adapters keyed by ``channel_type``.
+    """
+
+    def __init__(self, registry: PluginRegistry | None = None) -> None:
+        self._registry = registry if registry is not None else get_registry()
+        self._cache: dict[str, Any] = {}
+
+    def get(self, channel_type: str) -> Any | None:
+        """Live adapter for a channel, or None if not configured/active."""
+        return self._cache.get(channel_type)
+
+    async def refresh(self, channel_type: str, *, session: Session | None = None) -> bool:
+
+        plugin = self._registry.get(channel_type)
+        if plugin is None:
+            self._cache.pop(channel_type, None)
+            return False
+        own_session = session is None
+        s = session or get_open_session()
+        try:
+            creds = ChannelConfigService(s, registry=self._registry).load_credentials(channel_type)
+        finally:
+            if own_session:
+                s.close()
+        try:
+            adapter = await plugin.factory(creds)
+        except Exception:
+            log.exception("failed building live adapter for channel %s", channel_type)
+            adapter = None
+        if adapter is None:
+            self._cache.pop(channel_type, None)
+            return False
+        self._cache[channel_type] = adapter
+        return True
+
+    async def refresh_all(self) -> list[str]:
+        active: list[str] = []
+        for plugin in self._registry.all():
+            if await self.refresh(plugin.channel_type):
+                active.append(plugin.channel_type)
+        return active
+
+    async def remove(self, channel_type: str) -> None:
+
+        adapter = self._cache.pop(channel_type, None)
+        if adapter is not None:
+            try:
+                await adapter.shutdown()
+            except Exception:
+                log.exception("error shutting down channel adapter %s", channel_type)
+
+    async def shutdown(self) -> None:
+        for adapter in list(self._cache.values()):
+            try:
+                await adapter.shutdown()
+            except Exception:
+                log.exception("error shutting down channel adapter")
+        self._cache.clear()
+
+
+class AntonChannelRuntime:
+    """Inbound sink: resolve binding → conversation → run Anton → deliver."""
+
+    def __init__(
+        self,
+        adapters: LiveAdapterRegistry,
+        *,
+        default_project_id: UUID = GENERAL_PROJECT_ID,
+    ) -> None:
+        self._adapters = adapters
+        self._default_project_id = default_project_id
+        self._locks = _KeyedLocks()
+
+    @staticmethod
+    def _lock_key(channel_type: str, event: Any) -> str:
+        thread_key = event.address.thread_id or _DEFAULT_THREAD_KEY
+        return f"{channel_type}:{event.address.platform_id}:{thread_key}"
+
+    async def handle(self, channel_type: str, event: Any) -> None:
+
+        async with self._locks.acquire(self._lock_key(channel_type, event)):
+            await self._handle_locked(channel_type, event)
+
+    async def _handle_locked(self, channel_type: str, event: Any) -> None:
+        session = get_open_session()
+        try:
+            binding = self._resolve_or_create_binding(session, channel_type, event)
+            if not self._should_respond(binding, event):
+                log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
+                return
+            conversation = self._ensure_conversation(session, binding)
+            self._touch_channel_session(session, binding, conversation, event)
+            reply = await self._run_anton(session, conversation, event)
+            if reply and reply.strip():
+                await self._deliver(channel_type, event, reply)
+        finally:
+            session.close()
+
+
+    def _resolve_or_create_binding(self, session: Session, channel_type: str, event: Any) -> ChannelBinding:
+        group_id = event.address.platform_id
+        thread_id = event.address.thread_id
+        thread_key = thread_id or _DEFAULT_THREAD_KEY
+        binding = session.exec(
+            select(ChannelBinding).where(
+                ChannelBinding.channel_type == channel_type,
+                ChannelBinding.external_group_id == group_id,
+                ChannelBinding.external_thread_key == thread_key,
+            )
+        ).first()
+        if binding is not None:
+            return binding
+        binding = ChannelBinding(
+            channel_type=channel_type,
+            external_group_id=group_id,
+            external_thread_id=thread_id,
+            external_thread_key=thread_key,
+            anton_project_id=self._default_project_id,
+            trigger_rule="mention_only" if event.message.is_group else "always",
+        )
+        session.add(binding)
+        session.commit()
+        session.refresh(binding)
+        return binding
+
+    @staticmethod
+    def _should_respond(binding: ChannelBinding, event: Any) -> bool:
+        rule = binding.trigger_rule
+        if rule == "always":
+            return True
+        if rule == "mention_only":
+            return bool(event.message.is_mention)
+        if rule == "regex":
+            pattern = binding.trigger_pattern
+            if not pattern:
+                return False
+            try:
+                return re.search(pattern, str(event.message.content)) is not None
+            except re.error:
+                return False
+        return True
+
+    def _ensure_conversation(self, session: Session, binding: ChannelBinding) -> Conversation:
+        if binding.anton_conversation_id is not None:
+            existing = session.get(Conversation, binding.anton_conversation_id)
+            if existing is not None:
+                return existing
+        topic = f"{binding.channel_type}: {binding.display_name or binding.external_group_id}"[:80]
+        conversation = ConversationService(session).create_conversation(
+            topic=topic,
+            project_id=binding.anton_project_id or self._default_project_id,
+        )
+        binding.anton_conversation_id = conversation.id
+        session.add(binding)
+        session.commit()
+        return conversation
+
+    @staticmethod
+    def _touch_channel_session(
+        session: Session, binding: ChannelBinding, conversation: Conversation, event: Any
+    ) -> None:
+        key = event.address.thread_id or _DEFAULT_THREAD_KEY
+        row = session.exec(
+            select(ChannelSession).where(
+                ChannelSession.binding_id == binding.id,
+                ChannelSession.external_session_key == key,
+            )
+        ).first()
+        now = datetime.now(timezone.utc)
+        if row is None:
+            row = ChannelSession(
+                binding_id=binding.id,
+                external_session_key=key,
+                anton_session_id=str(conversation.id),
+                last_message_at=now,
+            )
+        else:
+            row.last_message_at = now
+        session.add(row)
+        session.commit()
+
+    async def _run_anton(self, session: Session, conversation: Conversation, event: Any) -> str:
+        harness = get_harness(CHANNEL_HARNESS_ID)
+        text = self._event_text(event)
+
+        _ = conversation.messages
+        session.add(DBMessage(conversation_id=conversation.id, role="user", content=text))
+        session.commit()
+
+        collected: list[str] = []
+        events: list[dict] = []
+
+        def event_sink(event_type: str, data: dict) -> None:
+            events.append(data)
+            if event_type == "response.output_text.delta":
+                collected.append(data.get("delta", ""))
+
+        stream = harness.stream_response(
+            conversation=conversation,
+            input=[{"type": "text", "text": text}],
+        )
+        async for _chunk in harness.formatter(stream, _FORMATTER_MODEL, event_sink):
+            pass
+
+        reply = "".join(collected)
+        ConversationService(session).save_assistant_turn(conversation.id, reply, events)
+        return reply
+
+    @staticmethod
+    def _event_text(event: Any) -> str:
+        content = event.message.content
+        return content if isinstance(content, str) else str(content)
+
+    async def _deliver(self, channel_type: str, event: Any, reply: str) -> None:
+        adapter = self._adapters.get(channel_type)
+        if adapter is None:
+            log.warning("channel %s: no live adapter; reply not delivered", channel_type)
+            return
+        await adapter.deliver(OutboundMessage(address=event.address, text=reply))
