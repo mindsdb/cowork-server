@@ -162,8 +162,8 @@ wheels = [
 
 [[package]]
 name = "anton"
-version = "2.26.5.13.1"
-source = { git = "https://github.com/mindsdb/anton.git#d9f15816fccc9a2fe59d03ef119c0b0434879f68" }
+version = "2.26.5.29.3"
+source = { git = "https://github.com/mindsdb/anton.git?tag=v2.26.5.29.3#62de65f0cb11ef87680be17c51d9c7981e124319" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -383,7 +383,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anton", git = "https://github.com/mindsdb/anton.git" },
+    { name = "anton", git = "https://github.com/mindsdb/anton.git?tag=v2.26.5.29.3" },
     { name = "cryptography", specifier = ">=48.0.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
     { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git" },
