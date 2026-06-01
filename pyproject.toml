@@ -28,7 +28,7 @@ build-backend = "hatchling.build"
 packages = ["cowork"]
 
 [tool.uv.sources]
-anton = { git = "https://github.com/mindsdb/anton.git" }
+anton = { git = "https://github.com/mindsdb/anton.git", tag = "v2.26.5.29.3" }
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
 
 [dependency-groups]
