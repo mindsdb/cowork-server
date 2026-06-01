@@ -3,7 +3,7 @@ name = "cowork-server"
 version = "0.1.0"
 description = "FastAPI backend for the Minds Cowork desktop app"
 readme = "README.md"
-license = "Elastic-2.0"
+license = "LicenseRef-Proprietary"
 requires-python = ">=3.12"
 authors = [
     { name = "MindsDB Inc", email = "admin@mindsdb.com" },
