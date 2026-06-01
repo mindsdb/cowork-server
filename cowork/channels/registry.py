@@ -1,16 +1,3 @@
-"""Channel plugin registry + first-party discovery.
-
-The registry holds :class:`ChannelPlugin` descriptors keyed by ``channel_type``.
-First-party plugins live under :mod:`cowork.channels.plugins`; each module
-exposes a module-level ``plugin`` attribute, and :func:`load_first_party_plugins`
-imports every module in that package and registers the ones it finds. Discovery
-is side-effect-free at the contract level — a module is only registered if it
-declares a ``plugin``, so importing the package alone registers nothing.
-
-External entry-point discovery (third-party ``pip``-installed channels) is
-intentionally NOT wired here: loading arbitrary external code into the server
-is a trust boundary deferred to a later, opt-in step.
-"""
 from __future__ import annotations
 
 import importlib
@@ -46,8 +33,6 @@ class PluginRegistry:
         return sorted(self._plugins)
 
 
-# Process-wide default registry. The app wires discovery into it at startup
-# (later slice); tests can construct their own PluginRegistry in isolation.
 default_registry = PluginRegistry()
 
 
@@ -58,10 +43,6 @@ def get_registry() -> PluginRegistry:
 def load_first_party_plugins(registry: PluginRegistry | None = None) -> list[str]:
     """Import every module under :mod:`cowork.channels.plugins` and register
     any module-level ``plugin``.
-
-    Returns the channel types loaded. A module that fails to import, or whose
-    ``plugin`` is not a :class:`ChannelPlugin`, is logged and skipped — one
-    broken plugin must not take down discovery.
     """
     target = registry if registry is not None else default_registry
 
