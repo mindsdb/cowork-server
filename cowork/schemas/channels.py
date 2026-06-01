@@ -96,3 +96,57 @@ class ChannelEventResponse(BaseModel):
     dedupe_key: str | None = None
     error: str | None = None
     created_at: datetime | None = None
+
+class CredentialFieldSpec(BaseModel):
+    """A plugin credential field, as advertised to the UI. No values here."""
+
+    name: str
+    label: str
+    secret: bool
+    required: bool
+    description: str | None = None
+
+
+class PluginResponse(BaseModel):
+    channel_type: str
+    display_name: str
+    credentials: list[CredentialFieldSpec]
+    has_oauth: bool = False
+    webhook_paths: list[str] = []
+
+
+class CredentialValue(BaseModel):
+    """Masked credential state. Secret values are never returned: ``value`` is
+    null for secret fields (only ``is_set`` is meaningful); non-secret fields
+    may echo their stored ``value``."""
+
+    is_set: bool
+    value: str | None = None
+
+
+class ChannelConfigResponse(BaseModel):
+    channel_type: str
+    configured: bool
+    fields: dict[str, CredentialValue]
+
+
+class ChannelConfigUpdateRequest(BaseModel):
+    """Field name → raw value. Only provided fields are written; omitted fields
+    keep their existing stored value (no magic sentinel needed). Secret values
+    are accepted here and stored encrypted, but never returned."""
+
+    values: dict[str, str]
+
+
+class ChannelStatusItem(BaseModel):
+    channel_type: str
+    display_name: str
+    enabled: bool
+    status: InstallationStatus
+    configured: bool
+
+
+class ChannelStatusResponse(BaseModel):
+    plugin_count: int
+    installation_count: int
+    channels: list[ChannelStatusItem]
