@@ -14,6 +14,7 @@ from cowork.schemas.channels import (
     ChannelStatusResponse,
     CredentialFieldSpec,
     CredentialValue,
+    PluginCapabilities,
     PluginResponse,
 )
 
@@ -129,6 +130,9 @@ class ChannelConfigService:
             ],
             has_oauth=plugin.oauth is not None,
             webhook_paths=[w.path for w in plugin.webhooks],
+            capabilities=PluginCapabilities.model_validate(
+                plugin.capabilities, from_attributes=True
+            ),
         )
 
     def _config_dto(self, plugin: ChannelPlugin) -> ChannelConfigResponse:

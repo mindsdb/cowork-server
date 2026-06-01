@@ -70,6 +70,22 @@ class OAuthSpec:
 
 
 @dataclass(frozen=True)
+class ChannelCapabilities:
+    """What a channel supports, for the UI to decide which forms/buttons to show.
+
+    Declared explicitly per plugin (rather than inferred) so the advertised
+    surface is intentional and stable even as internals change.
+    """
+
+    supports_webhook_ingress: bool = False
+    supports_webhook_setup: bool = False
+    supports_teardown: bool = False
+    supports_oauth: bool = False
+    supports_direct_credentials: bool = True
+    supports_custom_ack: bool = False
+
+
+@dataclass(frozen=True)
 class ChannelPlugin:
     """Everything the host needs to expose one channel.
     """
@@ -82,3 +98,4 @@ class ChannelPlugin:
     oauth: OAuthSpec | None = None
     connector_spec: dict[str, Any] | None = field(default=None)
     lifecycle: ChannelLifecycle | None = field(default=None)
+    capabilities: ChannelCapabilities = field(default_factory=ChannelCapabilities)

@@ -18,6 +18,7 @@ from cowork.channels.lifecycle import (
     LifecycleResult,
 )
 from cowork.channels.plugin import (
+    ChannelCapabilities,
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
@@ -304,4 +305,12 @@ plugin = ChannelPlugin(
     ),
     webhooks=(WebhookRoute(path="/webhook", methods=("POST",), needs_raw_body=True),),
     lifecycle=ChannelLifecycle(setup=_setup, teardown=_teardown),
+    capabilities=ChannelCapabilities(
+        supports_webhook_ingress=True,
+        supports_webhook_setup=True,
+        supports_teardown=True,
+        supports_oauth=False,
+        supports_direct_credentials=True,
+        supports_custom_ack=False,
+    ),
 )
