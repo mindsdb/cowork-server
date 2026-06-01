@@ -12,7 +12,7 @@ from cowork.channels.plugin import ChannelPlugin
 from cowork.db.session import get_open_session
 from cowork.services.channel_events import ChannelEventService
 
-_log = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,6 +22,14 @@ class WebhookHandshake:
 
     handled: bool
     response_body: str = ""
+    content_type: str = "text/plain"
+    status_code: int = 200
+
+
+@dataclass
+class WebhookAck:
+    """Optional custom ACK response from a bridge's ``ack_response(events)`` hook."""
+    body: str = ""
     content_type: str = "text/plain"
     status_code: int = 200
 
@@ -78,7 +86,7 @@ async def drain_background_tasks(*, timeout: float = 3.0) -> None:
     try:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
     except asyncio.TimeoutError:
-        _log.warning("%d channel inbound task(s) did not finish within %.1fs", len(tasks), timeout)
+        log.warning("%d channel inbound task(s) did not finish within %.1fs", len(tasks), timeout)
 
 
 def build_channel_webhook_router(
@@ -132,17 +140,17 @@ def _add_webhook_route(
         try:
             bridge.verify_signature(body=body, headers=headers)
         except SignatureError:
-            _log.warning("channel %s webhook signature verification failed", channel_type)
+            log.warning("channel %s webhook signature verification failed", channel_type)
             return Response("invalid signature", status_code=401)
 
         try:
             events = await bridge.parse_inbound(body=body, headers=headers, route_name=route_name)
         except Exception:
-            _log.exception("channel %s parse_inbound failed", channel_type)
+            log.exception("channel %s parse_inbound failed", channel_type)
             return Response("could not parse webhook payload", status_code=400)
 
         _intake_events(channel_type, bridge, events, sink=sink, scheduler=scheduler)
-        return Response(status_code=200)
+        return _success_ack(bridge, events)
 
     router.add_api_route(
         f"/{channel_type}{path}",
@@ -151,6 +159,17 @@ def _add_webhook_route(
         name=f"channel_{channel_type}_webhook_{route_name or 'default'}",
         include_in_schema=False,
     )
+
+
+def _success_ack(bridge: WebhookBridge, events: list[Any]) -> Response:
+    hook = getattr(bridge, "ack_response", None)
+    if hook is not None:
+        ack = hook(events)
+        if ack is not None:
+            return Response(
+                content=ack.body, media_type=ack.content_type, status_code=ack.status_code
+            )
+    return Response(status_code=200)
 
 
 def _intake_events(
@@ -166,15 +185,15 @@ def _intake_events(
     actual sink call happens in the background."""
     session = get_open_session()
     try:
-        log = ChannelEventService(session)
+        channel_log = ChannelEventService(session)
         for event in events:
             key = bridge.dedupe_key(event)
-            if log.is_duplicate_inbound(channel_type, key):
-                _log.info("channel %s dropping duplicate inbound key=%s", channel_type, key)
+            if channel_log.is_duplicate_inbound(channel_type, key):
+                log.info("channel %s dropping duplicate inbound key=%s", channel_type, key)
                 continue
-            event_id = log.record_inbound(channel_type, dedupe_key=key, external_message_id=key)
+            event_id = channel_log.record_inbound(channel_type, dedupe_key=key, external_message_id=key)
             if event_id is None:
-                _log.info("channel %s dropping duplicate inbound (insert race) key=%s", channel_type, key)
+                log.info("channel %s dropping duplicate inbound (insert race) key=%s", channel_type, key)
                 continue
             scheduler(_process_event(channel_type, event, event_id, sink))
     finally:
@@ -186,13 +205,12 @@ async def _process_event(channel_type: str, event: Any, event_id: Any, sink: Inb
     since it runs after the request's session is closed."""
     session = get_open_session()
     try:
-        log = ChannelEventService(session)
+        channel_log = ChannelEventService(session)
         try:
             await sink(channel_type, event)
-            log.set_status(event_id, "routed")
+            channel_log.set_status(event_id, "routed")
         except Exception as exc:
-            # Store only the exception type — a message could carry secrets.
-            log.set_status(event_id, "failed", error=type(exc).__name__)
-            _log.exception("channel %s inbound sink failed", channel_type)
+            channel_log.set_status(event_id, "failed", error=type(exc).__name__)
+            log.exception("channel %s inbound sink failed", channel_type)
     finally:
         session.close()
