@@ -184,6 +184,14 @@ def build_llm_client():
                 api_key=key.get_secret_value(),
                 base_url=settings.minds_url,
             )
+        if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            key = settings.openai_api_key
+            if key is None:
+                raise ValueError("OpenAI API key is not configured")
+            return OpenAIProvider(
+                api_key=key.get_secret_value(),
+                base_url=settings.openai_base_url or "https://api.openai.com/v1",
+            )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
         if cls is None:
