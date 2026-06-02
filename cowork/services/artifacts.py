@@ -246,7 +246,7 @@ def serve_url_for(path: str | Path) -> str:
         if not rel.parts:
             return ""
         rel_str = "/".join(quote(part) for part in rel.parts)
-        return f"/api/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
+        return f"/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
     return ""
 
 
