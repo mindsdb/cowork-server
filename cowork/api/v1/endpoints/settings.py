@@ -244,6 +244,10 @@ def _maybe_migrate_env(svc: SettingService) -> None:
     for env_key, setting_key in _ENV_TO_SETTING.items():
         val = dotenv.get(env_key)
         if val:
+            # The .env uses hyphens (openai-compatible, minds-cloud) but
+            # the Provider enum uses underscores (openai_compatible, minds_cloud).
+            if setting_key.endswith("_provider"):
+                val = val.replace("-", "_")
             try:
                 svc.upsert_setting(setting_key, val)
             except Exception as e:
