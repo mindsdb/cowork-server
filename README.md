@@ -84,6 +84,7 @@ Environment variables fall into two namespaces:
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
+| `COWORK_SERVER_DISABLE_AUTOUPDATE` | *(unset)* | Set to `1` or `true` to skip the PyPI update check on startup |
 
 **Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
 

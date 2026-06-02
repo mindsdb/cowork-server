@@ -15,7 +15,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "anton-agent>=2.26.5,<3",
+    "anton-agent>=2.26.5.29.4,<3",
     "cryptography>=48.0.0",
     "fastapi>=0.136.1",
     "hermes-agent>=0.15.2,<1",
