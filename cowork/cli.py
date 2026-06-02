@@ -7,6 +7,9 @@ from cowork.dev_setup import run_dev_setup
 
 
 def main() -> None:
+    from cowork.updater import maybe_self_update
+    maybe_self_update()
+
     settings = get_app_settings()
     port = settings.port
     host = settings.host
