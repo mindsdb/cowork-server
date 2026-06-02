@@ -348,13 +348,12 @@ wheels = [
 
 [[package]]
 name = "cowork-server"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "anton" },
     { name = "cryptography" },
     { name = "fastapi" },
-    { name = "hermes-agent" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-multipart" },
@@ -362,18 +361,24 @@ dependencies = [
     { name = "uvicorn" },
 ]
 
+[package.optional-dependencies]
+hermes = [
+    { name = "hermes-agent" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "anton", git = "https://github.com/mindsdb/anton.git" },
     { name = "cryptography", specifier = ">=48.0.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
-    { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git" },
-    { name = "pydantic", specifier = "==2.12.5" },
+    { name = "hermes-agent", marker = "extra == 'hermes'", git = "https://github.com/NousResearch/hermes-agent.git" },
+    { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pydantic-settings", specifier = ">=2.14.1" },
     { name = "python-multipart", specifier = ">=0.0.28" },
     { name = "sqlmodel", specifier = ">=0.0.38" },
     { name = "uvicorn", specifier = ">=0.47.0" },
 ]
+provides-extras = ["hermes"]
 
 [[package]]
 name = "croniter"
