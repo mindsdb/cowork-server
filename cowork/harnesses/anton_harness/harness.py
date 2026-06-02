@@ -248,18 +248,13 @@ class AntonHarness:
         # back to the "anthropic" default, causing a TypeError when no
         # ANTHROPIC_API_KEY is set. Loading the file here ensures settings
         # always reflect the current config, even after onboarding.
-        # Skip server-operational vars that the Electron host controls.
-        # TODO: Is all of this necessary?
-        # _SERVER_MANAGED_KEYS = {"ANTON_SERVER_PORT", "ANTON_SERVER_HOST", "ANTON_PROJECTS_DIR"}
-        # _user_env = Path.home() / ".anton" / ".env"
-        # if _user_env.is_file():
-        #     for _line in _user_env.read_text(encoding="utf-8").splitlines():
-        #         _line = _line.strip()
-        #         if _line and not _line.startswith("#") and "=" in _line:
-        #             _k, _, _v = _line.partition("=")
-        #             _k = _k.strip()
-        #             if _k not in _SERVER_MANAGED_KEYS:
-        #                 os.environ[_k] = _v.strip().strip('"').strip("'")
+        _user_env = Path.home() / ".anton" / ".env"
+        if _user_env.is_file():
+            for _line in _user_env.read_text(encoding="utf-8").splitlines():
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _, _v = _line.partition("=")
+                    os.environ[_k.strip()] = _v.strip().strip('"').strip("'")
 
         settings = AntonSettings()
         settings.resolve_workspace(str(base))
