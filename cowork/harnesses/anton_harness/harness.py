@@ -276,10 +276,10 @@ class AntonHarness:
             if db_val is not None:
                 setattr(settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
 
-        # URLs
+        # URLs (skip empty strings so AntonSettings.model_post_init derivations are preserved)
         for attr in ("minds_url", "openai_base_url"):
             db_val = getattr(user, attr, None)
-            if db_val is not None:
+            if db_val:
                 setattr(settings, attr, db_val)
         # if model:
         #     # Minds Cloud sentinels (`_reason_`, `_code_`) only resolve at
