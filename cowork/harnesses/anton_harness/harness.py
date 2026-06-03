@@ -391,7 +391,7 @@ class AntonHarness:
             data_vault=data_vault,
             initial_history=[message.model_dump() for message in history],
             # history_store=history_store,
-            session_id=conversation.id,
+            session_id=str(conversation.id),
             proactive_dashboards=settings.proactive_dashboards,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
