@@ -40,9 +40,7 @@ SessionDep = Annotated[Session, Depends(get_session)]
 
 @router.get("/", response_model=list[SettingResponse])
 def list_settings(session: SessionDep) -> list[SettingResponse]:
-    svc = SettingService(session)
-    _maybe_migrate_env(svc)
-    return svc.list_settings()
+    return SettingService(session).list_settings()
 
 
 @router.put("/{key}", response_model=SettingResponse)
@@ -199,58 +197,5 @@ def write_raw_settings(body: _RawSettingsBody):
     return {"ok": True}
 
 
-# ── .env → DB migration (one-time) ──────────────────────────────────
-
-_ENV_TO_SETTING: dict[str, str] = {
-    "ANTON_ANTHROPIC_API_KEY": "anthropic_api_key",
-    "ANTON_OPENAI_API_KEY": "openai_api_key",
-    "ANTON_MINDS_API_KEY": "minds_api_key",
-    "ANTON_MINDS_URL": "minds_url",
-    "ANTON_PLANNING_PROVIDER": "planning_provider",
-    "ANTON_PLANNING_MODEL": "planning_model",
-    "ANTON_CODING_PROVIDER": "coding_provider",
-    "ANTON_CODING_MODEL": "coding_model",
-}
-
-_migrated = False
-
-
-def _maybe_migrate_env(svc: SettingService) -> None:
-    """One-time migration: seed DB from .env if the settings table is empty."""
-    global _migrated
-    if _migrated:
-        return
-    _migrated = True
-
-    if svc._fetch_all_rows():
-        return
-
-    if not _ENV_PATH.exists():
-        return
-
-    dotenv: dict[str, str] = {}
-    try:
-        for line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            dotenv[key.strip()] = val.strip().strip('"').strip("'")
-    except Exception:
-        return
-
-    import logging
-    logger = logging.getLogger(__name__)
-    for env_key, setting_key in _ENV_TO_SETTING.items():
-        val = dotenv.get(env_key)
-        if val:
-            # The .env uses hyphens (openai-compatible, minds-cloud) but
-            # the Provider enum uses underscores (openai_compatible, minds_cloud).
-            if setting_key.endswith("_provider"):
-                val = val.replace("-", "_")
-            try:
-                svc.upsert_setting(setting_key, val)
-            except Exception as e:
-                logger.debug("Skipping env migration for %s: %s", env_key, e)
-
-    logger.info("Migrated settings from .env to database")
+# NOTE: .env → DB migration now runs at server startup via
+# cowork.migrations.migrate_env_to_db(), called from dev_setup.
