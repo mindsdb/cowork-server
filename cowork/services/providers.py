@@ -180,9 +180,12 @@ def build_llm_client():
             key = settings.minds_api_key
             if key is None:
                 raise ValueError("MindsHub API key is not configured")
+            base = settings.minds_url.rstrip("/")
+            if not base.endswith("/v1"):
+                base = f"{base}/api/v1"
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
-                base_url=settings.minds_url,
+                base_url=base,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             key = settings.openai_api_key
