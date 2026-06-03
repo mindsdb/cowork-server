@@ -33,6 +33,56 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# ── Artifact reconciliation helpers ───────────────────────────────
+
+def _snapshot_artifacts(artifacts_root: Path) -> dict:
+    """Take a pre-turn snapshot of the artifacts directory."""
+    try:
+        from anton.core.artifacts import snapshot_dir
+        return snapshot_dir(artifacts_root)
+    except Exception:
+        logger.debug("Could not snapshot artifacts dir", exc_info=True)
+        return {}
+
+
+def _reconcile_artifacts(
+    artifacts_root: Path,
+    snapshot_before: dict,
+    conversation_id: str,
+    conversation_title: str | None,
+    turn_index: int,
+    user_prompt: str,
+) -> None:
+    """Diff artifacts and record provenance for any that changed."""
+    try:
+        from anton.core.artifacts import ArtifactStore, diff_snapshots, snapshot_dir
+        from anton.core.artifacts.snapshot import _files_by_artifact
+    except Exception:
+        logger.debug("Anton artifact module unavailable; skipping reconcile", exc_info=True)
+        return
+    if not artifacts_root.exists():
+        return
+    after = snapshot_dir(artifacts_root)
+    changed = diff_snapshots(snapshot_before, after)
+    if not changed:
+        return
+    grouped = _files_by_artifact(changed)
+    store = ArtifactStore(artifacts_root)
+    for slug, files in grouped.items():
+        try:
+            store.record_turn(
+                slug,
+                conversation_id=conversation_id,
+                conversation_title=conversation_title,
+                turn_index=turn_index,
+                summary=user_prompt[:240] if user_prompt else "",
+                files_touched=files,
+            )
+            store.rescan_files(slug)
+        except Exception:
+            logger.debug("Failed to record artifact provenance for slug=%s", slug, exc_info=True)
+
+
 class ResponsesHandler:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -84,6 +134,17 @@ class ResponsesHandler:
         self.session.commit()
         self.session.refresh(user_message)
 
+        # Pre-turn artifact snapshot so post-turn reconciliation can detect changes.
+        artifacts_root: Path | None = None
+        artifact_snapshot: dict = {}
+        project = getattr(conversation, "project", None)
+        if project is not None and getattr(project, "path", None):
+            artifacts_root = Path(project.path) / ".anton" / "artifacts"
+            artifact_snapshot = _snapshot_artifacts(artifacts_root)
+
+        turn_index = sum(1 for m in conversation.messages if m.role == "user")
+        user_prompt = self._prompt_text(harness_input)
+
         # The model provided as part of the request is ignored for now, because the Cowork
         # UI does not currently provide a way to specify it when making each request.
         # It is only extracted from the values specified in the settings.
@@ -95,16 +156,26 @@ class ResponsesHandler:
             if request.disabled_connections else None,
         )
 
-        if request.stream:
-            return self._stream(stream, conversation.id, request.model)
+        reconcile_ctx = {
+            "artifacts_root": artifacts_root,
+            "snapshot_before": artifact_snapshot,
+            "conversation_id": str(conversation.id),
+            "conversation_title": getattr(conversation, "topic", None),
+            "turn_index": turn_index,
+            "user_prompt": user_prompt,
+        }
 
-        return await self._collect(stream, conversation.id, request.model, str(user_message.id))
+        if request.stream:
+            return self._stream(stream, conversation.id, request.model, reconcile_ctx)
+
+        return await self._collect(stream, conversation.id, request.model, str(user_message.id), reconcile_ctx)
 
     async def _stream(
         self,
         stream,
         conversation_id: UUID,
         model: str,
+        reconcile_ctx: dict | None = None,
     ) -> AsyncGenerator[str, None]:
         collected_text: list[str] = []
         collected_events: list[dict] = []
@@ -134,6 +205,7 @@ class ResponsesHandler:
 
         logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
         self._save_assistant_turn(conversation_id, "".join(collected_text), collected_events)
+        self._maybe_reconcile_artifacts(reconcile_ctx)
 
     async def _collect(
         self,
@@ -141,6 +213,7 @@ class ResponsesHandler:
         conversation_id: UUID,
         model: str,
         output_item_id: str,
+        reconcile_ctx: dict | None = None,
     ) -> Response:
         collected_text: list[str] = []
         collected_events: list[dict] = []
@@ -155,6 +228,7 @@ class ResponsesHandler:
 
         assistant_text = "".join(collected_text)
         self._save_assistant_turn(conversation_id, assistant_text, collected_events)
+        self._maybe_reconcile_artifacts(reconcile_ctx)
 
         return Response(
             status=ResponseStatus.completed,
@@ -169,6 +243,22 @@ class ResponsesHandler:
         events: list[dict],
     ) -> None:
         ConversationService(self.session).save_assistant_turn(conversation_id, text, events)
+
+    @staticmethod
+    def _maybe_reconcile_artifacts(ctx: dict | None) -> None:
+        if ctx is None or ctx.get("artifacts_root") is None:
+            return
+        try:
+            _reconcile_artifacts(
+                artifacts_root=ctx["artifacts_root"],
+                snapshot_before=ctx["snapshot_before"],
+                conversation_id=ctx["conversation_id"],
+                conversation_title=ctx.get("conversation_title"),
+                turn_index=ctx["turn_index"],
+                user_prompt=ctx.get("user_prompt", ""),
+            )
+        except Exception:
+            logger.debug("Post-turn artifact reconciliation failed", exc_info=True)
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
         blocks: list[dict] = []
