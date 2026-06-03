@@ -241,28 +241,46 @@ class AntonHarness:
         from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
         base = Path(conversation.project.path)
-        # Reload ~/.anton/.env into os.environ before building settings.
-        # AntonSettings caches its env_file list at module import time — if the
-        # server started before ~/.anton/.env existed (first-run onboarding),
-        # the file is not in the cached list and planning_provider would fall
-        # back to the "anthropic" default, causing a TypeError when no
-        # ANTHROPIC_API_KEY is set. Loading the file here ensures settings
-        # always reflect the current config, even after onboarding.
-        # Skip server-operational vars that the Electron host controls.
-        # TODO: Is all of this necessary?
-        # _SERVER_MANAGED_KEYS = {"ANTON_SERVER_PORT", "ANTON_SERVER_HOST", "ANTON_PROJECTS_DIR"}
-        # _user_env = Path.home() / ".anton" / ".env"
-        # if _user_env.is_file():
-        #     for _line in _user_env.read_text(encoding="utf-8").splitlines():
-        #         _line = _line.strip()
-        #         if _line and not _line.startswith("#") and "=" in _line:
-        #             _k, _, _v = _line.partition("=")
-        #             _k = _k.strip()
-        #             if _k not in _SERVER_MANAGED_KEYS:
-        #                 os.environ[_k] = _v.strip().strip('"').strip("'")
+
+        # Build AntonSettings for workspace/path resolution (fields only
+        # in AntonSettings like memory_dir, context_dir, artifacts_dir).
+        # Then overlay the DB-authoritative values for all fields that
+        # overlap between AntonSettings and UserSettings (API keys,
+        # provider, model, memory flags, etc.) so the DB is the single
+        # source of truth — no .env reload needed.
+        from cowork.common.settings.user_settings import get_user_settings
+        from pydantic import SecretStr
 
         settings = AntonSettings()
         settings.resolve_workspace(str(base))
+
+        user = get_user_settings()
+        for attr in (
+            "planning_provider", "planning_model",
+            "coding_provider", "coding_model",
+            "memory_enabled", "memory_mode",
+            "episodic_memory", "proactive_dashboards",
+            "publish_url",
+        ):
+            db_val = getattr(user, attr, None)
+            if db_val is None:
+                continue
+            # Provider enum -> string value for AntonSettings
+            if hasattr(db_val, "value"):
+                db_val = db_val.value
+            setattr(settings, attr, db_val)
+
+        # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
+        for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
+            db_val = getattr(user, attr, None)
+            if db_val is not None:
+                setattr(settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
+
+        # URLs (skip empty strings so AntonSettings.model_post_init derivations are preserved)
+        for attr in ("minds_url", "openai_base_url"):
+            db_val = getattr(user, attr, None)
+            if db_val:
+                setattr(settings, attr, db_val)
         # if model:
         #     # Minds Cloud sentinels (`_reason_`, `_code_`) only resolve at
         #     # the openai-compatible router. If the active provider is
@@ -396,7 +414,7 @@ class AntonHarness:
             data_vault=data_vault,
             initial_history=[message.model_dump() for message in history],
             # history_store=history_store,
-            session_id=conversation.id,
+            session_id=str(conversation.id),
             proactive_dashboards=settings.proactive_dashboards,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
