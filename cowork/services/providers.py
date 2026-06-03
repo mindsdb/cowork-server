@@ -182,7 +182,8 @@ def build_llm_client():
                 raise ValueError("MindsHub API key is not configured")
             base = settings.minds_url.rstrip("/")
             if not base.endswith("/v1"):
-                base = f"{base}/api/v1"
+                # mdb.ai uses /api/v1; api.mindshub.ai uses /v1
+                base = f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=base,
