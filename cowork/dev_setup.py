@@ -29,7 +29,7 @@ import cowork.models.skill  # noqa: F401
 
 
 def run_dev_setup() -> None:
-    """Create local schema and seed required base rows for development."""
+    """Create local schema, seed required base rows, and run migrations."""
     settings = get_app_settings()
     db_uri = settings.database.uri
 
@@ -58,3 +58,9 @@ def run_dev_setup() -> None:
                 )
             )
             session.commit()
+
+    # Migrate .env settings to DB (one-time, idempotent).
+    from cowork.migrations import migrate_env_to_db
+
+    with SQLSession(engine) as session:
+        migrate_env_to_db(session)
