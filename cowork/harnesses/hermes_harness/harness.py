@@ -214,6 +214,12 @@ class HermesHarness:
         def thinking_callback(text: str) -> None:
             _put({"type": "thought.progress", "subtype": "thinking", "content": text})
 
+        # Derive artifacts root from the conversation's project.
+        artifacts_root: Path | None = None
+        project = getattr(conversation, "project", None)
+        if project is not None and getattr(project, "path", None):
+            artifacts_root = Path(project.path) / ".anton" / "artifacts"
+
         history = [
             msg.to_openai_message().model_dump()
             for msg in conversation.messages
@@ -233,6 +239,7 @@ class HermesHarness:
                     reasoning_callback=reasoning_callback,
                     thinking_callback=thinking_callback,
                     disabled_connections=disabled_connections or [],
+                    artifacts_root=artifacts_root,
                 )
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -271,6 +278,7 @@ class HermesHarness:
         reasoning_callback=None,
         thinking_callback=None,
         disabled_connections: list[dict] | None = None,
+        artifacts_root: Path | None = None,
     ) -> dict:
         from pathlib import Path
 
@@ -283,6 +291,16 @@ class HermesHarness:
         from cowork.common.settings.user_settings import Provider
 
         register_connector_tools()
+
+        # Register artifact tools and set the artifacts root for this turn.
+        from cowork.harnesses.hermes_harness.tools import (
+            register_artifact_tools,
+            set_artifacts_root,
+        )
+        if artifacts_root is not None:
+            artifacts_root.mkdir(parents=True, exist_ok=True)
+            set_artifacts_root(artifacts_root)
+            register_artifact_tools()
 
         # Sync Hermes config.yaml with the user's cowork provider/key settings.
         # AIAgent validates config.yaml at init time (before using constructor
@@ -309,6 +327,24 @@ class HermesHarness:
 
         datasource_context = _build_datasource_context(vault, disabled_keys)
 
+        # Build artifact context for the system prompt so the LLM knows
+        # how to use the artifact tools.
+        artifact_context = ""
+        if artifacts_root is not None:
+            artifact_context = (
+                "\n\n## Artifacts\n"
+                f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, apps, etc.) "
+                f"live under `{str(artifacts_root)}/`.\n"
+                "Workflow:\n"
+                "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
+                "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
+                "  2. To MODIFY an existing artifact, call `list_artifacts()` to find its slug, "
+                "then `open_artifact(slug)` to get the path again.\n"
+                "  3. Use absolute paths so the file always lands in the right place.\n"
+            )
+
+        combined_context = datasource_context + artifact_context
+
         if settings.planning_provider == Provider.MINDS_CLOUD:
             from cowork.services.providers import minds_chat_base_url
             agent = AIAgent(
@@ -318,7 +354,7 @@ class HermesHarness:
                 model=model,
                 api_key=settings.minds_api_key.get_secret_value(),
                 quiet_mode=True,
-                ephemeral_system_prompt=datasource_context,
+                ephemeral_system_prompt=combined_context,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
@@ -345,7 +381,7 @@ class HermesHarness:
                 model=model,
                 api_key=api_key,
                 quiet_mode=True,
-                ephemeral_system_prompt=datasource_context,
+                ephemeral_system_prompt=combined_context,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 reasoning_callback=reasoning_callback,
@@ -364,3 +400,4 @@ class HermesHarness:
             )
         finally:
             vault.clear_ds_env()
+            set_artifacts_root(None)
