@@ -289,6 +289,62 @@ def build_llm_client():
     )
 
 
+# ── Dynamic model list from Minds agent ──────────────────────────────
+
+_MINDS_MODELS_TTL = 300.0       # successful fetch
+_MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
+_minds_models_cache: dict[str, tuple[float, Optional[list[str]]]] = {}
+
+
+async def fetch_minds_models(base_url: str, api_key: str) -> Optional[list[str]]:
+    """Fetch supported model ids from the agent's OpenAI-compatible
+    ``/v1/models`` endpoint. Returns the model-id list, or None on any
+    failure so the caller falls back to the static list."""
+    base = (base_url or "").rstrip("/")
+    if not base or not api_key:
+        return None
+
+    now = time.monotonic()
+    cached = _minds_models_cache.get(base)
+    if cached:
+        ts, val = cached
+        ttl = _MINDS_MODELS_TTL if val else _MINDS_MODELS_FAIL_TTL
+        if (now - ts) < ttl:
+            return val
+
+    def _remember(val: Optional[list[str]]) -> Optional[list[str]]:
+        _minds_models_cache[base] = (time.monotonic(), val)
+        return val
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(6.0), follow_redirects=True
+        ) as client:
+            r = await client.get(
+                f"{base}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if r.status_code >= 400:
+            logger.debug("minds /models fetch returned HTTP %s", r.status_code)
+            return _remember(None)
+        data = r.json()
+    except Exception as exc:
+        logger.debug("minds /models fetch failed: %s", exc)
+        return _remember(None)
+
+    # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return _remember(None)
+    ids = [
+        str(row.get("id")).strip()
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    ]
+    ids = [i for i in ids if i]
+    return _remember(ids or None)
+
+
 def resolve_stored_key(settings: UserSettings, ptype: str) -> str:
     """Get the stored (unmasked) API key for a UI provider type."""
     from cowork.common.settings.user_settings import UI_TYPE_TO_PROVIDER

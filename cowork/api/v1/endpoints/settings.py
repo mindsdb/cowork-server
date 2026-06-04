@@ -25,12 +25,12 @@ from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
 from cowork.services.providers import (
     check_config_status,
     fetch_minds_models,
+    minds_chat_base_url,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
 )
 from cowork.services.settings import SettingService
-from cowork.common.settings.app_settings import RECOMMENDED_MODELS, RECOMMENDED_PAIR
 
 router = APIRouter()
 
@@ -159,27 +159,30 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
 
-@router.get("/recommended-models")
-async def recommended_models(session: SessionDep):
-    """Per-provider model picker options for the Settings UI.
+# ── Recommended models (with live Minds overlay) ─────────────────────
 
-    Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
-    the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
-    when a Minds key + URL are configured. Falls back to the static list
-    (the `latest:*` aliases) when the key is absent or the endpoint can't
-    be reached."""
-    recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
-    pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
+
+@router.get("/models")
+async def recommended_models(session: SessionDep):
+    """Return recommended models per provider, overlaying the live Minds
+    agent ``/v1/models`` list when available."""
+    from cowork.common.settings.user_settings import UserSettings
 
     s = SettingService(session).load()
-    if s.minds_api_key is not None and s.minds_url:
-        live = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value()
-        )
-        if live:
-            recommended["minds-cloud"] = live
+    models = {k: list(v) for k, v in UserSettings.RECOMMENDED_MODELS.items()}
 
-    return {"recommendedModels": recommended, "recommendedPair": pair}
+    minds_key = s.minds_api_key
+    if minds_key is not None:
+        key_str = minds_key.get_secret_value() if isinstance(minds_key, SecretStr) else str(minds_key)
+        base = minds_chat_base_url(s.minds_url or "https://api.mindshub.ai")
+        live = await fetch_minds_models(base, key_str)
+        if live:
+            models["minds-cloud"] = live
+
+    return {
+        "recommendedModels": models,
+        "recommendedPair": {k: list(v) for k, v in UserSettings.RECOMMENDED_PAIR.items()},
+    }
 
 
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
