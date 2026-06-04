@@ -28,6 +28,10 @@ class Message(BaseSQLModel, table=True):
         sa_column=Column(JSON),
         description="Content of the message as JSON",
     )
+    harness: str | None = Field(
+        default=None,
+        description="Harness/agent that generated this message (e.g. 'anton', 'hermes')",
+    )
 
     message_events: list["MessageEvent"] = Relationship(
         sa_relationship_kwargs={"order_by": "MessageEvent.sequence_number"}

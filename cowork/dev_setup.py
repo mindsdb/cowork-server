@@ -44,6 +44,16 @@ def run_dev_setup() -> None:
     engine = get_engine(db_uri)
     SQLModel.metadata.create_all(engine)
 
+    # Lightweight migrations for columns added after initial schema.
+    # create_all doesn't alter existing tables, so we add missing columns here.
+    import sqlalchemy as sa
+    with engine.connect() as conn:
+        inspector = sa.inspect(engine)
+        msg_cols = {c["name"] for c in inspector.get_columns("messages")}
+        if "harness" not in msg_cols:
+            conn.execute(sa.text("ALTER TABLE messages ADD COLUMN harness VARCHAR"))
+            conn.commit()
+
     with SQLSession(engine) as session:
         if session.get(Project, GENERAL_PROJECT_ID) is None:
             project_root = Path(settings.project.root_dir)
