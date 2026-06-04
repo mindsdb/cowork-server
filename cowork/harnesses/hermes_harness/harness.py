@@ -310,10 +310,11 @@ class HermesHarness:
         datasource_context = _build_datasource_context(vault, disabled_keys)
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
+            from cowork.services.providers import minds_chat_base_url
             agent = AIAgent(
                 session_id=session_id,
                 provider="openai",
-                base_url=settings.minds_url,
+                base_url=minds_chat_base_url(settings.minds_url),
                 model=model,
                 api_key=settings.minds_api_key.get_secret_value(),
                 quiet_mode=True,

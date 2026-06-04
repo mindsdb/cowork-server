@@ -15,6 +15,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def minds_chat_base_url(minds_url: str) -> str:
+    """Derive the OpenAI-compatible chat base URL from a raw minds_url.
+
+    mdb.ai needs /api/v1, api.mindshub.ai needs /v1.  If the URL
+    already ends with /v1, return it as-is.
+    """
+    base = minds_url.rstrip("/")
+    if base.endswith("/v1"):
+        return base
+    return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
+
+
 # ── Config readiness ─────────────────────────────────────────────────
 
 
@@ -182,7 +194,15 @@ def build_llm_client():
                 raise ValueError("MindsHub API key is not configured")
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
-                base_url=settings.minds_url,
+                base_url=minds_chat_base_url(settings.minds_url),
+            )
+        if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            key = settings.openai_api_key
+            if key is None:
+                raise ValueError("OpenAI API key is not configured")
+            return OpenAIProvider(
+                api_key=key.get_secret_value(),
+                base_url=settings.openai_base_url or "https://api.openai.com/v1",
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
