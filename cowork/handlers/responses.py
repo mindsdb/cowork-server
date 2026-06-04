@@ -119,14 +119,18 @@ class ResponsesHandler:
             event_count += 1
             if event_count <= 3 or "response.completed" in sse_string:
                 logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
-            # Inject conversation_id into the response.created event so the
-            # client learns the canonical (UUID) id for this conversation.
+            # Inject conversation_id and harness into the response.created
+            # event so the client learns the canonical id and which agent
+            # generated this response.
             if "response.created" in sse_string and "conversation_id" not in sse_string:
                 try:
                     lines = sse_string.strip().split("\n")
                     data_line = next(l for l in lines if l.startswith("data:"))
                     payload = json.loads(data_line[5:])
                     payload["conversation_id"] = str(conversation_id)
+                    harness_id = getattr(self.harness, 'id', None)
+                    if harness_id:
+                        payload["harness"] = harness_id
                     sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
                 except Exception:
                     pass
@@ -168,7 +172,10 @@ class ResponsesHandler:
         text: str,
         events: list[dict],
     ) -> None:
-        ConversationService(self.session).save_assistant_turn(conversation_id, text, events)
+        harness_id = getattr(self.harness, 'id', None)
+        ConversationService(self.session).save_assistant_turn(
+            conversation_id, text, events, harness=harness_id,
+        )
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
         blocks: list[dict] = []

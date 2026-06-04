@@ -135,6 +135,7 @@ class ConversationService:
         conversation_id: UUID,
         text: str,
         events: list[dict],
+        harness: str | None = None,
     ) -> None:
         """Persist an assistant message and its streaming events."""
         if not text:
@@ -143,6 +144,7 @@ class ConversationService:
             conversation_id=conversation_id,
             role="assistant",
             content=text,
+            harness=harness,
         )
         self.session.add(assistant_msg)
         self.session.commit()
@@ -171,11 +173,14 @@ class ConversationService:
                 .where(MessageEvent.message_id == message.id)
                 .order_by(MessageEvent.sequence_number)
             ).all()
-            result.append({
+            item = {
                 "id": message.id,
                 "role": message.role,
                 "content": message.content,
                 "created_at": message.created_at,
                 "events": [e.event_data for e in events],
-            })
+            }
+            if message.harness:
+                item["harness"] = message.harness
+            result.append(item)
         return result
