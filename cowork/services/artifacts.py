@@ -244,7 +244,7 @@ def _project_artifacts_base(project_name: str) -> Path | None:
 
 
 def serve_url_for(path: str | Path) -> str:
-    """Origin-relative `/v1/artifacts/serve/...` URL for a file under a
+    """Origin-relative `/api/v1/artifacts/serve/...` URL for a file under a
     project's `.anton/artifacts` tree. Returns "" when the path isn't
     inside such a tree."""
     try:
@@ -260,7 +260,7 @@ def serve_url_for(path: str | Path) -> str:
         if not rel.parts:
             return ""
         rel_str = "/".join(quote(part) for part in rel.parts)
-        return f"/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
+        return f"/api/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
     return ""
 
 

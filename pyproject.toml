@@ -1,14 +1,24 @@
 [project]
 name = "cowork-server"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.1.3"
+description = "FastAPI backend for the Minds Cowork desktop app"
 readme = "README.md"
+license = "LicenseRef-Proprietary"
 requires-python = ">=3.12"
+authors = [
+    { name = "MindsDB Inc", email = "admin@mindsdb.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+    "Operating System :: OS Independent",
+]
 dependencies = [
-    "anton",
+    "anton-agent>=2.26.5.29.4,<3",
     "cryptography>=48.0.0",
     "fastapi>=0.136.1",
-    "hermes-agent",
+    "hermes-agent>=0.15.2,<1",
     "httpx>=0.27",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
@@ -16,6 +26,11 @@ dependencies = [
     "sqlmodel>=0.0.38",
     "uvicorn>=0.47.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mindsdb/cowork-server"
+Repository = "https://github.com/mindsdb/cowork-server"
+Issues = "https://github.com/mindsdb/cowork-server/issues"
 
 [project.scripts]
 cowork-server = "cowork.cli:main"
@@ -28,6 +43,3 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
 
-[tool.uv.sources]
-anton = { git = "https://github.com/mindsdb/anton.git" }
-hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
