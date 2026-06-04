@@ -25,6 +25,27 @@ _NAME_MAX_LEN = 48
 _NAME_FALLBACK = "untitled-project"
 
 
+def safe_project_path(project: Project | None) -> Path | None:
+    """Return a normalized project path only when it stays under the project root."""
+    if project is None or not project.path or "\x00" in project.path:
+        return None
+
+    try:
+        root = Path(get_app_settings().project.root_dir).expanduser().resolve(strict=False)
+        path = Path(project.path).expanduser().resolve(strict=False)
+        path.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return path
+
+
+def artifact_root_for_project(project: Project | None) -> Path | None:
+    project_path = safe_project_path(project)
+    if project_path is None:
+        return None
+    return project_path / ".anton" / "artifacts"
+
+
 class ProjectService:
     def __init__(self, session: Session) -> None:
         self.session = session

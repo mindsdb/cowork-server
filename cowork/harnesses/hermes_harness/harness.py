@@ -13,6 +13,7 @@ from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_strea
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.skill import Skill
+from cowork.services.projects import artifact_root_for_project
 
 # Redirect all Hermes data (skills, sessions, config) to ~/.cowork/hermes before
 # run_agent is first imported, so its module-level get_hermes_home() call lands here.
@@ -214,11 +215,7 @@ class HermesHarness:
         def thinking_callback(text: str) -> None:
             _put({"type": "thought.progress", "subtype": "thinking", "content": text})
 
-        # Derive artifacts root from the conversation's project.
-        artifacts_root: Path | None = None
-        project = getattr(conversation, "project", None)
-        if project is not None and getattr(project, "path", None):
-            artifacts_root = Path(project.path) / ".anton" / "artifacts"
+        artifacts_root = artifact_root_for_project(getattr(conversation, "project", None))
 
         history = [
             msg.to_openai_message().model_dump()
@@ -295,11 +292,11 @@ class HermesHarness:
         # Register artifact tools and set the artifacts root for this turn.
         from cowork.harnesses.hermes_harness.tools import (
             register_artifact_tools,
+            reset_artifacts_root,
             set_artifacts_root,
         )
         if artifacts_root is not None:
             artifacts_root.mkdir(parents=True, exist_ok=True)
-            set_artifacts_root(artifacts_root)
             register_artifact_tools()
 
         # Sync Hermes config.yaml with the user's cowork provider/key settings.
@@ -392,6 +389,7 @@ class HermesHarness:
 
             agent = AIAgent(**kwargs)
 
+        artifacts_root_token = set_artifacts_root(artifacts_root)
         try:
             return agent.run_conversation(
                 user_message=prompt,
@@ -400,4 +398,4 @@ class HermesHarness:
             )
         finally:
             vault.clear_ds_env()
-            set_artifacts_root(None)
+            reset_artifacts_root(artifacts_root_token)

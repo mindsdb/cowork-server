@@ -24,7 +24,7 @@ from cowork.schemas.responses import (
 )
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
-from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
+from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService, artifact_root_for_project
 from cowork.services.skills import SkillService
 
 
@@ -137,9 +137,8 @@ class ResponsesHandler:
         # Pre-turn artifact snapshot so post-turn reconciliation can detect changes.
         artifacts_root: Path | None = None
         artifact_snapshot: dict = {}
-        project = getattr(conversation, "project", None)
-        if project is not None and getattr(project, "path", None):
-            artifacts_root = Path(project.path) / ".anton" / "artifacts"
+        artifacts_root = artifact_root_for_project(getattr(conversation, "project", None))
+        if artifacts_root is not None:
             artifact_snapshot = _snapshot_artifacts(artifacts_root)
 
         turn_index = sum(1 for m in conversation.messages if m.role == "user")

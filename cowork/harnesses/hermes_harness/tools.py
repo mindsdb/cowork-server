@@ -1,29 +1,32 @@
 from __future__ import annotations
 
+from contextvars import ContextVar, Token
 import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Module-level artifacts root, set by the harness before each turn so
-# the registered tool handlers can locate the project's artifact store.
-_artifacts_root: Optional[Path] = None
+# Context-local artifacts root, set by the harness for each Hermes turn.
+_artifacts_root: ContextVar[Path | None] = ContextVar("hermes_artifacts_root", default=None)
 
 
-def set_artifacts_root(root: Path | None) -> None:
+def set_artifacts_root(root: Path | None) -> Token:
     """Called by HermesHarness.stream_response() before launching AIAgent."""
-    global _artifacts_root
-    _artifacts_root = root
+    return _artifacts_root.set(root)
+
+
+def reset_artifacts_root(token: Token) -> None:
+    _artifacts_root.reset(token)
 
 
 def _get_artifact_store():
     """Return an ArtifactStore for the current project, or None."""
-    if _artifacts_root is None:
+    root = _artifacts_root.get()
+    if root is None:
         return None
     from anton.core.artifacts import ArtifactStore
-    return ArtifactStore(_artifacts_root)
+    return ArtifactStore(root)
 
 
 # ── Connector tool handlers ───────────────────────────────────────
