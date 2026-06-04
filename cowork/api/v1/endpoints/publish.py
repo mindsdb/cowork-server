@@ -18,6 +18,7 @@ router = APIRouter()
 
 class _PublishBody(BaseModel):
     path: str
+    password: str | None = None
 
 
 @router.get("/")
@@ -28,7 +29,7 @@ async def list_publishable_endpoint():
 @router.post("/")
 async def publish_artifact(req: _PublishBody):
     try:
-        return _publish(req.path)
+        return _publish(req.path, password=req.password)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:

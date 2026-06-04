@@ -215,6 +215,30 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
     return ""
 
 
+def _published_access_for(folder: Path, primary: Path | None) -> dict:
+    """Owner-side access state for the primary file, from `.published.json`.
+
+    Returns {"accessProtected": bool, "accessPassword": str}. The plaintext
+    password is owner-only — `.published.json` never enters the published
+    bundle — and powers the in-app eye-reveal.
+    """
+    out: dict[str, object] = {"accessProtected": False, "accessPassword": ""}
+    if primary is None:
+        return out
+    published_index = folder / ".published.json"
+    if not published_index.is_file():
+        return out
+    try:
+        pmap = json.loads(published_index.read_text(encoding="utf-8"))
+        entry = pmap.get(primary.name)
+        if isinstance(entry, dict) and entry.get("requires_password"):
+            out["accessProtected"] = True
+            out["accessPassword"] = entry.get("access_password", "") or ""
+    except Exception:
+        pass
+    return out
+
+
 def _project_artifacts_base(project_name: str) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
     maps to a registered project. Returns None for unknown projects or
@@ -423,6 +447,7 @@ def list_artifacts(project_path: str | None = None) -> list[dict]:
             "path": primary_path,
             "primary": meta.get("primary") or None,
             "publishedUrl": _published_url_for(folder, primary),
+            **_published_access_for(folder, primary),
             "serveUrl": serve_url_for(primary_path),
             "_sortTs": sort_ts,
         })
@@ -457,9 +482,14 @@ def mount_preview(path: Path) -> dict:
     _PREVIEW_MOUNTS[token] = parent
 
     published_url = ""
+    access_protected = False
+    access_password = ""
     entry = _load_published_map(parent).get(path.name)
     if isinstance(entry, dict):
         published_url = entry.get("url", "") or ""
+        if entry.get("requires_password"):
+            access_protected = True
+            access_password = entry.get("access_password", "") or ""
 
     return {
         "token": token,
@@ -467,6 +497,8 @@ def mount_preview(path: Path) -> dict:
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
         "serveUrl": serve_url_for(path),
         "publishedUrl": published_url,
+        "accessProtected": access_protected,
+        "accessPassword": access_password,
     }
 
 
