@@ -281,6 +281,28 @@ class AntonHarness:
             db_val = getattr(user, attr, None)
             if db_val:
                 setattr(settings, attr, db_val)
+        # Minds Cloud sentinels (`_reason_`, `_code_`) and the `latest:*`
+        # alias namespace only resolve at the openai-compatible router.
+        # If the user switched providers but an old saved preference still
+        # references one of these, use a sensible default for the active
+        # provider instead of forwarding a Minds-only name (which 404s).
+        model = settings.planning_model
+        is_minds_only = (
+            (model.startswith("_") and model.endswith("_"))
+            or model.startswith("latest:")
+        )
+        if is_minds_only and settings.planning_provider != "openai-compatible":
+            from cowork.common.settings.user_settings import UserSettings, Provider
+            default_model = UserSettings.PLANNING_MODEL_DEFAULTS.get(
+                Provider(settings.planning_provider),
+                "claude-sonnet-4-6",
+            )
+            logger.warning(
+                "Ignoring Minds-Cloud-only model %r — active planning_provider is %r. "
+                "Using default model %r.",
+                model, settings.planning_provider, default_model,
+            )
+            settings.planning_model = default_model
 
         workspace = Workspace(base)
         workspace.initialize()
