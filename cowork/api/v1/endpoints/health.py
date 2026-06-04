@@ -1,8 +1,17 @@
+from importlib.metadata import version, PackageNotFoundError
+
 from fastapi import APIRouter
 
 from cowork.common.settings.user_settings import get_user_settings
 
 router = APIRouter()
+
+
+def _pkg_version(name: str) -> str | None:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
 
 
 # Health endpoint — the Electron app and dev-web.mjs probe this
@@ -16,5 +25,7 @@ def health() -> dict:
         "status": "ok",
         "anton_available": True,
         "mode": "anton",
+        "server_version": _pkg_version("cowork-server"),
+        "anton_version": _pkg_version("anton-agent"),
         **settings.config_status,
     }
