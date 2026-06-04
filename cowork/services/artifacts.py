@@ -223,6 +223,31 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
     return ""
 
 
+def _published_access_for(folder: Path, primary: Path | None) -> dict:
+    """Owner-side access state for the primary file, from `.published.json`.
+
+    Returns {"accessProtected": bool, "accessPassword": str}. The plaintext
+    password is owner-only — `.published.json` never enters the published
+    bundle — and powers the in-app eye-reveal. Callers must only return
+    this to the artifact's owner (the local/authenticated session).
+    """
+    out = {"accessProtected": False, "accessPassword": ""}
+    if primary is None:
+        return out
+    published_index = folder / ".published.json"
+    if not published_index.is_file():
+        return out
+    try:
+        pmap = json.loads(published_index.read_text(encoding="utf-8"))
+        entry = pmap.get(primary.name)
+        if isinstance(entry, dict) and entry.get("requires_password"):
+            out["accessProtected"] = True
+            out["accessPassword"] = entry.get("access_password", "") or ""
+    except Exception:
+        pass
+    return out
+
+
 def _project_artifacts_base(project_name: str) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
     maps to a registered project. Returns None for unknown projects or
@@ -285,11 +310,17 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     return list(matches.values())
 
 
-def resolve_artifact_path(raw_path: str) -> Path | None:
+def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
     Returns None if invalid, or the resolved Path if found.
     Raises ValueError with a message for 400/404 cases.
+
+    When `allow_dir` is set, an absolute path that resolves to an artifact
+    *root directory* (one carrying `metadata.json`) is also accepted — used
+    by publish/unpublish so a folder-based artifact can be addressed by its
+    folder. The relative-path branch stays file-only (the client always
+    sends absolute folder paths).
     """
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
@@ -309,6 +340,8 @@ def resolve_artifact_path(raw_path: str) -> Path | None:
                 continue
             if resolved.is_file():
                 return resolved
+            if allow_dir and resolved.is_dir() and (resolved / "metadata.json").is_file():
+                return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
     matches = _candidate_relative_artifacts(raw_path)
@@ -317,6 +350,45 @@ def resolve_artifact_path(raw_path: str) -> Path | None:
     if len(matches) > 1:
         raise ValueError("Artifact path matches multiple project artifact roots; pass an absolute path")
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
+
+
+def _artifact_root_for(path: Path) -> Path:
+    """Climb from an artifact file to the folder that holds its
+    `metadata.json` — the artifact root.
+
+    The primary file isn't always at the root: backend+frontend apps
+    keep their frontend in a `static/` subdir (so the backend can mount
+    it with `StaticFiles`), which puts the primary one level below the
+    root. `path.parent` then points at `static/`, where there's no
+    `metadata.json`, and callers that look there miss the backend port
+    entirely. We walk up until we find the dir carrying `metadata.json`,
+    bounded by the registered artifact container dirs
+    (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
+    climbing into the rest of the disk. Falls back to `path.parent`.
+    """
+    containers = {str(d.resolve()) for d in _scan_artifact_dirs()}
+    current = path.parent.resolve()
+    while True:
+        if (current / "metadata.json").is_file():
+            return current
+        # Stop at a container root (its direct children are the artifact
+        # roots — it has no metadata.json of its own) or the fs root.
+        if str(current) in containers or current.parent == current:
+            return path.parent.resolve()
+        current = current.parent
+
+
+def _fullstack_types() -> frozenset[str]:
+    """The artifact types anton's publisher bundles as fullstack apps.
+
+    Imported lazily so publish/preview degrade to static-HTML-only
+    behaviour if the anton package is unavailable, rather than 500ing.
+    """
+    try:
+        from anton.publisher import FULLSTACK_ARTIFACT_TYPES
+        return frozenset(FULLSTACK_ARTIFACT_TYPES)
+    except Exception:
+        return frozenset()
 
 
 def reveal_in_file_manager(path: Path) -> None:
@@ -372,6 +444,9 @@ def list_artifacts(project_path: str | None = None) -> list[dict]:
             "path": primary_path,
             "primary": meta.get("primary") or None,
             "publishedUrl": _published_url_for(folder, primary),
+            # Owner-side access state (lock badge + eye-reveal). accessPassword
+            # is the plaintext, returned only to the owner's own session.
+            **_published_access_for(folder, primary),
             "serveUrl": serve_url_for(primary_path),
             "_sortTs": sort_ts,
         })
@@ -408,13 +483,17 @@ async def mount_preview(path: Path) -> dict:
         the absolute proxyUrl pointing at our forwarder.
     """
     parent = path.parent.resolve()
-    token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
+    # The artifact root (where metadata.json lives) is not always the
+    # primary file's parent — fullstack apps keep their frontend in a
+    # `static/` subdir. Resolve it explicitly for all backend lookups so
+    # we read the `port` from the root, not from `static/`.
+    root = _artifact_root_for(path)
 
-    # Backend+frontend artifacts: detect them by a `port` field in
-    # metadata.json. The iframe will load through our proxy endpoint
-    # instead of preview-asset.
+    # Backend+frontend artifacts: detect them by a `port` field in the
+    # root's metadata.json. The iframe will load through our proxy
+    # endpoint instead of preview-asset.
     backend_port: int | None = None
-    metadata_path = parent / "metadata.json"
+    metadata_path = root / "metadata.json"
     if metadata_path.is_file():
         try:
             meta = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -425,29 +504,36 @@ async def mount_preview(path: Path) -> dict:
             backend_port = None
 
     if backend_port is not None:
-        # Proxy mode. Register the dir so the proxy endpoint can look
-        # it up by token, then auto-launch the backend if dead. Returns
-        # without `proxyUrl` — the route layer fills it in using the
-        # incoming Request URL so the absolute URL matches whatever
-        # host/scheme the client used to reach us.
-        _PREVIEW_MOUNTS[token] = parent
+        # Proxy mode. Register the artifact root (where metadata.json +
+        # the live port live) so the proxy endpoint reads a current port
+        # by token, then auto-launch the backend if dead. Returns without
+        # `proxyUrl` — the route layer fills it in using the incoming
+        # Request URL so the absolute URL matches whatever host/scheme
+        # the client used to reach us.
+        root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+        _PREVIEW_MOUNTS[root_token] = root
         running, launch_detail, current_port = await _ensure_backend_running(
-            parent, backend_port
+            root, backend_port
         )
         return {
             "kind": "proxy",
-            "token": token,
-            "artifactDir": str(parent),
+            "token": root_token,
+            "artifactDir": str(root),
             "port": current_port if running else backend_port,
             "backendRunning": running,
             "launchError": "" if running else launch_detail,
-            "publishedUrl": "",
+            # Fullstack apps publish from the artifact root, `.published.json`
+            # keyed by the primary file name — surface the published state so
+            # the viewer shows the "Published" pill for backend artifacts too.
+            "publishedUrl": _published_url_for(root, path),
+            **_published_access_for(root, path),
         }
 
     # Static (HTML) branch — same behaviour as before, with an explicit
     # `kind` discriminator so the client doesn't have to infer.
     if path.suffix.lower() != ".html":
         raise ValueError("Preview mount is only available for HTML artifacts")
+    token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
 
     published_url = ""
@@ -468,6 +554,7 @@ async def mount_preview(path: Path) -> dict:
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
         "serveUrl": serve_url_for(path),
         "publishedUrl": published_url,
+        **_published_access_for(parent, path),
     }
 
 
@@ -476,9 +563,16 @@ def get_preview_mount(token: str) -> Path | None:
 
 
 def html_artifacts() -> list[dict]:
-    """List every HTML file under every project's artifacts tree for publish."""
+    """List every HTML file under every project's artifacts tree for publish.
+
+    Fullstack apps keep their pages inside `static/`; they're surfaced as a
+    single entry per artifact root (titled by the root's metadata), not one
+    row per page.
+    """
     out = []
     seen: set[str] = set()
+    seen_roots: set[str] = set()
+    fullstack_types = _fullstack_types()
     for art_root in _scan_artifact_dirs():
         if not art_root.exists():
             continue
@@ -486,19 +580,34 @@ def html_artifacts() -> list[dict]:
             key = str(path.resolve())
             if key in seen:
                 continue
+
+            # Group fullstack apps by their artifact root — one entry per app.
+            artifact_root = _artifact_root_for(path)
+            meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
+            if (meta or {}).get("type") in fullstack_types:
+                root_key = str(artifact_root.resolve())
+                if root_key in seen_roots:
+                    continue
+                seen_roots.add(root_key)
+                primary_hint = meta.get("primary") or ""
+                entry_path = (artifact_root / primary_hint) if primary_hint else path
+                if not entry_path.is_file():
+                    entry_path = path
+                seen.add(str(entry_path.resolve()))
+                out.append({
+                    "title": meta.get("name") or artifact_root.name.replace("_", " ").replace("-", " ").title(),
+                    "path": str(entry_path),
+                    "bytes": entry_path.stat().st_size if entry_path.is_file() else 0,
+                    "publishedUrl": _published_url_for(artifact_root, entry_path),
+                })
+                continue
+
             seen.add(key)
-            published_path = path.parent / ".published.json"
-            published: dict = {}
-            if published_path.is_file():
-                try:
-                    published = json.loads(published_path.read_text(encoding="utf-8")).get(path.name, {})
-                except Exception:
-                    published = {}
             out.append({
                 "title": path.stem.replace("_", " ").replace("-", " ").title(),
                 "path": str(path),
                 "bytes": path.stat().st_size,
-                "publishedUrl": published.get("url", "") if isinstance(published, dict) else "",
+                "publishedUrl": _published_url_for(path.parent, path),
             })
     return out[:40]
 
@@ -598,6 +707,36 @@ async def _launch_backend_locked(
         return False, "Artifact is not in a registered project.", 0
 
     pool = WorkspaceScopedPool(str(project_root))
+
+    # Inject the secrets of datasources the artifact declared in metadata.json
+    # into the backend subprocess only — NOT the cowork server's global
+    # os.environ. The backend is a separate subprocess, so we build an
+    # explicit env mapping and let the launcher merge it for the spawn.
+    extra_env: dict[str, str] = {}
+    try:
+        meta = _load_metadata(artifact_dir) or {}
+        datasources = meta.get("datasources") or []
+        if datasources:
+            from anton.core.datasources.data_vault import LocalDataVault
+
+            vault = LocalDataVault()
+            for ds in datasources:
+                engine, name = ds.get("engine"), ds.get("name")
+                if not engine or not name:
+                    continue
+                env = vault.env_for(engine, name)
+                if env is None:
+                    logger.warning(
+                        "Datasource %s/%s declared by artifact %s not found in vault — skipping",
+                        engine, name, slug,
+                    )
+                    continue
+                extra_env.update(env)
+    except Exception:
+        logger.warning(
+            "Could not build datasource env for backend launch of %s", slug, exc_info=True
+        )
+
     # anton's default health_timeout is 10s — too short for artifacts
     # that do slow IO (HTTP fetches with retry/backoff, large model
     # loads, etc.) before binding their port. The launcher would
@@ -610,6 +749,7 @@ async def _launch_backend_locked(
         artifact_folder=artifact_dir,
         scratchpad_pool=pool,
         tracked_backends=_LAUNCHED_BACKENDS,
+        extra_env=extra_env,
         health_timeout=45.0,
     )
     if isinstance(result, str):

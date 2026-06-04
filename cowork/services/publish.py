@@ -15,7 +15,15 @@ from typing import Any
 from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import get_user_settings
-from cowork.services.artifacts import html_artifacts, resolve_artifact_path
+from cowork.services.artifacts import (
+    _artifact_root_for,
+    _fullstack_types,
+    _load_metadata,
+    _pick_primary,
+    _user_files,
+    html_artifacts,
+    resolve_artifact_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +78,42 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _resolve_publish_target(artifact: Path) -> tuple[Path, Path, str, bool]:
+    """Decide what to publish given a resolved artifact path (file OR dir).
+
+    Folder-based artifacts are addressed by their folder; legacy loose-HTML
+    (and chat-bubble / Utilities-list) artifacts by their file. In both cases:
+      - fullstack (metadata.json type ∈ FULLSTACK_ARTIFACT_TYPES) → publish
+        the artifact *directory* (anton bundles backend.py + static/ +
+        requirements.txt only when handed a dir), `.published.json` at root;
+      - static → publish the single primary *file* (anton's `_zip_html`
+        renames it to index.html + pulls referenced siblings; handing it a
+        dir would over-bundle metadata.json/data and skip the rename),
+        `.published.json` in that file's parent.
+    The map is always keyed by the primary file name — matching how
+    `_published_url_for` / `list_artifacts` read it back.
+
+    Returns (publish_target, published_dir, published_key, is_fullstack).
+    """
+    if artifact.is_dir():
+        # Folder addressed directly — its primary file lives inside.
+        artifact_root = artifact
+        meta = _load_metadata(artifact_root) or {}
+        primary = _pick_primary(artifact_root, _user_files(artifact_root), primary_hint=meta.get("primary"))
+    else:
+        # File addressed directly — it *is* the primary; climb to its root.
+        artifact_root = _artifact_root_for(artifact)
+        meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
+        primary = artifact
+
+    if (meta or {}).get("type") in _fullstack_types():
+        key = primary.name if primary else "index.html"
+        return artifact_root, artifact_root, key, True
+    if primary:
+        return primary, primary.parent, primary.name, False
+    return artifact_root, artifact_root, "index.html", False
+
+
 def list_publishable() -> dict:
     settings = get_user_settings()
     state = _load_state()
@@ -81,14 +125,18 @@ def list_publishable() -> dict:
     }
 
 
-def publish_artifact(raw_path: str) -> dict:
+def publish_artifact(raw_path: str, password: str | None = None) -> dict:
     settings = get_user_settings()
     api_key = _secret_str(settings.minds_api_key)
     if not api_key:
         raise ValueError("Configure your Minds API key in Settings before publishing")
 
-    artifact = resolve_artifact_path(raw_path)
-    if artifact.suffix.lower() != ".html":
+    # The request path is either the artifact folder (folder-based
+    # artifacts) or a single file (legacy loose-HTML / chat-bubble / the
+    # Utilities per-page list). `_resolve_publish_target` normalizes both.
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(artifact)
+    if not is_fullstack and publish_target.suffix.lower() != ".html":
         raise ValueError("Only HTML artifacts can be published")
 
     try:
@@ -96,25 +144,36 @@ def publish_artifact(raw_path: str) -> dict:
     except Exception as exc:
         raise RuntimeError("Anton publisher is unavailable") from exc
 
-    published_json = artifact.parent / ".published.json"
+    published_json = published_dir / ".published.json"
     published_map: dict[str, Any] = {}
     if published_json.is_file():
         try:
             published_map = json.loads(published_json.read_text(encoding="utf-8"))
         except Exception:
             published_map = {}
-    previous = published_map.get(artifact.name)
+    previous = published_map.get(published_key)
     report_id = previous.get("report_id") if isinstance(previous, dict) else None
+
+    # Resolve access state. A non-empty password publishes (or keeps) the
+    # artifact password-protected; empty/None publishes it public. Bump
+    # pwd_version whenever the password value changes so access cookies
+    # issued for the old password stop validating in the viewer.
+    password = (password or "").strip() or None
+    prev_password = previous.get("access_password") if isinstance(previous, dict) else None
+    prev_version = previous.get("pwd_version", 0) if isinstance(previous, dict) else 0
+    pwd_version = (prev_version + 1) if password and password != prev_password else (prev_version or 1)
 
     publish_url = settings.publish_url or "https://4nton.ai"
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
         result = publish(
-            artifact,
+            publish_target,
             api_key=api_key,
             report_id=report_id,
             publish_url=publish_url,
             ssl_verify=ssl_verify,
+            password=password,
+            pwd_version=pwd_version,
         )
     except Exception as exc:
         logger.exception("Publishing failed")
@@ -124,17 +183,23 @@ def publish_artifact(raw_path: str) -> dict:
     returned_report_id = result.get("report_id", "")
     if returned_report_id:
         history_item = {
-            "artifact": str(artifact),
-            "artifactName": artifact.name,
+            "artifact": str(publish_target),
+            "artifactName": published_key,
             "url": view_url,
             "reportId": returned_report_id,
             "publishedAt": _utc_now_iso(),
         }
-        published_map[artifact.name] = {
+        entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", ""),
+            "requires_password": bool(password),
         }
+        if password:
+            # Owner-side only — .published.json never enters the bundle.
+            entry["access_password"] = password
+            entry["pwd_version"] = pwd_version
+        published_map[published_key] = entry
         try:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
         except Exception:
@@ -143,7 +208,12 @@ def publish_artifact(raw_path: str) -> dict:
         state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
         _save_state(state)
 
-    return {"status": "ok", "url": view_url, "result": {k: v for k, v in result.items() if k != "file_payload"}}
+    return {
+        "status": "ok",
+        "url": view_url,
+        "accessProtected": bool(password),
+        "result": {k: v for k, v in result.items() if k != "file_payload"},
+    }
 
 
 def unpublish_artifact(raw_path: str) -> dict:
@@ -152,8 +222,11 @@ def unpublish_artifact(raw_path: str) -> dict:
     if not api_key:
         raise ValueError("Configure your Minds API key in Settings before unpublishing")
 
-    artifact = resolve_artifact_path(raw_path)
-    published_json = artifact.parent / ".published.json"
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    # Mirror publish: resolve the same .published.json location + key
+    # (primary file name) whether a folder or a file was passed.
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError("Artifact has no publish record")
 
@@ -162,7 +235,7 @@ def unpublish_artifact(raw_path: str) -> dict:
     except Exception as exc:
         raise RuntimeError("Could not read publish record") from exc
 
-    entry = published_map.get(artifact.name)
+    entry = published_map.get(published_key)
     identifier = None
     if isinstance(entry, dict):
         identifier = entry.get("report_id") or entry.get("last_md5") or None
@@ -191,7 +264,7 @@ def unpublish_artifact(raw_path: str) -> dict:
             logger.exception("Unpublishing failed (identifier=%s)", identifier)
             raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
-    published_map.pop(artifact.name, None)
+    published_map.pop(published_key, None)
     try:
         if published_map:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
