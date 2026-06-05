@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import re
@@ -22,6 +23,7 @@ from cowork.models.message import Message as DBMessage
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
+from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.skills import SkillService
 
@@ -193,7 +195,7 @@ class AntonChannelRuntime:
             try:
                 conversation = self._ensure_conversation(session, binding)
                 self._touch_channel_session(session, binding, conversation, event)
-                reply, used_tools = await self._run_anton(session, conversation, event)
+                reply, used_tools = await self._run_anton(session, conversation, event, adapter)
             finally:
                 if typing is not None:
                     typing.cancel()
@@ -294,14 +296,19 @@ class AntonChannelRuntime:
         session.add(row)
         session.commit()
 
-    async def _run_anton(self, session: Session, conversation: Conversation, event: Any) -> tuple[str, bool]:
+    async def _run_anton(
+        self, session: Session, conversation: Conversation, event: Any, adapter: Any = None
+    ) -> tuple[str, bool]:
         """Run one channel turn; returns the reply text and whether tools ran."""
         harness = get_harness(CHANNEL_HARNESS_ID)
         await harness.sync_skills(SkillService(session).list_skills())
         text = self._event_text(event)
+        blocks = await self.build_input_blocks(session, adapter, event, text)
 
         _ = conversation.messages
-        session.add(DBMessage(conversation_id=conversation.id, role="user", content=text))
+        names = [a.filename for a in (event.message.attachments or [])]
+        content = text or (f"[attachments: {', '.join(names)}]" if names else "")
+        session.add(DBMessage(conversation_id=conversation.id, role="user", content=content))
         session.commit()
 
         collected: list[str] = []
@@ -314,7 +321,7 @@ class AntonChannelRuntime:
 
         stream = harness.stream_response(
             conversation=conversation,
-            input=[{"type": "text", "text": text}],
+            input=blocks,
         )
         async for _chunk in harness.formatter(stream, _FORMATTER_MODEL, event_sink):
             pass
@@ -329,6 +336,35 @@ class AntonChannelRuntime:
     def _event_text(event: Any) -> str:
         content = event.message.content
         return content if isinstance(content, str) else str(content)
+
+    async def build_input_blocks(self, session: Session, adapter: Any, event: Any, text: str) -> list[dict]:
+        """Harness input from the inbound event: stored media become image/file
+        blocks (same shapes the responses handler builds), text rides last."""
+        blocks: list[dict] = []
+        fetch = getattr(adapter, "fetch_attachment", None) if adapter is not None else None
+        for attachment in (event.message.attachments or []):
+            data = attachment.data
+            if data is None and callable(fetch):
+                data = await fetch(attachment)
+            if not data:
+                continue
+            stored = FileService(session).create_file_from_bytes(
+                filename=attachment.filename,
+                content_type=attachment.mime_type,
+                data=data,
+                purpose="channel",
+            )
+            if (attachment.mime_type or "").startswith("image/"):
+                blocks.append({"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": attachment.mime_type,
+                    "data": base64.standard_b64encode(data).decode("ascii"),
+                }})
+            else:
+                blocks.append({"type": "file", "path": stored.path, "filename": stored.filename})
+        if text or not blocks:
+            blocks.append({"type": "text", "text": text})
+        return blocks
 
     async def _deliver(self, channel_type: str, event: Any, reply: str) -> None:
         adapter = self._adapters.get(channel_type)
