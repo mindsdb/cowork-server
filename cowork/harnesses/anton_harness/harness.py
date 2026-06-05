@@ -8,7 +8,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import (
-    FileInputBlock, TextInputBlock, MemoryScope, register
+    FileInputBlock, ProposedToolCall, TextInputBlock, ToolGate, MemoryScope, register
 )
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
 from cowork.models.conversation import Conversation
@@ -20,6 +20,22 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+DENIED_TOOL_RESULT = "Denied: the operator declined this action. Do not retry it; continue without it."
+
+
+def apply_tool_gate(session, tool_gate: ToolGate) -> None:
+    """Wrap the session's tool dispatch so every call awaits the gate first.
+    Instance-level override — anton's ToolRegistry has no native gate hook yet."""
+    registry = session.tool_registry
+    original = registry.dispatch_tool
+
+    async def gated_dispatch(chat_session, tool_name, tc_input):
+        if not await tool_gate(ProposedToolCall(tool_name=tool_name, tool_input=dict(tc_input or {}))):
+            return DENIED_TOOL_RESULT
+        return await original(chat_session, tool_name, tc_input)
+
+    registry.dispatch_tool = gated_dispatch
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -169,12 +185,15 @@ class AntonHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        tool_gate: ToolGate | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
             )
+            if tool_gate is not None:
+                apply_tool_gate(session, tool_gate)
             async for event in session.turn_stream(self._to_anton_input(input)):
                 yield event
         finally:

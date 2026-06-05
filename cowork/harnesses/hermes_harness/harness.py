@@ -189,7 +189,12 @@ class HermesHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        tool_gate=None,
     ) -> AsyncIterator[dict]:
+        if tool_gate is not None:
+            # hermes-agent runs tools internally; no interception seam yet, so
+            # gated_tools cannot be enforced here. Tracked as a follow-up.
+            logger.warning("hermes harness does not support tool gating yet; gated tools will run ungated")
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict | None] = asyncio.Queue()
 

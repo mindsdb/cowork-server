@@ -15,11 +15,11 @@ from uuid import UUID
 
 from sqlmodel import select
 
-from anton.core.dispatch import OutboundMessage
+from anton.core.dispatch import ActionCard, ActionOption, OutboundMessage
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.models.channel import ChannelBinding, ChannelSession
+from cowork.models.channel import ChannelBinding, ChannelPendingAction, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.common.settings.app_settings import get_app_settings
@@ -52,6 +52,25 @@ def turn_used_tools(events: list[dict]) -> bool:
 TYPING_REFRESH_S = 4.0
 
 MAX_TURN_ATTACHMENTS = 3
+
+# Gated tool calls wait this long for an in-channel reply, then fail closed.
+APPROVAL_TIMEOUT_S = 300.0
+APPROVAL_KEYWORDS = {"approve": True, "yes": True, "deny": False, "no": False}
+
+
+def expire_stale_pending_actions(session: Session) -> int:
+    """Mark leftover pending approvals expired (their turns died with the
+    process); called once at startup."""
+    rows = session.exec(
+        select(ChannelPendingAction).where(ChannelPendingAction.status == "pending")
+    ).all()
+    for row in rows:
+        row.status = "expired"
+        row.resolved_at = datetime.now(timezone.utc)
+        session.add(row)
+    if rows:
+        session.commit()
+    return len(rows)
 
 
 def artifacts_since(project_path: str, since: float) -> list[tuple[str, str]]:
@@ -193,6 +212,11 @@ class AntonChannelRuntime:
         self._adapters = adapters
         self._default_project_id = default_project_id
         self._locks = _KeyedLocks()
+        # Live approval waits: action id -> Future, plus chat -> action id so an
+        # approve/deny reply resolves WITHOUT taking the chat lock (the waiting
+        # turn holds it — going through the lock would deadlock until timeout).
+        self._pending_actions: dict[UUID, asyncio.Future[bool]] = {}
+        self._pending_by_chat: dict[str, UUID] = {}
 
     @staticmethod
     def _lock_key(channel_type: str, event: Any) -> str:
@@ -200,9 +224,108 @@ class AntonChannelRuntime:
         return f"{channel_type}:{event.address.platform_id}:{thread_key}"
 
     async def handle(self, channel_type: str, event: Any) -> None:
-
+        # Approval replies must resolve before lock acquisition: the waiting
+        # turn holds the chat lock.
+        if self.resolve_pending_reply(channel_type, event):
+            return
         async with self._locks.acquire(self._lock_key(channel_type, event)):
             await self._handle_locked(channel_type, event)
+
+    def resolve_pending_reply(self, channel_type: str, event: Any) -> bool:
+        action_id = self._pending_by_chat.get(self._lock_key(channel_type, event))
+        if action_id is None:
+            return False
+        content = event.message.content
+        text = content.strip().lower() if isinstance(content, str) else ""
+        if text not in APPROVAL_KEYWORDS:
+            return False
+        future = self._pending_actions.get(action_id)
+        if future is None or future.done():
+            return False
+        approved = APPROVAL_KEYWORDS[text]
+        future.set_result(approved)
+        session = get_open_session()
+        try:
+            row = session.get(ChannelPendingAction, action_id)
+            if row is not None:
+                row.status = "approved" if approved else "denied"
+                row.responder_id = event.message.sender_id
+                row.resolved_at = datetime.now(timezone.utc)
+                session.add(row)
+                session.commit()
+        finally:
+            session.close()
+        return True
+
+    def build_tool_gate(self, binding: ChannelBinding, adapter: Any, event: Any, conversation: Conversation):
+        gated = {name for name in (binding.gated_tools or []) if name}
+        if not gated or adapter is None:
+            return None
+        lock_key = self._lock_key(binding.channel_type, event)
+
+        async def gate(call: Any) -> bool:
+            if call.tool_name not in gated:
+                return True
+            return await self.request_approval(binding, adapter, event, conversation, call, lock_key)
+
+        return gate
+
+    async def request_approval(self, binding: ChannelBinding, adapter: Any, event: Any,
+                               conversation: Conversation, call: Any, lock_key: str) -> bool:
+        session = get_open_session()
+        try:
+            row = ChannelPendingAction(
+                channel_type=binding.channel_type,
+                binding_id=binding.id,
+                conversation_id=conversation.id,
+                tool_name=call.tool_name,
+                summary=str(call.tool_input)[:200],
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            action_id = row.id
+        finally:
+            session.close()
+
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_actions[action_id] = future
+        self._pending_by_chat[lock_key] = action_id
+        card = ActionCard(
+            question_id=str(action_id),
+            prompt=f"Approve running '{call.tool_name}'? Reply APPROVE or DENY.",
+            options=[ActionOption(id="approve", label="Approve"),
+                     ActionOption(id="deny", label="Deny")],
+        )
+        try:
+            try:
+                await adapter.show_action_card(event.address, card)
+            except Exception:
+                # Card never reached the user — fail closed instead of waiting.
+                log.warning("channel %s: could not show approval card; denying", binding.channel_type)
+                self.finish_pending(action_id, "denied")
+                return False
+            try:
+                return await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_S)
+            except (asyncio.TimeoutError, TimeoutError):
+                self.finish_pending(action_id, "expired")
+                return False
+        finally:
+            self._pending_actions.pop(action_id, None)
+            self._pending_by_chat.pop(lock_key, None)
+
+    @staticmethod
+    def finish_pending(action_id: UUID, status: str) -> None:
+        session = get_open_session()
+        try:
+            row = session.get(ChannelPendingAction, action_id)
+            if row is not None and row.status == "pending":
+                row.status = status
+                row.resolved_at = datetime.now(timezone.utc)
+                session.add(row)
+                session.commit()
+        finally:
+            session.close()
 
     async def _handle_locked(self, channel_type: str, event: Any) -> None:
         session = get_open_session()
@@ -222,7 +345,8 @@ class AntonChannelRuntime:
             try:
                 conversation = self._ensure_conversation(session, binding)
                 self._touch_channel_session(session, binding, conversation, event)
-                reply, used_tools = await self._run_anton(session, conversation, event, adapter)
+                gate = self.build_tool_gate(binding, adapter, event, conversation)
+                reply, used_tools = await self._run_anton(session, conversation, event, adapter, gate)
             finally:
                 if typing is not None:
                     typing.cancel()
@@ -340,7 +464,8 @@ class AntonChannelRuntime:
         return (get_app_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
 
     async def _run_anton(
-        self, session: Session, conversation: Conversation, event: Any, adapter: Any = None
+        self, session: Session, conversation: Conversation, event: Any,
+        adapter: Any = None, tool_gate: Any = None,
     ) -> tuple[str, bool]:
         """Run one channel turn; returns the reply text and whether tools ran."""
         harness_id = self.resolve_turn_harness(session, conversation)
@@ -368,10 +493,10 @@ class AntonChannelRuntime:
             if event_type == "response.output_text.delta":
                 collected.append(data.get("delta", ""))
 
-        stream = harness.stream_response(
-            conversation=conversation,
-            input=blocks,
-        )
+        stream_kwargs: dict[str, Any] = {"conversation": conversation, "input": blocks}
+        if tool_gate is not None:
+            stream_kwargs["tool_gate"] = tool_gate
+        stream = harness.stream_response(**stream_kwargs)
         async for _chunk in harness.formatter(stream, harness_id, event_sink):
             pass
 

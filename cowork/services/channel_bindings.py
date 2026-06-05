@@ -19,6 +19,13 @@ from cowork.schemas.channels import (
 _DEFAULT_THREAD_KEY = "__default__"
 
 
+def clean_gated_tools(values: list[str] | None) -> list[str] | None:
+    if not values:
+        return None
+    cleaned = sorted({v.strip() for v in values if v and v.strip()})
+    return cleaned or None
+
+
 class BindingNotFoundError(Exception):
     """Binding id does not exist (→ 404)."""
 
@@ -60,6 +67,7 @@ class ChannelBindingService:
             trigger_pattern=req.trigger_pattern,
             anton_project_id=req.anton_project_id,
             anton_conversation_id=req.anton_conversation_id,
+            gated_tools=clean_gated_tools(req.gated_tools),
         )
         self.session.add(binding)
         try:
@@ -99,6 +107,8 @@ class ChannelBindingService:
             binding.anton_project_id = req.anton_project_id
         if "anton_conversation_id" in provided:
             binding.anton_conversation_id = req.anton_conversation_id
+        if "gated_tools" in provided:
+            binding.gated_tools = clean_gated_tools(req.gated_tools)
 
         self.session.add(binding)
         self.session.commit()
