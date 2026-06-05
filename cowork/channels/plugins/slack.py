@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -32,6 +33,7 @@ CHANNEL_TYPE = "slack"
 SLACK_API_BASE = "https://slack.com/api"
 SLACK_MAX_TEXT = 3900  # Slack docs say 4000 chars, but in practice it seems to truncate at 3900 or so.
 SLACK_MAX_FILE_BYTES = 20 * 1024 * 1024
+SLACK_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 _REPLAY_WINDOW_S = 5 * 60
 
 
@@ -177,6 +179,59 @@ class SlackBridge:
                 attachments=attachments,
             ),
         )
+
+    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
+        """Upload via the external-upload flow (files.upload is deprecated):
+        getUploadURLExternal → POST bytes → completeUploadExternal."""
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            raise RuntimeError("slack bot_token not configured")
+        source = Path(path)
+        if source.stat().st_size > SLACK_MAX_UPLOAD_BYTES:
+            raise RuntimeError("slack attachment exceeds the upload size cap")
+        name = (filename or source.name).strip() or "file"
+        data = source.read_bytes()
+
+        issued = await self.web_api(bot_token, "files.getUploadURLExternal",
+                                    data={"filename": name, "length": len(data)})
+        if not issued.get("ok") or not issued.get("upload_url"):
+            raise RuntimeError(f"slack getUploadURLExternal failed: {issued.get('error', 'unknown')}")
+        if not await self.upload_bytes(issued["upload_url"], data):
+            raise ConnectionError("slack file upload failed")
+
+        payload: dict[str, Any] = {
+            "files": [{"id": issued.get("file_id"), "title": name}],
+            "channel_id": address.platform_id,
+        }
+        if address.thread_id:
+            payload["thread_ts"] = address.thread_id
+        done = await self.web_api(bot_token, "files.completeUploadExternal", json_body=payload)
+        if not done.get("ok"):
+            raise RuntimeError(f"slack completeUploadExternal failed: {done.get('error', 'unknown')}")
+        return str(issued.get("file_id", ""))
+
+    @staticmethod
+    async def web_api(bot_token: str, method: str, *, data: dict | None = None,
+                      json_body: dict | None = None) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{SLACK_API_BASE}/{method}", data=data, json=json_body,
+                    headers={"Authorization": f"Bearer {bot_token}"},
+                )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ConnectionError(f"slack {method} transport error: {exc!r}") from exc
+        return resp.json()
+
+    @staticmethod
+    async def upload_bytes(upload_url: str, data: bytes) -> bool:
+        # Pre-signed URL from getUploadURLExternal — no auth header needed.
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(upload_url, content=data)
+        except (httpx.TimeoutException, httpx.TransportError):
+            return False
+        return resp.status_code == 200
 
     async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
         """Best-effort download of a shared file; failures fall back to text-only."""

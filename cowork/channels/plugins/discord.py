@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -29,6 +30,7 @@ CHANNEL_TYPE = "discord"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_MAX_TEXT = 2000
 DISCORD_MAX_FILE_BYTES = 20 * 1024 * 1024
+DISCORD_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # default bot upload cap
 _OAUTH_SCOPES = ("bot", "applications.commands")
 
 
@@ -191,6 +193,30 @@ class DiscordBridge:
             body=json.dumps({"type": 5}),
             content_type="application/json",
         )
+
+    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
+        """Post one file to the channel; returns the platform message id."""
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            raise RuntimeError("discord bot_token not configured")
+        source = Path(path)
+        if source.stat().st_size > DISCORD_MAX_UPLOAD_BYTES:
+            raise RuntimeError("discord attachment exceeds the upload size cap")
+        name = (filename or source.name).strip() or "file"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{DISCORD_API_BASE}/channels/{address.platform_id}/messages",
+                    headers={"Authorization": f"Bot {bot_token}"},
+                    files={"files[0]": (name, source.read_bytes())},
+                )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ConnectionError(f"discord upload transport error: {exc!r}") from exc
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise ConnectionError(f"discord transient HTTP {resp.status_code}")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"discord upload failed: HTTP {resp.status_code}")
+        return str((resp.json() or {}).get("id", ""))
 
     async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
         """Best-effort CDN download (attachment URLs need no auth)."""
