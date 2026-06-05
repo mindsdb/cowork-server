@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
+from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.plugin import (
     ChannelCapabilities,
@@ -31,7 +31,30 @@ log = logging.getLogger(__name__)
 CHANNEL_TYPE = "slack"
 SLACK_API_BASE = "https://slack.com/api"
 SLACK_MAX_TEXT = 3900  # Slack docs say 4000 chars, but in practice it seems to truncate at 3900 or so.
+SLACK_MAX_FILE_BYTES = 20 * 1024 * 1024
 _REPLAY_WINDOW_S = 5 * 60
+
+
+def extract_media(event: dict) -> list[Attachment]:
+    """Shared-file descriptors from a message event; bytes are fetched later in
+    the background via fetch_attachment (url_private needs the bot token)."""
+    media: list[Attachment] = []
+    for f in event.get("files") or []:
+        if not isinstance(f, dict):
+            continue
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            continue
+        if (f.get("size") or 0) > SLACK_MAX_FILE_BYTES:
+            log.info("skipping slack attachment over the size cap")
+            continue
+        attachment = Attachment(
+            filename=f.get("name") or "file",
+            mime_type=f.get("mimetype") or "application/octet-stream",
+        )
+        attachment.slack_url = url
+        media.append(attachment)
+    return media
 _OAUTH_SCOPES = (
     "app_mentions:read", "channels:history", "groups:history",
     "im:history", "im:write", "mpim:history", "chat:write",
@@ -130,7 +153,8 @@ class SlackBridge:
         ):
             return None
         text = (event.get("text") or "").strip()
-        if not text:
+        attachments = extract_media(event)
+        if not text and not attachments:
             return None
         channel = event.get("channel", "") or ""
         thread_ts = event.get("thread_ts")
@@ -150,8 +174,26 @@ class SlackBridge:
                 sender_id=event.get("user") or None,
                 is_mention=kind == "app_mention",
                 is_group=is_group,
+                attachments=attachments,
             ),
         )
+
+    async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
+        """Best-effort download of a shared file; failures fall back to text-only."""
+        url = getattr(attachment, "slack_url", None)
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not url or not bot_token:
+            return None
+        return await self.download_url(bot_token, url)
+
+    @staticmethod
+    async def download_url(bot_token: str, url: str) -> bytes | None:
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"Authorization": f"Bearer {bot_token}"})
+        except (httpx.TimeoutException, httpx.TransportError):
+            return None
+        return resp.content if resp.status_code == 200 else None
 
     async def send_text(self, *, address: PlatformAddress, text: str) -> str:
         bot_token = (self._secrets.get("bot_token") or "").strip()

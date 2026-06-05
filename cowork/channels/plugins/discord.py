@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
+from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.plugin import (
     ChannelCapabilities,
@@ -28,7 +28,28 @@ log = logging.getLogger(__name__)
 CHANNEL_TYPE = "discord"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_MAX_TEXT = 2000
+DISCORD_MAX_FILE_BYTES = 20 * 1024 * 1024
 _OAUTH_SCOPES = ("bot", "applications.commands")
+
+
+def extract_media(data: dict) -> list[Attachment]:
+    """Attachment-option descriptors from a slash-command interaction; the CDN
+    bytes are fetched later in the background via fetch_attachment."""
+    media: list[Attachment] = []
+    resolved = ((data.get("data") or {}).get("resolved") or {}).get("attachments") or {}
+    for raw in resolved.values():
+        if not isinstance(raw, dict) or not raw.get("url"):
+            continue
+        if (raw.get("size") or 0) > DISCORD_MAX_FILE_BYTES:
+            log.info("skipping discord attachment over the size cap")
+            continue
+        attachment = Attachment(
+            filename=raw.get("filename") or "file",
+            mime_type=raw.get("content_type") or "application/octet-stream",
+        )
+        attachment.discord_url = raw.get("url")
+        media.append(attachment)
+    return media
 _INTERACTION_PING = 1
 _INTERACTION_APPLICATION_COMMAND = 2
 
@@ -150,6 +171,7 @@ class DiscordBridge:
                 sender_id=str(user_obj.get("id", "")) or None,
                 is_mention=True,
                 is_group=bool(data.get("guild_id")),
+                attachments=extract_media(data),
             ),
         )
         event._dedupe_key = f"discord:interaction:{interaction_id}"  # type: ignore[attr-defined]
@@ -169,6 +191,22 @@ class DiscordBridge:
             body=json.dumps({"type": 5}),
             content_type="application/json",
         )
+
+    async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
+        """Best-effort CDN download (attachment URLs need no auth)."""
+        url = getattr(attachment, "discord_url", None)
+        if not url:
+            return None
+        return await self.download_url(url)
+
+    @staticmethod
+    async def download_url(url: str) -> bytes | None:
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(url)
+        except (httpx.TimeoutException, httpx.TransportError):
+            return None
+        return resp.content if resp.status_code == 200 else None
 
     async def send_text(self, *, address: PlatformAddress, text: str) -> str:
         bot_token = (self._secrets.get("bot_token") or "").strip()

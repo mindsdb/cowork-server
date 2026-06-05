@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
+from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.plugin import (
     ChannelCapabilities,
@@ -29,8 +29,30 @@ log = logging.getLogger(__name__)
 CHANNEL_TYPE = "whatsapp"
 GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
 WHATSAPP_MAX_TEXT = 4096
+WHATSAPP_MAX_FILE_BYTES = 20 * 1024 * 1024
 _CUSTOMER_CARE_WINDOW = timedelta(hours=24)
 _TRANSIENT_ERROR_CODES = {4, 17, 32, 80007}
+
+
+def extract_media(msg: dict) -> tuple[str, list[Attachment]]:
+    """(caption, attachments) for image/document messages; bytes are resolved
+    later in the background via fetch_attachment (media id → url → download)."""
+    mtype = msg.get("type")
+    if mtype not in ("image", "document"):
+        return "", []
+    media = msg.get(mtype) or {}
+    media_id = media.get("id")
+    if not media_id:
+        return (media.get("caption") or "").strip(), []
+    mime = media.get("mime_type") or "application/octet-stream"
+    if mtype == "image":
+        subtype = mime.split("/")[-1].split(";")[0] or "bin"
+        filename = f"image_{media_id}.{subtype}"
+    else:
+        filename = media.get("filename") or f"document_{media_id}"
+    attachment = Attachment(filename=filename, mime_type=mime)
+    attachment.whatsapp_media_id = media_id
+    return (media.get("caption") or "").strip(), [attachment]
 
 
 class WhatsAppBridge:
@@ -107,12 +129,14 @@ class WhatsAppBridge:
         return f"whatsapp:{mid}" if mid else None
 
     def _normalize_message(self, msg: dict) -> InboundEvent | None:
-        if msg.get("type") != "text":
-            return None
-        text = ((msg.get("text") or {}).get("body") or "").strip()
+        attachments: list[Attachment] = []
+        if msg.get("type") == "text":
+            text = ((msg.get("text") or {}).get("body") or "").strip()
+        else:
+            text, attachments = extract_media(msg)
         sender = (msg.get("from") or "").strip()  # E.164, no '+'
         message_id = str(msg.get("id", ""))
-        if not text or not sender or not message_id:
+        if (not text and not attachments) or not sender or not message_id:
             return None
         try:
             timestamp = datetime.fromtimestamp(int(msg.get("timestamp", "")), timezone.utc)
@@ -129,10 +153,47 @@ class WhatsAppBridge:
                 sender_id=sender,
                 is_mention=True,
                 is_group=False,
+                attachments=attachments,
             ),
         )
         event._dedupe_key = f"whatsapp:{message_id}"  # type: ignore[attr-defined]
         return event
+
+    async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
+        """Resolve a media id to bytes (Graph media lookup + authed download).
+        Best-effort: any failure returns None and the turn proceeds text-only."""
+        media_id = getattr(attachment, "whatsapp_media_id", None)
+        access_token = (self._secrets.get("access_token") or "").strip()
+        if not media_id or not access_token:
+            return None
+        info = await self.media_info(access_token, media_id)
+        if not info or not info.get("url"):
+            return None
+        if (info.get("file_size") or 0) > WHATSAPP_MAX_FILE_BYTES:
+            log.info("skipping whatsapp attachment over the size cap")
+            return None
+        return await self.download_url(access_token, info["url"])
+
+    @staticmethod
+    async def media_info(access_token: str, media_id: str) -> dict | None:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{GRAPH_API_BASE}/{media_id}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+        except (httpx.TimeoutException, httpx.TransportError):
+            return None
+        return resp.json() if resp.status_code == 200 else None
+
+    @staticmethod
+    async def download_url(access_token: str, url: str) -> bytes | None:
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+        except (httpx.TimeoutException, httpx.TransportError):
+            return None
+        return resp.content if resp.status_code == 200 else None
 
     async def send_text(self, *, address: PlatformAddress, text: str) -> str:
         phone_number_id = (self._secrets.get("phone_number_id") or "").strip()
