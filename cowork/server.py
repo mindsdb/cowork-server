@@ -29,6 +29,15 @@ async def lifespan(app: FastAPI):
     # create_app. Here we build the live adapters from stored credentials so
     # configured channels resolve, and tear them down cleanly on shutdown.
     await app.state.channel_adapters.refresh_all()
+    # Approvals left pending by a previous process can never resolve — expire them.
+    from cowork.channels.runtime import expire_stale_pending_actions
+    from cowork.db.session import get_open_session
+
+    sweep_session = get_open_session()
+    try:
+        expire_stale_pending_actions(sweep_session)
+    finally:
+        sweep_session.close()
     try:
         yield
     finally:
