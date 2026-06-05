@@ -83,6 +83,13 @@ class TelegramBridge:
         for chunk in _split_for_limit(text, TELEGRAM_MAX_TEXT):
             await self.send_text(address=address, text=chunk)
 
+    async def set_typing(self, *, address: PlatformAddress) -> None:
+        # Best-effort: Telegram shows the indicator for ~5s per call.
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return
+        await self._call(bot_token, "sendChatAction", {"chat_id": address.platform_id, "action": "typing"})
+
     def try_handshake(
         self, *, method: str, body: bytes, headers: Mapping[str, str], query: Mapping[str, str]
     ) -> WebhookHandshake:
