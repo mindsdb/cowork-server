@@ -35,8 +35,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-CHANNEL_HARNESS_ID = "anton"
-_FORMATTER_MODEL = "anton"
+# Channel turns run the server-configured channels_harness (default anton),
+# pinned per conversation via per-message harness identity. The UI harness
+# hotswitch (UserSettings.harness) never applies to channels.
+DEFAULT_CHANNEL_HARNESS = "anton"
 _DEFAULT_THREAD_KEY = "__default__"
 
 
@@ -323,11 +325,31 @@ class AntonChannelRuntime:
         session.add(row)
         session.commit()
 
+    def resolve_turn_harness(self, session: Session, conversation: Conversation) -> str:
+        """Pinned harness for this conversation (whatever first served it), else
+        the configured channels_harness. Never the UI harness selection."""
+        pinned = session.exec(
+            select(DBMessage.harness).where(
+                DBMessage.conversation_id == conversation.id,
+                DBMessage.role == "assistant",
+                DBMessage.harness != None,  # noqa: E711
+            ).limit(1)
+        ).first()
+        if pinned:
+            return pinned
+        return (get_app_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
+
     async def _run_anton(
         self, session: Session, conversation: Conversation, event: Any, adapter: Any = None
     ) -> tuple[str, bool]:
         """Run one channel turn; returns the reply text and whether tools ran."""
-        harness = get_harness(CHANNEL_HARNESS_ID)
+        harness_id = self.resolve_turn_harness(session, conversation)
+        try:
+            harness = get_harness(harness_id)
+        except ValueError:
+            log.warning("harness %r is not registered; falling back to %s", harness_id, DEFAULT_CHANNEL_HARNESS)
+            harness_id = DEFAULT_CHANNEL_HARNESS
+            harness = get_harness(harness_id)
         await harness.sync_skills(SkillService(session).list_skills())
         text = self._event_text(event)
         blocks = await self.build_input_blocks(session, adapter, event, text)
@@ -350,12 +372,12 @@ class AntonChannelRuntime:
             conversation=conversation,
             input=blocks,
         )
-        async for _chunk in harness.formatter(stream, _FORMATTER_MODEL, event_sink):
+        async for _chunk in harness.formatter(stream, harness_id, event_sink):
             pass
 
         reply = "".join(collected)
         ConversationService(session).save_assistant_turn(
-            conversation.id, reply, events, harness=CHANNEL_HARNESS_ID,
+            conversation.id, reply, events, harness=harness_id,
         )
         return reply, turn_used_tools(events)
 
