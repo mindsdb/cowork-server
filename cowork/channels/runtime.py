@@ -18,9 +18,11 @@ from cowork.harnesses.base import get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT_ID
+from cowork.services.skills import SkillService
 
 if TYPE_CHECKING:
     from sqlmodel import Session
@@ -30,6 +32,22 @@ log = logging.getLogger(__name__)
 CHANNEL_HARNESS_ID = "anton"
 _FORMATTER_MODEL = "anton"
 _DEFAULT_THREAD_KEY = "__default__"
+
+
+def turn_used_tools(events: list[dict]) -> bool:
+    """Tool/scratchpad activity rides on stream events as ``tool_use_id``."""
+    return any(isinstance(event, dict) and "tool_use_id" in event for event in events)
+
+
+def conversation_link(conversation_id: Any) -> str | None:
+    template = (get_app_settings().conversation_link_template or "").strip()
+    if not template:
+        return None
+    try:
+        return template.format(conversation_id=conversation_id)
+    except (KeyError, IndexError, ValueError):
+        log.warning("invalid conversation_link_template; skipping link")
+        return None
 
 
 class _KeyedLocks:
@@ -153,9 +171,16 @@ class AntonChannelRuntime:
                 return
             conversation = self._ensure_conversation(session, binding)
             self._touch_channel_session(session, binding, conversation, event)
-            reply = await self._run_anton(session, conversation, event)
+            reply, used_tools = await self._run_anton(session, conversation, event)
             if reply and reply.strip():
-                await self._deliver(channel_type, event, reply)
+                # The link is a channel affordance only; the stored assistant
+                # message stays canonical (UI users are already in the conversation).
+                outbound = reply
+                if used_tools:
+                    link = conversation_link(conversation.id)
+                    if link:
+                        outbound = f"{reply}\n\n{link}"
+                await self._deliver(channel_type, event, outbound)
         finally:
             session.close()
 
@@ -242,8 +267,10 @@ class AntonChannelRuntime:
         session.add(row)
         session.commit()
 
-    async def _run_anton(self, session: Session, conversation: Conversation, event: Any) -> str:
+    async def _run_anton(self, session: Session, conversation: Conversation, event: Any) -> tuple[str, bool]:
+        """Run one channel turn; returns the reply text and whether tools ran."""
         harness = get_harness(CHANNEL_HARNESS_ID)
+        await harness.sync_skills(SkillService(session).list_skills())
         text = self._event_text(event)
 
         _ = conversation.messages
@@ -266,8 +293,10 @@ class AntonChannelRuntime:
             pass
 
         reply = "".join(collected)
-        ConversationService(session).save_assistant_turn(conversation.id, reply, events)
-        return reply
+        ConversationService(session).save_assistant_turn(
+            conversation.id, reply, events, harness=CHANNEL_HARNESS_ID,
+        )
+        return reply, turn_used_tools(events)
 
     @staticmethod
     def _event_text(event: Any) -> str:
