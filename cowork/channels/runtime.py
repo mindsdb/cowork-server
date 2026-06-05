@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from collections.abc import AsyncIterator
@@ -37,6 +38,20 @@ _DEFAULT_THREAD_KEY = "__default__"
 def turn_used_tools(events: list[dict]) -> bool:
     """Tool/scratchpad activity rides on stream events as ``tool_use_id``."""
     return any(isinstance(event, dict) and "tool_use_id" in event for event in events)
+
+
+# Platform typing indicators expire after a few seconds, so refresh while
+# the turn runs. Module-level so tests can shrink it.
+TYPING_REFRESH_S = 4.0
+
+
+async def typing_loop(adapter: Any, address: Any) -> None:
+    while True:
+        try:
+            await adapter.set_typing(address=address)
+        except Exception:
+            log.debug("set_typing failed; continuing without indicator")
+        await asyncio.sleep(TYPING_REFRESH_S)
 
 
 def conversation_link(conversation_id: Any) -> str | None:
@@ -169,9 +184,21 @@ class AntonChannelRuntime:
             if not self._should_respond(binding, event):
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
-            conversation = self._ensure_conversation(session, binding)
-            self._touch_channel_session(session, binding, conversation, event)
-            reply, used_tools = await self._run_anton(session, conversation, event)
+            # Optional hook: adapters with set_typing show a typing indicator
+            # for the duration of the turn; others are untouched.
+            adapter = self._adapters.get(channel_type)
+            typing = None
+            if adapter is not None and callable(getattr(adapter, "set_typing", None)):
+                typing = asyncio.create_task(typing_loop(adapter, event.address))
+            try:
+                conversation = self._ensure_conversation(session, binding)
+                self._touch_channel_session(session, binding, conversation, event)
+                reply, used_tools = await self._run_anton(session, conversation, event)
+            finally:
+                if typing is not None:
+                    typing.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await typing
             if reply and reply.strip():
                 # The link is a channel affordance only; the stored assistant
                 # message stays canonical (UI users are already in the conversation).

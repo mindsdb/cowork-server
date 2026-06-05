@@ -71,6 +71,20 @@ class DiscordBridge:
         for chunk in split_for_limit(text, DISCORD_MAX_TEXT):
             await self.send_text(address=address, text=chunk)
 
+    async def set_typing(self, *, address: PlatformAddress) -> None:
+        # Best-effort: Discord shows the indicator for ~10s per trigger.
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{DISCORD_API_BASE}/channels/{address.platform_id}/typing",
+                    headers={"Authorization": f"Bot {bot_token}"},
+                )
+        except (httpx.TimeoutException, httpx.TransportError):
+            pass
+
     def try_handshake(
         self, *, method: str, body: bytes, headers: Mapping[str, str], query: Mapping[str, str]
     ) -> WebhookHandshake:
