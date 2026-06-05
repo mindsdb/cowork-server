@@ -239,23 +239,41 @@ class AntonChannelRuntime:
         text = content.strip().lower() if isinstance(content, str) else ""
         if text not in APPROVAL_KEYWORDS:
             return False
+        return self.resolve_pending_action(action_id, APPROVAL_KEYWORDS[text], event.message.sender_id)
+
+    def resolve_pending_action(self, action_id: UUID, approved: bool, responder: str | None) -> bool:
         future = self._pending_actions.get(action_id)
         if future is None or future.done():
             return False
-        approved = APPROVAL_KEYWORDS[text]
         future.set_result(approved)
         session = get_open_session()
         try:
             row = session.get(ChannelPendingAction, action_id)
             if row is not None:
                 row.status = "approved" if approved else "denied"
-                row.responder_id = event.message.sender_id
+                row.responder_id = responder
                 row.resolved_at = datetime.now(timezone.utc)
                 session.add(row)
                 session.commit()
         finally:
             session.close()
         return True
+
+    async def handle_action_response(self, channel_type: str, response: Any) -> None:
+        """ActionSink for approval button presses parsed by the bridges."""
+        try:
+            action_id = UUID(str(response.question_id))
+        except (ValueError, AttributeError):
+            return
+        approved = response.selected_option_id == "approve"
+        resolved = self.resolve_pending_action(action_id, approved, getattr(response, "user_id", None))
+        adapter = self._adapters.get(channel_type)
+        ack = getattr(adapter, "ack_action_response", None) if adapter is not None else None
+        if callable(ack):
+            try:
+                await ack(response, resolved=resolved, approved=approved)
+            except Exception:
+                log.warning("channel %s: action-response ack failed", channel_type)
 
     def build_tool_gate(self, binding: ChannelBinding, adapter: Any, event: Any, conversation: Conversation):
         gated = {name for name in (binding.gated_tools or []) if name}
