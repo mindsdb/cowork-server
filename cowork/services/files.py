@@ -62,6 +62,27 @@ class FileService:
         self.session.refresh(file)
         return self._to_response(file)
 
+    def create_file_from_bytes(self, *, filename: str, content_type: str, data: bytes, purpose: str) -> File:
+        """Server-side ingestion (e.g. channel media); returns the model.
+        The filename comes from an external platform, so keep only its basename."""
+        safe_name = Path(filename).name.strip() or "file"
+        file = File(
+            filename=safe_name,
+            content_type=content_type or "application/octet-stream",
+            size=len(data),
+            purpose=purpose,
+            path="",
+        )
+        file_dir = self._root_dir() / str(file.id)
+        file_dir.mkdir(parents=True)
+        dest = file_dir / safe_name
+        dest.write_bytes(data)
+        file.path = str(dest)
+        self.session.add(file)
+        self.session.commit()
+        self.session.refresh(file)
+        return file
+
     def _get_file_model(self, file_id: UUID) -> File:
         file = self.session.get(File, file_id)
         if file is None:

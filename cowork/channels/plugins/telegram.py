@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
+from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.lifecycle import (
     ChannelLifecycle,
@@ -33,8 +33,40 @@ log = logging.getLogger(__name__)
 
 CHANNEL_TYPE = "telegram"
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
+TELEGRAM_FILE_BASE = "https://api.telegram.org/file/bot"
 TELEGRAM_MAX_TEXT = 4096
+TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024  # Bot API getFile hard limit
 _SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"
+
+
+def extract_media(msg: dict) -> list[Attachment]:
+    """Photo/document → Attachment descriptors; the bytes are fetched later in
+    the background via fetch_attachment (never in the pre-ACK parse path)."""
+    media: list[Attachment] = []
+    if isinstance(msg.get("photo"), list) and msg["photo"]:
+        size = msg["photo"][-1]  # largest rendition is last
+        attachment = Attachment(filename=f"photo_{size.get('file_unique_id', 'tg')}.jpg", mime_type="image/jpeg")
+        attachment.telegram_file_id = size.get("file_id")
+        attachment.telegram_file_size = size.get("file_size")
+        media.append(attachment)
+    document = msg.get("document")
+    if isinstance(document, dict):
+        attachment = Attachment(
+            filename=document.get("file_name") or f"document_{document.get('file_unique_id', 'tg')}",
+            mime_type=document.get("mime_type") or "application/octet-stream",
+        )
+        attachment.telegram_file_id = document.get("file_id")
+        attachment.telegram_file_size = document.get("file_size")
+        media.append(attachment)
+    kept = []
+    for attachment in media:
+        size = getattr(attachment, "telegram_file_size", None)
+        if size and size > TELEGRAM_MAX_FILE_BYTES:
+            log.info("skipping telegram attachment over getFile limit")
+            continue
+        if getattr(attachment, "telegram_file_id", None):
+            kept.append(attachment)
+    return kept
 
 
 def _split_for_limit(text: str, limit: int) -> list[str]:
@@ -90,6 +122,33 @@ class TelegramBridge:
             return
         await self._call(bot_token, "sendChatAction", {"chat_id": address.platform_id, "action": "typing"})
 
+    async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
+        """Resolve a parsed attachment to bytes (getFile + download). Best-effort:
+        any failure returns None so the turn proceeds with the text alone."""
+        file_id = getattr(attachment, "telegram_file_id", None)
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not file_id or not bot_token:
+            return None
+        try:
+            info = await self._call(bot_token, "getFile", {"file_id": file_id})
+        except (ConnectionError, RuntimeError):
+            return None
+        file_path = (info.get("result") or {}).get("file_path") if info.get("ok") else None
+        if not file_path:
+            return None
+        return await self.download_file(bot_token, file_path)
+
+    @staticmethod
+    async def download_file(bot_token: str, file_path: str) -> bytes | None:
+        # The URL embeds the bot token — never log it.
+        url = f"{TELEGRAM_FILE_BASE}{bot_token}/{file_path}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url)
+        except (httpx.TimeoutException, httpx.TransportError):
+            return None
+        return resp.content if resp.status_code == 200 else None
+
     def try_handshake(
         self, *, method: str, body: bytes, headers: Mapping[str, str], query: Mapping[str, str]
     ) -> WebhookHandshake:
@@ -136,8 +195,9 @@ class TelegramBridge:
         sender = msg.get("from") or {}
         if sender.get("is_bot"):
             return None
-        text = (msg.get("text") or "").strip()
-        if not text:
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        attachments = extract_media(msg)
+        if not text and not attachments:
             return None
 
         chat = msg.get("chat") or {}
@@ -169,6 +229,7 @@ class TelegramBridge:
                 sender_id=str(sender.get("id", "")) or None,
                 is_mention=is_mention,
                 is_group=is_group,
+                attachments=attachments,
             ),
         )
 
