@@ -5,8 +5,10 @@ import base64
 import contextlib
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -21,6 +23,7 @@ from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.artifacts import list_artifacts
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -45,6 +48,26 @@ def turn_used_tools(events: list[dict]) -> bool:
 # Platform typing indicators expire after a few seconds, so refresh while
 # the turn runs. Module-level so tests can shrink it.
 TYPING_REFRESH_S = 4.0
+
+MAX_TURN_ATTACHMENTS = 3
+
+
+def artifacts_since(project_path: str, since: float) -> list[tuple[str, str]]:
+    """(path, filename) of artifact primaries created/updated after ``since``
+    in this project. Time-window based: concurrent turns in the same project
+    could cross-attribute — acceptable for the single-operator v1."""
+    out: list[tuple[str, str]] = []
+    for card in list_artifacts(project_path):
+        folder = Path(card.get("folder") or "")
+        try:
+            if (folder / "metadata.json").stat().st_mtime < since:
+                continue
+        except OSError:
+            continue
+        primary = Path(card.get("path") or "")
+        if primary.is_file():
+            out.append((str(primary), primary.name))
+    return out
 
 
 async def typing_loop(adapter: Any, address: Any) -> None:
@@ -192,6 +215,8 @@ class AntonChannelRuntime:
             typing = None
             if adapter is not None and callable(getattr(adapter, "set_typing", None)):
                 typing = asyncio.create_task(typing_loop(adapter, event.address))
+            # 1s slack for filesystem timestamp granularity.
+            turn_started = time.time() - 1
             try:
                 conversation = self._ensure_conversation(session, binding)
                 self._touch_channel_session(session, binding, conversation, event)
@@ -210,6 +235,8 @@ class AntonChannelRuntime:
                     if link:
                         outbound = f"{reply}\n\n{link}"
                 await self._deliver(channel_type, event, outbound)
+            if used_tools:
+                await self.send_turn_artifacts(adapter, event, conversation, turn_started)
         finally:
             session.close()
 
@@ -365,6 +392,21 @@ class AntonChannelRuntime:
         if text or not blocks:
             blocks.append({"type": "text", "text": text})
         return blocks
+
+    async def send_turn_artifacts(self, adapter: Any, event: Any, conversation: Conversation, since: float) -> None:
+        """Send files the turn produced through the optional send_attachment
+        hook. Best-effort per file; channels without the hook are untouched."""
+        sender = getattr(adapter, "send_attachment", None) if adapter is not None else None
+        if not callable(sender):
+            return
+        project = conversation.project
+        if project is None:
+            return
+        for path, filename in artifacts_since(project.path, since)[:MAX_TURN_ATTACHMENTS]:
+            try:
+                await sender(address=event.address, path=path, filename=filename)
+            except Exception:
+                log.warning("channel %s: failed sending artifact %s", event.address.channel_type, filename)
 
     async def _deliver(self, channel_type: str, event: Any, reply: str) -> None:
         adapter = self._adapters.get(channel_type)

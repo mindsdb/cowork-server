@@ -6,6 +6,7 @@ import logging
 import secrets
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -36,6 +37,7 @@ TELEGRAM_API_BASE = "https://api.telegram.org/bot"
 TELEGRAM_FILE_BASE = "https://api.telegram.org/file/bot"
 TELEGRAM_MAX_TEXT = 4096
 TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024  # Bot API getFile hard limit
+TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # Bot API sendDocument hard limit
 _SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"
 
 
@@ -137,6 +139,29 @@ class TelegramBridge:
         if not file_path:
             return None
         return await self.download_file(bot_token, file_path)
+
+    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
+        """Upload one file via sendDocument; returns the platform message id."""
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            raise RuntimeError("telegram bot_token not configured")
+        source = Path(path)
+        if source.stat().st_size > TELEGRAM_MAX_UPLOAD_BYTES:
+            raise RuntimeError("telegram attachment exceeds the 50MB upload limit")
+        name = (filename or source.name).strip() or "file"
+        try:
+            async with httpx.AsyncClient(timeout=60.0, headers={"User-Agent": "Cowork/1.0"}) as client:
+                resp = await client.post(
+                    f"{TELEGRAM_API_BASE}{bot_token}/sendDocument",
+                    data={"chat_id": address.platform_id},
+                    files={"document": (name, source.read_bytes())},
+                )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ConnectionError(f"telegram sendDocument transport error: {exc!r}") from exc
+        result = resp.json()
+        if not result.get("ok"):
+            raise RuntimeError(f"telegram sendDocument failed: {result.get('description', 'unknown')}")
+        return str((result.get("result") or {}).get("message_id", ""))
 
     @staticmethod
     async def download_file(bot_token: str, file_path: str) -> bytes | None:
