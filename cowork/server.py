@@ -106,7 +106,8 @@ def _install_channels(app: FastAPI) -> None:
         if not plugin.webhooks:
             continue
         app.include_router(
-            build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
+            build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle,
+                                         action_sink=runtime.handle_action_response),
             prefix="/api/v1/channels",
         )
     app.state.channel_adapters = adapters
