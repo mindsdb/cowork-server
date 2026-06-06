@@ -265,9 +265,12 @@ class AntonHarness:
             db_val = getattr(user, attr, None)
             if db_val is None:
                 continue
-            # Provider enum -> string value for AntonSettings
+            # Provider enum -> string value for AntonSettings.
+            # The DB enum uses snake_case (openai_compatible, minds_cloud)
+            # but AntonSettings / LLMClient expect kebab-case
+            # (openai-compatible, minds-cloud).
             if hasattr(db_val, "value"):
-                db_val = db_val.value
+                db_val = db_val.value.replace("_", "-")
             setattr(settings, attr, db_val)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
