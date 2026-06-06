@@ -80,7 +80,8 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
             if not key:
                 return "fail", "missing API key"
             base = (p.get("mindsUrl") or "https://api.mindshub.ai").rstrip("/")
-            return await _check(f"{base}/v1/minds/", {"Authorization": f"Bearer {key}"})
+            chat_url = minds_chat_base_url(base)
+            return await _check(f"{chat_url}/models", {"Authorization": f"Bearer {key}"})
     except httpx.HTTPError as e:
         return "fail", f"{type(e).__name__}: {e}"
     except Exception as e:
@@ -125,10 +126,10 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
 
 async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict[str, Any]:
     try:
-        base = base_url.rstrip("/")
+        chat_base = minds_chat_base_url(base_url.rstrip("/"))
         timeout = httpx.Timeout(15.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.get(f"{base}/v1/minds/", headers={"Authorization": f"Bearer {api_key}"})
+            r = await client.get(f"{chat_base}/models", headers={"Authorization": f"Bearer {api_key}"})
         if r.status_code in (401, 403):
             return {"ok": False, "error": "Invalid API key"}
         if 200 <= r.status_code < 300:
