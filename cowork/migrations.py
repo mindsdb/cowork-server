@@ -74,15 +74,17 @@ def _parse_env_file() -> dict[str, str]:
 def _normalize_provider_value(val: str, dotenv: dict[str, str]) -> str:
     """Translate .env provider strings to DB enum values.
 
-    The .env uses hyphens (``openai-compatible``) and doesn't distinguish
-    MindsHub from generic OpenAI-compatible.  The DB ``Provider`` enum uses
-    underscores and has a dedicated ``minds_cloud`` value.
+    The .env may use hyphens (``openai-compatible``) or underscores
+    (``openai_compatible``).  The DB ``Provider`` enum uses underscores
+    and has a dedicated ``minds_cloud`` value.
     """
+    # Canonicalize to underscores first so both forms are handled.
+    canonical = val.replace("-", "_")
     # Detect MindsHub: if the user has a Minds key and the provider is
-    # "openai-compatible", this is really minds_cloud.
-    if val == "openai-compatible" and dotenv.get("ANTON_MINDS_API_KEY"):
+    # "openai_compatible", this is really minds_cloud.
+    if canonical == "openai_compatible" and dotenv.get("ANTON_MINDS_API_KEY"):
         return "minds_cloud"
-    return val.replace("-", "_")
+    return canonical
 
 
 def migrate_env_to_db(session: Session) -> bool:
