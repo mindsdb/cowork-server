@@ -161,6 +161,37 @@ async def proxy_artifact_request(
             f"Proxy error: {exc}", status_code=502, headers=cors
         )
 
+    # For the root HTML response, patch the `api-base` meta tag so that
+    # absolute-path fetch calls (e.g. fetch('/api/top-cpu')) from the
+    # artifact JS are routed through this proxy route, not to the cowork
+    # server root.  The proxy lives at /api/v1/artifacts/proxy/{token}/…,
+    # so a bare /api/… path misses it entirely and hits a 404.
+    content_type = upstream.headers.get("content-type", "")
+    if (
+        upstream_path == "/"
+        and upstream.status_code == 200
+        and "text/html" in content_type
+    ):
+        raw = await upstream.aread()
+        await upstream.aclose()
+        proxy_prefix = f"/api/v1/artifacts/proxy/{token}"
+        # Replace the conventional empty api-base value that Anton generates.
+        patched = raw.replace(
+            b'name="api-base" content=""',
+            f'name="api-base" content="{proxy_prefix}"'.encode(),
+        )
+        resp_headers = dict(_strip_hop_headers(upstream.headers, drop_cors=True))
+        resp_headers.update(cors)
+        # Drop Content-Length — the patched body may be larger than the
+        # original; let the ASGI layer set the correct value.
+        resp_headers.pop("content-length", None)
+        resp_headers.pop("Content-Length", None)
+        return Response(
+            content=patched,
+            status_code=upstream.status_code,
+            headers=resp_headers,
+        )
+
     resp_headers = _strip_hop_headers(upstream.headers, drop_cors=True)
     resp_headers.extend(cors.items())
 
