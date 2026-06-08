@@ -86,6 +86,7 @@ def get_channel_agent() -> ChannelAgentResponse:
 
 @router.put("/agent", response_model=ChannelAgentResponse)
 def set_channel_agent(body: ChannelAgentUpdateRequest, session: SessionDep) -> ChannelAgentResponse:
+    from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 
     options = _harness_options()
@@ -95,8 +96,16 @@ def set_channel_agent(body: ChannelAgentUpdateRequest, session: SessionDep) -> C
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"unknown harness '{harness}'. Available: {', '.join(options) or 'none'}",
         )
+    previous = (get_user_settings().channels_harness or "").strip()
     SettingService(session).upsert_setting("channels_harness", harness)
-    return ChannelAgentResponse(harness=harness, options=options)
+
+    # Changing the agent re-points existing chats: detach their conversations
+    # so the next message starts fresh under the new agent (existing pins are
+    # per-conversation, so without this only new chats would switch).
+    reset = 0
+    if harness != previous:
+        reset = ChannelBindingService(session).reset_conversations()
+    return ChannelAgentResponse(harness=harness, options=options, reset_conversations=reset)
 
 
 @router.get("/{channel_type}/config", response_model=ChannelConfigResponse)
