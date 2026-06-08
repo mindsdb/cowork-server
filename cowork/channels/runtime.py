@@ -23,6 +23,7 @@ from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import list_artifacts
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
@@ -338,7 +339,8 @@ class AntonChannelRuntime:
 
     def resolve_turn_harness(self, session: Session, conversation: Conversation) -> str:
         """Pinned harness for this conversation (whatever first served it), else
-        the configured channels_harness. Never the UI harness selection."""
+        the configured channel agent. This is the persisted ``channels_harness``
+        setting (UI-selectable, env-seeded) — never the desktop UI harness."""
         pinned = session.exec(
             select(DBMessage.harness).where(
                 DBMessage.conversation_id == conversation.id,
@@ -348,7 +350,7 @@ class AntonChannelRuntime:
         ).first()
         if pinned:
             return pinned
-        return (get_app_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
+        return (get_user_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
 
     async def _run_anton(
         self, session: Session, conversation: Conversation, event: Any, adapter: Any = None
