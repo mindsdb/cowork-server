@@ -39,6 +39,10 @@ TELEGRAM_MAX_TEXT = 4096
 TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024  # Bot API getFile hard limit
 TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # Bot API sendDocument hard limit
 _SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"
+# Long-poll window for getUpdates when running tunnel-free (server-side
+# polling). The HTTP client timeout must exceed this so the long poll isn't
+# aborted before Telegram returns.
+POLL_TIMEOUT_S = 25
 
 
 def extract_media(msg: dict) -> list[Attachment]:
@@ -266,6 +270,42 @@ class TelegramBridge:
         )
         return event
 
+    async def poll(self, *, offset: int | None) -> tuple[list[InboundEvent], int | None]:
+        """One long-poll getUpdates cycle for tunnel-free operation: returns the
+        parsed events and the next offset to request. On the first cycle
+        (offset is None) any registered webhook is cleared, since getUpdates and
+        a webhook are mutually exclusive at the Telegram side."""
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return [], offset
+        if offset is None:
+            await self._call(bot_token, "deleteWebhook", {"drop_pending_updates": False})
+        params: dict[str, Any] = {
+            "timeout": POLL_TIMEOUT_S,
+            "allowed_updates": json.dumps(["message"]),
+        }
+        if offset is not None:
+            params["offset"] = offset
+        url = f"{TELEGRAM_API_BASE}{bot_token}/getUpdates"
+        try:
+            async with httpx.AsyncClient(
+                timeout=POLL_TIMEOUT_S + 10, headers={"User-Agent": "Cowork/1.0"}
+            ) as client:
+                resp = await client.get(url, params=params)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ConnectionError(f"telegram getUpdates transport error: {exc!r}") from exc
+        updates = (resp.json().get("result") if resp.status_code == 200 else None) or []
+        events: list[InboundEvent] = []
+        next_offset = offset
+        for update in updates:
+            update_id = update.get("update_id")
+            if update_id is not None:
+                next_offset = update_id + 1
+            event = self._normalize_update(update)
+            if event is not None:
+                events.append(event)
+        return events, next_offset
+
     async def send_text(self, *, address: PlatformAddress, text: str) -> str:
         """Send one chunk via ``sendMessage``; returns the platform message id.
 
@@ -327,13 +367,18 @@ async def _setup(ctx: LifecycleContext) -> LifecycleResult:
     bot_token = (ctx.credentials.get("bot_token") or "").strip()
     if not bot_token:
         raise LifecycleError(400, "telegram bot_token is required before setup")
-    if not ctx.webhook_url:
-        raise LifecycleError(409, "public base URL is not configured; cannot register a webhook")
 
     secret_token = (ctx.credentials.get("secret_token") or "").strip()
     if not secret_token:
         secret_token = secrets.token_urlsafe(32)
         ctx.persist_credentials({"secret_token": secret_token})
+
+    if not ctx.webhook_url:
+        active = await ctx.refresh_adapter()
+        return LifecycleResult(
+            active=active,
+            detail="telegram active; webhook not registered (no public base URL)",
+        )
 
     result = await TelegramBridge._call(
         bot_token,
