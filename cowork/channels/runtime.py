@@ -200,7 +200,10 @@ class AntonChannelRuntime:
         return f"{channel_type}:{event.address.platform_id}:{thread_key}"
 
     async def handle(self, channel_type: str, event: Any) -> None:
-
+        log.info(
+            "channel %s: runtime received inbound from %s thread=%s",
+            channel_type, event.address.platform_id, event.address.thread_id,
+        )
         async with self._locks.acquire(self._lock_key(channel_type, event)):
             await self._handle_locked(channel_type, event)
 
@@ -208,6 +211,10 @@ class AntonChannelRuntime:
         session = get_open_session()
         try:
             binding = self._resolve_or_create_binding(session, channel_type, event)
+            log.info(
+                "channel %s: binding %s → project %s (trigger=%s)",
+                channel_type, binding.id, binding.anton_project_id, binding.trigger_rule,
+            )
             if not self._should_respond(binding, event):
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
@@ -228,6 +235,10 @@ class AntonChannelRuntime:
                     typing.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await typing
+            log.info(
+                "channel %s: turn complete (reply=%d chars, used_tools=%s)",
+                channel_type, len(reply or ""), used_tools,
+            )
             if reply and reply.strip():
                 # The link is a channel affordance only; the stored assistant
                 # message stays canonical (UI users are already in the conversation).
@@ -436,3 +447,4 @@ class AntonChannelRuntime:
             log.warning("channel %s: no live adapter; reply not delivered", channel_type)
             return
         await adapter.deliver(OutboundMessage(address=event.address, text=reply))
+        log.info("channel %s: delivered reply to %s", channel_type, event.address.platform_id)
