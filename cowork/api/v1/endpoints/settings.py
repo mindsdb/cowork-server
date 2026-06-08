@@ -88,12 +88,12 @@ def validate_settings(session: SessionDep):
 @router.get("/configured")
 def check_configured(session: SessionDep):
     s = SettingService(session).load()
+    if s.minds_api_key is not None:
+        return {"configured": True, "provider": "minds-cloud"}
     if s.anthropic_api_key is not None:
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
-    if s.minds_api_key is not None:
-        return {"configured": True, "provider": "minds"}
     return {"configured": False, "provider": ""}
 
 
@@ -185,9 +185,35 @@ class _RawSettingsBody(BaseModel):
 
 @router.post("/raw")
 def write_raw_settings(body: _RawSettingsBody):
+    """Merge the supplied dotenv content into ~/.anton/.env (key-level upsert).
+
+    Keys not present in the incoming content are preserved — prevents the
+    OAuth token refresh loop from wiping model config and other unrelated
+    settings."""
     try:
+        incoming: dict[str, str] = {}
+        for line in body.content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            incoming[key.strip()] = val.strip().strip('"').strip("'")
+
+        # Read existing values and merge
+        existing: dict[str, str] = {}
+        if _ENV_PATH.exists():
+            for line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                existing[key.strip()] = val.strip().strip('"').strip("'")
+
+        existing.update(incoming)
+
         _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ENV_PATH.write_text(body.content + "\n", encoding="utf-8")
+        lines = [f"{k}={v}" for k, v in existing.items()]
+        _ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
         try:
             _ENV_PATH.chmod(0o600)
         except OSError:
