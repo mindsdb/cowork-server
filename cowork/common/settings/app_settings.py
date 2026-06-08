@@ -111,6 +111,26 @@ class AppSettings(Settings):
         ),
     )  # COWORK_PUBLIC_BASE_URL
 
+    conversation_link_template: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_CONVERSATION_LINK_TEMPLATE"),
+        description=(
+            "Link template appended to channel replies whose turn ran tools, "
+            "with a {conversation_id} placeholder. Empty disables the link."
+        ),
+    )  # COWORK_CONVERSATION_LINK_TEMPLATE
+
+    channels_harness: str = Field(
+        default="anton",
+        validation_alias=AliasChoices("COWORK_CHANNELS_HARNESS"),
+        description=(
+            "Harness that serves channel conversations (e.g. 'anton', 'hermes'). "
+            "Applies to NEW channel conversations only — existing ones stay pinned "
+            "to the harness that first served them. Independent of the UI harness "
+            "selection, which never applies to channels."
+        ),
+    )  # COWORK_CHANNELS_HARNESS
+
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*

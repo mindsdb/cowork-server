@@ -8,6 +8,8 @@ from sqlmodel import Session
 
 from cowork.db.session import get_session
 from cowork.schemas.channels import (
+    ChannelAgentResponse,
+    ChannelAgentUpdateRequest,
     BindingCreateRequest,
     BindingResponse,
     BindingUpdateRequest,
@@ -20,6 +22,7 @@ from cowork.schemas.channels import (
     PluginResponse,
 )
 from cowork.channels.lifecycle import LifecycleError
+from cowork.channels.polling import sync_channel_polling
 from cowork.services.channel_bindings import (
     BindingConflictError,
     BindingNotFoundError,
@@ -40,6 +43,13 @@ def _live_adapters(request: Request):
     return getattr(request.app.state, "channel_adapters", None)
 
 
+async def _reconcile_polling(request: Request, channel_type: str) -> None:
+    """Start/stop tunnel-free polling after a change to the channel's live
+    adapter (config/setup/teardown/reload)."""
+    poller = getattr(request.app.state, "channel_poller", None)
+    await sync_channel_polling(poller, _live_adapters(request), channel_type)
+
+
 @router.get("/status", response_model=ChannelStatusResponse)
 def channel_status(session: SessionDep) -> ChannelStatusResponse:
     return ChannelConfigService(session).status()
@@ -53,6 +63,49 @@ def list_plugins(session: SessionDep) -> list[PluginResponse]:
 @router.get("/installations", response_model=list[ChannelInstallationResponse])
 def list_installations(session: SessionDep) -> list[ChannelInstallationResponse]:
     return ChannelConfigService(session).list_installations()
+
+
+def _harness_options() -> list[str]:
+    # Registered harness ids, resolved at request time (after plugins/harnesses
+    # have loaded — they aren't available when app_settings parses env).
+    from cowork.harnesses.base import _registry
+
+    return list(_registry.keys())
+
+
+@router.get("/agent", response_model=ChannelAgentResponse)
+def get_channel_agent() -> ChannelAgentResponse:
+    """The harness that serves channel conversations. Distinct from the desktop
+    harness setting and applied to new conversations (existing ones stay pinned
+    to whatever first served them)."""
+    from cowork.common.settings.user_settings import get_user_settings
+
+    current = (get_user_settings().channels_harness or "").strip() or "anton"
+    return ChannelAgentResponse(harness=current, options=_harness_options())
+
+
+@router.put("/agent", response_model=ChannelAgentResponse)
+def set_channel_agent(body: ChannelAgentUpdateRequest, session: SessionDep) -> ChannelAgentResponse:
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.services.settings import SettingService
+
+    options = _harness_options()
+    harness = (body.harness or "").strip()
+    if harness not in options:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unknown harness '{harness}'. Available: {', '.join(options) or 'none'}",
+        )
+    previous = (get_user_settings().channels_harness or "").strip()
+    SettingService(session).upsert_setting("channels_harness", harness)
+
+    # Changing the agent re-points existing chats: detach their conversations
+    # so the next message starts fresh under the new agent (existing pins are
+    # per-conversation, so without this only new chats would switch).
+    reset = 0
+    if harness != previous:
+        reset = ChannelBindingService(session).reset_conversations()
+    return ChannelAgentResponse(harness=harness, options=options, reset_conversations=reset)
 
 
 @router.get("/{channel_type}/config", response_model=ChannelConfigResponse)
@@ -80,6 +133,7 @@ async def set_config(
     adapters = _live_adapters(request)
     if adapters is not None:
         await adapters.refresh(channel_type, session=session)
+    await _reconcile_polling(request, channel_type)
     return result
 
 
@@ -98,6 +152,7 @@ async def delete_config(channel_type: str, request: Request, session: SessionDep
     adapters = _live_adapters(request)
     if adapters is not None:
         await adapters.remove(channel_type)
+    await _reconcile_polling(request, channel_type)
 
 
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
@@ -111,6 +166,7 @@ async def reload_channel(channel_type: str, request: Request, session: SessionDe
     active = False
     if adapters is not None:
         active = await adapters.refresh(channel_type, session=session)
+    await _reconcile_polling(request, channel_type)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
 
 
@@ -169,6 +225,7 @@ async def setup_channel(channel_type: str, request: Request, session: SessionDep
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
+    await _reconcile_polling(request, channel_type)
     return ChannelLifecycleResponse(channel_type=channel_type, action="setup", active=result.active, detail=result.detail)
 
 
@@ -186,4 +243,5 @@ async def teardown_channel(channel_type: str, request: Request, session: Session
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
+    await _reconcile_polling(request, channel_type)
     return ChannelLifecycleResponse(channel_type=channel_type, action="teardown", active=result.active, detail=result.detail)

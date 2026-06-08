@@ -4,10 +4,11 @@ import json
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
+from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.plugin import (
     ChannelCapabilities,
@@ -28,7 +29,29 @@ log = logging.getLogger(__name__)
 CHANNEL_TYPE = "discord"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_MAX_TEXT = 2000
+DISCORD_MAX_FILE_BYTES = 20 * 1024 * 1024
+DISCORD_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # default bot upload cap
 _OAUTH_SCOPES = ("bot", "applications.commands")
+
+
+def extract_media(data: dict) -> list[Attachment]:
+    """Attachment-option descriptors from a slash-command interaction; the CDN
+    bytes are fetched later in the background via fetch_attachment."""
+    media: list[Attachment] = []
+    resolved = ((data.get("data") or {}).get("resolved") or {}).get("attachments") or {}
+    for raw in resolved.values():
+        if not isinstance(raw, dict) or not raw.get("url"):
+            continue
+        if (raw.get("size") or 0) > DISCORD_MAX_FILE_BYTES:
+            log.info("skipping discord attachment over the size cap")
+            continue
+        attachment = Attachment(
+            filename=raw.get("filename") or "file",
+            mime_type=raw.get("content_type") or "application/octet-stream",
+        )
+        attachment.discord_url = raw.get("url")
+        media.append(attachment)
+    return media
 _INTERACTION_PING = 1
 _INTERACTION_APPLICATION_COMMAND = 2
 
@@ -70,6 +93,20 @@ class DiscordBridge:
         text = f"**{getattr(card, 'prompt', '')}**\n{bullets}".strip()
         for chunk in split_for_limit(text, DISCORD_MAX_TEXT):
             await self.send_text(address=address, text=chunk)
+
+    async def set_typing(self, *, address: PlatformAddress) -> None:
+        # Best-effort: Discord shows the indicator for ~10s per trigger.
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{DISCORD_API_BASE}/channels/{address.platform_id}/typing",
+                    headers={"Authorization": f"Bot {bot_token}"},
+                )
+        except (httpx.TimeoutException, httpx.TransportError):
+            pass
 
     def try_handshake(
         self, *, method: str, body: bytes, headers: Mapping[str, str], query: Mapping[str, str]
@@ -136,6 +173,7 @@ class DiscordBridge:
                 sender_id=str(user_obj.get("id", "")) or None,
                 is_mention=True,
                 is_group=bool(data.get("guild_id")),
+                attachments=extract_media(data),
             ),
         )
         event._dedupe_key = f"discord:interaction:{interaction_id}"  # type: ignore[attr-defined]
@@ -155,6 +193,46 @@ class DiscordBridge:
             body=json.dumps({"type": 5}),
             content_type="application/json",
         )
+
+    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
+        """Post one file to the channel; returns the platform message id."""
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            raise RuntimeError("discord bot_token not configured")
+        source = Path(path)
+        if source.stat().st_size > DISCORD_MAX_UPLOAD_BYTES:
+            raise RuntimeError("discord attachment exceeds the upload size cap")
+        name = (filename or source.name).strip() or "file"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{DISCORD_API_BASE}/channels/{address.platform_id}/messages",
+                    headers={"Authorization": f"Bot {bot_token}"},
+                    files={"files[0]": (name, source.read_bytes())},
+                )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ConnectionError(f"discord upload transport error: {exc!r}") from exc
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise ConnectionError(f"discord transient HTTP {resp.status_code}")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"discord upload failed: HTTP {resp.status_code}")
+        return str((resp.json() or {}).get("id", ""))
+
+    async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
+        """Best-effort CDN download (attachment URLs need no auth)."""
+        url = getattr(attachment, "discord_url", None)
+        if not url:
+            return None
+        return await self.download_url(url)
+
+    @staticmethod
+    async def download_url(url: str) -> bytes | None:
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(url)
+        except (httpx.TimeoutException, httpx.TransportError):
+            return None
+        return resp.content if resp.status_code == 200 else None
 
     async def send_text(self, *, address: PlatformAddress, text: str) -> str:
         bot_token = (self._secrets.get("bot_token") or "").strip()

@@ -6,10 +6,11 @@ import logging
 import secrets
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from anton.core.dispatch import InboundEvent, InboundMessage, PlatformAddress
+from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.lifecycle import (
     ChannelLifecycle,
@@ -33,8 +34,45 @@ log = logging.getLogger(__name__)
 
 CHANNEL_TYPE = "telegram"
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
+TELEGRAM_FILE_BASE = "https://api.telegram.org/file/bot"
 TELEGRAM_MAX_TEXT = 4096
+TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024  # Bot API getFile hard limit
+TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # Bot API sendDocument hard limit
 _SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"
+# Long-poll window for getUpdates when running tunnel-free (server-side
+# polling). The HTTP client timeout must exceed this so the long poll isn't
+# aborted before Telegram returns.
+POLL_TIMEOUT_S = 25
+
+
+def extract_media(msg: dict) -> list[Attachment]:
+    """Photo/document → Attachment descriptors; the bytes are fetched later in
+    the background via fetch_attachment (never in the pre-ACK parse path)."""
+    media: list[Attachment] = []
+    if isinstance(msg.get("photo"), list) and msg["photo"]:
+        size = msg["photo"][-1]  # largest rendition is last
+        attachment = Attachment(filename=f"photo_{size.get('file_unique_id', 'tg')}.jpg", mime_type="image/jpeg")
+        attachment.telegram_file_id = size.get("file_id")
+        attachment.telegram_file_size = size.get("file_size")
+        media.append(attachment)
+    document = msg.get("document")
+    if isinstance(document, dict):
+        attachment = Attachment(
+            filename=document.get("file_name") or f"document_{document.get('file_unique_id', 'tg')}",
+            mime_type=document.get("mime_type") or "application/octet-stream",
+        )
+        attachment.telegram_file_id = document.get("file_id")
+        attachment.telegram_file_size = document.get("file_size")
+        media.append(attachment)
+    kept = []
+    for attachment in media:
+        size = getattr(attachment, "telegram_file_size", None)
+        if size and size > TELEGRAM_MAX_FILE_BYTES:
+            log.info("skipping telegram attachment over getFile limit")
+            continue
+        if getattr(attachment, "telegram_file_id", None):
+            kept.append(attachment)
+    return kept
 
 
 def _split_for_limit(text: str, limit: int) -> list[str]:
@@ -83,6 +121,63 @@ class TelegramBridge:
         for chunk in _split_for_limit(text, TELEGRAM_MAX_TEXT):
             await self.send_text(address=address, text=chunk)
 
+    async def set_typing(self, *, address: PlatformAddress) -> None:
+        # Best-effort: Telegram shows the indicator for ~5s per call.
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return
+        await self._call(bot_token, "sendChatAction", {"chat_id": address.platform_id, "action": "typing"})
+
+    async def fetch_attachment(self, attachment: Attachment) -> bytes | None:
+        """Resolve a parsed attachment to bytes (getFile + download). Best-effort:
+        any failure returns None so the turn proceeds with the text alone."""
+        file_id = getattr(attachment, "telegram_file_id", None)
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not file_id or not bot_token:
+            return None
+        try:
+            info = await self._call(bot_token, "getFile", {"file_id": file_id})
+        except (ConnectionError, RuntimeError):
+            return None
+        file_path = (info.get("result") or {}).get("file_path") if info.get("ok") else None
+        if not file_path:
+            return None
+        return await self.download_file(bot_token, file_path)
+
+    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
+        """Upload one file via sendDocument; returns the platform message id."""
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            raise RuntimeError("telegram bot_token not configured")
+        source = Path(path)
+        if source.stat().st_size > TELEGRAM_MAX_UPLOAD_BYTES:
+            raise RuntimeError("telegram attachment exceeds the 50MB upload limit")
+        name = (filename or source.name).strip() or "file"
+        try:
+            async with httpx.AsyncClient(timeout=60.0, headers={"User-Agent": "Cowork/1.0"}) as client:
+                resp = await client.post(
+                    f"{TELEGRAM_API_BASE}{bot_token}/sendDocument",
+                    data={"chat_id": address.platform_id},
+                    files={"document": (name, source.read_bytes())},
+                )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ConnectionError(f"telegram sendDocument transport error: {exc!r}") from exc
+        result = resp.json()
+        if not result.get("ok"):
+            raise RuntimeError(f"telegram sendDocument failed: {result.get('description', 'unknown')}")
+        return str((result.get("result") or {}).get("message_id", ""))
+
+    @staticmethod
+    async def download_file(bot_token: str, file_path: str) -> bytes | None:
+        # The URL embeds the bot token — never log it.
+        url = f"{TELEGRAM_FILE_BASE}{bot_token}/{file_path}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url)
+        except (httpx.TimeoutException, httpx.TransportError):
+            return None
+        return resp.content if resp.status_code == 200 else None
+
     def try_handshake(
         self, *, method: str, body: bytes, headers: Mapping[str, str], query: Mapping[str, str]
     ) -> WebhookHandshake:
@@ -129,8 +224,9 @@ class TelegramBridge:
         sender = msg.get("from") or {}
         if sender.get("is_bot"):
             return None
-        text = (msg.get("text") or "").strip()
-        if not text:
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        attachments = extract_media(msg)
+        if not text and not attachments:
             return None
 
         chat = msg.get("chat") or {}
@@ -162,6 +258,7 @@ class TelegramBridge:
                 sender_id=str(sender.get("id", "")) or None,
                 is_mention=is_mention,
                 is_group=is_group,
+                attachments=attachments,
             ),
         )
 
@@ -172,6 +269,42 @@ class TelegramBridge:
             else f"telegram:message:{chat_id}:{message_id}"
         )
         return event
+
+    async def poll(self, *, offset: int | None) -> tuple[list[InboundEvent], int | None]:
+        """One long-poll getUpdates cycle for tunnel-free operation: returns the
+        parsed events and the next offset to request. On the first cycle
+        (offset is None) any registered webhook is cleared, since getUpdates and
+        a webhook are mutually exclusive at the Telegram side."""
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return [], offset
+        if offset is None:
+            await self._call(bot_token, "deleteWebhook", {"drop_pending_updates": False})
+        params: dict[str, Any] = {
+            "timeout": POLL_TIMEOUT_S,
+            "allowed_updates": json.dumps(["message"]),
+        }
+        if offset is not None:
+            params["offset"] = offset
+        url = f"{TELEGRAM_API_BASE}{bot_token}/getUpdates"
+        try:
+            async with httpx.AsyncClient(
+                timeout=POLL_TIMEOUT_S + 10, headers={"User-Agent": "Cowork/1.0"}
+            ) as client:
+                resp = await client.get(url, params=params)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ConnectionError(f"telegram getUpdates transport error: {exc!r}") from exc
+        updates = (resp.json().get("result") if resp.status_code == 200 else None) or []
+        events: list[InboundEvent] = []
+        next_offset = offset
+        for update in updates:
+            update_id = update.get("update_id")
+            if update_id is not None:
+                next_offset = update_id + 1
+            event = self._normalize_update(update)
+            if event is not None:
+                events.append(event)
+        return events, next_offset
 
     async def send_text(self, *, address: PlatformAddress, text: str) -> str:
         """Send one chunk via ``sendMessage``; returns the platform message id.
@@ -234,13 +367,18 @@ async def _setup(ctx: LifecycleContext) -> LifecycleResult:
     bot_token = (ctx.credentials.get("bot_token") or "").strip()
     if not bot_token:
         raise LifecycleError(400, "telegram bot_token is required before setup")
-    if not ctx.webhook_url:
-        raise LifecycleError(409, "public base URL is not configured; cannot register a webhook")
 
     secret_token = (ctx.credentials.get("secret_token") or "").strip()
     if not secret_token:
         secret_token = secrets.token_urlsafe(32)
         ctx.persist_credentials({"secret_token": secret_token})
+
+    if not ctx.webhook_url:
+        active = await ctx.refresh_adapter()
+        return LifecycleResult(
+            active=active,
+            detail="telegram active; webhook not registered (no public base URL)",
+        )
 
     result = await TelegramBridge._call(
         bot_token,

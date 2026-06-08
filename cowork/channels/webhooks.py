@@ -121,9 +121,18 @@ def _add_webhook_route(
     async def handler(request: Request) -> Response:
         bridge = resolver(channel_type)
         if bridge is None:
+            # Inbound arrived but no live adapter is registered: the channel
+            # isn't active (setup/reload not run, or credentials incomplete).
+            # Warn because this silently drops every message and is a common
+            # misconfig — the 204 keeps the platform from retrying.
+            log.warning(
+                "channel %s: webhook hit but no live adapter registered; "
+                "dropping inbound (is the channel active?)", channel_type,
+            )
             return Response(status_code=204)
 
         body = await request.body()
+        log.info("channel %s: webhook received (%d bytes)", channel_type, len(body))
         headers = {k.lower(): v for k, v in request.headers.items()}
         query = dict(request.query_params)
 
@@ -149,7 +158,8 @@ def _add_webhook_route(
             log.exception("channel %s parse_inbound failed", channel_type)
             return Response("could not parse webhook payload", status_code=400)
 
-        _intake_events(channel_type, bridge, events, sink=sink, scheduler=scheduler)
+        log.info("channel %s: parsed %d inbound event(s)", channel_type, len(events))
+        intake_events(channel_type, bridge, events, sink=sink, scheduler=scheduler)
         return _success_ack(bridge, events)
 
     router.add_api_route(
@@ -172,17 +182,21 @@ def _success_ack(bridge: WebhookBridge, events: list[Any]) -> Response:
     return Response(status_code=200)
 
 
-def _intake_events(
+def intake_events(
     channel_type: str,
     bridge: WebhookBridge,
     events: list[Any],
     *,
     sink: InboundSink,
-    scheduler: Scheduler,
+    scheduler: Scheduler | None = None,
 ) -> None:
-    """De-dup, record, and schedule each parsed event. Runs in request scope so
-    the ACK is sent only after duplicates are filtered and events recorded; the
-    actual sink call happens in the background."""
+    """De-dup, record, and schedule each parsed event for background sink
+    processing. Shared by both ingress paths — webhook routes and server-side
+    polling — so dedupe and event logging behave identically regardless of how
+    the event arrived. For webhooks this runs in request scope, so the ACK is
+    sent only after duplicates are filtered and recorded; the sink call itself
+    always happens in the background."""
+    sched = scheduler or _default_scheduler
     session = get_open_session()
     try:
         channel_log = ChannelEventService(session)
@@ -195,7 +209,8 @@ def _intake_events(
             if event_id is None:
                 log.info("channel %s dropping duplicate inbound (insert race) key=%s", channel_type, key)
                 continue
-            scheduler(_process_event(channel_type, event, event_id, sink))
+            log.info("channel %s: accepted inbound key=%s; dispatching to runtime", channel_type, key)
+            sched(_process_event(channel_type, event, event_id, sink))
     finally:
         session.close()
 

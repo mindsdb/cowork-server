@@ -85,8 +85,10 @@ class ChannelLifecycleService:
             remove_adapter=remove,
         )
 
-    def _resolve_webhook_url(self, plugin: ChannelPlugin) -> str:
+    def _resolve_webhook_url(self, plugin: ChannelPlugin) -> str | None:
         settings = get_app_settings()
+        if not (settings.public_base_url or "").strip():
+            return None
         base = validate_public_base_url(
             settings.public_base_url,
             allow_insecure_local=settings.env in _LOCAL_ENVS,
