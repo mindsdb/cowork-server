@@ -90,12 +90,12 @@ def validate_settings(session: SessionDep):
 @router.get("/configured")
 def check_configured(session: SessionDep):
     s = SettingService(session).load()
+    if s.minds_api_key is not None:
+        return {"configured": True, "provider": "minds-cloud"}
     if s.anthropic_api_key is not None:
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
-    if s.minds_api_key is not None:
-        return {"configured": True, "provider": "minds"}
     return {"configured": False, "provider": ""}
 
 
