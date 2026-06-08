@@ -3,8 +3,10 @@ import sqlite3
 from sqlalchemy import create_engine, text
 from sqlmodel import SQLModel
 
+from alembic.script import ScriptDirectory
+
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.migrations import run_schema_migrations
+from cowork.db.migrations import _alembic_config, run_schema_migrations
 
 # Import models so SQLModel.metadata can create a pre-Alembic legacy schema.
 import cowork.models.conversation  # noqa: F401
@@ -32,6 +34,12 @@ def _alembic_version(path) -> str:
         return connection.execute("select version_num from alembic_version").fetchone()[0]
 
 
+def expected_head() -> str:
+    # Resolve the head from the script directory so new migrations don't
+    # require updating a hardcoded revision here.
+    return ScriptDirectory.from_config(_alembic_config("sqlite://")).get_current_head()
+
+
 def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
@@ -43,7 +51,7 @@ def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
     run_schema_migrations(engine, uri)
 
     assert "harness" in _message_columns(db_path)
-    assert _alembic_version(db_path) == "b8a2f4c6d9e1"
+    assert _alembic_version(db_path) == expected_head()
 
 
 def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
@@ -57,8 +65,12 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
 
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE messages DROP COLUMN harness"))
+        # A real pre-Alembic database predates the channel tables too; drop them
+        # so the upgrade path recreates them via the channels migration.
+        for table in ("channel_events", "channel_sessions", "channel_bindings", "channel_installations"):
+            connection.execute(text(f"DROP TABLE IF EXISTS {table}"))
 
     run_schema_migrations(engine, uri)
 
     assert "harness" in _message_columns(db_path)
-    assert _alembic_version(db_path) == "b8a2f4c6d9e1"
+    assert _alembic_version(db_path) == expected_head()
