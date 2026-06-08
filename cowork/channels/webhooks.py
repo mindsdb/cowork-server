@@ -65,8 +65,6 @@ class WebhookBridge(Protocol):
 
 BridgeResolver = Callable[[str], "WebhookBridge | None"]
 InboundSink = Callable[[str, Any], Awaitable[None]]
-# Receives parsed approval button responses (channel_type, ActionResponse-like).
-ActionSink = Callable[[str, Any], Awaitable[None]]
 Scheduler = Callable[[Coroutine[Any, Any, None]], None]
 
 
@@ -97,7 +95,6 @@ def build_channel_webhook_router(
     resolver: BridgeResolver,
     sink: InboundSink,
     scheduler: Scheduler = _default_scheduler,
-    action_sink: ActionSink | None = None,
 ) -> APIRouter:
     """Build an APIRouter exposing every webhook a plugin declares.
     """
@@ -105,7 +102,7 @@ def build_channel_webhook_router(
     for webhook in plugin.webhooks:
         _add_webhook_route(
             router, plugin.channel_type, webhook.path, webhook.name, list(webhook.methods),
-            resolver=resolver, sink=sink, scheduler=scheduler, action_sink=action_sink,
+            resolver=resolver, sink=sink, scheduler=scheduler,
         )
     return router
 
@@ -120,7 +117,6 @@ def _add_webhook_route(
     resolver: BridgeResolver,
     sink: InboundSink,
     scheduler: Scheduler,
-    action_sink: ActionSink | None = None,
 ) -> None:
     async def handler(request: Request) -> Response:
         bridge = resolver(channel_type)
@@ -147,14 +143,6 @@ def _add_webhook_route(
             log.warning("channel %s webhook signature verification failed", channel_type)
             return Response("invalid signature", status_code=401)
 
-        # Approval button presses short-circuit the inbound path (post-verify).
-        parse_action = getattr(bridge, "parse_action_response", None)
-        if action_sink is not None and callable(parse_action):
-            response = parse_action(body=body, headers=headers)
-            if response is not None:
-                scheduler(process_action_response(channel_type, response, action_sink))
-                return Response(status_code=200)
-
         try:
             events = await bridge.parse_inbound(body=body, headers=headers, route_name=route_name)
         except Exception:
@@ -171,13 +159,6 @@ def _add_webhook_route(
         name=f"channel_{channel_type}_webhook_{route_name or 'default'}",
         include_in_schema=False,
     )
-
-
-async def process_action_response(channel_type: str, response: Any, action_sink: ActionSink) -> None:
-    try:
-        await action_sink(channel_type, response)
-    except Exception:
-        log.exception("channel %s action-response handling failed", channel_type)
 
 
 def _success_ack(bridge: WebhookBridge, events: list[Any]) -> Response:
