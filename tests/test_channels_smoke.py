@@ -687,6 +687,42 @@ def test_channel_agent_endpoint_validates_and_persists():
         session.close()
 
 
+def test_channel_agent_switch_resets_bound_conversations():
+    from cowork.models.channel import ChannelBinding
+    from cowork.services.channel_bindings import ChannelBindingService
+    from cowork.services.conversations import ConversationService
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    session = get_open_session()
+    bid = None
+    try:
+        conv = ConversationService(session).create_conversation(topic="chan", project_id=GENERAL_PROJECT_ID)
+        binding = ChannelBinding(
+            channel_type="telegram",
+            external_group_id="reset-test",
+            external_thread_key="__default__",
+            anton_conversation_id=conv.id,
+            anton_project_id=GENERAL_PROJECT_ID,
+            trigger_rule="always",
+        )
+        session.add(binding)
+        session.commit()
+        session.refresh(binding)
+        bid = binding.id
+
+        reset = ChannelBindingService(session).reset_conversations(channel_type="telegram")
+        assert reset >= 1
+        session.expire_all()
+        assert session.get(ChannelBinding, bid).anton_conversation_id is None
+    finally:
+        if bid is not None:
+            row = session.get(ChannelBinding, bid)
+            if row is not None:
+                session.delete(row)
+                session.commit()
+        session.close()
+
+
 def test_plugin_capabilities_match_declared_hooks():
     registry = PluginRegistry()
     load_first_party_plugins(registry)
