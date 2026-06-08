@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from anton.core.dispatch import ActionResponse, Attachment, InboundEvent, InboundMessage, PlatformAddress
+from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
 from cowork.channels.lifecycle import (
     ChannelLifecycle,
@@ -112,73 +112,10 @@ class TelegramBridge:
             await self.send_text(address=message.address, text=chunk)
 
     async def show_action_card(self, address: PlatformAddress, card: Any) -> None:
-        question_id = getattr(card, "question_id", None)
-        options = list(getattr(card, "options", []) or [])
-        bot_token = (self._secrets.get("bot_token") or "").strip()
-        if question_id and options and bot_token:
-            keyboard = [[
-                {"text": option.label, "callback_data": f"appr:{question_id}:{option.id}"}
-                for option in options
-            ]]
-            result = await self._call(bot_token, "sendMessage", {
-                "chat_id": address.platform_id,
-                "text": getattr(card, "prompt", "") or "Approve?",
-                "reply_markup": {"inline_keyboard": keyboard},
-            })
-            if result.get("ok"):
-                return
-            log.warning("telegram inline card failed; falling back to text")
-        bullets = "\n".join(f"  • {o.label}" for o in options)
+        bullets = "\n".join(f"  • {o.label}" for o in getattr(card, "options", []))
         text = f"*{getattr(card, 'prompt', '')}*\n{bullets}".strip()
         for chunk in _split_for_limit(text, TELEGRAM_MAX_TEXT):
             await self.send_text(address=address, text=chunk)
-
-    def parse_action_response(self, *, body: bytes, headers: Mapping[str, str]) -> ActionResponse | None:
-        """Inline-button presses arrive as callback_query updates; anything else
-        falls through to the normal inbound path."""
-        try:
-            update = json.loads(body.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
-        query = update.get("callback_query") if isinstance(update, dict) else None
-        if not isinstance(query, dict):
-            return None
-        data = query.get("data") or ""
-        parts = data.split(":", 2)
-        if len(parts) != 3 or parts[0] != "appr":
-            return None
-        response = ActionResponse(
-            question_id=parts[1],
-            selected_option_id=parts[2],
-            user_id=str((query.get("from") or {}).get("id", "")) or None,
-        )
-        message = query.get("message") or {}
-        response.telegram_callback_query_id = query.get("id")
-        response.telegram_chat_id = str((message.get("chat") or {}).get("id", ""))
-        response.telegram_message_id = message.get("message_id")
-        return response
-
-    async def ack_action_response(self, response: Any, *, resolved: bool, approved: bool) -> None:
-        """Clear the button spinner and rewrite the card with the outcome."""
-        bot_token = (self._secrets.get("bot_token") or "").strip()
-        if not bot_token:
-            return
-        note = ("Approved" if approved else "Denied") if resolved else "No longer pending"
-        query_id = getattr(response, "telegram_callback_query_id", None)
-        if query_id:
-            try:
-                await self._call(bot_token, "answerCallbackQuery", {"callback_query_id": query_id, "text": note})
-            except Exception:
-                log.debug("answerCallbackQuery failed", exc_info=True)
-        chat_id = getattr(response, "telegram_chat_id", None)
-        message_id = getattr(response, "telegram_message_id", None)
-        if chat_id and message_id:
-            try:
-                await self._call(bot_token, "editMessageText", {
-                    "chat_id": chat_id, "message_id": message_id, "text": note,
-                })
-            except Exception:
-                log.debug("editMessageText failed", exc_info=True)
 
     async def set_typing(self, *, address: PlatformAddress) -> None:
         # Best-effort: Telegram shows the indicator for ~5s per call.
@@ -404,7 +341,7 @@ async def _setup(ctx: LifecycleContext) -> LifecycleResult:
         {
             "url": ctx.webhook_url,
             "secret_token": secret_token,
-            "allowed_updates": ["message", "callback_query"],
+            "allowed_updates": ["message"],
         },
     )
     if not result.get("ok"):

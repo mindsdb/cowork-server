@@ -51,7 +51,6 @@ class BindingCreateRequest(BaseModel):
     trigger_pattern: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
-    gated_tools: list[str] | None = None
 
 
 class BindingUpdateRequest(BaseModel):
@@ -62,7 +61,6 @@ class BindingUpdateRequest(BaseModel):
     trigger_pattern: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
-    gated_tools: list[str] | None = None
 
 
 class BindingResponse(BaseModel):
@@ -75,7 +73,6 @@ class BindingResponse(BaseModel):
     trigger_pattern: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
-    gated_tools: list[str] | None = None
     created_at: datetime | None = None
     modified_at: datetime | None = None
 

@@ -4,8 +4,7 @@ from datetime import datetime
 from uuid import UUID
 
 import sqlalchemy as sa
-from sqlalchemy import JSON
-from sqlmodel import Column, Field
+from sqlmodel import Field
 
 from cowork.models.base import BaseSQLModel
 
@@ -58,11 +57,6 @@ class ChannelBinding(BaseSQLModel, table=True):
         foreign_key="conversations.id",
         description="Conversation this binding is pinned to, when one external chat == one conversation",
     )
-    gated_tools: list[str] | None = Field(
-        default=None,
-        sa_column=Column(JSON),
-        description="Tool names that require in-channel approval before running; null/empty = none",
-    )
 
 
 class ChannelSession(BaseSQLModel, table=True):
@@ -83,27 +77,6 @@ class ChannelSession(BaseSQLModel, table=True):
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="UTC time of the most recent message routed through this session",
-    )
-
-
-class ChannelPendingAction(BaseSQLModel, table=True):
-    __tablename__ = "channel_pending_actions"
-
-    channel_type: str = Field(description="Stable adapter name")
-    binding_id: UUID = Field(foreign_key="channel_bindings.id", index=True, description="Binding the approval belongs to")
-    conversation_id: UUID | None = Field(
-        default=None,
-        foreign_key="conversations.id",
-        description="Conversation whose turn is waiting on this approval",
-    )
-    tool_name: str = Field(description="Gated tool awaiting approval")
-    summary: str | None = Field(default=None, description="Short human-readable description of the call")
-    status: str = Field(default="pending", description="pending | approved | denied | expired")
-    responder_id: str | None = Field(default=None, description="Platform sender id that resolved it")
-    resolved_at: datetime | None = Field(
-        default=None,
-        sa_type=sa.DateTime(timezone=True),  # type: ignore
-        description="UTC time the approval was resolved",
     )
 
 

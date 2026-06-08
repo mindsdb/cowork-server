@@ -1,5 +1,4 @@
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Protocol
+from typing import AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
 from uuid import UUID
 
@@ -9,19 +8,6 @@ from cowork.models.conversation import Conversation
 from cowork.schemas.memory import MemoryScope
 from cowork.models.project import Project
 from cowork.models.skill import Skill
-
-
-@dataclass
-class ProposedToolCall:
-    """A tool call awaiting permission from a tool gate."""
-
-    tool_name: str
-    tool_input: dict[str, Any]
-
-
-# Awaited before a gated tool runs; True = run, False = deny. Harnesses that
-# support gating consult it in their tool loop (see stream_response).
-ToolGate = Callable[[ProposedToolCall], Awaitable[bool]]
 
 
 class TextInputBlock(TypedDict):
@@ -54,7 +40,6 @@ class HarnessProvider(Protocol):
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
-        tool_gate: "ToolGate | None" = None,
     ) -> AsyncIterator[str]:
         ...
 
