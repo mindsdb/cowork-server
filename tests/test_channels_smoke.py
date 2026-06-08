@@ -602,7 +602,7 @@ def test_whatsapp_send_attachment(monkeypatch, tmp_path):
 
 
 def test_channels_harness_selection_and_pinning(monkeypatch):
-    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.common.settings.user_settings import get_user_settings
 
     anton_harness = FakeHarness()
     hermes_harness = FakeHarness()
@@ -635,7 +635,7 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
         s.close()
         return sorted({m.harness for m in msgs if m.role == "assistant"})
 
-    settings = get_app_settings()
+    settings = get_user_settings()
     monkeypatch.setattr(settings, "channels_harness", "hermes")
     turn(700, 200)
     assert harnesses_of(700) == ["hermes"] and hermes_harness.inputs
@@ -653,6 +653,38 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
     monkeypatch.setattr(settings, "channels_harness", "ghost")
     turn(702, 203)
     assert harnesses_of(702) == ["anton"]
+
+
+def test_channel_agent_endpoint_validates_and_persists():
+    import pytest
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.channels import get_channel_agent, set_channel_agent
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.schemas.channels import ChannelAgentUpdateRequest
+    from cowork.services.settings import SettingService
+
+    session = get_open_session()
+    try:
+        # Unknown harness is rejected, not persisted.
+        with pytest.raises(HTTPException) as exc:
+            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session)
+        assert exc.value.status_code == 400
+
+        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session)
+        assert resp.harness == "hermes"
+        assert "anton" in resp.options and "hermes" in resp.options
+        assert get_channel_agent().harness == "hermes"
+        assert get_user_settings().channels_harness == "hermes"
+    finally:
+        session.close()
+
+    # Reset so the stored setting doesn't leak into other tests.
+    session = get_open_session()
+    try:
+        SettingService(session).delete_setting("channels_harness")
+    finally:
+        session.close()
 
 
 def test_plugin_capabilities_match_declared_hooks():

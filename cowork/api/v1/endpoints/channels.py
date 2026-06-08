@@ -8,6 +8,8 @@ from sqlmodel import Session
 
 from cowork.db.session import get_session
 from cowork.schemas.channels import (
+    ChannelAgentResponse,
+    ChannelAgentUpdateRequest,
     BindingCreateRequest,
     BindingResponse,
     BindingUpdateRequest,
@@ -61,6 +63,40 @@ def list_plugins(session: SessionDep) -> list[PluginResponse]:
 @router.get("/installations", response_model=list[ChannelInstallationResponse])
 def list_installations(session: SessionDep) -> list[ChannelInstallationResponse]:
     return ChannelConfigService(session).list_installations()
+
+
+def _harness_options() -> list[str]:
+    # Registered harness ids, resolved at request time (after plugins/harnesses
+    # have loaded — they aren't available when app_settings parses env).
+    from cowork.harnesses.base import _registry
+
+    return list(_registry.keys())
+
+
+@router.get("/agent", response_model=ChannelAgentResponse)
+def get_channel_agent() -> ChannelAgentResponse:
+    """The harness that serves channel conversations. Distinct from the desktop
+    harness setting and applied to new conversations (existing ones stay pinned
+    to whatever first served them)."""
+    from cowork.common.settings.user_settings import get_user_settings
+
+    current = (get_user_settings().channels_harness or "").strip() or "anton"
+    return ChannelAgentResponse(harness=current, options=_harness_options())
+
+
+@router.put("/agent", response_model=ChannelAgentResponse)
+def set_channel_agent(body: ChannelAgentUpdateRequest, session: SessionDep) -> ChannelAgentResponse:
+    from cowork.services.settings import SettingService
+
+    options = _harness_options()
+    harness = (body.harness or "").strip()
+    if harness not in options:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unknown harness '{harness}'. Available: {', '.join(options) or 'none'}",
+        )
+    SettingService(session).upsert_setting("channels_harness", harness)
+    return ChannelAgentResponse(harness=harness, options=options)
 
 
 @router.get("/{channel_type}/config", response_model=ChannelConfigResponse)

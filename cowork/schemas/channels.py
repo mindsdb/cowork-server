@@ -7,6 +7,17 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
+class ChannelAgentResponse(BaseModel):
+    # The harness that serves channel conversations, plus the registered
+    # harnesses to choose from. Separate from the desktop harness setting.
+    harness: str
+    options: list[str]
+
+
+class ChannelAgentUpdateRequest(BaseModel):
+    harness: str
+
+
 class InstallationStatus(str, Enum):
     disconnected = "disconnected"
     active = "active"
