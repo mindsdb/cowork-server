@@ -105,6 +105,33 @@ class ChannelBindingService:
         self.session.refresh(binding)
         return self._dto(binding)
 
+    def reset_conversations(self, channel_type: str | None = None) -> int:
+        """Detach bindings from their current conversation so the next inbound
+        message starts a fresh one — used when the channel agent changes, so
+        existing chats pick up the new agent instead of staying pinned to the
+        old one. Past conversations are preserved (just no longer the active
+        thread). Returns how many bindings had an active conversation.
+        """
+        stmt = select(ChannelBinding)
+        if channel_type:
+            stmt = stmt.where(ChannelBinding.channel_type == channel_type)
+        reset = 0
+        for binding in self.session.exec(stmt).all():
+            if binding.anton_conversation_id is None:
+                continue
+            binding.anton_conversation_id = None
+            self.session.add(binding)
+            # Drop the session rows too so a fresh one is recorded against the
+            # new conversation on the next message.
+            for sess in self.session.exec(
+                select(ChannelSession).where(ChannelSession.binding_id == binding.id)
+            ).all():
+                self.session.delete(sess)
+            reset += 1
+        if reset:
+            self.session.commit()
+        return reset
+
     def delete(self, binding_id: UUID) -> bool:
         binding = self.session.get(ChannelBinding, binding_id)
         if binding is None:

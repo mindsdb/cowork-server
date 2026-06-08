@@ -7,6 +7,20 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
+class ChannelAgentResponse(BaseModel):
+    # The harness that serves channel conversations, plus the registered
+    # harnesses to choose from. Separate from the desktop harness setting.
+    harness: str
+    options: list[str]
+    # How many existing chats were reset to the new agent on this change
+    # (0 on reads or when the agent didn't actually change).
+    reset_conversations: int = 0
+
+
+class ChannelAgentUpdateRequest(BaseModel):
+    harness: str
+
+
 class InstallationStatus(str, Enum):
     disconnected = "disconnected"
     active = "active"

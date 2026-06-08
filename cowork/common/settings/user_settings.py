@@ -3,7 +3,7 @@ from typing import Annotated, Any, Callable, ClassVar, get_args
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 
-from cowork.common.settings.app_settings import Settings
+from cowork.common.settings.app_settings import Settings, get_app_settings
 
 
 class Provider(str, Enum):
@@ -147,6 +147,11 @@ class UserSettings(Settings):
         default="anton",
         title="Harness",
         description="The AI harness used to generate responses.",
+    )
+    channels_harness: Annotated[str, _DynamicOptions(_harness_options)] = Field(
+        default_factory=lambda: (get_app_settings().channels_harness or "anton"),
+        title="Channel Agent",
+        description="The AI harness that serves messaging-channel conversations.",
     )
 
     # ── UI preferences ──
