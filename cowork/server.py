@@ -25,13 +25,25 @@ logger = setup_logging()
 async def lifespan(app: FastAPI):
     run_dev_setup()
     start_scheduler()
+    await app.state.channel_adapters.refresh_all()
+    from cowork.channels.polling import sync_channel_polling
+    from cowork.channels.registry import get_registry
+
+    for plugin in get_registry().all():
+        await sync_channel_polling(
+            app.state.channel_poller, app.state.channel_adapters, plugin.channel_type
+        )
     try:
         yield
     finally:
+        from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.http_client import close_proxy_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
 
+        await app.state.channel_poller.stop_all()
+        await drain_background_tasks()
+        await app.state.channel_adapters.shutdown()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
@@ -69,8 +81,40 @@ def create_app() -> FastAPI:
     # Include v1 API routes
     app.include_router(v1_router)
 
+    _install_channels(app)
+
     logger.info("Cowork application created successfully")
     return app
+
+
+def _install_channels(app: FastAPI) -> None:
+    """Discover channel plugins, mount their webhook routes, and build the
+    Anton-only channel runtime + live-adapter registry.
+
+    The registry/runtime are stashed on ``app.state`` so the lifespan can build
+    adapters from stored credentials at startup and tear them down on shutdown.
+    Webhook routes resolve the live adapter synchronously through the registry's
+    cache, which the lifespan populates — so routes are mounted here but only
+    serve once a channel is configured (otherwise the route ACK-ignores: 204).
+    """
+    from cowork.channels.polling import PollManager
+    from cowork.channels.registry import get_registry, load_first_party_plugins
+    from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
+    from cowork.channels.webhooks import build_channel_webhook_router
+
+    load_first_party_plugins()
+    adapters = LiveAdapterRegistry()
+    runtime = AntonChannelRuntime(adapters)
+    for plugin in get_registry().all():
+        if not plugin.webhooks:
+            continue
+        app.include_router(
+            build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
+            prefix="/api/v1/channels",
+        )
+    app.state.channel_adapters = adapters
+    app.state.channel_runtime = runtime
+    app.state.channel_poller = PollManager(sink=runtime.handle)
 
 
 # Create the application instance
