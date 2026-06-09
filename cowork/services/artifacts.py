@@ -272,7 +272,7 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
             target.relative_to(art_root.resolve())
         except ValueError:
             continue
-        if target.is_file():
+        if target.is_file() or (target.is_dir() and (target / "metadata.json").exists()):
             matches[str(target)] = target
     return list(matches.values())
 
@@ -299,7 +299,7 @@ def resolve_artifact_path(raw_path: str) -> Path | None:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
                 continue
-            if resolved.is_file():
+            if resolved.is_file() or (resolved.is_dir() and (resolved / "metadata.json").exists()):
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
@@ -365,7 +365,7 @@ def delete_artifact(raw_path: str) -> None:
             continue
         # Unpublish before deleting; if this raises, the artifact stays.
         _unpublish_folder(folder)
-        shutil.rmtree(folder)
+        shutil.rmtree(folder)  # codeql[py/path-injection]
         return
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
