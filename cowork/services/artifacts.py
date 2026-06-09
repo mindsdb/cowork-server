@@ -345,12 +345,9 @@ def delete_artifact(raw_path: str) -> None:
     remote first. If any unpublish fails, the artifact is left on disk
     and the error propagates to the caller.
     """
-    if "\x00" in raw_path:
+    target = resolve_artifact_path(raw_path)
+    if target is None:
         raise ValueError("Invalid artifact path")
-    try:
-        target = Path(raw_path).expanduser().resolve()
-    except Exception as exc:
-        raise ValueError("Invalid artifact path") from exc
 
     if target.is_dir() and (target / "metadata.json").exists():
         folder = target
