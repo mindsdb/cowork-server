@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +34,17 @@ DISCORD_MAX_TEXT = 2000
 DISCORD_MAX_FILE_BYTES = 20 * 1024 * 1024
 DISCORD_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # default bot upload cap
 _OAUTH_SCOPES = ("bot", "applications.commands")
+
+# Gateway intents for receiving normal channel/DM messages. MESSAGE_CONTENT is
+# privileged — it must be enabled in the Discord Developer Portal or message
+# content arrives empty. GUILDS|GUILD_MESSAGES|DIRECT_MESSAGES|MESSAGE_CONTENT.
+_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15)
+_GATEWAY_DISPATCH = 0
+_GATEWAY_HEARTBEAT = 1
+_GATEWAY_IDENTIFY = 2
+_GATEWAY_RECONNECT = 7
+_GATEWAY_INVALID_SESSION = 9
+_GATEWAY_HELLO = 10
 
 
 def extract_media(data: dict) -> list[Attachment]:
@@ -73,6 +86,9 @@ class DiscordBridge:
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
+        # Learned from the Gateway READY frame; used to skip our own messages
+        # and detect @-mentions of the bot.
+        self._bot_user_id: str | None = None
 
     @property
     def channel_type(self) -> str:
@@ -186,6 +202,128 @@ class DiscordBridge:
         mid = event.message.id
         return f"discord:{event.address.platform_id}:{mid}" if mid else None
 
+    async def stream_events(self) -> AsyncIterator[list[InboundEvent]]:
+        """Connect to the Discord Gateway and yield inbound message events. This
+        is the primary ingress for normal channel/DM messages (the interactions
+        webhook only carries slash commands and needs a public URL). One
+        connection lifecycle per call — the ingress manager reconnects when it
+        returns. No session resume; dedupe absorbs any replays on reconnect."""
+        import aiohttp
+
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {bot_token}"}) as session:
+            async with session.get(f"{DISCORD_API_BASE}/gateway/bot") as resp:
+                if resp.status != 200:
+                    raise ConnectionError(f"discord gateway/bot HTTP {resp.status}")
+                gateway_url = (await resp.json())["url"]
+            async with session.ws_connect(f"{gateway_url}?v=10&encoding=json", heartbeat=None) as ws:
+                hello = await ws.receive_json()
+                interval = float(hello["d"]["heartbeat_interval"]) / 1000.0
+                seq: dict[str, Any] = {"s": None}
+                heartbeat = asyncio.create_task(self._heartbeat(ws, interval, seq))
+                try:
+                    await ws.send_json({
+                        "op": _GATEWAY_IDENTIFY,
+                        "d": {
+                            "token": bot_token,
+                            "intents": _GATEWAY_INTENTS,
+                            "properties": {"os": "linux", "browser": "cowork", "device": "cowork"},
+                        },
+                    })
+                    async for frame in ws:
+                        if frame.type != aiohttp.WSMsgType.TEXT:
+                            break
+                        payload = frame.json()
+                        if payload.get("s") is not None:
+                            seq["s"] = payload["s"]
+                        op = payload.get("op")
+                        if op == _GATEWAY_DISPATCH:
+                            t = payload.get("t")
+                            if t == "READY":
+                                self._bot_user_id = ((payload.get("d") or {}).get("user") or {}).get("id")
+                            elif t == "MESSAGE_CREATE":
+                                event = self._normalize_message(payload.get("d") or {})
+                                if event is not None:
+                                    yield [event]
+                        elif op == _GATEWAY_HEARTBEAT:
+                            await ws.send_json({"op": _GATEWAY_HEARTBEAT, "d": seq["s"]})
+                        elif op in (_GATEWAY_RECONNECT, _GATEWAY_INVALID_SESSION):
+                            break  # let the manager reconnect with a fresh IDENTIFY
+                finally:
+                    heartbeat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat
+
+    async def _heartbeat(self, ws: Any, interval: float, seq: dict[str, Any]) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            await ws.send_json({"op": _GATEWAY_HEARTBEAT, "d": seq["s"]})
+
+    def _normalize_message(self, d: dict) -> InboundEvent | None:
+        """One Gateway MESSAGE_CREATE → InboundEvent, or None to skip (bot/self
+        messages, empty non-attachment messages, missing channel)."""
+        author = d.get("author") or {}
+        if author.get("bot"):
+            return None
+        author_id = str(author.get("id", "") or "")
+        if self._bot_user_id and author_id == str(self._bot_user_id):
+            return None
+        channel_id = str(d.get("channel_id", "") or "")
+        if not channel_id:
+            return None
+        content = (d.get("content") or "").strip()
+        attachments = self._message_attachments(d)
+        if not content and not attachments:
+            return None
+
+        is_group = bool(d.get("guild_id"))
+        mentions = d.get("mentions") or []
+        is_mention = (not is_group) or (
+            bool(self._bot_user_id)
+            and any(str(m.get("id")) == str(self._bot_user_id) for m in mentions if isinstance(m, dict))
+        )
+        raw_ts = d.get("timestamp")
+        try:
+            timestamp = datetime.fromisoformat(raw_ts) if raw_ts else datetime.now(timezone.utc)
+        except (TypeError, ValueError):
+            timestamp = datetime.now(timezone.utc)
+
+        message_id = str(d.get("id", "") or "")
+        event = InboundEvent(
+            address=PlatformAddress(channel_type=CHANNEL_TYPE, platform_id=channel_id, thread_id=None),
+            message=InboundMessage(
+                id=message_id,
+                content=content,
+                timestamp=timestamp,
+                kind="chat",
+                sender_id=author_id or None,
+                is_mention=is_mention,
+                is_group=is_group,
+                attachments=attachments,
+            ),
+        )
+        event._dedupe_key = f"discord:message:{message_id}"  # type: ignore[attr-defined]
+        return event
+
+    @staticmethod
+    def _message_attachments(d: dict) -> list[Attachment]:
+        out: list[Attachment] = []
+        for raw in (d.get("attachments") or []):
+            if not isinstance(raw, dict) or not raw.get("url"):
+                continue
+            if (raw.get("size") or 0) > DISCORD_MAX_FILE_BYTES:
+                log.info("skipping discord attachment over the size cap")
+                continue
+            attachment = Attachment(
+                filename=raw.get("filename") or "file",
+                mime_type=raw.get("content_type") or "application/octet-stream",
+            )
+            attachment.discord_url = raw.get("url")
+            out.append(attachment)
+        return out
+
     def ack_response(self, events: list[InboundEvent]) -> WebhookAck | None:
         if not events:
             return None
@@ -255,8 +393,9 @@ class DiscordBridge:
 
 
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
-    if not (credentials.get("public_key") or "").strip():
-        return None
+    # Only the bot token is required: it powers the Gateway (inbound) and the
+    # REST API (outbound). public_key is needed solely for the interactions
+    # webhook (slash commands), so it stays optional.
     if not (credentials.get("bot_token") or "").strip():
         return None
     return DiscordBridge(credentials)
@@ -268,10 +407,10 @@ plugin = ChannelPlugin(
     factory=_factory,
     credentials=CredentialSchema(
         fields=(
-            CredentialField(name="public_key", label="Public key", secret=False, required=True,
-                            description="Application public key (hex); verifies interaction signatures"),
             CredentialField(name="bot_token", label="Bot token", secret=True, required=True,
-                            description="Bot token used to post messages"),
+                            description="Bot token — powers the Gateway (receive) and sending messages"),
+            CredentialField(name="public_key", label="Public key", secret=False, required=False,
+                            description="Application public key (hex) — only for the slash-command interactions webhook"),
             CredentialField(name="application_id", label="Application id", secret=False, required=False,
                             description="App id (OAuth install)"),
             CredentialField(name="client_secret", label="OAuth client secret", secret=True, required=False,
