@@ -26,19 +26,19 @@ async def lifespan(app: FastAPI):
     run_dev_setup()
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
-    from cowork.channels.polling import sync_channel_polling
+    from cowork.channels.ingress import sync_channel_ingress
     from cowork.channels.registry import get_registry
 
     for plugin in get_registry().all():
-        await sync_channel_polling(
-            app.state.channel_poller, app.state.channel_adapters, plugin.channel_type
+        await sync_channel_ingress(
+            app.state.channel_ingress, app.state.channel_adapters, plugin.channel_type
         )
     try:
         yield
     finally:
         from cowork.channels.webhooks import drain_background_tasks
 
-        await app.state.channel_poller.stop_all()
+        await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
         await app.state.channel_adapters.shutdown()
 
@@ -91,7 +91,7 @@ def _install_channels(app: FastAPI) -> None:
     cache, which the lifespan populates — so routes are mounted here but only
     serve once a channel is configured (otherwise the route ACK-ignores: 204).
     """
-    from cowork.channels.polling import PollManager
+    from cowork.channels.ingress import IngressManager
     from cowork.channels.registry import get_registry, load_first_party_plugins
     from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
     from cowork.channels.webhooks import build_channel_webhook_router
@@ -108,7 +108,7 @@ def _install_channels(app: FastAPI) -> None:
         )
     app.state.channel_adapters = adapters
     app.state.channel_runtime = runtime
-    app.state.channel_poller = PollManager(sink=runtime.handle)
+    app.state.channel_ingress = IngressManager(sink=runtime.handle)
 
 
 # Create the application instance

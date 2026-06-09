@@ -22,7 +22,7 @@ from cowork.schemas.channels import (
     PluginResponse,
 )
 from cowork.channels.lifecycle import LifecycleError
-from cowork.channels.polling import sync_channel_polling
+from cowork.channels.ingress import sync_channel_ingress
 from cowork.services.channel_bindings import (
     BindingConflictError,
     BindingNotFoundError,
@@ -43,11 +43,11 @@ def _live_adapters(request: Request):
     return getattr(request.app.state, "channel_adapters", None)
 
 
-async def _reconcile_polling(request: Request, channel_type: str) -> None:
-    """Start/stop tunnel-free polling after a change to the channel's live
-    adapter (config/setup/teardown/reload)."""
-    poller = getattr(request.app.state, "channel_poller", None)
-    await sync_channel_polling(poller, _live_adapters(request), channel_type)
+async def _reconcile_ingress(request: Request, channel_type: str) -> None:
+    """Start/stop background ingress (Gateway stream or tunnel-free poll) after a
+    change to the channel's live adapter (config/setup/teardown/reload)."""
+    manager = getattr(request.app.state, "channel_ingress", None)
+    await sync_channel_ingress(manager, _live_adapters(request), channel_type)
 
 
 @router.get("/status", response_model=ChannelStatusResponse)
@@ -133,7 +133,7 @@ async def set_config(
     adapters = _live_adapters(request)
     if adapters is not None:
         await adapters.refresh(channel_type, session=session)
-    await _reconcile_polling(request, channel_type)
+    await _reconcile_ingress(request, channel_type)
     return result
 
 
@@ -152,7 +152,7 @@ async def delete_config(channel_type: str, request: Request, session: SessionDep
     adapters = _live_adapters(request)
     if adapters is not None:
         await adapters.remove(channel_type)
-    await _reconcile_polling(request, channel_type)
+    await _reconcile_ingress(request, channel_type)
 
 
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
@@ -166,7 +166,7 @@ async def reload_channel(channel_type: str, request: Request, session: SessionDe
     active = False
     if adapters is not None:
         active = await adapters.refresh(channel_type, session=session)
-    await _reconcile_polling(request, channel_type)
+    await _reconcile_ingress(request, channel_type)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
 
 
@@ -225,7 +225,7 @@ async def setup_channel(channel_type: str, request: Request, session: SessionDep
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_polling(request, channel_type)
+    await _reconcile_ingress(request, channel_type)
     return ChannelLifecycleResponse(channel_type=channel_type, action="setup", active=result.active, detail=result.detail)
 
 
@@ -243,5 +243,5 @@ async def teardown_channel(channel_type: str, request: Request, session: Session
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_polling(request, channel_type)
+    await _reconcile_ingress(request, channel_type)
     return ChannelLifecycleResponse(channel_type=channel_type, action="teardown", active=result.active, detail=result.detail)
