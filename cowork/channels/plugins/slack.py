@@ -326,9 +326,11 @@ class SlackBridge:
 
 
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
-    if not (credentials.get("signing_secret") or "").strip():
-        return None
     if not (credentials.get("bot_token") or "").strip():
+        return None
+    has_signing = bool((credentials.get("signing_secret") or "").strip())
+    has_app_token = bool((credentials.get("app_token") or "").strip())
+    if not (has_signing or has_app_token):
         return None
     return SlackBridge(credentials)
 
@@ -339,10 +341,10 @@ plugin = ChannelPlugin(
     factory=_factory,
     credentials=CredentialSchema(
         fields=(
-            CredentialField(name="signing_secret", label="Signing secret", secret=True, required=True,
-                            description="Verifies inbound Events API requests"),
             CredentialField(name="bot_token", label="Bot token", secret=True, required=True,
                             description="xoxb- token used to post messages"),
+            CredentialField(name="signing_secret", label="Signing secret", secret=True, required=False,
+                            description="Verifies inbound Events API webhook requests (not needed for Socket Mode)"),
             CredentialField(name="client_id", label="OAuth client id", secret=False, required=False,
                             description="App client id (OAuth install)"),
             CredentialField(name="client_secret", label="OAuth client secret", secret=True, required=False,
