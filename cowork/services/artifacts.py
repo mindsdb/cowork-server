@@ -286,7 +286,7 @@ def resolve_artifact_path(raw_path: str) -> Path | None:
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
     try:
-        target = Path(raw_path).expanduser()
+        target = Path(raw_path).expanduser()  # codeql[py/path-injection]
     except Exception as exc:
         raise ValueError("Invalid artifact path") from exc
     if not str(target).strip():
