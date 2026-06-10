@@ -175,6 +175,16 @@ def test_slack_stream_events_bound_only_with_app_token():
     assert callable(getattr(socket_mode, "stream_events", None))
 
 
+def test_slack_factory_requires_bot_token_and_an_ingress_cred():
+    run = lambda creds: asyncio.run(slack._factory(creds))
+    # Missing bot_token, or no ingress credential at all → not configured.
+    assert run({"signing_secret": "s"}) is None
+    assert run({"bot_token": "xoxb-1"}) is None
+    # Either a signing_secret (webhook) or an app_token (Socket Mode) suffices.
+    assert run({"bot_token": "xoxb-1", "signing_secret": "s"}) is not None
+    assert run({"bot_token": "xoxb-1", "app_token": "xapp-1"}) is not None
+
+
 def test_slack_event_from_callback():
     bridge = slack.SlackBridge({"bot_token": "xoxb-1"})
 
