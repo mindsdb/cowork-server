@@ -286,7 +286,7 @@ def resolve_artifact_path(raw_path: str) -> Path | None:
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
     try:
-        target = Path(raw_path).expanduser()  # codeql[py/path-injection]
+        target = Path(raw_path).expanduser()
     except Exception as exc:
         raise ValueError("Invalid artifact path") from exc
     if not str(target).strip():
@@ -365,7 +365,7 @@ def delete_artifact(raw_path: str) -> None:
             continue
         # Unpublish before deleting; if this raises, the artifact stays.
         _unpublish_folder(folder)
-        shutil.rmtree(folder)  # codeql[py/path-injection]
+        shutil.rmtree(folder)
         return
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
