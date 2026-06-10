@@ -74,8 +74,21 @@ def _harness_options() -> list[str]:
 
 
 class UserSettings(Settings):
+    # minds-cloud is MindsHub's `latest:*` alias namespace. This static
+    # list is the offline fallback; the live set is fetched from MindsHub's
+    # OpenAI-compatible `/v1/models` endpoint (see
+    # cowork.services.providers.fetch_minds_models) and overlaid by the
+    # /settings/recommended-models endpoint. The deprecated `_reason_`/
+    # `_code_` sentinels are intentionally not listed here.
     RECOMMENDED_MODELS: ClassVar[dict[str, list[str]]] = {
-        "minds-cloud": ["_reason_", "_code_"],
+        "minds-cloud": [
+            "latest:sonnet", "latest:opus", "latest:haiku",
+            "latest:gpt", "latest:gpt-low", "latest:gpt-medium",
+            "latest:gpt-high", "latest:gpt-codex",
+            "latest:gpt-mini", "latest:gpt-nano",
+            "latest:gemini", "latest:gemini-flash",
+            "latest:kimi", "latest:deepseek", "latest:qwen",
+        ],
         "anthropic": ["claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
         "openai": ["gpt-5.4", "gpt-5.4-mini", "o3", "o4-mini"],
         "gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-flash-preview"],
@@ -83,7 +96,7 @@ class UserSettings(Settings):
     }
 
     RECOMMENDED_PAIR: ClassVar[dict[str, tuple[str, str]]] = {
-        "minds-cloud": ("_reason_", "_code_"),
+        "minds-cloud": ("latest:sonnet", "latest:haiku"),
         "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
         "openai": ("gpt-5.4", "gpt-5.4-mini"),
         "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
@@ -93,12 +106,12 @@ class UserSettings(Settings):
     PLANNING_MODEL_DEFAULTS: ClassVar[dict[Provider, str]] = {
         Provider.ANTHROPIC: "claude-sonnet-4-6",
         Provider.OPENAI: "gpt-4o",
-        Provider.MINDS_CLOUD: "_reason_",
+        Provider.MINDS_CLOUD: "latest:sonnet",
     }
     CODING_MODEL_DEFAULTS: ClassVar[dict[Provider, str]] = {
         Provider.ANTHROPIC: "claude-haiku-4-5-20251001",
         Provider.OPENAI: "gpt-5.3-codex",
-        Provider.MINDS_CLOUD: "_code_",
+        Provider.MINDS_CLOUD: "latest:haiku",
     }
 
     # ── Provider / model settings ──

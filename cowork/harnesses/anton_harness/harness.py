@@ -415,6 +415,9 @@ class AntonHarness:
             initial_history=[message.model_dump() for message in history],
             # history_store=history_store,
             session_id=str(conversation.id),
+            # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
+            # are attributed to the active harness. self.id == "anton".
+            harness=self.id,
             proactive_dashboards=settings.proactive_dashboards,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
