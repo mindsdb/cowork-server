@@ -5,7 +5,7 @@ import hmac
 import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -67,6 +67,8 @@ class SlackBridge:
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
+        if (credentials.get("app_token") or "").strip():
+            self.stream_events = self._stream_events
 
     @property
     def channel_type(self) -> str:
@@ -127,17 +129,65 @@ class SlackBridge:
             data = json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return []
+        event = self._event_from_callback(data)
+        return [event] if event is not None else []
+
+    def _event_from_callback(self, data: Any) -> InboundEvent | None:
+        """Turn a Slack ``event_callback`` envelope into an InboundEvent with a
+        stable dedupe key, or None to skip. Shared by the webhook (parse_inbound)
+        and Socket Mode (stream_events) — both receive the identical envelope."""
         if not isinstance(data, dict) or data.get("type") != "event_callback":
-            return []
+            return None
         event = self._normalize_event(data.get("event") or {})
         if event is None:
-            return []
+            return None
         event_id = str(data.get("event_id", "") or "")
         event._dedupe_key = (  # type: ignore[attr-defined]
             f"slack:event:{event_id}" if event_id
             else f"slack:{event.address.platform_id}:{event.message.id}"
         )
-        return [event]
+        return event
+
+    async def _stream_events(self) -> AsyncIterator[list[InboundEvent]]:
+        """Connect to Slack Socket Mode and yield inbound message events. This is
+        the ingress path for a local cowork-server with no public webhook URL —
+        Slack delivers Events API envelopes over an outbound websocket instead.
+
+        One connection lifecycle per call; the ingress manager reconnects when
+        it returns. Each envelope must be ACKed by echoing its ``envelope_id``
+        or Slack retries it. Bound onto the instance only when ``app_token`` is
+        set (see __init__). Dedupe absorbs any replays across reconnects."""
+        import aiohttp
+
+        app_token = (self._secrets.get("app_token") or "").strip()
+        if not app_token:
+            return
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {app_token}"}) as session:
+            async with session.post(f"{SLACK_API_BASE}/apps.connections.open") as resp:
+                opened = await resp.json()
+            if not opened.get("ok") or not opened.get("url"):
+                raise ConnectionError(
+                    f"slack apps.connections.open failed: {opened.get('error', 'unknown')}"
+                )
+            async with session.ws_connect(opened["url"]) as ws:
+                async for frame in ws:
+                    if frame.type != aiohttp.WSMsgType.TEXT:
+                        break
+                    payload = frame.json()
+                    msg_type = payload.get("type")
+                    if msg_type == "hello":
+                        continue
+                    if msg_type == "disconnect":
+                        break  # server asked us to reconnect (refresh/warning)
+                    envelope_id = payload.get("envelope_id")
+                    if envelope_id:
+                        # ACK first so Slack doesn't retry; then process.
+                        await ws.send_json({"envelope_id": envelope_id})
+                    if msg_type != "events_api":
+                        continue
+                    event = self._event_from_callback(payload.get("payload") or {})
+                    if event is not None:
+                        yield [event]
 
     def dedupe_key(self, event: InboundEvent) -> str | None:
         key = getattr(event, "_dedupe_key", None)
@@ -298,7 +348,8 @@ plugin = ChannelPlugin(
             CredentialField(name="client_secret", label="OAuth client secret", secret=True, required=False,
                             description="App client secret (OAuth install)"),
             CredentialField(name="app_token", label="App-level token", secret=True, required=False,
-                            description="xapp- token for Socket Mode (later)"),
+                            description="xapp- token enabling Socket Mode — lets Slack reach a local "
+                                        "server with no public webhook URL (scope: connections:write)"),
         )
     ),
     webhooks=(WebhookRoute(path="/events", methods=("POST",), name="events", needs_raw_body=True),),

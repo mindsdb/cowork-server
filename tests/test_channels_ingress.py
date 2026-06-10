@@ -7,6 +7,7 @@ channel suite (no pytest-asyncio dependency).
 import asyncio
 
 import cowork.channels.plugins.discord as discord
+import cowork.channels.plugins.slack as slack
 from cowork.channels.ingress import IngressManager, sync_channel_ingress
 
 
@@ -161,3 +162,40 @@ def test_discord_gateway_normalize_message():
         {"id": "4", "channel_id": "42", "content": "hi", "author": {"id": "7"}}
     )
     assert dm.message.is_mention is True
+
+
+def test_slack_stream_events_bound_only_with_app_token():
+    # Webhook-only install (no app_token) must NOT advertise stream_events, so
+    # the ingress manager leaves it to the webhook and doesn't spin a loop.
+    webhook_only = slack.SlackBridge({"signing_secret": "s", "bot_token": "xoxb-1"})
+    assert not callable(getattr(webhook_only, "stream_events", None))
+
+    # With an app-level token, Socket Mode ingress is enabled (duck-typed).
+    socket_mode = slack.SlackBridge({"bot_token": "xoxb-1", "app_token": "xapp-1"})
+    assert callable(getattr(socket_mode, "stream_events", None))
+
+
+def test_slack_event_from_callback():
+    bridge = slack.SlackBridge({"bot_token": "xoxb-1"})
+
+    # A normal channel message → InboundEvent with the event_id dedupe key.
+    # The same envelope arrives via the webhook and via Socket Mode.
+    ev = bridge._event_from_callback({
+        "type": "event_callback",
+        "event_id": "Ev123",
+        "event": {"type": "message", "channel": "C42", "user": "U7", "text": "hello", "ts": "100.5"},
+    })
+    assert ev is not None
+    assert ev.message.content == "hello"
+    assert ev.address.platform_id == "C42"
+    assert ev.message.is_group is True
+    assert getattr(ev, "_dedupe_key") == "slack:event:Ev123"
+
+    # Bot-authored messages are skipped (no echo loops).
+    assert bridge._event_from_callback({
+        "type": "event_callback",
+        "event": {"type": "message", "channel": "C42", "bot_id": "B1", "text": "x", "ts": "1"},
+    }) is None
+
+    # Non-event envelopes (e.g. a bare url_verification) are ignored here.
+    assert bridge._event_from_callback({"type": "url_verification", "challenge": "abc"}) is None
