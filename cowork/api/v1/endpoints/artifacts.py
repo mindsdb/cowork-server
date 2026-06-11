@@ -19,6 +19,7 @@ from sqlmodel import Session
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
+    delete_artifact as _delete_artifact,
     get_preview_mount,
     list_artifacts as _list_artifacts,
     mount_preview,
@@ -186,3 +187,15 @@ async def proxy(token: str, rel_path: str, request: Request):
     """
     from cowork.services.preview_proxy import proxy_artifact_request
     return await proxy_artifact_request(token, rel_path, request)
+
+
+@router.delete("/", status_code=status.HTTP_204_NO_CONTENT)
+def delete_artifact_endpoint(path: str = Query(...)):
+    try:
+        _delete_artifact(path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not delete artifact") from e
