@@ -18,6 +18,7 @@ class SubmissionStore:
         conversation_id: str | None,
         values: dict[str, Any],
         skipped: list[str] | None = None,
+        form_spec: dict[str, Any] | None = None,
     ) -> str:
         self._purge_expired()
         submission_id = "sub_" + uuid.uuid4().hex[:12]
@@ -28,6 +29,7 @@ class SubmissionStore:
             "conversation_id": conversation_id,
             "values": dict(values or {}),
             "skipped": list(skipped or []),
+            "form_spec": dict(form_spec) if form_spec else None,
             "created_at": time.time(),
             "status": "received",
         }
