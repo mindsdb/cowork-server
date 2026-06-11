@@ -19,6 +19,7 @@ from sqlmodel import Session
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
+    delete_artifact as _delete_artifact,
     get_preview_mount,
     list_artifacts as _list_artifacts,
     mount_preview,
@@ -159,3 +160,15 @@ async def reveal_artifact(req: _PathBody, session: SessionDep):
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Could not reveal artifact") from exc
     return {"status": "ok", "path": str(target)}
+
+
+@router.delete("/", status_code=status.HTTP_204_NO_CONTENT)
+def delete_artifact_endpoint(path: str = Query(...)):
+    try:
+        _delete_artifact(path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not delete artifact") from e
