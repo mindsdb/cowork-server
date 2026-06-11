@@ -32,10 +32,10 @@ def minds_chat_base_url(minds_url: str) -> str:
 
 # MindsHub exposes an OpenAI-compatible `/v1/models` route. We surface
 # that list in the Settings model picker so cowork tracks whatever the
-# router currently supports instead of a hand-maintained constant
-# (UserSettings.RECOMMENDED_MODELS["minds-cloud"] is the offline
-# fallback). The deprecated `_reason_`/`_code_` sentinels are hidden
-# from this route by design.
+# router currently supports instead of a hand-maintained constant —
+# app_settings.RECOMMENDED_MODELS["minds-cloud"] is intentionally empty,
+# so this live list is the only source of minds-cloud model names. The
+# deprecated MindsHub sentinel aliases are hidden from this route by design.
 #
 # Cached so a rapid sequence of Settings opens doesn't re-hit the
 # network. Failures are cached too — with a shorter TTL — so a route
@@ -216,7 +216,7 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
             r = await client.post(
                 chat_url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model or "gpt-4o", "messages": [{"role": "user", "content": "ping"}]},
+                json={"model": model or "gpt-5.5", "messages": [{"role": "user", "content": "ping"}]},
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
