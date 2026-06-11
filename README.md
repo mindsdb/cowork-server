@@ -148,7 +148,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 
 | Path | Description |
 |------|-------------|
-| `/health` | Readiness probe (includes `server_version` and `anton_version`) |
+| `/health` | Readiness probe |
 | `/projects` | Project CRUD and working-folder management |
 | `/conversations` | Conversation threads and message history |
 | `/responses` | Streaming agent responses (SSE) |
