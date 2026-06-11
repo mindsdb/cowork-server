@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import shutil
 import socket
 import subprocess
 import sys
@@ -207,19 +208,24 @@ def _pick_primary(folder: Path, files: list[Path], primary_hint: str | None = No
     return files[0]
 
 
+def _load_published_map(folder: Path) -> dict:
+    """Read a folder's `.published.json` into a dict, or {} if absent/unreadable."""
+    path = folder / ".published.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _published_url_for(folder: Path, primary: Path | None) -> str:
     if primary is None:
         return ""
-    published_index = folder / ".published.json"
-    if not published_index.is_file():
-        return ""
-    try:
-        pmap = json.loads(published_index.read_text(encoding="utf-8"))
-        entry = pmap.get(primary.name)
-        if isinstance(entry, dict):
-            return entry.get("url", "") or ""
-    except Exception:
-        pass
+    entry = _load_published_map(folder).get(primary.name)
+    if isinstance(entry, dict):
+        return entry.get("url", "") or ""
     return ""
 
 
@@ -305,7 +311,7 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
             target.relative_to(art_root.resolve())
         except ValueError:
             continue
-        if target.is_file():
+        if target.is_file() or (target.is_dir() and (target / "metadata.json").exists()):
             matches[str(target)] = target
     return list(matches.values())
 
@@ -338,7 +344,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
                 resolved.relative_to(art_root.resolve())
             except ValueError:
                 continue
-            if resolved.is_file():
+            if resolved.is_file() or (resolved.is_dir() and (resolved / "metadata.json").exists()):
                 return resolved
             if allow_dir and resolved.is_dir() and (resolved / "metadata.json").is_file():
                 return resolved
@@ -389,6 +395,65 @@ def _fullstack_types() -> frozenset[str]:
         return frozenset(FULLSTACK_ARTIFACT_TYPES)
     except Exception:
         return frozenset()
+
+
+def _unpublish_folder(folder: Path) -> None:
+    """Unpublish every published file in an artifact folder.
+
+    Reads `.published.json` and unpublishes each recorded file from the
+    remote. Raises if any unpublish fails so the caller can abort the
+    delete and leave the artifact intact.
+    """
+    published_map = _load_published_map(folder)
+    if not published_map:
+        # Absent or unreadable record — nothing actionable to unpublish.
+        return
+
+    # Local import to avoid a circular dependency: publish imports artifacts.
+    from cowork.services.publish import unpublish_artifact
+
+    for name, entry in published_map.items():
+        if not isinstance(entry, dict):
+            continue
+        if not (entry.get("report_id") or entry.get("last_md5")):
+            continue
+        # The path-based unpublish needs the file present; a stale record
+        # for a missing file can't be unpublished this way, so skip it.
+        if not (folder / name).is_file():
+            continue
+        unpublish_artifact(str(folder / name))
+
+
+def delete_artifact(raw_path: str) -> None:
+    """Permanently delete an artifact folder from disk.
+
+    If the artifact has published files, they are unpublished from the
+    remote first. If any unpublish fails, the artifact is left on disk
+    and the error propagates to the caller.
+    """
+    target = resolve_artifact_path(raw_path)
+    if target is None:
+        raise ValueError("Invalid artifact path")
+
+    if target.is_dir() and (target / "metadata.json").exists():
+        folder = target
+    elif target.is_file():
+        folder = target.parent
+        if not (folder / "metadata.json").exists():
+            raise ValueError("Not a valid artifact folder")
+    else:
+        raise FileNotFoundError("Artifact not found")
+
+    for art_root in _scan_artifact_dirs():
+        try:
+            folder.relative_to(art_root.resolve())
+        except ValueError:
+            continue
+        # Unpublish before deleting; if this raises, the artifact stays.
+        _unpublish_folder(folder)
+        shutil.rmtree(folder)
+        return
+    raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
 def reveal_in_file_manager(path: Path) -> None:
@@ -537,15 +602,9 @@ async def mount_preview(path: Path) -> dict:
     _PREVIEW_MOUNTS[token] = parent
 
     published_url = ""
-    published_path = parent / ".published.json"
-    if published_path.is_file():
-        try:
-            pmap = json.loads(published_path.read_text(encoding="utf-8"))
-            entry = pmap.get(path.name)
-            if isinstance(entry, dict):
-                published_url = entry.get("url", "") or ""
-        except Exception:
-            pass
+    entry = _load_published_map(parent).get(path.name)
+    if isinstance(entry, dict):
+        published_url = entry.get("url", "") or ""
 
     return {
         "kind": "static",
