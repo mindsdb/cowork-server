@@ -24,8 +24,6 @@ from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
 from cowork.services.providers import (
     check_config_status,
-    fetch_minds_models,
-    minds_chat_base_url,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -159,52 +157,31 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
 
-# ── Recommended models (with live Minds overlay) ─────────────────────
-
-
-@router.get("/models")
-async def recommended_models(session: SessionDep):
-    """Return recommended models per provider, overlaying the live Minds
-    agent ``/v1/models`` list when available."""
-    from cowork.common.settings.user_settings import UserSettings
-
-    s = SettingService(session).load()
-    models = {k: list(v) for k, v in UserSettings.RECOMMENDED_MODELS.items()}
-
-    minds_key = s.minds_api_key
-    if minds_key is not None:
-        key_str = minds_key.get_secret_value() if isinstance(minds_key, SecretStr) else str(minds_key)
-        base = minds_chat_base_url(s.minds_url or "https://api.mindshub.ai")
-        live = await fetch_minds_models(base, key_str)
-        if live:
-            models["minds-cloud"] = live
-
-    return {
-        "recommendedModels": models,
-        "recommendedPair": {k: list(v) for k, v in UserSettings.RECOMMENDED_PAIR.items()},
-    }
-
-
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
 
 _ENV_PATH = Path.home() / ".anton" / ".env"
+
+
+def _parse_dotenv_content(content: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        result[key.strip()] = val.strip().strip('"').strip("'")
+    return result
 
 
 @router.get("/raw")
 def read_raw_settings():
     if not _ENV_PATH.exists():
         return {}
-    result: dict[str, str] = {}
     try:
-        for line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            result[key.strip()] = val.strip().strip('"').strip("'")
+        return _parse_dotenv_content(_ENV_PATH.read_text(encoding="utf-8"))
     except Exception:
         pass
-    return result
+    return {}
 
 
 class _RawSettingsBody(BaseModel):
@@ -212,32 +189,28 @@ class _RawSettingsBody(BaseModel):
 
 
 @router.post("/raw")
-def write_raw_settings(body: _RawSettingsBody):
-    """Merge the supplied dotenv content into ~/.anton/.env (key-level upsert).
+def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
+    """Merge dotenv content into ~/.anton/.env and sync recognised keys to the DB.
 
-    Keys not present in the incoming content are preserved — prevents the
-    OAuth token refresh loop from wiping model config and other unrelated
-    settings."""
+    Uses key-level merge (not full overwrite) because callers like the
+    OAuth token refresh only send a subset of keys — a full overwrite
+    would wipe model config and other settings from .env.
+
+    The .env persists for the standalone ``anton`` CLI and is read by
+    ``GET /raw``; the DB is authoritative for cowork-server.  By syncing
+    to both we keep them consistent regardless of which frontend code
+    path writes settings (onboarding, OAuth token refresh, etc.)."""
+    from cowork.migrations import sync_env_vars_to_db
+
+    incoming = _parse_dotenv_content(body.content)
+
     try:
-        incoming: dict[str, str] = {}
-        for line in body.content.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            incoming[key.strip()] = val.strip().strip('"').strip("'")
-
-        # Read existing values and merge
-        existing: dict[str, str] = {}
-        if _ENV_PATH.exists():
-            for line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                existing[key.strip()] = val.strip().strip('"').strip("'")
-
+        existing = read_raw_settings()
         existing.update(incoming)
+
+        # Sync recognised ANTON_* vars to the DB first. If validation fails,
+        # leave the legacy .env untouched so the DB remains authoritative.
+        sync_env_vars_to_db(session, existing)
 
         _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
         lines = [f"{k}={v}" for k, v in existing.items()]
@@ -246,8 +219,11 @@ def write_raw_settings(body: _RawSettingsBody):
             _ENV_PATH.chmod(0o600)
         except OSError:
             pass
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail="Settings could not be saved.") from e
+
     return {"ok": True}
 
 

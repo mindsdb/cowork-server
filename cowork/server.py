@@ -46,6 +46,18 @@ def _start_token_refresh() -> None:
     logger.info("Google OAuth token refresh background task created")
 
 
+async def _stop_token_refresh() -> None:
+    global _token_refresh_task
+    if _token_refresh_task is None:
+        return
+    _token_refresh_task.cancel()
+    try:
+        await _token_refresh_task
+    except asyncio.CancelledError:
+        pass
+    _token_refresh_task = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
@@ -64,6 +76,7 @@ async def lifespan(app: FastAPI):
     finally:
         from cowork.channels.webhooks import drain_background_tasks
 
+        await _stop_token_refresh()
         await app.state.channel_poller.stop_all()
         await drain_background_tasks()
         await app.state.channel_adapters.shutdown()
