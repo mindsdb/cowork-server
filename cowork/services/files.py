@@ -42,6 +42,15 @@ class FileService:
             stmt = stmt.where(File.purpose == purpose)
         return [self._to_response(f) for f in self.session.exec(stmt).all()]
 
+    def list_file_rows(self, purpose: str) -> list[File]:
+        """Raw File rows for callers that need fields the OpenAI-style
+        FileResponse drops (content_type, timestamps) — e.g. the
+        attachments compat endpoints."""
+        return list(self.session.exec(select(File).where(File.purpose == purpose)).all())
+
+    def get_file_row(self, file_id: UUID) -> File:
+        return self._get_file_model(file_id)
+
     def relink_purpose(self, old_purpose: str, new_purpose: str) -> int:
         """Repoint every file stored under `old_purpose`. Used when a
         conversation ends up with a different id than the one the client

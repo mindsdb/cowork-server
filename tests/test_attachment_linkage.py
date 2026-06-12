@@ -78,6 +78,51 @@ def test_relink_purpose_noop_when_nothing_matches(session):
     ) == 0
 
 
+def test_list_attachments_returns_legacy_row_shape(session):
+    """The Task Uploads rail renders item.name / item.mime / item.size and
+    parses ISO timestamps — the OpenAI FileResponse shape (filename /
+    bytes / epoch-seconds) made rows show raw ids and a 1970s age."""
+    from cowork.api.v1.endpoints.compat.stubs import list_attachments
+
+    sid = str(uuid4())
+    _add_file(session, attachment_purpose("general", sid))
+    rows = list_attachments("general", sid, session, ids=None)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["name"] == "report.csv"
+    assert row["mime"] == "text/csv"
+    assert row["size"] == 12
+    # ISO string a JS `new Date(...)` parses correctly (not epoch seconds).
+    assert isinstance(row["created_at"], str) and "T" in row["created_at"]
+
+    # The client's ?ids= filter narrows the listing.
+    assert list_attachments("general", sid, session, ids=["nonexistent"]) == []
+    assert len(list_attachments("general", sid, session, ids=[row["id"]])) == 1
+
+
+def test_attachment_raw_serves_inline(session, tmp_path):
+    """Row click opens the raw URL in a browser tab expecting the file to
+    render — attachment disposition silently downloads instead."""
+    from cowork.api.v1.endpoints.compat.stubs import attachment_raw
+
+    payload = tmp_path / "photo.png"
+    payload.write_bytes(b"\x89PNG fake")
+    file = File(
+        filename="photo.png",
+        content_type="image/png",
+        size=9,
+        purpose=attachment_purpose("general", str(uuid4())),
+        path=str(payload),
+    )
+    session.add(file)
+    session.commit()
+    session.refresh(file)
+
+    response = attachment_raw("general", "ignored", file.id, session)
+    assert response.headers["content-disposition"].startswith("inline")
+    assert "photo.png" in response.headers["content-disposition"]
+
+
 def test_stubs_purpose_matches_canonical_helper():
     """The upload endpoint and the rail's list endpoint both tag through
     the same helper — pin the format so they can't drift apart."""
