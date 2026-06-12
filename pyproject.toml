@@ -4,7 +4,7 @@ version = "0.1.5"
 description = "FastAPI backend for the MindsHub Cowork desktop app"
 readme = "README.md"
 license = "LicenseRef-Proprietary"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 authors = [
     { name = "MindsDB Inc", email = "admin@mindsdb.com" },
 ]
