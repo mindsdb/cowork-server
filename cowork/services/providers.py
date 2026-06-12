@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+import time
+from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 from pydantic import SecretStr
@@ -25,6 +26,73 @@ def minds_chat_base_url(minds_url: str) -> str:
     if base.endswith("/v1"):
         return base
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
+
+
+# ── Live model listing ───────────────────────────────────────────────
+
+# MindsHub exposes an OpenAI-compatible `/v1/models` route. We surface
+# that list in the Settings model picker so cowork tracks whatever the
+# router currently supports instead of a hand-maintained constant —
+# app_settings.RECOMMENDED_MODELS["minds-cloud"] is intentionally empty,
+# so this live list is the only source of minds-cloud model names. The
+# deprecated MindsHub sentinel aliases are hidden from this route by design.
+#
+# Cached so a rapid sequence of Settings opens doesn't re-hit the
+# network. Failures are cached too — with a shorter TTL — so a route
+# that isn't deployed yet doesn't add a round-trip to every load.
+_MINDS_MODELS_TTL = 300.0       # successful fetch
+_MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
+_minds_models_cache: dict[str, tuple[float, Optional[list[str]]]] = {}
+
+
+async def fetch_minds_models(minds_url: str, api_key: str) -> Optional[list[str]]:
+    """Fetch supported model ids from MindsHub's OpenAI-compatible
+    `/v1/models` endpoint. Returns the model-id list, or None on any
+    failure so the caller falls back to the static list."""
+    if not minds_url or not api_key:
+        return None
+    base = minds_chat_base_url(minds_url)
+
+    now = time.monotonic()
+    cached = _minds_models_cache.get(base)
+    if cached:
+        ts, val = cached
+        ttl = _MINDS_MODELS_TTL if val else _MINDS_MODELS_FAIL_TTL
+        if (now - ts) < ttl:
+            return val
+
+    def _remember(val: Optional[list[str]]) -> Optional[list[str]]:
+        _minds_models_cache[base] = (time.monotonic(), val)
+        return val
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(6.0), follow_redirects=True
+        ) as client:
+            r = await client.get(
+                f"{base}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if r.status_code >= 400:
+            logger.debug("minds /models fetch returned HTTP %s", r.status_code)
+            return _remember(None)
+        data = r.json()
+    except Exception as exc:
+        logger.debug("minds /models fetch failed: %s", exc)
+        return _remember(None)
+
+    # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
+    # Accept a bare list too, defensively.
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return _remember(None)
+    ids = [
+        str(row.get("id")).strip()
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    ]
+    ids = [i for i in ids if i]
+    return _remember(ids or None)
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -148,7 +216,7 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
             r = await client.post(
                 chat_url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model or "gpt-4o", "messages": [{"role": "user", "content": "ping"}]},
+                json={"model": model or "gpt-5.5", "messages": [{"role": "user", "content": "ping"}]},
             )
             if r.status_code in (200, 201):
                 return {"ok": True}

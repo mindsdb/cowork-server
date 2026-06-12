@@ -1,9 +1,14 @@
 from enum import Enum
-from typing import Annotated, Any, Callable, ClassVar, get_args
+from typing import Annotated, Any, Callable, get_args
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 
-from cowork.common.settings.app_settings import Settings, get_app_settings
+from cowork.common.settings.app_settings import (
+    CODING_MODEL_DEFAULTS,
+    PLANNING_MODEL_DEFAULTS,
+    Settings,
+    get_app_settings,
+)
 
 
 class Provider(str, Enum):
@@ -74,32 +79,9 @@ def _harness_options() -> list[str]:
 
 
 class UserSettings(Settings):
-    RECOMMENDED_MODELS: ClassVar[dict[str, list[str]]] = {
-        "minds-cloud": ["_reason_", "_code_"],
-        "anthropic": ["claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
-        "openai": ["gpt-5.4", "gpt-5.4-mini", "o3", "o4-mini"],
-        "gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-flash-preview"],
-        "openai-compatible": [],
-    }
-
-    RECOMMENDED_PAIR: ClassVar[dict[str, tuple[str, str]]] = {
-        "minds-cloud": ("_reason_", "_code_"),
-        "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
-        "openai": ("gpt-5.4", "gpt-5.4-mini"),
-        "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
-        "openai-compatible": ("", ""),
-    }
-
-    PLANNING_MODEL_DEFAULTS: ClassVar[dict[Provider, str]] = {
-        Provider.ANTHROPIC: "claude-sonnet-4-6",
-        Provider.OPENAI: "gpt-4o",
-        Provider.MINDS_CLOUD: "_reason_",
-    }
-    CODING_MODEL_DEFAULTS: ClassVar[dict[Provider, str]] = {
-        Provider.ANTHROPIC: "claude-haiku-4-5-20251001",
-        Provider.OPENAI: "gpt-5.3-codex",
-        Provider.MINDS_CLOUD: "_code_",
-    }
+    # The recommended-model catalog and per-provider model defaults are
+    # global, application-level config and live in app_settings
+    # (RECOMMENDED_MODELS / RECOMMENDED_PAIR / *_MODEL_DEFAULTS).
 
     # ── Provider / model settings ──
 
@@ -249,9 +231,9 @@ class UserSettings(Settings):
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
         if self.planning_model is None:
-            self.planning_model = self.PLANNING_MODEL_DEFAULTS.get(self.planning_provider)
+            self.planning_model = PLANNING_MODEL_DEFAULTS.get(self.planning_provider.value)
         if self.coding_model is None:
-            self.coding_model = self.CODING_MODEL_DEFAULTS.get(self.coding_provider)
+            self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
         return self
 
     @property
