@@ -18,7 +18,6 @@ from cowork.channels.plugin import (
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
-    OAuthSpec,
     WebhookRoute,
 )
 from cowork.channels.text import split_for_limit
@@ -57,10 +56,6 @@ def extract_media(event: dict) -> list[Attachment]:
         attachment.slack_url = url
         media.append(attachment)
     return media
-_OAUTH_SCOPES = (
-    "app_mentions:read", "channels:history", "groups:history",
-    "im:history", "im:write", "mpim:history", "chat:write",
-)
 
 
 class SlackBridge:
@@ -343,24 +338,19 @@ plugin = ChannelPlugin(
         fields=(
             CredentialField(name="bot_token", label="Bot token", secret=True, required=True,
                             description="xoxb- token used to post messages"),
-            CredentialField(name="signing_secret", label="Signing secret", secret=True, required=False,
-                            description="Verifies inbound Events API webhook requests (not needed for Socket Mode)"),
-            CredentialField(name="client_id", label="OAuth client id", secret=False, required=False,
-                            description="App client id (OAuth install)"),
-            CredentialField(name="client_secret", label="OAuth client secret", secret=True, required=False,
-                            description="App client secret (OAuth install)"),
             CredentialField(name="app_token", label="App-level token", secret=True, required=False,
                             description="xapp- token enabling Socket Mode — lets Slack reach a local "
                                         "server with no public webhook URL (scope: connections:write)"),
+            CredentialField(name="signing_secret", label="Signing secret", secret=True, required=False,
+                            description="Verifies inbound Events API webhook requests (not needed for Socket Mode)"),
         )
     ),
     webhooks=(WebhookRoute(path="/events", methods=("POST",), name="events", needs_raw_body=True),),
-    oauth=OAuthSpec(scopes=_OAUTH_SCOPES),
     capabilities=ChannelCapabilities(
         supports_webhook_ingress=True,
         supports_webhook_setup=False,
         supports_teardown=False,
-        supports_oauth=True,
+        supports_oauth=False,
         supports_direct_credentials=True,
         supports_custom_ack=False,
     ),

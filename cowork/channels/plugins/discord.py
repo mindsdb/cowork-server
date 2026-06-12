@@ -17,7 +17,6 @@ from cowork.channels.plugin import (
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
-    OAuthSpec,
     WebhookRoute,
 )
 from cowork.channels.text import split_for_limit
@@ -33,7 +32,6 @@ DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_MAX_TEXT = 2000
 DISCORD_MAX_FILE_BYTES = 20 * 1024 * 1024
 DISCORD_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # default bot upload cap
-_OAUTH_SCOPES = ("bot", "applications.commands")
 
 # Gateway intents for receiving normal channel/DM messages. MESSAGE_CONTENT is
 # privileged — it must be enabled in the Discord Developer Portal or message
@@ -411,19 +409,14 @@ plugin = ChannelPlugin(
                             description="Bot token — powers the Gateway (receive) and sending messages"),
             CredentialField(name="public_key", label="Public key", secret=False, required=False,
                             description="Application public key (hex) — only for the slash-command interactions webhook"),
-            CredentialField(name="application_id", label="Application id", secret=False, required=False,
-                            description="App id (OAuth install)"),
-            CredentialField(name="client_secret", label="OAuth client secret", secret=True, required=False,
-                            description="App client secret (OAuth install)"),
         )
     ),
     webhooks=(WebhookRoute(path="/interactions", methods=("POST",), name="interactions", needs_raw_body=True),),
-    oauth=OAuthSpec(scopes=_OAUTH_SCOPES),
     capabilities=ChannelCapabilities(
         supports_webhook_ingress=True,
         supports_webhook_setup=False,
         supports_teardown=False,
-        supports_oauth=True,
+        supports_oauth=False,
         supports_direct_credentials=True,
         supports_custom_ack=True,
     ),
