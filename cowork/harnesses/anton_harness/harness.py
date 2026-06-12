@@ -281,23 +281,6 @@ class AntonHarness:
             db_val = getattr(user, attr, None)
             if db_val:
                 setattr(settings, attr, db_val)
-        # if model:
-        #     # Minds Cloud sentinels (`_reason_`, `_code_`) only resolve at
-        #     # the openai-compatible router. If the active provider is
-        #     # something else (e.g. anthropic, after the user switched off
-        #     # Minds), an old cowork preference can keep sending these on
-        #     # every request. Drop the override and stay with the env's
-        #     # `ANTON_PLANNING_MODEL` instead of forwarding `_reason_` to
-        #     # api.anthropic.com (which 404s).
-        #     is_minds_sentinel = model.startswith("_") and model.endswith("_")
-        #     if is_minds_sentinel and settings.planning_provider != "openai-compatible":
-        #         logger.warning(
-        #             "Ignoring Minds sentinel model %r — active planning_provider is %r. "
-        #             "Falling back to env ANTON_PLANNING_MODEL=%r.",
-        #             model, settings.planning_provider, settings.planning_model,
-        #         )
-        #     else:
-        #         settings.planning_model = model
 
         workspace = Workspace(base)
         workspace.initialize()
@@ -415,6 +398,9 @@ class AntonHarness:
             initial_history=[message.model_dump() for message in history],
             # history_store=history_store,
             session_id=str(conversation.id),
+            # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
+            # are attributed to the active harness. self.id == "anton".
+            harness=self.id,
             proactive_dashboards=settings.proactive_dashboards,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
