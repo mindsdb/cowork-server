@@ -423,21 +423,21 @@ plugin = ChannelPlugin(
                 description="Bot API token from @BotFather",
             ),
             CredentialField(
-                name="secret_token",
-                label="Webhook secret token",
-                secret=True,
-                required=True,
-                description=(
-                    "Passed to setWebhook and echoed in the "
-                    "X-Telegram-Bot-Api-Secret-Token header; required to authenticate webhook ingress"
-                ),
-            ),
-            CredentialField(
                 name="bot_username",
                 label="Bot username",
                 secret=False,
                 required=False,
                 description="Used to detect @mentions in group chats",
+            ),
+            CredentialField(
+                name="secret_token",
+                label="Webhook secret token",
+                secret=True,
+                required=False,
+                description=(
+                    "Authenticates webhook ingress via the "
+                    "X-Telegram-Bot-Api-Secret-Token header; auto-generated on connect when left blank"
+                ),
             ),
         )
     ),
