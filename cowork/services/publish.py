@@ -81,7 +81,7 @@ def list_publishable() -> dict:
     }
 
 
-def publish_artifact(raw_path: str) -> dict:
+def publish_artifact(raw_path: str, *, password: str | None = None) -> dict:
     settings = get_user_settings()
     api_key = _secret_str(settings.minds_api_key)
     if not api_key:
@@ -106,6 +106,12 @@ def publish_artifact(raw_path: str) -> dict:
     previous = published_map.get(artifact.name)
     report_id = previous.get("report_id") if isinstance(previous, dict) else None
 
+    # Resolve access-password state.
+    password = (password or "").strip() or None
+    prev_password = previous.get("access_password") if isinstance(previous, dict) else None
+    prev_version = previous.get("pwd_version", 0) if isinstance(previous, dict) else 0
+    pwd_version = (prev_version + 1) if password and password != prev_password else (prev_version or 1)
+
     publish_url = settings.publish_url or "https://4nton.ai"
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
@@ -115,6 +121,8 @@ def publish_artifact(raw_path: str) -> dict:
             report_id=report_id,
             publish_url=publish_url,
             ssl_verify=ssl_verify,
+            password=password,
+            pwd_version=pwd_version,
         )
     except Exception as exc:
         logger.exception("Publishing failed")
@@ -130,11 +138,16 @@ def publish_artifact(raw_path: str) -> dict:
             "reportId": returned_report_id,
             "publishedAt": _utc_now_iso(),
         }
-        published_map[artifact.name] = {
+        entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", ""),
+            "requires_password": bool(password),
         }
+        if password:
+            entry["access_password"] = password
+            entry["pwd_version"] = pwd_version
+        published_map[artifact.name] = entry
         try:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
         except Exception:
@@ -143,7 +156,12 @@ def publish_artifact(raw_path: str) -> dict:
         state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
         _save_state(state)
 
-    return {"status": "ok", "url": view_url, "result": {k: v for k, v in result.items() if k != "file_payload"}}
+    return {
+        "status": "ok",
+        "url": view_url,
+        "accessProtected": bool(password),
+        "result": {k: v for k, v in result.items() if k != "file_payload"},
+    }
 
 
 def unpublish_artifact(raw_path: str) -> dict:

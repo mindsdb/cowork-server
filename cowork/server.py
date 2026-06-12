@@ -5,6 +5,7 @@ This module sets up the FastAPI application with middleware, routing,
 and all necessary configurations for the Cowork service.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,11 +21,48 @@ from cowork.scheduler import start_scheduler
 # Set up logging
 logger = setup_logging()
 
+_TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # 30 minutes
+_token_refresh_task: asyncio.Task | None = None
+
+
+async def _token_refresh_loop() -> None:
+    """Background loop that refreshes Google OAuth tokens every 30 minutes."""
+    from cowork.services.connectors.oauth.google import refresh_google_oauth_tokens
+
+    await asyncio.sleep(60)  # initial delay — let the server finish startup
+    while True:
+        try:
+            await asyncio.to_thread(refresh_google_oauth_tokens)
+        except Exception:
+            logger.exception("Token refresh loop error")
+        await asyncio.sleep(_TOKEN_REFRESH_INTERVAL_SECONDS)
+
+
+def _start_token_refresh() -> None:
+    global _token_refresh_task
+    if _token_refresh_task is not None and not _token_refresh_task.done():
+        return
+    _token_refresh_task = asyncio.create_task(_token_refresh_loop())
+    logger.info("Google OAuth token refresh background task created")
+
+
+async def _stop_token_refresh() -> None:
+    global _token_refresh_task
+    if _token_refresh_task is None:
+        return
+    _token_refresh_task.cancel()
+    try:
+        await _token_refresh_task
+    except asyncio.CancelledError:
+        pass
+    _token_refresh_task = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
     start_scheduler()
+    _start_token_refresh()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.polling import sync_channel_polling
     from cowork.channels.registry import get_registry
@@ -38,6 +76,7 @@ async def lifespan(app: FastAPI):
     finally:
         from cowork.channels.webhooks import drain_background_tasks
 
+        await _stop_token_refresh()
         await app.state.channel_poller.stop_all()
         await drain_background_tasks()
         await app.state.channel_adapters.shutdown()

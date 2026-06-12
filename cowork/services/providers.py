@@ -4,8 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import SecretStr

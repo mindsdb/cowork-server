@@ -16,9 +16,7 @@ GOOGLE_SERVICES: dict[str, GoogleServiceConfig] = {
             "openid",
             "email",
             "profile",
-            "https://www.googleapis.com/auth/drive.readonly",
             "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive",
         ],
     ),
     "google-calendar": GoogleServiceConfig(
@@ -38,9 +36,11 @@ GOOGLE_SERVICES: dict[str, GoogleServiceConfig] = {
             "openid",
             "email",
             "profile",
+            "https://www.googleapis.com/auth/gmail.labels",
+            "https://www.googleapis.com/auth/gmail.send",
             "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.compose",
-            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.metadata",
         ],
     ),
     "google-ads": GoogleServiceConfig(

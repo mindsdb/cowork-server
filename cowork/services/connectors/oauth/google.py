@@ -315,3 +315,91 @@ def _callback_page(title: str, message: str, *, success: bool) -> str:
 
 
 google_service = GoogleOAuthService()
+
+
+def refresh_google_oauth_tokens() -> None:
+    """Proactively refresh Google OAuth tokens that are close to expiry.
+
+    Iterates all vault connections for Google engines, checks token expiry,
+    and refreshes tokens that expire within 10 minutes. Called periodically
+    from a background task.
+    """
+    import logging
+
+    log = logging.getLogger("oauth.token-refresh")
+
+    try:
+        from pathlib import Path
+
+        from anton.core.datasources.data_vault import LocalDataVault
+        vault = LocalDataVault(Path(ConnectorSettings().vault_dir))
+    except Exception:
+        return
+
+    oauth_settings = OAuthSettings()
+    client_id = oauth_settings.google_client_id
+    client_secret = oauth_settings.google_client_secret
+    if not client_id or not client_secret:
+        return
+
+    google_engines = {cfg.engine for cfg in GOOGLE_SERVICES.values()}
+    now = datetime.now(timezone.utc)
+    refresh_threshold = now + timedelta(minutes=10)
+
+    for item in vault.list_connections():
+        engine = item.get("engine")
+        name = item.get("name")
+        if engine not in google_engines or not name:
+            continue
+
+        try:
+            fields = vault.load(engine, name) or {}
+        except Exception:
+            continue
+
+        if fields.get("auth_type") != "oauth":
+            continue
+
+        refresh_token = fields.get("refresh_token", "").strip()
+        if not refresh_token:
+            continue
+
+        expires_at_str = fields.get("expires_at", "").strip()
+        if expires_at_str:
+            try:
+                expires_dt = datetime.fromisoformat(expires_at_str)
+                if expires_dt > refresh_threshold:
+                    continue  # still valid for >10 minutes, skip
+            except ValueError:
+                pass  # unparseable — refresh to be safe
+
+        try:
+            token_data = _json_request(
+                _GOOGLE_TOKEN_ENDPOINT,
+                method="POST",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+            )
+            new_access_token = str(token_data.get("access_token", "")).strip()
+            if not new_access_token:
+                continue
+
+            expires_in = int(token_data.get("expires_in", 0) or 0)
+            new_expires_at = (
+                (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+                if expires_in else ""
+            )
+
+            updated = {**fields, "access_token": new_access_token, "expires_at": new_expires_at}
+            new_refresh_token = str(token_data.get("refresh_token", "")).strip()
+            if new_refresh_token:
+                updated["refresh_token"] = new_refresh_token
+
+            vault.save(engine, name, updated)
+            log.info("Refreshed %s/%s token (expires %s)", engine, name, new_expires_at)
+        except Exception as exc:
+            log.warning("Could not refresh %s/%s token: %s", engine, name, exc)
