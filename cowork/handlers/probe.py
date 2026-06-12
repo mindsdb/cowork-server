@@ -114,24 +114,23 @@ class ProbeHandler:
                 if k not in skipped and v is not None and v != ""
             }
 
-            # Connector spec
+            # Connector spec — absent for agent-handcrafted (non-registry)
+            # connectors; those fall back to the form_spec staged with the
+            # submission and skip the probe below.
             spec = registry.get_connector(connector_id)
-            if spec is None:
-                yield _delta(f"Unknown connector: `{connector_id}`.")
-                yield _push("response.completed", {
-                    "type": "response.completed",
-                    "response": {"id": response_id, "status": "failed"},
-                })
-                self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
-                return
-
-            form_id = spec.form.form_id
-            form_spec = spec.form.model_dump()
+            if spec is not None:
+                form_id = spec.form.form_id
+                form_spec = spec.form.model_dump()
+            else:
+                form_spec = dict(submission.get("form_spec") or {})
+                form_id = form_spec.get("form_id") or f"{connector_id}-connector"
             if method:
                 form_spec["selected_method"] = method
 
-            # No conversation context — save without probe
-            if db_conversation_id is None:
+            # Save without probe when there is no conversation context, or no
+            # registry spec — there is no engine to verify a handcrafted
+            # connector against.
+            if db_conversation_id is None or spec is None:
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
@@ -148,7 +147,8 @@ class ProbeHandler:
                     })
                     self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
                     return
-                yield _delta(f"Saved as `{slug}` (no live probe — no conversation context).\n\n")
+                reason = "no conversation context" if db_conversation_id is None else "connector is not in the registry"
+                yield _delta(f"Saved as `{slug}` (no live probe — {reason}).\n\n")
                 yield _patch_delta({
                     "form_id": form_id,
                     "title": f"Saved — {slug}",
