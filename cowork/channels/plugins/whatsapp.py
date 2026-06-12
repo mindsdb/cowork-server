@@ -326,8 +326,9 @@ plugin = ChannelPlugin(
                             description="Graph API token used to send messages"),
             CredentialField(name="app_secret", label="App secret", secret=True, required=True,
                             description="Verifies inbound X-Hub-Signature-256"),
-            CredentialField(name="verify_token", label="Verify token", secret=True, required=True,
-                            description="Operator-chosen token echoed during webhook subscription"),
+            CredentialField(name="verify_token", label="Verify token", secret=False, required=True,
+                            description="Operator-chosen token echoed during webhook subscription; "
+                                        "enter the same value in the Meta dashboard"),
         )
     ),
     webhooks=(WebhookRoute(path="/webhook", methods=("GET", "POST"), needs_raw_body=True),),
