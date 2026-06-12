@@ -24,11 +24,13 @@ from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
 from cowork.services.providers import (
     check_config_status,
+    fetch_minds_models,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
 )
 from cowork.services.settings import SettingService
+from cowork.common.settings.app_settings import RECOMMENDED_MODELS, RECOMMENDED_PAIR
 
 router = APIRouter()
 
@@ -155,6 +157,29 @@ class _ValidateProviderBody(CamelRequest):
 @router.post("/validate-provider")
 async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
+
+
+@router.get("/recommended-models")
+async def recommended_models(session: SessionDep):
+    """Per-provider model picker options for the Settings UI.
+
+    Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
+    the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
+    when a Minds key + URL are configured. Falls back to the static list
+    (the `latest:*` aliases) when the key is absent or the endpoint can't
+    be reached."""
+    recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
+    pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
+
+    s = SettingService(session).load()
+    if s.minds_api_key is not None and s.minds_url:
+        live = await fetch_minds_models(
+            s.minds_url, s.minds_api_key.get_secret_value()
+        )
+        if live:
+            recommended["minds-cloud"] = live
+
+    return {"recommendedModels": recommended, "recommendedPair": pair}
 
 
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
