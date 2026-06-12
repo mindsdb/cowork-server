@@ -8,6 +8,7 @@ import asyncio
 
 import cowork.channels.plugins.discord as discord
 import cowork.channels.plugins.slack as slack
+import cowork.channels.plugins.telegram as telegram
 from cowork.channels.ingress import IngressManager, sync_channel_ingress
 
 
@@ -173,6 +174,68 @@ def test_slack_stream_events_bound_only_with_app_token():
     # With an app-level token, Socket Mode ingress is enabled (duck-typed).
     socket_mode = slack.SlackBridge({"bot_token": "xoxb-1", "app_token": "xapp-1"})
     assert callable(getattr(socket_mode, "stream_events", None))
+
+
+def test_telegram_poll_parses_and_advances_offset(monkeypatch):
+    # Drives the real poll() to cover response parsing + offset advancement
+    # (regression guard: a stuck offset re-fetches the same updates every cycle).
+    calls = {"deleteWebhook": 0}
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            return _Resp({"ok": True, "result": [{
+                "update_id": 10,
+                "message": {
+                    "message_id": 1,
+                    "chat": {"id": 99, "type": "private"},
+                    "from": {"id": 5},
+                    "text": "hi",
+                    "date": 0,
+                },
+            }]})
+
+        async def post(self, url, json=None):
+            calls["deleteWebhook"] += 1
+            return _Resp({"ok": True})
+
+    monkeypatch.setattr(telegram.httpx, "AsyncClient", _FakeClient)
+    bridge = telegram.TelegramBridge({"bot_token": "t", "secret_token": "s"})
+
+    events, offset = asyncio.run(bridge.poll(offset=None))
+    assert offset == 11                       # advanced past update_id 10
+    assert len(events) == 1
+    assert events[0].message.content == "hi"
+    assert calls["deleteWebhook"] == 1        # first cycle clears any stale webhook
+
+    # A subsequent cycle passes the advanced offset (and skips deleteWebhook).
+    events2, offset2 = asyncio.run(bridge.poll(offset=offset))
+    assert offset2 == 11
+    assert calls["deleteWebhook"] == 1
+
+
+def test_telegram_factory_needs_only_bot_token():
+    run = lambda creds: asyncio.run(telegram._factory(creds))
+    assert run({}) is None                                  # no bot_token
+    assert run({"bot_token": "t"}) is not None              # secret_token NOT required (polling)
+    assert run({"bot_token": "t", "secret_token": "s"}) is not None
 
 
 def test_slack_factory_requires_bot_token_and_an_ingress_cred():
