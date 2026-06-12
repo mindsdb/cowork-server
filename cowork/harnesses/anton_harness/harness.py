@@ -390,8 +390,8 @@ class AntonHarness:
                     "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
                     "is itself the final answer the user needs."
                     f"{project_context}"
+                    f"{output_context}"
                 ),
-                output_context=output_context,
             ),
             workspace=workspace,
             data_vault=data_vault,

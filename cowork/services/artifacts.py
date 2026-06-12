@@ -9,11 +9,13 @@ replaced by the DB-backed project service.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import mimetypes
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -26,8 +28,20 @@ from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
 
-# In-memory registry: deterministic token → parent dir of an HTML artifact.
+# In-memory registry: deterministic token → parent dir of an artifact.
+# Used for both static (HTML asset) and proxy (fullstack backend) mounts;
+# `kind` field on the preview-mount response payload discriminates.
 _PREVIEW_MOUNTS: dict[str, Path] = {}
+
+# Launched-by-cowork-server backend tracking, keyed by artifact slug.
+# Shape matches anton's launcher: {"proc", "port", "pid", "log_path"}.
+# Used to avoid double-launching and to reap on shutdown.
+_LAUNCHED_BACKENDS: dict[str, dict] = {}
+
+# Per-slug mutex so two parallel `preview-mount` requests (React
+# StrictMode double-effects, a double-click) can't both decide the port
+# is dead and spawn two backends side by side.
+_BACKEND_LAUNCH_LOCKS: dict[str, asyncio.Lock] = {}
 
 # ─── Type / kind mapping ──────────────────────────────────────────
 
@@ -215,6 +229,31 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
     return ""
 
 
+def _published_access_for(folder: Path, primary: Path | None) -> dict:
+    """Owner-side access state for the primary file, from `.published.json`.
+
+    Returns {"accessProtected": bool, "accessPassword": str}. The plaintext
+    password is owner-only — `.published.json` never enters the published
+    bundle — and powers the in-app eye-reveal. Callers must only return
+    this to the artifact's owner (the local/authenticated session).
+    """
+    out = {"accessProtected": False, "accessPassword": ""}
+    if primary is None:
+        return out
+    published_index = folder / ".published.json"
+    if not published_index.is_file():
+        return out
+    try:
+        pmap = json.loads(published_index.read_text(encoding="utf-8"))
+        entry = pmap.get(primary.name)
+        if isinstance(entry, dict) and entry.get("requires_password"):
+            out["accessProtected"] = True
+            out["accessPassword"] = entry.get("access_password", "") or ""
+    except Exception:
+        pass
+    return out
+
+
 def _project_artifacts_base(project_name: str) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
     maps to a registered project. Returns None for unknown projects or
@@ -277,11 +316,17 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     return list(matches.values())
 
 
-def resolve_artifact_path(raw_path: str) -> Path | None:
+def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
     Returns None if invalid, or the resolved Path if found.
     Raises ValueError with a message for 400/404 cases.
+
+    When `allow_dir` is set, an absolute path that resolves to an artifact
+    *root directory* (one carrying `metadata.json`) is also accepted — used
+    by publish/unpublish so a folder-based artifact can be addressed by its
+    folder. The relative-path branch stays file-only (the client always
+    sends absolute folder paths).
     """
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
@@ -301,6 +346,8 @@ def resolve_artifact_path(raw_path: str) -> Path | None:
                 continue
             if resolved.is_file() or (resolved.is_dir() and (resolved / "metadata.json").exists()):
                 return resolved
+            if allow_dir and resolved.is_dir() and (resolved / "metadata.json").is_file():
+                return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
     matches = _candidate_relative_artifacts(raw_path)
@@ -309,6 +356,45 @@ def resolve_artifact_path(raw_path: str) -> Path | None:
     if len(matches) > 1:
         raise ValueError("Artifact path matches multiple project artifact roots; pass an absolute path")
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
+
+
+def _artifact_root_for(path: Path) -> Path:
+    """Climb from an artifact file to the folder that holds its
+    `metadata.json` — the artifact root.
+
+    The primary file isn't always at the root: backend+frontend apps
+    keep their frontend in a `static/` subdir (so the backend can mount
+    it with `StaticFiles`), which puts the primary one level below the
+    root. `path.parent` then points at `static/`, where there's no
+    `metadata.json`, and callers that look there miss the backend port
+    entirely. We walk up until we find the dir carrying `metadata.json`,
+    bounded by the registered artifact container dirs
+    (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
+    climbing into the rest of the disk. Falls back to `path.parent`.
+    """
+    containers = {str(d.resolve()) for d in _scan_artifact_dirs()}
+    current = path.parent.resolve()
+    while True:
+        if (current / "metadata.json").is_file():
+            return current
+        # Stop at a container root (its direct children are the artifact
+        # roots — it has no metadata.json of its own) or the fs root.
+        if str(current) in containers or current.parent == current:
+            return path.parent.resolve()
+        current = current.parent
+
+
+def _fullstack_types() -> frozenset[str]:
+    """The artifact types anton's publisher bundles as fullstack apps.
+
+    Imported lazily so publish/preview degrade to static-HTML-only
+    behaviour if the anton package is unavailable, rather than 500ing.
+    """
+    try:
+        from anton.publisher import FULLSTACK_ARTIFACT_TYPES
+        return frozenset(FULLSTACK_ARTIFACT_TYPES)
+    except Exception:
+        return frozenset()
 
 
 def _unpublish_folder(folder: Path) -> None:
@@ -423,6 +509,9 @@ def list_artifacts(project_path: str | None = None) -> list[dict]:
             "path": primary_path,
             "primary": meta.get("primary") or None,
             "publishedUrl": _published_url_for(folder, primary),
+            # Owner-side access state (lock badge + eye-reveal). accessPassword
+            # is the plaintext, returned only to the owner's own session.
+            **_published_access_for(folder, primary),
             "serveUrl": serve_url_for(primary_path),
             "_sortTs": sort_ts,
         })
@@ -448,11 +537,67 @@ def preview_artifact(path: Path) -> dict:
     }
 
 
-def mount_preview(path: Path) -> dict:
-    """Register an HTML artifact's parent dir for iframe preview."""
+async def mount_preview(path: Path) -> dict:
+    """Register an artifact for iframe preview.
+
+    Two payload shapes share a `kind` discriminator:
+      - `kind: "static"` (HTML asset bundles) — token + relUrl that
+        the client loads against `/artifacts/preview-asset/`.
+      - `kind: "proxy"` (fullstack apps with a `port` in metadata.json)
+        — token + artifactDir + backend status; the route layer builds
+        the absolute proxyUrl pointing at our forwarder.
+    """
+    parent = path.parent.resolve()
+    # The artifact root (where metadata.json lives) is not always the
+    # primary file's parent — fullstack apps keep their frontend in a
+    # `static/` subdir. Resolve it explicitly for all backend lookups so
+    # we read the `port` from the root, not from `static/`.
+    root = _artifact_root_for(path)
+
+    # Backend+frontend artifacts: detect them by a `port` field in the
+    # root's metadata.json. The iframe will load through our proxy
+    # endpoint instead of preview-asset.
+    backend_port: int | None = None
+    metadata_path = root / "metadata.json"
+    if metadata_path.is_file():
+        try:
+            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+            raw_port = meta.get("port")
+            if isinstance(raw_port, int) and 0 < raw_port < 65536:
+                backend_port = raw_port
+        except Exception:
+            backend_port = None
+
+    if backend_port is not None:
+        # Proxy mode. Register the artifact root (where metadata.json +
+        # the live port live) so the proxy endpoint reads a current port
+        # by token, then auto-launch the backend if dead. Returns without
+        # `proxyUrl` — the route layer fills it in using the incoming
+        # Request URL so the absolute URL matches whatever host/scheme
+        # the client used to reach us.
+        root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+        _PREVIEW_MOUNTS[root_token] = root
+        running, launch_detail, current_port = await _ensure_backend_running(
+            root, backend_port
+        )
+        return {
+            "kind": "proxy",
+            "token": root_token,
+            "artifactDir": str(root),
+            "port": current_port if running else backend_port,
+            "backendRunning": running,
+            "launchError": "" if running else launch_detail,
+            # Fullstack apps publish from the artifact root, `.published.json`
+            # keyed by the primary file name — surface the published state so
+            # the viewer shows the "Published" pill for backend artifacts too.
+            "publishedUrl": _published_url_for(root, path),
+            **_published_access_for(root, path),
+        }
+
+    # Static (HTML) branch — same behaviour as before, with an explicit
+    # `kind` discriminator so the client doesn't have to infer.
     if path.suffix.lower() != ".html":
         raise ValueError("Preview mount is only available for HTML artifacts")
-    parent = path.parent.resolve()
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
 
@@ -462,11 +607,13 @@ def mount_preview(path: Path) -> dict:
         published_url = entry.get("url", "") or ""
 
     return {
+        "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
         "serveUrl": serve_url_for(path),
         "publishedUrl": published_url,
+        **_published_access_for(parent, path),
     }
 
 
@@ -475,9 +622,16 @@ def get_preview_mount(token: str) -> Path | None:
 
 
 def html_artifacts() -> list[dict]:
-    """List every HTML file under every project's artifacts tree for publish."""
+    """List every HTML file under every project's artifacts tree for publish.
+
+    Fullstack apps keep their pages inside `static/`; they're surfaced as a
+    single entry per artifact root (titled by the root's metadata), not one
+    row per page.
+    """
     out = []
     seen: set[str] = set()
+    seen_roots: set[str] = set()
+    fullstack_types = _fullstack_types()
     for art_root in _scan_artifact_dirs():
         if not art_root.exists():
             continue
@@ -485,12 +639,225 @@ def html_artifacts() -> list[dict]:
             key = str(path.resolve())
             if key in seen:
                 continue
+
+            # Group fullstack apps by their artifact root — one entry per app.
+            artifact_root = _artifact_root_for(path)
+            meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
+            if (meta or {}).get("type") in fullstack_types:
+                root_key = str(artifact_root.resolve())
+                if root_key in seen_roots:
+                    continue
+                seen_roots.add(root_key)
+                primary_hint = meta.get("primary") or ""
+                entry_path = (artifact_root / primary_hint) if primary_hint else path
+                if not entry_path.is_file():
+                    entry_path = path
+                seen.add(str(entry_path.resolve()))
+                out.append({
+                    "title": meta.get("name") or artifact_root.name.replace("_", " ").replace("-", " ").title(),
+                    "path": str(entry_path),
+                    "bytes": entry_path.stat().st_size if entry_path.is_file() else 0,
+                    "publishedUrl": _published_url_for(artifact_root, entry_path),
+                })
+                continue
+
             seen.add(key)
-            published = _load_published_map(path.parent).get(path.name, {})
             out.append({
                 "title": path.stem.replace("_", " ").replace("-", " ").title(),
                 "path": str(path),
                 "bytes": path.stat().st_size,
-                "publishedUrl": published.get("url", "") if isinstance(published, dict) else "",
+                "publishedUrl": _published_url_for(path.parent, path),
             })
     return out[:40]
+
+
+# ─── Backend-artifact auto-launch ─────────────────────────────────
+#
+# When the user opens preview for a `fullstack-stateful-app` artifact,
+# its `metadata.json` records the TCP port the backend bound to. That
+# backend may or may not still be alive — the session that launched it
+# could be gone, the server might have been restarted, the process
+# might have crashed. Rather than refuse to preview, we probe the port
+# and try to bring the backend back up if it's down: delegate to anton's
+# `launch_artifact_backend` so the spawn semantics (slug-keyed venv,
+# requirements.txt install, `--port` flag, HTTP+TCP readiness probe)
+# match Anton's own `launch_backend` tool exactly. The new port is
+# persisted back to metadata.json so the proxy and future opens see it.
+
+def _launch_lock(key: str) -> asyncio.Lock:
+    lock = _BACKEND_LAUNCH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _BACKEND_LAUNCH_LOCKS[key] = lock
+    return lock
+
+
+def _probe_port(port: int, *, timeout: float = 0.3) -> bool:
+    """True iff something is accepting TCP connections on 127.0.0.1:<port>."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _resolve_project_root(artifact_dir: Path) -> Path | None:
+    """The registered project root that owns this artifact dir, if any.
+
+    `artifact_dir` is the parent of the primary file (e.g.
+    `<project>/.anton/artifacts/<slug>/`). We walk back to the registered
+    project root by checking ancestors against `_registered_project_dirs()`.
+    Returns None when the dir isn't under any registered project — in
+    which case auto-launch is a non-starter anyway.
+    """
+    try:
+        artifact_resolved = artifact_dir.resolve()
+    except OSError:
+        return None
+    registered = _registered_project_dirs()
+    for parent in (artifact_resolved, *artifact_resolved.parents):
+        if parent in registered:
+            return parent
+    return None
+
+
+async def _ensure_backend_running(
+    artifact_dir: Path, port: int
+) -> tuple[bool, str, int]:
+    """Bring up the artifact's backend if it isn't already listening.
+
+    Returns `(running, detail, port)`:
+      - `running=True`  → port is alive; `detail` is a short label
+        ("already_running" or "launched"); `port` may differ from the
+        input when the helper had to allocate a fresh free port.
+      - `running=False` → backend is down and we couldn't start it;
+        `detail` carries the reason; `port` echoes the input port.
+    """
+    slug = artifact_dir.name
+    if _probe_port(port):
+        return True, "already_running", port
+
+    # Serialize launches per-slug. Whichever request wins the lock does
+    # the actual work; the rest just re-probe after it releases.
+    async with _launch_lock(slug):
+        if _probe_port(port):
+            return True, "already_running", port
+        return await _launch_backend_locked(artifact_dir, slug)
+
+
+async def _launch_backend_locked(
+    artifact_dir: Path, slug: str
+) -> tuple[bool, str, int]:
+    """Spawn the artifact's backend via anton's shared launcher.
+
+    The slug-keyed scratchpad venv (provisioned by Anton when the agent
+    built the artifact) is the python interpreter; `requirements.txt`
+    in the artifact folder is installed before spawn; the launcher
+    picks a free port and passes `--port <port>` to the script. New
+    port is persisted into `metadata.json` so the proxy reads a current
+    value on its next request.
+    """
+    from anton.core.artifacts.backend_launcher import launch_artifact_backend
+
+    from cowork.services.scratchpad_runtime import WorkspaceScopedPool
+
+    project_root = _resolve_project_root(artifact_dir)
+    if project_root is None:
+        return False, "Artifact is not in a registered project.", 0
+
+    pool = WorkspaceScopedPool(str(project_root))
+
+    # Inject the secrets of datasources the artifact declared in metadata.json
+    # into the backend subprocess only — NOT the cowork server's global
+    # os.environ. The backend is a separate subprocess, so we build an
+    # explicit env mapping and let the launcher merge it for the spawn.
+    extra_env: dict[str, str] = {}
+    try:
+        meta = _load_metadata(artifact_dir) or {}
+        datasources = meta.get("datasources") or []
+        if datasources:
+            from anton.core.datasources.data_vault import LocalDataVault
+
+            vault = LocalDataVault()
+            for ds in datasources:
+                engine, name = ds.get("engine"), ds.get("name")
+                if not engine or not name:
+                    continue
+                env = vault.env_for(engine, name)
+                if env is None:
+                    logger.warning(
+                        "Datasource %s/%s declared by artifact %s not found in vault — skipping",
+                        engine, name, slug,
+                    )
+                    continue
+                extra_env.update(env)
+    except Exception:
+        logger.warning(
+            "Could not build datasource env for backend launch of %s", slug, exc_info=True
+        )
+
+    # anton's default health_timeout is 10s — too short for artifacts
+    # that do slow IO (HTTP fetches with retry/backoff, large model
+    # loads, etc.) before binding their port. The launcher would
+    # otherwise terminate a perfectly healthy backend just because it
+    # didn't finish startup yet. 45s leaves room for retries without
+    # making the user wait forever on a truly stuck script — anton
+    # terminates the proc on timeout.
+    result = await launch_artifact_backend(
+        slug=slug,
+        artifact_folder=artifact_dir,
+        scratchpad_pool=pool,
+        tracked_backends=_LAUNCHED_BACKENDS,
+        extra_env=extra_env,
+        health_timeout=45.0,
+    )
+    if isinstance(result, str):
+        # Helper returned an error string. Strip the redundant "Error: "
+        # prefix so the message reads naturally in the preview pane.
+        detail = result[len("Error: "):] if result.startswith("Error: ") else result
+        return False, detail, 0
+
+    new_port = int(result["port"])
+    # Persist the new port directly to metadata.json. The proxy reads
+    # metadata.json on every request — without this write it would keep
+    # dialing the stale port even though the backend is healthy on a
+    # different one.
+    try:
+        meta_path = artifact_dir / "metadata.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["port"] = new_port
+        meta_path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        # Metadata write failure shouldn't abort an otherwise-working
+        # relaunch — the backend is up and we return the new port. But
+        # the proxy will keep dialing the stale port until the next
+        # successful write.
+        logger.warning("Could not persist backend port to metadata: %s", exc)
+
+    logger.info(
+        "Auto-launched artifact backend via anton helper: slug=%s port=%d pid=%s",
+        slug, new_port, result.get("pid"),
+    )
+    return True, "launched", new_port
+
+
+def shutdown_launched_backends() -> None:
+    """Terminate every backend cowork-server itself launched.
+
+    Synchronous: we schedule `proc.terminate()` (which is non-blocking on
+    `asyncio.subprocess.Process`) without awaiting `proc.wait()`. The
+    server is exiting anyway, and PR_SET_PDEATHSIG on Linux already makes
+    the kernel SIGTERM the backends when we go. macOS relies on the
+    explicit `terminate()` call.
+    """
+    for slug, entry in list(_LAUNCHED_BACKENDS.items()):
+        proc = entry.get("proc")
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+        _LAUNCHED_BACKENDS.pop(slug, None)
