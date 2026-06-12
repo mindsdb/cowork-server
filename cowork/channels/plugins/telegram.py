@@ -351,12 +351,13 @@ class TelegramBridge:
 
 
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
-    """Build a TelegramBridge from resolved credentials, or None if the channel
-    is not fully configured.
-"""
+    """Build a TelegramBridge from resolved credentials, or None if not
+    configured. Only ``bot_token`` is required: it powers getUpdates polling and
+    sending. ``secret_token`` is webhook-only (it authenticates webhook ingress
+    and is auto-minted by setup); polling never needs it, and verify_signature
+    guards the webhook path at call time, so the factory must not gate on it.
+    """
     if not (credentials.get("bot_token") or "").strip():
-        return None
-    if not (credentials.get("secret_token") or "").strip():
         return None
     return TelegramBridge(credentials)
 
