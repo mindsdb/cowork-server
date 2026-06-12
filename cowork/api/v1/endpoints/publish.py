@@ -18,6 +18,11 @@ router = APIRouter()
 
 class _PublishBody(BaseModel):
     path: str
+    # Optional access password. When set, the artifact is published
+    # password-protected — only a hash leaves this machine; the plaintext
+    # is kept in .published.json for the in-app reveal. Omit / empty to
+    # publish (or re-publish) as public.
+    password: str | None = None
 
 
 @router.get("/")
@@ -28,7 +33,7 @@ async def list_publishable_endpoint():
 @router.post("/")
 async def publish_artifact(req: _PublishBody):
     try:
-        return _publish(req.path)
+        return _publish(req.path, req.password)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
