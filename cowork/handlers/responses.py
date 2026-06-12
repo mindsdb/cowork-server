@@ -55,14 +55,28 @@ class ResponsesHandler:
             except ValueError:
                 conv_id = None
             if conv_id is not None:
-                conversation = conversation_service.get_conversation(conv_id)
+                try:
+                    conversation = conversation_service.get_conversation(conv_id)
+                except ValueError:
+                    # Unknown UUID — the composer allocates a conversation id
+                    # up front so attachments can be uploaded against it before
+                    # the first stream. Adopt it, otherwise those uploads strand
+                    # under an id no conversation ever gets (ENG-264).
+                    conversation = conversation_service.create_conversation(
+                        topic=self._prompt_text(harness_input)[:80],
+                        project_id=project_id,
+                        conversation_id=conv_id,
+                    )
             else:
-                # Client sent a non-UUID id (e.g. legacy name-based format) —
-                # treat as a new conversation since it won't exist in the DB.
+                # Client sent a non-UUID id (e.g. the legacy timestamp
+                # allocator, or a name-based format) — it can't become the
+                # row id, so create a fresh conversation and re-link any
+                # attachments uploaded against the client's id (ENG-264).
                 conversation = conversation_service.create_conversation(
                     topic=self._prompt_text(harness_input)[:80],
                     project_id=project_id,
                 )
+                self._relink_attachments(request.conversation, conversation)
         else:
             conversation = conversation_service.create_conversation(
                 topic=self._prompt_text(harness_input)[:80],
@@ -218,6 +232,26 @@ class ResponsesHandler:
                     break
 
         return blocks or [{"type": "text", "text": ""}]
+
+    def _relink_attachments(self, client_session_id: str, conversation) -> None:
+        """Repoint attachments uploaded against a client-side session id to
+        the conversation that actually got created, so the Task Uploads
+        rail (which queries by the live conversation id) still finds them."""
+        from cowork.services.files import FileService, attachment_purpose
+
+        try:
+            project_name = conversation.project.name
+        except Exception:
+            return
+        moved = FileService(self.session).relink_purpose(
+            attachment_purpose(project_name, client_session_id),
+            attachment_purpose(project_name, str(conversation.id)),
+        )
+        if moved:
+            logger.info(
+                "[responses] relinked %d attachment(s) from client session %r to conversation %s",
+                moved, client_session_id, conversation.id,
+            )
 
     def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
         if request.project_id is not None:

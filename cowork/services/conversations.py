@@ -37,11 +37,17 @@ class ConversationService:
         self,
         topic: str,
         project_id: UUID | None = None,
+        conversation_id: UUID | None = None,
     ) -> Conversation:
+        """`conversation_id` lets the caller adopt a client-allocated id —
+        the composer allocates one up front so attachments can be uploaded
+        against it before the first stream creates the conversation."""
         conversation = Conversation(
             topic=topic,
             project_id=project_id or GENERAL_PROJECT_ID,
         )
+        if conversation_id is not None:
+            conversation.id = conversation_id
         self.session.add(conversation)
         self.session.commit()
         self.session.refresh(conversation)

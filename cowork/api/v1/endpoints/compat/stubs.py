@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlmodel import Session
 
@@ -45,13 +45,41 @@ _SessionDep = Annotated[Session, Depends(get_session)]
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:
-    return f"attachment:{project_name}:{session_id}"
+    from cowork.services.files import attachment_purpose
+    return attachment_purpose(project_name, session_id)
+
+
+def _to_attachment(file) -> dict:
+    """Legacy FileAttachment shape the rail's Task Uploads rows render
+    (name / mime / size + ISO timestamps). Returning the OpenAI-style
+    FileResponse here (filename / bytes / epoch-seconds) left the rows
+    showing raw file ids and a 1970s age (ENG-264)."""
+    created = file.created_at.isoformat() if file.created_at else None
+    return {
+        "id": str(file.id),
+        "name": file.filename,
+        "mime": file.content_type,
+        "size": file.size,
+        "created_at": created,
+        # File rows are immutable once uploaded — created is updated.
+        "updated_at": created,
+        "purpose": file.purpose,
+    }
 
 
 @attachments_router.get("/{project_name}/{session_id}")
-def list_attachments(project_name: str, session_id: str, session: _SessionDep):
+def list_attachments(
+    project_name: str,
+    session_id: str,
+    session: _SessionDep,
+    ids: list[str] | None = Query(default=None),
+):
     from cowork.services.files import FileService
-    return FileService(session).list_files(purpose=_attachment_purpose(project_name, session_id))
+    rows = FileService(session).list_file_rows(purpose=_attachment_purpose(project_name, session_id))
+    if ids:
+        wanted = {str(i) for i in ids}
+        rows = [r for r in rows if str(r.id) in wanted]
+    return [_to_attachment(r) for r in rows]
 
 
 @attachments_router.post("/{project_name}/{session_id}/upload")
@@ -65,8 +93,8 @@ async def upload_attachment(
     svc = FileService(session)
     results = []
     for f in files:
-        result = await svc.create_file(upload=f, purpose=_attachment_purpose(project_name, session_id))
-        results.append(result)
+        created = await svc.create_file(upload=f, purpose=_attachment_purpose(project_name, session_id))
+        results.append(_to_attachment(svc.get_file_row(UUID(created.id))))
     return results
 
 
@@ -91,7 +119,16 @@ def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, sess
         content_type, filename, path = FileService(session).get_file_content(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return FileResponse(path, media_type=content_type, filename=filename)
+    # Inline, not attachment: the rail's row click opens this URL in a
+    # browser tab expecting the file to RENDER (image/pdf/text). The
+    # default attachment disposition silently downloads instead, which
+    # reads as "open does nothing" (ENG-264).
+    return FileResponse(
+        path,
+        media_type=content_type,
+        filename=filename,
+        content_disposition_type="inline",
+    )
 
 
 def _unique_project_target(project_dir: Path, filename: str) -> Path:
