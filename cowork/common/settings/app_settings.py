@@ -6,6 +6,48 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 import os
 
 
+# ── Global model catalog ───────────────────────────────────────────────
+# Recommended models and per-provider model defaults are global,
+# application-level configuration — the same for every user — so they live
+# here rather than as per-user fields on UserSettings.
+#
+# minds-cloud model names are owned by MindsHub, not this repo. The list is
+# resolved at runtime from MindsHub's OpenAI-compatible `/v1/models` endpoint
+# (see cowork.services.providers.fetch_minds_models) and supplied by the
+# /settings/recommended-models endpoint. It is intentionally left empty here
+# so no `latest:*` aliases are hand-maintained — the working default pair
+# lives in RECOMMENDED_PAIR / *_MODEL_DEFAULTS below.
+RECOMMENDED_MODELS: dict[str, list[str]] = {
+    "minds-cloud": [],
+    "anthropic": ["claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
+    "openai": ["gpt-5.5", "gpt-5.5-mini", "o3", "o4-mini"],
+    "gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-flash-preview"],
+    "openai-compatible": [],
+}
+
+RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
+    "minds-cloud": ("latest:sonnet", "latest:haiku"),
+    "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
+    "openai": ("gpt-5.5", "gpt-5.5-mini"),
+    "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
+    "openai-compatible": ("", ""),
+}
+
+# Keyed by the Provider enum *value* (the string) rather than the enum
+# itself, so this module stays free of a circular import with user_settings,
+# which owns the Provider enum.
+PLANNING_MODEL_DEFAULTS: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-5.5",
+    "minds_cloud": "latest:sonnet",
+}
+CODING_MODEL_DEFAULTS: dict[str, str] = {
+    "anthropic": "claude-haiku-4-5-20251001",
+    "openai": "gpt-5.5-mini",
+    "minds_cloud": "latest:haiku",
+}
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
