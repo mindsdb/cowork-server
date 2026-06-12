@@ -45,7 +45,8 @@ _SessionDep = Annotated[Session, Depends(get_session)]
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:
-    return f"attachment:{project_name}:{session_id}"
+    from cowork.services.files import attachment_purpose
+    return attachment_purpose(project_name, session_id)
 
 
 @attachments_router.get("/{project_name}/{session_id}")
