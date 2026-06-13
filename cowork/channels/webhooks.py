@@ -148,8 +148,11 @@ def _add_webhook_route(
 
         try:
             bridge.verify_signature(body=body, headers=headers)
-        except SignatureError:
-            log.warning("channel %s webhook signature verification failed", channel_type)
+        except SignatureError as exc:
+            # Surface the specific reason (e.g. "signing_secret not configured")
+            # so a misconfig — like a Socket-Mode-only Slack app still receiving
+            # webhook posts — isn't an opaque 401. Response stays generic.
+            log.warning("channel %s webhook signature verification failed: %s", channel_type, exc)
             return Response("invalid signature", status_code=401)
 
         try:
