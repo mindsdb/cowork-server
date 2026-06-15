@@ -124,6 +124,13 @@ class OAuthSettings(Settings):
     )
 
 
+class MemorySettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "memory"),
+        description="Root directory for all memory files",
+    )
+
+
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
@@ -177,6 +184,7 @@ class AppSettings(Settings):
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
+    memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
 
 
 @lru_cache
