@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import SecretStr
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import (
     _artifact_root_for,
@@ -140,6 +141,7 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
         raise ValueError("Only HTML artifacts can be published")
 
     try:
+        from anton.core.datasources.data_vault import LocalDataVault
         from anton.publisher import publish
     except Exception as exc:
         raise RuntimeError("Anton publisher is unavailable") from exc
@@ -174,6 +176,11 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
             ssl_verify=ssl_verify,
             password=password,
             pwd_version=pwd_version,
+            # Resolve datasource secrets from cowork's own vault
+            # (`~/.cowork/data-vault`), not anton's default
+            # (`~/.anton/data_vault`) — otherwise secrets are missed and
+            # the published artifact has no DB connection in the cloud.
+            vault=LocalDataVault(Path(get_app_settings().connector.vault_dir)),
         )
     except Exception as exc:
         logger.exception("Publishing failed")
