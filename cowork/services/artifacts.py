@@ -778,7 +778,7 @@ async def _launch_backend_locked(
         if datasources:
             from anton.core.datasources.data_vault import LocalDataVault
 
-            vault = LocalDataVault()
+            vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
             for ds in datasources:
                 engine, name = ds.get("engine"), ds.get("name")
                 if not engine or not name:
