@@ -117,7 +117,8 @@ Cowork-server is a **local-first desktop app** — users may downgrade at any ti
 |---------|-----------|
 | `create_table` | `drop_table` |
 | `add_column` | `drop_column` |
-| `create_index` | `rename_table` |
+| `create_index` | `drop_index` |
+| | `rename_table` |
 | | `alter_column` (rename / type change) |
 
 SQLite ignores columns it doesn't know about, and SQLModel selects explicit columns — so a schema with "extra" columns from a newer release is a safe superset for older code.

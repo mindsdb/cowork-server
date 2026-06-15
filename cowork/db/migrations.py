@@ -24,6 +24,7 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from alembic.util import CommandError
 from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,7 @@ def _is_future_revision(config: Config, connection: sa.Connection) -> bool:
     script = ScriptDirectory.from_config(config)
     try:
         script.get_revision(current_rev)
-    except Exception:
+    except CommandError:
         logger.warning(
             "Database stamped at unknown revision %s — skipping migrations. "
             "This is expected after a cowork-server downgrade.",
