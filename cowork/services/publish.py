@@ -5,9 +5,11 @@ Uses a local JSON state file for publish history tracking.
 """
 from __future__ import annotations
 
+import html as _html
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -126,6 +128,92 @@ def list_publishable() -> dict:
     }
 
 
+# Static artifact extensions a user can publish to a 4nton.ai web page.
+# `.html` is served as-is; `.md` is rendered to a styled HTML page first
+# (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
+# publish their directory regardless of the primary file's suffix.
+PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+
+# Minimal, self-contained page wrapper for rendered Markdown. No external
+# assets (fonts/CSS load from nowhere) so the published bundle is a single
+# index.html the viewer can serve standalone. Kept deliberately plain —
+# readable typography, sensible width, code/table styling.
+_MD_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{ color-scheme: light; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.65; color: #1f2328; background: #fff;
+    max-width: 760px; margin: 0 auto; padding: 48px 24px 96px;
+  }}
+  h1, h2, h3, h4 {{ line-height: 1.25; margin: 1.6em 0 0.6em; font-weight: 600; }}
+  h1 {{ font-size: 2em; border-bottom: 1px solid #e2e4e8; padding-bottom: 0.3em; margin-top: 0; }}
+  h2 {{ font-size: 1.5em; border-bottom: 1px solid #e2e4e8; padding-bottom: 0.3em; }}
+  a {{ color: #0969da; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  p, ul, ol, blockquote, table, pre {{ margin: 0 0 1em; }}
+  code {{ font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+          font-size: 0.88em; background: #f3f4f6; padding: 0.2em 0.4em; border-radius: 6px; }}
+  pre {{ background: #f6f8fa; padding: 16px; border-radius: 8px; overflow: auto; }}
+  pre code {{ background: none; padding: 0; }}
+  blockquote {{ margin-left: 0; padding: 0 1em; color: #59636e; border-left: 4px solid #d0d7de; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #d0d7de; padding: 6px 13px; }}
+  th {{ background: #f6f8fa; font-weight: 600; }}
+  img {{ max-width: 100%; }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def _markdown_title(md_path: Path, md_text: str) -> str:
+    """Page <title>: the first ATX `# ` heading if present, else the filename."""
+    for line in md_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip() or md_path.stem
+    return md_path.stem
+
+
+def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
+    """Render a Markdown file to a standalone ``index.html`` in ``out_dir``.
+
+    Returns the path to the generated file, which is what we hand to
+    ``anton.publisher.publish`` (it zips it as index.html and serves it as a
+    web page). The original ``.md`` is never modified — the registry and
+    publish history still key off it, not this temp file.
+    """
+    # `markdown` ships transitively via hermes-agent (a pinned core
+    # dependency), so it's always present in the resolved environment. The
+    # guard stays defensive in case that ever changes; promote markdown to a
+    # direct dependency in pyproject.toml when the lockfile is next
+    # regenerated with the canonical uv version.
+    try:
+        import markdown
+    except Exception as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError("Markdown renderer is unavailable") from exc
+
+    md_text = md_path.read_text(encoding="utf-8", errors="replace")
+    body = markdown.markdown(
+        md_text,
+        extensions=["fenced_code", "tables", "toc", "sane_lists"],
+        output_format="html5",
+    )
+    page = _MD_HTML_TEMPLATE.format(title=_html.escape(_markdown_title(md_path, md_text)), body=body)
+    out_path = out_dir / "index.html"
+    out_path.write_text(page, encoding="utf-8")
+    return out_path
+
+
 def publish_artifact(raw_path: str, password: str | None = None) -> dict:
     settings = get_user_settings()
     api_key = _secret_str(settings.minds_api_key)
@@ -137,8 +225,8 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
     # Utilities per-page list). `_resolve_publish_target` normalizes both.
     artifact = resolve_artifact_path(raw_path, allow_dir=True)
     publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(artifact)
-    if not is_fullstack and publish_target.suffix.lower() != ".html":
-        raise ValueError("Only HTML artifacts can be published")
+    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+        raise ValueError("Only HTML and Markdown artifacts can be published")
 
     try:
         from anton.core.datasources.data_vault import LocalDataVault
@@ -165,11 +253,21 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
     prev_version = previous.get("pwd_version", 0) if isinstance(previous, dict) else 0
     pwd_version = (prev_version + 1) if password and password != prev_password else (prev_version or 1)
 
+    # Markdown is rendered to a throwaway index.html that we hand to the
+    # publisher; `.html` and fullstack publish their real target directly.
+    # `publish_target` stays the original artifact so the registry, history,
+    # and unpublish all key off the file the user actually sees.
+    publish_source = publish_target
+    md_tmp_dir: tempfile.TemporaryDirectory | None = None
+    if not is_fullstack and publish_target.suffix.lower() == ".md":
+        md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
+        publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+
     publish_url = settings.publish_url or "https://4nton.ai"
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
         result = publish(
-            publish_target,
+            publish_source,
             api_key=api_key,
             report_id=report_id,
             publish_url=publish_url,
@@ -185,6 +283,9 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
     except Exception as exc:
         logger.exception("Publishing failed")
         raise RuntimeError("Publishing failed. Check your Minds credentials and try again.") from exc
+    finally:
+        if md_tmp_dir is not None:
+            md_tmp_dir.cleanup()
 
     view_url = result.get("view_url", "")
     returned_report_id = result.get("report_id", "")
