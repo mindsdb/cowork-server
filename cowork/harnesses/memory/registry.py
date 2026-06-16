@@ -4,38 +4,25 @@ These slots have been based on the Anton's memory system.
 When a new harness is onboarded, it's memory mechanim should be mapped to these canonical slots.
 If a particular aspect of a new harness's memory does not adhere to these slots, a new slot can be created.
 """
+from enum import StrEnum
 from dataclasses import dataclass
 
+class MemorySlot(StrEnum):
+    PROFILE = "profile"
+    RULES = "rules"
+    LESSONS = "lessons"
 
 @dataclass(frozen=True)
-class CanonicalSlot:
-    id: str
+class SlotMeta:
     filename: str
     description: str
 
-
-# The registry — add entries as new harnesses need new shared concepts.
-CANONICAL_SLOTS: dict[str, CanonicalSlot] = {
-    "profile": CanonicalSlot(
-        id="profile",
-        filename="profile.md",
-        description="User identity, preferences (Anton profile, Hermes user)",
-    ),
-    "rules": CanonicalSlot(
-        id="rules",
-        filename="rules.md",
-        description="Behavioral gates — Anton-only for now",
-    ),
-    "lessons": CanonicalSlot(
-        id="lessons",
-        filename="lessons.md",
-        description="Agent-learned knowledge (Anton lessons, Hermes memory)",
-    ),
+SLOT_REGISTRY: dict[MemorySlot, SlotMeta] = {
+    MemorySlot.PROFILE: SlotMeta("profile.md", "User identity, preferences"),
+    MemorySlot.RULES: SlotMeta("rules.md", "Behavioral gates"),
+    MemorySlot.LESSONS: SlotMeta("lessons.md", "Agent-learned knowledge"),
 }
 
-
-def get_filename(slot_id: str) -> str:
-    slot = CANONICAL_SLOTS.get(slot_id)
-    if slot is None:
-        raise ValueError(f"Unknown canonical memory slot: {slot_id!r}")
-    return slot.filename
+def get_filename(slot: MemorySlot | str) -> str:
+    slot = MemorySlot(slot) if isinstance(slot, str) else slot
+    return SLOT_REGISTRY[slot].filename
