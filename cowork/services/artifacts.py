@@ -622,11 +622,13 @@ def get_preview_mount(token: str) -> Path | None:
 
 
 def html_artifacts() -> list[dict]:
-    """List every HTML file under every project's artifacts tree for publish.
+    """List every publishable file (HTML + Markdown) under every project's
+    artifacts tree.
 
-    Fullstack apps keep their pages inside `static/`; they're surfaced as a
-    single entry per artifact root (titled by the root's metadata), not one
-    row per page.
+    `.md` files publish as rendered HTML pages (see `publish.py`), so they
+    belong in this list alongside `.html`. Fullstack apps keep their pages
+    inside `static/`; they're surfaced as a single entry per artifact root
+    (titled by the root's metadata), not one row per page.
     """
     out = []
     seen: set[str] = set()
@@ -635,7 +637,8 @@ def html_artifacts() -> list[dict]:
     for art_root in _scan_artifact_dirs():
         if not art_root.exists():
             continue
-        for path in sorted(art_root.rglob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True):
+        candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
+        for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
             key = str(path.resolve())
             if key in seen:
                 continue
