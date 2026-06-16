@@ -6,27 +6,26 @@ The core concept for enabling shared memory across harnesses is as follows:
 are three canonical slots (files) involved (defined in the registry module).
 - Each harness will follow two integration rules:
   1. Direct mapping when possible: 1:1 file ↔ canonical file via symlink.
-  2. Prompt injection for extras: when a harness reads more than it writes (Anton’s 
+  2. Prompt injection for extras: when a harness reads more than it writes (Anton's
   memory stores more context), inject read-only canonical content via system prompt.
 
 Each harness adapter should define:
-- RUNTIME_SYMLINKS: the direct mapping between the harness's memory files and the canonical 
+- RUNTIME_SYMLINKS: the direct mapping between the harness's memory files and the canonical
 slots. This is used to create the symlinks in the harness's memory directory.
 - PROMPT_INJECT_SLOTS: the slots that will be injected into the system prompt. This is used to
 inject the read-only canonical content into the system prompt.
 """
-from typing import Protocol
+from pathlib import Path
 
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import SharedMemoryStore
 
 
-class BaseMemoryAdapter(Protocol):
-    """Helper base — harnesses only override the dicts."""
+class BaseMemoryAdapter:
+    """Harnesses subclass this and override the class attributes."""
 
     harness_id: str
-
-    RUNTIME_SYMLINKS: dict[str, MemorySlot] = {}
+    RUNTIME_SYMLINKS: dict[Path, MemorySlot] = {}
     PROMPT_INJECT_SLOTS: list[MemorySlot] = []
 
     def build_prompt_context(self) -> str:
@@ -37,3 +36,10 @@ class BaseMemoryAdapter(Protocol):
             if content:
                 parts.append(self._format_slot_for_prompt(slot, content))
         return "\n\n".join(parts)
+
+    def _format_slot_for_prompt(self, slot: MemorySlot, content: str) -> str:
+        headings = {
+            MemorySlot.RULES: "## Behavioral Rules",
+            MemorySlot.PROFILE: "## User Profile",
+        }
+        return f"{headings.get(slot, f'## {slot.value}')}\n{content}"
