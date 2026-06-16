@@ -247,7 +247,7 @@ class GoogleOAuthService:
             return
         try:
             request = Request(
-                f"{_GOOGLE_REVOKE_ENDPOINT}?token={token}",
+                f"{_GOOGLE_REVOKE_ENDPOINT}?{urlencode({'token': token})}",
                 method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
