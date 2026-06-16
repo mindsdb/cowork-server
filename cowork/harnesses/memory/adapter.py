@@ -18,6 +18,7 @@ inject the read-only canonical content into the system prompt.
 from typing import Protocol
 
 from cowork.harnesses.memory.registry import MemorySlot
+from cowork.harnesses.memory.store import SharedMemoryStore
 
 
 class BaseMemoryAdapter(Protocol):
@@ -27,3 +28,12 @@ class BaseMemoryAdapter(Protocol):
 
     RUNTIME_SYMLINKS: dict[str, MemorySlot] = {}
     PROMPT_INJECT_SLOTS: list[MemorySlot] = []
+
+    def build_prompt_context(self) -> str:
+        store = SharedMemoryStore()
+        parts = []
+        for slot in self.PROMPT_INJECT_SLOTS:
+            content = store.read(slot).strip()
+            if content:
+                parts.append(self._format_slot_for_prompt(slot, content))
+        return "\n\n".join(parts)
