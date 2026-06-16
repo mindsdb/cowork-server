@@ -331,7 +331,8 @@ class GoogleOAuthService:
         try:
             vault = LocalDataVault(Path(connector_settings.vault_dir))
             all_connections = vault.list_connections() or []
-        except Exception:
+        except Exception as exc:
+            _log.warning("Could not load vault for catalogue: %s", exc)
             all_connections = []
 
         state_data = self._store(oauth_settings)._load()
