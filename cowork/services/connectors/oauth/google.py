@@ -57,7 +57,7 @@ class GoogleOAuthService:
         if datetime.now(timezone.utc) - entry["_ts"] > timedelta(minutes=20):
             self._OUTCOMES.pop(state, None)
             return None
-        return entry
+        return {k: v for k, v in entry.items() if k != "_ts"}
 
     def _store(self, settings: OAuthSettings) -> OAuthStateStore:
         return OAuthStateStore(settings.state_path)
