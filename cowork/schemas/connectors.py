@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ConnectorField(BaseModel):
@@ -135,10 +135,18 @@ class ConnectionDetailResponse(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)
 
 
+class OAuthStartRequest(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+
+
 class OAuthStartResponse(BaseModel):
-    auth_url: str
-    redirect_uri: str
-    started_at: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    auth_url: str = Field(serialization_alias="authUrl")
+    redirect_uri: str = Field(serialization_alias="redirectUri")
+    started_at: str = Field(serialization_alias="startedAt")
+    state: str
 
 
 class DisabledConnection(BaseModel):
