@@ -22,7 +22,7 @@ build_prompt_context method.
 from pathlib import Path
 
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.harnesses.memory.store import SharedMemoryStore
+from cowork.harnesses.memory.store import ProjectMemoryStore, PROJECT_SLOTS, SharedMemoryStore
 
 
 class BaseMemoryAdapter:
@@ -32,19 +32,37 @@ class BaseMemoryAdapter:
     RUNTIME_SYMLINKS: dict[Path, MemorySlot] = {}
     PROMPT_INJECT_SLOTS: list[MemorySlot] = []
 
-    def build_prompt_context(self) -> str:
+    def build_prompt_context(self, project_path: Path) -> str:
+        return self._format_global_prompt_context() + "\n\n" + self._format_project_prompt_context(project_path)
+
+    def _format_project_prompt_context(self, project_path: Path) -> str:
+        store = ProjectMemoryStore(project_path)
+        parts = []
+        for slot in PROJECT_SLOTS:
+            content = store.read(slot).strip()
+            if content:
+                parts.append(self._format_slot_for_prompt(slot, content))
+        # Header and footer are added to avoid trailing lines being absorbed into the project context.
+        if not parts:
+            return ""
+        return f"{"# Project Memory"}\n\n" + "\n\n".join(parts) + "\n\nEnd of Project Memory."
+
+    def _format_global_prompt_context(self) -> str:
         store = SharedMemoryStore()
         parts = []
         for slot in self.PROMPT_INJECT_SLOTS:
             content = store.read(slot).strip()
             if content:
                 parts.append(self._format_slot_for_prompt(slot, content))
+        if not parts:
+            return ""
         return "\n\n".join(parts)
 
     def _format_slot_for_prompt(self, slot: MemorySlot, content: str) -> str:
         headings = {
             MemorySlot.RULES: "## Behavioral Rules",
             MemorySlot.PROFILE: "## User Profile",
+            MemorySlot.LESSONS: "## Agent-learned Knowledge",
         }
         return f"{headings.get(slot, f'## {slot.value}')}\n{content}"
 
