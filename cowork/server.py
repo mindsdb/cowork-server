@@ -35,7 +35,11 @@ async def _token_refresh_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(_token_refresh_loop())
+    try:
+        token_refresh_task = asyncio.create_task(_token_refresh_loop())
+    except Exception:
+        logger.exception("Failed to start token refresh loop")
+        token_refresh_task = None
     run_dev_setup()
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
