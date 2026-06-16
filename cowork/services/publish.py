@@ -134,10 +134,12 @@ def list_publishable() -> dict:
 # publish their directory regardless of the primary file's suffix.
 PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
 
-# Minimal, self-contained page wrapper for rendered Markdown. No external
-# assets (fonts/CSS load from nowhere) so the published bundle is a single
-# index.html the viewer can serve standalone. Kept deliberately plain —
-# readable typography, sensible width, code/table styling.
+# Self-contained page wrapper for rendered Markdown. No external assets so
+# the published bundle is a single index.html the viewer serves standalone.
+# Styled to match Anton's dashboards (GitHub-dark palette + system fonts —
+# see anton's generated reports) so a published doc looks of-a-piece with
+# the dashboards/reports Anton produces, just tuned for long-form reading
+# (comfortable column width + line-height).
 _MD_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -145,31 +147,46 @@ _MD_HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-  :root {{ color-scheme: light; }}
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    line-height: 1.65; color: #1f2328; background: #fff;
-    max-width: 760px; margin: 0 auto; padding: 48px 24px 96px;
+  :root {{
+    color-scheme: dark;
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+    --border: #30363d; --text: #e6edf3; --muted: #8b949e;
+    --accent: #58a6ff;
   }}
-  h1, h2, h3, h4 {{ line-height: 1.25; margin: 1.6em 0 0.6em; font-weight: 600; }}
-  h1 {{ font-size: 2em; border-bottom: 1px solid #e2e4e8; padding-bottom: 0.3em; margin-top: 0; }}
-  h2 {{ font-size: 1.5em; border-bottom: 1px solid #e2e4e8; padding-bottom: 0.3em; }}
-  a {{ color: #0969da; text-decoration: none; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.7; font-size: 16px; -webkit-font-smoothing: antialiased;
+  }}
+  .doc {{ max-width: 820px; margin: 0 auto; padding: 56px 24px 96px; }}
+  h1, h2, h3, h4, h5 {{ line-height: 1.3; margin: 1.8em 0 0.6em; font-weight: 600; }}
+  h1 {{ font-size: 2em; margin-top: 0; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); letter-spacing: -0.4px; }}
+  h2 {{ font-size: 1.5em; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }}
+  h3 {{ font-size: 1.25em; }}
+  p, ul, ol, blockquote, table, pre {{ margin: 0 0 1.1em; }}
+  ul, ol {{ padding-left: 1.5em; }}
+  li {{ margin: 0.3em 0; }}
+  a {{ color: var(--accent); text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
-  p, ul, ol, blockquote, table, pre {{ margin: 0 0 1em; }}
+  strong {{ color: #fff; }}
   code {{ font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-          font-size: 0.88em; background: #f3f4f6; padding: 0.2em 0.4em; border-radius: 6px; }}
-  pre {{ background: #f6f8fa; padding: 16px; border-radius: 8px; overflow: auto; }}
+          font-size: 0.88em; background: var(--bg3); padding: 0.2em 0.4em; border-radius: 6px; }}
+  pre {{ background: var(--bg2); border: 1px solid var(--border); padding: 16px; border-radius: 10px; overflow: auto; }}
   pre code {{ background: none; padding: 0; }}
-  blockquote {{ margin-left: 0; padding: 0 1em; color: #59636e; border-left: 4px solid #d0d7de; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ border: 1px solid #d0d7de; padding: 6px 13px; }}
-  th {{ background: #f6f8fa; font-weight: 600; }}
-  img {{ max-width: 100%; }}
+  blockquote {{ margin-left: 0; padding: 0.2em 1em; color: var(--muted); border-left: 3px solid var(--accent); }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 0.95em; }}
+  th, td {{ border: 1px solid var(--border); padding: 8px 13px; text-align: left; }}
+  th {{ background: var(--bg2); font-weight: 600; }}
+  tr:nth-child(even) td {{ background: rgba(255, 255, 255, 0.02); }}
+  hr {{ border: none; border-top: 1px solid var(--border); margin: 2em 0; }}
+  img {{ max-width: 100%; border-radius: 8px; }}
 </style>
 </head>
 <body>
+<main class="doc">
 {body}
+</main>
 </body>
 </html>
 """
