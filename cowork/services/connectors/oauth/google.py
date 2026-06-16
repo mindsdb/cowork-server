@@ -51,7 +51,13 @@ class GoogleOAuthService:
         return client_id, client_secret
 
     def get_outcome(self, state: str) -> dict | None:
-        return self._OUTCOMES.get(state)
+        entry = self._OUTCOMES.get(state)
+        if entry is None:
+            return None
+        if datetime.now(timezone.utc) - entry["_ts"] > timedelta(minutes=20):
+            self._OUTCOMES.pop(state, None)
+            return None
+        return entry
 
     def _store(self, settings: OAuthSettings) -> OAuthStateStore:
         return OAuthStateStore(settings.state_path)
@@ -80,7 +86,7 @@ class GoogleOAuthService:
             redirect_uri=redirect_uri,
             started_at=started_at,
         )
-        self._OUTCOMES[state] = {"status": "pending"}
+        self._OUTCOMES[state] = {"status": "pending", "_ts": datetime.now(timezone.utc)}
 
         auth_url = _GOOGLE_AUTH_ENDPOINT + "?" + urlencode({
             "client_id": client_id,
@@ -105,7 +111,7 @@ class GoogleOAuthService:
             err_msg = f"Google sign-in returned: {error}"
             store.clear_pending(service, error=err_msg)
             if state:
-                self._OUTCOMES[state] = {"status": "error", "error": err_msg}
+                self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection was cancelled",
                 "You can return to CoWork and try the connection again whenever you are ready.",
@@ -141,7 +147,7 @@ class GoogleOAuthService:
         except HTTPException:
             err_msg = f"OAuth credentials not configured for {service}."
             store.clear_pending(service, error=err_msg)
-            self._OUTCOMES[state] = {"status": "error", "error": err_msg}
+            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection is not configured",
                 "Google OAuth credentials are not configured on this server.",
@@ -202,7 +208,7 @@ class GoogleOAuthService:
         except HTTPException as exc:
             err_msg = str(exc.detail)
             store.clear_pending(service, error=err_msg)
-            self._OUTCOMES[state] = {"status": "error", "error": err_msg}
+            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection failed",
                 "An error occurred during the sign-in flow. Return to CoWork and try again.",
@@ -211,7 +217,7 @@ class GoogleOAuthService:
         except Exception as exc:
             err_msg = str(exc)
             store.clear_pending(service, error=err_msg)
-            self._OUTCOMES[state] = {"status": "error", "error": err_msg}
+            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection failed",
                 f"CoWork could not finish the Google sign-in flow: {err_msg}",
@@ -219,7 +225,7 @@ class GoogleOAuthService:
             )
 
         store.clear_pending(service)
-        self._OUTCOMES[state] = {"status": "success", "name": connection_name}
+        self._OUTCOMES[state] = {"status": "success", "name": connection_name, "_ts": datetime.now(timezone.utc)}
         return _callback_page(
             f"{service_label} connected",
             f"{account_name or account_email or 'Your Google account'} is now connected. You can close this tab and return to CoWork.",
