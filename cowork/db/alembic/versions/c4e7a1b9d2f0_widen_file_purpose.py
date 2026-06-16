@@ -1,9 +1,10 @@
-"""widen files.purpose to 255
+"""widen files.purpose to unbounded TEXT
 
 The attachment purpose tag is "attachment:{project}:{session}". The session
-UUID is 36 chars, so the old String(64) left only ~16 chars for the project
-name — a longer name (e.g. "Catana-Outbound-email") overflowed and crashed
-the attachment upload with a 500. Widen the column to 255.
+UUID is 36 chars and a project name can be up to 255 (Project.name), so this
+string can reach ~303 chars — the old String(64) crashed the upload with a
+500. Any fixed width just couples the column to Project.name's cap, so widen
+to unbounded TEXT instead.
 
 Revision ID: c4e7a1b9d2f0
 Revises: b7c1d2e3f4a5
@@ -30,7 +31,7 @@ def upgrade() -> None:
         batch_op.alter_column(
             "purpose",
             existing_type=sa.String(64),
-            type_=sa.String(255),
+            type_=sa.Text(),
             existing_nullable=False,
         )
 
@@ -40,7 +41,7 @@ def downgrade() -> None:
     with op.batch_alter_table("files") as batch_op:
         batch_op.alter_column(
             "purpose",
-            existing_type=sa.String(255),
+            existing_type=sa.Text(),
             type_=sa.String(64),
             existing_nullable=False,
         )

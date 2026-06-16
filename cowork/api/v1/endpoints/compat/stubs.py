@@ -100,7 +100,7 @@ async def upload_attachment(
         try:
             created = await svc.create_file(upload=f, purpose=purpose)
             results.append(_to_attachment(svc.get_file_row(UUID(created.id))))
-        except Exception:
+        except Exception as exc:
             # Previously any failure here surfaced as an opaque 500 with no
             # server log (e.g. an over-long `purpose` failing model
             # validation — see the files.purpose width fix). Log the real
@@ -112,7 +112,7 @@ async def upload_attachment(
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to store attachment '{getattr(f, 'filename', '')}'.",
-            )
+            ) from exc
     return results
 
 
