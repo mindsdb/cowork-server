@@ -55,15 +55,17 @@ def migrate_harness_memory_to_shared(session: Session) -> bool:
             logger.info("Migrated %s → %s", source, slot.value)
 
     # Hermes memory files block symlink creation while they exist as real files.
-    from cowork.harnesses.hermes_harness.memory_adapter import HermesMemoryAdapter
+    from cowork.harnesses.memory.adapter import get_memory_adapter
 
-    for link_path in HermesMemoryAdapter.RUNTIME_SYMLINKS:
-        if link_path.is_file() and not link_path.is_symlink():
-            link_path.unlink()
-            logger.info(
-                "Removed legacy Hermes memory file %s (content in canonical store)",
-                link_path,
-            )
+    adapter = get_memory_adapter("hermes")
+    if adapter is not None:
+        for link_path in adapter.RUNTIME_SYMLINKS:
+            if link_path.is_file() and not link_path.is_symlink():
+                link_path.unlink()
+                logger.info(
+                    "Removed legacy Hermes memory file %s (content in canonical store)",
+                    link_path,
+                )
 
     session.add(Setting(key=_MEMORY_MIGRATION_SENTINEL, value="1"))
     session.commit()
