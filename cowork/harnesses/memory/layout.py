@@ -1,4 +1,7 @@
-"""Ensure canonical memory files and harness runtime symlinks exist."""
+"""
+This module is responsible for ensuring that the canonical memory files and 
+harness runtime symlinks exist.
+"""
 
 from __future__ import annotations
 
