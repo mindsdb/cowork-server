@@ -14,6 +14,10 @@ Each harness adapter should define:
 slots. This is used to create the symlinks in the harness's memory directory.
 - PROMPT_INJECT_SLOTS: the slots that will be injected into the system prompt. This is used to
 inject the read-only canonical content into the system prompt.
+
+The Symlinks will be created automatically based on the given definitions.
+The prompt, however, will need to be injected within each harness by calling the 
+build_prompt_context method.
 """
 from pathlib import Path
 

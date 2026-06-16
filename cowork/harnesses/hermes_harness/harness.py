@@ -298,6 +298,7 @@ class HermesHarness:
             set_artifact_run_context,
         )
         from cowork.common.settings.user_settings import Provider
+        from cowork.harnesses.hermes_harness.memory_adapter import HermesMemoryAdapter
 
         register_connector_tools()
         register_artifact_tools()
@@ -344,7 +345,10 @@ class HermesHarness:
                 vault.inject_env(conn["engine"], conn["name"])
 
         datasource_context = _build_datasource_context(vault, disabled_keys)
-        system_context = f"{datasource_context}\n\n{artifact_context}"
+        memory_context = HermesMemoryAdapter().build_prompt_context()
+        system_context = "\n\n".join(
+            part for part in (memory_context, datasource_context, artifact_context) if part
+        )
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
             from cowork.services.providers import minds_chat_base_url
