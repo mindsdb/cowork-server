@@ -26,8 +26,3 @@ SLOT_REGISTRY: dict[MemorySlot, SlotMeta] = {
     MemorySlot.RULES: SlotMeta("rules.md", "Behavioral gates"),
     MemorySlot.LESSONS: SlotMeta("lessons.md", "Agent-learned knowledge"),
 }
-
-
-def get_filename(slot: MemorySlot | str) -> str:
-    slot = MemorySlot(slot) if isinstance(slot, str) else slot
-    return SLOT_REGISTRY[slot].filename
