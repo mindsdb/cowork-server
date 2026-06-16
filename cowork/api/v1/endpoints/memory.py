@@ -5,8 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlmodel import Session
 
 from cowork.db.session import get_session
-from cowork.harnesses.memory.registry import MemorySlot
-from cowork.schemas.memory import MemoryResponse, MemoryScope, MemoryUpdateRequest
+from cowork.schemas.memory import (
+    MemoryDeleteRequest,
+    MemoryResponse,
+    MemoryUpdateRequest,
+)
 from cowork.services.memory import MemoryService
 
 router = APIRouter()
@@ -189,17 +192,12 @@ async def update_memory(body: MemoryUpdateRequest, session: SessionDep):
 
 
 @router.delete("/")
-async def delete_memory(
-    session: SessionDep,
-    scope: MemoryScope,
-    category: MemorySlot,
-    project_id: UUID | None = Query(default=None),
-):
+async def delete_memory(body: MemoryDeleteRequest, session: SessionDep):
     try:
         await MemoryService(session).delete_memory(
-            scope=scope,
-            category=category,
-            project_id=project_id,
+            scope=body.scope,
+            category=body.category,
+            project_id=body.project_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
