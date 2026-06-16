@@ -30,6 +30,16 @@ _MIGRATION_SOURCES: list[tuple[Path, MemorySlot]] = [
 ]
 
 
+def _combine_slot_memory(chunks: list[str]) -> str:
+    """Merge legacy sources for the same slot, preserving source order."""
+    parts: list[str] = []
+    for chunk in chunks:
+        text = chunk.strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
 def migrate_harness_memory_to_shared(session: Session) -> bool:
     """Copy legacy harness memory into the canonical store if not already migrated.
 
@@ -43,15 +53,25 @@ def migrate_harness_memory_to_shared(session: Session) -> bool:
     store = SharedMemoryStore()
     store._root.mkdir(parents=True, exist_ok=True)
 
+    pre_existing = {slot: store.read(slot).strip() for slot in MemorySlot}
+    incoming_by_slot: dict[MemorySlot, list[tuple[Path, str]]] = {}
+
     for source, slot in _MIGRATION_SOURCES:
         if not source.is_file():
             continue
         incoming = source.read_text(encoding="utf-8")
         if not incoming.strip():
             continue
-        existing = store.read(slot)
-        if not existing.strip():
-            store.write(slot, incoming)
+        incoming_by_slot.setdefault(slot, []).append((source, incoming))
+
+    for slot, entries in incoming_by_slot.items():
+        if pre_existing.get(slot):
+            continue
+        combined = _combine_slot_memory([text for _, text in entries])
+        if not combined:
+            continue
+        store.write(slot, combined)
+        for source, _ in entries:
             logger.info("Migrated %s → %s", source, slot.value)
 
     # Hermes memory files block symlink creation while they exist as real files.
