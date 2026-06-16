@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
-from cowork.harnesses.memory.adapter import BaseMemoryAdapter
+from cowork.harnesses.memory.adapter import BaseMemoryAdapter, register
 from cowork.harnesses.memory.registry import MemorySlot
 
 
@@ -10,6 +10,7 @@ settings = HermesHarnessSettings()
 memory_dir = Path(settings.root_dir) / "memories"
 
 
+@register
 class HermesMemoryAdapter(BaseMemoryAdapter):
     harness_id = "hermes"
     RUNTIME_SYMLINKS = {

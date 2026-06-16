@@ -43,3 +43,20 @@ class BaseMemoryAdapter:
             MemorySlot.PROFILE: "## User Profile",
         }
         return f"{headings.get(slot, f'## {slot.value}')}\n{content}"
+
+
+_registry: dict[str, type[BaseMemoryAdapter]] = {}
+
+
+def register(cls: type[BaseMemoryAdapter]) -> type[BaseMemoryAdapter]:
+    _registry[cls.harness_id] = cls
+    return cls
+
+
+def get_memory_adapter(harness_id: str) -> BaseMemoryAdapter | None:
+    cls = _registry.get(harness_id)
+    return cls() if cls else None
+
+
+def all_memory_adapters() -> list[BaseMemoryAdapter]:
+    return [cls() for cls in _registry.values()]
