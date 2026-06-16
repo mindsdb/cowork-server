@@ -56,7 +56,13 @@ def _conversation_attachment_context(conversation) -> str:
         rows = FileService(db_session).list_file_rows(
             purpose=attachment_purpose(conversation.project.name, str(conversation.id))
         )
-        attached = [f"  - {r.path}  ({r.filename})" for r in rows if getattr(r, "path", "")]
+        # Only list files that still exist on disk — a row whose file was
+        # deleted would otherwise hand the agent a dead path to chase.
+        attached = [
+            f"  - {r.path}  ({r.filename})"
+            for r in rows
+            if getattr(r, "path", "") and Path(r.path).exists()
+        ]
         if not attached:
             return ""
         return (

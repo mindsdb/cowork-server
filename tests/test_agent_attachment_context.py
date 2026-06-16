@@ -34,16 +34,17 @@ def _make_conversation(session: Session, project_name: str) -> Conversation:
     return conv
 
 
-def test_context_lists_attached_file_paths():
+def test_context_lists_attached_file_paths(tmp_path):
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-1")
         purpose = attachment_purpose("Cyberdeck-ctx-1", str(conv.id))
-        files = {
-            "README.md": "/home/anton/.cowork/files/51d15fc7/README.md",
-            "Kyle_Logo.png": "/home/anton/.cowork/files/28a83013/Kyle_Logo.png",
-        }
-        for name, path in files.items():
-            session.add(File(filename=name, content_type="text/plain", size=1, purpose=purpose, path=path))
+        # Real files on disk — the helper only lists paths that exist.
+        files = {}
+        for name in ("README.md", "Kyle_Logo.png"):
+            p = tmp_path / name
+            p.write_text("x")
+            files[name] = str(p)
+            session.add(File(filename=name, content_type="text/plain", size=1, purpose=purpose, path=str(p)))
         session.commit()
         session.refresh(conv)
 
@@ -55,6 +56,23 @@ def test_context_lists_attached_file_paths():
             assert name in ctx
         # And it must tell the agent these live outside the project dir.
         assert "OUTSIDE the project" in ctx
+
+
+def test_context_skips_files_missing_from_disk(tmp_path):
+    with _session() as session:
+        conv = _make_conversation(session, "ctx-miss")
+        purpose = attachment_purpose("ctx-miss", str(conv.id))
+        present = tmp_path / "here.md"
+        present.write_text("x")
+        session.add(File(filename="here.md", content_type="text/plain", size=1, purpose=purpose, path=str(present)))
+        # Row whose file was deleted from disk — must not be listed.
+        session.add(File(filename="gone.md", content_type="text/plain", size=1, purpose=purpose, path=str(tmp_path / "gone.md")))
+        session.commit()
+        session.refresh(conv)
+
+        ctx = _conversation_attachment_context(conv)
+        assert "here.md" in ctx
+        assert "gone.md" not in ctx
 
 
 def test_context_empty_when_no_attachments():
