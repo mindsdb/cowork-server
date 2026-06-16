@@ -3,12 +3,14 @@ from __future__ import annotations
 import html as html_lib
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from textwrap import dedent
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -183,9 +185,7 @@ class GoogleOAuthService:
                 if expires_in else ""
             )
 
-            from pathlib import Path as _Path
-            from anton.core.datasources.data_vault import LocalDataVault
-            LocalDataVault(_Path(ConnectorSettings().vault_dir)).save(
+            LocalDataVault(Path(ConnectorSettings().vault_dir)).save(
                 cfg.engine,
                 connection_name,
                 {
@@ -231,9 +231,7 @@ class GoogleOAuthService:
             return
         _log.info("Revoking Google token for %s/%s", engine, name)
         try:
-            from pathlib import Path as _P
-            from anton.core.datasources.data_vault import LocalDataVault
-            fields = LocalDataVault(_P(connector_settings.vault_dir)).load(engine, name) or {}
+            fields = LocalDataVault(Path(connector_settings.vault_dir)).load(engine, name) or {}
         except Exception:
             return
         if fields.get("auth_type") != "oauth":
@@ -255,9 +253,7 @@ class GoogleOAuthService:
 
     def refresh_all_tokens(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> None:
         try:
-            from pathlib import Path as _P
-            from anton.core.datasources.data_vault import LocalDataVault
-            vault = LocalDataVault(_P(connector_settings.vault_dir))
+            vault = LocalDataVault(Path(connector_settings.vault_dir))
             all_connections = vault.list_connections() or []
         except Exception:
             return
@@ -327,9 +323,7 @@ class GoogleOAuthService:
 
     def get_catalogue(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> list[dict]:
         try:
-            from pathlib import Path as _P
-            from anton.core.datasources.data_vault import LocalDataVault
-            vault = LocalDataVault(_P(connector_settings.vault_dir))
+            vault = LocalDataVault(Path(connector_settings.vault_dir))
             all_connections = vault.list_connections() or []
         except Exception:
             all_connections = []
