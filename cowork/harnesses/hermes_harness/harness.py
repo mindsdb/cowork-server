@@ -297,7 +297,8 @@ class HermesHarness:
                 vault.inject_env(conn["engine"], conn["name"])
 
         datasource_context = _build_datasource_context(vault, disabled_keys)
-        memory_context = HermesMemoryAdapter().build_prompt_context()
+        memory_context = HermesMemoryAdapter().build_prompt_context(Path(project_path))
+        print(f"Memory context: {memory_context}")
         system_context = "\n\n".join(
             part for part in (memory_context, datasource_context, artifact_context) if part
         )
