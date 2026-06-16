@@ -103,18 +103,23 @@ class ConnectorSettings(Settings):
 
 
 class OAuthSettings(Settings):
-    google_client_id: str = Field(
-        default="",
-        validation_alias=AliasChoices("GOOGLE_CLIENT_ID"),
-        description="Google OAuth client ID",
-    )
-    google_client_secret: str = Field(
-        default="",
-        validation_alias=AliasChoices("GOOGLE_CLIENT_SECRET"),
-        description="Google OAuth client secret",
-    )
+    google_drive_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_DRIVE_CLIENT_ID"))
+    google_drive_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_DRIVE_CLIENT_SECRET"))
+
+    google_calendar_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_CALENDAR_CLIENT_ID"))
+    google_calendar_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_CALENDAR_CLIENT_SECRET"))
+
+    gmail_client_id: str = Field(default="", validation_alias=AliasChoices("GMAIL_CLIENT_ID"))
+    gmail_client_secret: str = Field(default="", validation_alias=AliasChoices("GMAIL_CLIENT_SECRET"))
+
+    google_ads_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ADS_CLIENT_ID"))
+    google_ads_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ADS_CLIENT_SECRET"))
+
+    google_analytics_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_ID"))
+    google_analytics_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_SECRET"))
+
     server_origin: str = Field(
-        default="http://127.0.0.1:8000",
+        default="http://127.0.0.1:26866",
         validation_alias=AliasChoices("COWORK_SERVER_ORIGIN"),
         description="Public base URL of this server, used to build OAuth redirect URIs",
     )

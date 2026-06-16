@@ -21,8 +21,23 @@ from cowork.scheduler import start_scheduler
 logger = setup_logging()
 
 
+async def _token_refresh_loop() -> None:
+    import asyncio
+    from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
+    from cowork.services.connectors.oauth.google import google_service
+    while True:
+        await asyncio.sleep(30 * 60)
+        logger.info("Running Google token refresh check")
+        try:
+            google_service.refresh_all_tokens(ConnectorSettings(), OAuthSettings())
+        except Exception:
+            logger.exception("Token refresh loop error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+    asyncio.create_task(_token_refresh_loop())
     run_dev_setup()
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
