@@ -50,7 +50,7 @@ CODING_MODEL_DEFAULTS: dict[str, str] = {
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=[str(Path.home() / ".anton" / ".env"), ".env"],
         env_file_encoding="utf-8",
         env_nested_delimiter="_",
         extra="ignore",
