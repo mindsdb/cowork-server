@@ -7,21 +7,25 @@ If a particular aspect of a new harness's memory does not adhere to these slots,
 from enum import StrEnum
 from dataclasses import dataclass
 
+
 class MemorySlot(StrEnum):
     PROFILE = "profile"
     RULES = "rules"
     LESSONS = "lessons"
+
 
 @dataclass(frozen=True)
 class SlotMeta:
     filename: str
     description: str
 
+
 SLOT_REGISTRY: dict[MemorySlot, SlotMeta] = {
     MemorySlot.PROFILE: SlotMeta("profile.md", "User identity, preferences"),
     MemorySlot.RULES: SlotMeta("rules.md", "Behavioral gates"),
     MemorySlot.LESSONS: SlotMeta("lessons.md", "Agent-learned knowledge"),
 }
+
 
 def get_filename(slot: MemorySlot | str) -> str:
     slot = MemorySlot(slot) if isinstance(slot, str) else slot
