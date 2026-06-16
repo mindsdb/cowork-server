@@ -35,8 +35,11 @@ def test_file_model_accepts_long_purpose():
     assert f.purpose == purpose
 
 
-def test_file_model_accepts_a_very_long_project_name():
-    # Even a much longer project name should fit comfortably under 255.
-    purpose = attachment_purpose("A" * 120, "d6ad2000-915b-4915-baf4-369e2db05f17")
+def test_file_model_accepts_max_length_project_name():
+    # Worst case: a project name at Project.name's own cap (255). The tag is
+    # then ~303 chars — this would still have overflowed a 255-wide column,
+    # which is why purpose is now unbounded TEXT.
+    purpose = attachment_purpose("A" * 255, "d6ad2000-915b-4915-baf4-369e2db05f17")
+    assert len(purpose) > 255
     f = File(filename="x", content_type="text/plain", size=1, purpose=purpose, path="/tmp/x")
     assert f.purpose == purpose
