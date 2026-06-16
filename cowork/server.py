@@ -5,6 +5,7 @@ This module sets up the FastAPI application with middleware, routing,
 and all necessary configurations for the Cowork service.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,9 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cowork.api.v1.router import api_router as v1_router
 from cowork.common.logger import setup_logging
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
+from cowork.services.connectors.oauth.google import google_service
 
 
 # Set up logging
@@ -22,9 +24,6 @@ logger = setup_logging()
 
 
 async def _token_refresh_loop() -> None:
-    import asyncio
-    from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
-    from cowork.services.connectors.oauth.google import google_service
     while True:
         await asyncio.sleep(30 * 60)
         logger.info("Running Google token refresh check")
@@ -36,7 +35,6 @@ async def _token_refresh_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import asyncio
     asyncio.create_task(_token_refresh_loop())
     run_dev_setup()
     start_scheduler()
