@@ -5,6 +5,7 @@ startup for the local SQLite deployment and remains exposed as a CLI helper
 for development/test environments.
 """
 
+import shutil
 from pathlib import Path
 
 from sqlalchemy.engine import make_url
@@ -59,3 +60,25 @@ def run_dev_setup() -> None:
 
     with SQLSession(engine) as session:
         migrate_skills_to_files(session)
+
+    _link_anton_skills_dir()
+
+
+def _link_anton_skills_dir() -> None:
+    """Symlink Anton's skills dir to cowork's canonical skills folder"""
+    from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+
+    target = Path(get_app_settings().skill.root_dir)
+    target.mkdir(parents=True, exist_ok=True)
+
+    link = Path(AntonHarnessSettings().skills_root_dir)
+    link.parent.mkdir(parents=True, exist_ok=True)
+
+    if link.is_symlink():
+        if link.resolve() == target.resolve():
+            return
+        link.unlink()
+    elif link.exists():
+        shutil.rmtree(link) if link.is_dir() else link.unlink()
+
+    link.symlink_to(target, target_is_directory=True)
