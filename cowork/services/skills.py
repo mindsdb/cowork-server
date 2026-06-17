@@ -4,7 +4,6 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from anton.core.tools.skill_format import (
     SKILL_FILE,
@@ -38,8 +37,7 @@ class SkillService:
 
 
 
-    def __init__(self, session: Any = None) -> None:
-        self.session = session
+    def __init__(self) -> None:
         self.root = Path(get_app_settings().skill.root_dir)
 
     # ── helpers ──────────────────────────────────────────────────────────────
