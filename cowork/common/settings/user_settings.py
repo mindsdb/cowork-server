@@ -125,6 +125,23 @@ class UserSettings(Settings):
         title="Coding Model",
         description="The coding model. Defaults to the recommended model for the selected provider.",
     )
+    planning_reasoning_effort: str | None = Field(
+        default=None,
+        title="Planning Reasoning Effort",
+        description=(
+            "Opaque reasoning-effort level for the planning model (e.g. 'low' | "
+            "'medium' | 'high'). None uses the model's default. Only meaningful for "
+            "models that advertise effort levels."
+        ),
+    )
+    coding_reasoning_effort: str | None = Field(
+        default=None,
+        title="Coding Reasoning Effort",
+        description=(
+            "Opaque reasoning-effort level for the coding model. None uses the "
+            "model's default. Only meaningful for models that advertise effort levels."
+        ),
+    )
     harness: Annotated[str, _DynamicOptions(_harness_options)] = Field(
         default="anton",
         title="Harness",
