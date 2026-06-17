@@ -112,3 +112,35 @@ def test_context_logs_and_returns_empty_on_error(monkeypatch):
 
     assert ctx == ""  # degrades gracefully
     assert spy_logger.warning.called, "a failure must be logged, not swallowed silently"
+
+
+def test_context_skips_one_corrupt_row_keeps_others(tmp_path, monkeypatch):
+    # A single unresolvable row (here, a path the OS rejects on stat) must not
+    # abort the whole list — every other attachment must still be surfaced.
+    import cowork.harnesses.anton_harness.harness as harness_mod
+
+    good = tmp_path / "good.md"
+    good.write_text("x")
+    bad_path = str(tmp_path / "bad.md")
+
+    real_exists = harness_mod.Path.exists
+
+    def flaky_exists(self):
+        if str(self) == bad_path:
+            raise OSError("simulated unreadable path")
+        return real_exists(self)
+
+    monkeypatch.setattr(harness_mod.Path, "exists", flaky_exists)
+
+    with _session() as session:
+        conv = _make_conversation(session, "ctx-corrupt")
+        purpose = attachment_purpose("ctx-corrupt", str(conv.id))
+        session.add(File(filename="good.md", content_type="text/plain", size=1, purpose=purpose, path=str(good)))
+        session.add(File(filename="bad.md", content_type="text/plain", size=1, purpose=purpose, path=bad_path))
+        session.commit()
+        session.refresh(conv)
+
+        ctx = _conversation_attachment_context(conv)
+
+    assert "good.md" in ctx   # surviving file still listed
+    assert "bad.md" not in ctx  # corrupt row skipped, not fatal

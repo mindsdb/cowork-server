@@ -58,11 +58,23 @@ def _conversation_attachment_context(conversation) -> str:
         )
         # Only list files that still exist on disk — a row whose file was
         # deleted would otherwise hand the agent a dead path to chase.
-        attached = [
-            f"  - {r.path}  ({r.filename})"
-            for r in rows
-            if getattr(r, "path", "") and Path(r.path).exists()
-        ]
+        # Resolve one row at a time: a single bad row (e.g. a path the OS
+        # rejects) must not abort the whole list and hide every OTHER
+        # attachment — skip the bad one and keep going.
+        attached: list[str] = []
+        for r in rows:
+            try:
+                path = getattr(r, "path", "")
+                if path and Path(path).exists():
+                    attached.append(f"  - {r.path}  ({r.filename})")
+            except Exception:
+                logger.warning(
+                    "Skipping unresolvable attachment row (file id=%s) while "
+                    "building context for conversation %s",
+                    getattr(r, "id", "<unknown>"),
+                    getattr(conversation, "id", "<unknown>"),
+                    exc_info=True,
+                )
         if not attached:
             return ""
         return (
