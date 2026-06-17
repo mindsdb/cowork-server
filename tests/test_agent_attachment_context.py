@@ -87,3 +87,28 @@ def test_context_safe_when_conversation_detached():
         conv = _make_conversation(session, "Cyberdeck-ctx-3")
     session.close()  # detaches conv from its session
     assert _conversation_attachment_context(conv) == ""
+
+
+def test_context_logs_and_returns_empty_on_error(monkeypatch):
+    # An unexpected failure (e.g. the DB query blows up) must NOT crash the
+    # turn — but it must also not fail silently, because a swallowed error
+    # looks identical to "no attachments" and reintroduces the Cyberdeck bug.
+    # The helper must return "" AND log a warning so the failure is visible.
+    from unittest.mock import MagicMock
+
+    import cowork.harnesses.anton_harness.harness as harness_mod
+    from cowork.services import files as files_module
+
+    def _boom(self, *args, **kwargs):
+        raise RuntimeError("simulated DB failure")
+
+    monkeypatch.setattr(files_module.FileService, "list_file_rows", _boom)
+    spy_logger = MagicMock()
+    monkeypatch.setattr(harness_mod, "logger", spy_logger)
+
+    with _session() as session:
+        conv = _make_conversation(session, "Cyberdeck-ctx-err")
+        ctx = _conversation_attachment_context(conv)
+
+    assert ctx == ""  # degrades gracefully
+    assert spy_logger.warning.called, "a failure must be logged, not swallowed silently"

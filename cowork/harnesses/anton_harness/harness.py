@@ -74,6 +74,19 @@ def _conversation_attachment_context(conversation) -> str:
             + "\n".join(attached)
         )
     except Exception:
+        # Never crash a turn over attachment context — but don't fail
+        # silently either. A swallowed error here is indistinguishable from
+        # "no attachments", which is exactly how the agent ends up telling
+        # the user no files were uploaded (the Cyberdeck bug this helper
+        # exists to fix). Log it so the failure is diagnosable; the agent
+        # still degrades gracefully to "".
+        conv_id = getattr(conversation, "id", "<unknown>")
+        logger.warning(
+            "Failed to build conversation attachment context for conversation %s; "
+            "the agent will not see attached files this turn",
+            conv_id,
+            exc_info=True,
+        )
         return ""
 
 
