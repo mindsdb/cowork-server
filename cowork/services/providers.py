@@ -153,15 +153,19 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
             return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
 
     async def _chat_probe(url: str, headers: dict[str, str], model: str) -> tuple[str, str]:
-        """Exercise the actual inference path with a 1-token completion.
+        """Exercise the actual inference path with a tiny completion.
 
         This is the only route guaranteed to behave the same as a real
         task: `/models` and other listing endpoints are not deployed on
         every MindsHub host (they 404/401 even for valid keys), which
         produced false negatives even though chat completions worked.
         A 401/403 still means a rejected key; any other non-2xx is a
-        genuine failure surfaced with its HTTP code."""
-        payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
+        genuine failure surfaced with its HTTP code.
+
+        `max_tokens` is kept at a small-but-safe 20 rather than 1 — some
+        models reject a 1-token budget (or can't emit even a stop token),
+        which would fail the probe for a perfectly valid key."""
+        payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
         return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
@@ -231,7 +235,7 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
             r = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]},
+                json={"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]},
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
