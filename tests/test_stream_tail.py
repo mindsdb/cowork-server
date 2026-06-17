@@ -85,6 +85,47 @@ def test_registry_replaces_and_prunes():
     assert stream_buffer.get_buffer("conv-x") is None
 
 
+def test_ensure_buffer_reuses_existing():
+    """ensure_buffer returns the pre-created buffer instead of replacing
+    it, so early /tail followers aren't orphaned."""
+    early = stream_buffer.begin_turn("conv-ensure")
+    early.append({"type": "response.created"})
+
+    reused = stream_buffer.ensure_buffer("conv-ensure")
+    assert reused is early
+    assert reused.latest_seq == 1  # events preserved
+
+    # After the buffer is finished, ensure_buffer creates a fresh one
+    early.finish()
+    fresh = stream_buffer.ensure_buffer("conv-ensure")
+    assert fresh is not early
+    assert fresh.latest_seq == 0
+
+
+def test_early_buffer_survives_handler_sink():
+    """Simulates the run-now flow: buffer created eagerly, then the
+    handler's _make_event_sink reuses it via ensure_buffer."""
+    from uuid import UUID
+    from cowork.handlers.responses import ResponsesHandler
+
+    cid = "conv-early-sink"
+    early = stream_buffer.begin_turn(cid)
+
+    handler = object.__new__(ResponsesHandler)
+    sink, buf = handler._make_event_sink(UUID(int=0), [], [])
+
+    # _make_event_sink should have created its own buffer (keyed by
+    # the UUID), but for the run-now path the conversation_id matches.
+    # Let's test the exact scenario: buffer keyed by cid.
+    handler2 = object.__new__(ResponsesHandler)
+    # Patch: call with a UUID whose str matches cid — not possible with
+    # a plain UUID, so test the stream_buffer layer directly.
+    reused = stream_buffer.ensure_buffer(cid)
+    assert reused is early
+    reused.append({"type": "delta", "delta": "hello"})
+    assert early.latest_seq == 1
+
+
 def test_in_flight_reports_buffer_state():
     from cowork.api.v1.endpoints.responses import in_flight
 

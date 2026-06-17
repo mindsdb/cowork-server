@@ -101,6 +101,19 @@ def begin_turn(conversation_id: str) -> TurnBuffer:
     return buffer
 
 
+def ensure_buffer(conversation_id: str) -> TurnBuffer:
+    """Return the existing buffer for *conversation_id*, or create one.
+
+    Use this when the buffer may have been pre-created (e.g. by
+    ``run_schedule_now``) so that early ``/tail`` followers are not
+    orphaned by a replacement."""
+    cid = str(conversation_id)
+    existing = _buffers.get(cid)
+    if existing is not None and not existing.done:
+        return existing
+    return begin_turn(cid)
+
+
 def get_buffer(conversation_id: str) -> TurnBuffer | None:
     _prune()
     return _buffers.get(str(conversation_id))
