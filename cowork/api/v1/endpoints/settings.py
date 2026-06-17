@@ -30,7 +30,11 @@ from cowork.services.providers import (
     validate_provider as validate_provider_svc,
 )
 from cowork.services.settings import SettingService
-from cowork.common.settings.app_settings import RECOMMENDED_MODELS, RECOMMENDED_PAIR
+from cowork.common.settings.app_settings import (
+    DIRECT_EFFORT_CATALOG,
+    RECOMMENDED_MODELS,
+    RECOMMENDED_PAIR,
+)
 
 router = APIRouter()
 
@@ -171,15 +175,27 @@ async def recommended_models(session: SessionDep):
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
 
+    # `modelEfforts` maps a model id → {"efforts": [...], "default": "..."} and is
+    # the single capability surface for the UI: a model accepts an effort level
+    # iff it has an entry here. Direct (BYOK) provider levels are hand-maintained
+    # in DIRECT_EFFORT_CATALOG; minds-cloud levels come live from /v1/models and
+    # win on any key collision.
+    model_efforts: dict[str, dict] = {k: dict(v) for k, v in DIRECT_EFFORT_CATALOG.items()}
+
     s = SettingService(session).load()
     if s.minds_api_key is not None and s.minds_url:
-        live = await fetch_minds_models(
+        live, live_efforts = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value()
         )
         if live:
             recommended["minds-cloud"] = live
+        model_efforts.update(live_efforts)
 
-    return {"recommendedModels": recommended, "recommendedPair": pair}
+    return {
+        "recommendedModels": recommended,
+        "recommendedPair": pair,
+        "modelEfforts": model_efforts,
+    }
 
 
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
