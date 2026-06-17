@@ -81,8 +81,14 @@ async def fetch_minds_models(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(6.0), follow_redirects=True
         ) as client:
+            # Trailing slash is required: the MindsHub router serves the
+            # listing at `/models/` and a recent minds-inference release
+            # stopped cleanly redirecting the slashless `/models`, which
+            # left this fetch empty and emptied the model picker. Hitting
+            # `/models/` directly is what the other frameworks' shared
+            # model-catalog helper already does.
             r = await client.get(
-                f"{base}/models",
+                f"{base}/models/",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
         if r.status_code >= 400:
