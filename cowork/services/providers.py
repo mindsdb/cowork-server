@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 from pydantic import SecretStr
 
+from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
+
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
 
@@ -42,26 +44,36 @@ def minds_chat_base_url(minds_url: str) -> str:
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-_minds_models_cache: dict[str, tuple[float, Optional[list[str]]]] = {}
+# Cache value: (timestamp, (ids, efforts_map)). ids is None on failure.
+_minds_models_cache: dict[str, tuple[float, tuple[Optional[list[str]], dict[str, dict]]]] = {}
 
 
-async def fetch_minds_models(minds_url: str, api_key: str) -> Optional[list[str]]:
-    """Fetch supported model ids from MindsHub's OpenAI-compatible
-    `/v1/models` endpoint. Returns the model-id list, or None on any
-    failure so the caller falls back to the static list."""
+async def fetch_minds_models(
+    minds_url: str, api_key: str
+) -> tuple[Optional[list[str]], dict[str, dict]]:
+    """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
+
+    Returns ``(ids, efforts)`` where ``ids`` is the model-id list (or None on
+    any failure so the caller falls back to the static list) and ``efforts``
+    maps a model id to ``{"efforts": [...], "default": "..."}`` for every model
+    that advertises ``reasoning_efforts`` — the source of truth for which models
+    accept an effort level and at which levels.
+    """
     if not minds_url or not api_key:
-        return None
+        return None, {}
     base = minds_chat_base_url(minds_url)
 
     now = time.monotonic()
     cached = _minds_models_cache.get(base)
     if cached:
         ts, val = cached
-        ttl = _MINDS_MODELS_TTL if val else _MINDS_MODELS_FAIL_TTL
+        ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
         if (now - ts) < ttl:
             return val
 
-    def _remember(val: Optional[list[str]]) -> Optional[list[str]]:
+    def _remember(
+        val: tuple[Optional[list[str]], dict[str, dict]],
+    ) -> tuple[Optional[list[str]], dict[str, dict]]:
         _minds_models_cache[base] = (time.monotonic(), val)
         return val
 
@@ -69,30 +81,48 @@ async def fetch_minds_models(minds_url: str, api_key: str) -> Optional[list[str]
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(6.0), follow_redirects=True
         ) as client:
+            # Trailing slash is required: the MindsHub router serves the
+            # listing at `/models/` and a recent minds-inference release
+            # stopped cleanly redirecting the slashless `/models`, which
+            # left this fetch empty and emptied the model picker. Hitting
+            # `/models/` directly is what the other frameworks' shared
+            # model-catalog helper already does.
             r = await client.get(
-                f"{base}/models",
+                f"{base}/models/",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember(None)
+            return _remember((None, {}))
         data = r.json()
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
-        return _remember(None)
+        return _remember((None, {}))
 
     # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
-    # Accept a bare list too, defensively.
+    # Accept a bare list too, defensively. Each row may carry the non-standard
+    # extension fields `reasoning_efforts` (list) and `default_reasoning_effort`
+    # (str) — OpenAI clients ignore unknown keys; we surface them for the picker.
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return _remember(None)
-    ids = [
-        str(row.get("id")).strip()
-        for row in rows
-        if isinstance(row, dict) and row.get("id")
-    ]
-    ids = [i for i in ids if i]
-    return _remember(ids or None)
+        return _remember((None, {}))
+    ids: list[str] = []
+    efforts: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        model_id = str(row.get("id")).strip()
+        if not model_id:
+            continue
+        ids.append(model_id)
+        levels = row.get("reasoning_efforts")
+        if isinstance(levels, list) and levels:
+            entry: dict = {"efforts": [str(x) for x in levels]}
+            default = row.get("default_reasoning_effort")
+            if default:
+                entry["default"] = str(default)
+            efforts[model_id] = entry
+    return _remember(((ids or None), efforts))
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -122,6 +152,24 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
             r = await client.get(url, headers=headers)
             return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
 
+    async def _chat_probe(url: str, headers: dict[str, str], model: str) -> tuple[str, str]:
+        """Exercise the actual inference path with a tiny completion.
+
+        This is the only route guaranteed to behave the same as a real
+        task: `/models` and other listing endpoints are not deployed on
+        every MindsHub host (they 404/401 even for valid keys), which
+        produced false negatives even though chat completions worked.
+        A 401/403 still means a rejected key; any other non-2xx is a
+        genuine failure surfaced with its HTTP code.
+
+        `max_tokens` is kept at a small-but-safe 20 rather than 1 — some
+        models reject a 1-token budget (or can't emit even a stop token),
+        which would fail the probe for a perfectly valid key."""
+        payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            r = await client.post(url, headers=headers, json=payload)
+        return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
+
     try:
         if ptype == "anthropic":
             if not key:
@@ -149,7 +197,12 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 return "fail", "missing API key"
             base = (p.get("mindsUrl") or "https://api.mindshub.ai").rstrip("/")
             chat_url = minds_chat_base_url(base)
-            return await _check(f"{chat_url}/models", {"Authorization": f"Bearer {key}"})
+            model = (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
+            return await _chat_probe(
+                f"{chat_url}/chat/completions",
+                {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                model,
+            )
     except httpx.HTTPError as e:
         return "fail", f"{type(e).__name__}: {e}"
     except Exception as e:
@@ -182,7 +235,7 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
             r = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]},
+                json={"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]},
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
@@ -193,16 +246,26 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
 
 
 async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict[str, Any]:
+    # Probe the real inference path rather than `/models`: listing routes
+    # are not deployed on every MindsHub host and 404/401 even for valid
+    # keys, which blocked onboarding with a working key. A 1-token chat
+    # completion is the same surface a real task exercises.
     try:
         chat_base = minds_chat_base_url(base_url.rstrip("/"))
         timeout = httpx.Timeout(15.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.get(f"{chat_base}/models", headers={"Authorization": f"Bearer {api_key}"})
+            r = await client.post(
+                f"{chat_base}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": CODING_MODEL_DEFAULTS["minds_cloud"], "max_tokens": 20,
+                      "messages": [{"role": "user", "content": "ping"}]},
+            )
         if r.status_code in (401, 403):
             return {"ok": False, "error": "Invalid API key"}
         if 200 <= r.status_code < 300:
             return {"ok": True}
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
+        msg = r.json().get("error", {}).get("message", f"HTTP {r.status_code}") if r.content else f"HTTP {r.status_code}"
+        return {"ok": False, "error": msg}
     except Exception:
         return {"ok": False, "error": "Cannot connect"}
 
@@ -247,6 +310,13 @@ def build_llm_client():
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
+
+    Reasoning effort is a persisted per-role setting
+    (``planning_reasoning_effort`` / ``coding_reasoning_effort``) — chosen in the
+    Settings UI beside each model dropdown, just like the model itself. Each
+    level is forwarded in the provider's native shape (Anthropic
+    ``output_config``, OpenAI ``reasoning`` / ``reasoning_effort``); None leaves
+    the model's own default.
     """
     from anton.core.llm.client import LLMClient
     from anton.core.llm.anthropic import AnthropicProvider
@@ -256,7 +326,13 @@ def build_llm_client():
 
     settings = get_user_settings()
 
-    def _make_provider(role: Provider):
+    def _make_provider(role: Provider, effort: str | None = None):
+        # Only pass reasoning_effort when it's actually set. This keeps
+        # build_llm_client compatible with anton builds whose provider __init__
+        # predates the kwarg (passing reasoning_effort=None unconditionally would
+        # TypeError on every call, taking the whole agent down — not just effort
+        # users) and avoids handing an unset effort to a provider that can't take it.
+        effort_kw = {"reasoning_effort": effort} if effort else {}
         if role == Provider.MINDS_CLOUD:
             key = settings.minds_api_key
             if key is None:
@@ -264,6 +340,7 @@ def build_llm_client():
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=minds_chat_base_url(settings.minds_url),
+                **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             key = settings.openai_api_key
@@ -272,6 +349,7 @@ def build_llm_client():
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=settings.openai_base_url or "https://api.openai.com/v1",
+                **effort_kw,
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -280,12 +358,16 @@ def build_llm_client():
         key = getattr(settings, f"{role.value}_api_key")
         if key is None:
             raise ValueError(f"{role.value} API key is not configured")
-        return cls(api_key=key.get_secret_value())
+        return cls(api_key=key.get_secret_value(), **effort_kw)
 
     return LLMClient(
-        planning_provider=_make_provider(settings.planning_provider),
+        planning_provider=_make_provider(
+            settings.planning_provider, settings.planning_reasoning_effort
+        ),
         planning_model=settings.planning_model,
-        coding_provider=_make_provider(settings.coding_provider),
+        coding_provider=_make_provider(
+            settings.coding_provider, settings.coding_reasoning_effort
+        ),
         coding_model=settings.coding_model,
     )
 
