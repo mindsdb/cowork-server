@@ -24,6 +24,16 @@ logger = setup_logging()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # Seal any turn buffers left open by a previous process (crash/restart)
+    # so reconnecting clients get a clean Interrupted end-of-stream rather
+    # than hanging. GC of old buffers happens lazily; cheap no-op when none.
+    try:
+        from cowork.streaming import get_streams_dir
+        from cowork.streaming.recovery import gc_old_buffers, seal_orphan_buffers
+        seal_orphan_buffers(get_streams_dir())
+        gc_old_buffers(get_streams_dir(), max_age_days=7)
+    except Exception:
+        logger.exception("turn-buffer boot recovery failed (non-fatal)")
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.ingress import sync_channel_ingress
