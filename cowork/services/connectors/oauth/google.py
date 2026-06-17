@@ -185,6 +185,8 @@ class GoogleOAuthService:
             account_name = str(userinfo.get("name", "")).strip()
             connection_name = account_email or cfg.engine
 
+            self._verify_connection(service, access_token)
+
             expires_in = int(token_data.get("expires_in", 0) or 0)
             expires_at = (
                 (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
@@ -402,6 +404,17 @@ class GoogleOAuthService:
             _GOOGLE_USERINFO_ENDPOINT,
             headers={"Authorization": f"Bearer {access_token}"},
         )
+
+    def _verify_connection(self, service: str, access_token: str) -> None:
+        """Make a lightweight API call to confirm the token actually works.
+        Raises HTTPException(502) if the call fails, preventing vault save."""
+        verify_urls: dict[str, str] = {
+            "google-drive": "https://www.googleapis.com/drive/v3/about?fields=user",
+        }
+        url = verify_urls.get(service)
+        if url is None:
+            return
+        _json_request(url, headers={"Authorization": f"Bearer {access_token}"})
 
 
 def _json_request(
