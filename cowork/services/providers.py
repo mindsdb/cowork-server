@@ -42,26 +42,36 @@ def minds_chat_base_url(minds_url: str) -> str:
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-_minds_models_cache: dict[str, tuple[float, Optional[list[str]]]] = {}
+# Cache value: (timestamp, (ids, efforts_map)). ids is None on failure.
+_minds_models_cache: dict[str, tuple[float, tuple[Optional[list[str]], dict[str, dict]]]] = {}
 
 
-async def fetch_minds_models(minds_url: str, api_key: str) -> Optional[list[str]]:
-    """Fetch supported model ids from MindsHub's OpenAI-compatible
-    `/v1/models` endpoint. Returns the model-id list, or None on any
-    failure so the caller falls back to the static list."""
+async def fetch_minds_models(
+    minds_url: str, api_key: str
+) -> tuple[Optional[list[str]], dict[str, dict]]:
+    """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
+
+    Returns ``(ids, efforts)`` where ``ids`` is the model-id list (or None on
+    any failure so the caller falls back to the static list) and ``efforts``
+    maps a model id to ``{"efforts": [...], "default": "..."}`` for every model
+    that advertises ``reasoning_efforts`` — the source of truth for which models
+    accept an effort level and at which levels.
+    """
     if not minds_url or not api_key:
-        return None
+        return None, {}
     base = minds_chat_base_url(minds_url)
 
     now = time.monotonic()
     cached = _minds_models_cache.get(base)
     if cached:
         ts, val = cached
-        ttl = _MINDS_MODELS_TTL if val else _MINDS_MODELS_FAIL_TTL
+        ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
         if (now - ts) < ttl:
             return val
 
-    def _remember(val: Optional[list[str]]) -> Optional[list[str]]:
+    def _remember(
+        val: tuple[Optional[list[str]], dict[str, dict]],
+    ) -> tuple[Optional[list[str]], dict[str, dict]]:
         _minds_models_cache[base] = (time.monotonic(), val)
         return val
 
@@ -75,24 +85,36 @@ async def fetch_minds_models(minds_url: str, api_key: str) -> Optional[list[str]
             )
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember(None)
+            return _remember((None, {}))
         data = r.json()
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
-        return _remember(None)
+        return _remember((None, {}))
 
     # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
-    # Accept a bare list too, defensively.
+    # Accept a bare list too, defensively. Each row may carry the non-standard
+    # extension fields `reasoning_efforts` (list) and `default_reasoning_effort`
+    # (str) — OpenAI clients ignore unknown keys; we surface them for the picker.
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return _remember(None)
-    ids = [
-        str(row.get("id")).strip()
-        for row in rows
-        if isinstance(row, dict) and row.get("id")
-    ]
-    ids = [i for i in ids if i]
-    return _remember(ids or None)
+        return _remember((None, {}))
+    ids: list[str] = []
+    efforts: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        model_id = str(row.get("id")).strip()
+        if not model_id:
+            continue
+        ids.append(model_id)
+        levels = row.get("reasoning_efforts")
+        if isinstance(levels, list) and levels:
+            entry: dict = {"efforts": [str(x) for x in levels]}
+            default = row.get("default_reasoning_effort")
+            if default:
+                entry["default"] = str(default)
+            efforts[model_id] = entry
+    return _remember(((ids or None), efforts))
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -247,6 +269,13 @@ def build_llm_client():
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
+
+    Reasoning effort is a persisted per-role setting
+    (``planning_reasoning_effort`` / ``coding_reasoning_effort``) — chosen in the
+    Settings UI beside each model dropdown, just like the model itself. Each
+    level is forwarded in the provider's native shape (Anthropic
+    ``output_config``, OpenAI ``reasoning`` / ``reasoning_effort``); None leaves
+    the model's own default.
     """
     from anton.core.llm.client import LLMClient
     from anton.core.llm.anthropic import AnthropicProvider
@@ -256,7 +285,7 @@ def build_llm_client():
 
     settings = get_user_settings()
 
-    def _make_provider(role: Provider):
+    def _make_provider(role: Provider, effort: str | None = None):
         if role == Provider.MINDS_CLOUD:
             key = settings.minds_api_key
             if key is None:
@@ -264,6 +293,7 @@ def build_llm_client():
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=minds_chat_base_url(settings.minds_url),
+                reasoning_effort=effort,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             key = settings.openai_api_key
@@ -272,6 +302,7 @@ def build_llm_client():
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=settings.openai_base_url or "https://api.openai.com/v1",
+                reasoning_effort=effort,
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -280,12 +311,16 @@ def build_llm_client():
         key = getattr(settings, f"{role.value}_api_key")
         if key is None:
             raise ValueError(f"{role.value} API key is not configured")
-        return cls(api_key=key.get_secret_value())
+        return cls(api_key=key.get_secret_value(), reasoning_effort=effort)
 
     return LLMClient(
-        planning_provider=_make_provider(settings.planning_provider),
+        planning_provider=_make_provider(
+            settings.planning_provider, settings.planning_reasoning_effort
+        ),
         planning_model=settings.planning_model,
-        coding_provider=_make_provider(settings.coding_provider),
+        coding_provider=_make_provider(
+            settings.coding_provider, settings.coding_reasoning_effort
+        ),
         coding_model=settings.coding_model,
     )
 

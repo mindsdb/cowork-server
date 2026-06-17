@@ -47,6 +47,24 @@ CODING_MODEL_DEFAULTS: dict[str, str] = {
     "minds_cloud": "latest:haiku",
 }
 
+# Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
+# advertises its levels live via MindsHub's `/v1/models`; direct Anthropic/OpenAI
+# have no such endpoint, so the levels are hand-maintained here. Keyed by exact
+# model id → {"efforts": [<display order>], "default": <one of efforts>}. A model
+# absent from this map (e.g. claude-haiku) is treated as not supporting effort —
+# the UI hides the picker for it. Levels mirror what each provider accepts:
+# Anthropic via output_config={"effort": ...}; OpenAI via reasoning_effort /
+# reasoning={"effort": ...}.
+DIRECT_EFFORT_CATALOG: dict[str, dict] = {
+    "claude-opus-4-7":   {"efforts": ["low", "medium", "high"], "default": "high"},
+    "claude-opus-4-6":   {"efforts": ["low", "medium", "high"], "default": "high"},
+    "claude-sonnet-4-6": {"efforts": ["low", "medium", "high"], "default": "medium"},
+    "gpt-5.5":      {"efforts": ["minimal", "low", "medium", "high"], "default": "medium"},
+    "gpt-5.5-mini": {"efforts": ["minimal", "low", "medium", "high"], "default": "medium"},
+    "o3":      {"efforts": ["low", "medium", "high"], "default": "medium"},
+    "o4-mini": {"efforts": ["low", "medium", "high"], "default": "medium"},
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
