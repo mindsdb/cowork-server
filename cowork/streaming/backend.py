@@ -1,18 +1,20 @@
 """Backend selection for turn-stream buffers.
 
-`COWORK_STREAM_BACKEND` chooses the implementation:
-  - ``file`` (default) — FileStreamBuffer under ``COWORK_STREAMS_DIR``
-    (default ``~/.cowork/streams``). Desktop + single-instance cloud.
-  - ``redis`` — WIP; RedisStreamBuffer for multi-instance cloud.
+Configured via ``StreamSettings`` (common/settings/app_settings.py):
+  - ``backend`` (env ``COWORK_STREAM_BACKEND``, default ``file``) —
+    ``file`` = FileStreamBuffer (desktop + single-instance cloud);
+    ``redis`` = RedisStreamBuffer (multi-instance cloud, WIP).
+  - ``dir`` (env ``COWORK_STREAMS_DIR``, default ``~/.cowork/streams``) —
+    root for file-backed buffers.
 
 The rest of the app only calls ``new_buffer()`` / ``get_streams_dir()``,
-so swapping the backend is a one-line env change with no call-site churn.
+so swapping the backend is a one-line settings change with no call-site churn.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
+from cowork.common.settings.app_settings import StreamSettings
 from cowork.streaming.buffer import (
     FileStreamBuffer,
     RedisStreamBuffer,
@@ -22,14 +24,11 @@ from cowork.streaming.buffer import (
 
 
 def get_backend() -> str:
-    return (os.environ.get("COWORK_STREAM_BACKEND") or "file").strip().lower()
+    return (StreamSettings().backend or "file").strip().lower()
 
 
 def get_streams_dir() -> Path:
-    override = os.environ.get("COWORK_STREAMS_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".cowork" / "streams"
+    return Path(StreamSettings().dir)
 
 
 def new_buffer(conversation_id: str, turn_id: int) -> StreamBuffer:
