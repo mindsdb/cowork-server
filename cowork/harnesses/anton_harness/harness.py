@@ -32,6 +32,76 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
     return filtered
 
 
+def _conversation_attachment_context(conversation) -> str:
+    """Prompt fragment listing the absolute paths of every file attached to
+    this conversation.
+
+    Uploads are stored under the files dir (``.cowork/files/<uuid>/<name>``),
+    which is OUTSIDE the project workspace. An agent that only scans the
+    project root therefore never sees them and wrongly tells the user no
+    files were uploaded (the Cyberdeck bug). Handing it the exact paths lets
+    it read them on demand on any turn — not just the turn they arrived on.
+
+    Returns "" when there are no attachments or they can't be resolved
+    (e.g. the conversation is detached from its session), so the caller can
+    append it unconditionally.
+    """
+    try:
+        from sqlalchemy.orm import object_session
+        from cowork.services.files import FileService, attachment_purpose
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            return ""
+        rows = FileService(db_session).list_file_rows(
+            purpose=attachment_purpose(conversation.project.name, str(conversation.id))
+        )
+        # Only list files that still exist on disk — a row whose file was
+        # deleted would otherwise hand the agent a dead path to chase.
+        # Resolve one row at a time: a single bad row (e.g. a path the OS
+        # rejects) must not abort the whole list and hide every OTHER
+        # attachment — skip the bad one and keep going.
+        attached: list[str] = []
+        for r in rows:
+            try:
+                path = getattr(r, "path", "")
+                if path and Path(path).exists():
+                    attached.append(f"  - {r.path}  ({r.filename})")
+            except Exception:
+                logger.warning(
+                    "Skipping unresolvable attachment row (file id=%s) while "
+                    "building context for conversation %s",
+                    getattr(r, "id", "<unknown>"),
+                    getattr(conversation, "id", "<unknown>"),
+                    exc_info=True,
+                )
+        if not attached:
+            return ""
+        return (
+            " The user has attached the following files to THIS conversation. "
+            "They live OUTSIDE the project directory, so a project-only scan will "
+            "miss them — read them directly from these absolute paths whenever the "
+            "user refers to uploaded or reference materials, and never report them "
+            "missing just because they aren't in the project folder:\n"
+            + "\n".join(attached)
+        )
+    except Exception:
+        # Never crash a turn over attachment context — but don't fail
+        # silently either. A swallowed error here is indistinguishable from
+        # "no attachments", which is exactly how the agent ends up telling
+        # the user no files were uploaded (the Cyberdeck bug this helper
+        # exists to fix). Log it so the failure is diagnosable; the agent
+        # still degrades gracefully to "".
+        conv_id = getattr(conversation, "id", "<unknown>")
+        logger.warning(
+            "Failed to build conversation attachment context for conversation %s; "
+            "the agent will not see attached files this turn",
+            conv_id,
+            exc_info=True,
+        )
+        return ""
+
+
 # TODO: Handle topics.
 class AntonMemoryCategory(str, Enum):
     lesson = "lesson"
@@ -321,6 +391,12 @@ class AntonHarness:
         # history_store = HistoryStore(episodes_dir)
         # initial_history = history_store.load(conversation_id)
 
+        # Conversation-attached uploads land in the files dir
+        # (.cowork/files/<uuid>/<name>), OUTSIDE the project directory — so
+        # the agent must be told their exact paths or it scans only the
+        # project root and wrongly reports "no files uploaded" (Cyberdeck bug).
+        attachment_context = _conversation_attachment_context(conversation)
+
         project_context = (
             f"You are operating in the project {conversation.project.name}."
             f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
@@ -332,6 +408,7 @@ class AntonHarness:
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
             "ALWAYS use the scratchpad to interact with files."
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
+            + attachment_context
         )
         output_context = (
             # Artifacts now live in their own visible folder at the
