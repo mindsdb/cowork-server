@@ -122,7 +122,7 @@ class ResponsesHandler:
         runs, which execute with stream=False."""
         from cowork.services import stream_buffer
 
-        turn_buffer = stream_buffer.begin_turn(str(conversation_id))
+        turn_buffer = stream_buffer.ensure_buffer(str(conversation_id))
 
         def event_sink(event_type: str, data: dict) -> None:
             collected_events.append(data)
