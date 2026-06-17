@@ -323,6 +323,12 @@ def build_llm_client():
     settings = get_user_settings()
 
     def _make_provider(role: Provider, effort: str | None = None):
+        # Only pass reasoning_effort when it's actually set. This keeps
+        # build_llm_client compatible with anton builds whose provider __init__
+        # predates the kwarg (passing reasoning_effort=None unconditionally would
+        # TypeError on every call, taking the whole agent down — not just effort
+        # users) and avoids handing an unset effort to a provider that can't take it.
+        effort_kw = {"reasoning_effort": effort} if effort else {}
         if role == Provider.MINDS_CLOUD:
             key = settings.minds_api_key
             if key is None:
@@ -330,7 +336,7 @@ def build_llm_client():
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=minds_chat_base_url(settings.minds_url),
-                reasoning_effort=effort,
+                **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             key = settings.openai_api_key
@@ -339,7 +345,7 @@ def build_llm_client():
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=settings.openai_base_url or "https://api.openai.com/v1",
-                reasoning_effort=effort,
+                **effort_kw,
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -348,7 +354,7 @@ def build_llm_client():
         key = getattr(settings, f"{role.value}_api_key")
         if key is None:
             raise ValueError(f"{role.value} API key is not configured")
-        return cls(api_key=key.get_secret_value(), reasoning_effort=effort)
+        return cls(api_key=key.get_secret_value(), **effort_kw)
 
     return LLMClient(
         planning_provider=_make_provider(
