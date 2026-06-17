@@ -46,31 +46,9 @@ class AntonHarness:
     formatter = staticmethod(format_responses_stream)
 
     async def sync_skills(self, skills: list[Skill]) -> None:
-        from datetime import datetime, timezone
-        from anton.core.memory.skills import Skill as AntonSkill, SkillStore
-        
-        from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
-
-        settings = AntonHarnessSettings()
-        store = SkillStore(Path(settings.skills_root_dir))
-        active_labels: set[str] = set()
-        for skill in skills:
-            anton_skill = AntonSkill(
-                label=skill.label,
-                name=skill.name,
-                description=skill.description or "",
-                when_to_use=skill.when_to_use or "",
-                declarative_md=skill.instructions,
-                created_at=skill.created_at.isoformat() if skill.created_at else datetime.now(timezone.utc).isoformat(),
-                provenance="cowork",  # Helps track which skills originated from cowork.
-            )
-            store.save(anton_skill)
-            active_labels.add(skill.label)
-
-        # Delete any existing Anton skills that are not in the current list.
-        for existing in store.list_all():
-            if existing.provenance == "cowork" and existing.label not in active_labels:
-                store.delete(existing.label)
+        # No-op: Anton's skills dir is symlinked to cowork's canonical (seedev_setup)
+        #  so the Anton runtime already reads the skills files
+        return
     
     async def overwrite_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
         # Validate provided category.
