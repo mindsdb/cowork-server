@@ -41,7 +41,7 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
-        await self.harness.sync_skills(SkillService(self.session).list_skills())
+        await self.harness.sync_skills(SkillService().list_skills())
 
         conversation_service = ConversationService(self.session)
         project_id = self._resolve_project_id(request)

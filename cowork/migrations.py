@@ -147,7 +147,7 @@ def migrate_skills_to_files(session: Session) -> bool:
     if svc._fetch_row(SKILL_MIGRATION_SENTINEL) is not None:
         return False
 
-    store = SkillService(session)
+    store = SkillService()
     rows = list(session.exec(select(SkillLegacy)).all())
 
     def _unique_slug(svc: SkillService, base: str, taken: set[str]) -> str:
