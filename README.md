@@ -90,7 +90,7 @@ Data lives in two places: a **SQLite database** for structured records and the *
 
 - **Location**: `~/.cowork/cowork.db` (override with `DATABASE_URI`)
 - **ORM**: [SQLModel](https://sqlmodel.tiangolo.com/) (SQLAlchemy + Pydantic)
-- **Migrations**: Alembic (`cowork/db/alembic/versions/`) — **additive-only policy**, see below
+- **Migrations**: Alembic (`cowork/db/alembic/versions/`)
 
 Key tables:
 
@@ -108,24 +108,6 @@ Key tables:
 | `channel_*` | Channel installations, bindings, sessions, and events |
 
 All models use UUID primary keys with auto-tracked `created_at`/`modified_at` timestamps.
-
-### Migration policy: additive-only
-
-Cowork-server is a **local-first desktop app** — users may downgrade at any time (auto-updater rollback, switching branches, installing an older release). To ensure older code can always run against a database touched by a newer version, every Alembic migration must be **additive-only**:
-
-| Allowed | Forbidden |
-|---------|-----------|
-| `create_table` | `drop_table` |
-| `add_column` | `drop_column` |
-| `create_index` | `drop_index` |
-| | `rename_table` |
-| | `alter_column` (rename / type change) |
-
-SQLite ignores columns it doesn't know about, and SQLModel selects explicit columns — so a schema with "extra" columns from a newer release is a safe superset for older code.
-
-**Unknown-revision handling**: when the database is stamped at a revision this codebase doesn't recognise (i.e. it was written by a newer release), migrations are **skipped entirely** rather than re-stamped. The app starts normally against the superset schema.
-
-This policy is enforced by `test_migrations_are_additive_only` in `tests/test_schema_migrations.py` — the test parses every migration's `upgrade()` function and fails if any destructive op is found.
 
 ### Filesystem storage
 
