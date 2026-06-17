@@ -1,82 +1,161 @@
 from __future__ import annotations
 
-from uuid import UUID
+import os
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-from sqlmodel import Session, select
+from anton.core.tools.skill_format import (
+    SKILL_FILE,
+    dump_skill,
+    normalize_name,
+    parse_skill_dir,
+    validate_name,
+)
 
-from cowork.models.skill import Skill
+from cowork.common.settings import get_app_settings
+from cowork.models.skill import (
+    META_CREATED_AT,
+    META_DISPLAY_NAME,
+    Skill,
+)
+
+
+def _skill_from_dir(skill_dir: Path) -> Skill | None:
+    """Read a ``SKILL.md`` folder into a ``Skill``.
+    """
+    agent = parse_skill_dir(skill_dir)
+    if agent is None:
+        return None
+    skill = Skill.model_construct(**dict(agent))
+
+    return skill
 
 
 class SkillService:
-    def __init__(self, session: Session) -> None:
+    """File-backed skill store using the agentskills.io ``SKILL.md`` format."""
+
+
+
+    def __init__(self, session: Any = None) -> None:
         self.session = session
+        self.root = Path(get_app_settings().skill.root_dir)
 
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _skill_dir(self, slug: str) -> Path:
+        return self.root / slug
+
+    def _ensure_root(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _build_metadata(
+        slug: str,
+        name: str | None,
+        created_at: datetime,
+    ) -> dict[str, str]:
+        metadata: dict[str, str] = {}
+        if name and name != slug:
+            metadata[META_DISPLAY_NAME] = name
+        metadata[META_CREATED_AT] = created_at.isoformat()
+        return metadata
+
+    # ── reads ────────────────────────────────────────────────────────────────
     def list_skills(self) -> list[Skill]:
-        return list(self.session.exec(select(Skill).order_by(Skill.created_at.desc())).all())
+        if not self.root.exists():
+            return []
+        skills: list[Skill] = []
+        for entry in self.root.iterdir():
+            if entry.is_dir() and (entry / SKILL_FILE).exists():
+                skill = _skill_from_dir(entry)
+                if skill is not None:
+                    skills.append(skill)
+        skills.sort(key=lambda s: (s.created_at is None, s.created_at), reverse=True)
+        return skills
 
-    def get_skill(self, skill_id: UUID) -> Skill:
-        skill = self.session.get(Skill, skill_id)
+    def get_skill(self, slug: str) -> Skill:
+        skill_dir = self._skill_dir(slug)
+        skill = _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).exists() else None
         if skill is None:
-            raise ValueError(f"Skill {skill_id} not found.")
+            raise ValueError(f"Skill {slug!r} not found.")
         return skill
 
+    # ── writes ───────────────────────────────────────────────────────────────
     def create_skill(
         self,
         label: str,
         name: str,
         instructions: str,
         description: str | None = None,
-        when_to_use: str | None = None,
     ) -> Skill:
-        if self.session.exec(select(Skill).where(Skill.label == label)).first():
-            raise ValueError(f"A skill with label '{label}' already exists.")
-        if self.session.exec(select(Skill).where(Skill.name == name)).first():
-            raise ValueError(f"A skill named '{name}' already exists.")
-        skill = Skill(label=label, name=name, instructions=instructions, description=description, when_to_use=when_to_use)
-        self.session.add(skill)
-        self.session.commit()
-        self.session.refresh(skill)
-        return skill
+        label = normalize_name(label)
+        if self._skill_dir(label).exists():
+            raise ValueError(f"A skill named '{label}' already exists.")
+
+        skill = Skill(
+            name=label,
+            instructions=instructions or "",
+            # description is required and non-empty by spec; fall back to the
+            # display name / slug so we never write an empty value.
+            description=(description or "").strip() or name or label,
+            metadata=self._build_metadata(label, name, datetime.now(timezone.utc)),
+        )
+        self._write(skill)
+        return self.get_skill(label)
 
     def update_skill(
         self,
-        skill_id: UUID,
+        skill_id: str,
         label: str | None = None,
         name: str | None = None,
         description: str | None = None,
-        when_to_use: str | None = None,
         instructions: str | None = None,
     ) -> Skill:
         skill = self.get_skill(skill_id)
+        metadata = dict(skill.metadata)
+
+        new_slug = skill.name
         if label is not None:
-            skill.label = label
+            new_slug = normalize_name(label)
+
         if name is not None:
-            skill.name = name
+            if name and name != new_slug:
+                metadata[META_DISPLAY_NAME] = name
+            else:
+                metadata.pop(META_DISPLAY_NAME, None)
         if description is not None:
-            skill.description = description
-        if when_to_use is not None:
-            skill.when_to_use = when_to_use
+            skill.description = (description.strip() or skill.display_name or new_slug)
         if instructions is not None:
             skill.instructions = instructions
-        self.session.add(skill)
-        self.session.commit()
-        self.session.refresh(skill)
-        return skill
 
-    def delete_skill(self, skill_id: UUID) -> bool:
-        skill = self.session.get(Skill, skill_id)
-        if skill is None:
+        if new_slug != skill.name:
+            if self._skill_dir(new_slug).exists():
+                raise ValueError(f"A skill named '{new_slug}' already exists.")
+            self._rename_dir(skill.name, new_slug)
+            skill.name = new_slug
+
+        skill.metadata = metadata
+        self._write(skill)
+        return self.get_skill(skill.name)
+
+    def delete_skill(self, slug: str) -> bool:
+        skill_dir = self._skill_dir(slug)
+        if not skill_dir.exists():
             return False
-        self.session.delete(skill)
-        self.session.commit()
+        shutil.rmtree(skill_dir)
         return True
 
-    def delete_skill_by_name(self, name: str) -> bool:
-        skill = self.session.exec(
-            select(Skill).where((Skill.name == name) | (Skill.label == name))
-        ).first()
-        if skill is None:
-            return False
-        self.session.delete(skill)
-        self.session.commit()
-        return True
+    # ── low-level fs ─────────────────────────────────────────────────────────
+    def _write(self, skill: Skill) -> None:
+        self._ensure_root()
+        skill_dir = self._skill_dir(skill.name)
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        target = skill_dir / SKILL_FILE
+        tmp = skill_dir / f".{SKILL_FILE}.tmp"
+        tmp.write_text(dump_skill(skill), encoding="utf-8")
+        os.replace(tmp, target)  # atomic within the same directory
+
+    def _rename_dir(self, old_slug: str, new_slug: str) -> None:
+        self._ensure_root()
+        os.replace(self._skill_dir(old_slug), self._skill_dir(new_slug))

@@ -53,3 +53,9 @@ def run_dev_setup() -> None:
 
     with SQLSession(engine) as session:
         migrate_env_to_db(session)
+
+    # Migrate DB-backed skills to agentskills.io files (one-time, idempotent).
+    from cowork.migrations import migrate_skills_to_files
+
+    with SQLSession(engine) as session:
+        migrate_skills_to_files(session)
