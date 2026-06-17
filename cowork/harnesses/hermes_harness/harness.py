@@ -185,6 +185,7 @@ class HermesHarness:
                     str(conversation.id),
                     prompt,
                     history,
+                    project_name=conversation.project.name,
                     project_path=project_path,
                     conversation_topic=conversation_topic,
                     stream_callback=stream_callback,
@@ -226,6 +227,7 @@ class HermesHarness:
         prompt: str,
         history: list[dict],
         *,
+        project_name: str,
         project_path: str,
         conversation_topic: str | None = None,
         stream_callback=None,
@@ -296,11 +298,20 @@ class HermesHarness:
             if (conn["engine"], conn["name"]) not in disabled_keys:
                 vault.inject_env(conn["engine"], conn["name"])
 
+        project_context = (
+            f"You are operating in the project {project_name}."
+            f"You have access to all of the files in the project at {str(project_path)} except for the .anton/ directory."
+            "They are off limits. Do not mention the .anton/ directory in your responses."
+            "You can perform operations on these files by executing code."
+            "You can freely read any of these project files."
+            "If you need to perform any actions on these files, ask the user for permission first."
+            "The only other files that you are allowed to access are any items that are attached to the conversation."
+            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
+        )
         datasource_context = _build_datasource_context(vault, disabled_keys)
         memory_context = HermesMemoryAdapter().build_prompt_context(Path(project_path))
-        print(f"Memory context: {memory_context}")
         system_context = "\n\n".join(
-            part for part in (memory_context, datasource_context, artifact_context) if part
+            part for part in (project_context, memory_context, datasource_context, artifact_context) if part
         )
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
