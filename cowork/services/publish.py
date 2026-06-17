@@ -126,7 +126,93 @@ def list_publishable() -> dict:
     }
 
 
-def publish_artifact(raw_path: str, password: str | None = None) -> dict:
+def _normalize_emails(values) -> list[str]:
+    """Strip + lowercase + de-dupe, preserving first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in values or []:
+        email = str(raw).strip().lower()
+        if email and email not in seen:
+            seen.add(email)
+            out.append(email)
+    return out
+
+
+def _resolve_access(
+    password: str | None, access: dict | None, previous: Any
+) -> tuple[dict, int, int, dict]:
+    """Resolve the effective publish access from the request + prior state.
+
+    Returns ``(effective_access, pwd_version, access_version, owner_side)``:
+
+    - ``effective_access`` — the cowork→anton shape passed to ``publish()``
+      (``{"mode": "public"}`` / ``{"mode": "password", "password": ...}`` /
+      ``{"mode": "restricted", "emails": [...], "org_allowed": bool}``).
+    - ``pwd_version`` / ``access_version`` — monotonic versions, bumped only
+      when the password (resp. restricted list/org) actually changes vs the
+      previous publish, so stale viewer grants invalidate (mirrors the prior
+      ``pwd_version`` logic).
+    - ``owner_side`` — fields to persist in ``.published.json`` (kept
+      back-compatible: ``requires_password`` is always present).
+
+    A request with no usable selection (empty password, or restricted with no
+    emails and no org) degrades to ``public`` rather than publishing an
+    artifact nobody can open.
+    """
+    prev = previous if isinstance(previous, dict) else {}
+    password = (password or "").strip() or None
+
+    mode = (access or {}).get("mode") if access else None
+    if not mode:
+        mode = "password" if password else "public"
+
+    prev_pwd_version = prev.get("pwd_version", 0) or 0
+    prev_access_version = prev.get("access_version", 0) or 0
+    pwd_version = prev_pwd_version or 1
+    access_version = prev_access_version or 1
+
+    if mode == "password":
+        pw = ((access or {}).get("password") or password or "").strip() or None
+        if pw:
+            prev_password = prev.get("access_password")
+            pwd_version = (prev_pwd_version + 1) if pw != prev_password else (prev_pwd_version or 1)
+            owner_side = {
+                "mode": "password",
+                "requires_password": True,
+                "access_password": pw,
+                "pwd_version": pwd_version,
+            }
+            return {"mode": "password", "password": pw}, pwd_version, access_version, owner_side
+        mode = "public"  # empty password → public
+
+    if mode == "restricted":
+        emails = _normalize_emails((access or {}).get("emails"))
+        org_allowed = bool((access or {}).get("org_allowed"))
+        if emails or org_allowed:
+            prev_restricted = prev.get("mode") == "restricted"
+            prev_emails = prev.get("emails") if prev_restricted else None
+            prev_org = prev.get("org_allowed") if prev_restricted else None
+            changed = (emails != prev_emails) or (org_allowed != prev_org)
+            access_version = (prev_access_version + 1) if changed else (prev_access_version or 1)
+            owner_side = {
+                "mode": "restricted",
+                "requires_password": False,
+                "emails": emails,
+                "org_allowed": org_allowed,
+                "access_version": access_version,
+            }
+            return (
+                {"mode": "restricted", "emails": emails, "org_allowed": org_allowed},
+                pwd_version,
+                access_version,
+                owner_side,
+            )
+        mode = "public"  # nothing selected → public
+
+    return {"mode": "public"}, pwd_version, access_version, {"mode": "public", "requires_password": False}
+
+
+def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None) -> dict:
     settings = get_user_settings()
     api_key = _secret_str(settings.minds_api_key)
     if not api_key:
@@ -156,14 +242,10 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
     previous = published_map.get(published_key)
     report_id = previous.get("report_id") if isinstance(previous, dict) else None
 
-    # Resolve access state. A non-empty password publishes (or keeps) the
-    # artifact password-protected; empty/None publishes it public. Bump
-    # pwd_version whenever the password value changes so access cookies
-    # issued for the old password stop validating in the viewer.
-    password = (password or "").strip() or None
-    prev_password = previous.get("access_password") if isinstance(previous, dict) else None
-    prev_version = previous.get("pwd_version", 0) if isinstance(previous, dict) else 0
-    pwd_version = (prev_version + 1) if password and password != prev_password else (prev_version or 1)
+    # Resolve the effective access (mode + version) from the request and the
+    # prior publish. Versions bump only when the password / restricted list
+    # changed so previously issued viewer grants invalidate.
+    effective_access, pwd_version, access_version, owner_side = _resolve_access(password, access, previous)
 
     publish_url = settings.publish_url or "https://4nton.ai"
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
@@ -174,7 +256,8 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
             report_id=report_id,
             publish_url=publish_url,
             ssl_verify=ssl_verify,
-            password=password,
+            access=effective_access,
+            access_version=access_version,
             pwd_version=pwd_version,
             # Resolve datasource secrets from cowork's own vault
             # (`~/.cowork/data-vault`), not anton's default
@@ -196,16 +279,16 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
             "reportId": returned_report_id,
             "publishedAt": _utc_now_iso(),
         }
+        # Owner-side only — .published.json never enters the bundle. `owner_side`
+        # carries `mode` (+ `access_password`/`pwd_version` for password, or
+        # `emails`/`org_allowed`/`access_version` for restricted), and always
+        # `requires_password` for back-compat with older readers.
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", ""),
-            "requires_password": bool(password),
+            **owner_side,
         }
-        if password:
-            # Owner-side only — .published.json never enters the bundle.
-            entry["access_password"] = password
-            entry["pwd_version"] = pwd_version
         published_map[published_key] = entry
         try:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
@@ -218,7 +301,10 @@ def publish_artifact(raw_path: str, password: str | None = None) -> dict:
     return {
         "status": "ok",
         "url": view_url,
-        "accessProtected": bool(password),
+        "accessMode": owner_side.get("mode", "public"),
+        "accessProtected": bool(owner_side.get("requires_password")),
+        "accessEmails": owner_side.get("emails", []),
+        "orgAllowed": bool(owner_side.get("org_allowed")),
         "result": {k: v for k, v in result.items() if k != "file_payload"},
     }
 
