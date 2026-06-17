@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 from pydantic import SecretStr
 
+from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
+
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
 
@@ -144,6 +146,20 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
             r = await client.get(url, headers=headers)
             return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
 
+    async def _chat_probe(url: str, headers: dict[str, str], model: str) -> tuple[str, str]:
+        """Exercise the actual inference path with a 1-token completion.
+
+        This is the only route guaranteed to behave the same as a real
+        task: `/models` and other listing endpoints are not deployed on
+        every MindsHub host (they 404/401 even for valid keys), which
+        produced false negatives even though chat completions worked.
+        A 401/403 still means a rejected key; any other non-2xx is a
+        genuine failure surfaced with its HTTP code."""
+        payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            r = await client.post(url, headers=headers, json=payload)
+        return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
+
     try:
         if ptype == "anthropic":
             if not key:
@@ -171,7 +187,12 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 return "fail", "missing API key"
             base = (p.get("mindsUrl") or "https://api.mindshub.ai").rstrip("/")
             chat_url = minds_chat_base_url(base)
-            return await _check(f"{chat_url}/models", {"Authorization": f"Bearer {key}"})
+            model = (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
+            return await _chat_probe(
+                f"{chat_url}/chat/completions",
+                {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                model,
+            )
     except httpx.HTTPError as e:
         return "fail", f"{type(e).__name__}: {e}"
     except Exception as e:
@@ -215,16 +236,26 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
 
 
 async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict[str, Any]:
+    # Probe the real inference path rather than `/models`: listing routes
+    # are not deployed on every MindsHub host and 404/401 even for valid
+    # keys, which blocked onboarding with a working key. A 1-token chat
+    # completion is the same surface a real task exercises.
     try:
         chat_base = minds_chat_base_url(base_url.rstrip("/"))
         timeout = httpx.Timeout(15.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.get(f"{chat_base}/models", headers={"Authorization": f"Bearer {api_key}"})
+            r = await client.post(
+                f"{chat_base}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": CODING_MODEL_DEFAULTS["minds_cloud"], "max_tokens": 20,
+                      "messages": [{"role": "user", "content": "ping"}]},
+            )
         if r.status_code in (401, 403):
             return {"ok": False, "error": "Invalid API key"}
         if 200 <= r.status_code < 300:
             return {"ok": True}
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
+        msg = r.json().get("error", {}).get("message", f"HTTP {r.status_code}") if r.content else f"HTTP {r.status_code}"
+        return {"ok": False, "error": msg}
     except Exception:
         return {"ok": False, "error": "Cannot connect"}
 
