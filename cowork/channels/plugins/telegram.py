@@ -351,12 +351,13 @@ class TelegramBridge:
 
 
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
-    """Build a TelegramBridge from resolved credentials, or None if the channel
-    is not fully configured.
-"""
+    """Build a TelegramBridge from resolved credentials, or None if not
+    configured. Only ``bot_token`` is required: it powers getUpdates polling and
+    sending. ``secret_token`` is webhook-only (it authenticates webhook ingress
+    and is auto-minted by setup); polling never needs it, and verify_signature
+    guards the webhook path at call time, so the factory must not gate on it.
+    """
     if not (credentials.get("bot_token") or "").strip():
-        return None
-    if not (credentials.get("secret_token") or "").strip():
         return None
     return TelegramBridge(credentials)
 
@@ -423,21 +424,21 @@ plugin = ChannelPlugin(
                 description="Bot API token from @BotFather",
             ),
             CredentialField(
-                name="secret_token",
-                label="Webhook secret token",
-                secret=True,
-                required=True,
-                description=(
-                    "Passed to setWebhook and echoed in the "
-                    "X-Telegram-Bot-Api-Secret-Token header; required to authenticate webhook ingress"
-                ),
-            ),
-            CredentialField(
                 name="bot_username",
                 label="Bot username",
                 secret=False,
                 required=False,
                 description="Used to detect @mentions in group chats",
+            ),
+            CredentialField(
+                name="secret_token",
+                label="Webhook secret token",
+                secret=True,
+                required=False,
+                description=(
+                    "Authenticates webhook ingress via the "
+                    "X-Telegram-Bot-Api-Secret-Token header; auto-generated on connect when left blank"
+                ),
             ),
         )
     ),

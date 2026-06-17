@@ -220,12 +220,21 @@ class HermesHarness:
             if msg.role in {"user", "assistant"}
         ]
 
+        # Resolve project-derived values while the DB session is alive —
+        # _run executes on an executor thread where lazy relationship
+        # loads would fail.
+        project_path = str(conversation.project.path)
+        conversation_topic = conversation.topic
+        prompt = self._to_prompt_string(input)
+
         def run_sync() -> dict:
             try:
                 return self._run(
                     str(conversation.id),
-                    self._to_prompt_string(input),
+                    prompt,
                     history,
+                    project_path=project_path,
+                    conversation_topic=conversation_topic,
                     stream_callback=stream_callback,
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
@@ -264,6 +273,9 @@ class HermesHarness:
         session_id: str,
         prompt: str,
         history: list[dict],
+        *,
+        project_path: str,
+        conversation_topic: str | None = None,
         stream_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -279,10 +291,34 @@ class HermesHarness:
 
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import get_user_settings
-        from cowork.harnesses.hermes_harness.tools import register_connector_tools
+        from cowork.harnesses.hermes_harness.tools import (
+            finalize_artifact_run_context,
+            register_artifact_tools,
+            register_connector_tools,
+            set_artifact_run_context,
+        )
         from cowork.common.settings.user_settings import Provider
 
         register_connector_tools()
+        register_artifact_tools()
+
+        # Same folder-per-artifact convention as the Anton harness, so
+        # Hermes outputs surface in the (harness-agnostic) Artifacts UI.
+        artifacts_root = Path(project_path) / ".anton" / "artifacts"
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        artifact_context = (
+            "## Artifacts\n"
+            f"User-facing outputs (HTML dashboards, reports, CSVs/datasets, images, apps) "
+            f"live under `{artifacts_root}/`, one folder per artifact, and appear in the "
+            "app's Artifacts UI where the user can view, publish, and manage them.\n"
+            "Workflow:\n"
+            "  1. Call `create_artifact(name, description, type)` BEFORE writing any output "
+            "file. It returns `{slug, path}` — write your files into that absolute `path`.\n"
+            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find its slug "
+            "and path, then write into that folder.\n"
+            "  3. Never pick artifact folder names yourself, and never write user-facing "
+            "outputs anywhere else in the project."
+        )
 
         # Sync Hermes config.yaml with the user's cowork provider/key settings.
         # AIAgent validates config.yaml at init time (before using constructor
@@ -308,6 +344,7 @@ class HermesHarness:
                 vault.inject_env(conn["engine"], conn["name"])
 
         datasource_context = _build_datasource_context(vault, disabled_keys)
+        system_context = f"{datasource_context}\n\n{artifact_context}"
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
             from cowork.services.providers import minds_chat_base_url
@@ -318,7 +355,7 @@ class HermesHarness:
                 model=model,
                 api_key=settings.minds_api_key.get_secret_value(),
                 quiet_mode=True,
-                ephemeral_system_prompt=datasource_context,
+                ephemeral_system_prompt=system_context,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
@@ -326,18 +363,20 @@ class HermesHarness:
                 thinking_callback=thinking_callback,
             )
         else:
-            provider = settings.planning_provider.value
+            # The DB enum uses snake_case (openai_compatible) but AIAgent
+            # expects kebab-case (openai-compatible).
+            provider = settings.planning_provider.value.replace("_", "-")
             key_field = settings.planning_provider.api_key_field
             api_key = getattr(settings, key_field).get_secret_value()
 
             # AIAgent needs both api_key AND base_url to skip its config.yaml
             # provider-resolution path.  For providers that use the OpenAI-
-            # compatible API (openai, gemini, openai_compatible), we must
+            # compatible API (openai, gemini, openai-compatible), we must
             # supply a base_url. Anthropic is handled separately by AIAgent
             # (it detects provider="anthropic" and switches to the Anthropic
             # Messages API internally).
             base_url = _PROVIDER_BASE_URLS.get(provider)
-            if provider == "openai_compatible" and settings.openai_base_url:
+            if provider == "openai-compatible" and settings.openai_base_url:
                 base_url = settings.openai_base_url
 
             kwargs = dict(
@@ -345,7 +384,7 @@ class HermesHarness:
                 model=model,
                 api_key=api_key,
                 quiet_mode=True,
-                ephemeral_system_prompt=datasource_context,
+                ephemeral_system_prompt=system_context,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 reasoning_callback=reasoning_callback,
@@ -356,11 +395,25 @@ class HermesHarness:
 
             agent = AIAgent(**kwargs)
 
+        # The conversation id doubles as run_agent's task_id: dispatch
+        # forwards it to every tool handler (including on the concurrent
+        # worker-thread path), which is how the artifact tools find this
+        # run's project. Passing it also keeps terminal/VM state keyed
+        # per conversation instead of per turn.
+        set_artifact_run_context(
+            session_id,
+            artifacts_root=artifacts_root,
+            conversation_id=session_id,
+            conversation_title=conversation_topic,
+            turn_summary=prompt,
+        )
         try:
             return agent.run_conversation(
                 user_message=prompt,
                 conversation_history=history,
                 stream_callback=stream_callback,
+                task_id=session_id,
             )
         finally:
+            finalize_artifact_run_context(session_id)
             vault.clear_ds_env()
