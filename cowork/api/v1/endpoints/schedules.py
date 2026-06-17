@@ -98,6 +98,7 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: B
     # doesn't find it yet, and injects a "got interrupted" prompt.
     from cowork.api.v1.endpoints.responses import mark_stream_active
     from cowork.scheduler import execute_schedule
+    from cowork.services import stream_buffer
     from cowork.services.conversations import ConversationService
 
     conversation = ConversationService(session).create_conversation(
@@ -105,6 +106,10 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: B
         project_id=schedule.project_id,
     )
     mark_stream_active(str(conversation.id))
+    # Create the turn buffer eagerly so /tail and /in-flight report
+    # has_buffer=true from the moment the client can probe. The handler's
+    # _make_event_sink will reuse this buffer via ensure_buffer().
+    stream_buffer.begin_turn(str(conversation.id))
 
     background_tasks.add_task(
         execute_schedule, schedule_id, is_manual=True,

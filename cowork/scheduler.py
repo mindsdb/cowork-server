@@ -148,6 +148,13 @@ async def execute_schedule(
     finally:
         if conversation_id:
             mark_stream_finished(str(conversation_id))
+            # If the handler never ran (e.g. schedule lookup failed),
+            # an eagerly-created turn buffer would linger as not-done
+            # and any /tail follower would wait forever. Finish it.
+            from cowork.services import stream_buffer
+            buf = stream_buffer.get_buffer(str(conversation_id))
+            if buf and not buf.done:
+                buf.finish()
         try:
             run_service.finish_run(run.id, conversation_id=conversation_id, error=error)
         except Exception:

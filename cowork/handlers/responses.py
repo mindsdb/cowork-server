@@ -120,6 +120,24 @@ class ResponsesHandler:
 
         return await self._collect(stream, conversation.id, request.model, str(user_message.id))
 
+    def _make_event_sink(self, conversation_id: UUID, collected_text: list, collected_events: list):
+        """Shared event funnel for both the streaming and non-streaming
+        paths: collects text/events for persistence AND feeds the
+        in-memory turn buffer that GET /responses/tail follows, so a
+        client can attach to any running turn — including scheduled
+        runs, which execute with stream=False."""
+        from cowork.services import stream_buffer
+
+        turn_buffer = stream_buffer.ensure_buffer(str(conversation_id))
+
+        def event_sink(event_type: str, data: dict) -> None:
+            collected_events.append(data)
+            if event_type == "response.output_text.delta":
+                collected_text.append(data.get("delta", ""))
+            turn_buffer.append(data)
+
+        return event_sink, turn_buffer
+
     async def _stream(
         self,
         stream,
@@ -128,11 +146,7 @@ class ResponsesHandler:
     ) -> AsyncGenerator[str, None]:
         collected_text: list[str] = []
         collected_events: list[dict] = []
-
-        def event_sink(event_type: str, data: dict) -> None:
-            collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+        event_sink, turn_buffer = self._make_event_sink(conversation_id, collected_text, collected_events)
 
         event_count = 0
         try:
@@ -172,6 +186,10 @@ class ResponsesHandler:
                 logger.exception("[responses] turn failed after %d event(s)", event_count)
             yield response_failed_sse(message, code)
             return
+        finally:
+            # Always close the buffer — a hung tail follower otherwise
+            # waits forever if the turn dies mid-stream.
+            turn_buffer.finish()
 
         logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
         self._save_assistant_turn(conversation_id, "".join(collected_text), collected_events)
@@ -185,11 +203,7 @@ class ResponsesHandler:
     ) -> Response:
         collected_text: list[str] = []
         collected_events: list[dict] = []
-
-        def event_sink(event_type: str, data: dict) -> None:
-            collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+        event_sink, turn_buffer = self._make_event_sink(conversation_id, collected_text, collected_events)
 
         try:
             async for _ in self.harness.formatter(stream, model, event_sink):
@@ -206,6 +220,8 @@ class ResponsesHandler:
                 raise HTTPException(status_code=400, detail=message)
             logger.exception("[responses] turn failed")
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
+        finally:
+            turn_buffer.finish()
 
         assistant_text = "".join(collected_text)
         self._save_assistant_turn(conversation_id, assistant_text, collected_events)
