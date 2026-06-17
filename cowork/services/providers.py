@@ -261,9 +261,19 @@ def build_llm_client():
             key = settings.minds_api_key
             if key is None:
                 raise ValueError("MindsHub API key is not configured")
+            # MindsHub speaks an OpenAI-compatible HTTP envelope but passes
+            # content straight through to Claude, so image blocks must stay
+            # in Anthropic shape (`type: image`). Without vision_format the
+            # OpenAIProvider defaults to "openai" and rewrites them to
+            # `image_url`, which Claude rejects (400: 'image_url' not an
+            # expected tag). FLAVOR_MINDS_PASSTHROUGH also enables the native
+            # web-tool passthrough for this endpoint.
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=minds_chat_base_url(settings.minds_url),
+                supports_vision=True,
+                vision_format="anthropic",
+                flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             key = settings.openai_api_key
