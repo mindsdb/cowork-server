@@ -6,6 +6,7 @@ response. Replace with real implementations as they're ported over.
 """
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import shutil
@@ -18,6 +19,8 @@ from fastapi.responses import FileResponse
 from sqlmodel import Session
 
 from cowork.db.session import get_session
+
+logger = logging.getLogger(__name__)
 
 # ── Integrations ─────────────────────────────────────────────────────
 
@@ -91,10 +94,25 @@ async def upload_attachment(
 ):
     from cowork.services.files import FileService
     svc = FileService(session)
+    purpose = _attachment_purpose(project_name, session_id)
     results = []
     for f in files:
-        created = await svc.create_file(upload=f, purpose=_attachment_purpose(project_name, session_id))
-        results.append(_to_attachment(svc.get_file_row(UUID(created.id))))
+        try:
+            created = await svc.create_file(upload=f, purpose=purpose)
+            results.append(_to_attachment(svc.get_file_row(UUID(created.id))))
+        except Exception as exc:
+            # Previously any failure here surfaced as an opaque 500 with no
+            # server log (e.g. an over-long `purpose` failing model
+            # validation — see the files.purpose width fix). Log the real
+            # cause and return an actionable error instead of a bare crash.
+            logger.exception(
+                "Attachment upload failed (project=%s session=%s file=%s)",
+                project_name, session_id, getattr(f, "filename", "?"),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to store attachment '{getattr(f, 'filename', '')}'.",
+            ) from exc
     return results
 
 

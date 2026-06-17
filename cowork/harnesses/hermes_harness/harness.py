@@ -363,18 +363,20 @@ class HermesHarness:
                 thinking_callback=thinking_callback,
             )
         else:
-            provider = settings.planning_provider.value
+            # The DB enum uses snake_case (openai_compatible) but AIAgent
+            # expects kebab-case (openai-compatible).
+            provider = settings.planning_provider.value.replace("_", "-")
             key_field = settings.planning_provider.api_key_field
             api_key = getattr(settings, key_field).get_secret_value()
 
             # AIAgent needs both api_key AND base_url to skip its config.yaml
             # provider-resolution path.  For providers that use the OpenAI-
-            # compatible API (openai, gemini, openai_compatible), we must
+            # compatible API (openai, gemini, openai-compatible), we must
             # supply a base_url. Anthropic is handled separately by AIAgent
             # (it detects provider="anthropic" and switches to the Anthropic
             # Messages API internally).
             base_url = _PROVIDER_BASE_URLS.get(provider)
-            if provider == "openai_compatible" and settings.openai_base_url:
+            if provider == "openai-compatible" and settings.openai_base_url:
                 base_url = settings.openai_base_url
 
             kwargs = dict(
