@@ -22,6 +22,12 @@ from cowork.schemas.responses import (
     ResponsesRequest,
     Role,
 )
+from cowork.handlers.turn_errors import (
+    GENERIC_TURN_ERROR_CODE,
+    GENERIC_TURN_ERROR_MESSAGE,
+    friendly_turn_error,
+    response_failed_sse,
+)
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
@@ -164,6 +170,22 @@ class ResponsesHandler:
                     except Exception:
                         pass
                 yield sse_string
+        except Exception as exc:
+            # A turn died mid-stream (e.g. a provider 400). Without this the
+            # exception would propagate out of the StreamingResponse and the
+            # client's SSE connection would just drop with no error event.
+            # Emit a `response.failed` instead: curated copy for failures we
+            # recognise (e.g. an unsupported image), redacted generic text
+            # otherwise so provider internals never leak. (cowork PR #156.)
+            friendly = friendly_turn_error(exc)
+            if friendly is not None:
+                code, message = friendly
+                logger.info("[responses] user-facing turn error: %s", exc)
+            else:
+                code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+                logger.exception("[responses] turn failed after %d event(s)", event_count)
+            yield response_failed_sse(message, code)
+            return
         finally:
             # Always close the buffer — a hung tail follower otherwise
             # waits forever if the turn dies mid-stream.
@@ -186,6 +208,18 @@ class ResponsesHandler:
         try:
             async for _ in self.harness.formatter(stream, model, event_sink):
                 pass
+        except Exception as exc:
+            # Mirror the streaming path: a recognised failure (e.g. an
+            # unsupported image) surfaces its curated message with a 400;
+            # anything else stays a generic 500 so provider internals never
+            # leak. (cowork PR #156.)
+            friendly = friendly_turn_error(exc)
+            if friendly is not None:
+                _, message = friendly
+                logger.info("[responses] user-facing turn error: %s", exc)
+                raise HTTPException(status_code=400, detail=message)
+            logger.exception("[responses] turn failed")
+            raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
         finally:
             turn_buffer.finish()
 
