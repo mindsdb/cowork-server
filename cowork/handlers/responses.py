@@ -22,6 +22,12 @@ from cowork.schemas.responses import (
     ResponsesRequest,
     Role,
 )
+from cowork.handlers.turn_errors import (
+    GENERIC_TURN_ERROR_CODE,
+    GENERIC_TURN_ERROR_MESSAGE,
+    friendly_turn_error,
+    response_failed_sse,
+)
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
@@ -129,26 +135,43 @@ class ResponsesHandler:
                 collected_text.append(data.get("delta", ""))
 
         event_count = 0
-        async for sse_string in self.harness.formatter(stream, model, event_sink):
-            event_count += 1
-            if event_count <= 3 or "response.completed" in sse_string:
-                logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
-            # Inject conversation_id and harness into the response.created
-            # event so the client learns the canonical id and which agent
-            # generated this response.
-            if "response.created" in sse_string and "conversation_id" not in sse_string:
-                try:
-                    lines = sse_string.strip().split("\n")
-                    data_line = next(l for l in lines if l.startswith("data:"))
-                    payload = json.loads(data_line[5:])
-                    payload["conversation_id"] = str(conversation_id)
-                    harness_id = getattr(self.harness, 'id', None)
-                    if harness_id:
-                        payload["harness"] = harness_id
-                    sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
-                except Exception:
-                    pass
-            yield sse_string
+        try:
+            async for sse_string in self.harness.formatter(stream, model, event_sink):
+                event_count += 1
+                if event_count <= 3 or "response.completed" in sse_string:
+                    logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
+                # Inject conversation_id and harness into the response.created
+                # event so the client learns the canonical id and which agent
+                # generated this response.
+                if "response.created" in sse_string and "conversation_id" not in sse_string:
+                    try:
+                        lines = sse_string.strip().split("\n")
+                        data_line = next(l for l in lines if l.startswith("data:"))
+                        payload = json.loads(data_line[5:])
+                        payload["conversation_id"] = str(conversation_id)
+                        harness_id = getattr(self.harness, 'id', None)
+                        if harness_id:
+                            payload["harness"] = harness_id
+                        sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
+                    except Exception:
+                        pass
+                yield sse_string
+        except Exception as exc:
+            # A turn died mid-stream (e.g. a provider 400). Without this the
+            # exception would propagate out of the StreamingResponse and the
+            # client's SSE connection would just drop with no error event.
+            # Emit a `response.failed` instead: curated copy for failures we
+            # recognise (e.g. an unsupported image), redacted generic text
+            # otherwise so provider internals never leak. (cowork PR #156.)
+            friendly = friendly_turn_error(exc)
+            if friendly is not None:
+                code, message = friendly
+                logger.info("[responses] user-facing turn error: %s", exc)
+            else:
+                code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+                logger.exception("[responses] turn failed after %d event(s)", event_count)
+            yield response_failed_sse(message, code)
+            return
 
         logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
         self._save_assistant_turn(conversation_id, "".join(collected_text), collected_events)
@@ -168,8 +191,21 @@ class ResponsesHandler:
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
-        async for _ in self.harness.formatter(stream, model, event_sink):
-            pass
+        try:
+            async for _ in self.harness.formatter(stream, model, event_sink):
+                pass
+        except Exception as exc:
+            # Mirror the streaming path: a recognised failure (e.g. an
+            # unsupported image) surfaces its curated message with a 400;
+            # anything else stays a generic 500 so provider internals never
+            # leak. (cowork PR #156.)
+            friendly = friendly_turn_error(exc)
+            if friendly is not None:
+                _, message = friendly
+                logger.info("[responses] user-facing turn error: %s", exc)
+                raise HTTPException(status_code=400, detail=message)
+            logger.exception("[responses] turn failed")
+            raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
 
         assistant_text = "".join(collected_text)
         self._save_assistant_turn(conversation_id, assistant_text, collected_events)
