@@ -153,6 +153,19 @@ class OAuthSettings(Settings):
     )
 
 
+class StreamSettings(Settings):
+    backend: str = Field(
+        default="file",
+        validation_alias=AliasChoices("COWORK_STREAM_BACKEND"),
+        description="Turn-stream buffer backend: 'file' (desktop / single-instance cloud) or 'redis' (multi-instance cloud, WIP)",
+    )
+    dir: str = Field(
+        default=str(Path.home() / ".cowork" / "streams"),
+        validation_alias=AliasChoices("COWORK_STREAMS_DIR"),
+        description="Root directory for file-backed turn-stream buffers",
+    )
+
+
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
