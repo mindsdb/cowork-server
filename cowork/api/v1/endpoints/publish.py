@@ -4,6 +4,8 @@ Ported from cowork/server/routes/utilities.py (publish section).
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -16,13 +18,25 @@ from cowork.services.publish import (
 router = APIRouter()
 
 
+class _AccessBody(BaseModel):
+    # Mutually exclusive publish modes (ENG-322):
+    #   public     — anyone with the link
+    #   password   — visitors must enter `password`
+    #   restricted — only `emails` and/or everyone in the owner's org
+    mode: Literal["public", "password", "restricted"] = "public"
+    password: str | None = None
+    emails: list[str] = []
+    org_allowed: bool = False
+
+
 class _PublishBody(BaseModel):
     path: str
-    # Optional access password. When set, the artifact is published
-    # password-protected — only a hash leaves this machine; the plaintext
-    # is kept in .published.json for the in-app reveal. Omit / empty to
-    # publish (or re-publish) as public.
+    # Back-compat: a bare top-level password still publishes password-protected.
+    # New clients send the structured `access` object instead. Only a hash (and,
+    # for restricted, the email list) leaves this machine; plaintext stays in
+    # .published.json for the in-app reveal.
     password: str | None = None
+    access: _AccessBody | None = None
 
 
 @router.get("/")
@@ -33,7 +47,7 @@ async def list_publishable_endpoint():
 @router.post("/")
 async def publish_artifact(req: _PublishBody):
     try:
-        return _publish(req.path, req.password)
+        return _publish(req.path, req.password, access=req.access.model_dump() if req.access else None)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
