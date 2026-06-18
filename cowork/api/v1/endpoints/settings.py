@@ -94,12 +94,12 @@ def validate_settings(session: SessionDep):
 @router.get("/configured")
 def check_configured(session: SessionDep):
     s = SettingService(session).load()
+    if s.minds_api_key is not None:
+        return {"configured": True, "provider": "minds-cloud"}
     if s.anthropic_api_key is not None:
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
-    if s.minds_api_key is not None:
-        return {"configured": True, "provider": "minds"}
     return {"configured": False, "provider": ""}
 
 
@@ -203,21 +203,26 @@ async def recommended_models(session: SessionDep):
 _ENV_PATH = Path.home() / ".anton" / ".env"
 
 
+def _parse_dotenv_content(content: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        result[key.strip()] = val.strip().strip('"').strip("'")
+    return result
+
+
 @router.get("/raw")
 def read_raw_settings():
     if not _ENV_PATH.exists():
         return {}
-    result: dict[str, str] = {}
     try:
-        for line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            result[key.strip()] = val.strip().strip('"').strip("'")
+        return _parse_dotenv_content(_ENV_PATH.read_text(encoding="utf-8"))
     except Exception:
         pass
-    return result
+    return {}
 
 
 class _RawSettingsBody(BaseModel):
@@ -225,16 +230,41 @@ class _RawSettingsBody(BaseModel):
 
 
 @router.post("/raw")
-def write_raw_settings(body: _RawSettingsBody):
+def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
+    """Merge dotenv content into ~/.anton/.env and sync recognised keys to the DB.
+
+    Uses key-level merge (not full overwrite) because callers like the
+    OAuth token refresh only send a subset of keys — a full overwrite
+    would wipe model config and other settings from .env.
+
+    The .env persists for the standalone ``anton`` CLI and is read by
+    ``GET /raw``; the DB is authoritative for cowork-server.  By syncing
+    to both we keep them consistent regardless of which frontend code
+    path writes settings (onboarding, OAuth token refresh, etc.)."""
+    from cowork.migrations import sync_env_vars_to_db
+
+    incoming = _parse_dotenv_content(body.content)
+
     try:
+        existing = read_raw_settings()
+        existing.update(incoming)
+
+        # Sync recognised ANTON_* vars to the DB first. If validation fails,
+        # leave the legacy .env untouched so the DB remains authoritative.
+        sync_env_vars_to_db(session, existing)
+
         _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ENV_PATH.write_text(body.content + "\n", encoding="utf-8")
+        lines = [f"{k}={v}" for k, v in existing.items()]
+        _ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
         try:
             _ENV_PATH.chmod(0o600)
         except OSError:
             pass
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail="Settings could not be saved.") from e
+
     return {"ok": True}
 
 
