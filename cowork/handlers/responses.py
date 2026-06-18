@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator
@@ -10,8 +11,10 @@ from fastapi import HTTPException
 from sqlmodel import Session
 
 from cowork.common.settings.user_settings import get_user_settings
+from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
 from cowork.models.message import Message as DBMessage
+from cowork.streaming import new_buffer, registry
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -91,10 +94,48 @@ class ResponsesHandler:
 
         self.last_conversation_id = str(conversation.id)
 
-        # Pre-load messages before committing the new user message so the ORM
-        # cache doesn't include it when _build_chat_session reads history.
+        # Pre-load messages before adding the new user message so the ORM
+        # cache (and thus the harness's initial_history) doesn't include the
+        # current turn's input — it's passed separately via `input`.
         _ = conversation.messages
+        # turn_id: prior message count. The current user message is NOT
+        # persisted yet (deferred to the producer for the streaming path), so
+        # this is a stable per-conversation index for the buffer file.
+        turn_id = len(conversation.messages)
 
+        disabled = (
+            [dc.model_dump() for dc in request.disabled_connections]
+            if request.disabled_connections else None
+        )
+
+        if request.stream:
+            # Detached + resumable. The agent run executes in a background
+            # task that writes events to a per-turn buffer; this request just
+            # tails the buffer. Closing the connection never reaches the
+            # producer — only an explicit /cancel does. The user message is
+            # persisted by the producer at the end (deferred), so the harness
+            # reads history WITHOUT the current turn (see _produce).
+            buffer = new_buffer(str(conversation.id), turn_id)
+            await registry.start(
+                conversation_id=str(conversation.id),
+                turn_id=turn_id,
+                buffer=buffer,
+                producer_coro=self._produce(
+                    conv_id=conversation.id,
+                    harness_input=harness_input,
+                    original_content=original_content,
+                    model=request.model,
+                    disabled=disabled,
+                    harness_name=get_user_settings().harness,
+                    harness_id=getattr(self.harness, "id", None),
+                    buffer=buffer,
+                ),
+            )
+            return sse_from_buffer(buffer, 0)
+
+        # Non-streaming (legacy/rare): persist the user message inline (via FK,
+        # not the relationship, so the cached history above stays clean) and
+        # run synchronously within the request.
         user_message = DBMessage(
             conversation_id=conversation.id,
             role=Role.user,
@@ -104,77 +145,107 @@ class ResponsesHandler:
         self.session.commit()
         self.session.refresh(user_message)
 
-        # The model provided as part of the request is ignored for now, because the Cowork
-        # UI does not currently provide a way to specify it when making each request.
-        # It is only extracted from the values specified in the settings.
         stream = self.harness.stream_response(
             conversation=conversation,
             input=harness_input,
-            # model=request.model,
-            disabled_connections=[dc.model_dump() for dc in request.disabled_connections]
-            if request.disabled_connections else None,
+            disabled_connections=disabled,
         )
-
-        if request.stream:
-            return self._stream(stream, conversation.id, request.model)
-
         return await self._collect(stream, conversation.id, request.model, str(user_message.id))
 
-    async def _stream(
+    async def _produce(
         self,
-        stream,
-        conversation_id: UUID,
+        *,
+        conv_id: UUID,
+        harness_input: list[dict],
+        original_content,
         model: str,
-    ) -> AsyncGenerator[str, None]:
+        disabled: list[dict] | None,
+        harness_name: str,
+        harness_id: str | None,
+        buffer,
+    ) -> None:
+        """Detached producer: run the turn and write events to the buffer.
+
+        Runs in its OWN DB session (it outlives the request). Persistence is
+        deferred to the end so the harness reads history WITHOUT the current
+        user message; on terminal we persist user + assistant together.
+        Never reaches the HTTP response — readers tail the buffer.
+        """
+        own = get_open_session()
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        persisted = False
 
         def event_sink(event_type: str, data: dict) -> None:
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
-        event_count = 0
+        def persist() -> None:
+            nonlocal persisted
+            if persisted:
+                return
+            persisted = True
+            try:
+                own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
+                own.commit()
+                ConversationService(own).save_assistant_turn(
+                    conv_id, "".join(collected_text), collected_events, harness=harness_id,
+                )
+            except Exception:
+                logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
+
         try:
-            async for sse_string in self.harness.formatter(stream, model, event_sink):
+            conv = ConversationService(own).get_conversation(conv_id)
+            harness = get_harness(harness_name)
+            stream = harness.stream_response(
+                conversation=conv, input=harness_input, disabled_connections=disabled,
+            )
+            event_count = 0
+            async for sse_string in harness.formatter(stream, model, event_sink):
                 event_count += 1
-                if event_count <= 3 or "response.completed" in sse_string:
-                    logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
-                # Inject conversation_id and harness into the response.created
-                # event so the client learns the canonical id and which agent
-                # generated this response.
-                if "response.created" in sse_string and "conversation_id" not in sse_string:
-                    try:
-                        lines = sse_string.strip().split("\n")
-                        data_line = next(l for l in lines if l.startswith("data:"))
-                        payload = json.loads(data_line[5:])
-                        payload["conversation_id"] = str(conversation_id)
-                        harness_id = getattr(self.harness, 'id', None)
-                        if harness_id:
-                            payload["harness"] = harness_id
-                        sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
-                    except Exception:
-                        pass
-                yield sse_string
+                sse_string = self._inject_created(sse_string, conv_id, harness_id)
+                await buffer.append("sse", {"sse": sse_string})
+            logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
+            persist()
+            await buffer.close("completed")
+        except asyncio.CancelledError:
+            # Explicit /cancel (Stop button). Buffer writes are synchronous
+            # for the file backend, so they complete despite cancellation.
+            await buffer.append("sse", {"sse": response_failed_sse("Stopped by user.", "cancelled")})
+            persist()
+            await buffer.close("cancelled")
+            return
         except Exception as exc:
-            # A turn died mid-stream (e.g. a provider 400). Without this the
-            # exception would propagate out of the StreamingResponse and the
-            # client's SSE connection would just drop with no error event.
-            # Emit a `response.failed` instead: curated copy for failures we
-            # recognise (e.g. an unsupported image), redacted generic text
-            # otherwise so provider internals never leak. (cowork PR #156.)
             friendly = friendly_turn_error(exc)
             if friendly is not None:
                 code, message = friendly
                 logger.info("[responses] user-facing turn error: %s", exc)
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
-                logger.exception("[responses] turn failed after %d event(s)", event_count)
-            yield response_failed_sse(message, code)
-            return
+                logger.exception("[responses] turn failed for conversation %s", conv_id)
+            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            persist()
+            await buffer.close("error")
+        finally:
+            own.close()
 
-        logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
-        self._save_assistant_turn(conversation_id, "".join(collected_text), collected_events)
+    @staticmethod
+    def _inject_created(sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
+        """Inject conversation_id + harness into the response.created event so
+        the client learns the canonical id and which agent generated this."""
+        if "response.created" in sse_string and "conversation_id" not in sse_string:
+            try:
+                lines = sse_string.strip().split("\n")
+                data_line = next(l for l in lines if l.startswith("data:"))
+                payload = json.loads(data_line[5:])
+                payload["conversation_id"] = str(conversation_id)
+                if harness_id:
+                    payload["harness"] = harness_id
+                return f"event: response.created\ndata: {json.dumps(payload)}\n\n"
+            except Exception:
+                pass
+        return sse_string
 
     async def _collect(
         self,
@@ -335,3 +406,17 @@ class ResponsesHandler:
             status=ResponseStatus.completed,
             content=[ResponseOutputContent(text=text)],
         )
+
+
+async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None]:
+    """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
+    then live-tailing. Used by both the initial POST /responses stream
+    (from_seq=0) and reconnects via GET /responses/tail. The terminal record
+    just ends the stream — the harness's own response.completed/failed frame
+    was already written as a normal record."""
+    async for rec in buffer.tail(from_seq):
+        if rec.is_terminal:
+            return
+        sse = rec.data.get("sse")
+        if sse:
+            yield sse

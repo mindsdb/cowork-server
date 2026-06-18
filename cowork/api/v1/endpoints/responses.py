@@ -1,15 +1,15 @@
-"""
-Responses API endpoints for API v1.
+"""Responses API endpoints (OpenAI-compatible Responses API).
 
-This module contains endpoints for handling OpenAI-compatible Responses API requests,
-including both streaming and non-streaming responses.
+Streaming turns run **detached**: POST /responses starts a background
+producer (see handlers.responses + cowork.streaming) that writes to a
+per-turn buffer; the response tails that buffer. Closing the connection
+does NOT stop the run — the client reconnects via GET /responses/tail
+with a `from_seq` cursor and resumes from where it left off. Only an
+explicit POST /responses/cancel halts the producer.
 """
-
-import asyncio
-import threading
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -17,8 +17,9 @@ from starlette.responses import JSONResponse
 
 from cowork.common.logger import setup_logging
 from cowork.db.session import get_session
-from cowork.handlers.responses import ResponsesHandler
+from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.schemas.responses import ResponsesRequest
+from cowork.streaming import registry
 
 
 logger = setup_logging()
@@ -26,35 +27,11 @@ logger = setup_logging()
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
-# In-memory tracking of conversations with active streams.
-_active_streams: dict[str, asyncio.Event] = {}
-_active_streams_lock = threading.Lock()
-
-
-def mark_stream_active(conversation_id: str) -> asyncio.Event:
-    cancel_event = asyncio.Event()
-    with _active_streams_lock:
-        _active_streams[conversation_id] = cancel_event
-    return cancel_event
-
-
-def mark_stream_finished(conversation_id: str) -> None:
-    with _active_streams_lock:
-        _active_streams.pop(conversation_id, None)
-
-
-def get_active_stream_ids() -> list[str]:
-    with _active_streams_lock:
-        return list(_active_streams.keys())
-
-
-def request_cancel(conversation_id: str) -> bool:
-    with _active_streams_lock:
-        event = _active_streams.get(conversation_id)
-    if event is None:
-        return False
-    event.set()
-    return True
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+}
 
 
 @router.options("/")
@@ -70,45 +47,46 @@ async def options_handler():
 
 
 @router.post("/")
-async def responses(
-    responses_request: ResponsesRequest,
-    session: SessionDep,
-):
+async def responses(responses_request: ResponsesRequest, session: SessionDep):
     handler = ResponsesHandler(session)
     result = await handler.handle(responses_request)
-
     if responses_request.stream:
-        conversation_id = handler.last_conversation_id
-        cancel_event = None
-        if conversation_id:
-            cancel_event = mark_stream_active(conversation_id)
-
-        async def tracked_stream():
-            try:
-                async for chunk in result:
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    yield chunk
-            finally:
-                if conversation_id:
-                    mark_stream_finished(conversation_id)
-
-        return StreamingResponse(tracked_stream(), media_type="text/event-stream")
-
+        # `result` is sse_from_buffer(buffer, 0); the producer is already
+        # running detached in the registry.
+        return StreamingResponse(result, media_type="text/event-stream", headers=_SSE_HEADERS)
     return result
 
 
 @router.get("/in-flight-list")
 async def in_flight_list():
-    """List conversations with active streams."""
-    return {"in_flight": [{"conversation_id": cid} for cid in get_active_stream_ids()]}
+    """Conversations whose producer task is currently running. Cheap
+    in-memory lookup — the renderer uses it to sync stream state across
+    clients/boots."""
+    return {
+        "in_flight": [
+            {"conversation_id": h.conversation_id, "turn_id": h.turn_id, "latest_seq": h.buffer.latest_seq}
+            for h in registry.in_flight()
+        ],
+    }
 
 
 @router.get("/in-flight")
 async def in_flight(conversation_id: str | None = None):
-    """Check if a conversation has an active stream."""
-    active = conversation_id in get_active_stream_ids() if conversation_id else False
-    return {"in_flight": active, "conversation_id": conversation_id}
+    """Probe so the renderer can decide whether to open a /tail on mount.
+
+    `latest_seq` is the count of records so far; pass `from_seq=0` to
+    replay the whole turn on first reconnect, or the last-rendered seq to
+    resume without re-rendering.
+    """
+    handle = registry.get(conversation_id) if conversation_id else None
+    if handle is None:
+        return {"in_flight": False, "has_buffer": False, "latest_seq": 0, "turn_id": None}
+    return {
+        "in_flight": handle.is_running,
+        "has_buffer": True,
+        "latest_seq": handle.buffer.latest_seq,
+        "turn_id": handle.turn_id,
+    }
 
 
 class CancelRequest(BaseModel):
@@ -117,22 +95,26 @@ class CancelRequest(BaseModel):
 
 @router.post("/cancel")
 async def cancel_response(req: CancelRequest):
-    """Cancel an active stream for the given conversation."""
-    cancelled = request_cancel(req.conversation_id)
+    """Halt the in-flight producer (Stop button). Fetch-abort / tab-close
+    does NOT cancel — only this does."""
+    cancelled = await registry.cancel(req.conversation_id)
     return {"cancelled": cancelled, "conversation_id": req.conversation_id}
 
 
 @router.get("/tail")
-async def tail_response(conversation_id: str | None = None):
-    """Tail/reconnect to an active stream.
-
-    Currently returns the stream status. Full reconnect with event replay
-    is not yet implemented — the client should fall back to
-    GET /conversations/{id}/items for persisted history.
-    """
-    if not conversation_id:
-        return {"status": "not_found"}
-    active = conversation_id in get_active_stream_ids()
-    if not active:
-        return {"status": "not_found"}
-    return {"status": "active", "conversation_id": conversation_id}
+async def tail_response(
+    conversation_id: str = Query(..., description="Conversation to tail."),
+    from_seq: int = Query(0, ge=0, description="Resume from this seq; records with seq >= from_seq are replayed, then live-tail."),
+):
+    """Reconnect to an in-flight (or just-finished) turn: replay from
+    `from_seq` then live-tail to the terminal record. 404 when no buffer is
+    registered — the client should fall back to GET /conversations/{id}/items
+    for the persisted history."""
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+    return StreamingResponse(
+        sse_from_buffer(handle.buffer, from_seq),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )

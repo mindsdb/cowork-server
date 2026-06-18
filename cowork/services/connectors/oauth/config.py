@@ -16,9 +16,7 @@ GOOGLE_SERVICES: dict[str, GoogleServiceConfig] = {
             "openid",
             "email",
             "profile",
-            "https://www.googleapis.com/auth/drive.readonly",
             "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive",
         ],
     ),
     "google-calendar": GoogleServiceConfig(
@@ -59,15 +57,6 @@ GOOGLE_SERVICES: dict[str, GoogleServiceConfig] = {
             "email",
             "profile",
             "https://www.googleapis.com/auth/analytics.readonly",
-        ],
-    ),
-    "gcp": GoogleServiceConfig(
-        engine="gcp",
-        scopes=[
-            "openid",
-            "email",
-            "profile",
-            "https://www.googleapis.com/auth/cloud-platform",
         ],
     ),
 }
