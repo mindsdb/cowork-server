@@ -483,6 +483,10 @@ class AntonHarness:
             harness=self.id,
             proactive_dashboards=settings.proactive_dashboards,
             act_first=settings.act_first,
+            # Task-anchored clock: the conversation's created_at keeps the
+            # system-prompt date byte-identical across every turn of this task,
+            # so the prompt prefix stays cache-stable (see anton 2a).
+            clock=conversation.created_at,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
                 PUBLISH_TOOL,
