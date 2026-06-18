@@ -172,3 +172,41 @@ class TaskObjectService:
         if old_purpose == new_purpose:
             return 0
         return FileService(self.session).relink_purpose(old_purpose, new_purpose)
+
+
+# ── run-boundary attribution ──────────────────────────────────────────────
+# Anton runs with its own episodic session id and never tags artifacts with
+# the cowork conversation_id, so provenance can't tell us which task created
+# which artifact. Instead cowork-server (which DOES know the conversation it's
+# running) snapshots the project's artifact folders before a turn and records
+# any that appear afterward as owned by that conversation. Harness-agnostic
+# and needs no agent change.
+
+def snapshot_artifact_slugs(artifacts_base) -> set[str]:
+    """The set of artifact folder names under a project's artifacts dir."""
+    base = Path(artifacts_base)
+    if not base.is_dir():
+        return set()
+    return {
+        child.name
+        for child in base.iterdir()
+        if child.is_dir() and (child / "metadata.json").is_file()
+    }
+
+
+def index_new_artifacts(conversation_id, project_id, artifacts_base, before: set[str]) -> None:
+    """After a turn, index any artifact folders that appeared during it as
+    owned by this conversation. Opens its own DB session (called from the
+    harness, outside a request)."""
+    after = snapshot_artifact_slugs(artifacts_base)
+    new = after - set(before or ())
+    if not new:
+        return
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine, get_session_factory
+
+    factory = get_session_factory(get_engine(get_app_settings().database.uri))
+    with factory() as session:
+        svc = TaskObjectService(session)
+        for slug in sorted(new):
+            svc.index_artifact(conversation_id, project_id, slug)
