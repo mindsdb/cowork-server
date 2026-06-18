@@ -232,12 +232,21 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
 def _published_access_for(folder: Path, primary: Path | None) -> dict:
     """Owner-side access state for the primary file, from `.published.json`.
 
-    Returns {"accessProtected": bool, "accessPassword": str}. The plaintext
-    password is owner-only — `.published.json` never enters the published
-    bundle — and powers the in-app eye-reveal. Callers must only return
-    this to the artifact's owner (the local/authenticated session).
+    Returns ``accessMode`` (public|password|restricted) plus the mode-specific
+    state needed to pre-fill the publish dialog on re-publish:
+    ``accessProtected``/``accessPassword`` (password) and
+    ``accessEmails``/``orgAllowed`` (restricted). The plaintext password and
+    the email list are owner-only — `.published.json` never enters the
+    published bundle — so callers must only return this to the artifact's owner
+    (the local/authenticated session).
     """
-    out = {"accessProtected": False, "accessPassword": ""}
+    out = {
+        "accessMode": "public",
+        "accessProtected": False,
+        "accessPassword": "",
+        "accessEmails": [],
+        "orgAllowed": False,
+    }
     if primary is None:
         return out
     published_index = folder / ".published.json"
@@ -246,9 +255,17 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
     try:
         pmap = json.loads(published_index.read_text(encoding="utf-8"))
         entry = pmap.get(primary.name)
-        if isinstance(entry, dict) and entry.get("requires_password"):
-            out["accessProtected"] = True
-            out["accessPassword"] = entry.get("access_password", "") or ""
+        if isinstance(entry, dict):
+            # `mode` is authoritative; fall back to the legacy requires_password
+            # flag for artifacts published before the mode field existed.
+            mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
+            out["accessMode"] = mode
+            if mode == "password":
+                out["accessProtected"] = True
+                out["accessPassword"] = entry.get("access_password", "") or ""
+            elif mode == "restricted":
+                out["accessEmails"] = entry.get("emails", []) or []
+                out["orgAllowed"] = bool(entry.get("org_allowed"))
     except Exception:
         pass
     return out

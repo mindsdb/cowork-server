@@ -5,6 +5,7 @@ This module sets up the FastAPI application with middleware, routing,
 and all necessary configurations for the Cowork service.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,18 +13,44 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cowork.api.v1.router import api_router as v1_router
 from cowork.common.logger import setup_logging
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
+from cowork.services.connectors.oauth.google import google_service
 
 
 # Set up logging
 logger = setup_logging()
 
 
+async def _token_refresh_loop() -> None:
+    while True:
+        await asyncio.sleep(30 * 60)
+        logger.info("Running Google token refresh check")
+        try:
+            google_service.refresh_all_tokens(ConnectorSettings(), OAuthSettings())
+        except Exception:
+            logger.exception("Token refresh loop error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        token_refresh_task = asyncio.create_task(_token_refresh_loop())
+    except Exception:
+        logger.exception("Failed to start token refresh loop")
+        token_refresh_task = None
     run_dev_setup()
+    # Seal any turn buffers left open by a previous process (crash/restart)
+    # so reconnecting clients get a clean Interrupted end-of-stream rather
+    # than hanging. GC of old buffers happens lazily; cheap no-op when none.
+    try:
+        from cowork.streaming import get_streams_dir
+        from cowork.streaming.recovery import gc_old_buffers, seal_orphan_buffers
+        seal_orphan_buffers(get_streams_dir())
+        gc_old_buffers(get_streams_dir(), max_age_days=7)
+    except Exception:
+        logger.exception("turn-buffer boot recovery failed (non-fatal)")
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.ingress import sync_channel_ingress
