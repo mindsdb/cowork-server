@@ -41,16 +41,38 @@ PROGRESS_THROTTLE = 0.25  # seconds
 
 
 def classify_cell_status(content: str) -> str:
-    """Classify a scratchpad tool-result string as ok / timeout / error.
+    """Classify a scratchpad tool-result as ok / timeout / error.
 
     The renderer uses this to show a killed cell as distinctly dead rather
-    than indistinguishable from a slow-but-running one. Markers match the
-    strings anton produces: a timeout/inactivity kill (`core/backends/local.py`)
-    and the bracketed `[error]` / empty-code (`exec failed`) results
-    (`format_cell_result` / `prepare_scratchpad_exec`).
+    than indistinguishable from a slow-but-running one.
+
+    An exec result arrives as ``json.dumps(asdict(cell))`` (see
+    ``ChatSession.turn_stream`` → ``StreamToolResult``), so we inspect the
+    structured ``error`` field rather than sniffing the rendered text. That
+    matters: a *successful* cell whose own stdout contains "[error]" or
+    "Cell timed out" (e.g. a log-analysis cell) must NOT be misclassified —
+    only the cell's error field decides. Non-exec results (e.g. a `dump`
+    notebook string, or other tools) aren't JSON; for those we fall back to
+    a best-effort text sniff. Timeout-kill text in the error → "timeout";
+    any other non-empty error → "error".
     """
-    low = (content or "").lower()
-    if "cell timed out" in low or "cell killed" in low or "of inactivity" in low:
+    if not content:
+        return "ok"
+    try:
+        cell = json.loads(content)
+    except (ValueError, TypeError):
+        cell = None
+    if isinstance(cell, dict) and "error" in cell:
+        err = (cell.get("error") or "").strip()
+        if not err:
+            return "ok"
+        low = err.lower()
+        if "timed out" in low or "of inactivity" in low or "cell killed" in low:
+            return "timeout"
+        return "error"
+    # Fallback for non-JSON results (dump notebook, non-scratchpad tools).
+    low = content.lower()
+    if "cell timed out" in low or "of inactivity" in low or "cell killed" in low:
         return "timeout"
     if "[error]" in low or "exec failed" in low:
         return "error"
