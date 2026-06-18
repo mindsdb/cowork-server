@@ -5,12 +5,16 @@ harness runtime symlinks exist.
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 from pathlib import Path
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.memory.adapter import BaseMemoryAdapter
 from cowork.harnesses.memory.registry import SLOT_REGISTRY
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryLayout:
@@ -37,7 +41,17 @@ class MemoryLayout:
         return self._memory_root
 
     def _ensure_symlink(self, link: Path, target: Path) -> None:
-        """Create a relative symlink from link → target. Never clobber a real file."""
+        """Link a harness runtime path → the canonical slot file.
+
+        Prefers a relative symlink. On Windows, creating a symlink needs
+        Administrator or Developer Mode and otherwise raises OSError
+        (WinError 1314), which would crash layout setup. When symlinks
+        aren't permitted we fall back to a one-time copy so the app still
+        starts — but the copy is independent of the canonical file, so that
+        harness's memory is NOT shared on such a platform. We log a warning
+        to make the degraded state visible (enable Developer Mode for
+        sharing). Never clobbers a pre-existing real file.
+        """
         link = link.expanduser()
         target = target.expanduser().resolve()
 
@@ -52,7 +66,16 @@ class MemoryLayout:
 
         link.parent.mkdir(parents=True, exist_ok=True)
         rel = os.path.relpath(target, link.parent)
-        link.symlink_to(rel)
+
+        try:
+            link.symlink_to(rel)
+        except OSError as exc:
+            logger.warning(
+                "symlink %s -> %s failed (%s); copied instead — this harness's "
+                "memory will NOT be shared on this platform (enable Developer "
+                "Mode on Windows for sharing)", link, target, exc,
+            )
+            shutil.copyfile(target, link)
 
     def ensure_layout(self, adapters: list[BaseMemoryAdapter]) -> None:
         """Ensure canonical files exist and create adapter-declared runtime symlinks."""
