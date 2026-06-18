@@ -1,0 +1,40 @@
+"""Backend selection for turn-stream buffers.
+
+Configured via ``StreamSettings`` (common/settings/app_settings.py):
+  - ``backend`` (env ``COWORK_STREAM_BACKEND``, default ``file``) —
+    ``file`` = FileStreamBuffer (desktop + single-instance cloud);
+    ``redis`` = RedisStreamBuffer (multi-instance cloud, WIP).
+  - ``dir`` (env ``COWORK_STREAMS_DIR``, default ``~/.cowork/streams``) —
+    root for file-backed buffers.
+
+The rest of the app only calls ``new_buffer()`` / ``get_streams_dir()``,
+so swapping the backend is a one-line settings change with no call-site churn.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from cowork.common.settings.app_settings import StreamSettings
+from cowork.streaming.buffer import (
+    FileStreamBuffer,
+    RedisStreamBuffer,
+    StreamBuffer,
+    turn_buffer_path,
+)
+
+
+def get_backend() -> str:
+    return (StreamSettings().backend or "file").strip().lower()
+
+
+def get_streams_dir() -> Path:
+    return Path(StreamSettings().dir)
+
+
+def new_buffer(conversation_id: str, turn_id: int) -> StreamBuffer:
+    """Construct the buffer for a new turn on the configured backend."""
+    backend = get_backend()
+    if backend == "redis":
+        # WIP — raises NotImplementedError until the cloud move wires it.
+        return RedisStreamBuffer(conversation_id=conversation_id, turn_id=turn_id)
+    return FileStreamBuffer(turn_buffer_path(get_streams_dir(), conversation_id, turn_id))

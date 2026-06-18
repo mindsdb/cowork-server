@@ -7,6 +7,11 @@ from cowork.dev_setup import run_dev_setup
 
 
 def main() -> None:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=False)
+    except ImportError:
+        pass
     settings = get_app_settings()
     port = settings.port
     host = settings.host
