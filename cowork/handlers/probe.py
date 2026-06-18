@@ -127,10 +127,10 @@ class ProbeHandler:
             if method:
                 form_spec["selected_method"] = method
 
-            # Save without probe when there is no conversation context, or no
-            # registry spec — there is no engine to verify a handcrafted
-            # connector against.
-            if db_conversation_id is None or spec is None:
+            # Save without probe only when there is no registry spec —
+            # there is no engine to verify a handcrafted connector against.
+            # Missing conversation context is fine: a temp workspace is created below.
+            if spec is None:
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
@@ -147,7 +147,7 @@ class ProbeHandler:
                     })
                     self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
                     return
-                reason = "no conversation context" if db_conversation_id is None else "connector is not in the registry"
+                reason = "connector is not in the registry"
                 yield _delta(f"Saved as `{slug}` (no live probe — {reason}).\n\n")
                 yield _patch_delta({
                     "form_id": form_id,
