@@ -130,3 +130,73 @@ def test_collect_raises_500_generic_for_unmapped_error():
     assert err.value.status_code == 500
     assert err.value.detail == te.GENERIC_TURN_ERROR_MESSAGE
     assert "secret-token" not in err.value.detail
+
+
+# ── Token-limit (quota) detection / mapping ───────────────────────
+#
+# When an account's included-token allowance is spent, anton raises
+# TokenLimitExceeded mid-turn. Before this was mapped, the exception
+# aborted the SSE generator with no terminal event — the connection just
+# closed and the renderer's spinner stopped, reading as "Anton is dead".
+# These tests pin that a quota failure now surfaces curated copy on both
+# paths instead.
+
+# The stable 429 message anton builds for this case. Used to exercise the
+# type-independent fallback path (no anton import needed).
+_TOKEN_LIMIT_MESSAGE = (
+    "Server returned 429 — Monthly limit exceeded for tokens: 5000000/5000000 "
+    "Visit https://console.mindshub.ai to upgrade or to top up your tokens."
+)
+
+
+def test_detects_token_limit_via_anton_type():
+    provider = pytest.importorskip("anton.core.llm.provider")
+    assert te.is_token_limit_error(provider.TokenLimitExceeded(_TOKEN_LIMIT_MESSAGE)) is True
+
+
+def test_detects_token_limit_via_message_fallback():
+    # Even when the anton type isn't importable, the 429 message is stable
+    # enough to recognise so the quota case never falls through to generic.
+    assert te.is_token_limit_error(Exception(_TOKEN_LIMIT_MESSAGE)) is True
+
+
+def test_token_limit_requires_both_signals():
+    # A bare 429 (rate limit, not quota) or the tokens phrase on its own
+    # must NOT be misread as an exhausted allowance.
+    assert te.is_token_limit_error(Exception("Server returned 429 — too many requests")) is False
+    assert te.is_token_limit_error(Exception("Monthly limit exceeded for tokens")) is False
+
+
+def test_maps_token_limit_to_curated_copy():
+    result = te.friendly_turn_error(Exception(_TOKEN_LIMIT_MESSAGE))
+    assert result is not None
+    code, message = result
+    assert code == te.TOKEN_LIMIT_CODE
+    assert message == te.TOKEN_LIMIT_USER_MESSAGE
+    # Raw provider usage figures must not leak into the user copy.
+    assert "5000000" not in message
+
+
+def test_token_limit_takes_precedence_over_generic():
+    # A quota failure must map to curated copy, never the redacted generic.
+    code, _ = te.friendly_turn_error(Exception(_TOKEN_LIMIT_MESSAGE))
+    assert code != te.GENERIC_TURN_ERROR_CODE
+
+
+def test_stream_emits_friendly_failed_event_for_token_limit():
+    frames = asyncio.run(_collect_stream(_handler_with_raising_formatter(Exception(_TOKEN_LIMIT_MESSAGE))))
+    # created frame still came through, then a clean quota failure — no raise.
+    assert any("response.created" in f for f in frames)
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.TOKEN_LIMIT_CODE
+    assert payload["error"] == te.TOKEN_LIMIT_USER_MESSAGE
+
+
+def test_collect_raises_400_with_curated_message_for_token_limit():
+    handler = _handler_with_raising_formatter(Exception(_TOKEN_LIMIT_MESSAGE))
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
+    assert err.value.status_code == 400
+    assert err.value.detail == te.TOKEN_LIMIT_USER_MESSAGE
