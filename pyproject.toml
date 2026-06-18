@@ -1,6 +1,6 @@
 [project]
 name = "cowork-server"
-version = "0.1.8"
+version = "0.1.9"
 description = "FastAPI backend for the MindsHub Cowork desktop app"
 readme = "README.md"
 license = "LicenseRef-Proprietary"
