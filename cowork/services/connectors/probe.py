@@ -400,7 +400,6 @@ class CredentialProbe:
                     "credential set, then exit. Don't narrate. Don't ask "
                     "the user questions in prose."
                 ),
-                output_context="",
             ),
             workspace=self.workspace,
             tools=[
