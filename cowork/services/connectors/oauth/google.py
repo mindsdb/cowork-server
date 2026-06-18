@@ -406,12 +406,14 @@ class GoogleOAuthService:
         )
 
     def verify_connection(self, connector_id_or_service: str, access_token: str) -> None:
-        """Confirm the token works with a lightweight API call before vault save.
+        """Make a lightweight API call to confirm the token works before vault save.
         Accepts either an engine name (e.g. 'google_drive') or a service id
         (e.g. 'google-drive') — maps engine names via _ENGINE_TO_SERVICE.
-        Raises HTTPException(502) on failure; no-ops for unrecognised services."""
+        Raises HTTPException(502) on failure. No-ops for services not yet in
+        verify_urls — add an entry here when adding a new Google service."""
         service = _ENGINE_TO_SERVICE.get(connector_id_or_service, connector_id_or_service)
         verify_urls: dict[str, str] = {
+            # TODO: add google-calendar, gmail, google-ads, google-analytics
             "google-drive": "https://www.googleapis.com/drive/v3/about?fields=user",
         }
         url = verify_urls.get(service)

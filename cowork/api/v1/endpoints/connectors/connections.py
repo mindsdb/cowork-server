@@ -10,6 +10,7 @@ from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse, DirectSaveRequest
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.oauth.google import google_service
+from cowork.services.connectors.specs._registry import registry
 
 _log = logging.getLogger("cowork.connectors.connections")
 router = APIRouter()
@@ -32,9 +33,11 @@ def get_connection(engine: str, name: str):
 def save_connection_direct(body: DirectSaveRequest):
     """Persist credentials to the vault without running a probe.
     Used after an OAuth PKCE flow (Electron main-process PKCE) where the
-    token exchange already succeeded. Runs _verify_connection before saving
-    so the token is confirmed to work, consistent with the browser_oauth_builtin
-    and probe paths."""
+    token exchange already succeeded. Calls verify_connection before saving —
+    token validation is only implemented for Google Drive so far; other Google
+    services skip the check until their verify URLs are added to verify_connection."""
+    if registry.get_connector(body.connector_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
     from anton.core.datasources.data_vault import LocalDataVault
     access_token = body.values.get("access_token", "")
     if access_token:
@@ -52,8 +55,9 @@ def save_connection_direct(body: DirectSaveRequest):
         payload["auth_type"] = "oauth"
     try:
         LocalDataVault(Path(ConnectorSettings().vault_dir)).save(body.connector_id, slug, payload)
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+    except Exception:
+        _log.exception("Failed to save connection %s/%s", body.connector_id, slug)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
     return {"ok": True, "name": slug, "label": slug}
 
 
