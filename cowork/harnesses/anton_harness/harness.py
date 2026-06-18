@@ -299,8 +299,10 @@ class AntonHarness:
         from cowork.common.settings.user_settings import get_user_settings
         from pydantic import SecretStr
 
-        settings = AntonSettings()
-        settings.resolve_workspace(str(base))
+        anton_settings = AntonSettings()
+        anton_settings.resolve_workspace(str(base))
+
+        anton_settings.skills_root = Path(settings.skills_root_dir)
 
         user = get_user_settings()
         for attr in (
@@ -319,19 +321,19 @@ class AntonHarness:
             # (openai-compatible, minds-cloud).
             if hasattr(db_val, "value"):
                 db_val = db_val.value.replace("_", "-")
-            setattr(settings, attr, db_val)
+            setattr(anton_settings, attr, db_val)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
             db_val = getattr(user, attr, None)
             if db_val is not None:
-                setattr(settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
+                setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
 
         # URLs (skip empty strings so AntonSettings.model_post_init derivations are preserved)
         for attr in ("minds_url", "openai_base_url"):
             db_val = getattr(user, attr, None)
             if db_val:
-                setattr(settings, attr, db_val)
+                setattr(anton_settings, attr, db_val)
 
         workspace = Workspace(base)
         workspace.initialize()
@@ -347,7 +349,7 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
-        context_dir = _settings_path(getattr(settings, "context_dir", None), anton_dir / "context")
+        context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
         project_memory_dir = anton_dir / "memory"
         for directory in (artifacts_dir, context_dir, episodes_dir, project_memory_dir):
@@ -360,7 +362,7 @@ class AntonHarness:
         cortex = Cortex(
             global_hc=Hippocampus(global_memory_dir),
             project_hc=Hippocampus(project_memory_dir),
-            mode=settings.memory_mode if settings.memory_enabled else "off",
+            mode=anton_settings.memory_mode if anton_settings.memory_enabled else "off",
             llm_client=llm_client,
         )
         # TODO: Is episodic memory required given that we are handling history outside of the harness?
@@ -435,12 +437,12 @@ class AntonHarness:
 
         config = ChatSessionConfig(
             llm_client=llm_client,
-            settings=settings,
+            settings=anton_settings,
             self_awareness=self_awareness,
             cortex=cortex,
             # episodic=episodic,
             system_prompt_context=SystemPromptContext(
-                runtime_context=build_runtime_context(settings),
+                runtime_context=build_runtime_context(anton_settings),
                 suffix=(
                     "The Anton CoWork desktop UI displays progress, tool usage, and actions "
                     "as separate structured activity rows. Keep assistant text focused on the "
@@ -459,7 +461,7 @@ class AntonHarness:
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
-            proactive_dashboards=settings.proactive_dashboards,
+            proactive_dashboards=anton_settings.proactive_dashboards,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
                 PUBLISH_TOOL,
