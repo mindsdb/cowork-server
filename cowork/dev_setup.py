@@ -66,12 +66,12 @@ def run_dev_setup() -> None:
 
 def _link_anton_skills_dir() -> None:
     """Symlink Anton's skills dir to cowork's canonical skills folder"""
-    from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+    from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 
     target = Path(get_app_settings().skill.root_dir)
     target.mkdir(parents=True, exist_ok=True)
 
-    link = Path(AntonHarnessSettings().skills_root_dir)
+    link = Path(HermesHarnessSettings().root_dir) / "skills"
     link.parent.mkdir(parents=True, exist_ok=True)
 
     if link.is_symlink():
