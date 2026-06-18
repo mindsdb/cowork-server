@@ -32,6 +32,9 @@ def run_dev_setup() -> None:
 
     engine = get_engine(db_uri)
     run_schema_migrations(engine, db_uri)
+    # Re-fetch the engine — run_schema_migrations may have disposed and
+    # rebuilt it (e.g. after deleting a corrupt SQLite DB).
+    engine = get_engine(db_uri)
 
     with SQLSession(engine) as session:
         if session.get(Project, GENERAL_PROJECT_ID) is None:
