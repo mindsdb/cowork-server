@@ -329,7 +329,7 @@ class AntonHarness:
             "planning_provider", "planning_model",
             "coding_provider", "coding_model",
             "memory_enabled", "memory_mode",
-            "episodic_memory", "proactive_dashboards",
+            "episodic_memory", "proactive_dashboards", "act_first",
             "publish_url",
         ):
             db_val = getattr(user, attr, None)
@@ -482,6 +482,7 @@ class AntonHarness:
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
             proactive_dashboards=settings.proactive_dashboards,
+            act_first=settings.act_first,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
                 PUBLISH_TOOL,
