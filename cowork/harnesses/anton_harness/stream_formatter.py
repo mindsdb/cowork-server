@@ -40,6 +40,23 @@ PHASE_LABELS = {
 PROGRESS_THROTTLE = 0.25  # seconds
 
 
+def classify_cell_status(content: str) -> str:
+    """Classify a scratchpad tool-result string as ok / timeout / error.
+
+    The renderer uses this to show a killed cell as distinctly dead rather
+    than indistinguishable from a slow-but-running one. Markers match the
+    strings anton produces: a timeout/inactivity kill (`core/backends/local.py`)
+    and the bracketed `[error]` / empty-code (`exec failed`) results
+    (`format_cell_result` / `prepare_scratchpad_exec`).
+    """
+    low = (content or "").lower()
+    if "cell timed out" in low or "cell killed" in low or "of inactivity" in low:
+        return "timeout"
+    if "[error]" in low or "exec failed" in low:
+        return "error"
+    return "ok"
+
+
 async def format_responses_stream(
     event_stream: AsyncIterator,
     model: str,
@@ -180,6 +197,10 @@ async def format_responses_stream(
                 "tool_name": getattr(event, "name", "") or "",
                 "tool_action": getattr(event, "action", "") or "",
                 "tool_use_id": getattr(event, "id", None) or "",
+                # ok / timeout / error — lets the renderer show a killed cell
+                # as dead instead of stuck "running". Additive: older clients
+                # ignore the field.
+                "cell_status": classify_cell_status(event.content),
             })
 
         elif isinstance(event, StreamTaskProgress):
