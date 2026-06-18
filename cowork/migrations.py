@@ -20,8 +20,10 @@ import logging
 from pathlib import Path
 
 from sqlmodel import Session, select
+from pydantic import ValidationError
 
 from anton.core.tools.skill_format import normalize_name, DESC_MAX
+from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
@@ -90,6 +92,32 @@ def _normalize_provider_value(val: str, dotenv: dict[str, str]) -> str:
     return canonical
 
 
+def sync_env_vars_to_db(session: Session, dotenv: dict[str, str]) -> list[str]:
+    """Upsert a dict of ANTON_* env vars into the settings DB.
+
+    Returns the list of DB setting keys that were written.  Skips env
+    keys that have no mapping in ``_ENV_TO_SETTING``.
+    """
+    svc = SettingService(session)
+    updates: dict[str, str] = {}
+    for env_key, setting_key in _ENV_TO_SETTING.items():
+        val = dotenv.get(env_key)
+        if not val:
+            continue
+        if setting_key.endswith("_provider"):
+            val = _normalize_provider_value(val, dotenv)
+        updates[setting_key] = val
+
+    for key, value in updates.items():
+        svc._validate_key(key)
+        try:
+            UserSettings.model_validate({key: value})
+        except ValidationError as e:
+            raise ValueError(str(e)) from e
+
+    return svc.bulk_upsert(updates)
+
+
 def migrate_env_to_db(session: Session) -> bool:
     """Seed DB settings from .env if migration hasn't run yet.
 
@@ -111,7 +139,6 @@ def migrate_env_to_db(session: Session) -> bool:
             val = dotenv.get(env_key)
             if not val:
                 continue
-            # Normalize provider enum values
             if setting_key.endswith("_provider"):
                 val = _normalize_provider_value(val, dotenv)
             try:

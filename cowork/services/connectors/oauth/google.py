@@ -3,12 +3,14 @@ from __future__ import annotations
 import html as html_lib
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from textwrap import dedent
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -17,21 +19,58 @@ from cowork.services.connectors.oauth import pkce as pkce_utils
 from cowork.services.connectors.oauth.config import GOOGLE_SERVICES
 from cowork.services.connectors.oauth.state import OAuthStateStore
 
+import logging as _logging
+
 _GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 _GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _GOOGLE_USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
+_GOOGLE_REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
+
+_log = _logging.getLogger("cowork.oauth.google")
+
+_SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
+    "google-drive":     ("google_drive_client_id",     "google_drive_client_secret"),
+    "google-calendar":  ("google_calendar_client_id",  "google_calendar_client_secret"),
+    "gmail":            ("gmail_client_id",             "gmail_client_secret"),
+    "google-ads":       ("google_ads_client_id",        "google_ads_client_secret"),
+    "google-analytics": ("google_analytics_client_id",  "google_analytics_client_secret"),
+}
+
+# engine name (e.g. "google_drive") → service id (e.g. "google-drive")
+_ENGINE_TO_SERVICE: dict[str, str] = {cfg.engine: svc for svc, cfg in GOOGLE_SERVICES.items()}
 
 
 class GoogleOAuthService:
+    _OUTCOMES: dict[str, dict] = {}
+    def _resolve_credentials(self, service: str, settings: OAuthSettings) -> tuple[str, str]:
+        id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
+        client_id = getattr(settings, id_attr)
+        client_secret = getattr(settings, secret_attr)
+        if not client_id or not client_secret:
+            raise HTTPException(status_code=400, detail=f"OAuth credentials not configured for {service}.")
+        return client_id, client_secret
+
+    def get_outcome(self, state: str) -> dict | None:
+        entry = self._OUTCOMES.get(state)
+        if entry is None:
+            return None
+        if datetime.now(timezone.utc) - entry["_ts"] > timedelta(minutes=20):
+            self._OUTCOMES.pop(state, None)
+            return None
+        return {k: v for k, v in entry.items() if k != "_ts"}
+
     def _store(self, settings: OAuthSettings) -> OAuthStateStore:
         return OAuthStateStore(settings.state_path)
 
     def _redirect_uri(self, service: str, settings: OAuthSettings) -> str:
         return f"{settings.server_origin.rstrip('/')}/api/v1/connectors/oauth/{service}/callback"
 
-    def start(self, service: str, settings: OAuthSettings) -> OAuthStartResponse:
-        if not settings.google_client_id or not settings.google_client_secret:
-            raise HTTPException(status_code=400, detail="Google OAuth credentials are not configured.")
+    def start(self, service: str, settings: OAuthSettings, *, client_id: str = "", client_secret: str = "") -> OAuthStartResponse:
+        if client_id and client_secret:
+            cid, csecret = client_id, client_secret
+        else:
+            cid, csecret = self._resolve_credentials(service, settings)
+        client_id = cid
 
         cfg = GOOGLE_SERVICES[service]
         verifier = pkce_utils.generate_verifier()
@@ -47,9 +86,10 @@ class GoogleOAuthService:
             redirect_uri=redirect_uri,
             started_at=started_at,
         )
+        self._OUTCOMES[state] = {"status": "pending", "_ts": datetime.now(timezone.utc)}
 
         auth_url = _GOOGLE_AUTH_ENDPOINT + "?" + urlencode({
-            "client_id": settings.google_client_id,
+            "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "access_type": "offline",
@@ -60,7 +100,7 @@ class GoogleOAuthService:
             "code_challenge_method": "S256",
         })
 
-        return OAuthStartResponse(auth_url=auth_url, redirect_uri=redirect_uri, started_at=started_at)
+        return OAuthStartResponse(auth_url=auth_url, redirect_uri=redirect_uri, started_at=started_at, state=state)
 
     def callback(self, service: str, code: str, state: str, error: str, settings: OAuthSettings) -> str:
         cfg = GOOGLE_SERVICES[service]
@@ -68,7 +108,10 @@ class GoogleOAuthService:
         service_label = service.replace("-", " ").title()
 
         if error:
-            store.clear_pending(service, error=f"Google sign-in returned: {error}")
+            err_msg = f"Google sign-in returned: {error}"
+            store.clear_pending(service, error=err_msg)
+            if state:
+                self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection was cancelled",
                 "You can return to CoWork and try the connection again whenever you are ready.",
@@ -99,8 +142,12 @@ class GoogleOAuthService:
                 success=False,
             )
 
-        if not settings.google_client_id or not settings.google_client_secret:
-            store.clear_pending(service, error="Google OAuth credentials are not configured.")
+        try:
+            client_id, client_secret = self._resolve_credentials(service, settings)
+        except HTTPException:
+            err_msg = f"OAuth credentials not configured for {service}."
+            store.clear_pending(service, error=err_msg)
+            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection is not configured",
                 "Google OAuth credentials are not configured on this server.",
@@ -124,8 +171,8 @@ class GoogleOAuthService:
         try:
             token_data = self._exchange_code(
                 code=code,
-                client_id=settings.google_client_id,
-                client_secret=settings.google_client_secret,
+                client_id=client_id,
+                client_secret=client_secret,
                 redirect_uri=str(pending.get("redirectUri") or self._redirect_uri(service, settings)),
                 verifier=str(pending.get("verifier", "")),
             )
@@ -138,14 +185,15 @@ class GoogleOAuthService:
             account_name = str(userinfo.get("name", "")).strip()
             connection_name = account_email or cfg.engine
 
+            self._verify_connection(service, access_token)
+
             expires_in = int(token_data.get("expires_in", 0) or 0)
             expires_at = (
                 (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
                 if expires_in else ""
             )
 
-            from anton.core.datasources.data_vault import LocalDataVault
-            LocalDataVault(ConnectorSettings().vault_dir).save(
+            LocalDataVault(Path(ConnectorSettings().vault_dir)).save(
                 cfg.engine,
                 connection_name,
                 {
@@ -160,26 +208,174 @@ class GoogleOAuthService:
                 },
             )
         except HTTPException as exc:
-            store.clear_pending(service, error=str(exc.detail))
+            err_msg = str(exc.detail)
+            store.clear_pending(service, error=err_msg)
+            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection failed",
                 "An error occurred during the sign-in flow. Return to CoWork and try again.",
                 success=False,
             )
         except Exception as exc:
-            store.clear_pending(service, error=str(exc))
+            err_msg = str(exc)
+            store.clear_pending(service, error=err_msg)
+            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
             return _callback_page(
                 f"{service_label} connection failed",
-                "CoWork could not finish the Google sign-in flow.",
+                f"CoWork could not finish the Google sign-in flow: {err_msg}",
                 success=False,
             )
 
         store.clear_pending(service)
+        self._OUTCOMES[state] = {"status": "success", "name": connection_name, "_ts": datetime.now(timezone.utc)}
         return _callback_page(
             f"{service_label} connected",
             f"{account_name or account_email or 'Your Google account'} is now connected. You can close this tab and return to CoWork.",
             success=True,
         )
+
+    def revoke(self, engine: str, name: str, connector_settings: ConnectorSettings) -> None:
+        if engine not in _ENGINE_TO_SERVICE:
+            return
+        _log.info("Revoking Google token for %s/%s", engine, name)
+        try:
+            fields = LocalDataVault(Path(connector_settings.vault_dir)).load(engine, name) or {}
+        except Exception:
+            return
+        if fields.get("auth_type") != "oauth":
+            return
+        token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
+        if not token:
+            return
+        try:
+            request = Request(
+                f"{_GOOGLE_REVOKE_ENDPOINT}?{urlencode({'token': token})}",
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urlopen(request, timeout=10):
+                pass
+            _log.info("Revoked Google token for %s/%s", engine, name)
+        except Exception as exc:
+            _log.warning("Could not revoke Google token for %s/%s: %s", engine, name, exc)
+
+    def refresh_all_tokens(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> None:
+        try:
+            vault = LocalDataVault(Path(connector_settings.vault_dir))
+            all_connections = vault.list_connections() or []
+        except Exception:
+            return
+
+        now = datetime.now(timezone.utc)
+        threshold = now + timedelta(minutes=10)
+
+        for item in all_connections:
+            engine = item.get("engine", "")
+            name = item.get("name", "")
+            if engine not in _ENGINE_TO_SERVICE or not name:
+                continue
+            try:
+                fields = vault.load(engine, name) or {}
+            except Exception:
+                continue
+            if fields.get("auth_type") != "oauth":
+                continue
+            refresh_token = fields.get("refresh_token", "").strip()
+            if not refresh_token:
+                continue
+
+            expires_at_str = fields.get("expires_at", "").strip()
+            if expires_at_str:
+                try:
+                    expires_dt = datetime.fromisoformat(expires_at_str)
+                    if expires_dt.tzinfo is None:
+                        expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+                    if expires_dt > threshold:
+                        continue
+                except ValueError:
+                    pass
+
+            service_id = _ENGINE_TO_SERVICE[engine]
+            try:
+                cid, csecret = self._resolve_credentials(service_id, oauth_settings)
+            except HTTPException:
+                continue
+
+            try:
+                token_data = _json_request(
+                    _GOOGLE_TOKEN_ENDPOINT,
+                    method="POST",
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": cid,
+                        "client_secret": csecret,
+                    },
+                )
+                new_access_token = str(token_data.get("access_token", "")).strip()
+                if not new_access_token:
+                    continue
+                expires_in = int(token_data.get("expires_in", 0) or 0)
+                new_expires_at = (
+                    (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+                    if expires_in else ""
+                )
+                updated = {**fields, "access_token": new_access_token, "expires_at": new_expires_at}
+                new_refresh = str(token_data.get("refresh_token", "")).strip()
+                if new_refresh:
+                    updated["refresh_token"] = new_refresh
+                vault.save(engine, name, updated)
+                _log.info("Refreshed token for %s/%s", engine, name)
+            except Exception as exc:
+                _log.warning("Could not refresh token for %s/%s: %s", engine, name, exc)
+
+    def get_catalogue(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> list[dict]:
+        try:
+            vault = LocalDataVault(Path(connector_settings.vault_dir))
+            all_connections = vault.list_connections() or []
+        except Exception as exc:
+            _log.warning("Could not load vault for catalogue: %s", exc)
+            all_connections = []
+
+        state_data = self._store(oauth_settings)._load()
+        items = []
+
+        for service_id, cfg in GOOGLE_SERVICES.items():
+            engine = cfg.engine
+            id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service_id]
+            cid = getattr(oauth_settings, id_attr, "")
+            csecret = getattr(oauth_settings, secret_attr, "")
+            ready = bool(cid and csecret)
+            config_error = "" if ready else f"OAuth credentials not configured for {service_id}."
+
+            connections = [
+                {"engine": engine, "name": c.get("name", ""), "label": c.get("name", "")}
+                for c in all_connections if c.get("engine") == engine
+            ]
+
+            entry = state_data.get(service_id) or {}
+            service_label = " ".join(w.capitalize() for w in service_id.replace("-", " ").split())
+
+            items.append({
+                "id": engine,
+                "title": service_label,
+                "engine": engine,
+                "status": "connected" if connections else ("available" if ready else "needs_config"),
+                "connections": connections,
+                "connectionCount": len(connections),
+                "oauth": {
+                    "ready": ready,
+                    "configError": config_error,
+                    "pending": bool((entry.get("pending") or {}).get("state")),
+                    "lastSuccessAt": entry.get("lastSuccessAt", ""),
+                    "lastError": entry.get("lastError", ""),
+                    "lastErrorAt": entry.get("lastErrorAt", ""),
+                    "launchLabel": f"Connect {service_label}",
+                    "redirectUri": self._redirect_uri(service_id, oauth_settings),
+                },
+            })
+
+        return items
 
     def _exchange_code(
         self,
@@ -208,6 +404,17 @@ class GoogleOAuthService:
             _GOOGLE_USERINFO_ENDPOINT,
             headers={"Authorization": f"Bearer {access_token}"},
         )
+
+    def _verify_connection(self, service: str, access_token: str) -> None:
+        """Make a lightweight API call to confirm the token actually works.
+        Raises HTTPException(502) if the call fails, preventing vault save."""
+        verify_urls: dict[str, str] = {
+            "google-drive": "https://www.googleapis.com/drive/v3/about?fields=user",
+        }
+        url = verify_urls.get(service)
+        if url is None:
+            return
+        _json_request(url, headers={"Authorization": f"Bearer {access_token}"})
 
 
 def _json_request(
