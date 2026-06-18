@@ -116,8 +116,7 @@ class AntonHarness:
     formatter = staticmethod(format_responses_stream)
 
     async def sync_skills(self, skills: list[Skill]) -> None:
-        # No-op: Anton's skills dir is symlinked to cowork's canonical (seedev_setup)
-        #  so the Anton runtime already reads the skills files
+        # No-op: Anton's skills dir is pointed to cowork's canonical (seedev_setup)
         return
     
     async def overwrite_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
@@ -302,7 +301,8 @@ class AntonHarness:
         anton_settings = AntonSettings()
         anton_settings.resolve_workspace(str(base))
 
-        anton_settings.skills_root = Path(settings.skills_root_dir)
+        from cowork.common.settings.app_settings import get_app_settings
+        anton_settings.skills_root = Path(get_app_settings().skill.root_dir)
 
         user = get_user_settings()
         for attr in (
