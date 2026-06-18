@@ -157,6 +157,7 @@ class MemorySettings(Settings):
     root_dir: str = Field(
         default=str(Path.home() / ".cowork" / "memory"),
         description="Root directory for all memory files",
+    )
 
 
 class StreamSettings(Settings):
