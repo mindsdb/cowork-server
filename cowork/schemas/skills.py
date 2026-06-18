@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
@@ -22,7 +22,8 @@ class SkillUpdateRequest(CamelRequest):
 class SkillResponse(CamelResponse):
     id: str  # the slug
     label: str
-    name: str
+    # get "name" (is the human-readable display name) from skill.display_name
+    name: str = Field(validation_alias=AliasChoices("display_name", "name"))
     description: str | None
     instructions: str = Field(serialization_alias="declarative")
     created_at: datetime | None
