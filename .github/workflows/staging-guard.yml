@@ -1,0 +1,28 @@
+name: Staging guard
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [pyproject.toml]
+
+jobs:
+  check-sources:
+    name: Verify dependency pins target main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check anton-agent source branch
+        run: |
+          branch=$(python3 -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              cfg = tomllib.load(f)
+          src = cfg.get('tool',{}).get('uv',{}).get('sources',{}).get('anton-agent',{})
+          print(src.get('branch', src.get('rev', src.get('tag', 'main'))))
+          ")
+          echo "anton-agent pin: $branch"
+          if [ "$branch" != "main" ]; then
+            echo "::error::anton-agent is pinned to '$branch' in [tool.uv.sources]. It must target 'main' before merging."
+            exit 1
+          fi
