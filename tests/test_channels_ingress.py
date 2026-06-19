@@ -128,6 +128,28 @@ def test_sync_channel_ingress_decision(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_log_loop_failure_edge_triggers(caplog):
+    from cowork.channels.ingress import _log_loop_failure
+
+    # Transient transport errors warn once when an outage starts, then stay
+    # quiet while it persists (recovery is logged by the caller).
+    with caplog.at_level("WARNING", logger="cowork.channels.ingress"):
+        failing = _log_loop_failure("telegram", "poll cycle", ConnectionError("ConnectTimeout('')"), False)
+        assert failing is True
+        assert len(caplog.records) == 1 and caplog.records[0].levelname == "WARNING"
+
+        failing = _log_loop_failure("telegram", "poll cycle", ConnectionError("ConnectTimeout('')"), True)
+        assert failing is True
+        assert len(caplog.records) == 1  # no repeat while still failing
+
+    # Unexpected errors always surface at ERROR and don't open a quiet streak.
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="cowork.channels.ingress"):
+        failing = _log_loop_failure("telegram", "poll cycle", ValueError("bug"), False)
+        assert failing is False
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
 def test_discord_gateway_normalize_message():
     bridge = discord.DiscordBridge({"bot_token": "t"})
     bridge._bot_user_id = "999"
