@@ -25,11 +25,12 @@ def oauth_catalogue():
 
 @router.get("/status")
 def oauth_status(state: str = Query(...)):
-    outcome = google_service.get_outcome(state)
+    settings = OAuthSettings()
+    outcome = google_service.get_outcome(state, settings)
     if outcome is None:
         return {"status": "expired"}
     if outcome.get("status") in {"success", "error"}:
-        google_service._OUTCOMES.pop(state, None)
+        google_service.clear_outcome(state, settings)
     return outcome
 
 

@@ -39,9 +39,16 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
 _ENGINE_TO_SERVICE: dict[str, str] = {cfg.engine: svc for svc, cfg in GOOGLE_SERVICES.items()}
 
+_VERIFY_URLS: dict[str, str] = {
+    "google-drive":     "https://www.googleapis.com/drive/v3/about?fields=user",
+    "gmail":            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+    "google-calendar":  "https://www.googleapis.com/calendar/v3/colors",
+    "google-ads":       "https://www.googleapis.com/oauth2/v3/userinfo",
+    "google-analytics": "https://www.googleapis.com/oauth2/v3/userinfo",
+}
+
 
 class GoogleOAuthService:
-    _OUTCOMES: dict[str, dict] = {}
     def _resolve_credentials(self, service: str, settings: OAuthSettings) -> tuple[str, str]:
         id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
         client_id = getattr(settings, id_attr)
@@ -50,14 +57,11 @@ class GoogleOAuthService:
             raise HTTPException(status_code=400, detail=f"OAuth credentials not configured for {service}.")
         return client_id, client_secret
 
-    def get_outcome(self, state: str) -> dict | None:
-        entry = self._OUTCOMES.get(state)
-        if entry is None:
-            return None
-        if datetime.now(timezone.utc) - entry["_ts"] > timedelta(minutes=20):
-            self._OUTCOMES.pop(state, None)
-            return None
-        return {k: v for k, v in entry.items() if k != "_ts"}
+    def get_outcome(self, state: str, settings: OAuthSettings) -> dict | None:
+        return self._store(settings).get_outcome(state)
+
+    def clear_outcome(self, state: str, settings: OAuthSettings) -> None:
+        self._store(settings).clear_outcome(state)
 
     def _store(self, settings: OAuthSettings) -> OAuthStateStore:
         return OAuthStateStore(settings.state_path)
@@ -85,9 +89,11 @@ class GoogleOAuthService:
             verifier=verifier,
             redirect_uri=redirect_uri,
             started_at=started_at,
+            client_id=cid,
+            client_secret=csecret,
             extra_fields=extra_fields,
         )
-        self._OUTCOMES[state] = {"status": "pending", "_ts": datetime.now(timezone.utc)}
+        self._store(settings).set_outcome(state, {"status": "pending"})
 
         auth_url = _GOOGLE_AUTH_ENDPOINT + "?" + urlencode({
             "client_id": client_id,
@@ -112,7 +118,7 @@ class GoogleOAuthService:
             err_msg = f"Google sign-in returned: {error}"
             store.clear_pending(service, error=err_msg)
             if state:
-                self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
+                store.set_outcome(state, {"status": "error", "error": err_msg})
             return _callback_page(
                 f"{service_label} connection was cancelled",
                 "You can return to CoWork and try the connection again whenever you are ready.",
@@ -143,17 +149,22 @@ class GoogleOAuthService:
                 success=False,
             )
 
-        try:
-            client_id, client_secret = self._resolve_credentials(service, settings)
-        except HTTPException:
-            err_msg = f"OAuth credentials not configured for {service}."
-            store.clear_pending(service, error=err_msg)
-            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
-            return _callback_page(
-                f"{service_label} connection is not configured",
-                "Google OAuth credentials are not configured on this server.",
-                success=False,
-            )
+        pending_client_id = str(pending.get("clientId", "")).strip()
+        pending_client_secret = str(pending.get("clientSecret", "")).strip()
+        if pending_client_id and pending_client_secret:
+            client_id, client_secret = pending_client_id, pending_client_secret
+        else:
+            try:
+                client_id, client_secret = self._resolve_credentials(service, settings)
+            except HTTPException:
+                err_msg = f"OAuth credentials not configured for {service}."
+                store.clear_pending(service, error=err_msg)
+                store.set_outcome(state, {"status": "error", "error": err_msg})
+                return _callback_page(
+                    f"{service_label} connection is not configured",
+                    "Google OAuth credentials are not configured on this server.",
+                    success=False,
+                )
 
         started_at = str(pending.get("startedAt", "")).strip()
         if started_at:
@@ -213,7 +224,7 @@ class GoogleOAuthService:
         except HTTPException as exc:
             err_msg = str(exc.detail)
             store.clear_pending(service, error=err_msg)
-            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
+            store.set_outcome(state, {"status": "error", "error": err_msg})
             return _callback_page(
                 f"{service_label} connection failed",
                 "An error occurred during the sign-in flow. Return to CoWork and try again.",
@@ -222,7 +233,7 @@ class GoogleOAuthService:
         except Exception as exc:
             err_msg = str(exc)
             store.clear_pending(service, error=err_msg)
-            self._OUTCOMES[state] = {"status": "error", "error": err_msg, "_ts": datetime.now(timezone.utc)}
+            store.set_outcome(state, {"status": "error", "error": err_msg})
             return _callback_page(
                 f"{service_label} connection failed",
                 f"CoWork could not finish the Google sign-in flow: {err_msg}",
@@ -230,7 +241,7 @@ class GoogleOAuthService:
             )
 
         store.clear_pending(service)
-        self._OUTCOMES[state] = {"status": "success", "name": connection_name, "_ts": datetime.now(timezone.utc)}
+        store.set_outcome(state, {"status": "success", "name": connection_name})
         return _callback_page(
             f"{service_label} connected",
             f"{account_name or account_email or 'Your Google account'} is now connected. You can close this tab and return to CoWork.",
@@ -259,6 +270,18 @@ class GoogleOAuthService:
             with urlopen(request, timeout=10):
                 pass
             _log.info("Revoked Google token for %s/%s", engine, name)
+        except HTTPError as exc:
+            if exc.code == 400:
+                try:
+                    body = json.loads(exc.read().decode())
+                except Exception:
+                    body = {}
+                if body.get("error") == "invalid_token":
+                    _log.debug("Token for %s/%s already expired or revoked — skipping revocation", engine, name)
+                else:
+                    _log.warning("Could not revoke Google token for %s/%s: %s %s", engine, name, exc.code, body)
+            else:
+                _log.warning("Could not revoke Google token for %s/%s: %s", engine, name, exc)
         except Exception as exc:
             _log.warning("Could not revoke Google token for %s/%s: %s", engine, name, exc)
 
@@ -412,17 +435,9 @@ class GoogleOAuthService:
         """Make a lightweight API call to confirm the token works before vault save.
         Accepts either an engine name (e.g. 'google_drive') or a service id
         (e.g. 'google-drive') — maps engine names via _ENGINE_TO_SERVICE.
-        Raises HTTPException(502) on failure. No-ops for services not yet in
-        verify_urls — add an entry here when adding a new Google service."""
+        Raises HTTPException(502) on failure. No-ops for services not in _VERIFY_URLS."""
         service = _ENGINE_TO_SERVICE.get(connector_id_or_service, connector_id_or_service)
-        verify_urls: dict[str, str] = {
-            "google-drive": "https://www.googleapis.com/drive/v3/about?fields=user",
-            "gmail": "https://gmail.googleapis.com/gmail/v1/users/me/profile",
-            "google-calendar": "https://www.googleapis.com/calendar/v3/colors",
-            "google-ads": "https://www.googleapis.com/oauth2/v3/userinfo",
-            "google-analytics": "https://www.googleapis.com/oauth2/v3/userinfo",
-        }
-        url = verify_urls.get(service)
+        url = _VERIFY_URLS.get(service)
         if url is None:
             return
         _json_request(url, headers={"Authorization": f"Bearer {access_token}"})
