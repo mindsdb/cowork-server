@@ -59,4 +59,5 @@ hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
 dev = [
     "alembic>=1.18.4",
     "pytest>=9.0.3",
+    "pytest-cov>=6.0.0",
 ]
