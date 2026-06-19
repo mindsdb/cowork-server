@@ -140,8 +140,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.6.15.1"
-source = { git = "https://github.com/mindsdb/anton.git?branch=main#50beef39dfa15bde11ffa12795c8198f4c2714a3" }
+version = "2.26.6.18.1"
+source = { git = "https://github.com/mindsdb/anton.git?branch=staging#fdd41ac9250fe7aa39162024dd0eb8d99cf2989d" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -326,7 +326,7 @@ wheels = [
 
 [[package]]
 name = "cowork-server"
-version = "0.1.6"
+version = "0.1.9"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -359,7 +359,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=main" },
+    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=staging" },
     { name = "cryptography", specifier = ">=48.0.0" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
