@@ -35,12 +35,6 @@ class ProjectService:
     def _project_path(self, name: str) -> Path:
         return self._root_dir() / name
 
-    # TODO: Move this. This should only be done when using Anton.
-    def _scaffold(self, target: Path) -> None:
-        anton_dir = target / ".anton"
-        anton_dir.mkdir(parents=True, exist_ok=True)
-        (anton_dir / "anton.md").touch()
-
     def _unique_name(self, base: str, *, exclude: str | None = None) -> str:
         existing = {
             p.name for p in self.session.exec(select(Project)).all()
@@ -91,7 +85,7 @@ class ProjectService:
         final_name = self._unique_name(sanitized)
         path = path or self._project_path(final_name)
         path.mkdir(parents=True, exist_ok=True)
-        # self._scaffold(path)
+
         project = Project(name=final_name, path=str(path), is_active=False)
         self.session.add(project)
         self.session.commit()
