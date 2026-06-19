@@ -74,32 +74,57 @@ class IngressManager:
     async def _stream_loop(self, channel_type: str, bridge: Any) -> None:
         # One stream_events() call is a single connection lifecycle; when it
         # ends (clean close or error) we back off and reconnect.
+        failing = False
         while True:
             try:
                 async for events in bridge.stream_events():
+                    if failing:
+                        log.info("channel %s: ingress stream recovered", channel_type)
+                        failing = False
                     if events:
                         log.info("channel %s: stream delivered %d event(s)", channel_type, len(events))
                         intake_events(channel_type, bridge, events, sink=self._sink)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                log.exception("channel %s: ingress stream failed; reconnecting", channel_type)
+            except Exception as exc:
+                failing = _log_loop_failure(channel_type, "ingress stream", exc, failing)
             await asyncio.sleep(_ERROR_BACKOFF_S)
 
     async def _poll_loop(self, channel_type: str, bridge: Any) -> None:
         offset: int | None = None
+        failing = False
         while True:
             try:
                 events, offset = await bridge.poll(offset=offset)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                log.exception("channel %s: poll cycle failed; backing off", channel_type)
+            except Exception as exc:
+                failing = _log_loop_failure(channel_type, "poll cycle", exc, failing)
                 await asyncio.sleep(_ERROR_BACKOFF_S)
                 continue
+            if failing:
+                log.info("channel %s: poll cycle recovered", channel_type)
+                failing = False
             if events:
                 log.info("channel %s: poll fetched %d event(s)", channel_type, len(events))
                 intake_events(channel_type, bridge, events, sink=self._sink)
+
+
+def _log_loop_failure(channel_type: str, what: str, exc: Exception, failing: bool) -> bool:
+    """Log an ingress-loop failure once per outage and return the new failing
+    state. Transient transport errors (platform unreachable, DNS, timeout) are
+    expected operational noise: emit one human-readable WARNING when a streak
+    starts, then stay quiet until it recovers (logged by the caller). Anything
+    unexpected still gets a full ERROR traceback every time so real bugs surface."""
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        if not failing:
+            log.warning(
+                "channel %s: %s failed (%s); retrying every %.0fs until it recovers",
+                channel_type, what, exc, _ERROR_BACKOFF_S,
+            )
+        return True
+    log.exception("channel %s: %s failed; backing off", channel_type, what)
+    return failing
 
 
 async def sync_channel_ingress(manager: IngressManager | None, adapters: Any, channel_type: str) -> None:
