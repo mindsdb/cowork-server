@@ -80,13 +80,13 @@ class ProjectService:
     def get_project_by_name_or_none(self, name: str) -> Project | None:
         return self.session.exec(select(Project).where(Project.name == name)).first()
 
-    def create_project(self, name: str, path: Path | None = None) -> Project:
+    def create_project(self, name: str, path: Path | None = None, instructions: str | None = None) -> Project:
         sanitized = self._sanitize_name(name)
         final_name = self._unique_name(sanitized)
         path = path or self._project_path(final_name)
         path.mkdir(parents=True, exist_ok=True)
 
-        project = Project(name=final_name, path=str(path), is_active=False)
+        project = Project(name=final_name, path=str(path), is_active=False, instructions=instructions)
         self.session.add(project)
         self.session.commit()
         self.session.refresh(project)
@@ -102,6 +102,7 @@ class ProjectService:
         project_id: UUID,
         name: str | None = None,
         is_active: bool | None = None,
+        instructions: str | None = None,
     ) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
@@ -135,6 +136,9 @@ class ProjectService:
                         other.is_active = False
                         self.session.add(other)
             project.is_active = is_active
+
+        if instructions is not None:
+            project.instructions = instructions or None
 
         self.session.add(project)
         self.session.commit()

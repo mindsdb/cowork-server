@@ -12,4 +12,4 @@ class Project(BaseSQLModel, table=True):
         max_length=1024,
     )
     is_active: bool = Field(default=True, description="Whether the project is active")
-
+    instructions: str | None = Field(default=None, description="Instructions for the project")
