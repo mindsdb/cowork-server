@@ -453,7 +453,21 @@ class AntonHarness:
         cells = extract_scratchpad_cells_from_message_events(conversation.messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
-        history = [message.to_openai_message() for message in conversation.messages if message.role in {"user", "assistant"}]
+        # Per-message timestamps: embed each message's created_at so the agent
+        # always knows WHEN something was said (even resuming a conversation
+        # days/weeks later). Absolute stamps are fixed per message, so the
+        # history prefix stays byte-stable across turns (cache-safe).
+        def _stamped(m):
+            om = m.to_openai_message().model_dump()
+            ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+            if ts and isinstance(om.get("content"), str) and om["content"]:
+                om["content"] = f"[{ts}] {om['content']}"
+            return om
+
+        initial_history = [
+            _stamped(m) for m in conversation.messages
+            if m.role in {"user", "assistant"}
+        ]
 
         config = ChatSessionConfig(
             llm_client=llm_client,
@@ -475,7 +489,7 @@ class AntonHarness:
             ),
             workspace=workspace,
             data_vault=data_vault,
-            initial_history=[message.model_dump() for message in history],
+            initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
@@ -483,10 +497,10 @@ class AntonHarness:
             harness=self.id,
             proactive_dashboards=settings.proactive_dashboards,
             act_first=settings.act_first,
-            # Task-anchored clock: the conversation's created_at keeps the
-            # system-prompt date byte-identical across every turn of this task,
-            # so the prompt prefix stays cache-stable (see anton 2a).
-            clock=conversation.created_at,
+            # "Conversation started" stamp for the cache-stable prompt prefix
+            # (anton 2a). The live current time is rendered separately in the
+            # volatile tail, so resuming days later still reports the real "now".
+            started_at=conversation.created_at,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
                 PUBLISH_TOOL,
