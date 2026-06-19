@@ -120,15 +120,11 @@ class ProjectService:
             final_name = self._unique_name(sanitized, exclude=project.name)
             if final_name != project.name:
                 old_name = project.name
-                old_path = Path(project.path)
-                new_path = self._project_path(final_name)
-                if old_path.exists():
-                    old_path.rename(new_path)
                 project.name = final_name
-                project.path = str(new_path)
 
                 # Update skill metadata that referenced the old project name,
-                # then reconcile links for the renamed dir.
+                # then reconcile links. The directory itself is not renamed —
+                # the path may be a user-chosen folder outside the root dir.
                 from cowork.services.skill_links import reconcile_project
                 from cowork.services.skills import SkillService
                 svc = SkillService()
@@ -136,7 +132,7 @@ class ProjectService:
                     if old_name in skill.projects:
                         updated = [final_name if p == old_name else p for p in skill.projects]
                         svc.update_skill(skill.name, projects=updated)
-                reconcile_project(new_path, svc.list_skills())
+                reconcile_project(Path(project.path), svc.list_skills())
 
         if is_active is not None:
             if is_active:
