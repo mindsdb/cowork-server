@@ -5,6 +5,8 @@ startup for the local SQLite deployment and remains exposed as a CLI helper
 for development/test environments.
 """
 
+import os
+import subprocess
 from pathlib import Path
 
 from sqlalchemy.engine import make_url
@@ -53,3 +55,36 @@ def run_dev_setup() -> None:
 
     with SQLSession(engine) as session:
         migrate_env_to_db(session)
+
+
+# Sibling repos a developer may have checked out locally, mapped to their
+# default location relative to this repo root. Only anton is a source
+# dependency today; add more here if other repos become path-overridable.
+_LOCAL_SIBLINGS = {
+    "anton-agent": ("ANTON_LOCAL_DIR", "anton"),
+}
+
+
+def link_local_siblings() -> None:
+    """Overlay local sibling-repo checkouts as editable installs for dev.
+
+    cowork-server pins anton-agent to a git branch in ``[tool.uv.sources]``,
+    so a developer's local ``../anton`` feature branch is otherwise ignored.
+    When the checkout is present we editable-install it on top of the synced
+    environment; the dev launcher then runs the server with ``UV_NO_SYNC=1``
+    so the overlay survives — a plain ``uv run`` re-syncs and reverts it.
+
+    Auto-detects each sibling next to the repo root; the location can be
+    overridden per package (e.g. ``ANTON_LOCAL_DIR``). Best-effort: a failure
+    leaves the pinned dependency in place rather than blocking dev startup.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    for package, (env_var, default_dir) in _LOCAL_SIBLINGS.items():
+        location = Path(os.environ.get(env_var) or repo_root.parent / default_dir)
+        if not (location / "pyproject.toml").is_file():
+            print(f"[dev-link] no local {package} at {location} — using the pinned dependency")
+            continue
+        print(f"[dev-link] linking {package} (editable) from {location}")
+        result = subprocess.run(["uv", "pip", "install", "-e", str(location)], cwd=str(repo_root))
+        if result.returncode != 0:
+            print(f"[dev-link] WARNING: could not link {package}; keeping the pinned dependency")
