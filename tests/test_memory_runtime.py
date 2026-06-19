@@ -26,7 +26,7 @@ def test_build_prompt_context_includes_rules(tmp_path, monkeypatch):
         )(),
     )
 
-    context = HermesMemoryAdapter().build_prompt_context()
+    context = HermesMemoryAdapter().build_prompt_context(Path("/tmp/test_project"))
     assert "Always be concise" in context
 
 
