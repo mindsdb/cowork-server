@@ -90,7 +90,7 @@ class ProjectService:
         sanitized = self._sanitize_name(name)
         final_name = self._unique_name(sanitized)
         path = path or self._project_path(final_name)
-        path.mkdir(parents=True)
+        path.mkdir(parents=True, exist_ok=True)
         # self._scaffold(path)
         project = Project(name=final_name, path=str(path), is_active=False)
         self.session.add(project)
