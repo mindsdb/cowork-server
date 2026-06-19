@@ -86,10 +86,10 @@ class ProjectService:
     def get_project_by_name_or_none(self, name: str) -> Project | None:
         return self.session.exec(select(Project).where(Project.name == name)).first()
 
-    def create_project(self, name: str) -> Project:
+    def create_project(self, name: str, path: Path | None = None) -> Project:
         sanitized = self._sanitize_name(name)
         final_name = self._unique_name(sanitized)
-        path = self._project_path(final_name)
+        path = path or self._project_path(final_name)
         path.mkdir(parents=True)
         # self._scaffold(path)
         project = Project(name=final_name, path=str(path), is_active=False)

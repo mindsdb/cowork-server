@@ -20,7 +20,7 @@ def list_projects(session: SessionDep):
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_project(body: ProjectCreateRequest, session: SessionDep):
-    return ProjectService(session).create_project(body.name)
+    return ProjectService(session).create_project(body.name, body.path)
 
 
 @router.patch("/{project_id}")
