@@ -112,14 +112,8 @@ class ProjectService:
             if project.name == GENERAL_PROJECT:
                 raise ValueError("Cannot rename the General project")
             sanitized = self._sanitize_name(name)
-            final_name = self._unique_name(sanitized, exclude=project.name)
-            if final_name != project.name:
-                old_path = Path(project.path)
-                new_path = self._project_path(final_name)
-                if old_path.exists():
-                    old_path.rename(new_path)
-                project.name = final_name
-                project.path = str(new_path)
+            final_name = self._unique_name(sanitized)
+            project.name = final_name
 
         if is_active is not None:
             if is_active:
