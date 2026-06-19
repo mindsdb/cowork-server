@@ -20,36 +20,37 @@ jobs:
     # Runs unit tests
     uses: ./.github/workflows/tests-unit.yml
 
+  # TODO: Uncomment this when we have a way to deploy to dev environments
   # Looks for labels like "deploy-to-<env>" attached to a PR, so we can deploy to those envs
-  get-deploy-labels:
-    runs-on: ubuntu-latest
-    outputs:
-      deploy-envs: ${{ steps.get-labels.outputs.deploy-envs }}
-    steps:
-      - name: Pull MindsDB Github Actions
-        uses: actions/checkout@v4
-        with:
-          repository: mindsdb/github-actions
-          path: github-actions
-      - id: get-labels
-        uses: ./github-actions/get-deploy-labels
+  # get-deploy-labels:
+  #   runs-on: ubuntu-latest
+  #   outputs:
+  #     deploy-envs: ${{ steps.get-labels.outputs.deploy-envs }}
+  #   steps:
+  #     - name: Pull MindsDB Github Actions
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: mindsdb/github-actions
+  #         path: github-actions
+  #     - id: get-labels
+  #       uses: ./github-actions/get-deploy-labels
 
-  filter-deploy-envs:
-    needs: [get-deploy-labels]
-    runs-on: ubuntu-latest
-    outputs:
-      deploy-envs: ${{ steps.filter.outputs.deploy-envs }}
-    steps:
-      - name: Drop prod + staging from PR-label matrix
-        id: filter
-        env:
-          RAW_ENVS: ${{ needs.get-deploy-labels.outputs.deploy-envs }}
-        run: |
-          set -euo pipefail
-          # prod ships from release.published; staging ships from push:main.
-          # Labels for those envs should be no-ops on PRs to avoid clobbering shared infra.
-          FILTERED="$(printf '%s' "$RAW_ENVS" | jq -c '[ .[] | select(. != "prod" and . != "staging") ]')"
-          echo "deploy-envs=${FILTERED}" >> "$GITHUB_OUTPUT"
+  # filter-deploy-envs:
+  #   needs: [get-deploy-labels]
+  #   runs-on: ubuntu-latest
+  #   outputs:
+  #     deploy-envs: ${{ steps.filter.outputs.deploy-envs }}
+  #   steps:
+  #     - name: Drop prod + staging from PR-label matrix
+  #       id: filter
+  #       env:
+  #         RAW_ENVS: ${{ needs.get-deploy-labels.outputs.deploy-envs }}
+  #       run: |
+  #         set -euo pipefail
+  #         # prod ships from release.published; staging ships from push:main.
+  #         # Labels for those envs should be no-ops on PRs to avoid clobbering shared infra.
+  #         FILTERED="$(printf '%s' "$RAW_ENVS" | jq -c '[ .[] | select(. != "prod" and . != "staging") ]')"
+  #         echo "deploy-envs=${FILTERED}" >> "$GITHUB_OUTPUT"
 
   build:
     runs-on: ubuntu-latest
