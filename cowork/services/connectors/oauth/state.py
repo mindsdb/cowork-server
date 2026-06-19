@@ -30,6 +30,7 @@ class OAuthStateStore:
         verifier: str,
         redirect_uri: str,
         started_at: str,
+        extra_fields: dict[str, str] | None = None,
     ) -> None:
         data = self._load()
         entry = data.get(service) or {}
@@ -38,6 +39,7 @@ class OAuthStateStore:
             "verifier": verifier,
             "redirectUri": redirect_uri,
             "startedAt": started_at,
+            "extraFields": {k: v for k, v in (extra_fields or {}).items() if v},
         }
         entry.setdefault("lastSuccessAt", "")
         entry.setdefault("lastError", "")

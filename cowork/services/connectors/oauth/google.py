@@ -65,7 +65,7 @@ class GoogleOAuthService:
     def _redirect_uri(self, service: str, settings: OAuthSettings) -> str:
         return f"{settings.server_origin.rstrip('/')}/api/v1/connectors/oauth/{service}/callback"
 
-    def start(self, service: str, settings: OAuthSettings, *, client_id: str = "", client_secret: str = "") -> OAuthStartResponse:
+    def start(self, service: str, settings: OAuthSettings, *, client_id: str = "", client_secret: str = "", extra_fields: dict[str, str] | None = None) -> OAuthStartResponse:
         if client_id and client_secret:
             cid, csecret = client_id, client_secret
         else:
@@ -85,6 +85,7 @@ class GoogleOAuthService:
             verifier=verifier,
             redirect_uri=redirect_uri,
             started_at=started_at,
+            extra_fields=extra_fields,
         )
         self._OUTCOMES[state] = {"status": "pending", "_ts": datetime.now(timezone.utc)}
 
@@ -193,6 +194,7 @@ class GoogleOAuthService:
                 if expires_in else ""
             )
 
+            extra = {k: v for k, v in (pending.get("extraFields") or {}).items() if v}
             LocalDataVault(Path(ConnectorSettings().vault_dir)).save(
                 cfg.engine,
                 connection_name,
@@ -205,6 +207,7 @@ class GoogleOAuthService:
                     "expires_at": expires_at,
                     "account_email": account_email,
                     "account_name": account_name,
+                    **extra,
                 },
             )
         except HTTPException as exc:
@@ -413,8 +416,11 @@ class GoogleOAuthService:
         verify_urls — add an entry here when adding a new Google service."""
         service = _ENGINE_TO_SERVICE.get(connector_id_or_service, connector_id_or_service)
         verify_urls: dict[str, str] = {
-            # TODO: add google-calendar, gmail, google-ads, google-analytics
             "google-drive": "https://www.googleapis.com/drive/v3/about?fields=user",
+            "gmail": "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            "google-calendar": "https://www.googleapis.com/calendar/v3/colors",
+            "google-ads": "https://www.googleapis.com/oauth2/v3/userinfo",
+            "google-analytics": "https://www.googleapis.com/oauth2/v3/userinfo",
         }
         url = verify_urls.get(service)
         if url is None:

@@ -15,7 +15,7 @@ router = APIRouter()
 def start_oauth(service: str, body: OAuthStartRequest = Body(default_factory=OAuthStartRequest)):
     if service not in GOOGLE_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    return google_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret)
+    return google_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
 
 @router.get("/catalogue")
