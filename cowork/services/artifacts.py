@@ -10,28 +10,35 @@ replaced by the DB-backed project service.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import hashlib
 import json
 import logging
 import mimetypes
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 from urllib.parse import quote
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.encryption import _load_or_create_master_key
 
 logger = logging.getLogger(__name__)
 
-# In-memory registry: deterministic token → parent dir of an artifact.
+# In-memory registry: short-lived opaque token -> parent dir of an artifact.
 # Used for both static (HTML asset) and proxy (fullstack backend) mounts;
 # `kind` field on the preview-mount response payload discriminates.
 _PREVIEW_MOUNTS: dict[str, Path] = {}
+_PREVIEW_MOUNT_EXPIRES: dict[str, float] = {}
+_PREVIEW_MOUNT_TTL_SECONDS = 60 * 60
+_SERVE_URL_TTL_SECONDS = 15 * 60
 
 # Launched-by-cowork-server backend tracking, keyed by artifact slug.
 # Shape matches anton's launcher: {"proc", "port", "pid", "log_path"}.
@@ -82,6 +89,49 @@ TEXT_EXTENSIONS = {
 
 
 # ─── Helpers ──────────────────────────────────────────────────────
+
+def register_preview_mount(parent: str | Path, *, salt: str | None = None, ttl_seconds: int = _PREVIEW_MOUNT_TTL_SECONDS) -> str:
+    """Expose a folder through the tokenized preview-asset endpoint."""
+    root = Path(parent).expanduser().resolve(strict=False)
+    # `salt` used to make preview tokens deterministic for diff previews.
+    # Browser-visible preview URLs are bearer grants, so they must stay
+    # unguessable even when the mounted path or version hash is known.
+    _ = salt
+    token = secrets.token_urlsafe(18)
+    _PREVIEW_MOUNTS[token] = root
+    _PREVIEW_MOUNT_EXPIRES[token] = time.time() + max(60, ttl_seconds)
+    return token
+
+
+def sign_serve_url_path(path: str | Path, *, ttl_seconds: int = _SERVE_URL_TTL_SECONDS) -> str:
+    try:
+        resolved = str(Path(path).expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        resolved = str(path)
+    expires = int(time.time() + max(60, ttl_seconds))
+    message = f"{resolved}:{expires}".encode("utf-8")
+    signature = hmac.new(_load_or_create_master_key(), message, hashlib.sha256).hexdigest()
+    return f"{expires}.{signature}"
+
+
+def verify_serve_url_token(path: str | Path, token: str | None) -> bool:
+    if not token or "." not in token:
+        return False
+    expires_text, signature = token.split(".", 1)
+    try:
+        expires = int(expires_text)
+    except ValueError:
+        return False
+    if expires < int(time.time()):
+        return False
+    try:
+        resolved = str(Path(path).expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        return False
+    message = f"{resolved}:{expires}".encode("utf-8")
+    expected = hmac.new(_load_or_create_master_key(), message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
 
 def _human_mtime(path: Path) -> str:
     secs = time.time() - path.stat().st_mtime
@@ -229,6 +279,21 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
     return ""
 
 
+def _published_version_for(folder: Path, primary: Path | None) -> dict:
+    if primary is None:
+        return {}
+    entry = _load_published_map(folder).get(primary.name)
+    if not isinstance(entry, dict):
+        return {}
+    payload = {
+        "publishedVersionId": entry.get("version_id") or "",
+        "publishedFilesHash": entry.get("files_hash") or "",
+        "publishedManifestHash": entry.get("manifest_hash") or "",
+        "publishedVersionNumber": entry.get("version_number"),
+    }
+    return {key: value for key, value in payload.items() if value not in ("", None)}
+
+
 def _published_access_for(folder: Path, primary: Path | None) -> dict:
     """Owner-side access state for the primary file, from `.published.json`.
 
@@ -271,6 +336,250 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
     return out
 
 
+def _last_good_preview_for(folder: Path) -> dict:
+    try:
+        from sqlmodel import Session, select
+
+        from cowork.db.session import get_engine
+        from cowork.models.artifact import Artifact, ArtifactVersion
+        from cowork.services.artifact_versions import ArtifactVersionService
+    except Exception:
+        return {}
+    try:
+        engine = get_engine(get_app_settings().database.uri)
+        folder_key = str(folder.expanduser().resolve(strict=False))
+        with Session(engine) as session:
+            artifact = session.exec(select(Artifact).where(Artifact.path == folder_key)).first()
+            if artifact is None or artifact.last_known_good_version_id is None:
+                return {}
+            version = session.get(ArtifactVersion, artifact.last_known_good_version_id)
+            if version is None:
+                return {}
+            service = ArtifactVersionService(session)
+            target = service.store_root / "previews" / "last-good" / str(artifact.id) / str(version.id)
+            service.materialize_version(version.id, target, clean=True)
+            service.write_version_housekeeping(version.id, target)
+            metadata = _load_metadata(target) if (target / "metadata.json").is_file() else {}
+            files = _user_files(target)
+            primary = _pick_primary(target, files, primary_hint=metadata.get("primary"))
+            preview_path = str(primary) if primary is not None else str(target)
+            return {
+                "lastKnownGoodVersionId": str(version.id),
+                "lastGoodPath": preview_path,
+                "lastGood": {
+                    "versionId": str(version.id),
+                    "path": preview_path,
+                    "label": version.label,
+                },
+            }
+    except Exception:
+        logger.debug("Could not resolve last-known-good preview for %s", folder, exc_info=True)
+        return {}
+
+
+def _review_summary_for(folder: Path, *, viewer_email: str | None = None) -> dict:
+    try:
+        from sqlmodel import Session, select
+
+        from cowork.db.session import get_engine
+        from cowork.models.artifact import Artifact, ArtifactActivityEvent, ArtifactComment
+        from cowork.models.project_collaboration import ProjectCollaborator
+        from cowork.services.project_collaboration import normalize_email
+        from cowork.services.project_permissions import role_allows
+    except Exception:
+        return _empty_review_summary()
+    try:
+        engine = get_engine(get_app_settings().database.uri)
+        folder_key = str(folder.expanduser().resolve(strict=False))
+        with Session(engine) as session:
+            artifact = session.exec(select(Artifact).where(Artifact.path == folder_key)).first()
+            if artifact is None:
+                return _empty_review_summary()
+            comments = session.exec(
+                select(ArtifactComment).where(ArtifactComment.artifact_id == artifact.id)
+            ).all()
+            events = session.exec(
+                select(ArtifactActivityEvent)
+                .where(ArtifactActivityEvent.artifact_id == artifact.id)
+                .order_by(ArtifactActivityEvent.created_at.desc())
+                .limit(50)
+            ).all()
+            viewer_state = _review_viewer_state(
+                session,
+                artifact,
+                comments,
+                events,
+                viewer_email=viewer_email,
+                collaborator_model=ProjectCollaborator,
+                normalize_email_fn=normalize_email,
+                role_allows_fn=role_allows,
+            )
+    except Exception:
+        logger.debug("Could not resolve review summary for %s", folder, exc_info=True)
+        return _empty_review_summary()
+
+    open_statuses = {"open"}
+    open_comments = [comment for comment in comments if comment.status in open_statuses]
+    comments_count = sum(1 for comment in open_comments if comment.kind == "comment")
+    suggestions_count = sum(1 for comment in open_comments if comment.kind == "suggestion")
+    review_requests_count = sum(1 for comment in open_comments if comment.kind == "review")
+    latest = max((comment.created_at for comment in comments if comment.created_at is not None), default=None)
+    return {
+        "open": len(open_comments),
+        "unresolved": len(open_comments),
+        "comments": comments_count,
+        "suggestions": suggestions_count,
+        "reviewRequests": review_requests_count,
+        "resolved": sum(1 for comment in comments if comment.status == "resolved"),
+        "accepted": sum(1 for comment in comments if comment.status == "accepted"),
+        "rejected": sum(1 for comment in comments if comment.status == "rejected"),
+        "needsReview": bool(suggestions_count or review_requests_count),
+        "latestAt": latest.isoformat() if latest is not None else None,
+        "viewerState": viewer_state,
+    }
+
+
+def _empty_review_summary() -> dict:
+    return {
+        "open": 0,
+        "unresolved": 0,
+        "comments": 0,
+        "suggestions": 0,
+        "reviewRequests": 0,
+        "resolved": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "needsReview": False,
+        "latestAt": None,
+        "viewerState": _empty_review_viewer_state(),
+    }
+
+
+def _empty_review_viewer_state() -> dict:
+    return {
+        "available": False,
+        "unreadComments": 0,
+        "unreadActivity": 0,
+        "needsAction": 0,
+        "reviewRequests": {
+            "open": 0,
+            "needsAction": 0,
+            "unread": 0,
+        },
+    }
+
+
+def _review_viewer_state(
+    session,
+    artifact,
+    comments,
+    events,
+    *,
+    viewer_email: str | None,
+    collaborator_model,
+    normalize_email_fn,
+    role_allows_fn,
+) -> dict:
+    if not viewer_email or artifact.project_id is None:
+        return _empty_review_viewer_state()
+    try:
+        email = normalize_email_fn(viewer_email)
+    except ValueError:
+        return _empty_review_viewer_state()
+    from sqlmodel import select
+
+    collaborator = session.exec(
+        select(collaborator_model)
+        .where(collaborator_model.project_id == artifact.project_id)
+        .where(collaborator_model.email == email)
+    ).first()
+    if collaborator is None:
+        return _empty_review_viewer_state()
+
+    artifact_state = dict((collaborator.notification_state or {}).get("artifacts", {}).get(str(artifact.id), {}) or {})
+    last_read_at = _parse_review_dt(artifact_state.get("lastReadAt"))
+    role = collaborator.role
+    unread_comments = 0
+    unread_activity = 0
+    open_review_requests = 0
+    needs_action = 0
+    unread_review_requests = 0
+
+    for comment in comments:
+        own_comment = _same_email(_comment_actor_email(comment), collaborator.email)
+        unread = bool(not own_comment and (last_read_at is None or _created_after(comment.created_at, last_read_at)))
+        closed = comment.status in {"resolved", "accepted", "rejected"}
+        review_request = comment.kind == "review" and not closed
+        needs = bool(review_request and role_allows_fn(role, "review") and not own_comment)
+        if unread:
+            unread_comments += 1
+        if review_request:
+            open_review_requests += 1
+            if unread:
+                unread_review_requests += 1
+        if needs:
+            needs_action += 1
+
+    for event in events:
+        own_event = _same_email(_event_actor_email(event), collaborator.email)
+        if not own_event and (last_read_at is None or _created_after(event.created_at, last_read_at)):
+            unread_activity += 1
+
+    return {
+        "available": True,
+        "collaboratorId": str(collaborator.id),
+        "role": role,
+        "lastReadAt": last_read_at.isoformat() if last_read_at else None,
+        "unreadComments": unread_comments,
+        "unreadActivity": unread_activity,
+        "needsAction": needs_action,
+        "reviewRequests": {
+            "open": open_review_requests,
+            "needsAction": needs_action,
+            "unread": unread_review_requests,
+        },
+    }
+
+
+def _comment_actor_email(comment) -> str | None:
+    state = comment.notification_state if isinstance(comment.notification_state, dict) else {}
+    return state.get("actorEmail") or state.get("actor_email")
+
+
+def _event_actor_email(event) -> str | None:
+    details = event.details if isinstance(event.details, dict) else {}
+    return details.get("actorEmail") or details.get("actor_email")
+
+
+def _same_email(left: str | None, right: str | None) -> bool:
+    return bool(left and right and left.strip().lower() == right.strip().lower())
+
+
+def _created_after(created_at: datetime | None, marker: datetime | None) -> bool:
+    if created_at is None or marker is None:
+        return False
+    created = _normalize_review_dt(created_at)
+    marked = _normalize_review_dt(marker)
+    return bool(created and marked and created > marked)
+
+
+def _parse_review_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return _normalize_review_dt(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _normalize_review_dt(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _project_artifacts_base(project_name: str) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
     maps to a registered project. Returns None for unknown projects or
@@ -291,7 +600,7 @@ def _project_artifacts_base(project_name: str) -> Path | None:
     return base if base.is_dir() else None
 
 
-def serve_url_for(path: str | Path) -> str:
+def serve_url_for(path: str | Path, *, signed: bool = True) -> str:
     """Origin-relative `/api/v1/artifacts/serve/...` URL for a file under a
     project's `.anton/artifacts` tree. Returns "" when the path isn't
     inside such a tree."""
@@ -308,7 +617,10 @@ def serve_url_for(path: str | Path) -> str:
         if not rel.parts:
             return ""
         rel_str = "/".join(quote(part) for part in rel.parts)
-        return f"/api/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
+        url = f"/api/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
+        if signed:
+            return f"{url}?token={quote(sign_serve_url_path(p))}"
+        return url
     return ""
 
 
@@ -466,6 +778,15 @@ def delete_artifact(raw_path: str) -> None:
             folder.relative_to(art_root.resolve())
         except ValueError:
             continue
+        from cowork.db.session import get_open_session
+        from cowork.services.artifact_versions import ArtifactVersionService
+
+        with get_open_session(get_app_settings().database.uri) as session:
+            ArtifactVersionService(session).snapshot_artifact(
+                folder,
+                operation_type="pre_delete",
+                label="Before delete",
+            )
         # Unpublish before deleting; if this raises, the artifact stays.
         _unpublish_folder(folder)
         shutil.rmtree(folder)
@@ -484,7 +805,7 @@ def reveal_in_file_manager(path: Path) -> None:
 
 # ─── Public API ───────────────────────────────────────────────────
 
-def list_artifacts(project_path: str | None = None) -> list[dict]:
+def list_artifacts(project_path: str | None = None, *, viewer_email: str | None = None) -> list[dict]:
     """Every artifact across all projects, newest first."""
     cards: list[dict] = []
     for folder in _iter_artifact_folders(project_path):
@@ -537,9 +858,12 @@ def list_artifacts(project_path: str | None = None) -> list[dict]:
             "path": primary_path,
             "primary": meta.get("primary") or None,
             "publishedUrl": _published_url_for(folder, primary),
+            **_published_version_for(folder, primary),
             # Owner-side access state (lock badge + eye-reveal). accessPassword
             # is the plaintext, returned only to the owner's own session.
             **_published_access_for(folder, primary),
+            **_last_good_preview_for(folder),
+            "reviewSummary": _review_summary_for(folder, viewer_email=viewer_email),
             "serveUrl": serve_url_for(primary_path),
             "_sortTs": sort_ts,
         })
@@ -603,8 +927,7 @@ async def mount_preview(path: Path) -> dict:
         # `proxyUrl` — the route layer fills it in using the incoming
         # Request URL so the absolute URL matches whatever host/scheme
         # the client used to reach us.
-        root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
-        _PREVIEW_MOUNTS[root_token] = root
+        root_token = register_preview_mount(root, ttl_seconds=_PREVIEW_MOUNT_TTL_SECONDS)
         running, launch_detail, current_port = await _ensure_backend_running(
             root, backend_port
         )
@@ -619,6 +942,7 @@ async def mount_preview(path: Path) -> dict:
             # keyed by the primary file name — surface the published state so
             # the viewer shows the "Published" pill for backend artifacts too.
             "publishedUrl": _published_url_for(root, path),
+            **_published_version_for(root, path),
             **_published_access_for(root, path),
         }
 
@@ -626,8 +950,7 @@ async def mount_preview(path: Path) -> dict:
     # `kind` discriminator so the client doesn't have to infer.
     if path.suffix.lower() != ".html":
         raise ValueError("Preview mount is only available for HTML artifacts")
-    token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
-    _PREVIEW_MOUNTS[token] = parent
+    token = register_preview_mount(parent)
 
     published_url = ""
     entry = _load_published_map(parent).get(path.name)
@@ -641,11 +964,19 @@ async def mount_preview(path: Path) -> dict:
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
         "serveUrl": serve_url_for(path),
         "publishedUrl": published_url,
+        **_published_version_for(parent, path),
         **_published_access_for(parent, path),
     }
 
 
 def get_preview_mount(token: str) -> Path | None:
+    expires = _PREVIEW_MOUNT_EXPIRES.get(token)
+    if expires is None:
+        return None
+    if expires < time.time():
+        _PREVIEW_MOUNTS.pop(token, None)
+        _PREVIEW_MOUNT_EXPIRES.pop(token, None)
+        return None
     return _PREVIEW_MOUNTS.get(token)
 
 
@@ -689,6 +1020,7 @@ def html_artifacts() -> list[dict]:
                     "path": str(entry_path),
                     "bytes": entry_path.stat().st_size if entry_path.is_file() else 0,
                     "publishedUrl": _published_url_for(artifact_root, entry_path),
+                    **_published_version_for(artifact_root, entry_path),
                 })
                 continue
 
@@ -698,6 +1030,7 @@ def html_artifacts() -> list[dict]:
                 "path": str(path),
                 "bytes": path.stat().st_size,
                 "publishedUrl": _published_url_for(path.parent, path),
+                **_published_version_for(path.parent, path),
             })
     return out[:40]
 
