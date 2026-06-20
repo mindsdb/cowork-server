@@ -54,9 +54,26 @@ _CORS_RESPONSE_HEADERS = {
     "access-control-max-age",
 }
 
-# Headers the upstream `httpx` request must not carry — `Content-Length`
-# is recomputed by httpx itself, and `Host` is rewritten below.
-_UPSTREAM_BLOCKED_REQUEST_HEADERS = {"content-length", "host"}
+# Headers the upstream `httpx` request must not carry. Artifact preview
+# backends are untrusted app code; never forward Cowork/session credentials.
+# `Content-Length` is recomputed by httpx itself, and `Host` is rewritten below.
+_UPSTREAM_BLOCKED_REQUEST_HEADERS = {
+    "authorization",
+    "content-length",
+    "cookie",
+    "host",
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+    "x-cowork-local-session",
+    "x-cowork-session",
+}
+
+_BROWSER_SAFETY_RESPONSE_HEADERS = {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
 
 
 def _read_backend_port(artifact_dir: Path) -> Optional[int]:
@@ -77,6 +94,7 @@ def _cors_headers(req: Request) -> dict[str, str]:
         "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": requested,
         "Access-Control-Max-Age": "600",
+        **_BROWSER_SAFETY_RESPONSE_HEADERS,
     }
 
 
@@ -182,6 +200,7 @@ async def proxy_artifact_request(
         )
         resp_headers = dict(_strip_hop_headers(upstream.headers, drop_cors=True))
         resp_headers.update(cors)
+        resp_headers.update(_BROWSER_SAFETY_RESPONSE_HEADERS)
         # Drop Content-Length — the patched body may be larger than the
         # original; let the ASGI layer set the correct value.
         resp_headers.pop("content-length", None)
@@ -194,6 +213,7 @@ async def proxy_artifact_request(
 
     resp_headers = _strip_hop_headers(upstream.headers, drop_cors=True)
     resp_headers.extend(cors.items())
+    resp_headers.extend(_BROWSER_SAFETY_RESPONSE_HEADERS.items())
 
     async def body_iter():
         try:

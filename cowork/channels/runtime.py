@@ -385,8 +385,13 @@ class AntonChannelRuntime:
             conversation=conversation,
             input=blocks,
         )
-        async for _chunk in harness.formatter(stream, harness_id, event_sink):
-            pass
+        try:
+            async for _chunk in harness.formatter(stream, harness_id, event_sink):
+                pass
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if callable(aclose):
+                await aclose()
 
         reply = "".join(collected)
         ConversationService(session).save_assistant_turn(
