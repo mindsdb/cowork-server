@@ -309,6 +309,8 @@ class AntonHarness:
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             + attachment_context
         )
+        if conversation.project.instructions:
+            project_context += f"\n\nProject instructions: {conversation.project.instructions}"
         output_context = (
             # Artifacts now live in their own visible folder at the
             # project root (`<base>/artifacts/<slug>/...`), one folder
