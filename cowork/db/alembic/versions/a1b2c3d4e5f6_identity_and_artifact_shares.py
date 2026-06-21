@@ -1,7 +1,7 @@
 """identity and artifact shares
 
 Revision ID: a1b2c3d4e5f6
-Revises: f1c2d3e4a5b6
+Revises: 9b7c6d5e4f3a
 Create Date: 2026-06-21 12:00:00.000000
 
 """
@@ -13,7 +13,10 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a1b2c3d4e5f6"
-down_revision: Union[str, Sequence[str], None] = "f1c2d3e4a5b6"
+# Chained onto 9b7c6d5e4f3a (direction-a artifact metadata) so this
+# branch's history matches the shared/live DB lineage:
+#   ...f1c2d3e4a5b6 -> 9b7c6d5e4f3a -> a1b2c3d4e5f6
+down_revision: Union[str, Sequence[str], None] = "9b7c6d5e4f3a"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
