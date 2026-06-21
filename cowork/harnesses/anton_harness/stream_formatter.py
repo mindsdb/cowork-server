@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Optional
 
+from cowork.harnesses.anton_harness.selection import SelectionRequestEvent
 from cowork.schemas.responses import (
     Response,
     ResponseOutput,
@@ -162,6 +163,20 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "item_id": msg_id,
                 "delta": event.text,
+            })
+
+        elif isinstance(event, SelectionRequestEvent):
+            # The agent is ambiguous about a path — surface an inline picker.
+            # The turn is now paused awaiting POST /responses/selection; this
+            # frame carries everything the renderer needs to draw the picker.
+            seq += 1
+            yield _event("response.selection.requested", {
+                "type": "response.selection.requested",
+                "sequence_number": seq,
+                "request_id": event.request_id,
+                "prompt": event.prompt,
+                "kind": event.kind,
+                "options": event.options,
             })
 
         elif isinstance(event, StreamToolUseStart):
