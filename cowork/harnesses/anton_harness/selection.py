@@ -30,11 +30,16 @@ logger = logging.getLogger(__name__)
 class SelectionRequestEvent:
     """A request, flowing through the turn's event stream, for the UI to render
     an inline picker. ``options`` are plain dicts (value/label/kind/detail) so
-    the formatter can serialise them straight to JSON."""
+    the formatter can serialise them straight to JSON.
+
+    ``mode`` is ``"pick"`` (disambiguate ``options``) or ``"browse"`` (the user
+    navigates a file tree from ``root``)."""
 
     request_id: str
     prompt: str
     kind: str
+    mode: str = "pick"
+    root: str = ""
     options: list[dict] = field(default_factory=list)
 
 
@@ -65,6 +70,8 @@ class StreamingSelectionElicitor:
                 request_id=request_id,
                 prompt=request.prompt,
                 kind=request.kind,
+                mode=request.mode,
+                root=request.root,
                 options=[
                     {"value": o.value, "label": o.label, "kind": o.kind, "detail": o.detail}
                     for o in request.options

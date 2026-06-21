@@ -176,6 +176,8 @@ async def format_responses_stream(
                 "request_id": event.request_id,
                 "prompt": event.prompt,
                 "kind": event.kind,
+                "mode": event.mode,
+                "root": event.root,
                 "options": event.options,
             })
 
