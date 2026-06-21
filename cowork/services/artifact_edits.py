@@ -205,6 +205,7 @@ def accept_edit(
     old_text: str,
     new_text: str,
     base_version_id: str | None,
+    operation_type: str = "ai_edit",
     actor_name: str | None = None,
     actor_email: str | None = None,
     actor_subject: str | None = None,
@@ -219,8 +220,11 @@ def accept_edit(
 
     On success the rewrite is applied via the existing ``_apply_patch_operations``
     machinery against a staged copy of the live folder, the folder is atomically
-    swapped, and a new ``ai_edit`` snapshot is recorded (advancing
-    ``current_version_id``). Returns::
+    swapped, and a new snapshot is recorded (advancing ``current_version_id``).
+    ``operation_type`` defaults to ``"ai_edit"`` but a direct (typed) in-place
+    edit passes ``"manual_edit"`` so the Versions/Story panel can label it as the
+    user's own edit rather than an AI edit. The actor (when supplied) is forwarded
+    to the snapshot so the recorded activity event attributes the version. Returns::
 
         {
             "ok": True,
@@ -272,14 +276,20 @@ def accept_edit(
         changed_paths = _apply_patch_operations(staged_root, patch)
         backup = service._replace_artifact_folder(root, staged_root, keep_backup=True)
 
+    is_manual = operation_type == "manual_edit"
+    label = "Edited" if is_manual else "AI edit"
+    prompt = f"Edited {target}" if is_manual else f"AI edit: {target}"
     try:
         applied = service.snapshot_artifact(
             root,
             artifact_id=artifact.id,
-            label="AI edit",
-            operation_type="ai_edit",
-            prompt=f"AI edit: {target}",
+            label=label,
+            operation_type=operation_type,
+            prompt=prompt,
             preview_status="ready",
+            actor_name=actor_name,
+            actor_email=actor_email,
+            actor_subject=actor_subject,
         )
     except Exception:
         # Roll the live folder back to its pre-edit state on any failure.
