@@ -107,6 +107,13 @@ class _AcceptEditBody(BaseModel):
         default=None,
         validation_alias=AliasChoices("base_version_id", "baseVersionId"),
     )
+    # Distinguishes a direct (typed) in-place edit ("manual_edit") from the
+    # default AI rewrite ("ai_edit"). Omitted → "ai_edit", so existing callers
+    # are unchanged.
+    operation_type: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("operation_type", "operationType"),
+    )
 
 
 @router.post("/edits/propose")
@@ -140,6 +147,8 @@ def accept_artifact_edit(req: _AcceptEditBody, session: SessionDep, principal: P
             old_text=req.old_text,
             new_text=req.new_text,
             base_version_id=req.base_version_id,
+            # Omitted on the wire → None here → let accept_edit default to "ai_edit".
+            **({"operation_type": req.operation_type} if req.operation_type else {}),
             **_actor_kwargs(principal),
         )
     except EditConflict as conflict:
