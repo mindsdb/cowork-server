@@ -28,6 +28,7 @@ class HarnessProvider(Protocol):
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        interactive: bool = False,
     ) -> AsyncIterator[str]:
         ...
 

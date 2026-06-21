@@ -132,6 +132,7 @@ class HermesHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        interactive: bool = False,
     ) -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict | None] = asyncio.Queue()

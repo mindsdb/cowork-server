@@ -155,6 +155,7 @@ class AntonHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        interactive: bool = False,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
         conversation_id = str(conversation.id)
@@ -176,23 +177,24 @@ class AntonHarness:
             # the user's pick — so the picker reaches the client before the
             # turn pauses. anton stays transport-agnostic (it only sees the
             # SelectionElicitor protocol).
-            queue: asyncio.Queue = asyncio.Queue()
-            session.selection_elicitor = StreamingSelectionElicitor(
-                emit=queue.put_nowait,
-                gateway=selection_gateway,
-                conversation_id=conversation_id,
-            )
+            queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+            if interactive:
+                session.selection_elicitor = StreamingSelectionElicitor(
+                    emit=queue.put,
+                    gateway=selection_gateway,
+                    conversation_id=conversation_id,
+                )
 
             async def _pump() -> None:
                 try:
                     async for event in session.turn_stream(self._to_anton_input(input)):
-                        queue.put_nowait(event)
+                        await queue.put(event)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # surface to the consumer as a failed turn
-                    queue.put_nowait(_PumpError(exc))
+                    await queue.put(_PumpError(exc))
                 finally:
-                    queue.put_nowait(_PUMP_DONE)
+                    await queue.put(_PUMP_DONE)
 
             pump = asyncio.create_task(_pump(), name=f"anton-turn[{conversation_id}]")
             try:

@@ -200,7 +200,7 @@ class ResponsesHandler:
             conv = ConversationService(own).get_conversation(conv_id)
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=conv, input=harness_input, disabled_connections=disabled,
+                conversation=conv, input=harness_input, disabled_connections=disabled, interactive=True,
             )
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):
@@ -248,6 +248,36 @@ class ResponsesHandler:
             except Exception:
                 pass
         return sse_string
+
+    def _failure_sse(self, exc: Exception, conv_id: UUID) -> str:
+        """Map a turn exception to a user-facing failed-response SSE frame, logging it.
+
+        Shared by the detached producer (`_produce`) and the direct stream
+        (`_stream`) so the friendly-vs-generic decision lives in one place.
+        """
+        friendly = friendly_turn_error(exc)
+        if friendly is not None:
+            code, message = friendly
+            logger.info("[responses] user-facing turn error: %s", exc)
+        else:
+            code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+            logger.exception("[responses] turn failed for conversation %s", conv_id)
+        return response_failed_sse(message, code)
+
+    async def _stream(self, stream, conversation_id: UUID, model: str):
+        """Format a live harness stream and convert failures to SSE frames.
+
+        Kept as a small direct-stream wrapper for tests and non-detached callers;
+        the normal streaming endpoint now uses `_produce` plus a resumable buffer.
+        """
+        def event_sink(_event_type: str, _data: dict) -> None:
+            return None
+
+        try:
+            async for sse_string in self.harness.formatter(stream, model, event_sink):
+                yield self._inject_created(sse_string, conversation_id, getattr(self.harness, "id", None))
+        except Exception as exc:
+            yield self._failure_sse(exc, conversation_id)
 
     async def _collect(
         self,
