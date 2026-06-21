@@ -234,6 +234,11 @@ class HermesHarness:
             if checkpoint_tracker is not None
             else {}
         )
+        checkpoint_before_versions = (
+            dict(getattr(checkpoint_tracker, "_before_versions", {}))
+            if checkpoint_tracker is not None
+            else {}
+        )
         source_conversation_id = conversation.id
 
         def run_sync() -> dict:
@@ -259,6 +264,7 @@ class HermesHarness:
                         source_conversation_id=source_conversation_id,
                         prompt=prompt,
                         before_hashes=checkpoint_before_hashes,
+                        before_versions=checkpoint_before_versions,
                     )
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
@@ -303,6 +309,7 @@ class HermesHarness:
         source_conversation_id,
         prompt: str,
         before_hashes: dict,
+        before_versions: dict,
     ) -> None:
         """Snapshot generated artifact updates from Hermes' worker thread.
 
@@ -323,6 +330,7 @@ class HermesHarness:
                     prompt=prompt,
                 )
                 tracker._before_hashes = dict(before_hashes)
+                tracker._before_versions = dict(before_versions)
                 tracker.snapshot_after(label="Generated update")
             finally:
                 session.close()

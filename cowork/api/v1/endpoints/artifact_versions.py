@@ -78,6 +78,14 @@ class _CheckpointBody(_ArtifactPathBody):
     label: str | None = None
     summary: str | None = None
     prompt: str | None = None
+    snapshot_role: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("snapshot_role", "snapshotRole"),
+    )
+    pre_snapshot_version_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("pre_snapshot_version_id", "preSnapshotVersionId"),
+    )
     source_conversation_id: UUID | None = Field(
         default=None,
         validation_alias=AliasChoices("source_conversation_id", "sourceConversationId", "conversation_id", "conversationId"),

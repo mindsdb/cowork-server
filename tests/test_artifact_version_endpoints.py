@@ -1733,6 +1733,60 @@ def test_artifact_comments_can_be_suggested_resolved_and_reopened(client: TestCl
     assert rejected_response.json()["comment"]["status"] == "rejected"
 
 
+def test_artifact_review_comments_normalize_rect_anchor_and_verdict(client: TestClient):
+    artifact_id, folder = _make_artifact(
+        files={"slides.html": "<main><section>Opening</section></main>\n"},
+        artifact_type="html-app",
+    )
+    _checkpoint(client, artifact_id, label="Baseline")
+
+    comment_response = client.post(
+        "/api/v1/artifacts/comments",
+        json={
+            "path": str(folder),
+            "body": "Please tighten the first-slide headline.",
+            "kind": "review",
+            "reviewVerdict": "request_changes",
+            "anchor": {
+                "type": "rect",
+                "file": "slides.html",
+                "slideId": "slide-1",
+                "unit": "percent",
+                "coordinate_space": "preview",
+                "boundingClientRect": {"left": "12.5", "top": 9, "right": 72.5, "bottom": 21},
+                "label": "Hero headline",
+            },
+        },
+    )
+    assert comment_response.status_code == 201, comment_response.text
+    created = comment_response.json()["comment"]
+
+    assert created["reviewVerdict"] == "changes_requested"
+    assert created["anchor"]["kind"] == "rect"
+    assert created["anchor"]["path"] == "slides.html"
+    assert created["anchor"]["unit"] == "percent"
+    assert created["anchor"]["coordinateSpace"] == "preview"
+    assert created["anchor"]["slideId"] == "slide-1"
+    assert created["anchor"]["label"] == "Hero headline"
+    assert created["anchor"]["rect"] == {
+        "x": 12.5,
+        "y": 9.0,
+        "width": 60.0,
+        "height": 12.0,
+        "left": 12.5,
+        "top": 9.0,
+        "right": 72.5,
+        "bottom": 21.0,
+    }
+
+    listed_response = client.get("/api/v1/artifacts/comments", params={"path": str(folder)})
+    assert listed_response.status_code == 200, listed_response.text
+    listed = listed_response.json()
+    assert listed["comments"][0]["reviewVerdict"] == "changes_requested"
+    verdict_event = next(event for event in listed["activity"] if event["eventType"] == "review_verdict")
+    assert verdict_event["details"]["reviewVerdict"] == "changes_requested"
+
+
 def test_artifact_comments_track_collaborator_read_state(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "cowork.api.v1.endpoints.artifacts.principal_from_authorization_header",
@@ -2086,15 +2140,21 @@ def test_suggestion_patch_can_be_previewed_and_accepted_with_checkpoints(client:
     accepted = accepted_response.json()
     assert accepted["comment"]["status"] == "accepted"
     assert accepted["createdCheckpoint"]["operationType"] == "review_safety"
+    assert accepted["createdCheckpoint"]["snapshotRole"] == "pre"
     assert accepted["version"]["operationType"] == "review_accept"
+    assert accepted["version"]["snapshotRole"] == "post"
+    assert accepted["version"]["preSnapshotVersionId"] == accepted["createdCheckpoint"]["id"]
     assert accepted["changedPaths"] == ["report.md"]
     assert accepted["comment"]["notificationState"]["appliedVersionId"] == accepted["version"]["id"]
+    assert accepted["comment"]["notificationState"]["preApplyVersionId"] == accepted["createdCheckpoint"]["id"]
     assert (folder / "report.md").read_text(encoding="utf-8") == "# Draft\nSummary: clear\n"
 
     listed_response = client.get(f"/api/v1/artifacts/{artifact_id}/versions")
     assert listed_response.status_code == 200, listed_response.text
-    operations = [version["operationType"] for version in listed_response.json()["versions"]]
+    versions = listed_response.json()["versions"]
+    operations = [version["operationType"] for version in versions]
     assert operations[:2] == ["review_accept", "review_safety"]
+    assert versions[0]["preSnapshotVersionId"] == versions[1]["id"]
 
 
 def test_stale_suggestion_patch_must_be_reviewed_again_before_apply(client: TestClient):
@@ -3323,18 +3383,30 @@ def test_artifact_handoff_allows_source_viewer_and_records_activity(
     assert response.status_code == 201, response.text
     payload = response.json()
     assert payload["conversation"]["title"] == "Viewer follow-up"
+    assert payload["version"] is None
+    assert payload["materializedVersion"] is False
+    assert Path(payload["handoffPath"]).resolve(strict=False) == folder.resolve(strict=False)
+    assert payload["preTurnCheckpoint"]["operationType"] == "handoff_safety"
+    assert payload["preTurnCheckpoint"]["snapshotRole"] == "pre"
+    assert payload["preTurnCheckpoint"]["sourceConversationId"] == payload["conversationId"]
     assert captured and captured[0].conversation == payload["conversationId"]
 
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:
         artifact = session.exec(select(Artifact).where(Artifact.path == str(folder.resolve()))).one()
+        checkpoint = session.get(ArtifactVersion, UUID(payload["preTurnCheckpoint"]["id"]))
         event = session.exec(
             select(ArtifactActivityEvent)
             .where(ArtifactActivityEvent.artifact_id == artifact.id)
             .where(ArtifactActivityEvent.event_type == "handoff")
         ).one()
+    assert checkpoint is not None
+    assert checkpoint.operation_type == "handoff_safety"
+    assert checkpoint.snapshot_role == "pre"
+    assert artifact.current_version_id == checkpoint.id
     assert event.actor_name == "Viewer"
     assert event.details["conversationId"] == payload["conversationId"]
+    assert event.details["preTurnCheckpointId"] == payload["preTurnCheckpoint"]["id"]
     assert event.details["actorEmail"] == "viewer@example.com"
     assert event.details["materializedVersion"] is False
 

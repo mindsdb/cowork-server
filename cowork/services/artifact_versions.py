@@ -13,6 +13,7 @@ import os
 import shutil
 import difflib
 import csv
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -191,6 +192,8 @@ class ArtifactVersionService:
         prompt: str | None = None,
         label: str | None = None,
         operation_type: str = "snapshot",
+        snapshot_role: str | None = None,
+        pre_snapshot_version_id: UUID | None = None,
         preview_status: str = "pending",
         publish_status: str = "unpublished",
         restored_from_version_id: UUID | None = None,
@@ -230,6 +233,8 @@ class ArtifactVersionService:
             source_message_id=source_message_id,
             prompt=prompt,
             operation_type=operation_type,
+            snapshot_role=_clean_snapshot_role(snapshot_role),
+            pre_snapshot_version_id=pre_snapshot_version_id,
             preview_status=preview_status,
             publish_status=publish_status,
             restored_from_version_id=restored_from_version_id,
@@ -748,6 +753,8 @@ def snapshot_artifact(
     prompt: str | None = None,
     preview_status: str = "pending",
     publish_status: str = "unpublished",
+    snapshot_role: str | None = None,
+    pre_snapshot_version_id: str | UUID | None = None,
     actor_name: str | None = None,
     actor_email: str | None = None,
     actor_subject: str | None = None,
@@ -783,6 +790,12 @@ def snapshot_artifact(
         prompt=prompt or _body_str(body, "prompt"),
         label=checkpoint_label,
         operation_type=operation_type if operation_type != "checkpoint" else _body_str(body, "kind") or operation_type,
+        snapshot_role=snapshot_role or _body_str(body, "snapshot_role") or _body_str(body, "snapshotRole"),
+        pre_snapshot_version_id=_uuid_or_none(
+            pre_snapshot_version_id
+            or body.get("pre_snapshot_version_id")
+            or body.get("preSnapshotVersionId")
+        ),
         preview_status=preview_status,
         publish_status=publish_status,
         actor_name=actor_name,
@@ -1230,6 +1243,8 @@ def version_to_dict(
         "filesHash": version.files_hash,
         "manifestHash": version.manifest_hash,
         "operationType": version.operation_type,
+        "snapshotRole": version.snapshot_role,
+        "preSnapshotVersionId": str(version.pre_snapshot_version_id) if version.pre_snapshot_version_id else None,
         "previewStatus": version.preview_status,
         "publishStatus": version.publish_status,
         "sourceConversationId": str(version.source_conversation_id) if version.source_conversation_id else None,
@@ -1351,6 +1366,7 @@ def create_comment(
     kind: str = "comment",
     anchor: dict | None = None,
     proposed_patch: dict | None = None,
+    review_verdict: str | None = None,
     parent_comment_id: str | UUID | None = None,
     actor_name: str | None = None,
     actor_email: str | None = None,
@@ -1368,14 +1384,17 @@ def create_comment(
         parent_comment_id=parent_uuid,
         kind=kind if kind in {"comment", "suggestion", "review"} else "comment",
         body=body,
-        anchor=anchor or {},
+        anchor=_normalize_anchor(anchor),
         proposed_patch=_normalize_proposed_patch(proposed_patch) if proposed_patch else {},
         status="open",
+        review_verdict=_clean_review_verdict(review_verdict),
         actor_name=actor_name or "You",
         notification_state={},
     )
     event_type = (
-        "review_requested"
+        "review_verdict"
+        if comment.review_verdict
+        else "review_requested"
         if comment.kind == "review"
         else "suggested" if comment.kind == "suggestion" else "commented"
     )
@@ -1388,7 +1407,12 @@ def create_comment(
             version_id=artifact.current_version_id,
             event_type=event_type,
             actor_name=comment.actor_name,
-            details={"commentId": str(comment.id), "kind": comment.kind, **actor_details},
+            details={
+                "commentId": str(comment.id),
+                "kind": comment.kind,
+                **({"reviewVerdict": comment.review_verdict} if comment.review_verdict else {}),
+                **actor_details,
+            },
         )
     )
     deliveries = dispatch_project_notification(
@@ -1398,6 +1422,7 @@ def create_comment(
         details={
             "commentId": str(comment.id),
             "kind": comment.kind,
+            **({"reviewVerdict": comment.review_verdict} if comment.review_verdict else {}),
             "actorName": comment.actor_name,
             **actor_details,
             "anchor": comment.anchor or {},
@@ -1539,6 +1564,7 @@ def apply_comment_patch(
         artifact_id=artifact.id,
         label="Before accepting suggestion",
         operation_type="review_safety",
+        snapshot_role="pre",
     )
     backup: Path | None = None
     with TemporaryDirectory(prefix="cowork-review-apply-", dir=root.parent) as tmp:
@@ -1553,6 +1579,8 @@ def apply_comment_patch(
             artifact_id=artifact.id,
             label="Accepted suggestion",
             operation_type="review_accept",
+            snapshot_role="post",
+            pre_snapshot_version_id=safety.id,
             prompt=comment.body,
             preview_status="ready",
         )
@@ -1827,10 +1855,11 @@ def comment_to_dict(comment: ArtifactComment, *, viewer_state: dict | None = Non
         "kind": comment.kind,
         "body": comment.body,
         "text": comment.body,
-        "anchor": comment.anchor or {},
+        "anchor": _normalize_anchor(comment.anchor),
         "proposedPatch": comment.proposed_patch or {},
         "status": comment.status,
         "resolved": comment.status == "resolved",
+        "reviewVerdict": comment.review_verdict,
         "actorName": comment.actor_name,
         "createdAt": comment.created_at.isoformat() if comment.created_at else None,
         "notificationState": comment.notification_state or {},
@@ -2841,6 +2870,126 @@ def _diff_roots(session: Session, artifact: Artifact, base_root: Path, compare_r
 def _comment_patch_applied(comment: ArtifactComment) -> bool:
     state = comment.notification_state or {}
     return bool(state.get("appliedVersionId"))
+
+
+def _clean_snapshot_role(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = value.strip().lower().replace("-", "_")
+    return clean if clean in {"pre", "post", "single"} else None
+
+
+def _clean_review_verdict(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = value.strip().lower().replace("-", "_")
+    if clean in {"approve", "approved"}:
+        return "approved"
+    if clean in {"request_changes", "requested_changes", "changes_requested"}:
+        return "changes_requested"
+    if clean in {"comment", "commented"}:
+        return "commented"
+    return None
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _normalize_anchor_rect(rect: object) -> dict[str, float] | None:
+    if not isinstance(rect, dict):
+        return None
+    left = _number(rect.get("left"))
+    top = _number(rect.get("top"))
+    right = _number(rect.get("right"))
+    bottom = _number(rect.get("bottom"))
+    x = _number(rect.get("x"))
+    y = _number(rect.get("y"))
+    width = _number(rect.get("width"))
+    height = _number(rect.get("height"))
+
+    if left is None:
+        left = x if x is not None else (right - width if right is not None and width is not None else None)
+    if top is None:
+        top = y if y is not None else (bottom - height if bottom is not None and height is not None else None)
+    if width is None and left is not None and right is not None:
+        width = right - left
+    if height is None and top is not None and bottom is not None:
+        height = bottom - top
+    if left is None or top is None or width is None or height is None:
+        return None
+
+    width = max(0.0, width)
+    height = max(0.0, height)
+    return {
+        "x": left,
+        "y": top,
+        "width": width,
+        "height": height,
+        "left": left,
+        "top": top,
+        "right": left + width,
+        "bottom": top + height,
+    }
+
+
+def _normalize_anchor(anchor: dict | None) -> dict:
+    if not isinstance(anchor, dict):
+        return {}
+    if not anchor:
+        return {}
+    normalized = dict(anchor)
+    kind = str(anchor.get("kind") or anchor.get("type") or "").strip().lower().replace("-", "_")
+    rect_source = (
+        anchor.get("rect")
+        or anchor.get("boundingClientRect")
+        or anchor.get("clientRect")
+        or anchor.get("selectionRect")
+        or anchor.get("box")
+    )
+    rect = _normalize_anchor_rect(rect_source)
+    if rect is None and any(key in anchor for key in ("x", "y", "left", "top", "right", "bottom", "width", "height")):
+        rect = _normalize_anchor_rect(anchor)
+    if kind != "rect" and rect is None:
+        return dict(anchor)
+
+    path = str(anchor.get("path") or anchor.get("file") or "").strip()
+    if path:
+        _safe_relative_path(path)
+    unit = str(anchor.get("unit") or "").strip().lower()
+    coordinate_space = str(anchor.get("coordinateSpace") or anchor.get("coordinate_space") or "").strip() or "preview"
+    for alias in ("boundingClientRect", "clientRect", "selectionRect", "box", "coordinate_space"):
+        normalized.pop(alias, None)
+    normalized["kind"] = "rect"
+    normalized["path"] = path
+    normalized["rect"] = rect or {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 0.0,
+        "height": 0.0,
+        "left": 0.0,
+        "top": 0.0,
+        "right": 0.0,
+        "bottom": 0.0,
+    }
+    normalized["unit"] = unit if unit in {"px", "percent"} else "px"
+    normalized["coordinateSpace"] = coordinate_space
+    if anchor.get("label") is not None:
+        normalized["label"] = str(anchor.get("label") or "").strip()
+    if anchor.get("slideId") is not None or anchor.get("slide_id") is not None:
+        normalized["slideId"] = str(anchor.get("slideId") or anchor.get("slide_id") or "").strip()
+    return normalized
 
 
 def _normalize_proposed_patch(patch: dict | None) -> dict:

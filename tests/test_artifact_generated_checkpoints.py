@@ -59,6 +59,8 @@ def test_generated_tracker_snapshots_before_and_after_changed_artifact(tmp_path:
         assert len(before) == 0
         assert len(after) == 1
         assert [version.operation_type for version in versions] == ["snapshot", "generated_update"]
+        assert versions[-1].snapshot_role == "post"
+        assert versions[-1].pre_snapshot_version_id == versions[0].id
         assert versions[-1].files_hash != versions[0].files_hash
 
 
@@ -79,6 +81,8 @@ def test_generated_tracker_records_unsnapshotted_existing_state_before_mutation(
         assert len(before) == 1
         assert len(after) == 1
         assert [version.operation_type for version in versions] == ["pre_generated_update", "generated_update"]
+        assert [version.snapshot_role for version in versions] == ["pre", "post"]
+        assert versions[1].pre_snapshot_version_id == versions[0].id
 
 
 def test_generated_tracker_records_source_conversation_and_prompt(tmp_path: Path):
@@ -141,6 +145,8 @@ def test_generated_tracker_captures_new_artifacts_after_generation(tmp_path: Pat
         assert len(after) == 1
         assert len(versions) == 1
         assert versions[0].operation_type == "generated_update"
+        assert versions[0].snapshot_role == "single"
+        assert versions[0].pre_snapshot_version_id is None
 
 
 def test_hermes_snapshots_after_consumer_closes_early(tmp_path: Path, monkeypatch):

@@ -47,7 +47,7 @@ async def handoff_artifact_to_conversation(
         topic=title or _default_title(artifact, comment=comment),
         project_id=resolved_project_id,
     )
-    handoff_path = _handoff_source_path(
+    handoff_path, pre_turn_checkpoint = _handoff_source_path(
         session,
         artifact,
         version=version,
@@ -87,6 +87,7 @@ async def handoff_artifact_to_conversation(
                 "commentId": str(comment.id) if comment is not None else None,
                 "handoffPath": str(handoff_path),
                 "materializedVersion": version is not None,
+                "preTurnCheckpointId": str(pre_turn_checkpoint.id) if pre_turn_checkpoint is not None else None,
                 "actorName": actor_name or "",
                 **({"actorEmail": actor_email} if actor_email else {}),
                 **({"actorSubject": actor_subject} if actor_subject else {}),
@@ -95,6 +96,15 @@ async def handoff_artifact_to_conversation(
     )
     session.commit()
     session.refresh(conversation)
+    pre_turn_checkpoint_payload = None
+    if pre_turn_checkpoint is not None:
+        checkpoint_artifact = session.get(Artifact, pre_turn_checkpoint.artifact_id)
+        checkpoint_external_id = _external_artifact_id(checkpoint_artifact) if checkpoint_artifact is not None else None
+        pre_turn_checkpoint_payload = version_to_dict(
+            pre_turn_checkpoint,
+            session=session,
+            artifact_external_id=checkpoint_external_id,
+        )
     return {
         "conversationId": str(conversation.id),
         "conversation": {
@@ -104,6 +114,7 @@ async def handoff_artifact_to_conversation(
         },
         "artifact": _artifact_payload(artifact),
         "version": version_to_dict(version, session=session, artifact_external_id=_external_artifact_id(artifact)) if version else None,
+        "preTurnCheckpoint": pre_turn_checkpoint_payload,
         "comment": comment_to_dict(comment) if comment else None,
         "handoffPath": str(handoff_path),
         "materializedVersion": version is not None,
@@ -214,9 +225,18 @@ def _handoff_source_path(
     conversation_id: UUID,
     project_id: UUID | None,
     prompt: str | None,
-) -> Path:
+) -> tuple[Path, ArtifactVersion | None]:
     if version is None:
-        return Path(artifact.path)
+        checkpoint = ArtifactVersionService(session).snapshot_artifact(
+            Path(artifact.path),
+            artifact_id=artifact.id,
+            source_conversation_id=conversation_id,
+            prompt=prompt or "Before artifact handoff",
+            label="Before follow-up task",
+            operation_type="handoff_safety",
+            snapshot_role="pre",
+        )
+        return Path(artifact.path), checkpoint
     service = ArtifactVersionService(session)
     target = _handoff_target_root(session, artifact, version=version, conversation_id=conversation_id, project_id=project_id)
     external_id = _external_artifact_id(artifact) or artifact.slug or str(artifact.id)
@@ -231,8 +251,9 @@ def _handoff_source_path(
         metadata_overrides=metadata_overrides,
         clear_published=True,
     )
+    checkpoint = None
     if project_id is not None:
-        service.snapshot_artifact(
+        checkpoint = service.snapshot_artifact(
             target,
             project_id=project_id,
             slug=target.name,
@@ -247,8 +268,9 @@ def _handoff_source_path(
             publish_status="unpublished",
             branch_name=f"handoff/{str(conversation_id)[:8]}",
             forked_from_version_id=version.id,
+            snapshot_role="pre",
         )
-    return target
+    return target, checkpoint
 
 
 def _handoff_target_root(
