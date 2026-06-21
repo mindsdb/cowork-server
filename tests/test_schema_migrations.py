@@ -100,10 +100,10 @@ def test_schema_migrations_handle_partial_artifact_schema(tmp_path, monkeypatch)
     assert {"path", "current_version_id", "last_known_good_version_id"}.issubset(
         _table_columns(db_path, "artifacts")
     )
-    assert {"branch_name", "forked_from_version_id", "store_path"}.issubset(
+    assert {"branch_name", "forked_from_version_id", "pre_snapshot_version_id", "snapshot_role", "store_path"}.issubset(
         _table_columns(db_path, "artifact_versions")
     )
-    assert {"proposed_patch", "notification_state"}.issubset(
+    assert {"proposed_patch", "notification_state", "review_verdict"}.issubset(
         _table_columns(db_path, "artifact_comments")
     )
     assert {"token_hash", "expires_at", "invited_by_email"}.issubset(

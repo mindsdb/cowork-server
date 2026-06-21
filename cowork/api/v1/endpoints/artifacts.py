@@ -230,10 +230,20 @@ class _PathBody(BaseModel):
 
 
 class _CheckpointBody(BaseModel):
+    model_config = {"populate_by_name": True}
+
     path: str
     label: str | None = None
     operation_type: str = "checkpoint"
     prompt: str | None = None
+    snapshot_role: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("snapshot_role", "snapshotRole"),
+    )
+    pre_snapshot_version_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("pre_snapshot_version_id", "preSnapshotVersionId"),
+    )
 
 
 class _RestoreVersionBody(BaseModel):
@@ -274,6 +284,10 @@ class _CommentBody(BaseModel):
     proposed_patch: dict | None = Field(
         default=None,
         validation_alias=AliasChoices("proposed_patch", "proposedPatch"),
+    )
+    review_verdict: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("review_verdict", "reviewVerdict", "verdict"),
     )
     parent_comment_id: str | None = Field(
         default=None,
@@ -611,6 +625,8 @@ def create_artifact_checkpoint(req: _CheckpointBody, session: SessionDep, princi
             operation_type=req.operation_type,
             label=req.label,
             prompt=req.prompt,
+            snapshot_role=req.snapshot_role,
+            pre_snapshot_version_id=req.pre_snapshot_version_id,
             **_actor_kwargs(principal),
         )
     except FileNotFoundError as e:
@@ -735,6 +751,7 @@ def create_artifact_comment(req: _CommentBody, session: SessionDep, principal: P
             kind=req.kind,
             anchor=req.anchor or {},
             proposed_patch=req.proposed_patch,
+            review_verdict=req.review_verdict,
             parent_comment_id=req.parent_comment_id,
             actor_name=(principal.name if principal is not None and principal.name else req.actor_name),
             actor_email=principal.email if principal is not None else None,

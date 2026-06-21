@@ -83,6 +83,18 @@ class ArtifactVersion(BaseSQLModel, table=True):
     )
     prompt: str | None = Field(default=None, sa_type=sa.Text, description="Prompt or instruction that produced it")
     operation_type: str = Field(default="snapshot", max_length=64, description="snapshot | edit | restore | import")
+    snapshot_role: str | None = Field(
+        default=None,
+        max_length=64,
+        index=True,
+        description="Role in a paired snapshot flow, such as pre | post | single",
+    )
+    pre_snapshot_version_id: UUID | None = Field(
+        default=None,
+        foreign_key="artifact_versions.id",
+        index=True,
+        description="Pre-change snapshot paired with this version, when applicable",
+    )
     preview_status: str = Field(default="pending", max_length=64, description="Preview lifecycle status")
     publish_status: str = Field(default="unpublished", max_length=64, description="Publish lifecycle status")
     restored_from_version_id: UUID | None = Field(
@@ -178,6 +190,12 @@ class ArtifactComment(BaseSQLModel, table=True):
     anchor: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     proposed_patch: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     status: str = Field(default="open", max_length=64, description="open | resolved | accepted | rejected")
+    review_verdict: str | None = Field(
+        default=None,
+        max_length=64,
+        index=True,
+        description="Review verdict such as approved | changes_requested",
+    )
     actor_name: str | None = Field(default=None, max_length=255, description="Display name for the commenter")
     notification_state: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
