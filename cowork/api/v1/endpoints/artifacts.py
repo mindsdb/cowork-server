@@ -6,6 +6,7 @@ agent-produced artifacts.
 """
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import shutil
@@ -26,7 +27,6 @@ from cowork.services.artifacts import (
     _load_metadata,
     _pick_primary,
     _project_artifacts_base,
-    delete_artifact as _delete_artifact,
     get_preview_mount,
     list_artifacts as _list_artifacts,
     mount_preview,
@@ -65,6 +65,8 @@ from cowork.services.artifact_versions import (
     version_to_dict,
 )
 from cowork.services.artifact_handoff import handoff_artifact_to_conversation
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -168,6 +170,7 @@ def _mark_live_preview_ready(session: Session, artifact_path: Path, payload: dic
             details={"kind": payload.get("kind") or "", "path": str(artifact_path)},
         )
     except Exception:
+        logger.warning("Failed to mark live preview ready for %s", artifact_path, exc_info=True)
         session.rollback()
 
 
@@ -219,6 +222,7 @@ def _record_live_preview_failure(session: Session, artifact_path: Path, detail: 
         session.add(artifact)
         session.commit()
     except Exception:
+        logger.warning("Failed to record live preview failure for %s", artifact_path, exc_info=True)
         session.rollback()
 
 
@@ -422,17 +426,27 @@ def _deleted_artifact_card(
         except ValueError:
             version = None
     external_id = str(details.get("externalArtifactId") or details.get("artifactId") or artifact.slug or artifact.id)
+    # On delete the row's slug/path were tombstoned ("…#deleted-<uuid>"). Show
+    # the originals: prefer the values captured in the event details, else strip
+    # the tombstone suffix off the row's current values.
+    def _undeleted(value: str | None) -> str | None:
+        if not value:
+            return value
+        return value.split("#deleted-", 1)[0]
+
+    display_slug = details.get("slug") or _undeleted(artifact.slug)
+    display_path = details.get("path") or _undeleted(artifact.path)
     return {
         "id": external_id,
         "artifactId": external_id,
         "internalArtifactId": str(artifact.id),
-        "title": artifact.title or artifact.slug,
+        "title": artifact.title or display_slug,
         "description": artifact.description or "",
         "type": artifact.artifact_type or "mixed",
         "kind": artifact.artifact_type or "Artifact",
-        "slug": artifact.slug,
-        "path": artifact.path,
-        "folder": artifact.path,
+        "slug": display_slug,
+        "path": display_path,
+        "folder": display_path,
         "projectId": str(artifact.project_id) if artifact.project_id else None,
         "deletedAt": event.created_at.isoformat() if event.created_at else None,
         "actorName": event.actor_name,
