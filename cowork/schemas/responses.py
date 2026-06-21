@@ -100,6 +100,7 @@ class StreamingResponseEvent(str, Enum):
     created = "response.created"
     in_progress = "response.in_progress"
     output_text_delta = "response.output_text.delta"
+    selection_requested = "response.selection.requested"
     completed = "response.completed"
 
 

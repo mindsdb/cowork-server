@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 import os
 from pathlib import Path
@@ -7,14 +9,30 @@ import tempfile
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, format_responses_stream
+from cowork.harnesses.anton_harness.selection import StreamingSelectionElicitor
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+from cowork.streaming.selection_gateway import selection_gateway
 
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+# Sentinels bridging the turn's pump task to the consumer in `stream_response`.
+_PUMP_DONE = object()  # the turn's event stream is exhausted
+
+
+class _PumpError:
+    """Carries an exception from the pump task to the consumer loop so a
+    failing turn surfaces as a failed response rather than a silent stall."""
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -139,6 +157,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
+        conversation_id = str(conversation.id)
         # Attribute + surface any artifact created during this turn. Anton runs
         # with its own session id and doesn't tag artifacts with the cowork
         # conversation_id, so we diff the project's artifacts dir around the run
@@ -151,8 +170,46 @@ class AntonHarness:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
             )
-            async for event in session.turn_stream(self._to_anton_input(input)):
-                yield event
+            # Inject the GUI elicitor so `select_path` can prompt mid-turn. The
+            # turn runs in a pump task feeding `queue`; the elicitor enqueues a
+            # request event (drained + streamed below) and then blocks awaiting
+            # the user's pick — so the picker reaches the client before the
+            # turn pauses. anton stays transport-agnostic (it only sees the
+            # SelectionElicitor protocol).
+            queue: asyncio.Queue = asyncio.Queue()
+            session.selection_elicitor = StreamingSelectionElicitor(
+                emit=queue.put_nowait,
+                gateway=selection_gateway,
+                conversation_id=conversation_id,
+            )
+
+            async def _pump() -> None:
+                try:
+                    async for event in session.turn_stream(self._to_anton_input(input)):
+                        queue.put_nowait(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # surface to the consumer as a failed turn
+                    queue.put_nowait(_PumpError(exc))
+                finally:
+                    queue.put_nowait(_PUMP_DONE)
+
+            pump = asyncio.create_task(_pump(), name=f"anton-turn[{conversation_id}]")
+            try:
+                while True:
+                    event = await queue.get()
+                    if event is _PUMP_DONE:
+                        break
+                    if isinstance(event, _PumpError):
+                        raise event.exc
+                    yield event
+            finally:
+                if not pump.done():
+                    pump.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pump
+                # Unblock any selection still awaiting a reply for this turn.
+                selection_gateway.cancel_all(conversation_id)
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)

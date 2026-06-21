@@ -19,7 +19,7 @@ from cowork.common.logger import setup_logging
 from cowork.db.session import get_session
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.schemas.responses import ResponsesRequest
-from cowork.streaming import registry
+from cowork.streaming import registry, selection_gateway
 
 
 logger = setup_logging()
@@ -99,6 +99,26 @@ async def cancel_response(req: CancelRequest):
     does NOT cancel — only this does."""
     cancelled = await registry.cancel(req.conversation_id)
     return {"cancelled": cancelled, "conversation_id": req.conversation_id}
+
+
+class SelectionSubmitRequest(BaseModel):
+    conversation_id: str
+    request_id: str
+    # The chosen path, or null when the user dismissed the picker. The agent
+    # tool validates the path against the candidates it offered, so a bad value
+    # is rejected there rather than trusted here.
+    selection: str | None = None
+
+
+@router.post("/selection")
+async def submit_selection(req: SelectionSubmitRequest):
+    """Deliver a file/folder pick into the paused, in-flight turn that asked
+    for it. 404 when nothing is awaiting this request (turn ended, or a stale
+    / duplicate submit) so the client can drop the picker."""
+    delivered = selection_gateway.resolve(req.conversation_id, req.request_id, req.selection)
+    if not delivered:
+        return JSONResponse(status_code=404, content={"status": "not_pending"})
+    return {"status": "ok", "conversation_id": req.conversation_id, "request_id": req.request_id}
 
 
 @router.get("/tail")
