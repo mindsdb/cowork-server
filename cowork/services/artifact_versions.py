@@ -851,16 +851,26 @@ def restore_artifact(
     if not folder.is_dir():
         original = _deleted_original_path(session, requested_artifact)
         if original:
+            def _slug_taken(name: str) -> bool:
+                existing = session.exec(
+                    select(Artifact)
+                    .where(Artifact.project_id == requested_artifact.project_id)
+                    .where(Artifact.slug == name)
+                ).first()
+                return existing is not None and existing.id != requested_artifact.id
+
+            # Find a free landing spot: the original folder, or a `-restored`
+            # sibling if the path OR the slug (basename) is now taken by a new
+            # artifact. Healing both un-tombstones the record (both unique keys).
             target = Path(original)
-            if target.exists():
-                base, n = target, 2
-                while target.exists():
-                    target = base.parent / f"{base.name}-restored{'' if n == 2 else f'-{n}'}"
-                    n += 1
-            if str(target) != requested_artifact.path:
-                folder = target
-                requested_artifact.path = str(folder)
-                session.add(requested_artifact)
+            base, n = target, 2
+            while target.exists() or _slug_taken(target.name):
+                target = base.parent / f"{base.name}-restored{'' if n == 2 else f'-{n}'}"
+                n += 1
+            folder = target
+            requested_artifact.path = str(folder)
+            requested_artifact.slug = target.name
+            session.add(requested_artifact)
     folder_exists = folder.is_dir()
     if folder_exists and bool(body.get("create_checkpoint") or body.get("createCheckpoint")):
         created_checkpoint = service.snapshot_artifact(

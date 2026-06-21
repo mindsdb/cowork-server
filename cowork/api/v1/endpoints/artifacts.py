@@ -1101,11 +1101,16 @@ def delete_artifact_endpoint(session: SessionDep, principal: PrincipalDep, path:
                 },
             )
         )
-        # Release the folder path so a NEW artifact created at the same path starts
-        # fresh, instead of re-attaching to this (now-deleted) record and inheriting
-        # its history. The original path is preserved in the "deleted" event details
-        # above, so recovery can restore it (see restore_artifact / _deleted_original_path).
-        artifact.path = f"{artifact.path}#deleted-{uuid4().hex}"
+        # Release the folder path AND slug so a NEW artifact created at the same
+        # path/name starts fresh, instead of re-attaching to this (now-deleted)
+        # record and inheriting its history. BOTH unique keys must be freed —
+        # uq_artifacts_path AND uq_artifacts_project_slug — or the re-create 500s on
+        # an integrity error. The originals are preserved in the "deleted" event
+        # details above, so recovery can restore them (see restore_artifact).
+        tombstone = uuid4().hex
+        artifact.path = f"{artifact.path}#deleted-{tombstone}"
+        if artifact.slug:
+            artifact.slug = f"{artifact.slug}#deleted-{tombstone}"
         session.add(artifact)
         session.commit()
         committed = True
