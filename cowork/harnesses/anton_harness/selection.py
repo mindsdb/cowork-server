@@ -17,7 +17,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Awaitable, Callable
 
 from anton.core.interaction.selection import SelectionRequest
 
@@ -54,7 +54,7 @@ class StreamingSelectionElicitor:
     def __init__(
         self,
         *,
-        emit: Callable[[object], None],
+        emit: Callable[[object], Awaitable[None]],
         gateway: SelectionGateway,
         conversation_id: str,
     ) -> None:
@@ -65,7 +65,7 @@ class StreamingSelectionElicitor:
     async def elicit(self, request: SelectionRequest) -> str | None:
         request_id = uuid.uuid4().hex[:12]
         future = self._gateway.open(self._conversation_id, request_id)
-        self._emit(
+        await self._emit(
             SelectionRequestEvent(
                 request_id=request_id,
                 prompt=request.prompt,
@@ -82,7 +82,8 @@ class StreamingSelectionElicitor:
             return await future
         except asyncio.CancelledError:
             # Turn cancelled (Stop button / disconnect-driven teardown) while
-            # waiting — treat as "no choice" so the tool returns cleanly.
-            return None
+            # waiting. Preserve cancellation so the run actually stops; user
+            # dismiss is represented by the future resolving with None.
+            raise
         finally:
             self._gateway.close(self._conversation_id, request_id)
