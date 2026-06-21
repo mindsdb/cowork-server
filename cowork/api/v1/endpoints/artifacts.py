@@ -1101,6 +1101,12 @@ def delete_artifact_endpoint(session: SessionDep, principal: PrincipalDep, path:
                 },
             )
         )
+        # Release the folder path so a NEW artifact created at the same path starts
+        # fresh, instead of re-attaching to this (now-deleted) record and inheriting
+        # its history. The original path is preserved in the "deleted" event details
+        # above, so recovery can restore it (see restore_artifact / _deleted_original_path).
+        artifact.path = f"{artifact.path}#deleted-{uuid4().hex}"
+        session.add(artifact)
         session.commit()
         committed = True
     except FileNotFoundError as e:

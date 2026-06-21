@@ -844,6 +844,23 @@ def restore_artifact(
     folder = Path(requested_artifact.path)
     service = ArtifactVersionService(session)
     created_checkpoint = None
+    # A deleted artifact's path was tombstoned on delete (released so a new artifact
+    # could reuse the original path). Restore it to its ORIGINAL folder — or a free
+    # sibling if that path is now occupied by a different artifact — and heal the
+    # record's path so it's live again.
+    if not folder.is_dir():
+        original = _deleted_original_path(session, requested_artifact)
+        if original:
+            target = Path(original)
+            if target.exists():
+                base, n = target, 2
+                while target.exists():
+                    target = base.parent / f"{base.name}-restored{'' if n == 2 else f'-{n}'}"
+                    n += 1
+            if str(target) != requested_artifact.path:
+                folder = target
+                requested_artifact.path = str(folder)
+                session.add(requested_artifact)
     folder_exists = folder.is_dir()
     if folder_exists and bool(body.get("create_checkpoint") or body.get("createCheckpoint")):
         created_checkpoint = service.snapshot_artifact(
@@ -2019,6 +2036,27 @@ def _deleted_external_artifact_id(session: Session | None, artifact: Artifact) -
         return None
     details = event.details or {}
     value = details.get("externalArtifactId") or details.get("artifactId")
+    return value if isinstance(value, str) and value else None
+
+
+def _deleted_original_path(session: Session | None, artifact: Artifact) -> str | None:
+    """The folder path an artifact had when it was deleted.
+
+    On delete we tombstone ``artifact.path`` (so a new artifact can reuse the
+    original path) but stash the original in the "deleted" event details. Recovery
+    uses this to restore the artifact back to where it lived.
+    """
+    if session is None:
+        return None
+    event = session.exec(
+        select(ArtifactActivityEvent)
+        .where(ArtifactActivityEvent.artifact_id == artifact.id)
+        .where(ArtifactActivityEvent.event_type == "deleted")
+        .order_by(ArtifactActivityEvent.created_at.desc())
+    ).first()
+    if event is None:
+        return None
+    value = (event.details or {}).get("path")
     return value if isinstance(value, str) and value else None
 
 
