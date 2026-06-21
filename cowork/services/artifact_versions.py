@@ -507,6 +507,11 @@ class ArtifactVersionService:
         if artifact is None:
             artifact = self.session.exec(select(Artifact).where(Artifact.path == root_text)).first()
         if artifact is None:
+            # A different artifact in this project may already hold this slug
+            # (two folders sharing a metadata slug / folder name). Inserting a
+            # second (project_id, slug) row violates uq_artifacts_project_slug
+            # and raises an opaque IntegrityError 500. Uniquify before insert.
+            slug = self._unique_project_slug(project_id, slug, exclude_path=root_text)
             artifact = Artifact(
                 project_id=project_id,
                 slug=slug,
@@ -526,6 +531,24 @@ class ArtifactVersionService:
         self.session.add(artifact)
         self.session.flush()
         return artifact
+
+    def _unique_project_slug(self, project_id: UUID | None, slug: str, *, exclude_path: str) -> str:
+        """Return ``slug`` (or ``slug-2``, ``slug-3``, …) unused within the project.
+
+        A slug is considered taken only if held by an artifact at a DIFFERENT
+        path, so an existing same-path row keeps its slug untouched.
+        """
+        candidate, n = slug, 2
+        while True:
+            existing = self.session.exec(
+                select(Artifact)
+                .where(Artifact.project_id == project_id)
+                .where(Artifact.slug == candidate)
+            ).first()
+            if existing is None or existing.path == exclude_path:
+                return candidate
+            candidate = f"{slug}-{n}"
+            n += 1
 
     def _next_version_number(self, artifact_id: UUID) -> int:
         current = self.session.exec(
@@ -859,12 +882,20 @@ def restore_artifact(
                 ).first()
                 return existing is not None and existing.id != requested_artifact.id
 
+            def _path_taken(p: str) -> bool:
+                existing = session.exec(
+                    select(Artifact).where(Artifact.path == p)
+                ).first()
+                return existing is not None and existing.id != requested_artifact.id
+
             # Find a free landing spot: the original folder, or a `-restored`
             # sibling if the path OR the slug (basename) is now taken by a new
             # artifact. Healing both un-tombstones the record (both unique keys).
+            # `_path_taken` guards against a second deleted-but-untombstoned row
+            # (or any row whose folder is absent) still holding uq_artifacts_path.
             target = Path(original)
             base, n = target, 2
-            while target.exists() or _slug_taken(target.name):
+            while target.exists() or _slug_taken(target.name) or _path_taken(str(target)):
                 target = base.parent / f"{base.name}-restored{'' if n == 2 else f'-{n}'}"
                 n += 1
             folder = target

@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import secrets
 import shutil
 import socket
@@ -23,6 +24,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Iterator
 
 from urllib.parse import quote
@@ -754,7 +756,13 @@ def _unpublish_folder(folder: Path) -> None:
 
 
 def delete_artifact(raw_path: str) -> None:
-    """Permanently delete an artifact folder from disk.
+    """DEPRECATED — unused in production; hard-deletes without recovery.
+
+    The delete_artifact_endpoint uses inline tombstone logic (rename to a
+    `.delete-<uuid>` folder, recoverable via the "deleted" activity event),
+    NOT this function. This path does an unrecoverable ``shutil.rmtree`` and
+    is retained only because tests still exercise it. Do not wire it into new
+    code; prefer the endpoint's tombstone flow.
 
     If the artifact has published files, they are unpublished from the
     remote first. If any unpublish fails, the artifact is left on disk
@@ -1190,10 +1198,26 @@ async def _launch_backend_locked(
         meta_path = artifact_dir / "metadata.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta["port"] = new_port
-        meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+        # Atomic write: a concurrent reader (the proxy reads metadata.json on
+        # every request) must never observe a truncated file, or the artifact
+        # vanishes from listings. Write a temp file in the same dir, then
+        # os.replace it into place (atomic on the same filesystem).
+        payload = json.dumps(meta, indent=2, ensure_ascii=False) + "\n"
+        with NamedTemporaryFile(
+            "w",
+            prefix=".metadata.",
+            suffix=".tmp",
+            dir=meta_path.parent,
+            delete=False,
             encoding="utf-8",
-        )
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(payload)
+        try:
+            os.replace(tmp_path, meta_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
     except Exception as exc:
         # Metadata write failure shouldn't abort an otherwise-working
         # relaunch — the backend is up and we return the new port. But
