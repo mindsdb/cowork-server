@@ -7,6 +7,7 @@ from cowork.models.artifact import (  # noqa: F401
     ArtifactVersion,
     ArtifactVersionFile,
 )
+from cowork.models.identity import ArtifactShare, User  # noqa: F401
 from cowork.models.channel import (  # noqa: F401
     ChannelBinding,
     ChannelEvent,
