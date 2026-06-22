@@ -139,6 +139,13 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
+        # Attribute any artifact created during this turn to the conversation.
+        # Anton runs with its own session id and doesn't tag artifacts with the
+        # cowork conversation_id, so we observe the project's artifacts dir
+        # around the run instead (see services.task_objects).
+        from cowork.services.task_objects import index_new_artifacts, snapshot_artifact_slugs
+        artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
+        before_slugs = snapshot_artifact_slugs(artifacts_base)
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
@@ -148,6 +155,12 @@ class AntonHarness:
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            try:
+                index_new_artifacts(
+                    conversation.id, conversation.project_id, artifacts_base, before_slugs,
+                )
+            except Exception:
+                logger.warning("Could not index artifacts created this turn", exc_info=True)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
