@@ -179,6 +179,13 @@ class HermesHarness:
         conversation_topic = conversation.topic
         prompt = self._to_prompt_string(input)
 
+        # Snapshot the artifacts dir before the run so we can surface any
+        # artifacts this turn produces as inline cards — the same diff the
+        # move index uses, so both harnesses behave identically.
+        from cowork.services.task_objects import snapshot_artifact_slugs
+        artifacts_base = Path(project_path) / ".anton" / "artifacts"
+        before_slugs = snapshot_artifact_slugs(artifacts_base)
+
         def run_sync() -> dict:
             try:
                 return self._run(
@@ -206,6 +213,13 @@ class HermesHarness:
             if item is None:
                 break
             yield item
+
+        # Emit inline-artifact cards before the terminal result so they
+        # render at the end of the message (mapped to response.artifact_created
+        # by the formatter — same event the Anton harness produces).
+        from cowork.services.task_objects import new_artifact_cards
+        for card in new_artifact_cards(artifacts_base, before_slugs):
+            yield {"type": "artifact_created", "artifact": card}
 
         yield await task
 
