@@ -82,6 +82,20 @@ def get_request_principal(request: Request) -> RequestPrincipal | None:
 PrincipalDep = Annotated[RequestPrincipal | None, Depends(get_request_principal)]
 
 
+# Soft-deleted artifacts get their unique keys (path, slug) suffixed with this prefix
+# + a uuid, freeing the originals for a re-create while preserving them in the delete
+# event for recovery. Stripped again for display (see _undeleted).
+_DELETED_TOMBSTONE_PREFIX = "#deleted-"
+
+
+def _tombstone(value: str, token: str, max_length: int) -> str:
+    """Suffix ``value`` with the delete tombstone, truncating the base so the result
+    still fits ``max_length`` (slug 255, path 2048). Without the truncation a long
+    slug/path overflows the column under validate_assignment and turns delete into a 500."""
+    suffix = f"{_DELETED_TOMBSTONE_PREFIX}{token}"
+    return f"{value[: max_length - len(suffix)]}{suffix}"
+
+
 def _actor_kwargs(principal: RequestPrincipal | None) -> dict[str, str | None]:
     return {
         "actor_name": principal.name if principal is not None else None,
@@ -432,7 +446,7 @@ def _deleted_artifact_card(
     def _undeleted(value: str | None) -> str | None:
         if not value:
             return value
-        return value.split("#deleted-", 1)[0]
+        return value.split(_DELETED_TOMBSTONE_PREFIX, 1)[0]
 
     display_slug = details.get("slug") or _undeleted(artifact.slug)
     display_path = details.get("path") or _undeleted(artifact.path)
@@ -786,9 +800,7 @@ def resolve_artifact_comment(comment_id: UUID, session: SessionDep, principal: P
             session,
             comment_id,
             status="resolved",
-            actor_name=principal.name if principal is not None else None,
-            actor_email=principal.email if principal is not None else None,
-            actor_subject=principal.subject if principal is not None else None,
+            **_actor_kwargs(principal),
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -802,9 +814,7 @@ def reopen_artifact_comment(comment_id: UUID, session: SessionDep, principal: Pr
             session,
             comment_id,
             status="open",
-            actor_name=principal.name if principal is not None else None,
-            actor_email=principal.email if principal is not None else None,
-            actor_subject=principal.subject if principal is not None else None,
+            **_actor_kwargs(principal),
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -818,9 +828,7 @@ def accept_artifact_suggestion(comment_id: UUID, session: SessionDep, principal:
             session,
             comment_id,
             status="accepted",
-            actor_name=principal.name if principal is not None else None,
-            actor_email=principal.email if principal is not None else None,
-            actor_subject=principal.subject if principal is not None else None,
+            **_actor_kwargs(principal),
         )
     except ValueError as e:
         detail = str(e)
@@ -836,9 +844,7 @@ def reject_artifact_suggestion(comment_id: UUID, session: SessionDep, principal:
             session,
             comment_id,
             status="rejected",
-            actor_name=principal.name if principal is not None else None,
-            actor_email=principal.email if principal is not None else None,
-            actor_subject=principal.subject if principal is not None else None,
+            **_actor_kwargs(principal),
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -862,9 +868,7 @@ def apply_artifact_suggestion_patch(comment_id: UUID, session: SessionDep, princ
         return _apply_comment_patch(
             session,
             comment_id,
-            actor_name=principal.name if principal is not None else None,
-            actor_email=principal.email if principal is not None else None,
-            actor_subject=principal.subject if principal is not None else None,
+            **_actor_kwargs(principal),
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1122,9 +1126,9 @@ def delete_artifact_endpoint(session: SessionDep, principal: PrincipalDep, path:
         # an integrity error. The originals are preserved in the "deleted" event
         # details above, so recovery can restore them (see restore_artifact).
         tombstone = uuid4().hex
-        artifact.path = f"{artifact.path}#deleted-{tombstone}"
+        artifact.path = _tombstone(artifact.path, tombstone, 2048)
         if artifact.slug:
-            artifact.slug = f"{artifact.slug}#deleted-{tombstone}"
+            artifact.slug = _tombstone(artifact.slug, tombstone, 255)
         session.add(artifact)
         session.commit()
         committed = True
