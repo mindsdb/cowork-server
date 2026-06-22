@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 _OUTCOME_TTL = timedelta(minutes=20)
 
@@ -26,8 +29,11 @@ class OAuthStateStore:
             return {}
 
     def _save(self, data: dict[str, Any]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError as exc:
+            _log.warning("Could not save OAuth state to %s: %s", self._path, exc)
 
     def set_pending(
         self,
@@ -79,8 +85,8 @@ class OAuthStateStore:
             if datetime.now(timezone.utc) - ts > _OUTCOME_TTL:
                 self.clear_outcome(state)
                 return None
-        except (KeyError, ValueError):
-            pass
+        except (KeyError, ValueError) as exc:
+            _log.debug("Could not parse outcome timestamp for state %r: %s", state, exc)
         return {k: v for k, v in entry.items() if k != "_ts"}
 
     def clear_outcome(self, state: str) -> None:
