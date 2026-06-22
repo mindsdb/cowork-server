@@ -21,6 +21,14 @@ class ConversationUpdateRequest(CamelRequest):
     disabled_connections: list[dict] | None = None
 
 
+class ConversationMoveRequest(CamelRequest):
+    """Move a task to another project. `move_objects` (default true) also
+    relocates the artifacts the task created and re-tags its files."""
+    project: str | None = None
+    project_id: UUID | None = None
+    move_objects: bool = True
+
+
 class ConversationListItem(CamelResponse):
     id: UUID
     title: str

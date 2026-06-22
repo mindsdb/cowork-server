@@ -185,7 +185,7 @@ class GoogleOAuthService:
             account_name = str(userinfo.get("name", "")).strip()
             connection_name = account_email or cfg.engine
 
-            self._verify_connection(service, access_token)
+            self.verify_connection(service, access_token)
 
             expires_in = int(token_data.get("expires_in", 0) or 0)
             expires_at = (
@@ -405,10 +405,15 @@ class GoogleOAuthService:
             headers={"Authorization": f"Bearer {access_token}"},
         )
 
-    def _verify_connection(self, service: str, access_token: str) -> None:
-        """Make a lightweight API call to confirm the token actually works.
-        Raises HTTPException(502) if the call fails, preventing vault save."""
+    def verify_connection(self, connector_id_or_service: str, access_token: str) -> None:
+        """Make a lightweight API call to confirm the token works before vault save.
+        Accepts either an engine name (e.g. 'google_drive') or a service id
+        (e.g. 'google-drive') — maps engine names via _ENGINE_TO_SERVICE.
+        Raises HTTPException(502) on failure. No-ops for services not yet in
+        verify_urls — add an entry here when adding a new Google service."""
+        service = _ENGINE_TO_SERVICE.get(connector_id_or_service, connector_id_or_service)
         verify_urls: dict[str, str] = {
+            # TODO: add google-calendar, gmail, google-ads, google-analytics
             "google-drive": "https://www.googleapis.com/drive/v3/about?fields=user",
         }
         url = verify_urls.get(service)

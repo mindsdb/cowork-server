@@ -23,6 +23,20 @@ IMAGE_FORMAT_USER_MESSAGE = (
     "Sorry, I couldn't process that image. Try uploading it as a PNG or JPEG."
 )
 
+# Curated copy for a spent token allowance. Without this the turn would
+# die on a 429 mid-stream with no completion event and no error frame —
+# the SSE connection just closes and the renderer's spinner stops, which
+# reads as "Anton is dead" rather than "you ran out of tokens".
+TOKEN_LIMIT_USER_MESSAGE = (
+    "You've reached your monthly token limit. To keep going, upgrade your plan "
+    "or add your own LLM provider key in Settings — or wait until your allowance "
+    "resets."
+)
+
+# Wire-level code for the quota case. Distinct from the image/generic
+# codes so a client can branch on it if it ever wants a richer affordance.
+TOKEN_LIMIT_CODE = "token_limit"
+
 # Redacted stand-in for any failure we haven't mapped — never the raw
 # provider text.
 GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
@@ -51,12 +65,33 @@ def is_image_format_error(exc: Exception) -> bool:
     return "image" in s and ("unsupported image" in s or "could not process image" in s)
 
 
+def is_token_limit_error(exc: Exception) -> bool:
+    """Detect anton's ``TokenLimitExceeded`` — raised when the upstream LLM
+    endpoint returns 429 because the account's included-token allowance is
+    spent. anton already builds a friendly message; we just need to know it's
+    a quota failure (not a generic crash) so we can emit curated copy.
+    """
+    try:
+        from anton.core.llm.provider import TokenLimitExceeded
+
+        if isinstance(exc, TokenLimitExceeded):
+            return True
+    except Exception:
+        # anton not importable / the type moved — fall back to matching the
+        # stable 429 message anton constructs for this case.
+        pass
+    s = str(exc).lower()
+    return "429" in s and "limit exceeded for tokens" in s
+
+
 def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
     """Map a known, cryptic turn failure to ``(code, user_message)``.
 
     Returns ``None`` when the exception isn't one we have curated copy
     for — the caller then falls back to the generic redacted message.
     """
+    if is_token_limit_error(exc):
+        return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if is_image_format_error(exc):
         return "image_format", IMAGE_FORMAT_USER_MESSAGE
     return None
