@@ -52,7 +52,7 @@ build-backend = "hatchling.build"
 packages = ["cowork"]
 
 [tool.uv.sources]
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "staging" } # Update to main before release
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
 
 [dependency-groups]
