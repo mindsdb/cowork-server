@@ -523,7 +523,11 @@ class ArtifactVersionService:
         else:
             if project_id is not None:
                 artifact.project_id = project_id
-            artifact.slug = slug
+            # Same collision risk as the insert path: assigning a slug another
+            # artifact in this project already holds violates uq_artifacts_project_slug
+            # and raises an opaque IntegrityError 500. Uniquify here too (excluding this
+            # row's own path, so an unchanged slug stays stable).
+            artifact.slug = self._unique_project_slug(artifact.project_id, slug, exclude_path=root_text)
             artifact.title = title
             artifact.description = description
             artifact.artifact_type = artifact_type
@@ -949,6 +953,9 @@ def restore_artifact(
     return payload
 
 
+# Compat aliases (restore_checkpoint / fork_artifact_version / diff_artifact_versions):
+# NOT dead — the router in endpoints/artifact_versions.py resolves operations by NAME
+# via getattr, so these forward-by-name wrappers are load-bearing. Keep.
 def restore_checkpoint(*args, **kwargs) -> dict:
     return restore_artifact(*args, **kwargs)
 
@@ -1030,6 +1037,7 @@ def fork_version(
     }
 
 
+# Compat alias — reached by name from the endpoints/artifact_versions.py dispatch. Keep.
 def fork_artifact_version(*args, **kwargs) -> dict:
     return fork_version(*args, **kwargs)
 
@@ -1206,6 +1214,7 @@ def diff_versions(
     }
 
 
+# Compat alias — reached by name from the endpoints/artifact_versions.py dispatch. Keep.
 def diff_artifact_versions(*args, **kwargs) -> dict:
     return diff_versions(*args, **kwargs)
 
@@ -2064,28 +2073,11 @@ def _artifact_by_deleted_external_id(session: Session, artifact_id: str) -> Arti
     return None
 
 
-def _deleted_external_artifact_id(session: Session | None, artifact: Artifact) -> str | None:
-    if session is None:
-        return None
-    event = session.exec(
-        select(ArtifactActivityEvent)
-        .where(ArtifactActivityEvent.artifact_id == artifact.id)
-        .where(ArtifactActivityEvent.event_type == "deleted")
-        .order_by(ArtifactActivityEvent.created_at.desc())
-    ).first()
-    if event is None:
-        return None
-    details = event.details or {}
-    value = details.get("externalArtifactId") or details.get("artifactId")
-    return value if isinstance(value, str) and value else None
+def _latest_deleted_details(session: Session | None, artifact: Artifact) -> dict | None:
+    """Details of the most-recent "deleted" event for an artifact (or None).
 
-
-def _deleted_original_path(session: Session | None, artifact: Artifact) -> str | None:
-    """The folder path an artifact had when it was deleted.
-
-    On delete we tombstone ``artifact.path`` (so a new artifact can reuse the
-    original path) but stash the original in the "deleted" event details. Recovery
-    uses this to restore the artifact back to where it lived.
+    On delete we tombstone the row's path/slug (freeing them for a re-create) but
+    stash the originals + external id in the event details; recovery reads them here.
     """
     if session is None:
         return None
@@ -2095,9 +2087,24 @@ def _deleted_original_path(session: Session | None, artifact: Artifact) -> str |
         .where(ArtifactActivityEvent.event_type == "deleted")
         .order_by(ArtifactActivityEvent.created_at.desc())
     ).first()
-    if event is None:
+    return (event.details or {}) if event is not None else None
+
+
+def _deleted_external_artifact_id(session: Session | None, artifact: Artifact) -> str | None:
+    details = _latest_deleted_details(session, artifact)
+    if not details:
         return None
-    value = (event.details or {}).get("path")
+    value = details.get("externalArtifactId") or details.get("artifactId")
+    return value if isinstance(value, str) and value else None
+
+
+def _deleted_original_path(session: Session | None, artifact: Artifact) -> str | None:
+    """The folder path an artifact had when it was deleted (stashed in the delete
+    event, since the row's path is tombstoned). Recovery restores back to here."""
+    details = _latest_deleted_details(session, artifact)
+    if not details:
+        return None
+    value = details.get("path")
     return value if isinstance(value, str) and value else None
 
 
