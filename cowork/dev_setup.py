@@ -56,13 +56,16 @@ def run_dev_setup() -> None:
     with SQLSession(engine) as session:
         migrate_env_to_db(session)
 
+    # Migrate harness-local memory into ~/.cowork/memory, then wire runtime symlinks.
+    import cowork.harnesses  # noqa: F401 — registers memory adapters
 
-# Sibling repos a developer may have checked out locally, mapped to their
-# default location relative to this repo root. Only anton is a source
-# dependency today; add more here if other repos become path-overridable.
-_LOCAL_SIBLINGS = {
-    "anton-agent": ("ANTON_LOCAL_DIR", "anton"),
-}
+    from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
+    from cowork.harnesses.memory.runtime import ensure_all_layouts
+
+    with SQLSession(engine) as session:
+        migrate_harness_memory_to_shared(session)
+
+    ensure_all_layouts()
 
 
 def link_local_siblings() -> None:
