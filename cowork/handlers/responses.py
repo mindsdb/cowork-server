@@ -288,6 +288,33 @@ class ResponsesHandler:
                 pass
         return sse_string
 
+    async def _stream(
+        self,
+        *,
+        stream,
+        conversation_id: UUID,
+        model: str,
+    ) -> AsyncGenerator[str, None]:
+        """Async-generator path: drive harness.formatter and yield SSE frames.
+
+        Catches exceptions so the caller always receives a terminal
+        ``response.failed`` frame rather than an unhandled raise.  Known
+        failures (image-format, token-limit) surface curated copy; anything
+        else is redacted to ``GENERIC_TURN_ERROR_MESSAGE``.
+        """
+        try:
+            async for sse_string in self.harness.formatter(stream, model, lambda *_: None):
+                yield sse_string
+        except Exception as exc:
+            friendly = friendly_turn_error(exc)
+            if friendly is not None:
+                code, message = friendly
+                logger.info("[responses] user-facing turn error (_stream): %s", exc)
+            else:
+                code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+                logger.exception("[responses] turn failed (_stream) for conversation %s", conversation_id)
+            yield response_failed_sse(message, code)
+
     async def _collect(
         self,
         stream,
