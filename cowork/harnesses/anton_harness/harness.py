@@ -11,8 +11,6 @@ from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
-from cowork.services.task_objects import index_new_artifacts, snapshot_artifact_slugs
-
 
 
 logger = get_logger(__name__)
@@ -141,6 +139,11 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
+        # Attribute any artifact created during this turn to the conversation.
+        # Anton runs with its own session id and doesn't tag artifacts with the
+        # cowork conversation_id, so we observe the project's artifacts dir
+        # around the run instead (see services.task_objects).
+        from cowork.services.task_objects import index_new_artifacts, snapshot_artifact_slugs
         artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
         try:
