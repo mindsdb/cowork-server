@@ -68,6 +68,14 @@ def run_dev_setup() -> None:
     ensure_all_layouts()
 
 
+# Sibling repos a developer may have checked out locally, mapped to their
+# default location relative to this repo root. Only anton is a source
+# dependency today; add more here if other repos become path-overridable.
+_LOCAL_SIBLINGS = {
+    "anton-agent": ("ANTON_LOCAL_DIR", "anton"),
+}
+
+
 def link_local_siblings() -> None:
     """Overlay local sibling-repo checkouts as editable installs for dev.
 
