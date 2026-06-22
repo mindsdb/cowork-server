@@ -210,3 +210,53 @@ def index_new_artifacts(conversation_id, project_id, artifacts_base, before: set
         svc = TaskObjectService(session)
         for slug in sorted(new):
             svc.index_artifact(conversation_id, project_id, slug)
+
+
+def new_artifact_cards(artifacts_base, before: set[str]) -> list[dict]:
+    """Card payloads for artifact folders that appeared since `before`.
+
+    Built from the SAME artifacts-dir diff that `index_new_artifacts` uses,
+    so the inline chat cards and the move/index can never disagree about
+    what a turn produced. Each new slug is read via the shared ArtifactStore
+    so the payload carries everything the renderer needs (title, type, the
+    primary file's path + extension) for a uniform card, HTML or not.
+
+    Returns `[]` when nothing new (or on any error) — surfacing cards is
+    best-effort and must never break a turn.
+    """
+    after = snapshot_artifact_slugs(artifacts_base)
+    new = sorted(after - set(before or ()))
+    if not new:
+        return []
+    try:
+        from anton.core.artifacts.store import ArtifactStore
+    except Exception:  # pragma: no cover - anton always present at runtime
+        return []
+    store = ArtifactStore(Path(artifacts_base))
+    try:
+        by_slug = {a.slug: a for a in store.list()}
+    except Exception:
+        logger.warning("Could not list artifacts for inline cards", exc_info=True)
+        return []
+    cards: list[dict] = []
+    for slug in new:
+        art = by_slug.get(slug)
+        if art is None:
+            continue
+        folder = store.folder_for(slug)
+        primary = art.primary or (art.files[0].path if art.files else None)
+        file_path = str(folder / primary) if primary else str(folder)
+        ext = ""
+        if primary and "." in primary:
+            ext = "." + primary.rsplit(".", 1)[-1].lower()
+        cards.append(
+            {
+                "slug": slug,
+                "title": art.name or slug,
+                "type": art.type,
+                "file_path": file_path,
+                "path": file_path,
+                "ext": ext,
+            }
+        )
+    return cards

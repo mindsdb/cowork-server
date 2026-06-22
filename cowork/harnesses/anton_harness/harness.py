@@ -6,7 +6,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
@@ -143,7 +143,11 @@ class AntonHarness:
         # Anton runs with its own session id and doesn't tag artifacts with the
         # cowork conversation_id, so we observe the project's artifacts dir
         # around the run instead (see services.task_objects).
-        from cowork.services.task_objects import index_new_artifacts, snapshot_artifact_slugs
+        from cowork.services.task_objects import (
+            index_new_artifacts,
+            new_artifact_cards,
+            snapshot_artifact_slugs,
+        )
         artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
         try:
@@ -152,6 +156,11 @@ class AntonHarness:
             )
             async for event in session.turn_stream(self._to_anton_input(input)):
                 yield event
+            # Turn finished normally — surface any artifacts it produced as
+            # inline cards. Same artifacts-dir diff that index_new_artifacts
+            # uses below, so cards and the move/index never disagree.
+            for card in new_artifact_cards(artifacts_base, before_slugs):
+                yield ArtifactCreated(card)
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)

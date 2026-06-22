@@ -25,6 +25,20 @@ from cowork.schemas.responses import (
 )
 
 
+class ArtifactCreated:
+    """Synthetic post-turn event: an artifact folder appeared during the
+    turn (detected by the harness via the artifacts-dir diff, not by any
+    agent tool call). Rides the same stream as Anton's `Stream*` events and
+    is mapped to a `response.artifact_created` SSE event below, so the
+    renderer shows an inline card for every artifact type, identically and
+    deterministically — live and on reload."""
+
+    __slots__ = ("artifact",)
+
+    def __init__(self, artifact: dict) -> None:
+        self.artifact = artifact
+
+
 PHASE_LABELS = {
     "planning": "Planning",
     "analyzing": "Analyzing",
@@ -260,6 +274,14 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "thought_role": Role.thought_context_compacted.value,
                 "content": event.message,
+            })
+
+        elif isinstance(event, ArtifactCreated):
+            seq += 1
+            yield _event("response.artifact_created", {
+                "type": "response.artifact_created",
+                "sequence_number": seq,
+                "artifact": event.artifact,
             })
 
         elif isinstance(event, StreamComplete):
