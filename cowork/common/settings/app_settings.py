@@ -167,7 +167,11 @@ class StreamSettings(Settings):
 
 
 class AppSettings(Settings):
-    env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
+    env: str = Field(
+        default="local",
+        validation_alias=AliasChoices("COWORK_ENV", "ENV"),
+        description="Deployment profile (local | staging | prod). Unified selector shared with the cowork app's COWORK_ENV; ENV kept as a legacy alias.",
+    )
 
     port: int = Field(
         default=int(os.environ.get("COWORK_SERVER_PORT", os.environ.get("SERVER_PORT", 26866))),
