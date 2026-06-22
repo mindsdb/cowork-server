@@ -510,6 +510,16 @@ def list_artifacts(project_path: str | None = None) -> list[dict]:
         except OSError:
             sort_ts = 0.0
 
+        # Max mtime across the artifact's content files — a precise
+        # "content changed" signal for the renderer's preview viewer to
+        # cache-bust/reload on (ENG-375). Disk-derived, so it reflects
+        # in-place edits that the metadata.json mtime / `updated` string
+        # miss. Rounded to an int so it's a stable cache-buster token.
+        try:
+            content_mtime = int(max((p.stat().st_mtime for p in files), default=0.0))
+        except OSError:
+            content_mtime = 0
+
         cards.append({
             "id": meta.get("id") or folder.name,
             "slug": meta.get("slug") or folder.name,
@@ -519,6 +529,7 @@ def list_artifacts(project_path: str | None = None) -> list[dict]:
             "kind": kind,
             "ext": primary_ext,
             "updated": _human_mtime(folder / "metadata.json"),
+            "mtime": content_mtime,
             "live": is_live,
             "bg": BG_CYCLE[idx],
             "fileCount": len(files),
