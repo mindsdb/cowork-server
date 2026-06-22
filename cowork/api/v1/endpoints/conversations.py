@@ -5,8 +5,15 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
 from cowork.db.session import get_session
-from cowork.schemas.conversations import ConversationCreateRequest, ConversationListItem, ConversationUpdateRequest
+from cowork.models.project import Project
+from cowork.schemas.conversations import (
+    ConversationCreateRequest,
+    ConversationListItem,
+    ConversationMoveRequest,
+    ConversationUpdateRequest,
+)
 from cowork.services.conversations import ConversationService
+from cowork.services.task_objects import TaskObjectService
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -84,6 +91,35 @@ def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, 
         return _serialize_conversation(conversation)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.post("/{conversation_id}/move")
+def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, session: SessionDep):
+    """Move a task to another project. With `move_objects` (default), the
+    artifacts the task created are relocated into the destination project
+    and its attachment files are re-tagged; otherwise only the task's
+    project pointer changes. The destination project must already exist
+    (the client creates a new one first, then moves to its id)."""
+    svc = ConversationService(session)
+    try:
+        conversation = svc.get_conversation(conversation_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    dest = None
+    if body.project_id is not None:
+        dest = session.get(Project, body.project_id)
+    elif body.project:
+        dest = svc.project_by_name(body.project)
+    if dest is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Destination project not found")
+
+    source = conversation.project
+    if body.move_objects and source is not None and dest.id != source.id:
+        TaskObjectService(session).relocate_to_project(conversation, source, dest)
+
+    conversation = svc.update_conversation(conversation_id, project_id=dest.id)
+    return _serialize_conversation(conversation)
 
 
 @router.get("/{conversation_id}/items")
