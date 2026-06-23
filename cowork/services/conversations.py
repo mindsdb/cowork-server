@@ -144,7 +144,11 @@ class ConversationService:
         harness: str | None = None,
     ) -> None:
         """Persist an assistant message and its streaming events."""
-        if not text:
+        # Persist when there's body text OR any events — an artifact-only turn
+        # (the agent writes a file and says little/nothing) carries no text but
+        # emits a `response.artifact_created` event, and that event must survive
+        # reload so the inline card replays identically.
+        if not text and not events:
             return
         assistant_msg = Message(
             conversation_id=conversation_id,

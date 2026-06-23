@@ -58,6 +58,35 @@ async def preview_artifact(path: str = Query(...)):
         raise HTTPException(status_code=500, detail="Could not read artifact") from e
 
 
+class _ExportBody(BaseModel):
+    path: str
+    format: str  # 'pdf' | 'docx' | 'html'
+
+
+@router.post("/export")
+async def export_artifact_endpoint(req: _ExportBody):
+    """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
+    the result into the same artifact folder. Returns the new file's path so
+    the client can open or download it."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from cowork.services.artifact_export import ExportError, export_artifact
+
+    try:
+        source = resolve_artifact_path(req.path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    try:
+        out = await run_in_threadpool(export_artifact, source, req.format)
+    except ExportError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Export failed") from e
+    return {"path": str(out), "filename": out.name}
+
+
 @router.post("/preview-mount")
 async def preview_mount_endpoint(req: _PathBody, request: Request):
     try:
