@@ -327,6 +327,20 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     prev = published_map.get(file_key)
     report_id = prev.get("report_id") if isinstance(prev, dict) else None
 
+    # Preserve any access protection from the prior publish. The chat tool has
+    # no access UI, so without this a re-publish would silently downgrade a
+    # password/restricted artifact to public — clearing it on the backend and
+    # dropping the lock from .published.json. effective_access is None for a
+    # public (or first-time) publish, in which case we omit the kwargs and
+    # publish public exactly as before.
+    from cowork.services.publish import access_for_republish
+    effective_access, pwd_version, access_version, owner_side = access_for_republish(prev)
+    access_kwargs = (
+        {}
+        if effective_access is None
+        else {"access": effective_access, "access_version": access_version, "pwd_version": pwd_version}
+    )
+
     def _do_publish(source_path: Path, rid: str | None):
         return publish(
             source_path,
@@ -334,6 +348,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
             report_id=rid,
             publish_url=publish_url,
             ssl_verify=ssl_verify,
+            **access_kwargs,
         )
 
     publish_version_id = _snapshot_publish_attempt(file_path)
@@ -395,6 +410,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
             # so omitting it would only work by relying on the .get(..., True)
             # default — set it explicitly.
             "published": True,
+            # Persist the resolved owner-side access (mode/password/emails/...)
+            # so a protected artifact stays protected on re-publish and the
+            # lock badge survives — same shape the GUI path writes.
+            **owner_side,
             "version_id": str(publish_version_id or ""),
             **_publish_version_metadata(publish_version_id),
         }

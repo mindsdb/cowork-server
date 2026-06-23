@@ -2992,6 +2992,59 @@ def test_chat_publish_tool_uploads_materialized_version_not_live_file(monkeypatc
     assert sidecar["index.html"]["version_number"] == 1
 
 
+def test_chat_publish_tool_preserves_prior_access(monkeypatch: pytest.MonkeyPatch):
+    """Re-publishing a password-protected artifact from chat must keep it
+    protected, not silently downgrade it to public."""
+    from cowork.harnesses.anton_harness import tools as anton_tools
+
+    artifact_id, folder = _make_artifact(
+        files={"index.html": "<h1>Protected</h1>\n"},
+        artifact_type="html-app",
+    )
+    # Seed a prior password-protected publish record (as the GUI path writes it).
+    (folder / ".published.json").write_text(
+        json.dumps({
+            "index.html": {
+                "report_id": f"report-{artifact_id}",
+                "url": f"https://4nton.ai/p/{artifact_id}",
+                "mode": "password",
+                "requires_password": True,
+                "access_password": "s3cret",
+                "pwd_version": 2,
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    captured: dict = {}
+
+    def fake_publish(path, *, api_key, report_id=None, publish_url=None, ssl_verify=True,
+                     access=None, access_version=None, pwd_version=None):
+        captured["access"] = access
+        captured["report_id"] = report_id
+        return {"view_url": f"https://4nton.ai/p/{artifact_id}", "report_id": f"report-{artifact_id}", "md5": "z"}
+
+    monkeypatch.setenv("ANTON_MINDS_API_KEY", "test-key")
+    monkeypatch.setattr("anton.publisher.publish", fake_publish)
+
+    result = asyncio.run(
+        anton_tools._cowork_publish_or_preview(
+            object(),
+            {"file_path": str(folder / "index.html"), "title": "Protected", "action": "publish"},
+        )
+    )
+
+    assert "4nton.ai" in result
+    # Protection carried through to the publisher (not reset to public)...
+    assert captured["access"] == {"mode": "password", "password": "s3cret"}
+    assert captured["report_id"] == f"report-{artifact_id}"  # report_id reused
+    # ...and persisted in the sidecar so the artifact stays locked.
+    sidecar = json.loads((folder / ".published.json").read_text(encoding="utf-8"))["index.html"]
+    assert sidecar["mode"] == "password"
+    assert sidecar["access_password"] == "s3cret"
+    assert sidecar["published"] is True
+
+
 def test_chat_publish_aborts_if_version_source_cannot_materialize(monkeypatch: pytest.MonkeyPatch):
     from cowork.harnesses.anton_harness import tools as anton_tools
 
