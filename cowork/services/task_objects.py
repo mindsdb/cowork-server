@@ -194,19 +194,49 @@ def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     }
 
 
-def index_new_artifacts(conversation_id, project_id, artifacts_base, before: set[str]) -> None:
-    """After a turn, index any artifact folders that appeared during it as
-    owned by this conversation. Opens its own DB session (called from the
-    harness, outside a request)."""
-    after = snapshot_artifact_slugs(artifacts_base)
-    new = after - set(before or ())
-    if not new:
-        return
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.session import get_engine, get_session_factory
+def finalize_turn_artifacts(conversation_id, project_id, artifacts_base, before: set[str]) -> list[dict]:
+    """End-of-turn artifact handling, from a SINGLE artifacts-dir diff.
 
-    factory = get_session_factory(get_engine(get_app_settings().database.uri))
-    with factory() as session:
-        svc = TaskObjectService(session)
-        for slug in sorted(new):
-            svc.index_artifact(conversation_id, project_id, slug)
+    For every artifact folder that appeared during the turn this:
+      • indexes it as owned by this conversation (so it relocates with the
+        task and shows in the artifacts panel), and
+      • builds its inline-chat card payload.
+
+    Because both come from the same diff and the same per-folder card builder
+    that the artifacts list uses (`services.artifacts.card_for_folder`), the
+    inline cards, the artifacts panel, and the move/index can never disagree
+    about what a turn produced or how an artifact opens.
+
+    Returns the card payloads (``[]`` when nothing new). Best-effort: indexing
+    and card-building are each guarded, so neither can break a turn.
+    """
+    after = snapshot_artifact_slugs(artifacts_base)
+    new = sorted(after - set(before or ()))
+    if not new:
+        return []
+
+    try:
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.session import get_engine, get_session_factory
+
+        factory = get_session_factory(get_engine(get_app_settings().database.uri))
+        with factory() as session:
+            svc = TaskObjectService(session)
+            for slug in new:
+                svc.index_artifact(conversation_id, project_id, slug)
+    except Exception:
+        logger.warning("Could not index artifacts created this turn", exc_info=True)
+
+    from cowork.services.artifacts import card_for_folder
+
+    base = Path(artifacts_base)
+    cards: list[dict] = []
+    for slug in new:
+        try:
+            card = card_for_folder(base / slug)
+        except Exception:
+            logger.warning("Could not build inline card for artifact %r", slug, exc_info=True)
+            continue
+        if card is not None:
+            cards.append(card)
+    return cards
