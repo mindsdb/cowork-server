@@ -147,13 +147,20 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     try:
         result = _publish_artifact(abs_path)
     except ValueError as exc:
-        # Service raises ValueError when the Minds API key isn't configured.
-        logger.info("Cowork publish blocked: %s", exc)
-        return (
-            "STOP: No Minds API key configured. Tell the user to set their "
-            "Minds API key in Settings (or in their .env) before publishing. "
-            "Do NOT call this tool again until they confirm the key is set."
-        )
+        # The service raises ValueError for several distinct reasons. Only the
+        # missing-API-key case warrants the STOP/"go configure a key" directive;
+        # others (unsupported file type, unresolvable path) are real publish
+        # failures — surfacing them as STOP would send the user chasing a key
+        # they already have and block a legitimate retry.
+        if "api key" in str(exc).lower():
+            logger.info("Cowork publish blocked: %s", exc)
+            return (
+                "STOP: No Minds API key configured. Tell the user to set their "
+                "Minds API key in Settings (or in their .env) before publishing. "
+                "Do NOT call this tool again until they confirm the key is set."
+            )
+        logger.info("Cowork publish rejected: %s", exc)
+        return f"PUBLISH FAILED: {exc}"
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
         return f"PUBLISH FAILED: {exc}"
