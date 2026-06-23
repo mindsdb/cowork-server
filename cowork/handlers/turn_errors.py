@@ -26,12 +26,13 @@ IMAGE_FORMAT_USER_MESSAGE = (
 # Curated copy for a spent token/credit allowance. Without this the turn
 # would die on a 429/402 mid-stream with no completion event and no error
 # frame — the SSE connection just closes and the renderer's spinner stops,
-# which reads as "Anton is dead" rather than "you're out of credits". The
-# desktop renders a richer card for the `token_limit` code (Add credits /
-# Bring your own keys); this text is the fallback copy.
+# which reads as "Anton is dead" rather than a quota message. The desktop
+# renders a richer card for the `token_limit` code (Add credits / Bring
+# your own keys); this text is the fallback copy.
 TOKEN_LIMIT_USER_MESSAGE = (
-    "You're out of MindsHub credits. Add credits to your account, or bring "
-    "your own LLM provider key in Settings to keep going."
+    "You've reached your monthly token limit. To keep going, upgrade your plan "
+    "or add your own LLM provider key in Settings — or wait until your allowance "
+    "resets."
 )
 
 # Wire-level code for the quota case. Distinct from the image/generic
