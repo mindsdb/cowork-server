@@ -76,7 +76,7 @@ def run_dev_setup() -> None:
 
 
 def _link_hermes_skills_dir() -> None:
-    """Symlink Anton's skills dir to cowork's canonical skills folder"""
+    """Symlink Hermes's skills dir to cowork's canonical skills folder"""
     from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 
     target = Path(get_app_settings().skill.root_dir)
