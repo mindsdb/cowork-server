@@ -41,28 +41,6 @@ def _get_env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
-def _read_published_state(file_path: Path) -> dict[str, str]:
-    """Return `{report_id, url, last_md5}` for the given artifact file,
-    pulled from its parent dir's `.published.json` registry. Empty
-    dict if the file isn't a known publish target."""
-    try:
-        registry = file_path.parent / ".published.json"
-        if not registry.is_file():
-            return {}
-        data = json.loads(registry.read_text(encoding="utf-8"))
-        entry = data.get(file_path.name) if isinstance(data, dict) else None
-        if isinstance(entry, dict):
-            return {
-                "report_id": str(entry.get("report_id") or ""),
-                "url": str(entry.get("url") or ""),
-                "last_md5": str(entry.get("last_md5") or ""),
-                "version_id": str(entry.get("version_id") or ""),
-            }
-    except Exception:
-        logger.debug("Could not read .published.json next to %s", file_path, exc_info=True)
-    return {}
-
-
 def _published_state(raw_path: str) -> dict:
     """Delegate to the publish service so the tool and GUI agree on where
     `.published.json` lives. Imported lazily to avoid a startup import cycle."""
@@ -411,6 +389,12 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", "") if isinstance(result, dict) else "",
+            # Mirror the GUI publish path (services.publish.publish_artifact): a
+            # record written by the chat tool must read back identically. Readers
+            # gate liveness on this flag (a later unpublish flips it to False),
+            # so omitting it would only work by relying on the .get(..., True)
+            # default — set it explicitly.
+            "published": True,
             "version_id": str(publish_version_id or ""),
             **_publish_version_metadata(publish_version_id),
         }
