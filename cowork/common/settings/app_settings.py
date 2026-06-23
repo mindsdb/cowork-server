@@ -240,7 +240,6 @@ def get_app_settings() -> AppSettings:
 # samconfig. Anything that isn't a known staging/prod env (including `local`/`dev`)
 # publishes against the dev stack.
 _PUBLISH_HOSTS = {
-    "prod": "https://view.mindshub.ai",
     "production": "https://view.mindshub.ai",
     "staging": "https://view.staging.mindshub.ai",
 }
