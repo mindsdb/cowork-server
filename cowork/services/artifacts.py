@@ -225,6 +225,11 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
         return ""
     entry = _load_published_map(folder).get(primary.name)
     if isinstance(entry, dict):
+        # `published: False` is a soft-deleted record (kept so re-publish can
+        # reuse report_id) — it must not surface as a live URL. Legacy entries
+        # have no `published` field; a url means they're live.
+        if not entry.get("published", True):
+            return ""
         return entry.get("url", "") or ""
     return ""
 

@@ -405,6 +405,7 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", ""),
+            "published": True,
             **owner_side,
         }
         published_map[published_key] = entry
@@ -475,12 +476,46 @@ def unpublish_artifact(raw_path: str) -> dict:
             logger.exception("Unpublishing failed (identifier=%s)", identifier)
             raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
-    published_map.pop(published_key, None)
-    try:
-        if published_map:
+    # Soft-delete: keep report_id (and url) so a later re-publish reuses the
+    # same public URL. Only flip `published` off so readers stop showing it as
+    # live. The backend object is gone, but lambda re-mints at the same id when
+    # we resend report_id on the next publish.
+    if isinstance(entry, dict):
+        entry["published"] = False
+        published_map[published_key] = entry
+        try:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
-        else:
-            published_json.unlink()
-    except Exception:
-        pass
+        except Exception:
+            pass
     return {"status": "ok"}
+
+
+def published_state(raw_path: str) -> dict:
+    """Owner-side publish state for an artifact path, resolved exactly the way
+    `publish_artifact` resolves it (so the chat tool and the GUI never disagree
+    on where `.published.json` lives).
+
+    Returns ``{"report_id", "url", "published"}``. `url` is blank unless the
+    record is currently live (`published is True` and a url exists). `report_id`
+    is returned even for soft-deleted records so a re-publish can reuse it.
+    """
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    if artifact is None:
+        return {"report_id": "", "url": "", "published": False}
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    published_json = published_dir / ".published.json"
+    if not published_json.is_file():
+        return {"report_id": "", "url": "", "published": False}
+    try:
+        pmap = json.loads(published_json.read_text(encoding="utf-8"))
+    except Exception:
+        return {"report_id": "", "url": "", "published": False}
+    entry = pmap.get(published_key)
+    if not isinstance(entry, dict):
+        return {"report_id": "", "url": "", "published": False}
+    live = bool(entry.get("published", True)) and bool(entry.get("url"))
+    return {
+        "report_id": str(entry.get("report_id") or ""),
+        "url": str(entry.get("url") or "") if live else "",
+        "published": live,
+    }
