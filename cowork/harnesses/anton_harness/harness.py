@@ -139,37 +139,31 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
-        # Attribute any artifact created during this turn to the conversation.
-        # Anton runs with its own session id and doesn't tag artifacts with the
-        # cowork conversation_id, so we observe the project's artifacts dir
-        # around the run instead (see services.task_objects).
-        from cowork.services.task_objects import (
-            index_new_artifacts,
-            new_artifact_cards,
-            snapshot_artifact_slugs,
-        )
+        # Attribute + surface any artifact created during this turn. Anton runs
+        # with its own session id and doesn't tag artifacts with the cowork
+        # conversation_id, so we diff the project's artifacts dir around the run
+        # (see services.task_objects.finalize_turn_artifacts).
+        from cowork.services.task_objects import finalize_turn_artifacts, snapshot_artifact_slugs
         artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
+        cards: list[dict] = []
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
             )
             async for event in session.turn_stream(self._to_anton_input(input)):
                 yield event
-            # Turn finished normally — surface any artifacts it produced as
-            # inline cards. Same artifacts-dir diff that index_new_artifacts
-            # uses below, so cards and the move/index never disagree.
-            for card in new_artifact_cards(artifacts_base, before_slugs):
-                yield ArtifactCreated(card)
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
-            try:
-                index_new_artifacts(
-                    conversation.id, conversation.project_id, artifacts_base, before_slugs,
-                )
-            except Exception:
-                logger.warning("Could not index artifacts created this turn", exc_info=True)
+            # One dir diff → index the new artifacts AND build their cards.
+            # Runs on every exit (success, error, cancel) so an artifact is
+            # always indexed; cards are yielded just below on normal completion.
+            cards = finalize_turn_artifacts(
+                conversation.id, conversation.project_id, artifacts_base, before_slugs,
+            )
+        for card in cards:
+            yield ArtifactCreated(card)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:

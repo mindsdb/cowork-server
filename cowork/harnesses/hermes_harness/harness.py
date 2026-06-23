@@ -176,13 +176,15 @@ class HermesHarness:
         # _run executes on an executor thread where lazy relationship
         # loads would fail.
         project_path = str(conversation.project.path)
+        conversation_id = conversation.id
+        project_id = conversation.project_id
         conversation_topic = conversation.topic
         prompt = self._to_prompt_string(input)
 
-        # Snapshot the artifacts dir before the run so we can surface any
-        # artifacts this turn produces as inline cards — the same diff the
-        # move index uses, so both harnesses behave identically.
-        from cowork.services.task_objects import snapshot_artifact_slugs
+        # Snapshot the artifacts dir before the run so we can index + surface
+        # any artifacts this turn produces — the same diff the Anton harness
+        # uses, so both harnesses behave identically.
+        from cowork.services.task_objects import finalize_turn_artifacts, snapshot_artifact_slugs
         artifacts_base = Path(project_path) / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
 
@@ -208,20 +210,28 @@ class HermesHarness:
 
         task = loop.run_in_executor(None, run_sync)
 
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            yield item
-
-        # Emit inline-artifact cards before the terminal result so they
-        # render at the end of the message (mapped to response.artifact_created
-        # by the formatter — same event the Anton harness produces).
-        from cowork.services.task_objects import new_artifact_cards
-        for card in new_artifact_cards(artifacts_base, before_slugs):
+        cards: list[dict] = []
+        result: dict
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+            result = await task
+        finally:
+            # One dir diff → index the new artifacts AND build their cards.
+            # Runs on every exit so an artifact is always indexed; cards are
+            # yielded just below before the terminal result on normal
+            # completion (mapped to response.artifact_created by the formatter,
+            # same event the Anton harness produces).
+            cards = finalize_turn_artifacts(
+                conversation_id, project_id, artifacts_base, before_slugs,
+            )
+        for card in cards:
             yield {"type": "artifact_created", "artifact": card}
 
-        yield await task
+        yield result
 
     @staticmethod
     def _to_prompt_string(input_blocks: list[dict]) -> str:
