@@ -86,7 +86,6 @@ async def execute_schedule(
     is_manual: bool = False,
     conversation_id: UUID | None = None,
 ) -> None:
-    from cowork.api.v1.endpoints.responses import mark_stream_active, mark_stream_finished
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
@@ -109,18 +108,15 @@ async def execute_schedule(
             )
             conversation_id = conversation.id
 
-        # Mark as in-flight so the client doesn't inject synthetic
-        # continuation prompts while the LLM is still generating.
-        # (May already be marked if the caller pre-created the conversation.)
-        mark_stream_active(str(conversation_id))
-
         request = ResponsesRequest(
             input=schedule.prompt,
             model=schedule.model,
-            stream=False,
+            stream=True,
             conversation=str(conversation_id),
         )
-        await ResponsesHandler(session).handle(request)
+        stream = await ResponsesHandler(session).handle(request)
+        async for _ in stream:
+            pass
 
         # Refresh schedule in case it changed during execution
         schedule = schedule_service.get_schedule(schedule_id)
@@ -146,8 +142,6 @@ async def execute_schedule(
         except Exception:
             pass
     finally:
-        if conversation_id:
-            mark_stream_finished(str(conversation_id))
         try:
             run_service.finish_run(run.id, conversation_id=conversation_id, error=error)
         except Exception:
