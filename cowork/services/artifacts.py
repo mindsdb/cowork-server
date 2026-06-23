@@ -260,7 +260,10 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
     try:
         pmap = json.loads(published_index.read_text(encoding="utf-8"))
         entry = pmap.get(primary.name)
-        if isinstance(entry, dict):
+        # A soft-deleted record (published=False) is no longer live, so it must
+        # not report a password/restricted mode — that would draw a lock icon on
+        # an artifact whose publishedUrl is empty. Legacy entries have no flag.
+        if isinstance(entry, dict) and entry.get("published", True):
             # `mode` is authoritative; fall back to the legacy requires_password
             # flag for artifacts published before the mode field existed.
             mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
@@ -436,6 +439,12 @@ def _unpublish_folder(folder: Path) -> None:
 
     for name, entry in published_map.items():
         if not isinstance(entry, dict):
+            continue
+        # Soft-deleted records keep their report_id so a re-publish can reuse
+        # the URL, but they're already gone from the remote — re-unpublishing
+        # would fire a redundant delete (and a transient 5xx/timeout would
+        # raise and block the artifact delete).
+        if entry.get("published") is False:
             continue
         if not (entry.get("report_id") or entry.get("last_md5")):
             continue
@@ -644,18 +653,16 @@ async def mount_preview(path: Path) -> dict:
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
 
-    published_url = ""
-    entry = _load_published_map(parent).get(path.name)
-    if isinstance(entry, dict):
-        published_url = entry.get("url", "") or ""
-
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
         "serveUrl": serve_url_for(path),
-        "publishedUrl": published_url,
+        # Route through _published_url_for so a soft-deleted (published=False)
+        # record reports an empty URL — matching the artifact grid and the
+        # fullstack branch, instead of surfacing a dead 4nton.ai link.
+        "publishedUrl": _published_url_for(parent, path),
         **_published_access_for(parent, path),
     }
 

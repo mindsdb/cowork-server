@@ -22,6 +22,7 @@ from cowork.services.artifacts import (
     _artifact_root_for,
     _fullstack_types,
     _load_metadata,
+    _load_published_map,
     _pick_primary,
     _user_files,
     html_artifacts,
@@ -499,20 +500,20 @@ def published_state(raw_path: str) -> dict:
     record is currently live (`published is True` and a url exists). `report_id`
     is returned even for soft-deleted records so a re-publish can reuse it.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    if artifact is None:
-        return {"report_id": "", "url": "", "published": False}
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
-    published_json = published_dir / ".published.json"
-    if not published_json.is_file():
-        return {"report_id": "", "url": "", "published": False}
+    blank = {"report_id": "", "url": "", "published": False}
+    # resolve_artifact_path raises (not returns None) for paths outside a known
+    # artifacts dir, so guard the whole resolution — the documented contract is
+    # to return the blank default for any unresolvable path, never to raise.
     try:
-        pmap = json.loads(published_json.read_text(encoding="utf-8"))
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
     except Exception:
-        return {"report_id": "", "url": "", "published": False}
-    entry = pmap.get(published_key)
+        return dict(blank)
+    if artifact is None:
+        return dict(blank)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    entry = _load_published_map(published_dir).get(published_key)
     if not isinstance(entry, dict):
-        return {"report_id": "", "url": "", "published": False}
+        return dict(blank)
     live = bool(entry.get("published", True)) and bool(entry.get("url"))
     return {
         "report_id": str(entry.get("report_id") or ""),
