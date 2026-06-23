@@ -238,6 +238,39 @@ def _resolve_access(
     return {"mode": "public"}, pwd_version, access_version, {"mode": "public", "requires_password": False}
 
 
+def access_for_republish(previous: Any) -> tuple[dict | None, int, int, dict]:
+    """Re-derive a prior publish's access for a re-publish that carries no
+    explicit access selection (the chat publish tool always publishes with no
+    access UI). Without this, a re-publish silently downgrades a password- or
+    restricted artifact to public — clearing protection on the 4nton.ai backend
+    AND dropping the access keys from ``.published.json`` (so the owner-side lock
+    badge disappears too).
+
+    Returns ``(effective_access, pwd_version, access_version, owner_side)`` —
+    same shape as ``_resolve_access``. ``effective_access`` is ``None`` when the
+    artifact was public (or had no prior record), so the caller can omit the
+    ``access`` kwarg and behave exactly like a fresh public publish.
+    """
+    prev = previous if isinstance(previous, dict) else {}
+    access: dict | None = None
+    if prev.get("mode") == "password" and prev.get("access_password"):
+        access = {"mode": "password", "password": prev.get("access_password")}
+    elif prev.get("mode") == "restricted" and (prev.get("emails") or prev.get("org_allowed")):
+        access = {
+            "mode": "restricted",
+            "emails": prev.get("emails") or [],
+            "org_allowed": bool(prev.get("org_allowed")),
+        }
+    if access is None:
+        return None, prev.get("pwd_version", 0) or 1, prev.get("access_version", 0) or 1, {
+            "mode": "public",
+            "requires_password": False,
+        }
+    # Re-run through the single access resolver so versions stay correct
+    # (unchanged password/list => no version bump).
+    return _resolve_access(None, access, prev)
+
+
 # Static artifact extensions a user can publish to a 4nton.ai web page.
 # `.html` is served as-is; `.md` is rendered to a styled HTML page first
 # (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
