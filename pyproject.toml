@@ -29,6 +29,12 @@ dependencies = [
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "uvicorn>=0.47.0",
+    # Document export (md/html → pdf/docx). All pure-Python, no native
+    # deps — keeps the desktop install clean across platforms.
+    "markdown>=3.7",
+    "xhtml2pdf>=0.2.16",
+    "python-docx>=1.1.2",
+    "htmldocx>=0.0.6",
 ]
 
 [project.urls]

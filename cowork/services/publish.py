@@ -22,6 +22,7 @@ from cowork.services.artifacts import (
     _artifact_root_for,
     _fullstack_types,
     _load_metadata,
+    _load_published_map,
     _pick_primary,
     _user_files,
     html_artifacts,
@@ -440,6 +441,7 @@ def publish_artifact(
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", ""),
+            "published": True,
             **owner_side,
         }
         if isinstance(version_metadata, dict):
@@ -528,14 +530,14 @@ def unpublish_artifact(raw_path: str) -> dict:
             raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
     entry_snapshot = dict(entry) if isinstance(entry, dict) else {}
-    published_map.pop(published_key, None)
-    if published_map:
+    # Soft-delete: keep report_id (and url) so a later re-publish reuses the
+    # same public URL. Only flip `published` off so readers stop showing it as
+    # live. The backend object is gone, but lambda re-mints at the same id when
+    # we resend report_id on the next publish.
+    if isinstance(entry, dict):
+        entry["published"] = False
+        published_map[published_key] = entry
         _write_publish_record(published_json, published_map)
-    else:
-        try:
-            published_json.unlink()
-        except Exception as exc:
-            raise RuntimeError("Could not clear publish record") from exc
     return {
         "status": "ok",
         "publishedUrl": entry_snapshot.get("url") or "",
@@ -543,4 +545,35 @@ def unpublish_artifact(raw_path: str) -> dict:
         "publishedFilesHash": entry_snapshot.get("files_hash") or "",
         "publishedManifestHash": entry_snapshot.get("manifest_hash") or "",
         "publishedVersionNumber": entry_snapshot.get("version_number"),
+    }
+
+
+def published_state(raw_path: str) -> dict:
+    """Owner-side publish state for an artifact path, resolved exactly the way
+    `publish_artifact` resolves it (so the chat tool and the GUI never disagree
+    on where `.published.json` lives).
+
+    Returns ``{"report_id", "url", "published"}``. `url` is blank unless the
+    record is currently live (`published is True` and a url exists). `report_id`
+    is returned even for soft-deleted records so a re-publish can reuse it.
+    """
+    blank = {"report_id": "", "url": "", "published": False}
+    # resolve_artifact_path raises (not returns None) for paths outside a known
+    # artifacts dir, so guard the whole resolution — the documented contract is
+    # to return the blank default for any unresolvable path, never to raise.
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    except Exception:
+        return dict(blank)
+    if artifact is None:
+        return dict(blank)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    entry = _load_published_map(published_dir).get(published_key)
+    if not isinstance(entry, dict):
+        return dict(blank)
+    live = bool(entry.get("published", True)) and bool(entry.get("url"))
+    return {
+        "report_id": str(entry.get("report_id") or ""),
+        "url": str(entry.get("url") or "") if live else "",
+        "published": live,
     }

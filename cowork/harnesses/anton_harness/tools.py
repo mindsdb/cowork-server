@@ -63,6 +63,13 @@ def _read_published_state(file_path: Path) -> dict[str, str]:
     return {}
 
 
+def _published_state(raw_path: str) -> dict:
+    """Delegate to the publish service so the tool and GUI agree on where
+    `.published.json` lives. Imported lazily to avoid a startup import cycle."""
+    from cowork.services.publish import published_state
+    return published_state(raw_path)
+
+
 def _snapshot_publish_attempt(file_path: Path):
     try:
         from cowork.common.settings.app_settings import get_app_settings
@@ -274,35 +281,33 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     if not file_path.exists():
         return f"File not found: {file_path}"
 
-    # 'ask' and 'preview' are non-destructive — the artifact is already
-    # visible in the Live Artifacts panel. We use these calls to also
-    # report the publish state so the LLM can decide on the next step
-    # (re-publish vs publish-for-first-time) without a separate tool.
+    abs_path = str(file_path)
+
+    # 'ask'/'preview' are non-destructive: report current publish state so the
+    # LLM can choose publish-vs-re-publish. State is resolved by the service so
+    # fullstack (.published.json at the artifact root) and static (next to the
+    # primary file) never disagree — the desync that gave fullstack a new URL
+    # on every re-publish.
     #
-    # Why this is worded so directly: the previous version of this
-    # message told the LLM "the user can publish from the Live
-    # Artifacts panel — they don't need a /publish command". The LLM
-    # read that as "publishing is the user's job, not mine" and never
-    # called the tool with action='publish' even when the user
-    # explicitly asked for it. The fix is to spell out the publish
-    # path so the LLM knows it CAN act.
+    # Why the publish path is spelled out so directly: an earlier version told
+    # the LLM "the user can publish from the Live Artifacts panel", which it
+    # read as "publishing is the user's job" and never called action='publish'
+    # even when explicitly asked. The wording below makes clear it CAN act.
     if action in ("ask", "preview"):
-        existing = _read_published_state(file_path)
-        if existing.get("url"):
+        state = _published_state(abs_path)
+        if state.get("published") and state.get("url"):
             return (
-                f"{title} is already published at {existing['url']}. "
+                f"{title} is already published at {state['url']}. "
                 f"It is also visible inline + in the Live Artifacts panel. "
-                f"If the user asks to re-publish (overwrite the public copy), "
-                f"call this tool again with action='publish' — the same "
-                f"report_id will be reused so the URL stays stable."
+                f"If the user asks to re-publish, call this tool again with "
+                f"action='publish' — the same report_id is reused so the URL stays stable."
             )
         return (
             f"{title} is at {file_path} and visible in the Live Artifacts "
-            f"panel. It has NOT been published to the public web yet. "
-            f"If the user asks to publish / share / make it public, call "
-            f"this tool again with action='publish' — MindsHub publishing "
-            f"works directly from chat in the desktop app, no slash "
-            f"command needed."
+            f"panel. It has NOT been published to the public web yet. If the "
+            f"user asks to publish / share / make it public, call this tool "
+            f"again with action='publish' — MindsHub publishing works directly "
+            f"from chat in the desktop app, no slash command needed."
         )
 
     if action != "publish":
@@ -311,14 +316,6 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     # ── action == 'publish' ───────────────────────────────────────────
     # Read the API key the same way the cowork HTTP endpoint does so
     # both code paths agree on what's "configured".
-    #
-    # The settings helper lives in `routes.settings` (one level up
-    # from this package). A long-standing typo here pointed at a
-    # `.settings` module that doesn't exist inside `anton_api/`,
-    # so every publish call hit `PUBLISH FAILED: settings module
-    # unavailable (...)`. The LLM then recovered by telling the
-    # user to publish via the Live Artifacts panel — which made
-    # the bug look like a missing-publish-flow, not a typo.
     from .settings import AntonHarnessSettings
 
     api_key = _get_env("ANTON_MINDS_API_KEY")

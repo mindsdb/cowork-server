@@ -1,19 +1,14 @@
-
 from collections.abc import AsyncIterator
-from enum import Enum
 import os
 from pathlib import Path
 import shutil
 import tempfile
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import (
-    FileInputBlock, TextInputBlock, MemoryScope, register
-)
-from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
-from cowork.models.project import Project
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
@@ -102,13 +97,6 @@ def _conversation_attachment_context(conversation) -> str:
         return ""
 
 
-# TODO: Handle topics.
-class AntonMemoryCategory(str, Enum):
-    lesson = "lesson"
-    rule = "rule"
-    topic = "topic"
-
-
 @register
 class AntonHarness:
     id: str = "anton"
@@ -141,96 +129,6 @@ class AntonHarness:
         for existing in store.list_all():
             if existing.provenance == "cowork" and existing.label not in active_labels:
                 store.delete(existing.label)
-    
-    async def overwrite_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
-        # Validate provided category.
-        # This is not done at the schema (request) level because each harness supports different categories.
-        category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
-
-        if scope == MemoryScope.global_:
-            await self._write_to_global_memory(category_enum, content)
-        elif scope == MemoryScope.project:
-            await self._write_to_project_memory(project, category_enum, content)
-
-    async def _write_to_global_memory(self, category: AntonMemoryCategory, content: str) -> None:
-        global_memory_dir = Path(settings.global_memory_root_dir)
-        global_memory_dir.mkdir(parents=True, exist_ok=True)
-        
-        memory_file = self._resolve_memory_path(global_memory_dir, category)
-        memory_file.write_text(content + "\n", encoding="utf-8")
-
-    async def _write_to_project_memory(self, project: Project, category: AntonMemoryCategory, content: str) -> None:
-        project_memory_dir = Path(project.path) / ".anton" / "memory"
-        project_memory_dir.mkdir(parents=True, exist_ok=True)
-
-        memory_file = self._resolve_memory_path(project_memory_dir, category)
-        memory_file.write_text(content + "\n", encoding="utf-8")
-
-    def _resolve_memory_path(self, root_dir: Path, category: AntonMemoryCategory) -> Path:
-        # TODO: Topics are not handled at the moment because there are some discrepancies in
-        # how they are handled in Cowork Vs what Anton actually expects.
-        scope_to_path = {
-            AntonMemoryCategory.lesson: root_dir / "lessons.md",
-            AntonMemoryCategory.rule: root_dir / "rules.md",
-        }
-        return scope_to_path[category]
-    
-    async def retrieve_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> str:
-        category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
-
-        if scope == MemoryScope.global_:
-            return await self._read_from_global_memory(category_enum)
-        elif scope == MemoryScope.project:
-            return await self._read_from_project_memory(project, category_enum)
-        else:
-            raise ValueError(f"Unsupported memory scope: {scope}")
-
-    async def _read_from_global_memory(self, category: AntonMemoryCategory) -> str:
-        global_memory_dir = Path(settings.global_memory_root_dir)
-        memory_file = self._resolve_memory_path(global_memory_dir, category)
-        if not memory_file.is_file():
-            return ""
-        return memory_file.read_text(encoding="utf-8")
-    
-    async def _read_from_project_memory(self, project: Project, category: AntonMemoryCategory) -> str:
-        project_memory_dir = Path(project.path) / ".anton" / "memory"
-        memory_file = self._resolve_memory_path(project_memory_dir, category)
-        if not memory_file.is_file():
-            return ""
-        return memory_file.read_text(encoding="utf-8")
-
-    async def list_memory(self, projects: list[Project]) -> list:
-        from cowork.harnesses.base import MemoryItem
-        supported = [AntonMemoryCategory.lesson, AntonMemoryCategory.rule]
-        results = []
-        for category in supported:
-            content = await self._read_from_global_memory(category)
-            results.append(MemoryItem(scope=MemoryScope.global_, category=category.value, content=content, project=None))
-        for project in projects:
-            for category in supported:
-                content = await self._read_from_project_memory(project, category)
-                results.append(MemoryItem(scope=MemoryScope.project, category=category.value, content=content, project=project))
-        return results
-
-    async def delete_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> None:
-        category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
-
-        if scope == MemoryScope.global_:
-            await self._delete_global_memory(category_enum)
-        elif scope == MemoryScope.project:
-            await self._delete_project_memory(project, category_enum)
-
-    async def _delete_global_memory(self, category: AntonMemoryCategory) -> None:
-        global_memory_dir = Path(settings.global_memory_root_dir)
-        memory_file = self._resolve_memory_path(global_memory_dir, category)
-        if memory_file.is_file():
-            memory_file.unlink()
-
-    async def _delete_project_memory(self, project: Project, category: AntonMemoryCategory) -> None:
-        project_memory_dir = Path(project.path) / ".anton" / "memory"
-        memory_file = self._resolve_memory_path(project_memory_dir, category)
-        if memory_file.is_file():
-            memory_file.unlink()
 
     async def stream_response(
         self,
@@ -242,6 +140,14 @@ class AntonHarness:
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
         checkpoint_tracker = None
+        # Attribute + surface any artifact created during this turn. Anton runs
+        # with its own session id and doesn't tag artifacts with the cowork
+        # conversation_id, so we diff the project's artifacts dir around the run
+        # (see services.task_objects.finalize_turn_artifacts).
+        from cowork.services.task_objects import finalize_turn_artifacts, snapshot_artifact_slugs
+        artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
+        before_slugs = snapshot_artifact_slugs(artifacts_base)
+        cards: list[dict] = []
         try:
             checkpoint_tracker = self._build_artifact_checkpoint_tracker(conversation, input)
             if checkpoint_tracker is not None:
@@ -263,6 +169,14 @@ class AntonHarness:
                     )
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            # One dir diff → index the new artifacts AND build their cards.
+            # Runs on every exit (success, error, cancel) so an artifact is
+            # always indexed; cards are yielded just below on normal completion.
+            cards = finalize_turn_artifacts(
+                conversation.id, conversation.project_id, artifacts_base, before_slugs,
+            )
+        for card in cards:
+            yield ArtifactCreated(card)
 
     def _build_artifact_checkpoint_tracker(
         self,
@@ -359,8 +273,6 @@ class AntonHarness:
             from anton.core.datasources.data_vault import LocalDataVault
         except Exception:  # pragma: no cover
             LocalDataVault = None
-            
-        from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
         base = Path(conversation.project.path)
 
@@ -381,7 +293,7 @@ class AntonHarness:
             "planning_provider", "planning_model",
             "coding_provider", "coding_model",
             "memory_enabled", "memory_mode",
-            "episodic_memory", "proactive_dashboards",
+            "episodic_memory", "proactive_dashboards", "act_first",
             "publish_url",
         ):
             db_val = getattr(user, attr, None)
@@ -429,7 +341,10 @@ class AntonHarness:
 
         llm_client = self._build_llm_client()
         self_awareness = SelfAwarenessContext(context_dir)
-        global_memory_dir = Path(AntonHarnessSettings().global_memory_root_dir)
+
+        from cowork.common.settings.app_settings import get_app_settings
+
+        global_memory_dir = Path(get_app_settings().memory.root_dir).expanduser()
         global_memory_dir.mkdir(parents=True, exist_ok=True)
         cortex = Cortex(
             global_hc=Hippocampus(global_memory_dir),
@@ -534,6 +449,7 @@ class AntonHarness:
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
             proactive_dashboards=settings.proactive_dashboards,
+            act_first=settings.act_first,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
                 PUBLISH_TOOL,
