@@ -277,6 +277,11 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
         return ""
     entry = _load_published_map(folder).get(primary.name)
     if isinstance(entry, dict):
+        # `published: False` is a soft-deleted record (kept so re-publish can
+        # reuse report_id) — it must not surface as a live URL. Legacy entries
+        # have no `published` field; a url means they're live.
+        if not entry.get("published", True):
+            return ""
         return entry.get("url", "") or ""
     return ""
 
@@ -322,7 +327,10 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
     try:
         pmap = json.loads(published_index.read_text(encoding="utf-8"))
         entry = pmap.get(primary.name)
-        if isinstance(entry, dict):
+        # A soft-deleted record (published=False) is no longer live, so it must
+        # not report a password/restricted mode — that would draw a lock icon on
+        # an artifact whose publishedUrl is empty. Legacy entries have no flag.
+        if isinstance(entry, dict) and entry.get("published", True):
             # `mode` is authoritative; fall back to the legacy requires_password
             # flag for artifacts published before the mode field existed.
             mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
@@ -746,6 +754,12 @@ def _unpublish_folder(folder: Path) -> None:
     for name, entry in published_map.items():
         if not isinstance(entry, dict):
             continue
+        # Soft-deleted records keep their report_id so a re-publish can reuse
+        # the URL, but they're already gone from the remote — re-unpublishing
+        # would fire a redundant delete (and a transient 5xx/timeout would
+        # raise and block the artifact delete).
+        if entry.get("published") is False:
+            continue
         if not (entry.get("report_id") or entry.get("last_md5")):
             continue
         # The path-based unpublish needs the file present; a stale record
@@ -813,68 +827,78 @@ def reveal_in_file_manager(path: Path) -> None:
 
 # ─── Public API ───────────────────────────────────────────────────
 
+def card_for_folder(folder: Path, idx: int = 0, *, viewer_email: str | None = None) -> dict | None:
+    """The artifact card for a single folder, or ``None`` if its metadata is
+    unreadable. This is the canonical card shape — used both by the artifacts
+    list and by the inline chat cards (see services.task_objects), so the two
+    can never disagree about how an artifact is named, typed, or opened.
+
+    `idx` only selects a background gradient (cosmetic)."""
+    meta = _load_metadata(folder)
+    if meta is None:
+        return None
+    files = _user_files(folder)
+    primary = _pick_primary(folder, files, primary_hint=meta.get("primary"))
+    primary_path = str(primary) if primary is not None else str(folder)
+    primary_ext = primary.suffix.lower() if primary is not None else ""
+    artifact_type = meta.get("type") or "mixed"
+    kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
+    is_live = False
+    if primary is not None:
+        try:
+            is_live = (time.time() - primary.stat().st_mtime) < 300
+        except OSError:
+            is_live = False
+
+    # Max mtime across the artifact's content files — a precise
+    # "content changed" signal for the renderer's preview viewer to
+    # cache-bust/reload on (ENG-375). Disk-derived, so it reflects
+    # in-place edits that the metadata.json mtime / `updated` string
+    # miss. Rounded to an int so it's a stable cache-buster token.
+    try:
+        content_mtime = int(max((p.stat().st_mtime for p in files), default=0.0))
+    except OSError:
+        content_mtime = 0
+
+    return {
+        "id": meta.get("id") or folder.name,
+        "slug": meta.get("slug") or folder.name,
+        "title": meta.get("name") or folder.name,
+        "description": meta.get("description") or "",
+        "type": artifact_type,
+        "kind": kind,
+        "ext": primary_ext,
+        "updated": _human_mtime(folder / "metadata.json"),
+        "mtime": content_mtime,
+        "live": is_live,
+        "bg": BG_CYCLE[idx % len(BG_CYCLE)],
+        "fileCount": len(files),
+        "folder": str(folder),
+        "path": primary_path,
+        "primary": meta.get("primary") or None,
+        "publishedUrl": _published_url_for(folder, primary),
+        **_published_version_for(folder, primary),
+        # Owner-side access state (lock badge + eye-reveal). accessPassword
+        # is the plaintext, returned only to the owner's own session.
+        **_published_access_for(folder, primary),
+        **_last_good_preview_for(folder),
+        "reviewSummary": _review_summary_for(folder, viewer_email=viewer_email),
+        "serveUrl": serve_url_for(primary_path),
+    }
+
+
 def list_artifacts(project_path: str | None = None, *, viewer_email: str | None = None) -> list[dict]:
     """Every artifact across all projects, newest first."""
     cards: list[dict] = []
     for folder in _iter_artifact_folders(project_path):
-        meta = _load_metadata(folder)
-        if meta is None:
+        card = card_for_folder(folder, len(cards), viewer_email=viewer_email)
+        if card is None:
             continue
-        files = _user_files(folder)
-        primary = _pick_primary(folder, files, primary_hint=meta.get("primary"))
-        primary_path = str(primary) if primary is not None else str(folder)
-        primary_ext = primary.suffix.lower() if primary is not None else ""
-        artifact_type = meta.get("type") or "mixed"
-        kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
-        is_live = False
-        if primary is not None:
-            try:
-                is_live = (time.time() - primary.stat().st_mtime) < 300
-            except OSError:
-                is_live = False
-        idx = len(cards) % len(BG_CYCLE)
-        sort_ts: float
         try:
-            sort_ts = (folder / "metadata.json").stat().st_mtime
+            card["_sortTs"] = (folder / "metadata.json").stat().st_mtime
         except OSError:
-            sort_ts = 0.0
-
-        # Max mtime across the artifact's content files — a precise
-        # "content changed" signal for the renderer's preview viewer to
-        # cache-bust/reload on (ENG-375). Disk-derived, so it reflects
-        # in-place edits that the metadata.json mtime / `updated` string
-        # miss. Rounded to an int so it's a stable cache-buster token.
-        try:
-            content_mtime = int(max((p.stat().st_mtime for p in files), default=0.0))
-        except OSError:
-            content_mtime = 0
-
-        cards.append({
-            "id": meta.get("id") or folder.name,
-            "slug": meta.get("slug") or folder.name,
-            "title": meta.get("name") or folder.name,
-            "description": meta.get("description") or "",
-            "type": artifact_type,
-            "kind": kind,
-            "ext": primary_ext,
-            "updated": _human_mtime(folder / "metadata.json"),
-            "mtime": content_mtime,
-            "live": is_live,
-            "bg": BG_CYCLE[idx],
-            "fileCount": len(files),
-            "folder": str(folder),
-            "path": primary_path,
-            "primary": meta.get("primary") or None,
-            "publishedUrl": _published_url_for(folder, primary),
-            **_published_version_for(folder, primary),
-            # Owner-side access state (lock badge + eye-reveal). accessPassword
-            # is the plaintext, returned only to the owner's own session.
-            **_published_access_for(folder, primary),
-            **_last_good_preview_for(folder),
-            "reviewSummary": _review_summary_for(folder, viewer_email=viewer_email),
-            "serveUrl": serve_url_for(primary_path),
-            "_sortTs": sort_ts,
-        })
+            card["_sortTs"] = 0.0
+        cards.append(card)
 
     cards.sort(key=lambda c: c["_sortTs"], reverse=True)
     for c in cards:
@@ -960,18 +984,16 @@ async def mount_preview(path: Path) -> dict:
         raise ValueError("Preview mount is only available for HTML artifacts")
     token = register_preview_mount(parent)
 
-    published_url = ""
-    entry = _load_published_map(parent).get(path.name)
-    if isinstance(entry, dict):
-        published_url = entry.get("url", "") or ""
-
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
         "serveUrl": serve_url_for(path),
-        "publishedUrl": published_url,
+        # Route through _published_url_for so a soft-deleted (published=False)
+        # record reports an empty URL — matching the artifact grid and the
+        # fullstack branch, instead of surfacing a dead 4nton.ai link.
+        "publishedUrl": _published_url_for(parent, path),
         **_published_version_for(parent, path),
         **_published_access_for(parent, path),
     }

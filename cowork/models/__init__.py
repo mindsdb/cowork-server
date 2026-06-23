@@ -21,3 +21,4 @@ from cowork.models.project_collaboration import (  # noqa: F401
     ProjectNotificationHook,
 )
 from cowork.models.setting import Setting  # noqa: F401
+from cowork.models.task_object import TaskObject  # noqa: F401
