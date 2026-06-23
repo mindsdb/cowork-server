@@ -7,6 +7,7 @@ from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     PLANNING_MODEL_DEFAULTS,
     Settings,
+    default_publish_url,
     get_app_settings,
 )
 
@@ -219,9 +220,9 @@ class UserSettings(Settings):
         description="How UI updates are applied (manual or auto).",
     )
     publish_url: str = Field(
-        default="https://4nton.ai",
+        default_factory=default_publish_url,
         title="Publish URL",
-        description="URL for publishing artifacts.",
+        description="Base URL for publishing artifacts. Defaults to the MindsHub host for the active environment; set explicitly to override.",
     )
     openai_base_url: str = Field(
         default="",

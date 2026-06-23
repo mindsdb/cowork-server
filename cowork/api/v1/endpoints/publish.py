@@ -1,4 +1,4 @@
-"""Publish API endpoints — publish/unpublish HTML artifacts to 4nton.ai.
+"""Publish API endpoints — publish/unpublish HTML artifacts to MindsHub.
 
 Ported from cowork/server/routes/utilities.py (publish section).
 """
