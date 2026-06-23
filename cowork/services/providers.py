@@ -360,15 +360,19 @@ def build_llm_client():
             raise ValueError(f"{role.value} API key is not configured")
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
+    # Use the *resolved* provider/model (not the raw stored fields) so a
+    # configured key takes effect even when planning_provider still points at
+    # a keyless provider — the same resolution config_status reports, so the
+    # readiness gate never claims "ready" for a client that would then throw.
     return LLMClient(
         planning_provider=_make_provider(
-            settings.planning_provider, settings.planning_reasoning_effort
+            settings.resolved_planning_provider, settings.planning_reasoning_effort
         ),
-        planning_model=settings.planning_model,
+        planning_model=settings.resolved_planning_model,
         coding_provider=_make_provider(
-            settings.coding_provider, settings.coding_reasoning_effort
+            settings.resolved_coding_provider, settings.coding_reasoning_effort
         ),
-        coding_model=settings.coding_model,
+        coding_model=settings.resolved_coding_model,
     )
 
 
