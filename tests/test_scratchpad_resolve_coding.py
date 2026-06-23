@@ -50,7 +50,9 @@ def test_minds_cloud_resolves_from_minds_slot_not_openai(monkeypatch):
     provider, _model, api_key, base_url = scratchpad_runtime._resolve_coding(
         coding_provider="", coding_model="", coding_api_key="", coding_base_url=""
     )
-    assert provider == "minds-cloud"
+    # Presented to anton's scratchpad as openai-compatible (the string it
+    # understands) — NOT "minds-cloud", which anton would route to Anthropic.
+    assert provider == "openai-compatible"
     assert api_key == "mdb_minds_key"
     assert api_key != "sk-proj-real-user-key"          # NOT the OpenAI slot
     assert base_url == "https://api.mindshub.ai/v1"    # host-aware: /v1 for mindshub

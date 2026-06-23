@@ -57,13 +57,20 @@ def _resolve_coding(
     elif provider == "anthropic":
         api_key = s.anthropic_api_key or ""
     elif provider == "minds-cloud":
-        # MindsHub resolves through its own minds_api_key / minds_url
-        # slots — mirror `_make_provider` (services/providers.py) so the
-        # scratchpad never depends on the minds key being copied into the
-        # OpenAI slot. `minds_chat_base_url` selects the right path suffix
-        # per host (/v1 for api.mindshub.ai, /api/v1 for mdb.ai).
+        # MindsHub resolves through its own minds_api_key / minds_url slots
+        # (never the OpenAI slot). `minds_chat_base_url` picks the right
+        # path suffix per host (/v1 for api.mindshub.ai, /api/v1 for mdb.ai).
+        #
+        # IMPORTANT: present the provider to anton's scratchpad runtime as
+        # "openai-compatible", NOT "minds-cloud". anton's scratchpad
+        # (core/backends/local.py + scratchpad_boot.py) has no "minds-cloud"
+        # branch — it routes openai-compatible through OpenAIProvider with
+        # OPENAI_API_KEY/OPENAI_BASE_URL (exactly the minds gateway shape)
+        # and routes everything else to AnthropicProvider. So "minds-cloud"
+        # would silently hit Anthropic with the wrong key.
         from cowork.services.providers import minds_chat_base_url
 
+        provider = "openai-compatible"
         api_key = s.minds_api_key or ""
         minds_base = minds_chat_base_url(s.minds_url)
     else:
