@@ -161,6 +161,13 @@ class OAuthSettings(Settings):
     )
 
 
+class MemorySettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "memory"),
+        description="Root directory for all memory files",
+    )
+
+
 class StreamSettings(Settings):
     backend: str = Field(
         default="file",
@@ -228,6 +235,7 @@ class AppSettings(Settings):
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
+    memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
 
 
 @lru_cache

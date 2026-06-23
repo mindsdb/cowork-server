@@ -21,10 +21,3 @@ class AntonHarnessSettings(Settings):
         description="The root directory where the Anton harness will store skill-related files",
         validation_alias="ANTON_SKILLS_ROOT_DIR",
     )  # ANTON_SKILLS_ROOT_DIR
-    # This is for memory scoped at the global level.
-    # Project specific memory will be stored in the relevant project dir.
-    global_memory_root_dir: str = Field(
-        default=str(Path.home() / ".cowork" / "anton" / "memory"),
-        description="The root directory where the Anton harness will store memory files for global scope",
-        validation_alias="ANTON_GLOBAL_MEMORY_ROOT_DIR",
-    )  # ANTON_GLOBAL_MEMORY_ROOT_DIR

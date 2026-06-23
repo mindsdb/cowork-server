@@ -55,6 +55,7 @@ _ENV_TO_SETTING: dict[str, str] = {
     "ANTON_MEMORY_MODE": "memory_mode",
     "ANTON_EPISODIC_MEMORY": "episodic_memory",
     "ANTON_PROACTIVE_DASHBOARDS": "proactive_dashboards",
+    "ANTON_ACT_FIRST": "act_first",
     "ANTON_PUBLISH_URL": "publish_url",
 }
 
