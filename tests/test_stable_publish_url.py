@@ -265,3 +265,64 @@ def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
     assert "STOP" in out and "API key" in out
+
+
+def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: Path):
+    # Review #1: a non-key ValueError must not be reported as "no API key".
+    root = _make_fullstack(tmp_path)
+
+    def _raise(raw_path):
+        raise ValueError("Only HTML and Markdown artifacts can be published")
+
+    with patch.object(tools_mod, "_publish_artifact", _raise):
+        out = _run(tools_mod._cowork_publish_or_preview(
+            _FakeSession(tmp_path),
+            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
+        ))
+    assert "STOP" not in out
+    assert "PUBLISH FAILED" in out
+    assert "Only HTML and Markdown" in out
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: readers honour `published`; published_state never raises
+# ---------------------------------------------------------------------------
+
+from cowork.services.artifacts import _published_access_for, _unpublish_folder
+
+
+def test_published_access_unpublished_returns_public(tmp_path: Path):
+    # Review #5: a soft-deleted password artifact must not report a lock icon.
+    primary = _write_published(
+        tmp_path,
+        {"mode": "password", "requires_password": True, "access_password": "s3cret",
+         "report_id": "r1", "url": "https://x/a/r1", "published": False},
+    )
+    out = _published_access_for(tmp_path, primary)
+    assert out["accessMode"] == "public"
+    assert out["accessProtected"] is False
+    assert out["accessPassword"] == ""
+
+
+def test_published_state_path_outside_artifacts_dir_returns_default(tmp_path: Path):
+    # Review #6: resolve raises for unregistered paths; must return the default.
+    root = _make_fullstack(tmp_path)
+    # No _patch_scan here -> resolve_artifact_path raises FileNotFoundError.
+    state = publish_mod.published_state(str(root / "static" / "index.html"))
+    assert state == {"report_id": "", "url": "", "published": False}
+
+
+def test_unpublish_folder_skips_soft_deleted(tmp_path: Path):
+    # Review #3: deleting an artifact must not re-unpublish soft-deleted records.
+    root = _make_fullstack(tmp_path)
+    (root / ".published.json").write_text(
+        json.dumps({"index.html": {"report_id": "uuid-1", "url": "https://x/a/uuid-1",
+                                    "published": False}}),
+        encoding="utf-8",
+    )
+    # The keyed file must exist on disk so the only reason to skip is the flag.
+    (root / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    called = []
+    with patch.object(publish_mod, "unpublish_artifact", lambda p: called.append(p)):
+        _unpublish_folder(root)
+    assert called == []
