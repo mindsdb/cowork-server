@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Optional
 
 from cowork.schemas.responses import (
@@ -23,6 +24,18 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+
+
+@dataclass
+class ArtifactCreated:
+    """Synthetic post-turn event: an artifact folder appeared during the
+    turn (detected by the harness via the artifacts-dir diff, not by any
+    agent tool call). Rides the same stream as Anton's `Stream*` events and
+    is mapped to a `response.artifact_created` SSE event below, so the
+    renderer shows an inline card for every artifact type, identically and
+    deterministically — live and on reload."""
+
+    artifact: dict
 
 
 PHASE_LABELS = {
@@ -38,6 +51,45 @@ PHASE_LABELS = {
 }
 
 PROGRESS_THROTTLE = 0.25  # seconds
+
+
+def classify_cell_status(content: str) -> str:
+    """Classify a scratchpad tool-result as ok / timeout / error.
+
+    The renderer uses this to show a killed cell as distinctly dead rather
+    than indistinguishable from a slow-but-running one.
+
+    An exec result arrives as ``json.dumps(asdict(cell))`` (see
+    ``ChatSession.turn_stream`` → ``StreamToolResult``), so we inspect the
+    structured ``error`` field rather than sniffing the rendered text. That
+    matters: a *successful* cell whose own stdout contains "[error]" or
+    "Cell timed out" (e.g. a log-analysis cell) must NOT be misclassified —
+    only the cell's error field decides. Non-exec results (e.g. a `dump`
+    notebook string, or other tools) aren't JSON; for those we fall back to
+    a best-effort text sniff. Timeout-kill text in the error → "timeout";
+    any other non-empty error → "error".
+    """
+    if not content:
+        return "ok"
+    try:
+        cell = json.loads(content)
+    except (ValueError, TypeError):
+        cell = None
+    if isinstance(cell, dict) and "error" in cell:
+        err = (cell.get("error") or "").strip()
+        if not err:
+            return "ok"
+        low = err.lower()
+        if "timed out" in low or "of inactivity" in low or "cell killed" in low:
+            return "timeout"
+        return "error"
+    # Fallback for non-JSON results (dump notebook, non-scratchpad tools).
+    low = content.lower()
+    if "cell timed out" in low or "of inactivity" in low or "cell killed" in low:
+        return "timeout"
+    if "[error]" in low or "exec failed" in low:
+        return "error"
+    return "ok"
 
 
 async def format_responses_stream(
@@ -180,6 +232,10 @@ async def format_responses_stream(
                 "tool_name": getattr(event, "name", "") or "",
                 "tool_action": getattr(event, "action", "") or "",
                 "tool_use_id": getattr(event, "id", None) or "",
+                # ok / timeout / error — lets the renderer show a killed cell
+                # as dead instead of stuck "running". Additive: older clients
+                # ignore the field.
+                "cell_status": classify_cell_status(event.content),
             })
 
         elif isinstance(event, StreamTaskProgress):
@@ -217,6 +273,14 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "thought_role": Role.thought_context_compacted.value,
                 "content": event.message,
+            })
+
+        elif isinstance(event, ArtifactCreated):
+            seq += 1
+            yield _event("response.artifact_created", {
+                "type": "response.artifact_created",
+                "sequence_number": seq,
+                "artifact": event.artifact,
             })
 
         elif isinstance(event, StreamComplete):

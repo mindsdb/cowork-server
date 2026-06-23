@@ -53,3 +53,14 @@ def run_dev_setup() -> None:
 
     with SQLSession(engine) as session:
         migrate_env_to_db(session)
+
+    # Migrate harness-local memory into ~/.cowork/memory, then wire runtime symlinks.
+    import cowork.harnesses  # noqa: F401 — registers memory adapters
+
+    from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
+    from cowork.harnesses.memory.runtime import ensure_all_layouts
+
+    with SQLSession(engine) as session:
+        migrate_harness_memory_to_shared(session)
+
+    ensure_all_layouts()

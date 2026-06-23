@@ -135,9 +135,17 @@ class ConnectionDetailResponse(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)
 
 
+class DirectSaveRequest(BaseModel):
+    connector_id: str
+    method: str | None = None
+    name: str = ""
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
 class OAuthStartRequest(BaseModel):
     client_id: str = ""
     client_secret: str = ""
+    extra_fields: dict[str, str] = Field(default_factory=dict)
 
 
 class OAuthStartResponse(BaseModel):
