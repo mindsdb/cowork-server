@@ -93,14 +93,17 @@ def validate_settings(session: SessionDep):
 
 @router.get("/configured")
 def check_configured(session: SessionDep):
+    # Route the same readiness signal the in-app chat gate uses
+    # (config_status.config_ready) so the frontend's onboarding-vs-app routing
+    # can't disagree with the chat gate and strand a user who has a usable key
+    # but a stale planning_provider. config_status resolves the effective
+    # provider, so "any usable key" → configured, matching build_llm_client.
     s = SettingService(session).load()
-    if s.minds_api_key is not None:
-        return {"configured": True, "provider": "minds-cloud"}
-    if s.anthropic_api_key is not None:
-        return {"configured": True, "provider": "anthropic"}
-    if s.openai_api_key is not None:
-        return {"configured": True, "provider": "openai"}
-    return {"configured": False, "provider": ""}
+    cs = s.config_status
+    return {
+        "configured": bool(cs["config_ready"]),
+        "provider": cs["provider"] if cs["config_ready"] else "",
+    }
 
 
 @router.get("/install-status")
