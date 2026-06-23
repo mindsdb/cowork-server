@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, model_validator
 
+from cowork.harnesses.memory.registry import MemorySlot
+
 
 class MemoryScope(str, Enum):
     project = "project"
@@ -17,14 +19,10 @@ def validate_project_id(values):
     return values
 
 
-# An endpoint for creating memory does not exist,
-# because users will only update the content of the existing memory (files).
-# The relevant file will be created, however, if it does not exist.
-# TODO: Do we want to allow users to create these files? Or should only edits be allowed?
 class MemoryUpdateRequest(BaseModel):
     scope: MemoryScope
-    category: str
-    content: str  # Only the content can be updated, the scope and category are used to identify what to update.
+    category: MemorySlot
+    content: str
     project_id: UUID | None = None
 
     @model_validator(mode="before")
@@ -34,7 +32,7 @@ class MemoryUpdateRequest(BaseModel):
 
 class MemoryDeleteRequest(BaseModel):
     scope: MemoryScope
-    category: str
+    category: MemorySlot
     project_id: UUID | None = None
 
     @model_validator(mode="before")
@@ -44,7 +42,7 @@ class MemoryDeleteRequest(BaseModel):
 
 class MemoryResponse(BaseModel):
     scope: MemoryScope
-    category: str
+    category: MemorySlot
     content: str
     project_id: UUID | None = None
 

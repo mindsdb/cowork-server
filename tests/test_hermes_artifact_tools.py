@@ -199,3 +199,8 @@ def test_created_artifact_appears_in_cowork_listing():
     assert entry is not None
     assert entry["title"] == "Hermes Dash"
     assert entry["primary"] == "index.html"
+    # ENG-375: the card carries a disk-derived content mtime (max over the
+    # artifact's files) so the renderer's preview viewer can cache-bust /
+    # reload when the file changes in place.
+    assert isinstance(entry["mtime"], int)
+    assert entry["mtime"] == int((Path(result["path"]) / "index.html").stat().st_mtime)

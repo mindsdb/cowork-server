@@ -205,6 +205,14 @@ class UserSettings(Settings):
         title="Proactive Dashboards",
         description="Enable proactive dashboard suggestions.",
     )
+    act_first: bool = Field(
+        default=True,
+        title="Act first, ask later",
+        description=(
+            "Act on reasonable defaults and state assumptions inline instead of "
+            "stopping to ask. Turn off for a more cautious, ask-first agent."
+        ),
+    )
     ui_update_mode: str = Field(
         default="manual",
         title="UI Update Mode",
