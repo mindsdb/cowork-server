@@ -194,69 +194,49 @@ def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     }
 
 
-def index_new_artifacts(conversation_id, project_id, artifacts_base, before: set[str]) -> None:
-    """After a turn, index any artifact folders that appeared during it as
-    owned by this conversation. Opens its own DB session (called from the
-    harness, outside a request)."""
-    after = snapshot_artifact_slugs(artifacts_base)
-    new = after - set(before or ())
-    if not new:
-        return
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.session import get_engine, get_session_factory
+def finalize_turn_artifacts(conversation_id, project_id, artifacts_base, before: set[str]) -> list[dict]:
+    """End-of-turn artifact handling, from a SINGLE artifacts-dir diff.
 
-    factory = get_session_factory(get_engine(get_app_settings().database.uri))
-    with factory() as session:
-        svc = TaskObjectService(session)
-        for slug in sorted(new):
-            svc.index_artifact(conversation_id, project_id, slug)
+    For every artifact folder that appeared during the turn this:
+      • indexes it as owned by this conversation (so it relocates with the
+        task and shows in the artifacts panel), and
+      • builds its inline-chat card payload.
 
+    Because both come from the same diff and the same per-folder card builder
+    that the artifacts list uses (`services.artifacts.card_for_folder`), the
+    inline cards, the artifacts panel, and the move/index can never disagree
+    about what a turn produced or how an artifact opens.
 
-def new_artifact_cards(artifacts_base, before: set[str]) -> list[dict]:
-    """Card payloads for artifact folders that appeared since `before`.
-
-    Built from the SAME artifacts-dir diff that `index_new_artifacts` uses,
-    so the inline chat cards and the move/index can never disagree about
-    what a turn produced. Each new slug is read via the shared ArtifactStore
-    so the payload carries everything the renderer needs (title, type, the
-    primary file's path + extension) for a uniform card, HTML or not.
-
-    Returns `[]` when nothing new (or on any error) — surfacing cards is
-    best-effort and must never break a turn.
+    Returns the card payloads (``[]`` when nothing new). Best-effort: indexing
+    and card-building are each guarded, so neither can break a turn.
     """
     after = snapshot_artifact_slugs(artifacts_base)
     new = sorted(after - set(before or ()))
     if not new:
         return []
+
     try:
-        from anton.core.artifacts.store import ArtifactStore
-    except Exception:  # pragma: no cover - anton always present at runtime
-        return []
-    store = ArtifactStore(Path(artifacts_base))
-    try:
-        by_slug = {a.slug: a for a in store.list()}
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.session import get_engine, get_session_factory
+
+        factory = get_session_factory(get_engine(get_app_settings().database.uri))
+        with factory() as session:
+            svc = TaskObjectService(session)
+            for slug in new:
+                svc.index_artifact(conversation_id, project_id, slug)
     except Exception:
-        logger.warning("Could not list artifacts for inline cards", exc_info=True)
-        return []
+        logger.warning("Could not index artifacts created this turn", exc_info=True)
+
+    from cowork.services.artifacts import card_for_folder
+
+    base = Path(artifacts_base)
     cards: list[dict] = []
     for slug in new:
-        art = by_slug.get(slug)
-        if art is None:
+        try:
+            card = card_for_folder(base / slug)
+        except Exception:
+            logger.warning("Could not build inline card for artifact %r", slug, exc_info=True)
             continue
-        folder = store.folder_for(slug)
-        primary = art.primary or (art.files[0].path if art.files else None)
-        file_path = str(folder / primary) if primary else str(folder)
-        ext = ""
-        if primary and "." in primary:
-            ext = "." + primary.rsplit(".", 1)[-1].lower()
-        cards.append(
-            {
-                "slug": slug,
-                "title": art.name or slug,
-                "type": art.type,
-                "file_path": file_path,
-                "path": file_path,
-                "ext": ext,
-            }
-        )
+        if card is not None:
+            cards.append(card)
     return cards

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Optional
 
 from cowork.schemas.responses import (
@@ -25,6 +26,7 @@ from cowork.schemas.responses import (
 )
 
 
+@dataclass
 class ArtifactCreated:
     """Synthetic post-turn event: an artifact folder appeared during the
     turn (detected by the harness via the artifacts-dir diff, not by any
@@ -33,10 +35,7 @@ class ArtifactCreated:
     renderer shows an inline card for every artifact type, identically and
     deterministically — live and on reload."""
 
-    __slots__ = ("artifact",)
-
-    def __init__(self, artifact: dict) -> None:
-        self.artifact = artifact
+    artifact: dict
 
 
 PHASE_LABELS = {
