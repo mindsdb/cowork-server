@@ -51,13 +51,31 @@ def _resolve_coding(
     s = AntonSettings()
     provider = coding_provider or s.coding_provider or ""
     model = coding_model or s.coding_model or ""
+    minds_base = None
     if coding_api_key:
         api_key = coding_api_key
     elif provider == "anthropic":
         api_key = s.anthropic_api_key or ""
+    elif provider == "minds-cloud":
+        # MindsHub resolves through its own minds_api_key / minds_url slots
+        # (never the OpenAI slot). `minds_chat_base_url` picks the right
+        # path suffix per host (/v1 for api.mindshub.ai, /api/v1 for mdb.ai).
+        #
+        # IMPORTANT: present the provider to anton's scratchpad runtime as
+        # "openai-compatible", NOT "minds-cloud". anton's scratchpad
+        # (core/backends/local.py + scratchpad_boot.py) has no "minds-cloud"
+        # branch — it routes openai-compatible through OpenAIProvider with
+        # OPENAI_API_KEY/OPENAI_BASE_URL (exactly the minds gateway shape)
+        # and routes everything else to AnthropicProvider. So "minds-cloud"
+        # would silently hit Anthropic with the wrong key.
+        from cowork.services.providers import minds_chat_base_url
+
+        provider = "openai-compatible"
+        api_key = s.minds_api_key or ""
+        minds_base = minds_chat_base_url(s.minds_url)
     else:
         api_key = s.openai_api_key or ""
-    base_url = coding_base_url or (s.openai_base_url or "")
+    base_url = coding_base_url or minds_base or (s.openai_base_url or "")
     return provider, model, api_key, base_url
 
 
