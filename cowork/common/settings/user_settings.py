@@ -261,19 +261,56 @@ class UserSettings(Settings):
             self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
         return self
 
+    def _provider_configured(self, provider: Provider) -> bool:
+        # A provider is usable once it carries the credential it needs: an API
+        # key for the hosted providers, or a base URL for an OpenAI-compatible
+        # endpoint (key optional there). Mirrors the client's providerConfigured.
+        if provider == Provider.OPENAI_COMPATIBLE:
+            return bool(self.openai_base_url) or self.openai_api_key is not None
+        return getattr(self, provider.api_key_field, None) is not None
+
+    def _resolve_provider(self, preferred: Provider) -> Provider:
+        # Keep the selected provider when it has credentials; otherwise fall
+        # back to a configured one so a usable key still drives the agent even
+        # when the selected provider was never set up (e.g. the default
+        # MindsHub is selected but only an Anthropic key exists). Prefers
+        # MindsHub, then any configured provider. Returns the original when
+        # nothing is configured so the caller still surfaces the not-ready state.
+        if self._provider_configured(preferred):
+            return preferred
+        if self._provider_configured(Provider.MINDS_CLOUD):
+            return Provider.MINDS_CLOUD
+        for p in (Provider.ANTHROPIC, Provider.OPENAI, Provider.GEMINI, Provider.OPENAI_COMPATIBLE):
+            if self._provider_configured(p):
+                return p
+        return preferred
+
+    @property
+    def effective_planning_provider(self) -> Provider:
+        return self._resolve_provider(self.planning_provider)
+
+    @property
+    def effective_coding_provider(self) -> Provider:
+        return self._resolve_provider(self.coding_provider)
+
     @property
     def config_status(self) -> dict[str, Any]:
-        """Whether the active planning provider has an API key configured."""
-        p = self.planning_provider
-        key_field = p.api_key_field
-        has_key = getattr(self, key_field, None) is not None
+        """Whether a usable planning provider is configured (after fallback)."""
+        p = self.effective_planning_provider
+        has_key = self._provider_configured(p)
         label = p.label
+        # When we fell back, report the fallback provider's default model so the
+        # status reflects what will actually run, not the stale selected model.
+        model = (
+            self.planning_model if p == self.planning_provider
+            else PLANNING_MODEL_DEFAULTS.get(p.value, "")
+        )
         return {
             "config_ready": has_key,
-            "config_error": None if has_key else f"Configure {key_field} for {label}.",
+            "config_error": None if has_key else f"Configure {p.api_key_field} for {label}.",
             "provider": p.value,
             "provider_label": label,
-            "model": self.planning_model or "",
+            "model": model or "",
         }
 
     @staticmethod
