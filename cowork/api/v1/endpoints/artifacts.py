@@ -33,6 +33,7 @@ from cowork.services.artifacts import (
     preview_artifact as _preview_artifact,
     resolve_artifact_path,
     reveal_in_file_manager,
+    serve_url_for,
     _unpublish_folder,
     _user_files,
     verify_serve_url_token,
@@ -913,7 +914,8 @@ class _ExportBody(BaseModel):
 async def export_artifact_endpoint(req: _ExportBody):
     """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
     the result into the same artifact folder. Returns the new file's path so
-    the client can open or download it."""
+    the client can open it (desktop) plus a signed origin-relative ``serveUrl``
+    so the client can download it (web, where the file isn't on this machine)."""
     from fastapi.concurrency import run_in_threadpool
 
     from cowork.services.artifact_export import ExportError, export_artifact
@@ -930,7 +932,7 @@ async def export_artifact_endpoint(req: _ExportBody):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail="Export failed") from e
-    return {"path": str(out), "filename": out.name}
+    return {"path": str(out), "filename": out.name, "serveUrl": serve_url_for(out)}
 
 
 @router.post("/preview-mount")
