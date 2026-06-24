@@ -101,6 +101,13 @@ def check_configured(session: SessionDep):
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
+    # gemini / openai-compatible have dedicated key slots now — a user who
+    # configured only one of those (no shared openai key) must still read as
+    # configured (this endpoint gates app startup).
+    if s.gemini_api_key is not None:
+        return {"configured": True, "provider": "gemini"}
+    if s.openai_compatible_api_key is not None:
+        return {"configured": True, "provider": "openai-compatible"}
     return {"configured": False, "provider": ""}
 
 

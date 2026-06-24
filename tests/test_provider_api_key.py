@@ -83,3 +83,52 @@ class TestConfigStatusFallback:
     def test_gemini_planning_with_no_key_reads_as_not_configured(self):
         s = _settings(planning_provider=Provider.GEMINI)
         assert s.config_status["config_ready"] is False
+
+
+class TestCheckConfiguredGeminiOnly:
+    """A gemini-only user (dedicated key, no shared openai key) must read as
+    configured — /configured gates app startup (App.tsx)."""
+
+    _SLOTS = (
+        "minds_api_key", "anthropic_api_key", "openai_api_key",
+        "gemini_api_key", "openai_compatible_api_key",
+    )
+
+    def _clear(self, svc):
+        for k in self._SLOTS:
+            try:
+                svc.delete_setting(k)
+            except Exception:
+                pass
+
+    def test_gemini_only_is_configured(self):
+        from cowork.api.v1.endpoints.settings import check_configured
+        from cowork.db.session import get_open_session
+        from cowork.services.settings import SettingService
+
+        session = get_open_session()
+        svc = SettingService(session)
+        self._clear(svc)
+        try:
+            svc.upsert_setting("gemini_api_key", "AIza-only")
+            res = check_configured(session)
+            assert res["configured"] is True
+            assert res["provider"] == "gemini"
+        finally:
+            self._clear(svc)
+
+    def test_openai_compatible_only_is_configured(self):
+        from cowork.api.v1.endpoints.settings import check_configured
+        from cowork.db.session import get_open_session
+        from cowork.services.settings import SettingService
+
+        session = get_open_session()
+        svc = SettingService(session)
+        self._clear(svc)
+        try:
+            svc.upsert_setting("openai_compatible_api_key", "sk-compat-only")
+            res = check_configured(session)
+            assert res["configured"] is True
+            assert res["provider"] == "openai-compatible"
+        finally:
+            self._clear(svc)
