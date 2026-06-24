@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -134,6 +135,35 @@ class SkillService:
             skill.name = new_slug
 
         skill.metadata = metadata
+        self._write(skill)
+        return self.get_skill(skill.name)
+
+    def import_skill(self, content: str) -> Skill:
+        """Parse an uploaded ``SKILL.md`` text and persist it as a new skill.
+
+        Validation = "does it parse via skill_format". Raises ValueError if the
+        content is not a parseable SKILL.md, or FileExistsError on slug collision.
+        """
+        # parse_skill_dir needs a dir holding a file literally named SKILL.md.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp) / "skill"
+            tmp_dir.mkdir(parents=True)
+            (tmp_dir / SKILL_FILE).write_text(content, encoding="utf-8")
+            skill = _skill_from_dir(tmp_dir)
+
+        if skill is None:
+            raise ValueError("Could not parse the uploaded file as a SKILL.md.")
+        if not skill.name:
+            raise ValueError("Skill name is missing or invalid.")
+        if self._skill_dir(skill.name).exists():
+            raise FileExistsError(f"A skill named '{skill.name}' already exists.")
+
+        metadata = dict(skill.metadata)
+        metadata.setdefault(META_CREATED_AT, datetime.now(timezone.utc).isoformat())
+        skill.metadata = metadata
+        if not skill.description.strip():
+            skill.description = skill.display_name or skill.name
+
         self._write(skill)
         return self.get_skill(skill.name)
 
