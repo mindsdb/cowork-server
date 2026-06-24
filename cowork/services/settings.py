@@ -29,12 +29,30 @@ class SettingService:
 
     @staticmethod
     def _load(rows: list[Setting]) -> UserSettings:
-        data = {
-            row.key: (decrypt(row.value) if UserSettings.field_is_sensitive(row.key) else row.value)
-            for row in rows
-            if row.key in UserSettings.model_fields
-        }
+        data: dict[str, str] = {}
+        for row in rows:
+            if row.key not in UserSettings.model_fields:
+                continue
+            if UserSettings.field_is_sensitive(row.key):
+                decrypted = decrypt(row.value)
+                # An empty credential is no credential: a blank sensitive value
+                # (e.g. a key cleared in the UI, which upserts "") reads as unset,
+                # so the provider is honestly not-configured rather than present.
+                if not decrypted:
+                    continue
+                data[row.key] = decrypted
+            else:
+                data[row.key] = row.value
         return UserSettings(**data)
+
+    @staticmethod
+    def _is_set(key: str, settings: UserSettings, set_keys: set[str]) -> bool:
+        # Sensitive fields count as set only when they carry a non-empty value
+        # (a blank row reads as unset, matching _load); other fields are set
+        # whenever a row exists.
+        if UserSettings.field_is_sensitive(key):
+            return getattr(settings, key) is not None
+        return key in set_keys
 
     @staticmethod
     def _to_response(key: str, settings: UserSettings, is_set: bool) -> SettingResponse:
@@ -63,13 +81,14 @@ class SettingService:
         rows = self._fetch_all_rows()
         settings = self._load(rows)
         set_keys = {row.key for row in rows}
-        return [self._to_response(key, settings, key in set_keys) for key in UserSettings.model_fields]
+        return [self._to_response(key, settings, self._is_set(key, settings, set_keys)) for key in UserSettings.model_fields]
 
     def get_setting(self, key: str) -> SettingResponse:
         self._validate_key(key)
         row = self._fetch_row(key)
         settings = self._load([row] if row else [])
-        return self._to_response(key, settings, row is not None)
+        set_keys = {row.key} if row is not None else set()
+        return self._to_response(key, settings, self._is_set(key, settings, set_keys))
 
     def upsert_setting(self, key: str, value: str) -> SettingResponse:
         self._validate_key(key)
