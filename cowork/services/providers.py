@@ -30,6 +30,42 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
+# Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+def provider_base_url(
+    provider: str, *, openai_base_url: str = "", minds_url: str = ""
+) -> str | None:
+    """Single source of truth for a provider's inference base URL.
+
+    Returns the base URL the OpenAIProvider should use, or ``None`` to let the
+    SDK use its built-in default (direct Anthropic/OpenAI hosts).
+
+    The crux: ``openai_base_url`` is a *shared* DB slot reused by the openai,
+    gemini, and openai-compatible cards. Only **openai-compatible** legitimately
+    needs a user-supplied base. If openai or gemini were allowed to read that
+    shared slot, a value left behind by a prior provider setup (e.g. MindsHub
+    writing ``https://api.mindshub.ai/v1``) would silently misroute the next
+    provider's request — and its API key — to the wrong vendor. So each
+    provider's base is derived deterministically here and never inherited:
+
+      - anthropic / openai → ``None`` (SDK default host; never the shared slot)
+      - gemini             → Google's OpenAI-compatible endpoint
+      - minds-cloud        → derived from the dedicated ``minds_url`` slot
+      - openai-compatible  → the shared slot (this is the one that owns it)
+    """
+    p = (provider or "").replace("_", "-")
+    if p == "minds-cloud":
+        return minds_chat_base_url(minds_url)
+    if p == "gemini":
+        return GEMINI_BASE_URL
+    if p == "openai-compatible":
+        return openai_base_url or "https://api.openai.com/v1"
+    # anthropic, openai → SDK default; never inherit the shared openai_base_url.
+    return None
+
+
 # ── Live model listing ───────────────────────────────────────────────
 
 # MindsHub exposes an OpenAI-compatible `/v1/models` route. We surface
@@ -333,23 +369,29 @@ def build_llm_client():
         # TypeError on every call, taking the whole agent down — not just effort
         # users) and avoids handing an unset effort to a provider that can't take it.
         effort_kw = {"reasoning_effort": effort} if effort else {}
+        # Base URL is derived per-provider via provider_base_url() — never by
+        # blindly reading the shared openai_base_url slot — so one provider's
+        # stale base can't misroute another provider's key (see that helper).
+        base = provider_base_url(
+            role.value,
+            openai_base_url=settings.openai_base_url or "",
+            minds_url=settings.minds_url,
+        )
         if role == Provider.MINDS_CLOUD:
             key = settings.minds_api_key
             if key is None:
                 raise ValueError("MindsHub API key is not configured")
             return OpenAIProvider(
-                api_key=key.get_secret_value(),
-                base_url=minds_chat_base_url(settings.minds_url),
-                **effort_kw,
+                api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            # Both read the shared openai_api_key slot, but their base differs:
+            # gemini → Google's endpoint, openai-compatible → the user's slot.
             key = settings.openai_api_key
             if key is None:
                 raise ValueError("OpenAI API key is not configured")
             return OpenAIProvider(
-                api_key=key.get_secret_value(),
-                base_url=settings.openai_base_url or "https://api.openai.com/v1",
-                **effort_kw,
+                api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -358,6 +400,10 @@ def build_llm_client():
         key = getattr(settings, f"{role.value}_api_key")
         if key is None:
             raise ValueError(f"{role.value} API key is not configured")
+        # base is None for anthropic/openai → SDK default host (OpenAIProvider
+        # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
+        if cls is OpenAIProvider:
+            return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
     # Use the *resolved* provider/model (not the raw stored fields) so a
