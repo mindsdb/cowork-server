@@ -358,8 +358,13 @@ class HermesHarness:
             # The DB enum uses snake_case (openai_compatible) but AIAgent
             # expects kebab-case (openai-compatible).
             provider = settings.planning_provider.value.replace("_", "-")
-            key_field = settings.planning_provider.api_key_field
-            api_key = getattr(settings, key_field).get_secret_value()
+            # provider_api_key applies the gemini/openai-compatible → openai
+            # fallback, so a user on the shared key still resolves (avoids a
+            # None.get_secret_value() crash).
+            from cowork.common.settings.user_settings import provider_api_key
+
+            _key = provider_api_key(settings, settings.planning_provider)
+            api_key = _key.get_secret_value() if _key else ""
 
             # AIAgent needs both api_key AND base_url to skip its config.yaml
             # provider-resolution path.  For providers that use the OpenAI-

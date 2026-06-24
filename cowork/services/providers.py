@@ -358,7 +358,11 @@ def build_llm_client():
     from anton.core.llm.anthropic import AnthropicProvider
     from anton.core.llm.openai import OpenAIProvider
 
-    from cowork.common.settings.user_settings import get_user_settings, Provider
+    from cowork.common.settings.user_settings import (
+        get_user_settings,
+        provider_api_key,
+        Provider,
+    )
 
     settings = get_user_settings()
 
@@ -377,17 +381,18 @@ def build_llm_client():
             openai_base_url=settings.openai_base_url or "",
             minds_url=settings.minds_url,
         )
+        # Key is resolved per-provider via provider_api_key() — each provider
+        # reads its own slot (gemini/openai-compatible fall back to the shared
+        # openai slot when unset), so configuring one provider can't overwrite
+        # or misroute another's key.
+        key = provider_api_key(settings, role)
         if role == Provider.MINDS_CLOUD:
-            key = settings.minds_api_key
             if key is None:
                 raise ValueError("MindsHub API key is not configured")
             return OpenAIProvider(
                 api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
-            # Both read the shared openai_api_key slot, but their base differs:
-            # gemini → Google's endpoint, openai-compatible → the user's slot.
-            key = settings.openai_api_key
             if key is None:
                 raise ValueError("OpenAI API key is not configured")
             return OpenAIProvider(
@@ -397,7 +402,6 @@ def build_llm_client():
         cls = provider_map.get(role.value)
         if cls is None:
             raise ValueError(f"Unknown provider: {role.value}")
-        key = getattr(settings, f"{role.value}_api_key")
         if key is None:
             raise ValueError(f"{role.value} API key is not configured")
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
@@ -424,10 +428,14 @@ def build_llm_client():
 
 def resolve_stored_key(settings: UserSettings, ptype: str) -> str:
     """Get the stored (unmasked) API key for a UI provider type."""
-    from cowork.common.settings.user_settings import UI_TYPE_TO_PROVIDER
+    from cowork.common.settings.user_settings import (
+        UI_TYPE_TO_PROVIDER,
+        provider_api_key,
+    )
     provider = UI_TYPE_TO_PROVIDER.get(ptype)
     if provider is None:
         return ""
-    field = provider.api_key_field
-    val = getattr(settings, field, None)
+    # provider_api_key applies the gemini/openai-compatible → openai fallback,
+    # so existing single-key configs still resolve here (Test button, key reveal).
+    val = provider_api_key(settings, provider)
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
