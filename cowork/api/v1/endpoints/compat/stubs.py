@@ -92,7 +92,7 @@ async def upload_attachment(
     session: _SessionDep,
     files: list[UploadFile] = File(...),
 ):
-    from cowork.services.files import FileService
+    from cowork.services.files import FileService, FileValidationError
     svc = FileService(session)
     purpose = _attachment_purpose(project_name, session_id)
     results = []
@@ -100,6 +100,13 @@ async def upload_attachment(
         try:
             created = await svc.create_file(upload=f, purpose=purpose)
             results.append(_to_attachment(svc.get_file_row(UUID(created.id))))
+        except FileValidationError as exc:
+            # Guardrail rejection (too large / disallowed type): a client
+            # error with a human-readable reason. Must surface as a 4xx —
+            # the broad handler below would otherwise bury it in a 500.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
         except Exception as exc:
             # Previously any failure here surfaced as an opaque 500 with no
             # server log (e.g. an over-long `purpose` failing model

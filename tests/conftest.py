@@ -17,6 +17,8 @@ os.environ["MASTER_KEY_PATH"] = str(TMP / "master.key")
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 os.environ["COWORK_PROJECTS_DIR"] = str(TMP / "projects")
+# Uploaded files land here, never the real ~/.cowork/files.
+os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
 os.environ["ENV"] = "test"
 
 import pytest
