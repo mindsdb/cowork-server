@@ -237,26 +237,3 @@ class AppSettings(Settings):
 def get_app_settings() -> AppSettings:
     """Get cached application settings."""
     return AppSettings()
-
-
-# Per-environment MindsHub host that serves published artifacts. mindshub_services
-# deploys these under the `view` subdomain (prod drops the env segment); see its
-# samconfig. Anything that isn't a known staging/prod env (including `local`/`dev`)
-# publishes against the dev stack.
-_PUBLISH_HOSTS = {
-    "prod": "https://view.mindshub.ai",
-    "production": "https://view.mindshub.ai",
-    "staging": "https://view.staging.mindshub.ai",
-}
-_DEFAULT_PUBLISH_HOST = "https://view.dev.mindshub.ai"
-
-
-def default_publish_url(env: str | None = None) -> str:
-    """Publish base URL for the active environment.
-
-    Falls back to ``AppSettings.env`` (COWORK_ENV) when no env is given. An
-    explicit ``publish_url`` user setting and ``ANTON_PUBLISH_URL`` still
-    override this — call sites use it only as the unset default.
-    """
-    name = (env if env is not None else get_app_settings().env or "").strip().lower()
-    return _PUBLISH_HOSTS.get(name, _DEFAULT_PUBLISH_HOST)

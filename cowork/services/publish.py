@@ -16,7 +16,8 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from cowork.common.settings.app_settings import default_publish_url, get_app_settings
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.providers import publish_url_for_minds
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import (
     _artifact_root_for,
@@ -126,7 +127,7 @@ def list_publishable() -> dict:
     return {
         "artifacts": html_artifacts(),
         "publishReady": bool(_secret_str(settings.minds_api_key)),
-        "publishUrl": settings.publish_url or default_publish_url(),
+        "publishUrl": settings.publish_url or publish_url_for_minds(settings.minds_url),
         "history": state.get("publish_history", [])[:40],
     }
 
@@ -365,7 +366,7 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
         publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
 
-    publish_url = settings.publish_url or default_publish_url()
+    publish_url = settings.publish_url or publish_url_for_minds(settings.minds_url)
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
         result = publish(
@@ -462,7 +463,7 @@ def unpublish_artifact(raw_path: str) -> dict:
     except Exception as exc:
         raise RuntimeError("Anton publisher is unavailable") from exc
 
-    publish_url = settings.publish_url or default_publish_url()
+    publish_url = settings.publish_url or publish_url_for_minds(settings.minds_url)
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
         unpublish(

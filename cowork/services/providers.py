@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import SecretStr
@@ -28,6 +29,27 @@ def minds_chat_base_url(minds_url: str) -> str:
     if base.endswith("/v1"):
         return base
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
+
+
+# Prod is the publish host for shipped desktop installs (they configure no env).
+PROD_PUBLISH_URL = "https://view.mindshub.ai"
+
+
+def publish_url_for_minds(minds_url: str | None) -> str:
+    """Publish host that matches the configured MindsHub endpoint.
+
+    Publishing is a "related service" of the same MindsHub environment as the
+    LLM endpoint, so the host follows whatever `minds_url` points at:
+    ``api[.env].mindshub.ai`` → ``view[.env].mindshub.ai`` (so a developer who
+    points their provider at dev/staging publishes there too). Anything we don't
+    recognise — mdb.ai, a custom OpenAI-compatible endpoint, empty — falls back
+    to prod. An explicit `publish_url` / `ANTON_PUBLISH_URL` overrides this at
+    the call site.
+    """
+    host = (urlparse(minds_url or "").hostname or "").lower()
+    if host.startswith("api.") and host.endswith(".mindshub.ai"):
+        return f"https://view.{host[len('api.'):]}"
+    return PROD_PUBLISH_URL
 
 
 # ── Live model listing ───────────────────────────────────────────────
