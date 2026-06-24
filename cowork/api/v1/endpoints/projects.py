@@ -6,7 +6,11 @@ from sqlmodel import Session
 
 from cowork.db.session import get_session
 from cowork.schemas.base import CamelRequest
-from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
+from cowork.schemas.projects import (
+    ProjectCreateRequest,
+    ProjectReorderRequest,
+    ProjectUpdateRequest,
+)
 from cowork.services.request_identity import (
     AuthenticationError,
     RequestPrincipal,
@@ -104,8 +108,11 @@ def _require_project_capability_if_owned(
 
 
 @router.get("/")
-def list_projects(session: SessionDep):
-    return ProjectService(session).list_projects()
+def list_projects(
+    session: SessionDep,
+    include_archived: bool = Query(default=True),
+):
+    return ProjectService(session).list_projects(include_archived=include_archived)
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -125,12 +132,38 @@ def create_project(body: ProjectCreateRequest, session: SessionDep, principal: P
 @router.patch("/{project_id}")
 def update_project(project_id: UUID, body: ProjectUpdateRequest, session: SessionDep, principal: PrincipalDep):
     _require_project_capability_if_owned(session, project_id, principal, "manage")
+    service = ProjectService(session)
     try:
-        return ProjectService(session).update_project(
-            project_id, name=body.name, is_active=body.is_active
-        )
+        # Name / active-state changes (filesystem rename, single-active rule).
+        if body.name is not None or body.is_active is not None:
+            project = service.update_project(
+                project_id, name=body.name, is_active=body.is_active
+            )
+        else:
+            project = service.get_project(project_id)
+        # Organization metadata (pin / order / archived). Touch last-selected
+        # whenever the project is activated so cross-device recency works.
+        if (
+            body.pinned is not None
+            or body.sort_order is not None
+            or body.archived is not None
+            or body.is_active
+        ):
+            project = service.update_project_metadata(
+                project_id,
+                pinned=body.pinned,
+                sort_order=body.sort_order,
+                archived=body.archived,
+                touch_last_selected=bool(body.is_active),
+            )
+        return project
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/reorder")
+def reorder_projects(body: ProjectReorderRequest, session: SessionDep):
+    return ProjectService(session).reorder_projects(body.project_ids)
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
