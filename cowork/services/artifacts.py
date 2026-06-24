@@ -1170,9 +1170,9 @@ async def _launch_backend_locked(
         meta = _load_metadata(artifact_dir) or {}
         datasources = meta.get("datasources") or []
         if datasources:
-            from anton.core.datasources.data_vault import LocalDataVault
+            from cowork.services.connectors.encrypted_vault import build_vault
 
-            vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+            vault = build_vault(Path(get_app_settings().connector.vault_dir))
             for ds in datasources:
                 engine, name = ds.get("engine"), ds.get("name")
                 if not engine or not name:

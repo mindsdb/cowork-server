@@ -341,9 +341,9 @@ class HermesHarness:
         from pathlib import Path
 
         from run_agent import AIAgent
-        from anton.core.datasources.data_vault import LocalDataVault
 
         from cowork.common.settings.app_settings import get_app_settings
+        from cowork.services.connectors.encrypted_vault import build_vault
         from cowork.common.settings.user_settings import get_user_settings
         from cowork.harnesses.hermes_harness.tools import (
             finalize_artifact_run_context,
@@ -392,7 +392,7 @@ class HermesHarness:
 
         _sync_hermes_config(provider_value, api_key_value)
 
-        vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+        vault = build_vault(Path(get_app_settings().connector.vault_dir))
         disabled_keys = {(d["engine"], d["name"]) for d in (disabled_connections or [])}
         for conn in vault.list_connections():
             if (conn["engine"], conn["name"]) not in disabled_keys:

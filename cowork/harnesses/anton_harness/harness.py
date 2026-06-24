@@ -270,7 +270,10 @@ class AntonHarness:
         # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
 
         try:
-            from anton.core.datasources.data_vault import LocalDataVault
+            # Encrypting factory (subclass of anton's LocalDataVault) so vault
+            # credentials are decrypted at read and re-encrypted in the temp
+            # filtered vault handed to the ChatSession.
+            from cowork.services.connectors.encrypted_vault import build_vault as LocalDataVault
         except Exception:  # pragma: no cover
             LocalDataVault = None
 

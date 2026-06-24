@@ -10,11 +10,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.schemas.connectors import OAuthStartResponse
+from cowork.services.connectors.encrypted_vault import build_vault
 from cowork.services.connectors.oauth import pkce as pkce_utils
 from cowork.services.connectors.oauth.config import GOOGLE_SERVICES
 from cowork.services.connectors.oauth.state import OAuthStateStore
@@ -206,7 +206,7 @@ class GoogleOAuthService:
             )
 
             extra = {k: v for k, v in (pending.get("extraFields") or {}).items() if v}
-            LocalDataVault(Path(ConnectorSettings().vault_dir)).save(
+            build_vault(Path(ConnectorSettings().vault_dir)).save(
                 cfg.engine,
                 connection_name,
                 {
@@ -253,7 +253,7 @@ class GoogleOAuthService:
             return
         _log.info("Revoking Google token for %s/%s", engine, name)
         try:
-            fields = LocalDataVault(Path(connector_settings.vault_dir)).load(engine, name) or {}
+            fields = build_vault(Path(connector_settings.vault_dir)).load(engine, name) or {}
         except Exception:
             return
         if fields.get("auth_type") != "oauth":
@@ -287,7 +287,7 @@ class GoogleOAuthService:
 
     def refresh_all_tokens(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> None:
         try:
-            vault = LocalDataVault(Path(connector_settings.vault_dir))
+            vault = build_vault(Path(connector_settings.vault_dir))
             all_connections = vault.list_connections() or []
         except Exception:
             return
@@ -357,7 +357,7 @@ class GoogleOAuthService:
 
     def get_catalogue(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> list[dict]:
         try:
-            vault = LocalDataVault(Path(connector_settings.vault_dir))
+            vault = build_vault(Path(connector_settings.vault_dir))
             all_connections = vault.list_connections() or []
         except Exception as exc:
             _log.warning("Could not load vault for catalogue: %s", exc)
