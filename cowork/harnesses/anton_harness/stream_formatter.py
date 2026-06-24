@@ -38,6 +38,20 @@ class ArtifactCreated:
     artifact: dict
 
 
+@dataclass
+class MemoryLoaded:
+    """Synthetic pre-turn event: the Cortex loaded long-term memory (rules,
+    lessons, identity) into the system prompt for this turn. The harness
+    counts the entries from the same hippocampus the prompt is built from and
+    emits this once, up front, so the renderer can show an honest "used N
+    memories this turn" chip. Rides the same stream as Anton's `Stream*`
+    events and maps to a `thought.memory.loaded` `response.in_progress` SSE
+    event below. `count` is the number of memory entries injected; 0 means
+    no chip should show."""
+
+    count: int
+
+
 PHASE_LABELS = {
     "planning": "Planning",
     "analyzing": "Analyzing",
@@ -282,6 +296,19 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "artifact": event.artifact,
             })
+
+        elif isinstance(event, MemoryLoaded):
+            # Only surface when the Cortex actually loaded something — a
+            # zero-count chip would be noise (and a "used 0 memories" lie).
+            if event.count > 0:
+                seq += 1
+                yield _event("response.in_progress", {
+                    "type": "response.in_progress",
+                    "sequence_number": seq,
+                    "thought_role": Role.thought_memory_loaded.value,
+                    "content": str(event.count),
+                    "memory_count": event.count,
+                })
 
         elif isinstance(event, StreamComplete):
             pass

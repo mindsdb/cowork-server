@@ -23,6 +23,10 @@ class Role(str, Enum):
     thought_memorize_end = "thought.memorize.end"
     thought_recall_start = "thought.recall.start"
     thought_recall_end = "thought.recall.end"
+    # Emitted once per turn when the Cortex loads long-term memory (rules,
+    # lessons, identity) into the system prompt. Carries the count of
+    # entries injected so the client can show a "used N memories" chip.
+    thought_memory_loaded = "thought.memory.loaded"
     thought_progress = "thought.progress"
     thought_context_compacted = "thought.context_compacted"
     # General tool call events (relevant to other harnesses).

@@ -6,7 +6,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, MemoryLoaded, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
@@ -15,6 +15,33 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+def _count_loaded_memories(cortex) -> int:
+    """How many long-term memory entries the Cortex will inject into this
+    turn's system prompt.
+
+    Mirrors the slots `Cortex.build_memory_context` assembles (identity +
+    global/project rules + global/project lessons) by reading the same
+    hippocampus the prompt is built from, so the client's "used N memories"
+    chip reflects what was actually recalled rather than a guess. Returns 0
+    when memory is off or nothing is stored — best-effort: any error counts
+    as 0 so a memory hiccup never breaks a turn.
+    """
+    if cortex is None or getattr(cortex, "mode", "off") == "off":
+        return 0
+    total = 0
+    try:
+        for hc in (getattr(cortex, "global_hc", None), getattr(cortex, "project_hc", None)):
+            if hc is None:
+                continue
+            total += len(hc.get_identities())
+            total += len(hc.get_rules())
+            total += len(hc.get_lessons())
+    except Exception:
+        logger.debug("Could not count loaded memories for the turn", exc_info=True)
+        return 0
+    return total
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -155,6 +182,12 @@ class AntonHarness:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
             )
+            # Surface how many long-term memories the Cortex loads into this
+            # turn's prompt, up front, so the client can show an honest
+            # "used N memories" chip. Sourced from the same hippocampus the
+            # prompt is built from (see _count_loaded_memories); the
+            # formatter drops a zero count.
+            yield MemoryLoaded(_count_loaded_memories(getattr(session, "_cortex", None)))
             async for event in session.turn_stream(self._to_anton_input(input)):
                 yield event
         finally:
