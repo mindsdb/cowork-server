@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import shutil
+from collections.abc import Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -68,8 +70,19 @@ class ProjectService:
             cleaned = f"{cleaned}-x"
         return cleaned
 
-    def list_projects(self) -> list[Project]:
-        return list(self.session.exec(select(Project)).all())
+    def list_projects(self, *, include_archived: bool = True) -> list[Project]:
+        statement = select(Project)
+        if not include_archived:
+            statement = statement.where(Project.archived == False)  # noqa: E712
+        # Deterministic order so the persisted organization metadata is
+        # meaningful for any consumer (not just clients that re-sort): pinned
+        # first, then manual sort_order, then name as a stable tiebreaker.
+        statement = statement.order_by(
+            Project.pinned.desc(),
+            Project.sort_order.asc(),
+            Project.name.asc(),
+        )
+        return list(self.session.exec(statement).all())
 
     def get_project(self, project_id: UUID) -> Project:
         project = self.session.get(Project, project_id)
@@ -133,6 +146,53 @@ class ProjectService:
         self.session.commit()
         self.session.refresh(project)
         return project
+
+    def update_project_metadata(
+        self,
+        project_id: UUID,
+        *,
+        pinned: bool | None = None,
+        sort_order: int | None = None,
+        archived: bool | None = None,
+        touch_last_selected: bool = False,
+    ) -> Project:
+        """Update organization metadata (pin/order/archived/last-selected).
+
+        Independent of name/active-state mutation so the list UI can persist
+        organization without side effects. Only provided fields change.
+        """
+        project = self.session.get(Project, project_id)
+        if project is None:
+            raise ValueError("Project not found")
+
+        if pinned is not None:
+            project.pinned = pinned
+        if sort_order is not None:
+            project.sort_order = sort_order
+        if archived is not None:
+            project.archived = archived
+        if touch_last_selected:
+            project.last_selected_at = datetime.now(timezone.utc)
+
+        self.session.add(project)
+        self.session.commit()
+        self.session.refresh(project)
+        return project
+
+    def reorder_projects(self, ordered_ids: Iterable[UUID]) -> list[Project]:
+        """Assign sort_order from the given id sequence (0, 1, 2, ...).
+
+        Unknown ids are ignored; projects not named keep their existing order.
+        Returns the full project list after reordering.
+        """
+        by_id = {p.id: p for p in self.session.exec(select(Project)).all()}
+        for index, project_id in enumerate(ordered_ids):
+            project = by_id.get(project_id)
+            if project is not None and project.sort_order != index:
+                project.sort_order = index
+                self.session.add(project)
+        self.session.commit()
+        return list(self.session.exec(select(Project)).all())
 
     def delete_project(self, project_id: UUID) -> bool:
         project = self.session.get(Project, project_id)

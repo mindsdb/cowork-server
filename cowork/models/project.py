@@ -1,3 +1,6 @@
+from datetime import datetime
+
+import sqlalchemy as sa
 from sqlmodel import Field
 
 from cowork.models.base import BaseSQLModel
@@ -12,4 +15,23 @@ class Project(BaseSQLModel, table=True):
         max_length=1024,
     )
     is_active: bool = Field(default=True, description="Whether the project is active")
+
+    # ── Organization metadata (server-side, follows the user across devices) ──
+    pinned: bool = Field(
+        default=False,
+        description="Whether the project is pinned/favorited in the list.",
+    )
+    sort_order: int = Field(
+        default=0,
+        description="Manual ordering position within the list (ascending).",
+    )
+    archived: bool = Field(
+        default=False,
+        description="Whether the project is archived (hidden from the active list).",
+    )
+    last_selected_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="The last time this project was selected/opened by the user.",
+    )
 
