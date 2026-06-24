@@ -589,7 +589,7 @@ def test_owned_project_update_and_delete_require_owner_identity(
     project_path.mkdir()
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:
-        project = Project(name=f"owned-{uuid4().hex[:8]}", path=str(project_path), is_active=False)
+        project = Project(name=f"owned-{uuid4().hex[:8]}", path=str(project_path))
         session.add(project)
         session.commit()
         session.refresh(project)
@@ -613,7 +613,7 @@ def test_owned_project_update_and_delete_require_owner_identity(
         fake_principal,
     )
 
-    anonymous = client.patch(f"/api/v1/projects/{project_id}", json={"isActive": True})
+    anonymous = client.patch(f"/api/v1/projects/{project_id}", json={"lastSelected": True})
     assert anonymous.status_code == 401
 
     reviewer = client.delete(
@@ -625,10 +625,10 @@ def test_owned_project_update_and_delete_require_owner_identity(
     owner_update = client.patch(
         f"/api/v1/projects/{project_id}",
         headers={"Authorization": "Bearer owner"},
-        json={"isActive": True},
+        json={"lastSelected": True},
     )
     assert owner_update.status_code == 200, owner_update.text
-    assert owner_update.json()["is_active"] is True
+    assert owner_update.json()["last_selected_at"] is not None
 
     owner_delete = client.delete(
         f"/api/v1/projects/{project_id}",

@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
-from cowork.services.projects import GENERAL_PROJECT_ID
+from cowork.services.projects import ProjectService
 
 
 class ScheduleService:
@@ -37,6 +37,15 @@ class ScheduleService:
         project_id: UUID | None = None,
         enabled: bool = True,
     ) -> Schedule:
+        # A schedule's project is locked in at creation and reused on every
+        # run. When the caller doesn't pin one, resolve it the same way a
+        # headless run does — the most-recently-selected project (General as
+        # the final fallback) — so scheduled and interactive runs agree.
+        resolved_project_id = (
+            project_id
+            if project_id is not None
+            else ProjectService(self.session).resolve_fallback_project().id
+        )
         schedule = Schedule(
             title=title,
             prompt=prompt,
@@ -44,7 +53,7 @@ class ScheduleService:
             next_run_at=next_run_at,
             model=model,
             timezone=timezone,
-            project_id=project_id or GENERAL_PROJECT_ID,
+            project_id=resolved_project_id,
             enabled=enabled,
         )
         self.session.add(schedule)
