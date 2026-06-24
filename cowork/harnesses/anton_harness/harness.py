@@ -18,11 +18,16 @@ settings = AntonHarnessSettings()
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
+    from cowork.services.connectors.health import safe_runtime_load
+
     disabled_keys = {(d["engine"], d["name"]) for d in disabled_connections}
     filtered = LocalDataVault(temp_dir)
     for conn in source_vault.list_connections():
         if (conn["engine"], conn["name"]) not in disabled_keys:
-            creds = source_vault.load(conn["engine"], conn["name"]) or {}
+            # Defensive load against the SOURCE vault (the encrypting one that
+            # can stamp health): a credential read that fails marks the
+            # connection broken + returns {} rather than crashing the turn.
+            creds = safe_runtime_load(source_vault, conn["engine"], conn["name"])
             filtered.save(conn["engine"], conn["name"], creds)
     return filtered
 
