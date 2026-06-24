@@ -74,7 +74,11 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=[str(Path.home() / ".anton" / ".env"), ".env"],
+        # Global config lives in ~/.cowork/.env now; ~/.anton/.env is kept as
+        # a fallback for un-migrated installs. Order matters: pydantic-settings
+        # is "last wins", so ~/.cowork/.env must come AFTER ~/.anton/.env (fresh
+        # over stale), with local ".env" highest for dev overrides.
+        env_file=[str(Path.home() / ".anton" / ".env"), str(Path.home() / ".cowork" / ".env"), ".env"],
         env_file_encoding="utf-8",
         env_nested_delimiter="_",
         extra="ignore",
