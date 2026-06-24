@@ -24,7 +24,9 @@ from cowork.api.v1.router import api_router
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
 from cowork.models.project import Project
+from cowork.models.project_collaboration import ProjectCollaborator
 from cowork.services.projects import GENERAL_PROJECT_ID
+from cowork.services.request_identity import RequestPrincipal
 
 
 @pytest.fixture()
@@ -165,6 +167,78 @@ def test_reorder_endpoint_assigns_sort_order(client: TestClient):
     # three reordered projects appear in c, a, b order relative to each other.
     positions = {p["id"]: i for i, p in enumerate(listed)}
     assert positions[c["id"]] < positions[a["id"]] < positions[b["id"]]
+
+
+def test_owned_project_reorder_requires_owner_identity(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Reorder gates each owned project on the ``manage`` capability.
+
+    Mirrors ``test_owned_project_update_and_delete_require_owner_identity`` in
+    test_project_collaboration.py: once a project has an owner collaborator the
+    reorder write path requires an authenticated owner (anonymous -> 401,
+    non-owner -> 403, owner -> 200).
+    """
+    project_path = tmp_path / "owned-reorder"
+    project_path.mkdir()
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as session:
+        project = Project(name="owned-reorder", path=str(project_path), is_active=False)
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        project_id = project.id
+        session.add(ProjectCollaborator(project_id=project_id, email="owner@example.com", role="owner"))
+        session.add(ProjectCollaborator(project_id=project_id, email="reviewer@example.com", role="reviewer"))
+        session.commit()
+
+    def fake_principal(authorization: str | None):
+        if not authorization:
+            return None
+        token = authorization.removeprefix("Bearer ").strip()
+        if token == "owner":
+            return RequestPrincipal("owner", "owner@example.com", "Owner", "test", {})
+        if token == "reviewer":
+            return RequestPrincipal("reviewer", "reviewer@example.com", "Reviewer", "test", {})
+        return None
+
+    monkeypatch.setattr(
+        "cowork.api.v1.endpoints.projects.principal_from_authorization_header",
+        fake_principal,
+    )
+
+    try:
+        body = {"projectIds": [str(project_id)]}
+
+        anonymous = client.post("/api/v1/projects/reorder", json=body)
+        assert anonymous.status_code == 401, anonymous.text
+
+        reviewer = client.post(
+            "/api/v1/projects/reorder",
+            headers={"Authorization": "Bearer reviewer"},
+            json=body,
+        )
+        assert reviewer.status_code == 403, reviewer.text
+
+        owner = client.post(
+            "/api/v1/projects/reorder",
+            headers={"Authorization": "Bearer owner"},
+            json=body,
+        )
+        assert owner.status_code == 200, owner.text
+        owned = next(p for p in owner.json() if p["id"] == str(project_id))
+        assert owned["sort_order"] == 0
+    finally:
+        # Drop the seeded collaborator rows so they do not leak into the
+        # autouse cleanup (which only resets General and removes projects).
+        with Session(engine) as session:
+            for row in session.exec(
+                select(ProjectCollaborator).where(ProjectCollaborator.project_id == project_id)
+            ).all():
+                session.delete(row)
+            session.commit()
 
 
 def test_migration_backward_compatible_with_pre_metadata_schema(monkeypatch):
