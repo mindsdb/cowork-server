@@ -243,6 +243,16 @@ class UserSettings(Settings):
         title="Providers",
         description="JSON-encoded list of configured provider entries for the settings UI.",
     )
+    provider_status: str = Field(
+        default="{}",
+        title="Provider Status",
+        description="JSON-encoded map of provider type → last connectivity-test status (ok|fail). Persisted so the Settings dots survive a reload.",
+    )
+    provider_status_details: str = Field(
+        default="{}",
+        title="Provider Status Details",
+        description="JSON-encoded map of provider type → last connectivity-test detail (e.g. an HTTP code).",
+    )
 
     @field_validator("harness")
     @classmethod
