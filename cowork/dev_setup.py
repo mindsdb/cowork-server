@@ -67,10 +67,12 @@ def run_dev_setup() -> None:
     ensure_all_layouts()
 
     # Migrate DB-backed skills to agentskills.io files (one-time, idempotent).
-    from cowork.migrations import migrate_skills_to_files
+    from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
 
     with SQLSession(engine) as session:
         migrate_skills_to_files(session)
+        # Seed packaged builtin skills (versioned, idempotent).
+        seed_builtin_skills(session)
 
     _link_hermes_skills_dir()
 
