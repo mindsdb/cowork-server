@@ -162,7 +162,9 @@ def update_project(project_id: UUID, body: ProjectUpdateRequest, session: Sessio
 
 
 @router.post("/reorder")
-def reorder_projects(body: ProjectReorderRequest, session: SessionDep):
+def reorder_projects(body: ProjectReorderRequest, session: SessionDep, principal: PrincipalDep):
+    for project_id in body.project_ids:
+        _require_project_capability_if_owned(session, project_id, principal, "manage")
     return ProjectService(session).reorder_projects(body.project_ids)
 
 
