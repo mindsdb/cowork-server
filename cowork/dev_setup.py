@@ -43,7 +43,6 @@ def run_dev_setup() -> None:
                     id=GENERAL_PROJECT_ID,
                     name=GENERAL_PROJECT,
                     path=str(general_path),
-                    is_active=True,
                 )
             )
             session.commit()

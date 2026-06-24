@@ -14,7 +14,6 @@ class Project(BaseSQLModel, table=True):
         description="Path to the project directory on the server",
         max_length=1024,
     )
-    is_active: bool = Field(default=True, description="Whether the project is active")
 
     # ── Organization metadata (server-side, follows the user across devices) ──
     pinned: bool = Field(
@@ -32,6 +31,11 @@ class Project(BaseSQLModel, table=True):
     last_selected_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
-        description="The last time this project was selected/opened by the user.",
+        description=(
+            "The last time this project was selected/opened by the user. This is "
+            "the single server-side notion of the 'active' project: interactive "
+            "requests carry an explicit project, so the server only consults this "
+            "as the fallback for headless/scheduled runs that omit one."
+        ),
     )
 

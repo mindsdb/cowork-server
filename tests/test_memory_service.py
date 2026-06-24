@@ -37,7 +37,7 @@ def session(engine):
 def project(tmp_path, session):
     project_dir = tmp_path / "my-project"
     project_dir.mkdir()
-    project = Project(name="My Project", path=str(project_dir), is_active=True)
+    project = Project(name="My Project", path=str(project_dir))
     session.add(project)
     session.commit()
     session.refresh(project)
@@ -190,11 +190,11 @@ def test_put_project_profile_returns_400(client, session, project, memory_settin
 async def test_list_memory_filters_by_project_id(session, tmp_path, memory_settings):
     project_dir = tmp_path / "filtered-project"
     project_dir.mkdir()
-    project = Project(name="Filtered", path=str(project_dir), is_active=True)
+    project = Project(name="Filtered", path=str(project_dir))
     session.add(project)
     other_dir = tmp_path / "other-project"
     other_dir.mkdir()
-    other = Project(name="Other", path=str(other_dir), is_active=True)
+    other = Project(name="Other", path=str(other_dir))
     session.add(other)
     session.commit()
     session.refresh(project)

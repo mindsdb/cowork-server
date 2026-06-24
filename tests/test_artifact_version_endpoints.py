@@ -119,7 +119,7 @@ def _make_owned_project(tmp_path: Path, *, roles: dict[str, str]) -> tuple[UUID,
     path = tmp_path / name
     path.mkdir(parents=True)
     with Session(engine) as session:
-        project = Project(name=name, path=str(path), is_active=True)
+        project = Project(name=name, path=str(path))
         session.add(project)
         session.commit()
         session.refresh(project)
@@ -1666,7 +1666,7 @@ def test_checkpoint_body_path_can_create_artifact_metadata(client: TestClient, t
     project_path.mkdir(parents=True)
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:
-        project = Project(name=f"path-created-project-{uuid4().hex}", path=str(project_path), is_active=True)
+        project = Project(name=f"path-created-project-{uuid4().hex}", path=str(project_path))
         session.add(project)
         session.commit()
     folder = project_path / ".anton" / "artifacts" / "path-created"
@@ -3434,7 +3434,7 @@ def test_artifact_handoff_uses_target_project_name(
     target_path.mkdir()
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:
-        target = Project(name=f"named-target-{uuid4().hex}", path=str(target_path), is_active=False)
+        target = Project(name=f"named-target-{uuid4().hex}", path=str(target_path))
         session.add(target)
         session.commit()
         session.refresh(target)
@@ -3489,7 +3489,7 @@ def test_artifact_handoff_requires_edit_access_to_target_project(
     target_path.mkdir()
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:
-        target = Project(name=f"version-test-target-{uuid4().hex[:8]}", path=str(target_path), is_active=False)
+        target = Project(name=f"version-test-target-{uuid4().hex[:8]}", path=str(target_path))
         session.add(target)
         session.commit()
         session.refresh(target)
@@ -3533,7 +3533,7 @@ def test_pathless_duplicate_slug_identifier_is_rejected_for_restore(
         for index in range(2):
             project_path = tmp_path / f"project-{index}"
             project_path.mkdir(parents=True)
-            project = Project(name=f"duplicate-slug-project-{uuid4().hex}", path=str(project_path), is_active=True)
+            project = Project(name=f"duplicate-slug-project-{uuid4().hex}", path=str(project_path))
             session.add(project)
             session.commit()
             session.refresh(project)
