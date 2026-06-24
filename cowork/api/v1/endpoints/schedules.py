@@ -37,6 +37,7 @@ def create_schedule(body: ScheduleCreateRequest, session: SessionDep):
         timezone=body.timezone,
         project_id=body.project_id,
         enabled=body.enabled,
+        missed_run_policy=body.missed_run_policy,
     )
     return ScheduleResponse.serialize(schedule)
 
@@ -96,9 +97,14 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: B
     # *before* the background task starts. This closes the race where
     # the client sees the new conversation, polls /in-flight-list,
     # doesn't find it yet, and injects a "got interrupted" prompt.
-    from cowork.api.v1.endpoints.responses import mark_stream_active
     from cowork.scheduler import execute_schedule
     from cowork.services.conversations import ConversationService
+
+    try:
+        from cowork.api.v1.endpoints.responses import mark_stream_active
+    except ImportError:  # best-effort hint; streaming registry self-tracks
+        def mark_stream_active(_conversation_id: str) -> None:
+            pass
 
     conversation = ConversationService(session).create_conversation(
         topic=schedule.title,

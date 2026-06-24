@@ -36,6 +36,7 @@ class ScheduleService:
         timezone: str = "UTC",
         project_id: UUID | None = None,
         enabled: bool = True,
+        missed_run_policy: str = "skip",
     ) -> Schedule:
         schedule = Schedule(
             title=title,
@@ -46,6 +47,7 @@ class ScheduleService:
             timezone=timezone,
             project_id=project_id or GENERAL_PROJECT_ID,
             enabled=enabled,
+            missed_run_policy=missed_run_policy,
         )
         self.session.add(schedule)
         self.session.commit()
@@ -77,6 +79,7 @@ class ScheduleService:
     def pause_schedule(self, schedule_id: UUID) -> Schedule:
         schedule = self.get_schedule(schedule_id)
         schedule.enabled = False
+        schedule.health = "paused"
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
@@ -85,6 +88,11 @@ class ScheduleService:
     def resume_schedule(self, schedule_id: UUID) -> Schedule:
         schedule = self.get_schedule(schedule_id)
         schedule.enabled = True
+        # Give an auto-paused (or manually paused) task a clean slate so a
+        # stale failure streak doesn't immediately re-pause it.
+        schedule.consecutive_failures = 0
+        schedule.last_error = None
+        schedule.health = "ok"
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
@@ -95,12 +103,30 @@ class ScheduleRunService:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def create_run(self, schedule_id: UUID, is_manual: bool = False) -> ScheduleRun:
+    def run_exists(self, schedule_id: UUID, idempotency_key: str) -> bool:
+        """True if a run already satisfies this occurrence (idempotency guard)."""
+        return (
+            self.session.exec(
+                select(ScheduleRun).where(
+                    ScheduleRun.schedule_id == schedule_id,
+                    ScheduleRun.idempotency_key == idempotency_key,
+                )
+            ).first()
+            is not None
+        )
+
+    def create_run(
+        self,
+        schedule_id: UUID,
+        is_manual: bool = False,
+        idempotency_key: str | None = None,
+    ) -> ScheduleRun:
         run = ScheduleRun(
             schedule_id=schedule_id,
             started_at=datetime.now(timezone.utc),
             status=RunStatus.running,
             is_manual=is_manual,
+            idempotency_key=idempotency_key,
         )
         self.session.add(run)
         self.session.commit()
@@ -112,6 +138,7 @@ class ScheduleRunService:
         run_id: UUID,
         conversation_id: UUID | None = None,
         error: str | None = None,
+        attempts: int = 1,
     ) -> ScheduleRun:
         run = self.session.get(ScheduleRun, run_id)
         if run is None:
@@ -122,6 +149,7 @@ class ScheduleRunService:
         run.duration_ms = int((now - started_at).total_seconds() * 1000)
         run.status = RunStatus.failed if error else RunStatus.success
         run.error = error
+        run.attempts = attempts
         run.conversation_id = conversation_id
         self.session.add(run)
         self.session.commit()
