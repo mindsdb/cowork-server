@@ -200,7 +200,7 @@ async def recommended_models(session: SessionDep):
 
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
 
-_ENV_PATH = Path.home() / ".anton" / ".env"
+_ENV_PATH = Path.home() / ".cowork" / ".env"
 
 
 def _parse_dotenv_content(content: str) -> dict[str, str]:
@@ -231,7 +231,7 @@ class _RawSettingsBody(BaseModel):
 
 @router.post("/raw")
 def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
-    """Merge dotenv content into ~/.anton/.env and sync recognised keys to the DB.
+    """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
     Uses key-level merge (not full overwrite) because callers like the
     OAuth token refresh only send a subset of keys — a full overwrite
