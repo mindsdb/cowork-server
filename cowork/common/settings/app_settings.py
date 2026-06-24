@@ -116,6 +116,11 @@ class FileSettings(Settings):
         validation_alias=AliasChoices("COWORK_FILES_DIR", "FILES_ROOT_DIR"),
         description="Root directory where uploaded files are stored",
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
+    max_upload_bytes: int = Field(
+        default=25 * 1024 * 1024,
+        validation_alias=AliasChoices("COWORK_MAX_UPLOAD_BYTES", "FILE_MAX_UPLOAD_BYTES"),
+        description="Hard cap on a single uploaded file, in bytes (default 25 MiB)",
+    )  # FILE_MAX_UPLOAD_BYTES or COWORK_MAX_UPLOAD_BYTES
 
 
 class ConnectorSettings(Settings):
