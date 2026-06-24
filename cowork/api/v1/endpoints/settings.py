@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -189,6 +190,32 @@ async def recommended_models(session: SessionDep):
         )
         if live:
             recommended["minds-cloud"] = live
+        model_efforts.update(live_efforts)
+
+    # Overlay a configured custom OpenAI-compatible endpoint the same way as
+    # minds-cloud. The provider card's own baseUrl is authoritative — the
+    # shared openai_base_url setting is also reused by gemini/openai — so read
+    # it from providers_json. fetch_minds_models is just an OpenAI-compatible
+    # /models fetch and returns None on failure, leaving the bucket empty so
+    # the picker falls back to a free-text model input.
+    try:
+        provider_cards = json.loads(s.providers_json or "[]")
+    except (ValueError, TypeError):
+        provider_cards = []
+    oc_card = next(
+        (
+            c for c in provider_cards
+            if isinstance(c, dict)
+            and c.get("type") in ("openai-compatible", "openai_compatible")
+            and (c.get("baseUrl") or "").strip()
+        ),
+        None,
+    )
+    if oc_card:
+        oc_key = s.openai_api_key.get_secret_value() if s.openai_api_key else ""
+        live, live_efforts = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
+        if live:
+            recommended["openai-compatible"] = live
         model_efforts.update(live_efforts)
 
     return {
