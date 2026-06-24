@@ -183,3 +183,101 @@ def test_load_missing_connection_returns_none(tmp_path: Path):
 
 def test_build_vault_returns_encrypted_vault(tmp_path: Path):
     assert isinstance(build_vault(tmp_path), EncryptedDataVault)
+
+
+# ── test-result metadata (slice 2) ──────────────────────────────────────────
+
+def test_record_test_result_stamps_plaintext_metadata(tmp_path: Path):
+    vault = build_vault(tmp_path)
+    vault.save("postgres", "prod", {"password": "pw"})
+
+    stamped = vault.record_test_result("postgres", "prod", result="pass")
+    assert stamped is True
+
+    record = vault.read_record("postgres", "prod")
+    assert record["last_test_result"] == "pass"
+    assert record["last_tested_at"]  # ISO timestamp set
+    # A pass clears any error string.
+    assert record["last_test_error"] == ""
+    # Metadata is plaintext on disk; the password stays encrypted.
+    raw = json.loads(_record_file(tmp_path).read_text(encoding="utf-8"))
+    assert raw["last_test_result"] == "pass"
+    assert raw["fields"]["password"].startswith(_ENC_PREFIX)
+
+
+def test_record_test_result_retains_error_on_failure(tmp_path: Path):
+    vault = build_vault(tmp_path)
+    vault.save("postgres", "prod", {"password": "pw"})
+    vault.record_test_result("postgres", "prod", result="fail", error="auth denied")
+
+    record = vault.read_record("postgres", "prod")
+    assert record["last_test_result"] == "fail"
+    assert record["last_test_error"] == "auth denied"
+
+
+def test_record_test_result_missing_connection_returns_false(tmp_path: Path):
+    assert build_vault(tmp_path).record_test_result("nope", "x", result="pass") is False
+
+
+def test_test_metadata_survives_credential_resave(tmp_path: Path):
+    """A credential re-save (e.g. an OAuth token refresh) must not wipe the
+    stamped test metadata — the base LocalDataVault.save only writes a fixed
+    top-level key set, so the subclass has to carry it forward."""
+    vault = build_vault(tmp_path)
+    vault.save("google_drive", "me@example.com", {"access_token": "v1"})
+    vault.record_test_result("google_drive", "me@example.com", result="pass")
+
+    # Re-save credentials (simulates a token refresh).
+    vault.save("google_drive", "me@example.com", {"access_token": "v2"})
+
+    record = vault.read_record("google_drive", "me@example.com")
+    assert record["fields"]["access_token"] == "v2"      # creds updated
+    assert record["last_test_result"] == "pass"          # metadata preserved
+    assert record["last_tested_at"]
+
+
+def test_legacy_migration_does_not_recurse(tmp_path: Path):
+    """Regression: migrating a legacy plaintext record must re-save EXACTLY
+    once. The migration re-saves via ``self.save`` → base ``save`` → which
+    re-reads through ``self._read_raw`` (for created_at) on the not-yet-written
+    file; without the re-entrancy guard that nested read re-triggers migration
+    and recurses ~250 deep (RecursionError under a real request stack)."""
+    legacy = {
+        "engine": "pg", "name": "p",
+        "created_at": "2025-01-01T00:00:00+00:00",
+        "updated_at": "2025-01-01T00:00:00+00:00",
+        "fields": {"host": "h", "password": "pw"},
+        "secure_keys": ["password"],
+    }
+    (tmp_path / "pg-p").write_text(json.dumps(legacy), encoding="utf-8")
+
+    vault = build_vault(tmp_path)
+    calls = {"n": 0}
+    orig_save = type(vault).save
+
+    def counting_save(self, *a, **k):
+        calls["n"] += 1
+        return orig_save(self, *a, **k)
+
+    # Patch the instance's class method just for this read.
+    import types
+    vault.save = types.MethodType(counting_save, vault)
+
+    assert vault.load("pg", "p") == {"host": "h", "password": "pw"}
+    assert calls["n"] == 1, f"migration recursed: {calls['n']} save calls"
+    # Migration still completed: encrypted on disk, secure_keys preserved.
+    on_disk = json.loads((tmp_path / "pg-p").read_text(encoding="utf-8"))
+    assert on_disk["fields"]["password"].startswith(_ENC_PREFIX)
+    assert on_disk["secure_keys"] == ["password"]
+
+
+def test_test_metadata_does_not_leak_into_load_fields(tmp_path: Path):
+    """The stamped metadata lives at the top level, never inside ``fields`` —
+    so it never pollutes the credential dict the agent/probe consumes."""
+    vault = build_vault(tmp_path)
+    vault.save("postgres", "prod", {"password": "pw"})
+    vault.record_test_result("postgres", "prod", result="fail", error="boom")
+
+    fields = vault.load("postgres", "prod")
+    assert fields == {"password": "pw"}
+    assert "last_test_result" not in fields

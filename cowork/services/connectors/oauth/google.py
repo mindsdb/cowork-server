@@ -355,6 +355,75 @@ class GoogleOAuthService:
             except Exception as exc:
                 _log.warning("Could not refresh token for %s/%s: %s", engine, name, exc)
 
+    def refresh_one(self, engine: str, name: str, oauth_settings: OAuthSettings) -> bool:
+        """Force a token refresh for a single OAuth connection now.
+
+        The reconnect entry point's non-interactive fast path: if the
+        connection still holds a valid refresh token we can mint a fresh
+        access token without bouncing the user through the browser. Returns
+        True on a successful refresh, False otherwise (no refresh token, not an
+        OAuth/Google connection, credentials unconfigured, or the exchange
+        failed — in which case the caller should fall back to full re-auth).
+
+        Factored out of :meth:`refresh_all_tokens` (which sweeps every
+        connection on a timer); this targets one and ignores the expiry
+        threshold so it always attempts the refresh.
+        """
+        if engine not in _ENGINE_TO_SERVICE or not name:
+            return False
+        try:
+            vault = build_vault(Path(ConnectorSettings().vault_dir))
+            record = vault.read_record(engine, name) if hasattr(vault, "read_record") else None
+            fields = (record or {}).get("fields") if record else vault.load(engine, name)
+            fields = fields or {}
+        except Exception:
+            return False
+        if fields.get("auth_type") != "oauth":
+            return False
+        refresh_token = str(fields.get("refresh_token") or "").strip()
+        if not refresh_token:
+            return False
+        # Preserve the record's existing secret classification across the
+        # re-save, so a refresh never downgrades a field that was marked
+        # secret back to plaintext in the detail response.
+        prior_secure_keys = (record or {}).get("secure_keys") if record else None
+
+        service_id = _ENGINE_TO_SERVICE[engine]
+        try:
+            cid, csecret = self._resolve_credentials(service_id, oauth_settings)
+        except HTTPException:
+            return False
+
+        try:
+            token_data = _json_request(
+                _GOOGLE_TOKEN_ENDPOINT,
+                method="POST",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": cid,
+                    "client_secret": csecret,
+                },
+            )
+            new_access_token = str(token_data.get("access_token", "")).strip()
+            if not new_access_token:
+                return False
+            expires_in = int(token_data.get("expires_in", 0) or 0)
+            new_expires_at = (
+                (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+                if expires_in else ""
+            )
+            updated = {**fields, "access_token": new_access_token, "expires_at": new_expires_at}
+            new_refresh = str(token_data.get("refresh_token", "")).strip()
+            if new_refresh:
+                updated["refresh_token"] = new_refresh
+            vault.save(engine, name, updated, secure_keys=prior_secure_keys)
+            _log.info("Refreshed token on reconnect for %s/%s", engine, name)
+            return True
+        except Exception as exc:
+            _log.warning("Reconnect refresh failed for %s/%s: %s", engine, name, exc)
+            return False
+
     def get_catalogue(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> list[dict]:
         try:
             vault = build_vault(Path(connector_settings.vault_dir))
