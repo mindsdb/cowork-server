@@ -111,16 +111,22 @@ def install_status():
 
 @router.get("/reveal-key/{name}")
 def reveal_key(name: str, session: SessionDep):
-    field_map = {
-        "anthropic": "anthropic_api_key",
-        "openai": "openai_api_key",
-        "minds": "minds_api_key",
+    from cowork.common.settings.user_settings import Provider, provider_api_key
+
+    name_map = {
+        "anthropic": Provider.ANTHROPIC,
+        "openai": Provider.OPENAI,
+        "gemini": Provider.GEMINI,
+        "openai-compatible": Provider.OPENAI_COMPATIBLE,
+        "minds": Provider.MINDS_CLOUD,
+        "minds-cloud": Provider.MINDS_CLOUD,
     }
-    field = field_map.get(name.lower())
-    if field is None:
+    provider = name_map.get(name.lower())
+    if provider is None:
         raise HTTPException(status_code=404, detail="Unknown key name")
     s = SettingService(session).load()
-    val = getattr(s, field)
+    # provider_api_key applies the gemini/openai-compatible → openai fallback.
+    val = provider_api_key(s, provider)
     return {"value": val.get_secret_value() if isinstance(val, SecretStr) else ""}
 
 
