@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 from pydantic import SecretStr
 
-from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
+from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS, PLANNING_MODEL_DEFAULTS
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
@@ -360,15 +360,29 @@ def build_llm_client():
             raise ValueError(f"{role.value} API key is not configured")
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
+    # Resolve the provider that actually has credentials — falls back when the
+    # selected one is unconfigured, so a keyed provider drives the agent at boot
+    # instead of erroring on the unconfigured default. When a role falls back,
+    # its persisted model/effort belong to the *previous* provider, so swap in
+    # the resolved provider's default model and drop the effort.
+    planning = settings.effective_planning_provider
+    coding = settings.effective_coding_provider
+    planning_model = (
+        settings.planning_model if planning == settings.planning_provider
+        else PLANNING_MODEL_DEFAULTS.get(planning.value)
+    )
+    coding_model = (
+        settings.coding_model if coding == settings.coding_provider
+        else CODING_MODEL_DEFAULTS.get(coding.value)
+    )
+    planning_effort = settings.planning_reasoning_effort if planning == settings.planning_provider else None
+    coding_effort = settings.coding_reasoning_effort if coding == settings.coding_provider else None
+
     return LLMClient(
-        planning_provider=_make_provider(
-            settings.planning_provider, settings.planning_reasoning_effort
-        ),
-        planning_model=settings.planning_model,
-        coding_provider=_make_provider(
-            settings.coding_provider, settings.coding_reasoning_effort
-        ),
-        coding_model=settings.coding_model,
+        planning_provider=_make_provider(planning, planning_effort),
+        planning_model=planning_model,
+        coding_provider=_make_provider(coding, coding_effort),
+        coding_model=coding_model,
     )
 
 
