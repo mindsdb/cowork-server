@@ -1,9 +1,14 @@
 """One-time .env -> DB settings migration.
 
 On first boot (or after an upgrade from .env-only to DB-backed settings),
-this module reads ``~/.anton/.env`` and seeds any missing settings into the
-SQLite database.  A sentinel row (``_env_migrated``) is written to the
+this module reads ``~/.cowork/.env`` and seeds any missing settings into the
+SQLite database.  A sentinel row (``_env_migrated_v2``) is written to the
 ``settings`` table so the migration never runs twice.
+
+The v2 sentinel replaced the original ``_env_migrated`` sentinel (which read
+from the now-legacy ``~/.anton/.env`` path).  Bumping to v2 lets users who
+had the old sentinel fire against the wrong path get a fresh migration run
+from the correct ``~/.cowork/.env`` location.
 
 After migration the DB is **authoritative** for all overlapping fields.
 The ``.env`` file continues to exist for:
@@ -28,9 +33,11 @@ from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 
-_ENV_PATH = Path.home() / ".anton" / ".env"
+_ENV_PATH = Path.home() / ".cowork" / ".env"
 
-_MIGRATION_SENTINEL = "_env_migrated"
+# v2: path corrected from ~/.anton/.env to ~/.cowork/.env; bumped so users
+# with the old sentinel (which may have found nothing) get a fresh run.
+_MIGRATION_SENTINEL = "_env_migrated_v2"
 
 # Complete map of .env keys -> DB setting keys for all fields that
 # overlap between AntonSettings (.env) and UserSettings (DB).
@@ -58,7 +65,7 @@ _ENV_TO_SETTING: dict[str, str] = {
 
 
 def _parse_env_file() -> dict[str, str]:
-    """Read ``~/.anton/.env`` into a dict, or return empty if absent."""
+    """Read ``~/.cowork/.env`` into a dict, or return empty if absent."""
     if not _ENV_PATH.exists():
         return {}
     result: dict[str, str] = {}

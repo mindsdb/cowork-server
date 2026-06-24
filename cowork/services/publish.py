@@ -37,7 +37,9 @@ def _cowork_state_dir() -> Path:
     if base:
         path = Path(base).expanduser()
     else:
-        path = Path.home() / ".anton" / "cowork"
+        # Consolidated under ~/.cowork (was ~/.anton/cowork); the desktop app
+        # migrates the existing state.json on first run.
+        path = Path.home() / ".cowork"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
