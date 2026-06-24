@@ -135,10 +135,15 @@ class EncryptedDataVault(LocalDataVault):
             # becomes ciphertext. ``save`` preserves ``created_at`` and the
             # ``secure_keys`` list, so the migration is transparent.
             try:
+                # Re-save the *full* decrypted dict. ``save`` encrypts strings
+                # and passes non-strings (int ``port``, bool flags, nested dicts)
+                # through untouched, so migration is behavior-preserving.
+                # Filtering to strings here would silently drop those fields from
+                # disk on the first read — permanent credential corruption.
                 self.save(
                     record.get("engine", ""),
                     record.get("name", ""),
-                    {k: v for k, v in decrypted.items() if isinstance(v, str)},
+                    decrypted,
                     secure_keys=record.get("secure_keys"),
                 )
             except Exception:
