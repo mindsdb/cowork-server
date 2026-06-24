@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlmodel import Session
 
@@ -87,14 +87,28 @@ def list_attachments(
 
 @attachments_router.post("/{project_name}/{session_id}/upload")
 async def upload_attachment(
+    request: Request,
     project_name: str,
     session_id: str,
     session: _SessionDep,
     files: list[UploadFile] = File(...),
 ):
-    from cowork.services.files import FileService, FileValidationError
+    from cowork.services.files import (
+        FileService,
+        FileValidationError,
+        UploadTooLarge,
+        reject_if_content_length_over_cap,
+    )
     svc = FileService(session)
     purpose = _attachment_purpose(project_name, session_id)
+    # Cheap up-front reject for an obviously oversized request body, before we
+    # consume the stream. Per-file caps are still enforced mid-stream below.
+    try:
+        reject_if_content_length_over_cap(request.headers.get("content-length"))
+    except UploadTooLarge as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)
+        ) from exc
     results = []
     for f in files:
         try:
@@ -103,7 +117,9 @@ async def upload_attachment(
         except FileValidationError as exc:
             # Guardrail rejection (too large / disallowed type): a client
             # error with a human-readable reason. Must surface as a 4xx —
-            # the broad handler below would otherwise bury it in a 500.
+            # the broad handler below would otherwise bury it in a 500. (A
+            # mid-stream cap breach lands here as a 400; the up-front
+            # Content-Length breach above is the 413.)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
             ) from exc

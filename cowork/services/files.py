@@ -11,6 +11,12 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 
+# How much we pull off the upload stream per read. Bytes land on disk as we
+# go, so peak memory is roughly one chunk — not the whole file. (Starlette's
+# UploadFile is itself a SpooledTemporaryFile that spills to disk past ~1 MiB,
+# so even its internal buffer isn't unbounded RAM.)
+_STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB
+
 
 def attachment_purpose(project_name: str, session_id: str) -> str:
     """Canonical purpose tag for conversation attachments. The composer
@@ -83,21 +89,17 @@ def _humanize_bytes(num: int) -> str:
     return f"{num} bytes"  # unreachable; keeps type checkers happy
 
 
-def validate_upload(filename: str, content_type: str | None, size: int) -> None:
-    """Guardrail an upload before it touches disk. Raises
-    FileValidationError with a user-facing message if the file is over the
-    configured size cap or is a type the agent can't use. Both the
-    OpenAI-style /files endpoint and the attachments compat endpoint route
-    through here (via create_file), so the rules are enforced once."""
+def _label_for(filename: str) -> str:
     name = (filename or "").strip()
-    label = name or "this file"
+    return name or "this file"
 
-    max_bytes = get_app_settings().file.max_upload_bytes
-    if size > max_bytes:
-        raise FileValidationError(
-            f"{label} is {_humanize_bytes(size)} — max is {_humanize_bytes(max_bytes)}."
-        )
 
+def validate_upload_type(filename: str, content_type: str | None) -> None:
+    """Type half of the guardrail: reject anything off the MIME/extension
+    allow-list. Split out so it can run BEFORE we read a single byte off the
+    wire — a disallowed type never gets streamed to disk. Accepts if EITHER
+    the declared MIME or the extension is on the list."""
+    name = (filename or "").strip()
     mime = (content_type or "").split(";", 1)[0].strip().lower()
     ext = Path(name).suffix.lower()
     if mime in ALLOWED_MIME_TYPES or ext in ALLOWED_EXTENSIONS:
@@ -105,8 +107,93 @@ def validate_upload(filename: str, content_type: str | None, size: int) -> None:
 
     shown = ext or (mime or "unknown")
     raise FileValidationError(
-        f"{label} ({shown}) isn't a supported type. Allowed: {_ALLOWED_SUMMARY}."
+        f"{_label_for(filename)} ({shown}) isn't a supported type. "
+        f"Allowed: {_ALLOWED_SUMMARY}."
     )
+
+
+def _raise_oversize(
+    filename: str, size: int, max_bytes: int, *, at_least: bool = False
+) -> None:
+    # When streaming we stop reading the instant we cross the cap, so `size`
+    # is a floor, not the true length — say "over" rather than quote a number
+    # we deliberately never finished measuring.
+    measure = f"over {_humanize_bytes(max_bytes)}" if at_least else _humanize_bytes(size)
+    raise FileValidationError(
+        f"{_label_for(filename)} is {measure} — max is {_humanize_bytes(max_bytes)}."
+    )
+
+
+def validate_upload(filename: str, content_type: str | None, size: int) -> None:
+    """Guardrail an upload whose size is already known. Raises
+    FileValidationError with a user-facing message if the file is over the
+    configured size cap or is a type the agent can't use. The streaming
+    ingest path enforces the same two rules incrementally (type up front,
+    size mid-stream); this stays for callers that have the bytes in hand and
+    for direct unit coverage of the rules."""
+    max_bytes = get_app_settings().file.max_upload_bytes
+    if size > max_bytes:
+        _raise_oversize(filename, size, max_bytes)
+    validate_upload_type(filename, content_type)
+
+
+class UploadTooLarge(FileValidationError):
+    """Cap breach detected up front from the declared Content-Length, before
+    the body is read. Endpoints map this to 413 Payload Too Large (the size
+    is known with certainty from the header); a breach only discovered
+    mid-stream stays a 400. Subclasses FileValidationError so existing
+    handlers still catch it."""
+
+
+async def stream_upload_to_path(upload: UploadFile, dest: Path) -> int:
+    """Copy ``upload`` to ``dest`` one chunk at a time, aborting the moment
+    the running total crosses the configured cap. Never buffers the whole
+    file — peak memory is ~one chunk. Returns the bytes written. On a cap
+    breach (or any error mid-write) the partial file is removed and
+    FileValidationError is raised. The caller owns ``dest``'s parent dir."""
+    max_bytes = get_app_settings().file.max_upload_bytes
+    filename = upload.filename or dest.name
+    written = 0
+    try:
+        with dest.open("wb") as out:
+            while True:
+                chunk = await upload.read(_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    # Stop reading immediately — we don't drain the rest of
+                    # the (possibly huge) stream just to measure it.
+                    _raise_oversize(filename, written, max_bytes, at_least=True)
+                out.write(chunk)
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+    return written
+
+
+def reject_if_content_length_over_cap(content_length: str | int | None) -> None:
+    """Cheap early-out: if the request declares a body larger than the cap
+    (plus a small allowance for the multipart envelope), reject before
+    consuming the stream at all. The declared length is an UPPER bound on the
+    file bytes — a multipart body is `file + boundaries/headers` — so we only
+    trip when it's over the cap *with* headroom, leaving the authoritative
+    decision to the mid-stream counter. A missing/garbage header is ignored
+    (chunked-transfer uploads have none); the stream check still backstops."""
+    if content_length is None:
+        return
+    try:
+        declared = int(content_length)
+    except (TypeError, ValueError):
+        return
+    max_bytes = get_app_settings().file.max_upload_bytes
+    # 1 MiB of slack swallows multipart boundaries/part headers for any
+    # realistic field count, so we never false-reject a file that's actually
+    # under the cap.
+    if declared > max_bytes + (1024 * 1024):
+        raise UploadTooLarge(
+            f"Upload is {_humanize_bytes(declared)} — max is {_humanize_bytes(max_bytes)}."
+        )
 
 
 class FileService:
@@ -159,19 +246,16 @@ class FileService:
         return self._to_response(file)
 
     async def create_file(self, upload: UploadFile, purpose: str) -> FileResponse:
-        contents = await upload.read()
         filename = upload.filename or "upload"
 
-        # Guardrail before anything touches disk. (Reading fully into memory
-        # first is a known limitation — the streaming/OOM fix is a separate
-        # slice; here we only enforce the cap + allow-list on the bytes we
-        # already have.)
-        validate_upload(filename, upload.content_type, len(contents))
+        # Type check first — a disallowed type is rejected before we pull a
+        # single byte off the wire (the bytes never touch disk or RAM).
+        validate_upload_type(filename, upload.content_type)
 
         file = File(
             filename=filename,
             content_type=upload.content_type or "application/octet-stream",
-            size=len(contents),
+            size=0,
             purpose=purpose,
             path="",
         )
@@ -179,7 +263,16 @@ class FileService:
         file_dir = self._root_dir() / str(file.id)
         file_dir.mkdir(parents=True)
         dest = file_dir / filename
-        dest.write_bytes(contents)
+        # Stream chunked to disk, enforcing the size cap mid-stream. On a cap
+        # breach (or any failure) the partial file + its dir are removed so we
+        # don't leave a truncated artifact behind, then a 4xx is raised.
+        try:
+            written = await stream_upload_to_path(upload, dest)
+        except BaseException:
+            shutil.rmtree(file_dir, ignore_errors=True)
+            raise
+
+        file.size = written
         file.path = str(dest)
         self.session.add(file)
         self.session.commit()
