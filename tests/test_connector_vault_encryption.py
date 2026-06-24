@@ -105,6 +105,54 @@ def test_legacy_plaintext_is_transparently_migrated_on_first_read(tmp_path: Path
     }
 
 
+def test_legacy_migration_preserves_non_string_fields(tmp_path: Path):
+    """Regression: migrating a legacy plaintext record must not drop non-string
+    fields (int ``port``, bool flags, nested dicts).
+
+    The old migration re-saved only ``str`` fields, so any non-string in a
+    legacy record was permanently dropped from disk on the first read —
+    silently corrupting real connector credentials. ``save`` already passes
+    non-strings through unencrypted, so the migration must re-save the full
+    decrypted dict.
+    """
+    # Legacy plaintext record with mixed value types, as the old vault wrote it.
+    legacy = {
+        "engine": "mysql",
+        "name": "mixed_db",
+        "created_at": "2025-01-01T00:00:00+00:00",
+        "updated_at": "2025-01-01T00:00:00+00:00",
+        "fields": {
+            "password": "pw",          # str -> encrypted
+            "port": 3306,              # int -> preserved as-is
+            "ssl": True,               # bool -> preserved as-is
+            "opts": {"x": 1},          # nested dict -> preserved as-is
+        },
+        "secure_keys": ["password"],
+    }
+    path = tmp_path / "mysql-mixed_db"
+    path.write_text(json.dumps(legacy, indent=2), encoding="utf-8")
+
+    vault = build_vault(tmp_path)
+    expected = {"password": "pw", "port": 3306, "ssl": True, "opts": {"x": 1}}
+
+    # (a) First read returns ALL fields intact, including the non-strings.
+    assert vault.load("mysql", "mixed_db") == expected
+
+    # (b) The on-disk file after migration still contains every field —
+    #     port/ssl/opts are not dropped.
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+    assert set(migrated["fields"]) == {"password", "port", "ssl", "opts"}
+    # (d) Strings are encrypted on disk; non-strings preserved verbatim.
+    assert migrated["fields"]["password"].startswith(_ENC_PREFIX)
+    assert "pw" not in path.read_text(encoding="utf-8")
+    assert migrated["fields"]["port"] == 3306
+    assert migrated["fields"]["ssl"] is True
+    assert migrated["fields"]["opts"] == {"x": 1}
+
+    # (c) A second read from a fresh vault instance still returns all fields.
+    assert build_vault(tmp_path).load("mysql", "mixed_db") == expected
+
+
 def test_migrated_value_is_decryptable_by_a_fresh_vault_instance(tmp_path: Path):
     """Encryption is keyed by the shared master key, not per-instance state —
     a brand-new vault object reads what an earlier one wrote."""
