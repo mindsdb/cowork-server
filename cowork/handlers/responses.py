@@ -33,7 +33,7 @@ from cowork.handlers.turn_errors import (
 )
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
-from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
+from cowork.services.projects import ProjectService
 from cowork.services.skills import SkillService
 
 
@@ -401,6 +401,11 @@ class ResponsesHandler:
             )
 
     def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
+        # Single source of truth: an explicit project on the request (the
+        # client's canonical selection, sent on every interactive turn) wins.
+        # A request that carries none is a headless/scheduled run — fall back
+        # to the most-recently-selected project (resolve_fallback_project),
+        # never to a separate "active" flag that could disagree.
         if request.project_id is not None:
             return request.project_id
         if request.project:
@@ -408,7 +413,7 @@ class ResponsesHandler:
                 return ProjectService(self.session).get_project_by_name(request.project).id
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=f"Project not found: {request.project}") from exc
-        return GENERAL_PROJECT_ID
+        return ProjectService(self.session).resolve_fallback_project().id
 
     @staticmethod
     def _image_block(filepath: Path, media_type: str) -> dict:

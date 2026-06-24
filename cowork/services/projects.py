@@ -105,7 +105,7 @@ class ProjectService:
         path = self._project_path(final_name)
         path.mkdir(parents=True)
         # self._scaffold(path)
-        project = Project(name=final_name, path=str(path), is_active=False)
+        project = Project(name=final_name, path=str(path))
         self.session.add(project)
         self.session.commit()
         self.session.refresh(project)
@@ -115,7 +115,6 @@ class ProjectService:
         self,
         project_id: UUID,
         name: str | None = None,
-        is_active: bool | None = None,
     ) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
@@ -133,14 +132,6 @@ class ProjectService:
                     old_path.rename(new_path)
                 project.name = final_name
                 project.path = str(new_path)
-
-        if is_active is not None:
-            if is_active:
-                for other in self.session.exec(select(Project)).all():
-                    if other.id != project_id and other.is_active:
-                        other.is_active = False
-                        self.session.add(other)
-            project.is_active = is_active
 
         self.session.add(project)
         self.session.commit()
@@ -203,19 +194,41 @@ class ProjectService:
         path = Path(project.path)
         if path.exists():
             shutil.rmtree(path)
-        was_active = project.is_active
         self.session.delete(project)
         self.session.commit()
-        if was_active:
-            general = self.session.get(Project, GENERAL_PROJECT_ID)
-            if general is not None and not general.is_active:
-                general.is_active = True
-                self.session.add(general)
-                self.session.commit()
         return True
 
-    def get_active_project(self) -> Project:
-        project = self.session.exec(select(Project).where(Project.is_active)).first()
+    def touch_last_selected(self, project_id: UUID) -> Project:
+        """Record that ``project_id`` is the project the user most recently
+        selected. This is the single server-side signal for the "active"
+        project — used only as the fallback for headless/scheduled runs that
+        don't carry an explicit project (see ``resolve_fallback_project``)."""
+        project = self.session.get(Project, project_id)
         if project is None:
-            raise ValueError("No active project")
+            raise ValueError("Project not found")
+        project.last_selected_at = datetime.now(timezone.utc)
+        self.session.add(project)
+        self.session.commit()
+        self.session.refresh(project)
         return project
+
+    def resolve_fallback_project(self) -> Project:
+        """Resolve the project for a request that carries no explicit project.
+
+        Interactive requests always send an explicit project (the client's
+        ``selectedProject`` is canonical), so this is only hit by headless /
+        scheduled runs. It returns the most-recently-selected project, falling
+        back to General when nothing has been selected yet. This is the single
+        source of truth for the server-side fallback — there is no separate
+        ``is_active`` flag to disagree with it."""
+        project = self.session.exec(
+            select(Project)
+            .where(Project.last_selected_at.is_not(None))  # type: ignore[union-attr]
+            .order_by(Project.last_selected_at.desc())  # type: ignore[union-attr]
+        ).first()
+        if project is not None:
+            return project
+        general = self.session.get(Project, GENERAL_PROJECT_ID)
+        if general is None:
+            raise ValueError("No project available")
+        return general

@@ -134,27 +134,27 @@ def update_project(project_id: UUID, body: ProjectUpdateRequest, session: Sessio
     _require_project_capability_if_owned(session, project_id, principal, "manage")
     service = ProjectService(session)
     try:
-        # Name / active-state changes (filesystem rename, single-active rule).
-        if body.name is not None or body.is_active is not None:
-            project = service.update_project(
-                project_id, name=body.name, is_active=body.is_active
-            )
+        # Name changes (filesystem rename).
+        if body.name is not None:
+            project = service.update_project(project_id, name=body.name)
         else:
             project = service.get_project(project_id)
-        # Organization metadata (pin / order / archived). Touch last-selected
-        # whenever the project is activated so cross-device recency works.
+        # Organization metadata (pin / order / archived) plus selection. Selecting
+        # a project records last_selected_at — the single server-side "active"
+        # signal, used only as the headless/scheduled fallback. There is no
+        # separate is_active flag, so nothing can disagree with it.
         if (
             body.pinned is not None
             or body.sort_order is not None
             or body.archived is not None
-            or body.is_active
+            or body.last_selected
         ):
             project = service.update_project_metadata(
                 project_id,
                 pinned=body.pinned,
                 sort_order=body.sort_order,
                 archived=body.archived,
-                touch_last_selected=bool(body.is_active),
+                touch_last_selected=bool(body.last_selected),
             )
         return project
     except ValueError as e:

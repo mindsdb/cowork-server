@@ -72,7 +72,7 @@ def _create_project(client: TestClient, name: str) -> dict:
 
 
 def test_new_project_has_default_metadata(client: TestClient):
-    # Project endpoints return the raw ORM (snake_case), matching is_active.
+    # Project endpoints return the raw ORM (snake_case).
     project = _create_project(client, "meta-defaults")
     assert project["pinned"] is False
     assert project["sort_order"] == 0
@@ -116,12 +116,12 @@ def test_partial_metadata_update_does_not_clobber(client: TestClient):
     assert updated["archived"] is True
 
 
-def test_activating_project_touches_last_selected(client: TestClient):
+def test_selecting_project_touches_last_selected(client: TestClient):
     project = _create_project(client, "meta-active")
     project_id = project["id"]
     assert project["last_selected_at"] is None
 
-    resp = client.patch(f"/api/v1/projects/{project_id}", json={"isActive": True})
+    resp = client.patch(f"/api/v1/projects/{project_id}", json={"lastSelected": True})
     assert resp.status_code == 200, resp.text
     assert resp.json()["last_selected_at"] is not None
 
@@ -185,7 +185,7 @@ def test_owned_project_reorder_requires_owner_identity(
     project_path.mkdir()
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:
-        project = Project(name="owned-reorder", path=str(project_path), is_active=False)
+        project = Project(name="owned-reorder", path=str(project_path))
         session.add(project)
         session.commit()
         session.refresh(project)
@@ -321,6 +321,85 @@ def test_migration_backward_compatible_with_pre_metadata_schema(monkeypatch):
         command.downgrade(config, down_revision)
         post_columns = {c["name"] for c in sa.inspect(engine).get_columns("projects")}
         assert "pinned" not in post_columns
+
+        engine.dispose()
+    finally:
+        session_module._engines.clear()
+        session_module._session_factories.clear()
+        session_module._engines.update(saved_engines)
+        session_module._session_factories.update(saved_factories)
+
+
+def test_drop_is_active_migration_is_backward_compatible(monkeypatch):
+    """An existing DB that still has ``projects.is_active`` upgrades cleanly to
+    drop it (and the downgrade re-adds it). Builds the real schema at the
+    revision just before the drop on an isolated temp DB, seeds a row with the
+    column populated, then runs exactly the drop migration and asserts the
+    column is gone while the row (and its metadata) survives.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db import session as session_module
+    from cowork.db.migrations import _script_location
+
+    # The drop migration and the one immediately before it.
+    revision = "c5d9e1f3a7b6"
+    down_revision = "a3f7c9d1e2b4"
+
+    tmp = Path(tempfile.mkdtemp(prefix="cowork-migr-drop-test-"))
+    db_uri = f"sqlite:///{tmp / 'legacy.db'}"
+
+    settings = get_app_settings()
+    monkeypatch.setattr(settings.database, "uri", db_uri)
+    saved_engines = dict(session_module._engines)
+    saved_factories = dict(session_module._session_factories)
+    session_module._engines.clear()
+    session_module._session_factories.clear()
+
+    config = Config()
+    config.set_main_option("script_location", str(_script_location()))
+    config.set_main_option("sqlalchemy.url", db_uri)
+
+    try:
+        # Build the real schema as of the revision *before* the drop — is_active
+        # still exists here.
+        command.upgrade(config, down_revision)
+
+        engine = sa.create_engine(db_uri, connect_args={"check_same_thread": False})
+        pre_columns = {c["name"] for c in sa.inspect(engine).get_columns("projects")}
+        assert "is_active" in pre_columns  # baseline truly predates the drop
+
+        # Seed a project row with is_active populated (the old contract).
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO projects (id, name, path, is_active) "
+                    "VALUES (:id, :name, :path, 1)"
+                ).bindparams(id="e" * 32, name="legacy-active", path=str(tmp / "legacy"))
+            )
+
+        # Apply exactly the drop migration.
+        command.upgrade(config, revision)
+
+        columns = {c["name"] for c in sa.inspect(engine).get_columns("projects")}
+        assert "is_active" not in columns
+        # The row survives the drop; the unified metadata column is intact.
+        with engine.begin() as conn:
+            name, last_selected_at = conn.execute(
+                sa.text(
+                    "SELECT name, last_selected_at FROM projects "
+                    "WHERE name = 'legacy-active'"
+                )
+            ).one()
+        assert name == "legacy-active"
+        assert last_selected_at is None
+
+        # Downgrade re-adds the column (schema round-trips) with its default.
+        command.downgrade(config, down_revision)
+        post_columns = {c["name"] for c in sa.inspect(engine).get_columns("projects")}
+        assert "is_active" in post_columns
 
         engine.dispose()
     finally:

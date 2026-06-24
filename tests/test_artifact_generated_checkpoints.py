@@ -150,7 +150,7 @@ def test_hermes_snapshots_after_consumer_closes_early(tmp_path: Path, monkeypatc
     project_name = f"hermes-cancel-{uuid4().hex}"
 
     with Session(engine) as session:
-        project = Project(name=project_name, path=str(project_path), is_active=False)
+        project = Project(name=project_name, path=str(project_path))
         session.add(project)
         session.commit()
         session.refresh(project)

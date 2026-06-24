@@ -9,7 +9,11 @@ class ProjectCreateRequest(CamelRequest):
 
 class ProjectUpdateRequest(CamelRequest):
     name: str | None = None
-    is_active: bool | None = None
+    # Mark this project as the most-recently-selected one. The client's
+    # selection is canonical for interactive use; the server records it (via
+    # last_selected_at) only as the headless/scheduled-run fallback. Replaces
+    # the former dual ``is_active`` flag.
+    last_selected: bool | None = None
     # Organization metadata (server-side, follows the user across devices).
     pinned: bool | None = None
     sort_order: int | None = None
