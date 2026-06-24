@@ -121,14 +121,14 @@ async def format_responses_stream(
     seq = 0
     last_progress = 0.0
     collected_text: list[str] = []
-    # Per-turn token + USD cost totals, summed from every StreamComplete in the
-    # turn (a tool-use turn has several LLM rounds). anton prices each call
-    # additively on usage.cost_usd; we forward the running total on
-    # response.completed so the UI can show "$ this turn". Read-only telemetry —
-    # surfacing only, no enforcement.
+    # Per-turn token totals, summed from every StreamComplete in the turn
+    # (a tool-use turn has several LLM rounds). We forward tokens-consumed on
+    # response.completed so the UI can show usage. Per product policy we do NOT
+    # surface any computed dollar cost to the user; anton's internal cost_usd is
+    # reserved for operator-side budgeting and is intentionally not forwarded
+    # here. Read-only telemetry.
     turn_input_tokens = 0
     turn_output_tokens = 0
-    turn_cost_usd = 0.0
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -292,14 +292,11 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamComplete):
-            # Accumulate token + USD usage across the turn's LLM rounds.
-            # getattr keeps this safe against an anton build that predates the
-            # cost_usd field (the field defaults to 0.0 in the current fork).
+            # Accumulate tokens consumed across the turn's LLM rounds.
             usage = getattr(event.response, "usage", None)
             if usage is not None:
                 turn_input_tokens += getattr(usage, "input_tokens", 0) or 0
                 turn_output_tokens += getattr(usage, "output_tokens", 0) or 0
-                turn_cost_usd += getattr(usage, "cost_usd", 0.0) or 0.0
 
     full_text = "".join(collected_text)
     resp_completed = Response(
@@ -317,13 +314,11 @@ async def format_responses_stream(
         "type": "response.completed",
         "sequence_number": seq,
         "response": resp_completed.model_dump(),
-        # Additive per-turn usage telemetry sourced from anton's per-call
-        # cost_usd. Surfacing only — lets the UI show "$ this turn"; older
-        # clients ignore the unknown key. cost_usd is 0.0 when the model has no
-        # maintained rate in anton's price table.
+        # Additive per-turn usage telemetry: tokens consumed only. We do NOT
+        # expose computed dollar cost to the user (product policy); older
+        # clients ignore the unknown key.
         "usage": {
             "input_tokens": turn_input_tokens,
             "output_tokens": turn_output_tokens,
-            "cost_usd": round(turn_cost_usd, 6),
         },
     })
