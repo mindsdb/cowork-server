@@ -149,6 +149,16 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
 
     statuses, details = await ping_providers(providers)
+
+    # Persist the results merged into the stored map so the Settings dots
+    # survive a reload. Only the tested providers' entries change; every other
+    # provider keeps its last recorded result.
+    merged_status = {**json.loads(s.provider_status or "{}"), **statuses}
+    merged_details = {**json.loads(s.provider_status_details or "{}"), **details}
+    SettingService(session).bulk_upsert({
+        "provider_status": json.dumps(merged_status),
+        "provider_status_details": json.dumps(merged_details),
+    })
     return {"providerStatus": statuses, "providerStatusDetails": details}
 
 
