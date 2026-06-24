@@ -13,6 +13,7 @@ from cowork.services.publish import (
     list_publishable,
     publish_artifact as _publish,
     unpublish_artifact as _unpublish,
+    update_artifact as _update,
 )
 
 router = APIRouter()
@@ -39,6 +40,10 @@ class _PublishBody(BaseModel):
     access: _AccessBody | None = None
 
 
+class _UpdateBody(BaseModel):
+    path: str
+
+
 @router.get("/")
 async def list_publishable_endpoint():
     return list_publishable()
@@ -48,6 +53,21 @@ async def list_publishable_endpoint():
 async def publish_artifact(req: _PublishBody):
     try:
         return _publish(req.path, req.password, access=req.access.model_dump() if req.access else None)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        detail = str(e)
+        if "unavailable" in detail.lower():
+            raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
+
+
+@router.post("/update")
+async def update_artifact(req: _UpdateBody):
+    try:
+        return _update(req.path)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
