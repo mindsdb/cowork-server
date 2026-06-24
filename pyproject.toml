@@ -69,4 +69,17 @@ hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
 dev = [
     "alembic>=1.18.4",
     "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+]
+
+[tool.pytest.ini_options]
+# Async test support. `auto` treats every `async def test_*` as an asyncio
+# test without per-test decorators, and (importantly here) keeps the existing
+# `@pytest.mark.asyncio` markers in tests/test_memory_service.py valid — they
+# were previously erroring because the marker was unregistered (no
+# pytest-asyncio). `markers` registers it explicitly so `-W error`/`--strict-markers`
+# runs don't warn.
+asyncio_mode = "auto"
+markers = [
+    "asyncio: mark a coroutine test to run on the asyncio event loop",
 ]
