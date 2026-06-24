@@ -269,9 +269,10 @@ class UserSettings(Settings):
         set, otherwise the first configured provider (managed MindsHub first).
 
         Mirrors the client's ``defaultModeProviderType`` so the readiness gate
-        (``config_status``), the routing gate (``/settings/configured``), and
-        the agent's LLM client (``build_llm_client``) all agree on what
-        "configured" means — adding any key takes effect even if the stored
+        (``config_status``, surfaced at ``/health`` as ``config_ready`` — the
+        signal the frontend's chat gate AND onboarding-vs-app routing read) and
+        the agent's LLM client (``build_llm_client``) agree on what "configured"
+        means — adding any key takes effect even if the stored
         ``planning_provider`` still points at a keyless provider. Returns
         ``preferred`` unchanged when nothing is configured."""
         if self._has_key(preferred):
