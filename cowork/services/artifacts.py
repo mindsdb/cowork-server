@@ -887,23 +887,120 @@ def card_for_folder(folder: Path, idx: int = 0, *, viewer_email: str | None = No
     }
 
 
-def list_artifacts(project_path: str | None = None, *, viewer_email: str | None = None) -> list[dict]:
-    """Every artifact across all projects, newest first."""
-    cards: list[dict] = []
+# Default page size for the paginated listing. The client requests its own
+# limit; this is the fallback when none is given. There is NO hard cap on the
+# total — pagination replaced the old silent `[:80]` truncation that dropped
+# every artifact past the newest 80 with no signal to the user (ENG: silent
+# artifact data loss).
+_DEFAULT_PAGE_LIMIT = 60
+_MAX_PAGE_LIMIT = 500
+
+
+def _sorted_valid_folders(
+    project_path: str | None = None,
+    *,
+    folder_filter: "callable | None" = None,
+) -> list[tuple[Path, float]]:
+    """Artifact folders with readable metadata, newest-first by metadata mtime.
+
+    Returns ``[(folder, sort_ts)]``. This is the cheap pass: it loads each
+    folder's small ``metadata.json`` (to drop unreadable ones, matching
+    ``card_for_folder``'s own None-on-bad-metadata contract) and stats it for
+    the sort key, but does NOT build the full card (no per-folder DB queries for
+    review summaries / last-known-good previews). The expensive card build runs
+    only for the requested page window in ``list_artifacts_page``.
+
+    ``folder_filter`` — optional ``(folder: Path) -> bool`` applied per folder so
+    the caller (the endpoint) can drop artifacts the viewer can't see BEFORE
+    pagination, keeping the reported total and the page window honest.
+    """
+    out: list[tuple[Path, float]] = []
     for folder in _iter_artifact_folders(project_path):
-        card = card_for_folder(folder, len(cards), viewer_email=viewer_email)
-        if card is None:
+        if folder_filter is not None and not folder_filter(folder):
+            continue
+        if _load_metadata(folder) is None:
             continue
         try:
-            card["_sortTs"] = (folder / "metadata.json").stat().st_mtime
+            sort_ts = (folder / "metadata.json").stat().st_mtime
         except OSError:
-            card["_sortTs"] = 0.0
-        cards.append(card)
+            sort_ts = 0.0
+        out.append((folder, sort_ts))
+    out.sort(key=lambda item: item[1], reverse=True)
+    return out
 
-    cards.sort(key=lambda c: c["_sortTs"], reverse=True)
-    for c in cards:
-        c.pop("_sortTs", None)
-    return cards[:80]
+
+def list_artifacts_page(
+    project_path: str | None = None,
+    *,
+    viewer_email: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    folder_filter: "callable | None" = None,
+) -> dict:
+    """A single page of artifacts (newest-first) plus the true total.
+
+    Returns ``{"artifacts": [...], "total": N, "offset": o, "limit": l,
+    "hasMore": bool}``. ``total`` is the honest count of artifacts the viewer
+    can see (after ``folder_filter``), so the client can render "showing N of M"
+    and a load-more affordance instead of silently dropping everything past a
+    fixed cap.
+
+    Cards are built only for the ``[offset, offset+limit)`` window, so a large
+    library doesn't pay the per-folder DB cost for artifacts that aren't on the
+    requested page.
+    """
+    if limit is None:
+        limit = _DEFAULT_PAGE_LIMIT
+    limit = max(0, min(int(limit), _MAX_PAGE_LIMIT))
+    offset = max(0, int(offset))
+
+    folders = _sorted_valid_folders(project_path, folder_filter=folder_filter)
+    total = len(folders)
+    window = folders[offset:offset + limit] if limit else []
+
+    cards: list[dict] = []
+    for idx, (folder, _ts) in enumerate(window):
+        # `idx + offset` keeps the cosmetic background-gradient cycle stable
+        # across pages (so card N looks the same whichever page it loads on).
+        card = card_for_folder(folder, offset + idx, viewer_email=viewer_email)
+        if card is not None:
+            cards.append(card)
+
+    return {
+        "artifacts": cards,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "hasMore": (offset + limit) < total,
+    }
+
+
+def list_artifacts(project_path: str | None = None, *, viewer_email: str | None = None) -> list[dict]:
+    """Every artifact across all projects, newest first.
+
+    Backwards-compatible full list (no pagination) for internal callers that
+    need the whole set — e.g. the inline chat cards. The old silent ``[:80]``
+    truncation is gone: returning a hard-capped slice here dropped older
+    artifacts with no signal. HTTP callers should use ``list_artifacts_page``.
+    """
+    page = list_artifacts_page(
+        project_path,
+        viewer_email=viewer_email,
+        limit=_MAX_PAGE_LIMIT,
+        offset=0,
+    )
+    cards = page["artifacts"]
+    # If the library is larger than one max-size page, keep pulling so this
+    # full-list contract holds for in-process callers.
+    while page["hasMore"]:
+        page = list_artifacts_page(
+            project_path,
+            viewer_email=viewer_email,
+            limit=_MAX_PAGE_LIMIT,
+            offset=page["offset"] + page["limit"],
+        )
+        cards.extend(page["artifacts"])
+    return cards
 
 
 def preview_artifact(path: Path) -> dict:
