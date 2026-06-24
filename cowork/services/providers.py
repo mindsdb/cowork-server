@@ -31,25 +31,27 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
-# Prod is the publish host for shipped desktop installs (they configure no env).
-PROD_PUBLISH_URL = "https://view.mindshub.ai"
+# Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
+# publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
+# can't map to a non-prod MindsHub env, falls back here.
+PUBLISH_FAILSAFE_URL = "https://4nton.ai"
 
 
-def publish_url_for_minds(minds_url: str | None) -> str:
-    """Publish host that matches the configured MindsHub endpoint.
+def publish_url_for_endpoint(endpoint_url: str | None) -> str:
+    """Publish base URL for the MindsHub env the given endpoint points at.
 
-    Publishing is a "related service" of the same MindsHub environment as the
-    LLM endpoint, so the host follows whatever `minds_url` points at:
-    ``api[.env].mindshub.ai`` → ``view[.env].mindshub.ai`` (so a developer who
-    points their provider at dev/staging publishes there too). Anything we don't
-    recognise — mdb.ai, a custom OpenAI-compatible endpoint, empty — falls back
-    to prod. An explicit `publish_url` / `ANTON_PUBLISH_URL` overrides this at
-    the call site.
+    The publish API (root-mounted ``/upload``, ``/list``, ``/delete/{id}``) is
+    served on the *non-prod* MindsHub api hosts, so a provider pointed at
+    ``api.<env>.mindshub.ai`` (dev/staging) publishes to that same host. Prod
+    (``api.mindshub.ai``) has no publish routes, and anything unrecognised
+    (mdb.ai, a custom endpoint, empty) falls back to the legacy ``4nton.ai``
+    host. anton appends the route path; an explicit `publish_url` /
+    `ANTON_PUBLISH_URL` overrides this.
     """
-    host = (urlparse(minds_url or "").hostname or "").lower()
-    if host.startswith("api.") and host.endswith(".mindshub.ai"):
-        return f"https://view.{host[len('api.'):]}"
-    return PROD_PUBLISH_URL
+    host = (urlparse(endpoint_url or "").hostname or "").lower()
+    if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
+        return f"https://{host}"
+    return PUBLISH_FAILSAFE_URL
 
 
 # ── Live model listing ───────────────────────────────────────────────
