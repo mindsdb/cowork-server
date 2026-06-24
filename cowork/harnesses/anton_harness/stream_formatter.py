@@ -12,6 +12,7 @@ Emits typed events:
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -51,6 +52,36 @@ PHASE_LABELS = {
 }
 
 PROGRESS_THROTTLE = 0.25  # seconds
+
+# Pulls the string value of a "label" key out of a (possibly truncated)
+# tool-input JSON blob. Module-level so it's compiled once.
+_RECALL_LABEL_RE = re.compile(r'"label"\s*:\s*"((?:\\.|[^"\\])*)"')
+
+
+def _extract_recall_label(accumulated: str) -> str:
+    """Extract the `label` argument from a `recall_skill` tool-input JSON.
+
+    Tries a full parse first (the input is small — one field), then falls
+    back to a regex pull so a truncated blob still yields the label. Returns
+    "" when no usable label is present.
+    """
+    if not accumulated:
+        return ""
+    try:
+        data = json.loads(accumulated)
+        if isinstance(data, dict):
+            label = data.get("label")
+            if isinstance(label, str):
+                return label.strip()
+    except (ValueError, TypeError):
+        pass
+    m = _RECALL_LABEL_RE.search(accumulated)
+    if not m:
+        return ""
+    try:
+        return json.loads('"' + m.group(1) + '"').strip()
+    except ValueError:
+        return m.group(1).strip()
 
 
 def classify_cell_status(content: str) -> str:
@@ -221,6 +252,26 @@ async def format_responses_stream(
                 "content": accumulated[:65536],
                 "tool_use_id": event.id,
             })
+
+            # Anton's `recall_skill` tool pulls a procedural skill into
+            # working context (anton/core/tools/recall_skill.py). That's
+            # the existing "a skill fired" signal — surface it as a
+            # dedicated, additive event so the renderer can show a chip
+            # in the transcript naming the skill, and so the responses
+            # handler can bump the skill's `used` counter. We do NOT
+            # change triggering: this rides on the recall the LLM already
+            # decided to make. The recalled label is the tool's only
+            # argument; pull it from the accumulated input JSON.
+            if name == "recall_skill":
+                label = _extract_recall_label(accumulated)
+                if label:
+                    seq += 1
+                    yield _event("response.skill_recalled", {
+                        "type": "response.skill_recalled",
+                        "sequence_number": seq,
+                        "skill_label": label,
+                        "tool_use_id": event.id,
+                    })
 
         elif isinstance(event, StreamToolResult):
             seq += 1
