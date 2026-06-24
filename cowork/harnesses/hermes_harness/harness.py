@@ -35,8 +35,15 @@ _PROVIDER_ENV_KEY = {
 }
 
 
-def _sync_hermes_config(provider: str, api_key: str | None) -> None:
-    """Write ~/.cowork/hermes/config.yaml and set the env var that AIAgent expects."""
+def _sync_hermes_config(
+    provider: str,
+    api_key: str | None,
+    skills_dir: str | Path | None = None,
+) -> None:
+    """Write ~/.cowork/hermes/config.yaml and set the env var that AIAgent expects.
+
+    When ``skills_dir`` is given, it is added as a read-only external skill dir (``skills.external_dirs``)
+    """
     import yaml
 
     hermes_home = Path(os.environ.get("HERMES_HOME", HermesHarnessSettings().root_dir))
@@ -50,8 +57,20 @@ def _sync_hermes_config(provider: str, api_key: str | None) -> None:
         except Exception:
             existing = {}
 
+    to_update = False
+
+    external_dirs = [str(Path(skills_dir).expanduser())] if skills_dir else []
     if existing.get("provider") != provider:
         existing["provider"] = provider
+        to_update = True
+
+    skills_cfg = existing.get("skills") if isinstance(existing.get("skills"), dict) else {}
+    if skills_cfg.get("external_dirs") != external_dirs:
+        skills_cfg["external_dirs"] = external_dirs
+        existing["skills"] = skills_cfg
+        to_update = True
+
+    if to_update:
         hermes_home.mkdir(parents=True, exist_ok=True)
         config_path.write_text(yaml.dump(existing, default_flow_style=False))
 
