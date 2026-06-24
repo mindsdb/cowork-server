@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlmodel import Session
 
 from cowork.db.session import get_session
@@ -28,6 +28,27 @@ def create_skill(body: SkillCreateRequest, session: SessionDep):
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    return SkillResponse.serialize(skill)
+
+
+@router.post("/upload", status_code=status.HTTP_201_CREATED)
+async def upload_skill(file: UploadFile, session: SessionDep):
+    raw = await file.read()
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File must be UTF-8 encoded text.",
+        )
+    try:
+        skill = SkillService().import_skill(content)
+    except FileExistsError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+        )
     return SkillResponse.serialize(skill)
 
 
