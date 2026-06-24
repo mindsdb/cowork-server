@@ -7,7 +7,6 @@ from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     PLANNING_MODEL_DEFAULTS,
     Settings,
-    default_publish_url,
     get_app_settings,
 )
 
@@ -220,9 +219,9 @@ class UserSettings(Settings):
         description="How UI updates are applied (manual or auto).",
     )
     publish_url: str = Field(
-        default_factory=default_publish_url,
+        default="",
         title="Publish URL",
-        description="Base URL for publishing artifacts. Defaults to the MindsHub host for the active environment; set explicitly to override.",
+        description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
     openai_base_url: str = Field(
         default="",
