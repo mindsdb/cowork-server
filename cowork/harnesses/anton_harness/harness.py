@@ -391,7 +391,7 @@ class AntonHarness:
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
             proactive_dashboards=anton_settings.proactive_dashboards,
-            act_first=settings.act_first,
+            act_first=anton_settings.act_first,
             # "Conversation started" stamp for the cache-stable prompt prefix
             # (anton 2a). The live current time is rendered separately in the
             # volatile tail, so resuming days later still reports the real "now".
