@@ -130,6 +130,12 @@ class _TestProvidersBody(BaseModel):
 
 @router.post("/test-providers")
 async def test_providers(session: SessionDep, body: _TestProvidersBody | None = None):
+    """Ping the given (or all stored) providers and persist the results.
+
+    Despite the read-only-sounding name this WRITES: each tested provider's
+    status is merged into the persisted `provider_status` /
+    `provider_status_details` settings so the Settings dots survive a reload.
+    """
     s = SettingService(session).load()
 
     if body and body.providers is not None:
