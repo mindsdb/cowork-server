@@ -180,6 +180,17 @@ class ResponsesHandler:
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
+            elif event_type == "response.skill_recalled":
+                # Anton recalled a skill — bump its usage counter. Matched
+                # by label (the recall arg and the cowork skill's unique
+                # key). Best-effort: never let a stats write break the
+                # live stream.
+                label = data.get("skill_label")
+                if label:
+                    try:
+                        SkillService(own).record_use(label)
+                    except Exception:
+                        logger.exception("[responses] failed to bump skill usage for %r", label)
 
         def persist() -> None:
             nonlocal persisted
@@ -296,6 +307,13 @@ class ResponsesHandler:
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
+            elif event_type == "response.skill_recalled":
+                label = data.get("skill_label")
+                if label:
+                    try:
+                        SkillService(self.session).record_use(label)
+                    except Exception:
+                        logger.exception("[responses] failed to bump skill usage for %r", label)
 
         try:
             try:

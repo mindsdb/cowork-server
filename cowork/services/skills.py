@@ -20,6 +20,25 @@ class SkillService:
             raise ValueError(f"Skill {skill_id} not found.")
         return skill
 
+    def record_use(self, label: str) -> Skill | None:
+        """Bump the `used` counter for the skill with this label.
+
+        Driven by Anton's `recall_skill` tool firing (surfaced as the
+        `response.skill_recalled` stream event). Matching is by label —
+        the same identifier Anton recalls by and the cowork skill's
+        unique key. Unknown labels are a no-op (the recall may have hit a
+        skill that isn't cowork-managed, or a closest-match fallback).
+        Returns the updated Skill, or None if no row matched.
+        """
+        skill = self.session.exec(select(Skill).where(Skill.label == label)).first()
+        if skill is None:
+            return None
+        skill.used = (skill.used or 0) + 1
+        self.session.add(skill)
+        self.session.commit()
+        self.session.refresh(skill)
+        return skill
+
     def create_skill(
         self,
         label: str,
