@@ -319,14 +319,30 @@ def write_project_file(project_name: str, path: str, req: _FileWriteRequest, ses
 
 @router.post("/{project_name}/files/upload")
 async def upload_project_files(
+    request: Request,
     project_name: str,
     session: SessionDep,
     principal: PrincipalDep,
     files: list[UploadFile] = File(...),
 ):
+    from cowork.services.files import (
+        FileValidationError,
+        UploadTooLarge,
+        reject_if_content_length_over_cap,
+        stream_upload_to_path,
+    )
+
     project = _project_record(project_name, session)
     _require_project_capability_if_owned(session, project, principal, "edit")
     base = _project_base(project)
+    # Up-front reject for an obviously oversized body before streaming; the
+    # per-file cap below is the authoritative check.
+    try:
+        reject_if_content_length_over_cap(request.headers.get("content-length"))
+    except UploadTooLarge as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)
+        ) from exc
     results: list[dict[str, Any]] = []
     for f in files:
         if not f.filename:
@@ -338,9 +354,17 @@ async def upload_project_files(
             continue
         target = base / safe_name
         try:
-            data = await f.read()
-            target.write_bytes(data)
-            results.append({"name": safe_name, "ok": True, "size": len(data)})
+            # Stream chunked to disk so a giant file can't OOM the server,
+            # enforcing the size cap mid-stream. No type allow-list here: this
+            # is the project working directory, where arbitrary source/config/
+            # archive files are expected (unlike the chat-attachment path).
+            size = await stream_upload_to_path(f, target)
+            results.append({"name": safe_name, "ok": True, "size": size})
+        except FileValidationError as exc:
+            # Over the size cap: report per-file (the batch contract is
+            # per-file ok/error) with the user-facing reason. The partial file
+            # is cleaned up by stream_upload_to_path on breach.
+            results.append({"name": safe_name, "ok": False, "error": str(exc)})
         except Exception as exc:
             logger.error("Failed to write file %s: %s", safe_name, exc)
             results.append({"name": safe_name, "ok": False, "error": "File write failed"})

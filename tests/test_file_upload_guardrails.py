@@ -11,6 +11,9 @@ never touch the real ~/.cowork.
 """
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -20,6 +23,8 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.files import (
     FileValidationError,
     _humanize_bytes,
+    reject_if_content_length_over_cap,
+    stream_upload_to_path,
     validate_upload,
 )
 
@@ -130,3 +135,98 @@ def test_files_endpoint_accepts_allowed_file(client):
     )
     assert resp.status_code == 201, resp.text
     assert resp.json()["filename"] == "report.pdf"
+
+
+# ── Streaming ingest: cap is enforced mid-stream, never fully buffered ─────
+
+
+class _FakeStreamUpload:
+    """Stands in for an UploadFile backed by a stream far larger than the
+    cap. Serves a fixed chunk per ``read(size)`` call up to ``total`` bytes
+    and records how much was actually pulled — so a test can prove the cap
+    check stops reading early instead of draining (and buffering) the lot."""
+
+    def __init__(self, filename: str, content_type: str, total: int):
+        self.filename = filename
+        self.content_type = content_type
+        self._remaining = total
+        self.bytes_served = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        n = self._remaining if size is None or size < 0 else min(size, self._remaining)
+        self._remaining -= n
+        self.bytes_served += n
+        return b"\x00" * n
+
+
+def test_stream_upload_aborts_early_without_buffering(tmp_path, max_bytes):
+    # A "10x the cap" stream: if the writer drained it all we'd both buffer
+    # and write 10x the cap. It must stop just past the cap instead.
+    total = max_bytes * 10
+    fake = _FakeStreamUpload("huge.png", "image/png", total)
+    dest = tmp_path / "huge.png"
+
+    with pytest.raises(FileValidationError) as exc:
+        asyncio.run(stream_upload_to_path(fake, dest))  # type: ignore[arg-type]
+
+    assert "max is" in str(exc.value)
+    # Pulled only ~one chunk past the cap — nowhere near the full payload.
+    assert fake.bytes_served <= max_bytes + (1024 * 1024)
+    assert fake.bytes_served < total
+    # Partial file cleaned up — no truncated artifact left behind.
+    assert not dest.exists()
+
+
+def test_stream_upload_under_cap_writes_full_file(tmp_path):
+    payload = b"hello streamed world"
+    fake = _FakeStreamUpload("notes.txt", "text/plain", len(payload))
+
+    dest = tmp_path / "notes.txt"
+    written = asyncio.run(stream_upload_to_path(fake, dest))  # type: ignore[arg-type]
+
+    assert written == len(payload)
+    assert dest.exists()
+    assert dest.stat().st_size == len(payload)
+
+
+def test_attachment_upload_oversize_leaves_no_file_on_disk(client, max_bytes):
+    # End-to-end through the renderer's path: an over-cap body is rejected and
+    # nothing is committed to the files store (no orphaned partial upload).
+    files_root = Path(get_app_settings().file.root_dir)
+    before = set(files_root.glob("*")) if files_root.exists() else set()
+
+    big = b"\x00" * (max_bytes + 1)
+    resp = client.post(ATTACH_URL, files=[("files", ("big.png", big, "image/png"))])
+    assert resp.status_code == 400, resp.text
+
+    after = set(files_root.glob("*")) if files_root.exists() else set()
+    assert after == before, "over-cap upload left a file behind in the store"
+
+
+# ── Content-Length fast-reject ─────────────────────────────────────────────
+
+
+def test_content_length_over_cap_raises(max_bytes):
+    from cowork.services.files import UploadTooLarge
+
+    with pytest.raises(UploadTooLarge):
+        # Well past cap + the 1 MiB multipart allowance.
+        reject_if_content_length_over_cap(max_bytes + (5 * 1024 * 1024))
+
+
+def test_content_length_under_cap_passes(max_bytes):
+    # Under cap — no raise. (None / garbage headers are also ignored.)
+    reject_if_content_length_over_cap(max_bytes - 1)
+    reject_if_content_length_over_cap(None)
+    reject_if_content_length_over_cap("not-a-number")
+
+
+def test_attachment_upload_huge_content_length_returns_413(client, max_bytes):
+    # A declared body far over the cap is rejected up front as 413, before the
+    # stream is consumed.
+    big = b"\x00" * (max_bytes + (3 * 1024 * 1024))
+    resp = client.post(ATTACH_URL, files=[("files", ("big.png", big, "image/png"))])
+    assert resp.status_code == 413, resp.text
+    assert "max is" in resp.json()["detail"]
