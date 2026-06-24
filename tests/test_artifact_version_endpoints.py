@@ -201,6 +201,45 @@ def test_checkpoint_creation_and_listing(client: TestClient):
     assert listed["latest"]["id"] == second["version"]["id"]
 
 
+def test_artifact_list_endpoint_paginates_with_headers(client: TestClient):
+    """The list endpoint slices the body to the requested page and reports the
+    honest total via headers, so the library never silently drops artifacts past
+    a fixed cap (the old newest-80 truncation bug)."""
+    project_path = str(_general_project_path())
+    # Three artifacts so a limit of 2 produces two pages.
+    for _ in range(3):
+        _make_artifact(files={"report.md": "# Draft\n"})
+
+    page1 = client.get(
+        "/api/v1/artifacts/", params={"project_path": project_path, "limit": 2, "offset": 0}
+    )
+    assert page1.status_code == 200, page1.text
+    body1 = page1.json()
+    assert isinstance(body1, list), "body stays a bare array for back-compat"
+    assert len(body1) == 2
+    assert int(page1.headers["X-Total-Count"]) >= 3
+    assert page1.headers["X-Has-More"] == "true"
+    assert page1.headers["X-Limit"] == "2"
+    assert page1.headers["X-Offset"] == "0"
+
+    total = int(page1.headers["X-Total-Count"])
+    last = client.get(
+        "/api/v1/artifacts/",
+        params={"project_path": project_path, "limit": 2, "offset": total - 1},
+    )
+    assert last.status_code == 200, last.text
+    assert len(last.json()) == 1  # tail page is short
+    assert last.headers["X-Has-More"] == "false"
+
+    # No page overlaps: every id across the pages is distinct.
+    ids_page1 = {item["id"] for item in body1}
+    rest = client.get(
+        "/api/v1/artifacts/", params={"project_path": project_path, "limit": 100, "offset": 2}
+    )
+    ids_rest = {item["id"] for item in rest.json()}
+    assert ids_page1.isdisjoint(ids_rest)
+
+
 def test_owned_project_id_version_routes_respect_collaborator_roles(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

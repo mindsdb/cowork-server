@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import AliasChoices, BaseModel, Field
 from sqlmodel import Session, select
@@ -28,7 +28,7 @@ from cowork.services.artifacts import (
     _pick_primary,
     _project_artifacts_base,
     get_preview_mount,
-    list_artifacts as _list_artifacts,
+    list_artifacts_page,
     mount_preview,
     preview_artifact as _preview_artifact,
     resolve_artifact_path,
@@ -561,22 +561,68 @@ def _target_project_for_fork(session: Session, req: _ForkVersionBody) -> Project
 
 @router.get("/")
 async def list_artifacts(
+    response: Response,
     session: SessionDep,
     principal: PrincipalDep,
     project_path: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
+    """Paginated artifact listing (newest-first).
+
+    The body stays a bare JSON array of artifact cards (the page window) so
+    existing consumers keep working unchanged. Pagination metadata rides on
+    response headers — ``X-Total-Count`` (the honest total of artifacts the
+    viewer can see), ``X-Offset``, ``X-Limit``, ``X-Has-More`` — so the library
+    UI can render "showing N of M" + load-more instead of the old silent
+    newest-80 truncation that dropped the rest with no signal.
+
+    Per-artifact project visibility is enforced as a folder-level filter so the
+    total and the page window only ever count what the viewer is allowed to see.
+    """
     viewer_email = principal.email if principal is not None else None
     if project_path is not None:
+        # Single project-level capability check covers the whole scoped tree;
+        # no per-folder filtering needed.
         _require_path_project_capability(session, project_path, principal, "view")
-        return [_sanitize_artifact_payload(session, card, principal) for card in _list_artifacts(project_path, viewer_email=viewer_email)]
-    cards = _list_artifacts(project_path, viewer_email=viewer_email)
-    visible: list[dict] = []
-    for card in cards:
-        project = _project_for_path(session, card.get("folder") or card.get("path"))
-        if not _principal_can_project(session, project, principal, "view"):
-            continue
-        visible.append(_sanitize_artifact_payload(session, card, principal))
-    return visible
+        page = list_artifacts_page(
+            project_path, viewer_email=viewer_email, limit=limit, offset=offset
+        )
+    else:
+        # Global listing — filter by per-folder project visibility BEFORE
+        # paginating so the total stays honest. Cache the folder→allowed decision
+        # so a folder the pager touches twice (count pass + window build) only
+        # resolves once.
+        visibility_cache: dict[str, bool] = {}
+
+        def _folder_visible(folder: Path) -> bool:
+            key = str(folder)
+            cached = visibility_cache.get(key)
+            if cached is not None:
+                return cached
+            project = _project_for_path(session, folder)
+            allowed = _principal_can_project(session, project, principal, "view")
+            visibility_cache[key] = allowed
+            return allowed
+
+        page = list_artifacts_page(
+            None,
+            viewer_email=viewer_email,
+            limit=limit,
+            offset=offset,
+            folder_filter=_folder_visible,
+        )
+
+    response.headers["X-Total-Count"] = str(page["total"])
+    response.headers["X-Offset"] = str(page["offset"])
+    response.headers["X-Limit"] = str(page["limit"])
+    response.headers["X-Has-More"] = "true" if page["hasMore"] else "false"
+    # Let the browser fetch() read the pagination headers cross-origin (web build
+    # talks to the API over a different origin behind the auth proxy).
+    response.headers["Access-Control-Expose-Headers"] = (
+        "X-Total-Count, X-Offset, X-Limit, X-Has-More"
+    )
+    return [_sanitize_artifact_payload(session, card, principal) for card in page["artifacts"]]
 
 
 @router.post("/handoff", status_code=status.HTTP_201_CREATED)
