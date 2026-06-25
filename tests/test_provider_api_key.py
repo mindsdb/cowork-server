@@ -103,20 +103,34 @@ class TestResolverIsolation:
         assert s.resolved_planning_model == "gemini-2.5-pro"
         assert s.resolved_coding_model == "gemini-2.5-flash"
 
-    def test_openai_compatible_only_key_resolves_when_planning_is_keyless(self):
-        # openai-compatible has no canonical default model; resolved_*_model
-        # falls back to the user's own model so it's never None when they have
-        # one set.
+    def test_switch_to_oc_does_not_misroute_the_default_model(self):
+        # Realistic case: planning_provider=anthropic (keyless), only an OC key.
+        # apply_model_defaults fills planning_model with anthropic's DEFAULT
+        # (claude-sonnet-4-6). The resolver switches to OC — but must NOT hand
+        # that Claude id to the OC endpoint. resolved model is None → not ready
+        # → "select a model" (rather than silently misrouting).
         s = _settings(
             planning_provider=Provider.ANTHROPIC,   # keyless
-            planning_model="my-proxy-model",
-            coding_model="my-proxy-coder",
             openai_compatible_api_key=SecretStr("sk-compat-only"),
         )
+        assert s.planning_model == "claude-sonnet-4-6"   # filled by apply_model_defaults
         assert s.resolved_planning_provider == Provider.OPENAI_COMPATIBLE
+        assert s.resolved_planning_model is None          # NOT the Claude id
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "model" in cs["config_error"].lower()
+
+    def test_switch_to_gemini_uses_gemini_default_not_original(self):
+        # Switch to gemini (which HAS a default) must use the gemini default,
+        # never the original provider's model.
+        s = _settings(
+            planning_provider=Provider.ANTHROPIC,   # keyless; planning_model→claude default
+            gemini_api_key=SecretStr("AIza"),
+        )
+        assert s.resolved_planning_provider == Provider.GEMINI
+        assert s.resolved_planning_model == "gemini-2.5-pro"
+        assert s.resolved_coding_model == "gemini-2.5-flash"
         assert s.config_status["config_ready"] is True
-        assert s.resolved_planning_model == "my-proxy-model"
-        assert s.resolved_coding_model == "my-proxy-coder"
 
     def test_legacy_shared_openai_key_still_resolves(self):
         # Legacy single-key config (only the shared openai slot) keeps working
