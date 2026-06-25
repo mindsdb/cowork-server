@@ -2,13 +2,24 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from sqlalchemy import case
 from sqlmodel import Session, select
 
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
+from cowork.schemas.responses import Role
 from cowork.services.projects import GENERAL_PROJECT_ID
+
+# Streaming turns persist user + assistant in one persist() call; on SQLite
+# both rows often share the same created_at (second precision). Tie-break
+# user before assistant, then id.
+_MESSAGE_ORDER = (
+    Message.created_at,
+    case((Message.role == Role.user, 0), else_=1),
+    Message.id,
+)
 
 
 class ConversationService:
@@ -83,7 +94,7 @@ class ConversationService:
         messages = self.session.exec(
             select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at)
+            .order_by(*_MESSAGE_ORDER)
         ).all()
         for message in messages:
             for event in self.session.exec(
@@ -107,7 +118,7 @@ class ConversationService:
             self.session.exec(
                 select(Message)
                 .where(Message.conversation_id == conversation_id)
-                .order_by(Message.created_at)
+                .order_by(*_MESSAGE_ORDER)
             ).all()
         )
         # Find the Nth assistant message (0-based).
@@ -174,7 +185,7 @@ class ConversationService:
         messages = self.session.exec(
             select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at, Message.id)
+            .order_by(*_MESSAGE_ORDER)
         ).all()
         result = []
         for message in messages:
