@@ -24,7 +24,9 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
 from cowork.models.artifact import Artifact
 from cowork.models.identity import ArtifactShare, User
+from cowork.models.project_collaboration import ProjectCollaborator
 from cowork.services.projects import GENERAL_PROJECT_ID
+from cowork.services.request_identity import RequestPrincipal
 
 
 @pytest.fixture()
@@ -45,7 +47,7 @@ def clean_share_rows():
 
 
 def _delete_all(session: Session) -> None:
-    for model in (ArtifactShare, User):
+    for model in (ArtifactShare, User, ProjectCollaborator):
         for row in session.exec(select(model)).all():
             session.delete(row)
     session.commit()
@@ -66,6 +68,28 @@ def _make_artifact() -> str:
         session.commit()
         session.refresh(artifact)
         return str(artifact.id)
+
+
+def _own_general_project() -> None:
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as session:
+        session.add(ProjectCollaborator(project_id=GENERAL_PROJECT_ID, email="owner@example.com", role="owner"))
+        session.add(ProjectCollaborator(project_id=GENERAL_PROJECT_ID, email="editor@example.com", role="editor"))
+        session.add(ProjectCollaborator(project_id=GENERAL_PROJECT_ID, email="viewer@example.com", role="viewer"))
+        session.commit()
+
+
+def _fake_share_principal(authorization: str | None):
+    if not authorization:
+        return None
+    token = authorization.removeprefix("Bearer ").strip()
+    if token == "editor":
+        return RequestPrincipal("editor", "editor@example.com", "Editor", "test", {})
+    if token == "viewer":
+        return RequestPrincipal("viewer", "viewer@example.com", "Viewer", "test", {})
+    if token == "owner":
+        return RequestPrincipal("owner", "owner@example.com", "Owner", "test", {})
+    return None
 
 
 def test_create_share_returns_token_and_pending_row(client: TestClient):
@@ -100,6 +124,62 @@ def test_create_share_returns_token_and_pending_row(client: TestClient):
         json={"email": "ada@example.com", "role": "owner"},
     )
     assert bad_role.status_code == 400
+
+
+def test_owned_project_share_routes_require_editor(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    _own_general_project()
+    artifact_id = _make_artifact()
+    monkeypatch.setattr(
+        "cowork.api.v1.endpoints.artifact_shares.principal_from_authorization_header",
+        _fake_share_principal,
+    )
+
+    anonymous_create = client.post(
+        f"/api/v1/artifacts/{artifact_id}/shares",
+        json={"email": "ada@example.com", "role": "commenter"},
+    )
+    assert anonymous_create.status_code == 401
+
+    viewer_create = client.post(
+        f"/api/v1/artifacts/{artifact_id}/shares",
+        headers={"Authorization": "Bearer viewer"},
+        json={"email": "ada@example.com", "role": "commenter"},
+    )
+    assert viewer_create.status_code == 403
+
+    editor_create = client.post(
+        f"/api/v1/artifacts/{artifact_id}/shares",
+        headers={"Authorization": "Bearer editor"},
+        json={"email": "ada@example.com", "role": "commenter"},
+    )
+    assert editor_create.status_code == 201, editor_create.text
+    share_id = editor_create.json()["share"]["id"]
+
+    viewer_list = client.get(
+        f"/api/v1/artifacts/{artifact_id}/shares",
+        headers={"Authorization": "Bearer viewer"},
+    )
+    assert viewer_list.status_code == 403
+
+    editor_list = client.get(
+        f"/api/v1/artifacts/{artifact_id}/shares",
+        headers={"Authorization": "Bearer editor"},
+    )
+    assert editor_list.status_code == 200, editor_list.text
+
+    viewer_update = client.patch(
+        f"/api/v1/artifacts/shares/{share_id}",
+        headers={"Authorization": "Bearer viewer"},
+        json={"role": "editor"},
+    )
+    assert viewer_update.status_code == 403
+
+    editor_update = client.patch(
+        f"/api/v1/artifacts/shares/{share_id}",
+        headers={"Authorization": "Bearer editor"},
+        json={"role": "editor"},
+    )
+    assert editor_update.status_code == 200, editor_update.text
 
 
 def test_accept_share_creates_user_and_accepts_grant(client: TestClient):

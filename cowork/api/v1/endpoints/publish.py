@@ -24,6 +24,7 @@ from cowork.services.publish import (
     list_publishable,
     publish_artifact as _publish,
     unpublish_artifact as _unpublish,
+    update_artifact as _update,
 )
 from cowork.services.request_identity import (
     AuthenticationError,
@@ -74,6 +75,10 @@ class _PublishBody(BaseModel):
     # .published.json for the in-app reveal.
     password: str | None = None
     access: _AccessBody | None = None
+
+
+class _UpdateBody(BaseModel):
+    path: str
 
 
 @router.get("/")
@@ -193,6 +198,21 @@ async def publish_artifact(req: _PublishBody, session: SessionDep, principal: Pr
                         session.commit()
             except Exception:
                 session.rollback()
+        if "unavailable" in detail.lower():
+            raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
+
+
+@router.post("/update")
+async def update_artifact(req: _UpdateBody):
+    try:
+        return _update(req.path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        detail = str(e)
         if "unavailable" in detail.lower():
             raise HTTPException(status_code=503, detail=detail)
         raise HTTPException(status_code=502, detail=detail)

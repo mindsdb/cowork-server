@@ -5,14 +5,10 @@ Mirrors the router/auth conventions in
 ``PrincipalDep``, ``get_request_principal``) for PER-ARTIFACT sharing
 with a Google-Drive-style lightweight-signup accept flow.
 
-This module is intentionally NOT registered in ``router.py``; the
-integration agent includes it (see module docstring of
-``cowork.services.artifact_shares`` for the related TODOs).
-
-TODO(enforcement): these endpoints create/accept grants but do not yet
-    gate the artifact actions in ``artifacts.py`` on them. Once
-    enforced, ``POST /{artifact_id}/shares`` should require an owner/
-    editor capability on the artifact rather than any principal.
+Create/list/update operations require edit capability on the artifact's
+project when that project is owned. ``POST /shares/accept`` remains the
+lightweight-signup token flow and validates the invited email against
+the grant.
 """
 from __future__ import annotations
 
@@ -24,6 +20,8 @@ from pydantic import AliasChoices, BaseModel, Field
 from sqlmodel import Session
 
 from cowork.db.session import get_session
+from cowork.models.artifact import Artifact
+from cowork.models.identity import ArtifactShare
 from cowork.services.artifact_shares import (
     accept_share as _accept_share,
     create_share as _create_share,
@@ -36,6 +34,7 @@ from cowork.services.request_identity import (
     RequestPrincipal,
     principal_from_authorization_header,
 )
+from cowork.services.project_permissions import ProjectPermissionError, require_project_permission_if_owned
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -55,6 +54,50 @@ def _share_creator(principal: RequestPrincipal | None) -> str | None:
     if principal is None:
         return None
     return principal.email or principal.subject
+
+
+def _require_artifact_capability(
+    session: Session,
+    artifact_id: UUID,
+    principal: RequestPrincipal | None,
+    capability: str,
+) -> Artifact:
+    artifact = session.get(Artifact, artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+    if artifact.project_id is None:
+        return artifact
+    try:
+        require_project_permission_if_owned(
+            session,
+            artifact.project_id,
+            principal.email if principal is not None else None,
+            capability,
+        )
+    except ProjectPermissionError as exc:
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication is required for this shared project",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to share this artifact",
+        ) from exc
+    return artifact
+
+
+def _require_share_capability(
+    session: Session,
+    share_id: UUID,
+    principal: RequestPrincipal | None,
+    capability: str,
+) -> ArtifactShare:
+    row = session.get(ArtifactShare, share_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
+    _require_artifact_capability(session, row.artifact_id, principal, capability)
+    return row
 
 
 class _CreateShareBody(BaseModel):
@@ -83,6 +126,7 @@ class _UpdateShareBody(BaseModel):
 @router.post("/{artifact_id}/shares", status_code=status.HTTP_201_CREATED)
 def create_artifact_share(artifact_id: UUID, req: _CreateShareBody, session: SessionDep, principal: PrincipalDep):
     try:
+        _require_artifact_capability(session, artifact_id, principal, "edit")
         return _create_share(
             session,
             artifact_id=artifact_id,
@@ -99,6 +143,7 @@ def create_artifact_share(artifact_id: UUID, req: _CreateShareBody, session: Ses
 @router.get("/{artifact_id}/shares")
 def list_artifact_shares(artifact_id: UUID, session: SessionDep, principal: PrincipalDep):
     try:
+        _require_artifact_capability(session, artifact_id, principal, "edit")
         return _list_shares(session, artifact_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -121,6 +166,7 @@ def accept_artifact_share(req: _AcceptShareBody, session: SessionDep, principal:
 @router.patch("/shares/{share_id}")
 def update_artifact_share(share_id: UUID, req: _UpdateShareBody, session: SessionDep, principal: PrincipalDep):
     try:
+        _require_share_capability(session, share_id, principal, "edit")
         if req.status is not None:
             if req.status != "revoked":
                 raise ValueError("status can only be set to 'revoked'")

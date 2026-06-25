@@ -540,19 +540,31 @@ def _project_id_for_artifact_request(
         project = _project_for_path(session, path)
         if project is not None:
             return project.id
+        if create:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Artifact path must be inside a known project artifacts folder",
+            )
 
     artifact = _artifact_by_identifier(session, artifact_id)
     if artifact is not None:
         if artifact.project_id is not None:
             return artifact.project_id
         project = _project_for_path(session, artifact.path)
+        if path and project is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Artifact path must be inside a known project artifacts folder",
+            )
         return project.id if project is not None else None
-
-    if path and create:
-        return None
 
     folder = _resolve_artifact_folder(artifact_id, path=path)
     project = _project_for_path(session, folder)
+    if path and project is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Artifact path must be inside a known project artifacts folder",
+        )
     return project.id if project is not None else None
 
 

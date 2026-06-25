@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -100,6 +101,13 @@ def check_configured(session: SessionDep):
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
+    # gemini / openai-compatible have dedicated key slots now — a user who
+    # configured only one of those (no shared openai key) must still read as
+    # configured (this endpoint gates app startup).
+    if s.gemini_api_key is not None:
+        return {"configured": True, "provider": "gemini"}
+    if s.openai_compatible_api_key is not None:
+        return {"configured": True, "provider": "openai-compatible"}
     return {"configured": False, "provider": ""}
 
 
@@ -110,16 +118,22 @@ def install_status():
 
 @router.get("/reveal-key/{name}")
 def reveal_key(name: str, session: SessionDep):
-    field_map = {
-        "anthropic": "anthropic_api_key",
-        "openai": "openai_api_key",
-        "minds": "minds_api_key",
+    from cowork.common.settings.user_settings import Provider, provider_api_key
+
+    name_map = {
+        "anthropic": Provider.ANTHROPIC,
+        "openai": Provider.OPENAI,
+        "gemini": Provider.GEMINI,
+        "openai-compatible": Provider.OPENAI_COMPATIBLE,
+        "minds": Provider.MINDS_CLOUD,
+        "minds-cloud": Provider.MINDS_CLOUD,
     }
-    field = field_map.get(name.lower())
-    if field is None:
+    provider = name_map.get(name.lower())
+    if provider is None:
         raise HTTPException(status_code=404, detail="Unknown key name")
     s = SettingService(session).load()
-    val = getattr(s, field)
+    # provider_api_key applies the gemini/openai-compatible → openai fallback.
+    val = provider_api_key(s, provider)
     return {"value": val.get_secret_value() if isinstance(val, SecretStr) else ""}
 
 
@@ -191,6 +205,32 @@ async def recommended_models(session: SessionDep):
             recommended["minds-cloud"] = live
         model_efforts.update(live_efforts)
 
+    # Overlay a configured custom OpenAI-compatible endpoint the same way as
+    # minds-cloud. The provider card's own baseUrl is authoritative — the
+    # shared openai_base_url setting is also reused by gemini/openai — so read
+    # it from providers_json. fetch_minds_models is just an OpenAI-compatible
+    # /models fetch and returns None on failure, leaving the bucket empty so
+    # the picker falls back to a free-text model input.
+    try:
+        provider_cards = json.loads(s.providers_json or "[]")
+    except (ValueError, TypeError):
+        provider_cards = []
+    oc_card = next(
+        (
+            c for c in provider_cards
+            if isinstance(c, dict)
+            and c.get("type") in ("openai-compatible", "openai_compatible")
+            and (c.get("baseUrl") or "").strip()
+        ),
+        None,
+    )
+    if oc_card:
+        oc_key = s.openai_api_key.get_secret_value() if s.openai_api_key else ""
+        live, live_efforts = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
+        if live:
+            recommended["openai-compatible"] = live
+        model_efforts.update(live_efforts)
+
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
@@ -200,7 +240,7 @@ async def recommended_models(session: SessionDep):
 
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
 
-_ENV_PATH = Path.home() / ".anton" / ".env"
+_ENV_PATH = Path.home() / ".cowork" / ".env"
 
 
 def _parse_dotenv_content(content: str) -> dict[str, str]:
@@ -231,7 +271,7 @@ class _RawSettingsBody(BaseModel):
 
 @router.post("/raw")
 def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
-    """Merge dotenv content into ~/.anton/.env and sync recognised keys to the DB.
+    """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
     Uses key-level merge (not full overwrite) because callers like the
     OAuth token refresh only send a subset of keys — a full overwrite
