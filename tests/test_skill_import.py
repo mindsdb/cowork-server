@@ -2,7 +2,10 @@
 from pathlib import Path
 
 import pytest
+from sqlmodel import Session
 
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.session import get_engine
 from cowork.services.skills import SkillService
 
 VALID = """---
@@ -14,10 +17,12 @@ Step 1. do the thing
 
 
 @pytest.fixture
-def svc(tmp_path: Path) -> SkillService:
-    s = SkillService()
-    s.root = tmp_path
-    return s
+def svc(tmp_path: Path):
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as session:
+        s = SkillService(session)
+        s.root = tmp_path
+        yield s
 
 
 def test_import_valid(svc: SkillService):

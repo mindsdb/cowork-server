@@ -10,6 +10,8 @@ class SkillCreateRequest(CamelRequest):
     name: str
     description: str | None = None
     instructions: str | None = Field(default=None, alias="declarative")
+    enabled: bool | None = None
+    projects: list[str] | None = None
 
 
 class SkillUpdateRequest(CamelRequest):
@@ -17,6 +19,8 @@ class SkillUpdateRequest(CamelRequest):
     name: str | None = None
     description: str | None = None
     instructions: str | None = Field(default=None, alias="declarative")
+    enabled: bool | None = None
+    projects: list[str] | None = None
 
 
 class SkillResponse(CamelResponse):
@@ -27,4 +31,6 @@ class SkillResponse(CamelResponse):
     description: str | None
     instructions: str = Field(serialization_alias="declarative")
     created_at: datetime | None
+    enabled: bool
+    projects: list[str]
 

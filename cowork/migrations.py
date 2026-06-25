@@ -186,7 +186,7 @@ def seed_builtin_skills(session: Session) -> bool:
     if current >= BUILTIN_SKILLS_VERSION:
         return False
 
-    store = SkillService()
+    store = SkillService(session)
     copied = 0
     if BUILTIN_SKILLS_DIR.exists():
         store._ensure_root()
@@ -225,7 +225,7 @@ def migrate_skills_to_files(session: Session) -> bool:
     if svc._fetch_row(SKILL_MIGRATION_SENTINEL) is not None:
         return False
 
-    store = SkillService()
+    store = SkillService(session)
     rows = list(session.exec(select(SkillLegacy)).all())
 
     def _unique_slug(svc: SkillService, base: str, taken: set[str]) -> str:

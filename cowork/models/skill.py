@@ -11,6 +11,8 @@ from .base import BaseSQLModel
 
 META_DISPLAY_NAME = "display_name"
 META_CREATED_AT = "created_at"
+META_ENABLED = "enabled"
+META_PROJECTS = "projects"
 
 
 class Skill(AgentSkill):
@@ -30,6 +32,17 @@ class Skill(AgentSkill):
     @property
     def display_name(self) -> str:
         return self.metadata.get(META_DISPLAY_NAME) or self.name
+
+    @property
+    def enabled(self) -> bool:
+        # Default-on: only an explicit "false" disables the skill.
+        return self.metadata.get(META_ENABLED, "true").strip().lower() != "false"
+
+    @property
+    def projects(self) -> list[str]:
+        """Project ids the skill is distributed to (empty = none)."""
+        raw = self.metadata.get(META_PROJECTS, "")
+        return [p for p in (s.strip() for s in raw.split(",")) if p]
 
     @property
     def created_at(self) -> datetime | None:
