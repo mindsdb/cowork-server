@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from cowork.common.datetime_utils import ensure_utc
 from cowork.common.logger import get_logger
 from cowork.db.session import get_open_session
 from cowork.models.schedule import Schedule
@@ -33,9 +34,7 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
         return
 
     now = datetime.now(timezone.utc)
-    next_run = schedule.next_run_at
-    if next_run.tzinfo is None:
-        next_run = next_run.replace(tzinfo=timezone.utc)
+    next_run = ensure_utc(schedule.next_run_at)
 
     while next_run <= now:
         next_run += delta
@@ -51,9 +50,7 @@ def _handle_missed_runs(session) -> None:
         if not schedule.enabled:
             continue
 
-        next_run = schedule.next_run_at
-        if next_run.tzinfo is None:
-            next_run = next_run.replace(tzinfo=timezone.utc)
+        next_run = ensure_utc(schedule.next_run_at)
 
         if next_run >= now:
             continue
@@ -160,11 +157,7 @@ async def _scheduler_loop() -> None:
             schedules = ScheduleService(session).list_schedules()
             due = [
                 s for s in schedules
-                if s.enabled and (
-                    s.next_run_at.replace(tzinfo=timezone.utc)
-                    if s.next_run_at.tzinfo is None
-                    else s.next_run_at
-                ) <= now
+                if s.enabled and ensure_utc(s.next_run_at) <= now
             ]
         except Exception:
             logger.exception("Scheduler loop error during poll")
