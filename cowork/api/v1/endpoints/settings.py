@@ -225,7 +225,13 @@ async def recommended_models(session: SessionDep):
         None,
     )
     if oc_card:
-        oc_key = s.openai_api_key.get_secret_value() if s.openai_api_key else ""
+        # Read the openai-compatible key via provider_api_key so a user who set
+        # a dedicated openai_compatible_api_key is used (falls back to the
+        # shared openai_api_key), matching how the provider is actually built.
+        from cowork.common.settings.user_settings import Provider, provider_api_key
+
+        _oc = provider_api_key(s, Provider.OPENAI_COMPATIBLE)
+        oc_key = _oc.get_secret_value() if _oc else ""
         live, live_efforts = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
         if live:
             recommended["openai-compatible"] = live
