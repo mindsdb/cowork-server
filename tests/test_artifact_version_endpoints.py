@@ -1691,6 +1691,24 @@ def test_checkpoint_body_path_can_create_artifact_metadata(client: TestClient, t
     assert payload["artifact"]["title"] == "Path Created Artifact"
 
 
+def test_checkpoint_body_path_rejects_outside_project_artifacts(client: TestClient, tmp_path: Path):
+    folder = tmp_path / "outside-artifact"
+
+    response = client.post(
+        "/api/v1/artifacts/outside-path/checkpoints",
+        json={
+            "path": str(folder),
+            "title": "Outside Artifact",
+            "type": "document",
+            "primary": "report.md",
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "known project artifacts folder" in response.json()["detail"]
+    assert not folder.exists()
+
+
 def test_artifact_comments_can_be_suggested_resolved_and_reopened(client: TestClient):
     artifact_id, folder = _make_artifact(files={"report.md": "# Draft\n"})
     _checkpoint(client, artifact_id, label="Baseline")

@@ -272,6 +272,21 @@ def _load_published_map(folder: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _content_mtime(folder: Path) -> int:
+    """Max mtime (int seconds) across an artifact's user content files.
+
+    Disk-derived, so it reflects in-place edits the metadata.json mtime
+    misses. Housekeeping files (`metadata.json`, `README.md`,
+    `.published.json`) are excluded — they're not user content. Used both as
+    the renderer's cache-bust token and as the cheap "changed since publish"
+    gate for the `modified` badge.
+    """
+    try:
+        return int(max((p.stat().st_mtime for p in _user_files(folder)), default=0.0))
+    except OSError:
+        return 0
+
+
 def _published_url_for(folder: Path, primary: Path | None) -> str:
     if primary is None:
         return ""
@@ -299,6 +314,55 @@ def _published_version_for(folder: Path, primary: Path | None) -> dict:
         "publishedVersionNumber": entry.get("version_number"),
     }
     return {key: value for key, value in payload.items() if value not in ("", None)}
+
+
+def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool:
+    """Whether a *published* artifact's content diverged from what was published.
+
+    Hybrid mtime→md5 (see the 2026-06-23 design):
+      1. Not published → not modified.
+      2. Cheap gate: content_mtime <= published_mtime → not modified.
+      3. Exact: recompute the bundle md5; compare to last_md5.
+         - differ → modified;
+         - equal (mtime bumped, content identical) → not modified, and
+           self-heal published_mtime so the next listing hits the cheap gate.
+    A md5 we can't recompute (None) is treated as "can't tell" → not modified,
+    so the badge never appears on a false positive.
+    """
+    if primary is None:
+        return False
+    pmap = _load_published_map(folder)
+    entry = pmap.get(primary.name)
+    if not isinstance(entry, dict) or not entry.get("published", True):
+        return False
+    if not entry.get("report_id"):
+        return False
+
+    published_mtime = entry.get("published_mtime")
+    if isinstance(published_mtime, (int, float)) and content_mtime <= published_mtime:
+        return False  # cheap gate — nothing touched since publish
+
+    # Local import: publish imports this module, so import lazily to avoid a
+    # circular import (mirrors _unpublish_folder below).
+    from cowork.services.publish import compute_publish_md5
+
+    current_md5 = compute_publish_md5(str(folder))
+    if current_md5 is None:
+        return False  # can't tell — don't raise a false "modified"
+    if current_md5 != entry.get("last_md5"):
+        return True
+
+    # Content identical despite the bumped mtime — heal the snapshot so we
+    # don't re-zip on every future listing. Best-effort.
+    entry["published_mtime"] = content_mtime
+    pmap[primary.name] = entry
+    try:
+        (folder / ".published.json").write_text(
+            json.dumps(pmap, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        pass
+    return False
 
 
 def _published_access_for(folder: Path, primary: Path | None) -> dict:
@@ -852,13 +916,8 @@ def card_for_folder(folder: Path, idx: int = 0, *, viewer_email: str | None = No
 
     # Max mtime across the artifact's content files — a precise
     # "content changed" signal for the renderer's preview viewer to
-    # cache-bust/reload on (ENG-375). Disk-derived, so it reflects
-    # in-place edits that the metadata.json mtime / `updated` string
-    # miss. Rounded to an int so it's a stable cache-buster token.
-    try:
-        content_mtime = int(max((p.stat().st_mtime for p in files), default=0.0))
-    except OSError:
-        content_mtime = 0
+    # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
+    content_mtime = _content_mtime(folder)
 
     return {
         "id": meta.get("id") or folder.name,
@@ -878,6 +937,7 @@ def card_for_folder(folder: Path, idx: int = 0, *, viewer_email: str | None = No
         "primary": meta.get("primary") or None,
         "publishedUrl": _published_url_for(folder, primary),
         **_published_version_for(folder, primary),
+        "modified": _is_modified(folder, primary, content_mtime),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
         # is the plaintext, returned only to the owner's own session.
         **_published_access_for(folder, primary),
