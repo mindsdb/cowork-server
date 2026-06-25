@@ -45,7 +45,7 @@ Key structural API changes from the design doc:
 - **Conversations and messages** — previously stored as episodes on the filesystem by Anton's `HistoryStore`. Now first-class DB entities. Messages are persisted during streaming with a companion `message_events` table that stores the raw SSE event log for replay.
 - **Settings** — previously `~/.anton/.env` parsed by both Electron and the Python server. Now a DB `settings` table with encryption for sensitive values. A one-time migration reads the old `.env` and seeds the DB (read-only, non-destructive).
 - **Memory** — the design doc noted memory is harness-specific. `MemoryService` is a pass-through that delegates to whichever `HarnessProvider` is active. Anton uses its `Cortex`/`Hippocampus` system with files on disk; Hermes has its own implementation. No shared DB table.
-- **Skills** — moved to a DB `skills` table, synced to the active harness via `sync_skills()`.
+- **Skills** — canonical `SKILL.md` files (`~/.cowork/skills/<slug>/`) so they can be edited, uploaded, and distributed per project via symlinks. 
 - **Projects** — previously implicit from the filesystem. Now a DB `projects` table with a "General" project auto-seeded at startup.
 
 ## Data Migration
