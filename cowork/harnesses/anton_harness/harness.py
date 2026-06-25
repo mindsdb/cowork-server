@@ -139,6 +139,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
+        checkpoint_tracker = None
         # Attribute + surface any artifact created during this turn. Anton runs
         # with its own session id and doesn't tag artifacts with the cowork
         # conversation_id, so we diff the project's artifacts dir around the run
@@ -148,12 +149,24 @@ class AntonHarness:
         before_slugs = snapshot_artifact_slugs(artifacts_base)
         cards: list[dict] = []
         try:
+            checkpoint_tracker = self._build_artifact_checkpoint_tracker(conversation, input)
+            if checkpoint_tracker is not None:
+                checkpoint_tracker.snapshot_before(label="Before generated update")
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
             )
             async for event in session.turn_stream(self._to_anton_input(input)):
                 yield event
         finally:
+            if checkpoint_tracker is not None:
+                try:
+                    checkpoint_tracker.snapshot_after(label="Generated update")
+                except Exception:
+                    logger.warning(
+                        "Could not checkpoint generated artifact updates for conversation %s",
+                        getattr(conversation, "id", "<unknown>"),
+                        exc_info=True,
+                    )
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
             # One dir diff → index the new artifacts AND build their cards.
@@ -164,6 +177,45 @@ class AntonHarness:
             )
         for card in cards:
             yield ArtifactCreated(card)
+
+    def _build_artifact_checkpoint_tracker(
+        self,
+        conversation: Conversation,
+        input_blocks: list[TextInputBlock | FileInputBlock],
+    ):
+        try:
+            from sqlalchemy.orm import object_session
+            from cowork.services.artifact_generation_checkpoints import GeneratedArtifactCheckpointTracker
+
+            db_session = object_session(conversation)
+            project_path = getattr(getattr(conversation, "project", None), "path", None)
+            if db_session is None or not project_path:
+                return None
+            return GeneratedArtifactCheckpointTracker(
+                db_session,
+                Path(project_path) / ".anton" / "artifacts",
+                source_conversation_id=conversation.id,
+                prompt=self._prompt_text(input_blocks),
+            )
+        except Exception:
+            logger.warning(
+                "Could not prepare generated artifact checkpoint tracker for conversation %s",
+                getattr(conversation, "id", "<unknown>"),
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _prompt_text(input_blocks: list[dict]) -> str:
+        parts = []
+        for block in input_blocks:
+            if block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+            elif block.get("type") == "file":
+                parts.append(f"[Attached file: {block.get('filename') or block.get('path') or 'file'}]")
+            elif block.get("type") == "image":
+                parts.append("[Attached image]")
+        return "\n\n".join(part for part in parts if part).strip()
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
