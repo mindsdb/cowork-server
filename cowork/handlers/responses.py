@@ -129,6 +129,8 @@ class ResponsesHandler:
                     harness_name=get_user_settings().harness,
                     harness_id=getattr(self.harness, "id", None),
                     buffer=buffer,
+                    trace_tags=request.trace_tags,
+                    trace_metadata=request.trace_metadata,
                 ),
             )
             return sse_from_buffer(buffer, 0)
@@ -149,6 +151,8 @@ class ResponsesHandler:
             conversation=conversation,
             input=harness_input,
             disabled_connections=disabled,
+            trace_tags=request.trace_tags,
+            trace_metadata=request.trace_metadata,
         )
         return await self._collect(stream, conversation.id, request.model, str(user_message.id))
 
@@ -163,6 +167,8 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -200,6 +206,7 @@ class ResponsesHandler:
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,
+                trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):

@@ -132,6 +132,11 @@ class HermesHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        # Accepted for HarnessProvider compatibility; Hermes does not emit
+        # Langfuse traces, so these observability hints are intentionally
+        # ignored. Wire them up here if Hermes gains trace emission.
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
     ) -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict | None] = asyncio.Queue()
