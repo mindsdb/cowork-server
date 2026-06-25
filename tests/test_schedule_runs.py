@@ -41,13 +41,25 @@ def test_has_running_run_false_when_no_runs():
     assert ScheduleRunService(session).has_running_run(schedule.id) is False
 
 
-def test_has_running_run_true_while_status_running():
+def test_has_running_run_true_for_scheduled_run_in_progress():
     session = _session()
     schedule = _schedule(session)
     run_service = ScheduleRunService(session)
-    run = run_service.create_run(schedule.id)
+    run = run_service.create_run(schedule.id, is_manual=False)
 
     assert run_service.has_running_run(schedule.id) is True
+
+    run_service.finish_run(run.id)
+    assert run_service.has_running_run(schedule.id) is False
+
+
+def test_has_running_run_ignores_manual_run_in_progress():
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+    run = run_service.create_run(schedule.id, is_manual=True)
+
+    assert run_service.has_running_run(schedule.id) is False
 
     run_service.finish_run(run.id)
     assert run_service.has_running_run(schedule.id) is False
