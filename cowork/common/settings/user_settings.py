@@ -297,7 +297,11 @@ class UserSettings(Settings):
         return self
 
     def _has_key(self, p: Provider) -> bool:
-        return getattr(self, p.api_key_field, None) is not None
+        # provider_api_key applies the gemini/openai-compatible → shared-openai
+        # fallback, so a provider configured via EITHER its dedicated slot or the
+        # legacy shared slot is correctly seen as keyed. (Raw getattr on the
+        # dedicated slot would miss a gemini/oc user on the shared key.)
+        return provider_api_key(self, p) is not None
 
     def _resolve_provider(self, preferred: Provider) -> Provider:
         """The provider actually usable for `preferred`: itself if its key is
@@ -312,7 +316,17 @@ class UserSettings(Settings):
         ``preferred`` unchanged when nothing is configured."""
         if self._has_key(preferred):
             return preferred
-        for p in (Provider.MINDS_CLOUD, Provider.ANTHROPIC, Provider.OPENAI):
+        # Probe ALL providers (incl. gemini / openai-compatible, which have
+        # dedicated key slots since the isolation change) — not just the legacy
+        # minds/anthropic/openai trio — so a user who configured only a gemini
+        # or openai-compatible key still resolves to a usable provider.
+        for p in (
+            Provider.MINDS_CLOUD,
+            Provider.ANTHROPIC,
+            Provider.OPENAI,
+            Provider.GEMINI,
+            Provider.OPENAI_COMPATIBLE,
+        ):
             if self._has_key(p):
                 return p
         return preferred

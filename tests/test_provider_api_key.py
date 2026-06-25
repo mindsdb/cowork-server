@@ -85,6 +85,44 @@ class TestConfigStatusFallback:
         assert s.config_status["config_ready"] is False
 
 
+class TestResolverIsolation:
+    """Readiness resolver (#93) + dedicated key slots (#113): a user who
+    configured ONLY a gemini / openai-compatible key while planning_provider
+    still points at a keyless provider must resolve to that provider and read
+    as ready. Guards the bug that emerges from combining the two."""
+
+    def test_gemini_only_key_resolves_when_planning_is_keyless(self):
+        s = _settings(
+            planning_provider=Provider.ANTHROPIC,   # keyless
+            gemini_api_key=SecretStr("AIza-only"),
+        )
+        assert s.resolved_planning_provider == Provider.GEMINI
+        assert s.config_status["config_ready"] is True
+
+    def test_openai_compatible_only_key_resolves_when_planning_is_keyless(self):
+        s = _settings(
+            planning_provider=Provider.ANTHROPIC,   # keyless
+            openai_compatible_api_key=SecretStr("sk-compat-only"),
+        )
+        assert s.resolved_planning_provider == Provider.OPENAI_COMPATIBLE
+        assert s.config_status["config_ready"] is True
+
+    def test_legacy_shared_openai_key_still_resolves(self):
+        # Legacy single-key config (only the shared openai slot) keeps working
+        # via the fallback — resolver finds OPENAI.
+        s = _settings(
+            planning_provider=Provider.ANTHROPIC,   # keyless
+            openai_api_key=SecretStr("sk-shared"),
+        )
+        assert s.resolved_planning_provider == Provider.OPENAI
+        assert s.config_status["config_ready"] is True
+
+    def test_nothing_configured_returns_preferred_and_not_ready(self):
+        s = _settings(planning_provider=Provider.ANTHROPIC)
+        assert s.resolved_planning_provider == Provider.ANTHROPIC
+        assert s.config_status["config_ready"] is False
+
+
 class TestCheckConfiguredGeminiOnly:
     """A gemini-only user (dedicated key, no shared openai key) must read as
     configured — /configured gates app startup (App.tsx)."""
