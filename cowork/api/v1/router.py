@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from cowork.api.v1.endpoints import (
     activity,
     artifact_edits,
+    artifact_shares,
     artifact_versions,
     artifacts,
     conversations,
@@ -76,6 +77,7 @@ api_router.include_router(channels.router, prefix="/channels", tags=["channels"]
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
 api_router.include_router(artifact_versions.router, prefix="/artifacts", tags=["artifact-versions"])
 api_router.include_router(artifact_edits.router, prefix="/artifacts", tags=["artifact-edits"])
+api_router.include_router(artifact_shares.router, prefix="/artifacts", tags=["artifact-shares"])
 api_router.include_router(activity.router, prefix="/activity", tags=["activity"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])

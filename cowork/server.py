@@ -52,6 +52,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
     start_scheduler()
+    from cowork.services.notifications import start_notification_dispatcher
+    start_notification_dispatcher()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.ingress import sync_channel_ingress
     from cowork.channels.registry import get_registry
@@ -66,14 +68,22 @@ async def lifespan(app: FastAPI):
         from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.http_client import close_proxy_client
         from cowork.services.artifacts import shutdown_launched_backends
+        from cowork.services.notifications import stop_notification_dispatcher
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        await stop_notification_dispatcher()
         await app.state.channel_adapters.shutdown()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
+        if token_refresh_task is not None:
+            token_refresh_task.cancel()
+            try:
+                await token_refresh_task
+            except asyncio.CancelledError:
+                pass
 
 
 def create_app() -> FastAPI:
