@@ -261,10 +261,56 @@ class UserSettings(Settings):
             self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
         return self
 
+    def _has_key(self, p: Provider) -> bool:
+        return getattr(self, p.api_key_field, None) is not None
+
+    def _resolve_provider(self, preferred: Provider) -> Provider:
+        """The provider actually usable for `preferred`: itself if its key is
+        set, otherwise the first configured provider (managed MindsHub first).
+
+        Mirrors the client's ``defaultModeProviderType`` so the readiness gate
+        (``config_status``, surfaced at ``/health`` as ``config_ready`` — the
+        signal the frontend's chat gate AND onboarding-vs-app routing read) and
+        the agent's LLM client (``build_llm_client``) agree on what "configured"
+        means — adding any key takes effect even if the stored
+        ``planning_provider`` still points at a keyless provider. Returns
+        ``preferred`` unchanged when nothing is configured."""
+        if self._has_key(preferred):
+            return preferred
+        for p in (Provider.MINDS_CLOUD, Provider.ANTHROPIC, Provider.OPENAI):
+            if self._has_key(p):
+                return p
+        return preferred
+
+    @property
+    def resolved_planning_provider(self) -> Provider:
+        return self._resolve_provider(self.planning_provider)
+
+    @property
+    def resolved_coding_provider(self) -> Provider:
+        return self._resolve_provider(self.coding_provider)
+
+    @property
+    def resolved_planning_model(self) -> str | None:
+        p = self.resolved_planning_provider
+        # Keep the user's chosen model when we didn't have to switch provider;
+        # otherwise fall back to the resolved provider's default model so we
+        # don't hand e.g. a Claude model id to the MindsHub gateway.
+        return self.planning_model if p == self.planning_provider else PLANNING_MODEL_DEFAULTS.get(p.value)
+
+    @property
+    def resolved_coding_model(self) -> str | None:
+        p = self.resolved_coding_provider
+        return self.coding_model if p == self.coding_provider else CODING_MODEL_DEFAULTS.get(p.value)
+
     @property
     def config_status(self) -> dict[str, Any]:
-        """Whether the active planning provider has an API key configured."""
-        p = self.planning_provider
+        """Whether a usable provider is configured.
+
+        Resolves the active planning provider to the first one that actually
+        has a key (see ``_resolve_provider``) so this readiness signal matches
+        what ``build_llm_client`` will actually run with."""
+        p = self.resolved_planning_provider
         key_field = p.api_key_field
         has_key = getattr(self, key_field, None) is not None
         label = p.label
@@ -273,7 +319,7 @@ class UserSettings(Settings):
             "config_error": None if has_key else f"Configure {key_field} for {label}.",
             "provider": p.value,
             "provider_label": label,
-            "model": self.planning_model or "",
+            "model": self.resolved_planning_model or "",
         }
 
     @staticmethod
