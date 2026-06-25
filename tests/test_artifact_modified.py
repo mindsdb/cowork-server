@@ -346,3 +346,27 @@ def test_artifact_status_unknown_path_is_blank(tmp_path: Path):
     assert s["publishedUrl"] == ""
     assert s["modified"] is False
     assert s["accessMode"] == "public"
+
+
+def test_artifact_status_loose_file_never_leaks_password(tmp_path: Path):
+    # Loose file (no metadata.json) published password-protected → exercises
+    # the card_for_folder-is-None fallback. The owner-only plaintext password
+    # must NOT appear in the status response.
+    f = tmp_path / "page.html"
+    f.write_text("<h1>hi</h1>", encoding="utf-8")
+    (tmp_path / ".published.json").write_text(
+        json.dumps({
+            "page.html": {
+                "report_id": "rid", "url": "https://4nton.ai/a/rid", "published": True,
+                "mode": "password", "requires_password": True,
+                "access_password": "s3cret", "pwd_version": 1,
+            }
+        }),
+        encoding="utf-8",
+    )
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(f))
+    assert s["accessMode"] == "password"
+    assert s["accessProtected"] is True
+    assert s["publishedUrl"] == "https://4nton.ai/a/rid"
+    assert "accessPassword" not in s        # plaintext must never leak
