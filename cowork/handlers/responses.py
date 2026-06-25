@@ -210,9 +210,8 @@ class ResponsesHandler:
             persist()
             await buffer.close("completed")
         except asyncio.CancelledError:
-            # Explicit /cancel (Stop button). Buffer writes are synchronous
-            # for the file backend, so they complete despite cancellation.
-            await buffer.append("sse", {"sse": response_failed_sse("Stopped by user.", "cancelled")})
+            # Nothing special is emitted on cancellation.
+            # The partial text and evennts generated before cancellation are persisted.
             persist()
             await buffer.close("cancelled")
             return
