@@ -73,6 +73,29 @@ def _save_state(state: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _write_publish_record(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+            encoding="utf-8",
+        ) as handle:
+            tmp = Path(handle.name)
+            handle.write(json.dumps(payload, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise RuntimeError("Could not persist publish record") from exc
+
+
 def _secret_str(val: SecretStr | str | None) -> str:
     """Unwrap a SecretStr (or plain string) to a plain string, defaulting to ''."""
     if val is None:
@@ -219,6 +242,39 @@ def _resolve_access(
     return {"mode": "public"}, pwd_version, access_version, {"mode": "public", "requires_password": False}
 
 
+def access_for_republish(previous: Any) -> tuple[dict | None, int, int, dict]:
+    """Re-derive a prior publish's access for a re-publish that carries no
+    explicit access selection (the chat publish tool always publishes with no
+    access UI). Without this, a re-publish silently downgrades a password- or
+    restricted artifact to public — clearing protection on the 4nton.ai backend
+    AND dropping the access keys from ``.published.json`` (so the owner-side lock
+    badge disappears too).
+
+    Returns ``(effective_access, pwd_version, access_version, owner_side)`` —
+    same shape as ``_resolve_access``. ``effective_access`` is ``None`` when the
+    artifact was public (or had no prior record), so the caller can omit the
+    ``access`` kwarg and behave exactly like a fresh public publish.
+    """
+    prev = previous if isinstance(previous, dict) else {}
+    access: dict | None = None
+    if prev.get("mode") == "password" and prev.get("access_password"):
+        access = {"mode": "password", "password": prev.get("access_password")}
+    elif prev.get("mode") == "restricted" and (prev.get("emails") or prev.get("org_allowed")):
+        access = {
+            "mode": "restricted",
+            "emails": prev.get("emails") or [],
+            "org_allowed": bool(prev.get("org_allowed")),
+        }
+    if access is None:
+        return None, prev.get("pwd_version", 0) or 1, prev.get("access_version", 0) or 1, {
+            "mode": "public",
+            "requires_password": False,
+        }
+    # Re-run through the single access resolver so versions stay correct
+    # (unchanged password/list => no version bump).
+    return _resolve_access(None, access, prev)
+
+
 # Static artifact extensions a user can publish to a 4nton.ai web page.
 # `.html` is served as-is; `.md` is rendered to a styled HTML page first
 # (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
@@ -322,7 +378,13 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
-def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None) -> dict:
+def publish_artifact(
+    raw_path: str,
+    password: str | None = None,
+    access: dict | None = None,
+    version_metadata: dict[str, Any] | None = None,
+    publish_source_path: str | None = None,
+) -> dict:
     settings = get_user_settings()
     api_key = _secret_str(settings.minds_api_key)
     if not api_key:
@@ -332,7 +394,13 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
     # artifacts) or a single file (legacy loose-HTML / chat-bubble / the
     # Utilities per-page list). `_resolve_publish_target` normalizes both.
     artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(artifact)
+    live_publish_target, published_dir, published_key, _live_is_fullstack = _resolve_publish_target(artifact)
+    source_artifact = (
+        Path(publish_source_path).expanduser().resolve(strict=False)
+        if publish_source_path
+        else artifact
+    )
+    publish_target, _source_published_dir, _source_published_key, is_fullstack = _resolve_publish_target(source_artifact)
     if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
@@ -396,7 +464,7 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
     returned_report_id = result.get("report_id", "")
     if returned_report_id:
         history_item = {
-            "artifact": str(publish_target),
+            "artifact": str(live_publish_target),
             "artifactName": published_key,
             "url": view_url,
             "reportId": returned_report_id,
@@ -417,11 +485,24 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             "published": True,
             **owner_side,
         }
+        if isinstance(version_metadata, dict):
+            version_id = version_metadata.get("id") or version_metadata.get("versionId")
+            if version_id:
+                entry["version_id"] = str(version_id)
+            artifact_id = version_metadata.get("artifact_id") or version_metadata.get("artifactId")
+            if artifact_id:
+                entry["artifact_id"] = str(artifact_id)
+            files_hash = version_metadata.get("files_hash") or version_metadata.get("filesHash")
+            if files_hash:
+                entry["files_hash"] = str(files_hash)
+            manifest_hash = version_metadata.get("manifest_hash") or version_metadata.get("manifestHash")
+            if manifest_hash:
+                entry["manifest_hash"] = str(manifest_hash)
+            version_number = version_metadata.get("version_number") or version_metadata.get("versionNumber")
+            if version_number:
+                entry["version_number"] = version_number
         published_map[published_key] = entry
-        try:
-            published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
-        except Exception:
-            pass
+        _write_publish_record(published_json, published_map)
         state = _load_state()
         state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
         _save_state(state)
@@ -429,6 +510,10 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
     return {
         "status": "ok",
         "url": view_url,
+        "publishedVersionId": str((version_metadata or {}).get("id") or (version_metadata or {}).get("versionId") or ""),
+        "publishedFilesHash": str((version_metadata or {}).get("files_hash") or (version_metadata or {}).get("filesHash") or ""),
+        "publishedManifestHash": str((version_metadata or {}).get("manifest_hash") or (version_metadata or {}).get("manifestHash") or ""),
+        "publishedVersionNumber": (version_metadata or {}).get("version_number") or (version_metadata or {}).get("versionNumber"),
         "accessMode": owner_side.get("mode", "public"),
         "accessProtected": bool(owner_side.get("requires_password")),
         "accessEmails": owner_side.get("emails", []),
@@ -527,6 +612,7 @@ def unpublish_artifact(raw_path: str) -> dict:
             logger.exception("Unpublishing failed (identifier=%s)", identifier)
             raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
+    entry_snapshot = dict(entry) if isinstance(entry, dict) else {}
     # Soft-delete: keep report_id (and url) so a later re-publish reuses the
     # same public URL. Only flip `published` off so readers stop showing it as
     # live. The backend object is gone, but lambda re-mints at the same id when
@@ -534,11 +620,15 @@ def unpublish_artifact(raw_path: str) -> dict:
     if isinstance(entry, dict):
         entry["published"] = False
         published_map[published_key] = entry
-        try:
-            published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
-        except Exception:
-            pass
-    return {"status": "ok"}
+        _write_publish_record(published_json, published_map)
+    return {
+        "status": "ok",
+        "publishedUrl": entry_snapshot.get("url") or "",
+        "publishedVersionId": entry_snapshot.get("version_id") or "",
+        "publishedFilesHash": entry_snapshot.get("files_hash") or "",
+        "publishedManifestHash": entry_snapshot.get("manifest_hash") or "",
+        "publishedVersionNumber": entry_snapshot.get("version_number"),
+    }
 
 
 def update_artifact(raw_path: str) -> dict:

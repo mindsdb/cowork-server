@@ -22,12 +22,23 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 import uuid
 
 logger = logging.getLogger(__name__)
+
+
+class PublishSnapshotError(RuntimeError):
+    pass
+
+
+def _get_env(name: str) -> str:
+    return os.environ.get(name, "").strip()
 
 
 def _published_state(raw_path: str) -> dict:
@@ -37,9 +48,148 @@ def _published_state(raw_path: str) -> dict:
     return published_state(raw_path)
 
 
-def _publish_artifact(raw_path: str) -> dict:
-    from cowork.services.publish import publish_artifact
-    return publish_artifact(raw_path)
+def _snapshot_publish_attempt(file_path: Path):
+    try:
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.session import get_open_session
+        from cowork.services.artifact_versions import snapshot_artifact
+
+        with get_open_session(get_app_settings().database.uri) as db_session:
+            version = snapshot_artifact(db_session, str(file_path), operation_type="publish", label="Published version")
+            return getattr(version, "id", None)
+    except Exception:
+        logger.warning("Could not create publish checkpoint for %s", file_path, exc_info=True)
+        return None
+
+
+def _publish_version_metadata(version_id) -> dict[str, Any]:
+    if version_id is None:
+        return {}
+    try:
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.session import get_open_session
+        from cowork.models.artifact import ArtifactVersion
+
+        with get_open_session(get_app_settings().database.uri) as db_session:
+            version = db_session.get(ArtifactVersion, version_id)
+            if version is None:
+                return {}
+            return {
+                "artifact_id": str(version.artifact_id),
+                "files_hash": version.files_hash,
+                "manifest_hash": version.manifest_hash,
+                "version_number": version.version_number,
+            }
+    except Exception:
+        logger.warning("Could not read publish version metadata for %s", version_id, exc_info=True)
+        return {}
+
+
+def _record_publish_result(version_id, *, status: str, url: str | None = None, details: dict | None = None) -> None:
+    if version_id is None:
+        return
+    try:
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.session import get_open_session
+        from cowork.models.artifact import Artifact, ArtifactVersion
+        from cowork.services.artifact_versions import record_deployment
+
+        with get_open_session(get_app_settings().database.uri) as db_session:
+            version = db_session.get(ArtifactVersion, version_id)
+            if version is None:
+                return
+            failed_deployment = record_deployment(
+                db_session,
+                version,
+                target="publish",
+                status=status,
+                url=url,
+                details=details or {},
+            )
+            if status == "failed":
+                artifact = db_session.get(Artifact, version.artifact_id)
+                if artifact is not None:
+                    rollback_version_id = artifact.last_known_good_version_id or version.parent_version_id
+                    rollback_error = None
+                    if rollback_version_id is not None:
+                        try:
+                            from cowork.services.artifact_versions import ArtifactVersionService
+
+                            ArtifactVersionService(db_session).replace_with_version(
+                                rollback_version_id,
+                                artifact.path,
+                                preserve_published=True,
+                            )
+                        except Exception as exc:
+                            rollback_error = str(exc) or exc.__class__.__name__
+                            logger.warning(
+                                "Could not roll back artifact files after failed publish for version %s",
+                                version_id,
+                                exc_info=True,
+                            )
+                    if rollback_error:
+                        failed_details = dict(failed_deployment.details or {})
+                        failed_details["rollbackError"] = rollback_error
+                        failed_deployment.details = failed_details
+                        db_session.add(failed_deployment)
+                        db_session.commit()
+                    elif rollback_version_id is not None:
+                        artifact.current_version_id = rollback_version_id
+                        db_session.add(artifact)
+                        db_session.commit()
+    except Exception:
+        logger.warning("Could not record publish %s for version %s", status, version_id, exc_info=True)
+
+
+@contextmanager
+def _materialized_publish_source(file_path: Path, version_id):
+    """Yield the immutable snapshot path that should be uploaded for a publish."""
+    if version_id is None:
+        yield file_path
+        return
+
+    temp_dir: TemporaryDirectory | None = None
+    source = file_path
+    try:
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.session import get_open_session
+        from cowork.models.artifact import Artifact, ArtifactVersion
+        from cowork.services.artifact_versions import ArtifactVersionService
+
+        temp_dir = TemporaryDirectory(prefix="cowork-chat-publish-version-")
+        with get_open_session(get_app_settings().database.uri) as db_session:
+            version = db_session.get(ArtifactVersion, version_id)
+            if version is not None:
+                artifact = db_session.get(Artifact, version.artifact_id)
+                materialized_root = Path(temp_dir.name) / "artifact"
+                version_service = ArtifactVersionService(db_session)
+                version_service.materialize_version(
+                    version.id,
+                    materialized_root,
+                    clean=True,
+                )
+                version_service.write_version_housekeeping(version.id, materialized_root)
+                source = materialized_root
+                if artifact is not None:
+                    try:
+                        rel = file_path.relative_to(Path(artifact.path))
+                        candidate = materialized_root / rel
+                        if candidate.is_file():
+                            source = candidate
+                    except ValueError:
+                        pass
+    except Exception:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+            temp_dir = None
+        logger.exception("Could not materialize publish checkpoint for %s", file_path)
+        raise PublishSnapshotError("Could not prepare the versioned artifact for publishing")
+
+    try:
+        yield source
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
@@ -141,31 +291,146 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     if action != "publish":
         return f"publish_or_preview: unknown action '{action}'"
 
-    # action == 'publish' — delegate to the service (single source of truth for
-    # target resolution, fullstack bundling, vault secrets, access, history,
-    # and report_id reuse). The tool always publishes public.
+    # ── action == 'publish' ───────────────────────────────────────────
+    # Read the API key the same way the cowork HTTP endpoint does so
+    # both code paths agree on what's "configured".
+    from .settings import AntonHarnessSettings
+
+    api_key = _get_env("ANTON_MINDS_API_KEY")
+    if not api_key:
+        return (
+            "STOP: No Minds API key configured. Tell the user to set their "
+            "Minds API key in Settings (or in their .env) before publishing. "
+            "Do NOT call this tool again until they confirm the key is set."
+        )
+
+    settings = AntonHarnessSettings()
+    publish_url = settings.publish_url
+    ssl_verify = settings.publish_ssl_verify
+
     try:
-        result = _publish_artifact(abs_path)
-    except ValueError as exc:
-        # The service raises ValueError for several distinct reasons. Only the
-        # missing-API-key case warrants the STOP/"go configure a key" directive;
-        # others (unsupported file type, unresolvable path) are real publish
-        # failures — surfacing them as STOP would send the user chasing a key
-        # they already have and block a legitimate retry.
-        if "api key" in str(exc).lower():
-            logger.info("Cowork publish blocked: %s", exc)
-            return (
-                "STOP: No Minds API key configured. Tell the user to set their "
-                "Minds API key in Settings (or in their .env) before publishing. "
-                "Do NOT call this tool again until they confirm the key is set."
-            )
-        logger.info("Cowork publish rejected: %s", exc)
+        from anton.publisher import publish
+    except Exception as exc:
+        logger.exception("Cowork publish tool could not import anton.publisher")
+        return f"PUBLISH FAILED: anton.publisher unavailable ({exc})"
+
+    output_dir = file_path.parent
+    published_json_path = output_dir / ".published.json"
+    published_map: dict[str, Any] = {}
+    if published_json_path.is_file():
+        try:
+            published_map = json.loads(published_json_path.read_text(encoding="utf-8"))
+        except Exception:
+            published_map = {}
+
+    file_key = file_path.name
+    prev = published_map.get(file_key)
+    report_id = prev.get("report_id") if isinstance(prev, dict) else None
+
+    # Preserve any access protection from the prior publish. The chat tool has
+    # no access UI, so without this a re-publish would silently downgrade a
+    # password/restricted artifact to public — clearing it on the backend and
+    # dropping the lock from .published.json. effective_access is None for a
+    # public (or first-time) publish, in which case we omit the kwargs and
+    # publish public exactly as before.
+    from cowork.services.publish import access_for_republish
+    effective_access, pwd_version, access_version, owner_side = access_for_republish(prev)
+    access_kwargs = (
+        {}
+        if effective_access is None
+        else {"access": effective_access, "access_version": access_version, "pwd_version": pwd_version}
+    )
+
+    def _do_publish(source_path: Path, rid: str | None):
+        return publish(
+            source_path,
+            api_key=api_key,
+            report_id=rid,
+            publish_url=publish_url,
+            ssl_verify=ssl_verify,
+            **access_kwargs,
+        )
+
+    publish_version_id = _snapshot_publish_attempt(file_path)
+    if publish_version_id is None:
+        return "PUBLISH FAILED: Could not create a publish checkpoint."
+    try:
+        with _materialized_publish_source(file_path, publish_version_id) as publish_source:
+            result = _do_publish(publish_source, report_id)
+    except PublishSnapshotError as exc:
+        _record_publish_result(
+            publish_version_id,
+            status="failed",
+            details={"error": str(exc)},
+        )
         return f"PUBLISH FAILED: {exc}"
     except Exception as exc:
-        logger.exception("Cowork publish tool failed")
-        return f"PUBLISH FAILED: {exc}"
+        # If we tried to update an existing report and the upstream
+        # rejected it (e.g. report was deleted), retry as a fresh one
+        # — same recovery path anton's CLI tool uses.
+        if report_id:
+            try:
+                with _materialized_publish_source(file_path, publish_version_id) as publish_source:
+                    result = _do_publish(publish_source, None)
+            except PublishSnapshotError as snapshot_exc:
+                _record_publish_result(
+                    publish_version_id,
+                    status="failed",
+                    details={"error": str(snapshot_exc)},
+                )
+                return f"PUBLISH FAILED: {snapshot_exc}"
+            except Exception as retry_exc:
+                logger.exception("Cowork publish retry failed")
+                _record_publish_result(
+                    publish_version_id,
+                    status="failed",
+                    details={"error": str(retry_exc)},
+                )
+                return f"PUBLISH FAILED: {retry_exc}"
+        else:
+            logger.exception("Cowork publish failed")
+            _record_publish_result(
+                publish_version_id,
+                status="failed",
+                details={"error": str(exc)},
+            )
+            return f"PUBLISH FAILED: {exc}"
 
-    view_url = result.get("url", "") if isinstance(result, dict) else ""
+    view_url = result.get("view_url", "") if isinstance(result, dict) else ""
+    returned_report_id = result.get("report_id", "") if isinstance(result, dict) else ""
+
+    if returned_report_id:
+        published_map[file_key] = {
+            "report_id": returned_report_id,
+            "url": view_url,
+            "last_md5": result.get("md5", "") if isinstance(result, dict) else "",
+            # Mirror the GUI publish path (services.publish.publish_artifact): a
+            # record written by the chat tool must read back identically. Readers
+            # gate liveness on this flag (a later unpublish flips it to False),
+            # so omitting it would only work by relying on the .get(..., True)
+            # default — set it explicitly.
+            "published": True,
+            # Persist the resolved owner-side access (mode/password/emails/...)
+            # so a protected artifact stays protected on re-publish and the
+            # lock badge survives — same shape the GUI path writes.
+            **owner_side,
+            "version_id": str(publish_version_id or ""),
+            **_publish_version_metadata(publish_version_id),
+        }
+        try:
+            published_json_path.write_text(
+                json.dumps(published_map, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.debug("Could not persist .published.json", exc_info=True)
+
+    _record_publish_result(
+        publish_version_id,
+        status="published",
+        url=view_url,
+        details={"reportId": returned_report_id},
+    )
     if not view_url:
         return "Published, but no view URL was returned."
     return f"Published successfully! View URL: {view_url}"
