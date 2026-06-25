@@ -301,3 +301,48 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     with patch.object(publish_ep, "_update", _raise):
         res = client.post("/api/v1/publish/update", json={"path": "/some/art"})
     assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Task 6: artifact_status — the preview viewer's live in-place refresh (ENG-468)
+# ---------------------------------------------------------------------------
+
+from cowork.services.artifacts import artifact_status
+
+
+def test_artifact_status_unpublished(tmp_path: Path):
+    root = _make_static_html(tmp_path)  # never published
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root))
+    assert s["publishedUrl"] == ""
+    assert s["modified"] is False
+    assert s["accessMode"] == "public"
+    assert s["accessProtected"] is False
+
+
+def test_artifact_status_published_unmodified(tmp_path: Path):
+    root = _publish_static(tmp_path)
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root))
+    assert s["publishedUrl"]            # carries the view_url
+    assert s["modified"] is False
+
+
+def test_artifact_status_modified_after_change(tmp_path: Path):
+    root = _publish_static(tmp_path)
+    idx = root / "index.html"
+    idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
+    _touch(idx, publish_mod._content_mtime(root) + 100)
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root))
+    assert s["modified"] is True
+    assert s["publishedUrl"]            # still published
+
+
+def test_artifact_status_unknown_path_is_blank(tmp_path: Path):
+    # A path that can't be resolved → blank default, never raises.
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(tmp_path / "does-not-exist"))
+    assert s["publishedUrl"] == ""
+    assert s["modified"] is False
+    assert s["accessMode"] == "public"

@@ -19,6 +19,7 @@ from sqlmodel import Session
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
+    artifact_status as _artifact_status,
     delete_artifact as _delete_artifact,
     get_preview_mount,
     list_artifacts as _list_artifacts,
@@ -40,6 +41,13 @@ class _PathBody(BaseModel):
 @router.get("/")
 async def list_artifacts(project_path: str | None = Query(default=None)):
     return _list_artifacts(project_path)
+
+
+@router.get("/status")
+async def artifact_status(path: str = Query(...)):
+    # Cheap published/modified/access read for the preview viewer's in-place
+    # refresh. Never raises for an unknown path — returns the blank default.
+    return _artifact_status(path)
 
 
 @router.get("/preview")
