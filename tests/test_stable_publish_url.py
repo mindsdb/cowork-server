@@ -236,52 +236,24 @@ def test_tool_ask_reports_not_published(tmp_path: Path):
     assert "NOT" in out or "not been published" in out
 
 
-def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
-    root = _make_fullstack(tmp_path)
-    captured = {}
-
-    def _fake_publish_artifact(raw_path):
-        captured["path"] = raw_path
-        return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
-
-    with patch.object(tools_mod, "_publish_artifact", _fake_publish_artifact):
-        out = _run(tools_mod._cowork_publish_or_preview(
-            _FakeSession(tmp_path),
-            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
-        ))
-    assert "https://4nton.ai/a/uuid-1" in out
-    assert captured["path"].endswith("static/index.html")
+# The chat publish *tool* (`action='publish'`) keeps cowork's inline
+# version-tracking implementation (snapshot-before-publish, materialized-source
+# upload, deployment recording, rollback-on-failure) instead of delegating to
+# publish_artifact(). Its happy- and failure-path behaviour is covered by
+# test_artifact_version_endpoints.py::test_chat_publish_tool_* (real DB). The one
+# tool-level behaviour still worth asserting here is the pre-flight API-key gate,
+# which short-circuits before any publish work happens.
 
 
 def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
     root = _make_fullstack(tmp_path)
-
-    def _raise(raw_path):
-        raise ValueError("Configure your Minds API key in Settings before publishing")
-
-    with patch.object(tools_mod, "_publish_artifact", _raise):
+    # No Minds API key configured -> STOP before attempting to publish.
+    with patch.object(tools_mod, "_get_env", lambda name: ""):
         out = _run(tools_mod._cowork_publish_or_preview(
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
     assert "STOP" in out and "API key" in out
-
-
-def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: Path):
-    # Review #1: a non-key ValueError must not be reported as "no API key".
-    root = _make_fullstack(tmp_path)
-
-    def _raise(raw_path):
-        raise ValueError("Only HTML and Markdown artifacts can be published")
-
-    with patch.object(tools_mod, "_publish_artifact", _raise):
-        out = _run(tools_mod._cowork_publish_or_preview(
-            _FakeSession(tmp_path),
-            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
-        ))
-    assert "STOP" not in out
-    assert "PUBLISH FAILED" in out
-    assert "Only HTML and Markdown" in out
 
 
 # ---------------------------------------------------------------------------
