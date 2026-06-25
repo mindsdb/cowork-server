@@ -7,7 +7,7 @@ from sqlmodel import Session
 
 from cowork.db.session import get_session
 from cowork.schemas.files import FileListResponse, FileResponse
-from cowork.services.files import FileService
+from cowork.services.files import FileService, FileValidationError
 
 
 router = APIRouter()
@@ -20,7 +20,12 @@ async def upload_file(
     purpose: Annotated[str, Form()],
     session: SessionDep,
 ):
-    return await FileService(session).create_file(file, purpose)
+    try:
+        return await FileService(session).create_file(file, purpose)
+    except FileValidationError as e:
+        # Over the size cap or a disallowed type — surface the human-
+        # readable reason as a 400, not a generic 500.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.get("/", response_model=FileListResponse)
