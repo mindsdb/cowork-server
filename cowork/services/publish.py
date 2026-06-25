@@ -405,8 +405,9 @@ def publish_artifact(
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
     try:
-        from anton.core.datasources.data_vault import LocalDataVault
         from anton.publisher import publish
+
+        from cowork.services.connectors.encrypted_vault import build_vault
     except Exception as exc:
         raise RuntimeError("Anton publisher is unavailable") from exc
 
@@ -451,7 +452,7 @@ def publish_artifact(
             # (`~/.cowork/data-vault`), not anton's default
             # (`~/.anton/data_vault`) — otherwise secrets are missed and
             # the published artifact has no DB connection in the cloud.
-            vault=LocalDataVault(Path(get_app_settings().connector.vault_dir)),
+            vault=build_vault(Path(get_app_settings().connector.vault_dir)),
         )
     except Exception as exc:
         logger.exception("Publishing failed")

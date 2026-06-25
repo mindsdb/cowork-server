@@ -132,8 +132,8 @@ class ProbeHandler:
             # Missing conversation context is fine: a temp workspace is created below.
             if spec is None:
                 try:
-                    from anton.core.datasources.data_vault import LocalDataVault
-                    vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+                    from cowork.services.connectors.encrypted_vault import build_vault
+                    vault = build_vault(Path(get_app_settings().connector.vault_dir))
                     slug = (name or "").strip() or f"{connector_id}-{uuid.uuid4().hex[:6]}"
                     payload_to_save = {**credentials, "_connector_id": connector_id}
                     if method:
@@ -292,8 +292,8 @@ class ProbeHandler:
             saved_slug: str | None = None
             if final_outcome.status == "success":
                 try:
-                    from anton.core.datasources.data_vault import LocalDataVault
-                    vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+                    from cowork.services.connectors.encrypted_vault import build_vault
+                    vault = build_vault(Path(get_app_settings().connector.vault_dir))
                     slug = (name or "").strip() or f"{connector_id}-{uuid.uuid4().hex[:6]}"
                     payload_to_save = {**credentials, "_connector_id": connector_id}
                     if method:

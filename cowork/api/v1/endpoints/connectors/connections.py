@@ -36,7 +36,7 @@ def save_connection_direct(body: DirectSaveRequest):
     token exchange already succeeded. Calls verify_connection before saving."""
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
-    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.services.connectors.encrypted_vault import build_vault
     access_token = body.values.get("access_token", "")
     if access_token:
         try:
@@ -52,7 +52,7 @@ def save_connection_direct(body: DirectSaveRequest):
     if body.values.get("access_token") or body.values.get("refresh_token"):
         payload["auth_type"] = "oauth"
     try:
-        LocalDataVault(Path(ConnectorSettings().vault_dir)).save(body.connector_id, slug, payload)
+        build_vault(Path(ConnectorSettings().vault_dir)).save(body.connector_id, slug, payload)
     except Exception:
         _log.exception("Failed to save connection %s/%s", body.connector_id, slug)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
