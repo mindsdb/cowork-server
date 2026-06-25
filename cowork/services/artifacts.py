@@ -637,10 +637,18 @@ def artifact_status(raw_path: str) -> dict:
     folder = artifact if artifact.is_dir() else artifact.parent
     card = card_for_folder(folder)
     if card is None:
-        # Loose / legacy file (no metadata.json) — key status off the file.
-        primary = artifact if artifact.is_file() else None
-        base = artifact.parent if primary is not None else folder
-        return {**blank, "publishedUrl": _published_url_for(base, primary), **_published_access_for(base, primary)}
+        # Loose / legacy file (no metadata.json). When card_for_folder
+        # returns None the resolved path is always a FILE — a dir would
+        # carry metadata.json per resolve_artifact_path's allow_dir contract.
+        card = {
+            "publishedUrl": _published_url_for(artifact.parent, artifact),
+            "modified": False,
+            **_published_access_for(artifact.parent, artifact),
+        }
+    # One response shape for BOTH branches: explicitly the published /
+    # modified / access subset, and NEVER `accessPassword` — that owner-only
+    # plaintext (which `_published_access_for` and the card both carry) must
+    # not leave this endpoint.
     return {
         "publishedUrl": card.get("publishedUrl", ""),
         "modified": bool(card.get("modified")),
