@@ -202,10 +202,15 @@ class ResponsesHandler:
                 conversation=conv, input=harness_input, disabled_connections=disabled,
             )
             event_count = 0
-            async for sse_string in harness.formatter(stream, model, event_sink):
-                event_count += 1
-                sse_string = self._inject_created(sse_string, conv_id, harness_id)
-                await buffer.append("sse", {"sse": sse_string})
+            try:
+                async for sse_string in harness.formatter(stream, model, event_sink):
+                    event_count += 1
+                    sse_string = self._inject_created(sse_string, conv_id, harness_id)
+                    await buffer.append("sse", {"sse": sse_string})
+            finally:
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
+                    await aclose()
             logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
             persist()
             await buffer.close("completed")
@@ -247,6 +252,36 @@ class ResponsesHandler:
                 pass
         return sse_string
 
+    async def _stream(self, stream, conversation_id: UUID, model: str) -> AsyncGenerator[str, None]:
+        """Compatibility wrapper for legacy direct streaming callers.
+
+        Detached streaming now goes through `_produce`, but a few tests and
+        older integrations still exercise this formatter-facing method.
+        Keep the same user-facing error redaction policy here.
+        """
+        collected_events: list[dict] = []
+
+        def event_sink(event_type: str, data: dict) -> None:
+            collected_events.append(data)
+
+        try:
+            try:
+                async for sse_string in self.harness.formatter(stream, model, event_sink):
+                    yield self._inject_created(sse_string, conversation_id, getattr(self.harness, "id", None))
+            finally:
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
+                    await aclose()
+        except Exception as exc:
+            friendly = friendly_turn_error(exc)
+            if friendly is not None:
+                code, message = friendly
+                logger.info("[responses] user-facing turn error: %s", exc)
+            else:
+                code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+                logger.exception("[responses] turn failed")
+            yield response_failed_sse(message, code)
+
     async def _collect(
         self,
         stream,
@@ -263,8 +298,13 @@ class ResponsesHandler:
                 collected_text.append(data.get("delta", ""))
 
         try:
-            async for _ in self.harness.formatter(stream, model, event_sink):
-                pass
+            try:
+                async for _ in self.harness.formatter(stream, model, event_sink):
+                    pass
+            finally:
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
+                    await aclose()
         except Exception as exc:
             # Mirror the streaming path: a recognised failure (e.g. an
             # unsupported image) surfaces its curated message with a 400;
