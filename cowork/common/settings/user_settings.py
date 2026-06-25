@@ -370,10 +370,22 @@ class UserSettings(Settings):
         on the shared openai_api_key fallback."""
         p = self.resolved_planning_provider
         has_key = provider_api_key(self, p) is not None
+        # Also require a resolvable model. build_llm_client hands
+        # resolved_planning_model to the provider; openai-compatible has no
+        # default model, so a key-but-no-model config would build model=None
+        # and throw at runtime despite reading as "ready". Gate on both so
+        # config_ready ⟹ the client can actually run.
+        has_model = bool(self.resolved_planning_model)
         label = p.label
+        if not has_key:
+            error = f"Configure an API key for {label}."
+        elif not has_model:
+            error = f"Select a model for {label}."
+        else:
+            error = None
         return {
-            "config_ready": has_key,
-            "config_error": None if has_key else f"Configure an API key for {label}.",
+            "config_ready": has_key and has_model,
+            "config_error": error,
             "provider": p.value,
             "provider_label": label,
             "model": self.resolved_planning_model or "",
