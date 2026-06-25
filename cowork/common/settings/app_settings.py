@@ -215,6 +215,15 @@ class AppSettings(Settings):
         ),
     )  # COWORK_CONVERSATION_LINK_TEMPLATE
 
+    auth_issuers: str = Field(
+        default="https://auth.mindshub.ai/auth/realms/mindsdb,https://auth.dev.mindshub.ai/auth/realms/mindsdb",
+        validation_alias=AliasChoices("COWORK_AUTH_ISSUERS"),
+        description=(
+            "Comma-separated trusted OIDC issuers for UI bearer tokens. "
+            "Empty disables request-principal extraction."
+        ),
+    )
+
     channels_harness: str = Field(
         default="anton",
         validation_alias=AliasChoices("COWORK_CHANNELS_HARNESS"),
