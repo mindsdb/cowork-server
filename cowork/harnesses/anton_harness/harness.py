@@ -137,6 +137,12 @@ class AntonHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        # Observability pass-through (see ResponsesRequest / HarnessProvider):
+        # forwarded to Anton's per-turn TraceContext so they land on the
+        # Langfuse trace the LLM router records. Generic so new eval/telemetry
+        # tags or metadata need no change here.
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
         # Attribute + surface any artifact created during this turn. Anton runs
@@ -151,7 +157,11 @@ class AntonHarness:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
             )
-            async for event in session.turn_stream(self._to_anton_input(input)):
+            async for event in session.turn_stream(
+                self._to_anton_input(input),
+                trace_tags=trace_tags,
+                trace_metadata=trace_metadata,
+            ):
                 yield event
         finally:
             if temp_vault_dir:
