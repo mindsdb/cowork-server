@@ -301,7 +301,10 @@ class HermesHarness:
         if api_key_value and hasattr(api_key_value, "get_secret_value"):
             api_key_value = api_key_value.get_secret_value()
 
-        _sync_hermes_config(provider_value, api_key_value)
+        # Per-project skills
+        project_skills_dir = Path(project_path) / "skills"
+        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        _sync_hermes_config(provider_value, api_key_value, skills_dir=project_skills_dir)
 
         vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
         disabled_keys = {(d["engine"], d["name"]) for d in (disabled_connections or [])}

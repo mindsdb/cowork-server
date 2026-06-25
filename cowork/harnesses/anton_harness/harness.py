@@ -213,8 +213,10 @@ class AntonHarness:
         anton_settings = AntonSettings()
         anton_settings.resolve_workspace(str(base))
 
-        from cowork.common.settings.app_settings import get_app_settings
-        anton_settings.skills_root = Path(get_app_settings().skill.root_dir)
+        # Per-project skills
+        project_skills_dir = base / "skills"
+        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        anton_settings.skills_root = project_skills_dir
 
         user = get_user_settings()
         for attr in (
