@@ -112,6 +112,11 @@ def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
     return None
 
 
+def response_failed_payload(error: str, code: str) -> dict:
+    """Wire payload for a ``response.failed`` event (SSE + DB sidecar)."""
+    return {"type": "response.failed", "code": code, "error": error}
+
+
 def response_failed_sse(error: str, code: str) -> str:
     """Build a ``response.failed`` SSE frame.
 
