@@ -363,7 +363,7 @@ class AntonChannelRuntime:
             log.warning("harness %r is not registered; falling back to %s", harness_id, DEFAULT_CHANNEL_HARNESS)
             harness_id = DEFAULT_CHANNEL_HARNESS
             harness = get_harness(harness_id)
-        await harness.sync_skills(SkillService().list_skills())
+        await harness.sync_skills(SkillService(session).list_skills())
         text = self._event_text(event)
         blocks = await self.build_input_blocks(session, adapter, event, text)
 

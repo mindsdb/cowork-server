@@ -73,6 +73,11 @@ def run_dev_setup() -> None:
         migrate_skills_to_files(session)
         # Seed packaged builtin skills (versioned, idempotent).
         seed_builtin_skills(session)
+        # Project per-project skills/ links with the canonical store.
+        from cowork.services.skill_links import reconcile_all
+        from cowork.services.skills import SkillService
+
+        reconcile_all(SkillService(session).list_skills())
 
     _link_hermes_skills_dir()
 

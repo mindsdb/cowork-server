@@ -13,11 +13,15 @@ from anton.core.tools.skill_format import (
     parse_skill_dir,
     validate_name,
 )
+from sqlmodel import Session
 
 from cowork.common.settings import get_app_settings
+from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
 from cowork.models.skill import (
     META_CREATED_AT,
     META_DISPLAY_NAME,
+    META_ENABLED,
+    META_PROJECTS,
     Skill,
 )
 
@@ -38,7 +42,8 @@ class SkillService:
 
 
 
-    def __init__(self) -> None:
+    def __init__(self, session: Session) -> None:
+        self.session = session
         self.root = Path(get_app_settings().skill.root_dir)
 
     # ── helpers ──────────────────────────────────────────────────────────────
@@ -59,6 +64,25 @@ class SkillService:
             metadata[META_DISPLAY_NAME] = name
         metadata[META_CREATED_AT] = created_at.isoformat()
         return metadata
+
+    @staticmethod
+    def _apply_metadata_flags(
+        metadata: dict[str, str],
+        enabled: bool | None,
+        projects: list[str] | None,
+    ) -> None:
+        """Write enabled/projects into ``metadata`` (kept clean: omit defaults)."""
+        if enabled is not None:
+            if enabled:
+                metadata.pop(META_ENABLED, None)  # default-on
+            else:
+                metadata[META_ENABLED] = "false"
+        if projects is not None:
+            joined = ",".join(p.strip() for p in projects if p.strip())
+            if joined:
+                metadata[META_PROJECTS] = joined
+            else:
+                metadata.pop(META_PROJECTS, None)
 
     # ── reads ────────────────────────────────────────────────────────────────
     def list_skills(self) -> list[Skill]:
@@ -87,18 +111,22 @@ class SkillService:
         name: str,
         instructions: str,
         description: str | None = None,
+        enabled: bool | None = None,
+        projects: list[str] | None = None,
     ) -> Skill:
         label = normalize_name(label)
         if self._skill_dir(label).exists():
             raise ValueError(f"A skill named '{label}' already exists.")
 
+        metadata = self._build_metadata(label, name, datetime.now(timezone.utc))
+        self._apply_metadata_flags(metadata, enabled, projects)
         skill = Skill(
             name=label,
             instructions=instructions or "",
             # description is required and non-empty by spec; fall back to the
             # display name / slug so we never write an empty value.
             description=(description or "").strip() or name or label,
-            metadata=self._build_metadata(label, name, datetime.now(timezone.utc)),
+            metadata=metadata,
         )
         self._write(skill)
         return self.get_skill(label)
@@ -110,9 +138,12 @@ class SkillService:
         name: str | None = None,
         description: str | None = None,
         instructions: str | None = None,
+        enabled: bool | None = None,
+        projects: list[str] | None = None,
     ) -> Skill:
         skill = self.get_skill(skill_id)
         metadata = dict(skill.metadata)
+        self._apply_metadata_flags(metadata, enabled, projects)
 
         new_slug = skill.name
         if label is not None:
@@ -132,6 +163,7 @@ class SkillService:
             if self._skill_dir(new_slug).exists():
                 raise ValueError(f"A skill named '{new_slug}' already exists.")
             self._rename_dir(skill.name, new_slug)
+            remove_skill_links(skill.name)
             skill.name = new_slug
 
         skill.metadata = metadata
@@ -172,6 +204,7 @@ class SkillService:
         if not skill_dir.exists():
             return False
         shutil.rmtree(skill_dir)
+        remove_skill_links(slug)
         return True
 
     # ── low-level fs ─────────────────────────────────────────────────────────
@@ -183,6 +216,8 @@ class SkillService:
         tmp = skill_dir / f".{SKILL_FILE}.tmp"
         tmp.write_text(dump_skill(skill), encoding="utf-8")
         os.replace(tmp, target)  # atomic within the same directory
+        # Project per-project links to match the skill's metadata.
+        reconcile_skill_links(skill)
 
     def _rename_dir(self, old_slug: str, new_slug: str) -> None:
         self._ensure_root()
