@@ -152,10 +152,13 @@ async def _scheduler_loop() -> None:
         try:
             _handle_missed_runs(session)
             now = datetime.now(timezone.utc)
+            run_service = ScheduleRunService(session)
             schedules = ScheduleService(session).list_schedules()
             due = [
                 s for s in schedules
-                if s.enabled and ensure_utc(s.next_run_at) <= now
+                if s.enabled
+                and ensure_utc(s.next_run_at) <= now
+                and not run_service.has_running_run(s.id)
             ]
         except Exception:
             logger.exception("Scheduler loop error during poll")
