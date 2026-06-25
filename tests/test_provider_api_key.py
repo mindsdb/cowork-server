@@ -133,6 +133,29 @@ class TestResolverIsolation:
         assert s.resolved_planning_provider == Provider.ANTHROPIC
         assert s.config_status["config_ready"] is False
 
+    def test_openai_compatible_key_but_no_model_is_not_ready(self):
+        # openai-compatible has a key but no model and no canonical default →
+        # build_llm_client would get model=None. config_ready must be False so
+        # we don't claim "ready" for a client that throws on first use.
+        s = _settings(
+            planning_provider=Provider.OPENAI_COMPATIBLE,
+            planning_model=None,
+            openai_compatible_api_key=SecretStr("sk-compat"),
+        )
+        assert s.resolved_planning_provider == Provider.OPENAI_COMPATIBLE
+        assert s.resolved_planning_model is None
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "model" in cs["config_error"].lower()
+
+    def test_openai_compatible_key_with_model_is_ready(self):
+        s = _settings(
+            planning_provider=Provider.OPENAI_COMPATIBLE,
+            planning_model="my-model",
+            openai_compatible_api_key=SecretStr("sk-compat"),
+        )
+        assert s.config_status["config_ready"] is True
+
 
 class TestCheckConfiguredGeminiOnly:
     """A gemini-only user (dedicated key, no shared openai key) must read as
