@@ -343,14 +343,21 @@ class UserSettings(Settings):
     def resolved_planning_model(self) -> str | None:
         p = self.resolved_planning_provider
         # Keep the user's chosen model when we didn't have to switch provider;
-        # otherwise fall back to the resolved provider's default model so we
-        # don't hand e.g. a Claude model id to the MindsHub gateway.
-        return self.planning_model if p == self.planning_provider else PLANNING_MODEL_DEFAULTS.get(p.value)
+        # otherwise use the resolved provider's default model so we don't hand
+        # e.g. a Claude model id to the MindsHub gateway. Providers with no
+        # canonical default (openai-compatible) fall back to the user's own
+        # model rather than None — otherwise build_llm_client would get
+        # model=None and throw even though config_ready reported "ready".
+        if p == self.planning_provider:
+            return self.planning_model
+        return PLANNING_MODEL_DEFAULTS.get(p.value) or self.planning_model
 
     @property
     def resolved_coding_model(self) -> str | None:
         p = self.resolved_coding_provider
-        return self.coding_model if p == self.coding_provider else CODING_MODEL_DEFAULTS.get(p.value)
+        if p == self.coding_provider:
+            return self.coding_model
+        return CODING_MODEL_DEFAULTS.get(p.value) or self.coding_model
 
     @property
     def config_status(self) -> dict[str, Any]:
