@@ -171,6 +171,15 @@ class HermesHarness:
         project_id = conversation.project_id
         conversation_topic = conversation.topic
         prompt = self._to_prompt_string(input)
+        checkpoint_tracker = self._build_artifact_checkpoint_tracker(conversation, project_path, prompt)
+        if checkpoint_tracker is not None:
+            checkpoint_tracker.snapshot_before(label="Before generated update")
+        checkpoint_before_hashes = (
+            dict(getattr(checkpoint_tracker, "_before_hashes", {}))
+            if checkpoint_tracker is not None
+            else {}
+        )
+        source_conversation_id = conversation.id
 
         # Snapshot the artifacts dir before the run so we can index + surface
         # any artifacts this turn produces — the same diff the Anton harness
@@ -197,6 +206,13 @@ class HermesHarness:
                     disabled_connections=disabled_connections or [],
                 )
             finally:
+                if checkpoint_tracker is not None:
+                    self._snapshot_artifacts_after_generation(
+                        project_path=project_path,
+                        source_conversation_id=source_conversation_id,
+                        prompt=prompt,
+                        before_hashes=checkpoint_before_hashes,
+                    )
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
         task = loop.run_in_executor(None, run_sync)
@@ -223,6 +239,66 @@ class HermesHarness:
             yield {"type": "artifact_created", "artifact": card}
 
         yield result
+
+    @staticmethod
+    def _build_artifact_checkpoint_tracker(conversation: Conversation, project_path: str, prompt: str):
+        try:
+            from sqlalchemy.orm import object_session
+            from cowork.services.artifact_generation_checkpoints import GeneratedArtifactCheckpointTracker
+
+            db_session = object_session(conversation)
+            if db_session is None or not project_path:
+                return None
+            return GeneratedArtifactCheckpointTracker(
+                db_session,
+                Path(project_path) / ".anton" / "artifacts",
+                source_conversation_id=conversation.id,
+                prompt=prompt,
+            )
+        except Exception:
+            logger.warning(
+                "Could not prepare Hermes artifact checkpoint tracker for conversation %s",
+                getattr(conversation, "id", "<unknown>"),
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _snapshot_artifacts_after_generation(
+        *,
+        project_path: str,
+        source_conversation_id,
+        prompt: str,
+        before_hashes: dict,
+    ) -> None:
+        """Snapshot generated artifact updates from Hermes' worker thread.
+
+        The async consumer can stop reading before it reaches `await task`.
+        Hermes itself keeps running in the executor, so the durable finalizer
+        belongs to the executor completion path and must use its own DB session.
+        """
+        try:
+            from cowork.db.session import get_open_session
+            from cowork.services.artifact_generation_checkpoints import GeneratedArtifactCheckpointTracker
+
+            session = get_open_session()
+            try:
+                tracker = GeneratedArtifactCheckpointTracker(
+                    session,
+                    Path(project_path) / ".anton" / "artifacts",
+                    source_conversation_id=source_conversation_id,
+                    prompt=prompt,
+                )
+                tracker._before_hashes = dict(before_hashes)
+                tracker.snapshot_after(label="Generated update")
+            finally:
+                session.close()
+        except Exception:
+            logger.warning(
+                "Could not checkpoint Hermes artifact updates for conversation %s",
+                source_conversation_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _to_prompt_string(input_blocks: list[dict]) -> str:
