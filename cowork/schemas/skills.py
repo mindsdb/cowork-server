@@ -31,6 +31,7 @@ class SkillResponse(CamelResponse):
     description: str | None
     instructions: str = Field(serialization_alias="declarative")
     created_at: datetime | None
+    updated_at: datetime | None
     enabled: bool
     projects: list[str]
 

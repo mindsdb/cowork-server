@@ -11,6 +11,7 @@ from .base import BaseSQLModel
 
 META_DISPLAY_NAME = "display_name"
 META_CREATED_AT = "created_at"
+META_UPDATED_AT = "updated_at"
 META_ENABLED = "enabled"
 META_PROJECTS = "projects"
 
@@ -46,7 +47,14 @@ class Skill(AgentSkill):
 
     @property
     def created_at(self) -> datetime | None:
-        raw = self.metadata.get(META_CREATED_AT)
+        return self._dt(META_CREATED_AT)
+
+    @property
+    def updated_at(self) -> datetime | None:
+        return self._dt(META_UPDATED_AT)
+
+    def _dt(self, key: str) -> datetime | None:
+        raw = self.metadata.get(key)
         if not raw:
             return None
         try:

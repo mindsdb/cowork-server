@@ -22,6 +22,7 @@ from cowork.models.skill import (
     META_DISPLAY_NAME,
     META_ENABLED,
     META_PROJECTS,
+    META_UPDATED_AT,
     Skill,
 )
 
@@ -210,6 +211,7 @@ class SkillService:
     # ── low-level fs ─────────────────────────────────────────────────────────
     def _write(self, skill: Skill) -> None:
         self._ensure_root()
+        skill.metadata[META_UPDATED_AT] = datetime.now(timezone.utc).isoformat()
         skill_dir = self._skill_dir(skill.name)
         skill_dir.mkdir(parents=True, exist_ok=True)
         target = skill_dir / SKILL_FILE
