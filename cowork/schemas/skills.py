@@ -29,5 +29,7 @@ class SkillResponse(CamelResponse):
     description: str | None
     when_to_use: str | None
     instructions: str = Field(serialization_alias="declarative")
+    used: int = 0
+    confidence: float = 0.0
     created_at: datetime | None
     modified_at: datetime | None
