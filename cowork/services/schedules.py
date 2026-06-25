@@ -107,6 +107,15 @@ class ScheduleRunService:
         self.session.refresh(run)
         return run
 
+    def has_running_run(self, schedule_id: UUID) -> bool:
+        run = self.session.exec(
+            select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .limit(1)
+        ).first()
+        return run is not None
+
     def finish_run(
         self,
         run_id: UUID,
