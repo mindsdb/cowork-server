@@ -29,6 +29,7 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     friendly_turn_error,
+    response_failed_payload,
     response_failed_sse,
 )
 from cowork.services.conversations import ConversationService
@@ -223,7 +224,9 @@ class ResponsesHandler:
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
+            failed = response_failed_payload(message, code)
             await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            collected_events.append(failed)
             persist()
             await buffer.close("error")
         finally:
