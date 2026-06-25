@@ -101,6 +101,13 @@ def check_configured(session: SessionDep):
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
+    # gemini / openai-compatible have dedicated key slots now — a user who
+    # configured only one of those (no shared openai key) must still read as
+    # configured (this endpoint gates app startup).
+    if s.gemini_api_key is not None:
+        return {"configured": True, "provider": "gemini"}
+    if s.openai_compatible_api_key is not None:
+        return {"configured": True, "provider": "openai-compatible"}
     return {"configured": False, "provider": ""}
 
 
@@ -111,16 +118,22 @@ def install_status():
 
 @router.get("/reveal-key/{name}")
 def reveal_key(name: str, session: SessionDep):
-    field_map = {
-        "anthropic": "anthropic_api_key",
-        "openai": "openai_api_key",
-        "minds": "minds_api_key",
+    from cowork.common.settings.user_settings import Provider, provider_api_key
+
+    name_map = {
+        "anthropic": Provider.ANTHROPIC,
+        "openai": Provider.OPENAI,
+        "gemini": Provider.GEMINI,
+        "openai-compatible": Provider.OPENAI_COMPATIBLE,
+        "minds": Provider.MINDS_CLOUD,
+        "minds-cloud": Provider.MINDS_CLOUD,
     }
-    field = field_map.get(name.lower())
-    if field is None:
+    provider = name_map.get(name.lower())
+    if provider is None:
         raise HTTPException(status_code=404, detail="Unknown key name")
     s = SettingService(session).load()
-    val = getattr(s, field)
+    # provider_api_key applies the gemini/openai-compatible → openai fallback.
+    val = provider_api_key(s, provider)
     return {"value": val.get_secret_value() if isinstance(val, SecretStr) else ""}
 
 
