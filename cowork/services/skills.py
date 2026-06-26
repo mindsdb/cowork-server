@@ -109,8 +109,8 @@ class SkillService:
     def create_skill(
         self,
         label: str,
-        name: str,
         instructions: str,
+        name: str | None = None,
         description: str | None = None,
         enabled: bool | None = None,
         projects: list[str] | None = None,
