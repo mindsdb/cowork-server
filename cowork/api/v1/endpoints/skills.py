@@ -37,14 +37,7 @@ def create_skill(body: SkillCreateRequest, session: SessionDep):
 async def upload_skill(file: UploadFile, session: SessionDep):
     raw = await file.read()
     try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File must be UTF-8 encoded text.",
-        )
-    try:
-        skill = SkillService(session).import_skill(content)
+        skill = SkillService(session).import_skill(raw, filename=file.filename)
     except FileExistsError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
