@@ -615,6 +615,50 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
     }
 
 
+def artifact_status(raw_path: str) -> dict:
+    """Fresh owner-side status for a single artifact path: its published URL,
+    the stale-since-publish ``modified`` flag, and access settings.
+
+    Reuses ``card_for_folder`` so the preview viewer's in-place refresh can
+    never disagree with the listing. Returns the published/modified/access
+    subset only — the cheap read the viewer polls on window focus to light up
+    the "Update" button when the artifact changes underneath an open preview.
+    """
+    blank = {
+        "publishedUrl": "", "modified": False, "accessMode": "public",
+        "accessProtected": False, "accessEmails": [], "orgAllowed": False,
+    }
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    except Exception:
+        return dict(blank)
+    if artifact is None:
+        return dict(blank)
+    folder = artifact if artifact.is_dir() else artifact.parent
+    card = card_for_folder(folder)
+    if card is None:
+        # Loose / legacy file (no metadata.json). When card_for_folder
+        # returns None the resolved path is always a FILE — a dir would
+        # carry metadata.json per resolve_artifact_path's allow_dir contract.
+        card = {
+            "publishedUrl": _published_url_for(artifact.parent, artifact),
+            "modified": False,
+            **_published_access_for(artifact.parent, artifact),
+        }
+    # One response shape for BOTH branches: explicitly the published /
+    # modified / access subset, and NEVER `accessPassword` — that owner-only
+    # plaintext (which `_published_access_for` and the card both carry) must
+    # not leave this endpoint.
+    return {
+        "publishedUrl": card.get("publishedUrl", ""),
+        "modified": bool(card.get("modified")),
+        "accessMode": card.get("accessMode", "public"),
+        "accessProtected": bool(card.get("accessProtected")),
+        "accessEmails": card.get("accessEmails", []),
+        "orgAllowed": bool(card.get("orgAllowed")),
+    }
+
+
 def list_artifacts(project_path: str | None = None) -> list[dict]:
     """Every artifact across all projects, newest first."""
     cards: list[dict] = []
