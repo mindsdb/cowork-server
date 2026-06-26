@@ -399,6 +399,14 @@ def build_llm_client():
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             if key is None:
                 raise ValueError("OpenAI API key is not configured")
+            # No base for openai-compatible → OpenAIProvider would silently
+            # default to api.openai.com and leak the BYO key to OpenAI. Fail
+            # loudly instead (config_status surfaces this as "Set a base URL",
+            # but callers don't all gate on config_ready, so enforce it here at
+            # the build site too). gemini always has a base (Google), so this
+            # only guards openai-compatible.
+            if role == Provider.OPENAI_COMPATIBLE and not base:
+                raise ValueError("OpenAI-compatible base URL is not configured")
             return OpenAIProvider(
                 api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
