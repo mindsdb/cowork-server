@@ -44,13 +44,19 @@ class RunHandle:
     def is_running(self) -> bool:
         return not self.task.done()
 
-    def cancel(self) -> bool:
+    async def cancel(self) -> bool:
         """Request cancellation of the producer task. Returns True if a
         cancel was issued (task still running), False if already done."""
         if self.task.done():
             return False
         self.task.cancel()
-        return True
+
+        try:
+            await self.task
+        except asyncio.CancelledError:
+            return True
+        except Exception:
+            return False
 
 
 class RunRegistry:
@@ -99,7 +105,7 @@ class RunRegistry:
         handle = self._by_cid.get(conversation_id)
         if handle is None:
             return False
-        return handle.cancel()
+        return await handle.cancel()
 
     def in_flight(self) -> list[RunHandle]:
         return [h for h in self._by_cid.values() if h.is_running]
