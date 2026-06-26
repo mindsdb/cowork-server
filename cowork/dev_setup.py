@@ -49,7 +49,23 @@ def run_dev_setup() -> None:
             session.commit()
 
     # Migrate .env settings to DB (one-time, idempotent).
-    from cowork.migrations import migrate_env_to_db
+    from cowork.migrations import backfill_minds_url, migrate_env_to_db
 
     with SQLSession(engine) as session:
         migrate_env_to_db(session)
+        # Rewrite the legacy MindsHub host (mdb.ai -> api.mindshub.ai) for
+        # users who configured MindsHub before the default flipped. Idempotent;
+        # runs every boot (not gated by the env-migration sentinel, since
+        # affected users already passed it).
+        backfill_minds_url(session)
+
+    # Migrate harness-local memory into ~/.cowork/memory, then wire runtime symlinks.
+    import cowork.harnesses  # noqa: F401 — registers memory adapters
+
+    from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
+    from cowork.harnesses.memory.runtime import ensure_all_layouts
+
+    with SQLSession(engine) as session:
+        migrate_harness_memory_to_shared(session)
+
+    ensure_all_layouts()

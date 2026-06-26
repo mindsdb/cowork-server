@@ -145,6 +145,7 @@ class DirectSaveRequest(BaseModel):
 class OAuthStartRequest(BaseModel):
     client_id: str = ""
     client_secret: str = ""
+    extra_fields: dict[str, str] = Field(default_factory=dict)
 
 
 class OAuthStartResponse(BaseModel):

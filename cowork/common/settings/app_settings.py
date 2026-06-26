@@ -74,7 +74,11 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=[str(Path.home() / ".anton" / ".env"), ".env"],
+        # Global config lives in ~/.cowork/.env now; ~/.anton/.env is kept as
+        # a fallback for un-migrated installs. Order matters: pydantic-settings
+        # is "last wins", so ~/.cowork/.env must come AFTER ~/.anton/.env (fresh
+        # over stale), with local ".env" highest for dev overrides.
+        env_file=[str(Path.home() / ".anton" / ".env"), str(Path.home() / ".cowork" / ".env"), ".env"],
         env_file_encoding="utf-8",
         env_nested_delimiter="_",
         extra="ignore",
@@ -153,6 +157,13 @@ class OAuthSettings(Settings):
     )
 
 
+class MemorySettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "memory"),
+        description="Root directory for all memory files",
+    )
+
+
 class StreamSettings(Settings):
     backend: str = Field(
         default="file",
@@ -219,6 +230,7 @@ class AppSettings(Settings):
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
+    memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
 
 
 @lru_cache

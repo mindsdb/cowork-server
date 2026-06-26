@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from enum import Enum
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import FileInputBlock, TextInputBlock, MemoryScope, register
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
-from cowork.models.project import Project
 from cowork.models.skill import Skill
 
 # Redirect all Hermes data (skills, sessions, config) to ~/.cowork/hermes before
@@ -19,15 +17,6 @@ from cowork.models.skill import Skill
 os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().root_dir)
 
 logger = get_logger(__name__)
-
-# Default base URLs for providers that use the OpenAI-compatible API.
-# AIAgent requires both api_key AND base_url to bypass its config.yaml
-# provider-resolution path. Anthropic is omitted because AIAgent
-# auto-detects provider="anthropic" and uses its native Messages API.
-_PROVIDER_BASE_URLS: dict[str, str] = {
-    "openai": "https://api.openai.com/v1",
-    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
-}
 
 # Map cowork provider names to the env var AIAgent checks at init time.
 _PROVIDER_ENV_KEY = {
@@ -93,11 +82,6 @@ def _build_datasource_context(vault, disabled_keys: set[tuple[str, str]]) -> str
     return "\n".join(lines)
 
 
-class HermesMemoryCategory(str, Enum):
-    user = "user"
-    memory = "memory"
-
-
 @register
 class HermesHarness:
     id: str = "hermes"
@@ -141,47 +125,6 @@ class HermesHarness:
             if existing_dir.is_dir() and existing_dir.name not in active_labels:
                 shutil.rmtree(existing_dir)
 
-    async def overwrite_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
-        if scope == MemoryScope.project:
-            raise ValueError("Project-scoped memory is not supported for the Hermes harness.")
-        category_enum = HermesMemoryCategory(category)
-        memory_dir = Path(HermesHarnessSettings().root_dir) / "memories"
-        memory_dir.mkdir(parents=True, exist_ok=True)
-        self._resolve_memory_path(memory_dir, category_enum).write_text(content + "\n", encoding="utf-8")
-
-    async def retrieve_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> str:
-        if scope == MemoryScope.project:
-            raise ValueError("Project-scoped memory is not supported for the Hermes harness.")
-        category_enum = HermesMemoryCategory(category)
-        memory_file = self._resolve_memory_path(Path(HermesHarnessSettings().root_dir) / "memories", category_enum)
-        if not memory_file.is_file():
-            return ""
-        return memory_file.read_text(encoding="utf-8")
-
-    async def delete_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> None:
-        if scope == MemoryScope.project:
-            raise ValueError("Project-scoped memory is not supported for the Hermes harness.")
-        category_enum = HermesMemoryCategory(category)
-        memory_file = self._resolve_memory_path(Path(HermesHarnessSettings().root_dir) / "memories", category_enum)
-        if memory_file.is_file():
-            memory_file.unlink()
-
-    async def list_memory(self, projects: list[Project]) -> list:
-        from cowork.harnesses.base import MemoryItem
-        memory_dir = Path(HermesHarnessSettings().root_dir) / "memories"
-        results = []
-        for category in HermesMemoryCategory:
-            memory_file = self._resolve_memory_path(memory_dir, category)
-            content = memory_file.read_text(encoding="utf-8") if memory_file.is_file() else ""
-            results.append(MemoryItem(scope=MemoryScope.global_, category=category.value, content=content, project=None))
-        return results
-
-    def _resolve_memory_path(self, root_dir: Path, category: HermesMemoryCategory) -> Path:
-        return root_dir / {
-            HermesMemoryCategory.user: "USER.md",
-            HermesMemoryCategory.memory: "MEMORY.md",
-        }[category]
-
     async def stream_response(
         self,
         *,
@@ -224,8 +167,17 @@ class HermesHarness:
         # _run executes on an executor thread where lazy relationship
         # loads would fail.
         project_path = str(conversation.project.path)
+        conversation_id = conversation.id
+        project_id = conversation.project_id
         conversation_topic = conversation.topic
         prompt = self._to_prompt_string(input)
+
+        # Snapshot the artifacts dir before the run so we can index + surface
+        # any artifacts this turn produces — the same diff the Anton harness
+        # uses, so both harnesses behave identically.
+        from cowork.services.task_objects import finalize_turn_artifacts, snapshot_artifact_slugs
+        artifacts_base = Path(project_path) / ".anton" / "artifacts"
+        before_slugs = snapshot_artifact_slugs(artifacts_base)
 
         def run_sync() -> dict:
             try:
@@ -233,6 +185,7 @@ class HermesHarness:
                     str(conversation.id),
                     prompt,
                     history,
+                    project_name=conversation.project.name,
                     project_path=project_path,
                     conversation_topic=conversation_topic,
                     stream_callback=stream_callback,
@@ -248,13 +201,28 @@ class HermesHarness:
 
         task = loop.run_in_executor(None, run_sync)
 
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            yield item
+        cards: list[dict] = []
+        result: dict
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+            result = await task
+        finally:
+            # One dir diff → index the new artifacts AND build their cards.
+            # Runs on every exit so an artifact is always indexed; cards are
+            # yielded just below before the terminal result on normal
+            # completion (mapped to response.artifact_created by the formatter,
+            # same event the Anton harness produces).
+            cards = finalize_turn_artifacts(
+                conversation_id, project_id, artifacts_base, before_slugs,
+            )
+        for card in cards:
+            yield {"type": "artifact_created", "artifact": card}
 
-        yield await task
+        yield result
 
     @staticmethod
     def _to_prompt_string(input_blocks: list[dict]) -> str:
@@ -274,6 +242,7 @@ class HermesHarness:
         prompt: str,
         history: list[dict],
         *,
+        project_name: str,
         project_path: str,
         conversation_topic: str | None = None,
         stream_callback=None,
@@ -298,6 +267,7 @@ class HermesHarness:
             set_artifact_run_context,
         )
         from cowork.common.settings.user_settings import Provider
+        from cowork.harnesses.hermes_harness.memory_adapter import HermesMemoryAdapter
 
         register_connector_tools()
         register_artifact_tools()
@@ -343,8 +313,21 @@ class HermesHarness:
             if (conn["engine"], conn["name"]) not in disabled_keys:
                 vault.inject_env(conn["engine"], conn["name"])
 
+        project_context = (
+            f"You are operating in the project {project_name}."
+            f"You have access to all of the files in the project at {str(project_path)} except for the .anton/ directory."
+            "They are off limits. Do not mention the .anton/ directory in your responses."
+            "You can perform operations on these files by executing code."
+            "You can freely read any of these project files."
+            "If you need to perform any actions on these files, ask the user for permission first."
+            "The only other files that you are allowed to access are any items that are attached to the conversation."
+            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
+        )
         datasource_context = _build_datasource_context(vault, disabled_keys)
-        system_context = f"{datasource_context}\n\n{artifact_context}"
+        memory_context = HermesMemoryAdapter().build_prompt_context(Path(project_path))
+        system_context = "\n\n".join(
+            part for part in (project_context, memory_context, datasource_context, artifact_context) if part
+        )
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
             from cowork.services.providers import minds_chat_base_url
@@ -366,18 +349,28 @@ class HermesHarness:
             # The DB enum uses snake_case (openai_compatible) but AIAgent
             # expects kebab-case (openai-compatible).
             provider = settings.planning_provider.value.replace("_", "-")
-            key_field = settings.planning_provider.api_key_field
-            api_key = getattr(settings, key_field).get_secret_value()
+            # Resolve key and base URL through the shared single-source helpers
+            # (providers.provider_base_url / user_settings.provider_api_key) so
+            # the hermes path can't drift from the anton path. provider_api_key
+            # applies the gemini/openai-compatible → openai fallback (avoids a
+            # None.get_secret_value() crash for a user on the shared key).
+            from cowork.common.settings.user_settings import provider_api_key
+            from cowork.services.providers import provider_base_url
 
-            # AIAgent needs both api_key AND base_url to skip its config.yaml
-            # provider-resolution path.  For providers that use the OpenAI-
-            # compatible API (openai, gemini, openai-compatible), we must
-            # supply a base_url. Anthropic is handled separately by AIAgent
-            # (it detects provider="anthropic" and switches to the Anthropic
-            # Messages API internally).
-            base_url = _PROVIDER_BASE_URLS.get(provider)
-            if provider == "openai-compatible" and settings.openai_base_url:
-                base_url = settings.openai_base_url
+            _key = provider_api_key(settings, settings.planning_provider)
+            api_key = _key.get_secret_value() if _key else ""
+
+            # AIAgent needs an explicit base_url to skip its config.yaml
+            # provider-resolution path. provider_base_url returns None for
+            # direct openai (SDK default) and anthropic; anthropic is handled
+            # natively by AIAgent, but openai needs the explicit host here.
+            base_url = provider_base_url(
+                provider,
+                openai_base_url=settings.openai_base_url or "",
+                minds_url=settings.minds_url,
+            )
+            if base_url is None and provider == "openai":
+                base_url = "https://api.openai.com/v1"
 
             kwargs = dict(
                 provider=provider,
