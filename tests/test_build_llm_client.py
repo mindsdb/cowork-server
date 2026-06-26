@@ -113,6 +113,22 @@ def test_anthropic_gets_no_base_url_kwarg(build):
     assert "base_url" not in kw  # AnthropicProvider takes no base_url kwarg
 
 
+def test_openai_compatible_without_base_raises(build):
+    # Defense-in-depth: config_status flags an empty OC base, but callers don't
+    # all gate on config_ready, so the build site must refuse rather than let
+    # OpenAIProvider default to api.openai.com (which would leak the BYO key).
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE,
+        coding_provider=Provider.OPENAI_COMPATIBLE,
+        planning_model="m",
+        coding_model="m",
+        openai_compatible_api_key=SecretStr("sk-compat"),
+        # openai_base_url intentionally unset
+    )
+    with pytest.raises(ValueError, match="base URL"):
+        build(settings)
+
+
 def test_minds_cloud_uses_minds_key_and_derived_base(build):
     settings = UserSettings(
         planning_provider=Provider.MINDS_CLOUD,
