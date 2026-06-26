@@ -1,9 +1,14 @@
 """One-time .env -> DB settings migration.
 
 On first boot (or after an upgrade from .env-only to DB-backed settings),
-this module reads ``~/.anton/.env`` and seeds any missing settings into the
-SQLite database.  A sentinel row (``_env_migrated``) is written to the
+this module reads ``~/.cowork/.env`` and seeds any missing settings into the
+SQLite database.  A sentinel row (``_env_migrated_v2``) is written to the
 ``settings`` table so the migration never runs twice.
+
+The v2 sentinel replaced the original ``_env_migrated`` sentinel (which read
+from the now-legacy ``~/.anton/.env`` path).  Bumping to v2 lets users who
+had the old sentinel fire against the wrong path get a fresh migration run
+from the correct ``~/.cowork/.env`` location.
 
 After migration the DB is **authoritative** for all overlapping fields.
 The ``.env`` file continues to exist for:
@@ -23,6 +28,7 @@ from sqlmodel import Session, select
 from pydantic import ValidationError
 
 from anton.core.tools.skill_format import normalize_name, DESC_MAX
+from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
@@ -31,9 +37,11 @@ from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
 
-_ENV_PATH = Path.home() / ".anton" / ".env"
+_ENV_PATH = Path.home() / ".cowork" / ".env"
 
-_MIGRATION_SENTINEL = "_env_migrated"
+# v2: path corrected from ~/.anton/.env to ~/.cowork/.env; bumped so users
+# with the old sentinel (which may have found nothing) get a fresh run.
+_MIGRATION_SENTINEL = "_env_migrated_v2"
 
 # Complete map of .env keys -> DB setting keys for all fields that
 # overlap between AntonSettings (.env) and UserSettings (DB).
@@ -61,7 +69,7 @@ _ENV_TO_SETTING: dict[str, str] = {
 
 
 def _parse_env_file() -> dict[str, str]:
-    """Read ``~/.anton/.env`` into a dict, or return empty if absent."""
+    """Read ``~/.cowork/.env`` into a dict, or return empty if absent."""
     if not _ENV_PATH.exists():
         return {}
     result: dict[str, str] = {}
@@ -160,6 +168,50 @@ def migrate_env_to_db(session: Session) -> bool:
     session.add(Setting(key=_MIGRATION_SENTINEL, value="1"))
     session.commit()
     return True
+
+
+# Legacy MindsHub host. The default base URL changed from https://mdb.ai to
+# https://api.mindshub.ai (cowork "new urls", 2026-05-14) — but only for NEW
+# seeds. No migration ever rewrote existing rows, and mdb.ai's /api/v1 path
+# now 404s, so any user who configured MindsHub before that flip is stuck
+# with a failing provider ("Endpoint not found — check the base URL") and no
+# UI field to correct it. This backfill closes that gap.
+_LEGACY_MINDS_HOSTS = ("https://mdb.ai", "http://mdb.ai")
+_CANONICAL_MINDS_URL = "https://api.mindshub.ai"
+
+
+def backfill_minds_url(session: Session) -> bool:
+    """Rewrite the legacy MindsHub host (mdb.ai) to api.mindshub.ai.
+
+    Touches both ``providers_json`` (the per-provider ``mindsUrl`` the
+    Test/ping uses) and the top-level ``minds_url``. Idempotent and
+    sentinel-free: it only modifies rows that still contain the legacy
+    host, so it is safe to run on every boot and self-heals rows that a
+    later stale "Save settings" might re-introduce.
+
+    Returns True if any row was rewritten.
+    """
+    svc = SettingService(session)
+    changed: list[str] = []
+    for key in ("providers_json", "minds_url"):
+        row = svc._fetch_row(key)
+        if row is None or "mdb.ai" not in row.value:
+            continue
+        new_val = row.value
+        for legacy in _LEGACY_MINDS_HOSTS:
+            new_val = new_val.replace(legacy, _CANONICAL_MINDS_URL)
+        if new_val != row.value:
+            row.value = new_val
+            session.add(row)
+            changed.append(key)
+    if changed:
+        session.commit()
+        invalidate_user_settings_cache()
+        logger.info(
+            "Backfilled legacy MindsHub host (mdb.ai -> api.mindshub.ai) in: %s",
+            ", ".join(changed),
+        )
+    return bool(changed)
 
 
 

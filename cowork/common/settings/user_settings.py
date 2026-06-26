@@ -38,10 +38,33 @@ PROVIDER_LABELS: dict["Provider", str] = {
 _PROVIDER_KEY_FIELDS: dict["Provider", str] = {
     Provider.ANTHROPIC: "anthropic_api_key",
     Provider.OPENAI: "openai_api_key",
-    Provider.GEMINI: "openai_api_key",
-    Provider.OPENAI_COMPATIBLE: "openai_api_key",
+    Provider.GEMINI: "gemini_api_key",
+    Provider.OPENAI_COMPATIBLE: "openai_compatible_api_key",
     Provider.MINDS_CLOUD: "minds_api_key",
 }
+
+# gemini and openai-compatible historically shared the single openai_api_key
+# slot (alongside openai), which meant configuring one could overwrite/misroute
+# another provider's key. They now have dedicated slots, but we fall back to the
+# shared openai_api_key when a dedicated slot is empty so existing single-key
+# configs keep working with no migration; isolation kicks in once a distinct key
+# is set in the new field.
+_SHARED_KEY_FALLBACK_FIELDS = frozenset({"gemini_api_key", "openai_compatible_api_key"})
+
+
+def provider_api_key(settings: "UserSettings", provider: "Provider"):
+    """Resolve a provider's API key from its dedicated slot.
+
+    Returns the SecretStr in the provider's own key field; for gemini /
+    openai-compatible, falls back to the shared ``openai_api_key`` when their
+    dedicated slot is unset (backward compatibility — see above). Returns None
+    when nothing is configured.
+    """
+    field = _PROVIDER_KEY_FIELDS[provider]
+    val = getattr(settings, field, None)
+    if val is None and field in _SHARED_KEY_FALLBACK_FIELDS:
+        return settings.openai_api_key
+    return val
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
 UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
@@ -94,6 +117,18 @@ class UserSettings(Settings):
         default=None,
         title="OpenAI API Key",
         description="API key for OpenAI models. Required if not using Anthropic.",
+    )
+    gemini_api_key: SecretStr | None = Field(
+        default=None,
+        title="Gemini API Key",
+        description="API key for Google Gemini (via its OpenAI-compatible endpoint). "
+        "Falls back to the OpenAI key slot when unset.",
+    )
+    openai_compatible_api_key: SecretStr | None = Field(
+        default=None,
+        title="OpenAI-compatible API Key",
+        description="API key for a custom OpenAI-compatible endpoint. "
+        "Falls back to the OpenAI key slot when unset.",
     )
     minds_api_key: SecretStr | None = Field(
         default=None,
@@ -261,19 +296,80 @@ class UserSettings(Settings):
             self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
         return self
 
+    def _has_key(self, p: Provider) -> bool:
+        # provider_api_key applies the gemini/openai-compatible → shared-openai
+        # fallback, so a provider configured via EITHER its dedicated slot or the
+        # legacy shared slot is correctly seen as keyed. (Raw getattr on the
+        # dedicated slot would miss a gemini/oc user on the shared key.)
+        return provider_api_key(self, p) is not None
+
+    def _resolve_provider(self, preferred: Provider) -> Provider:
+        """The provider actually usable for `preferred`: itself if its key is
+        set, otherwise the first configured provider (managed MindsHub first).
+
+        Mirrors the client's ``defaultModeProviderType`` so the readiness gate
+        (``config_status``, surfaced at ``/health`` as ``config_ready`` — the
+        signal the frontend's chat gate AND onboarding-vs-app routing read) and
+        the agent's LLM client (``build_llm_client``) agree on what "configured"
+        means — adding any key takes effect even if the stored
+        ``planning_provider`` still points at a keyless provider. Returns
+        ``preferred`` unchanged when nothing is configured."""
+        if self._has_key(preferred):
+            return preferred
+        # Probe ALL providers (incl. gemini / openai-compatible, which have
+        # dedicated key slots since the isolation change) — not just the legacy
+        # minds/anthropic/openai trio — so a user who configured only a gemini
+        # or openai-compatible key still resolves to a usable provider.
+        for p in (
+            Provider.MINDS_CLOUD,
+            Provider.ANTHROPIC,
+            Provider.OPENAI,
+            Provider.GEMINI,
+            Provider.OPENAI_COMPATIBLE,
+        ):
+            if self._has_key(p):
+                return p
+        return preferred
+
+    @property
+    def resolved_planning_provider(self) -> Provider:
+        return self._resolve_provider(self.planning_provider)
+
+    @property
+    def resolved_coding_provider(self) -> Provider:
+        return self._resolve_provider(self.coding_provider)
+
+    @property
+    def resolved_planning_model(self) -> str | None:
+        p = self.resolved_planning_provider
+        # Keep the user's chosen model when we didn't have to switch provider;
+        # otherwise fall back to the resolved provider's default model so we
+        # don't hand e.g. a Claude model id to the MindsHub gateway.
+        return self.planning_model if p == self.planning_provider else PLANNING_MODEL_DEFAULTS.get(p.value)
+
+    @property
+    def resolved_coding_model(self) -> str | None:
+        p = self.resolved_coding_provider
+        return self.coding_model if p == self.coding_provider else CODING_MODEL_DEFAULTS.get(p.value)
+
     @property
     def config_status(self) -> dict[str, Any]:
-        """Whether the active planning provider has an API key configured."""
-        p = self.planning_provider
-        key_field = p.api_key_field
-        has_key = getattr(self, key_field, None) is not None
+        """Whether a usable provider is configured.
+
+        Resolves the active planning provider to the first one that actually
+        has a key (see ``_resolve_provider``) so this readiness signal matches
+        what ``build_llm_client`` will actually run with — and reads the key via
+        ``provider_api_key`` so gemini/openai-compatible still count when relying
+        on the shared openai_api_key fallback."""
+        p = self.resolved_planning_provider
+        has_key = provider_api_key(self, p) is not None
         label = p.label
         return {
             "config_ready": has_key,
-            "config_error": None if has_key else f"Configure {key_field} for {label}.",
+            "config_error": None if has_key else f"Configure an API key for {label}.",
             "provider": p.value,
             "provider_label": label,
-            "model": self.planning_model or "",
+            "model": self.resolved_planning_model or "",
         }
 
     @staticmethod
