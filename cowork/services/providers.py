@@ -392,13 +392,13 @@ def build_llm_client():
         key = provider_api_key(settings, role)
         if role == Provider.MINDS_CLOUD:
             if key is None:
-                raise ValueError("MindsHub API key is not configured")
+                raise ValueError(f"{role.label} API key is not configured")
             return OpenAIProvider(
                 api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             if key is None:
-                raise ValueError("OpenAI API key is not configured")
+                raise ValueError(f"{role.label} API key is not configured")
             # No base for openai-compatible → OpenAIProvider would silently
             # default to api.openai.com and leak the BYO key to OpenAI. Fail
             # loudly instead (config_status surfaces this as "Set a base URL",
@@ -415,7 +415,7 @@ def build_llm_client():
         if cls is None:
             raise ValueError(f"Unknown provider: {role.value}")
         if key is None:
-            raise ValueError(f"{role.value} API key is not configured")
+            raise ValueError(f"{role.label} API key is not configured")
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
         if cls is OpenAIProvider:
