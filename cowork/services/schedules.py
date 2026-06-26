@@ -107,6 +107,20 @@ class ScheduleRunService:
         self.session.refresh(run)
         return run
 
+    def has_running_run(self, schedule_id: UUID) -> bool:
+        """
+        Check if the schedule has a running run.
+        This is used to prevent overlapping scheduled runs. Manual runs are not relevant here.
+        """
+        run = self.session.exec(
+            select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .where(ScheduleRun.is_manual == False)
+            .limit(1)
+        ).first()
+        return run is not None
+
     def finish_run(
         self,
         run_id: UUID,
