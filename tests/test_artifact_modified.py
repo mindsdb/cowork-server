@@ -301,3 +301,72 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     with patch.object(publish_ep, "_update", _raise):
         res = client.post("/api/v1/publish/update", json={"path": "/some/art"})
     assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Task 6: artifact_status — the preview viewer's live in-place refresh (ENG-468)
+# ---------------------------------------------------------------------------
+
+from cowork.services.artifacts import artifact_status
+
+
+def test_artifact_status_unpublished(tmp_path: Path):
+    root = _make_static_html(tmp_path)  # never published
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root))
+    assert s["publishedUrl"] == ""
+    assert s["modified"] is False
+    assert s["accessMode"] == "public"
+    assert s["accessProtected"] is False
+
+
+def test_artifact_status_published_unmodified(tmp_path: Path):
+    root = _publish_static(tmp_path)
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root))
+    assert s["publishedUrl"]            # carries the view_url
+    assert s["modified"] is False
+
+
+def test_artifact_status_modified_after_change(tmp_path: Path):
+    root = _publish_static(tmp_path)
+    idx = root / "index.html"
+    idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
+    _touch(idx, publish_mod._content_mtime(root) + 100)
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root))
+    assert s["modified"] is True
+    assert s["publishedUrl"]            # still published
+
+
+def test_artifact_status_unknown_path_is_blank(tmp_path: Path):
+    # A path that can't be resolved → blank default, never raises.
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(tmp_path / "does-not-exist"))
+    assert s["publishedUrl"] == ""
+    assert s["modified"] is False
+    assert s["accessMode"] == "public"
+
+
+def test_artifact_status_loose_file_never_leaks_password(tmp_path: Path):
+    # Loose file (no metadata.json) published password-protected → exercises
+    # the card_for_folder-is-None fallback. The owner-only plaintext password
+    # must NOT appear in the status response.
+    f = tmp_path / "page.html"
+    f.write_text("<h1>hi</h1>", encoding="utf-8")
+    (tmp_path / ".published.json").write_text(
+        json.dumps({
+            "page.html": {
+                "report_id": "rid", "url": "https://4nton.ai/a/rid", "published": True,
+                "mode": "password", "requires_password": True,
+                "access_password": "s3cret", "pwd_version": 1,
+            }
+        }),
+        encoding="utf-8",
+    )
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(f))
+    assert s["accessMode"] == "password"
+    assert s["accessProtected"] is True
+    assert s["publishedUrl"] == "https://4nton.ai/a/rid"
+    assert "accessPassword" not in s        # plaintext must never leak
