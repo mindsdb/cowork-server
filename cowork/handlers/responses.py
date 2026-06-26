@@ -29,6 +29,7 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     friendly_turn_error,
+    response_failed_payload,
     response_failed_sse,
 )
 from cowork.services.conversations import ConversationService
@@ -210,9 +211,8 @@ class ResponsesHandler:
             persist()
             await buffer.close("completed")
         except asyncio.CancelledError:
-            # Explicit /cancel (Stop button). Buffer writes are synchronous
-            # for the file backend, so they complete despite cancellation.
-            await buffer.append("sse", {"sse": response_failed_sse("Stopped by user.", "cancelled")})
+            # Nothing special is emitted on cancellation.
+            # The partial text and evennts generated before cancellation are persisted.
             persist()
             await buffer.close("cancelled")
             return
@@ -224,7 +224,9 @@ class ResponsesHandler:
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
+            failed = response_failed_payload(message, code)
             await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            collected_events.append(failed)
             persist()
             await buffer.close("error")
         finally:

@@ -18,15 +18,6 @@ os.environ.setdefault("HERMES_HOME", HermesHarnessSettings().root_dir)
 
 logger = get_logger(__name__)
 
-# Default base URLs for providers that use the OpenAI-compatible API.
-# AIAgent requires both api_key AND base_url to bypass its config.yaml
-# provider-resolution path. Anthropic is omitted because AIAgent
-# auto-detects provider="anthropic" and uses its native Messages API.
-_PROVIDER_BASE_URLS: dict[str, str] = {
-    "openai": "https://api.openai.com/v1",
-    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
-}
-
 # Map cowork provider names to the env var AIAgent checks at init time.
 _PROVIDER_ENV_KEY = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -348,18 +339,28 @@ class HermesHarness:
             # The DB enum uses snake_case (openai_compatible) but AIAgent
             # expects kebab-case (openai-compatible).
             provider = settings.planning_provider.value.replace("_", "-")
-            key_field = settings.planning_provider.api_key_field
-            api_key = getattr(settings, key_field).get_secret_value()
+            # Resolve key and base URL through the shared single-source helpers
+            # (providers.provider_base_url / user_settings.provider_api_key) so
+            # the hermes path can't drift from the anton path. provider_api_key
+            # applies the gemini/openai-compatible → openai fallback (avoids a
+            # None.get_secret_value() crash for a user on the shared key).
+            from cowork.common.settings.user_settings import provider_api_key
+            from cowork.services.providers import provider_base_url
 
-            # AIAgent needs both api_key AND base_url to skip its config.yaml
-            # provider-resolution path.  For providers that use the OpenAI-
-            # compatible API (openai, gemini, openai-compatible), we must
-            # supply a base_url. Anthropic is handled separately by AIAgent
-            # (it detects provider="anthropic" and switches to the Anthropic
-            # Messages API internally).
-            base_url = _PROVIDER_BASE_URLS.get(provider)
-            if provider == "openai-compatible" and settings.openai_base_url:
-                base_url = settings.openai_base_url
+            _key = provider_api_key(settings, settings.planning_provider)
+            api_key = _key.get_secret_value() if _key else ""
+
+            # AIAgent needs an explicit base_url to skip its config.yaml
+            # provider-resolution path. provider_base_url returns None for
+            # direct openai (SDK default) and anthropic; anthropic is handled
+            # natively by AIAgent, but openai needs the explicit host here.
+            base_url = provider_base_url(
+                provider,
+                openai_base_url=settings.openai_base_url or "",
+                minds_url=settings.minds_url,
+            )
+            if base_url is None and provider == "openai":
+                base_url = "https://api.openai.com/v1"
 
             kwargs = dict(
                 provider=provider,
