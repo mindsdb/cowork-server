@@ -7,7 +7,7 @@ from cowork.schemas.base import CamelRequest, CamelResponse
 
 class SkillCreateRequest(CamelRequest):
     label: str
-    name: str
+    name: str | None = None
     description: str | None = None
     instructions: str | None = Field(default=None, alias="declarative")
     enabled: bool | None = None
