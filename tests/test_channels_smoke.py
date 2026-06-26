@@ -301,7 +301,12 @@ def test_telegram_fetch_attachment(monkeypatch):
     assert asyncio.run(bridge.fetch_attachment(attachment)) is None
 
 
-def test_inbound_media_becomes_harness_blocks(monkeypatch):
+def test_inbound_media_becomes_harness_blocks(monkeypatch, tmp_path):
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_FILES_DIR", str(tmp_path / "files"))
+    get_app_settings.cache_clear()
+
     harness = FakeHarness()
     monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: harness)
 
