@@ -210,6 +210,11 @@ class UserSettings(Settings):
         title="Show Dots",
         description="Show dot grid background.",
     )
+    show_token_usage: bool = Field(
+        default=False,
+        title="Show Token Usage",
+        description="Show estimated input/output token counts on each assistant message.",
+    )
     show_counters: bool = Field(
         default=True,
         title="Show Counters",
