@@ -8,7 +8,6 @@ import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
-from pydantic import SecretStr
 
 from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
 
@@ -54,6 +53,11 @@ def provider_base_url(
       - gemini             → Google's OpenAI-compatible endpoint
       - minds-cloud        → derived from the dedicated ``minds_url`` slot
       - openai-compatible  → the shared slot (this is the one that owns it)
+
+    openai-compatible with an *empty* base returns None, NOT api.openai.com:
+    forcing a BYO endpoint's key onto OpenAI's host would leak that key to the
+    wrong vendor. An empty openai-compatible base is a misconfiguration that
+    config_status surfaces ("Set a base URL") rather than silently routing.
     """
     p = (provider or "").replace("_", "-")
     if p == "minds-cloud":
@@ -61,7 +65,7 @@ def provider_base_url(
     if p == "gemini":
         return GEMINI_BASE_URL
     if p == "openai-compatible":
-        return openai_base_url or "https://api.openai.com/v1"
+        return openai_base_url or None
     # anthropic, openai → SDK default; never inherit the shared openai_base_url.
     return None
 
@@ -430,12 +434,11 @@ def resolve_stored_key(settings: UserSettings, ptype: str) -> str:
     """Get the stored (unmasked) API key for a UI provider type."""
     from cowork.common.settings.user_settings import (
         UI_TYPE_TO_PROVIDER,
-        provider_api_key,
+        provider_api_key_str,
     )
     provider = UI_TYPE_TO_PROVIDER.get(ptype)
     if provider is None:
         return ""
-    # provider_api_key applies the gemini/openai-compatible → openai fallback,
+    # provider_api_key_str applies the gemini/openai-compatible → openai fallback,
     # so existing single-key configs still resolve here (Test button, key reveal).
-    val = provider_api_key(settings, provider)
-    return val.get_secret_value() if isinstance(val, SecretStr) else ""
+    return provider_api_key_str(settings, provider)
