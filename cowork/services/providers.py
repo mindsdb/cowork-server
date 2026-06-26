@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import SecretStr
@@ -30,6 +31,27 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
+# Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
+# publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
+# can't map to a non-prod MindsHub env, falls back here.
+PUBLISH_FAILSAFE_URL = "https://4nton.ai"
+
+
+def publish_url_for_endpoint(endpoint_url: str | None) -> str:
+    """Publish base URL for the MindsHub env the given endpoint points at.
+
+    The publish API (root-mounted ``/upload``, ``/list``, ``/delete/{id}``) is
+    served on the *non-prod* MindsHub api hosts, so a provider pointed at
+    ``api.<env>.mindshub.ai`` (dev/staging) publishes to that same host. Prod
+    (``api.mindshub.ai``) has no publish routes, and anything unrecognised
+    (mdb.ai, a custom endpoint, empty) falls back to the legacy ``4nton.ai``
+    host. anton appends the route path; an explicit `publish_url` /
+    `ANTON_PUBLISH_URL` overrides this.
+    """
+    host = (urlparse(endpoint_url or "").hostname or "").lower()
+    if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
+        return f"https://{host}"
+    return PUBLISH_FAILSAFE_URL
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
