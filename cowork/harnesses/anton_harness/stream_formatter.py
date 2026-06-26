@@ -114,6 +114,7 @@ async def format_responses_stream(
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamUsageSummary,
     )
 
     resp_id = f"resp-{uuid.uuid4().hex[:12]}"
@@ -281,6 +282,17 @@ async def format_responses_stream(
                 "type": "response.artifact_created",
                 "sequence_number": seq,
                 "artifact": event.artifact,
+            })
+
+        elif isinstance(event, StreamUsageSummary):
+            seq += 1
+            yield _event("response.usage_summary", {
+                "type": "response.usage_summary",
+                "sequence_number": seq,
+                "input_tokens": event.input_tokens,
+                "output_tokens": event.output_tokens,
+                "cache_read_input_tokens": event.cache_read_input_tokens,
+                "cache_creation_input_tokens": event.cache_creation_input_tokens,
             })
 
         elif isinstance(event, StreamComplete):
