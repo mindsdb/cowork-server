@@ -5,6 +5,7 @@ Uses a local JSON state file for publish history tracking.
 """
 from __future__ import annotations
 
+import hashlib
 import html as _html
 import json
 import logging
@@ -20,8 +21,10 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import (
     _artifact_root_for,
+    _content_mtime,
     _fullstack_types,
     _load_metadata,
+    _load_published_map,
     _pick_primary,
     _user_files,
     html_artifacts,
@@ -36,7 +39,9 @@ def _cowork_state_dir() -> Path:
     if base:
         path = Path(base).expanduser()
     else:
-        path = Path.home() / ".anton" / "cowork"
+        # Consolidated under ~/.cowork (was ~/.anton/cowork); the desktop app
+        # migrates the existing state.json on first run.
+        path = Path.home() / ".cowork"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -405,6 +410,11 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", ""),
+            # Snapshot of the artifact's content mtime at publish time — the
+            # cheap gate for the `modified` badge (see card_for_folder). Uses
+            # the SAME basis as the card's `mtime` so the comparison is exact.
+            "published_mtime": _content_mtime(published_dir),
+            "published": True,
             **owner_side,
         }
         published_map[published_key] = entry
@@ -425,6 +435,48 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         "orgAllowed": bool(owner_side.get("org_allowed")),
         "result": {k: v for k, v in result.items() if k != "file_payload"},
     }
+
+
+def compute_publish_md5(raw_path: str) -> str | None:
+    """Recompute the md5 of the publish bundle for an artifact path.
+
+    Matches the `last_md5` the lambda stores at publish time (md5 of the zip
+    bytes `anton.publisher` produces). Mirrors `publish_artifact`'s source
+    resolution exactly: markdown renders to a throwaway index.html first;
+    static publishes the single primary file; fullstack publishes the
+    artifact directory.
+
+    Returns None when the artifact can't be resolved or bundled — the caller
+    treats None as "can't tell" and does not flag the artifact as modified.
+    """
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(artifact)
+    except Exception:
+        return None
+    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+        return None
+    try:
+        from anton.publisher import _zip_fullstack, _zip_html
+    except Exception:
+        return None
+
+    md_tmp_dir: tempfile.TemporaryDirectory | None = None
+    try:
+        publish_source = publish_target
+        if not is_fullstack and publish_target.suffix.lower() == ".md":
+            md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-md5-")
+            publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+        if is_fullstack:
+            zipped, _included = _zip_fullstack(publish_source)
+        else:
+            zipped = _zip_html(publish_source)
+    except Exception:
+        return None
+    finally:
+        if md_tmp_dir is not None:
+            md_tmp_dir.cleanup()
+    return hashlib.md5(zipped).hexdigest()
 
 
 def unpublish_artifact(raw_path: str) -> dict:
@@ -475,12 +527,99 @@ def unpublish_artifact(raw_path: str) -> dict:
             logger.exception("Unpublishing failed (identifier=%s)", identifier)
             raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
-    published_map.pop(published_key, None)
-    try:
-        if published_map:
+    # Soft-delete: keep report_id (and url) so a later re-publish reuses the
+    # same public URL. Only flip `published` off so readers stop showing it as
+    # live. The backend object is gone, but lambda re-mints at the same id when
+    # we resend report_id on the next publish.
+    if isinstance(entry, dict):
+        entry["published"] = False
+        published_map[published_key] = entry
+        try:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
-        else:
-            published_json.unlink()
+        except Exception:
+            pass
+    return {"status": "ok"}
+
+
+def update_artifact(raw_path: str) -> dict:
+    """Re-publish an already-published artifact, preserving its URL and access.
+
+    `publish_artifact` reuses the stored report_id (→ the lambda mints a new
+    version at the same URL), but it would reset access to public if handed no
+    access object. So reconstruct the prior access from `.published.json` and
+    pass it through. After republish, refresh `published_mtime` so the badge
+    clears. Raises FileNotFoundError when there's nothing published to update.
+    """
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    published_json = published_dir / ".published.json"
+    if not published_json.is_file():
+        raise FileNotFoundError("Artifact has no publish record")
+    try:
+        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Could not read publish record") from exc
+
+    entry = published_map.get(published_key)
+    if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
+        raise FileNotFoundError("No published version to update")
+
+    # Rebuild the cowork→publish access shape from the stored owner-side state.
+    mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
+    if mode == "password":
+        access = {"mode": "password", "password": entry.get("access_password", "") or ""}
+    elif mode == "restricted":
+        access = {
+            "mode": "restricted",
+            "emails": entry.get("emails", []) or [],
+            "org_allowed": bool(entry.get("org_allowed")),
+        }
+    else:
+        access = {"mode": "public"}
+
+    # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
+    result = publish_artifact(raw_path, access=access)
+
+    # Refresh the mtime snapshot so the cheap gate clears the `modified` badge.
+    try:
+        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
+        fresh_entry = fresh_map.get(published_key)
+        if isinstance(fresh_entry, dict):
+            fresh_entry["published_mtime"] = _content_mtime(published_dir)
+            fresh_map[published_key] = fresh_entry
+            published_json.write_text(json.dumps(fresh_map, indent=2) + "\n", encoding="utf-8")
     except Exception:
         pass
-    return {"status": "ok"}
+
+    return result
+
+
+def published_state(raw_path: str) -> dict:
+    """Owner-side publish state for an artifact path, resolved exactly the way
+    `publish_artifact` resolves it (so the chat tool and the GUI never disagree
+    on where `.published.json` lives).
+
+    Returns ``{"report_id", "url", "published"}``. `url` is blank unless the
+    record is currently live (`published is True` and a url exists). `report_id`
+    is returned even for soft-deleted records so a re-publish can reuse it.
+    """
+    blank = {"report_id": "", "url": "", "published": False}
+    # resolve_artifact_path raises (not returns None) for paths outside a known
+    # artifacts dir, so guard the whole resolution — the documented contract is
+    # to return the blank default for any unresolvable path, never to raise.
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    except Exception:
+        return dict(blank)
+    if artifact is None:
+        return dict(blank)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    entry = _load_published_map(published_dir).get(published_key)
+    if not isinstance(entry, dict):
+        return dict(blank)
+    live = bool(entry.get("published", True)) and bool(entry.get("url"))
+    return {
+        "report_id": str(entry.get("report_id") or ""),
+        "url": str(entry.get("url") or "") if live else "",
+        "published": live,
+    }

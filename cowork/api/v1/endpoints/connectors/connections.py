@@ -33,9 +33,7 @@ def get_connection(engine: str, name: str):
 def save_connection_direct(body: DirectSaveRequest):
     """Persist credentials to the vault without running a probe.
     Used after an OAuth PKCE flow (Electron main-process PKCE) where the
-    token exchange already succeeded. Calls verify_connection before saving —
-    token validation is only implemented for Google Drive so far; other Google
-    services skip the check until their verify URLs are added to verify_connection."""
+    token exchange already succeeded. Calls verify_connection before saving."""
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
     from anton.core.datasources.data_vault import LocalDataVault

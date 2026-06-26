@@ -23,10 +23,12 @@ IMAGE_FORMAT_USER_MESSAGE = (
     "Sorry, I couldn't process that image. Try uploading it as a PNG or JPEG."
 )
 
-# Curated copy for a spent token allowance. Without this the turn would
-# die on a 429 mid-stream with no completion event and no error frame —
-# the SSE connection just closes and the renderer's spinner stops, which
-# reads as "Anton is dead" rather than "you ran out of tokens".
+# Curated copy for a spent token/credit allowance. Without this the turn
+# would die on a 429/402 mid-stream with no completion event and no error
+# frame — the SSE connection just closes and the renderer's spinner stops,
+# which reads as "Anton is dead" rather than a quota message. The desktop
+# renders a richer card for the `token_limit` code (Add credits / Bring
+# your own keys); this text is the fallback copy.
 TOKEN_LIMIT_USER_MESSAGE = (
     "You've reached your monthly token limit. To keep going, upgrade your plan "
     "or add your own LLM provider key in Settings — or wait until your allowance "
@@ -66,10 +68,11 @@ def is_image_format_error(exc: Exception) -> bool:
 
 
 def is_token_limit_error(exc: Exception) -> bool:
-    """Detect anton's ``TokenLimitExceeded`` — raised when the upstream LLM
-    endpoint returns 429 because the account's included-token allowance is
-    spent. anton already builds a friendly message; we just need to know it's
-    a quota failure (not a generic crash) so we can emit curated copy.
+    """Detect a spent allowance — anton's ``TokenLimitExceeded`` (429 token
+    limit) OR an exhausted credit balance (the gateway may instead report a
+    402 / "insufficient credits"). Both mean "out of credits", so we map them
+    to the same ``token_limit`` code and let the client show the curated
+    out-of-credits card instead of a generic crash.
     """
     try:
         from anton.core.llm.provider import TokenLimitExceeded
@@ -78,10 +81,22 @@ def is_token_limit_error(exc: Exception) -> bool:
             return True
     except Exception:
         # anton not importable / the type moved — fall back to matching the
-        # stable 429 message anton constructs for this case.
+        # stable messages the upstream constructs for these cases.
         pass
     s = str(exc).lower()
-    return "429" in s and "limit exceeded for tokens" in s
+    # 429 token-allowance exhausted (the original case).
+    if "429" in s and "limit exceeded for tokens" in s:
+        return True
+    # Spent credit balance — a 402, or any "insufficient/no credits|quota"
+    # phrasing. Scoped to credit/quota/token context so unrelated 402s or
+    # "insufficient permissions" don't get mislabelled.
+    if "402" in s and ("credit" in s or "quota" in s or "token" in s):
+        return True
+    if "insufficient" in s and ("credit" in s or "quota" in s):
+        return True
+    if "out of credit" in s or "no credit" in s or "out of quota" in s:
+        return True
+    return False
 
 
 def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
@@ -95,6 +110,11 @@ def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
     if is_image_format_error(exc):
         return "image_format", IMAGE_FORMAT_USER_MESSAGE
     return None
+
+
+def response_failed_payload(error: str, code: str) -> dict:
+    """Wire payload for a ``response.failed`` event (SSE + DB sidecar)."""
+    return {"type": "response.failed", "code": code, "error": error}
 
 
 def response_failed_sse(error: str, code: str) -> str:
