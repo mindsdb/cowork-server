@@ -1,6 +1,6 @@
 [project]
 name = "cowork-server"
-version = "0.1.10"
+dynamic = ["version"]
 description = "FastAPI backend for the MindsHub Cowork desktop app"
 readme = "README.md"
 license = "LicenseRef-Proprietary"
@@ -51,8 +51,12 @@ channels = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0-dev"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
