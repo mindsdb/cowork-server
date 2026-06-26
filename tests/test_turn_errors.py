@@ -78,21 +78,58 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
         yield "event: response.created\ndata: {}\n\n"
         raise exc
 
+    async def _stream_response(*, conversation, input, disabled_connections=None):
+        if False:
+            yield
+
     class _Harness:
         id = "anton"
         formatter = staticmethod(_formatter)
+        stream_response = staticmethod(_stream_response)
 
     handler.harness = _Harness()
     return handler
 
 
-async def _collect_stream(handler: ResponsesHandler) -> list[str]:
-    return [frame async for frame in handler._stream(stream=None, conversation_id=uuid4(), model="anton")]
+async def _collect_produce_sse(handler: ResponsesHandler) -> list[str]:
+    """Drive the streaming (_produce) error path and collect SSE frames."""
+    from unittest.mock import MagicMock, patch
+
+    frames: list[str] = []
+
+    class _Buffer:
+        async def append(self, _kind, data):
+            frames.append(data["sse"])
+
+        async def close(self, _status):
+            pass
+
+    conv_id = uuid4()
+    mock_session = MagicMock()
+
+    with (
+        patch("cowork.handlers.responses.get_open_session", return_value=mock_session),
+        patch("cowork.handlers.responses.ConversationService") as conv_svc,
+        patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
+    ):
+        conv_svc.return_value.get_conversation.return_value = MagicMock()
+        await handler._produce(
+            conv_id=conv_id,
+            harness_input=[{"type": "text", "text": "hi"}],
+            original_content="hi",
+            model="anton",
+            disabled=None,
+            harness_name="anton",
+            harness_id="anton",
+            buffer=_Buffer(),
+        )
+
+    return frames
 
 
-def test_stream_emits_friendly_failed_event_for_image_error():
+async def test_stream_emits_friendly_failed_event_for_image_error():
     exc = Exception("Input tag 'image_url' ... does not match the expected tags: 'image'")
-    frames = asyncio.run(_collect_stream(_handler_with_raising_formatter(exc)))
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
     # created frame still came through, then a clean failure — no raise.
     assert any("response.created" in f for f in frames)
     failed = [f for f in frames if "response.failed" in f]
@@ -102,8 +139,10 @@ def test_stream_emits_friendly_failed_event_for_image_error():
     assert "PNG or JPEG" in payload["error"]
 
 
-def test_stream_redacts_generic_error():
-    frames = asyncio.run(_collect_stream(_handler_with_raising_formatter(Exception("psycopg2: password authentication failed for user 'admin'"))))
+async def test_stream_redacts_generic_error():
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(Exception("psycopg2: password authentication failed for user 'admin'"))
+    )
     failed = [f for f in frames if "response.failed" in f]
     assert len(failed) == 1
     payload = json.loads(failed[0].split("data: ", 1)[1].strip())
@@ -183,8 +222,8 @@ def test_token_limit_takes_precedence_over_generic():
     assert code != te.GENERIC_TURN_ERROR_CODE
 
 
-def test_stream_emits_friendly_failed_event_for_token_limit():
-    frames = asyncio.run(_collect_stream(_handler_with_raising_formatter(Exception(_TOKEN_LIMIT_MESSAGE))))
+async def test_stream_emits_friendly_failed_event_for_token_limit():
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(Exception(_TOKEN_LIMIT_MESSAGE)))
     # created frame still came through, then a clean quota failure — no raise.
     assert any("response.created" in f for f in frames)
     failed = [f for f in frames if "response.failed" in f]
