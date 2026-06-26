@@ -5,6 +5,9 @@ on:
     # types: [opened, reopened, synchronize, labeled]
     types: [opened, reopened, synchronize]
 
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: bash
