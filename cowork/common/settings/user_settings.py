@@ -254,9 +254,9 @@ class UserSettings(Settings):
         description="How UI updates are applied (manual or auto).",
     )
     publish_url: str = Field(
-        default="https://4nton.ai",
+        default="",
         title="Publish URL",
-        description="URL for publishing artifacts.",
+        description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
     openai_base_url: str = Field(
         default="",
