@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import tempfile
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -171,21 +173,47 @@ class SkillService:
         self._write(skill)
         return self.get_skill(skill.name)
 
-    def import_skill(self, content: str) -> Skill:
-        """Parse an uploaded ``SKILL.md`` text and persist it as a new skill.
+    def import_skill(self, data: bytes, filename: str | None = None) -> Skill:
+        """Import a skill from an uploaded file.
 
-        Validation = "does it parse via skill_format". Raises ValueError if the
-        content is not a parseable SKILL.md, or FileExistsError on slug collision.
+        Supported formats (by extension):
+          - ``.md`` / ``.skill`` — a text ``SKILL.md``.
+          - ``.zip`` — the contents of a skill folder, extracted as-is.
+
+        Validation = "does its ``SKILL.md`` parse via skill_format". Raises
+        ``ValueError`` for an unparseable/unsafe file, ``FileExistsError`` on
+        slug collision.
         """
+        if Path(filename or "").suffix.lower() == ".zip":
+            return self._import_zip(data)
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("File must be UTF-8 encoded text.")
         # parse_skill_dir needs a dir holding a file literally named SKILL.md.
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp) / "skill"
             tmp_dir.mkdir(parents=True)
             (tmp_dir / SKILL_FILE).write_text(content, encoding="utf-8")
-            skill = _skill_from_dir(tmp_dir)
+            return self._persist_imported(tmp_dir, copy_tree=False)
 
+    def _import_zip(self, data: bytes) -> Skill:
+        with tempfile.TemporaryDirectory() as tmp:
+            extract_dir = Path(tmp) / "skill"
+            extract_dir.mkdir(parents=True)
+            self._safe_extract_zip(data, extract_dir)
+            return self._persist_imported(extract_dir, copy_tree=True)
+
+    def _persist_imported(self, src_dir: Path, *, copy_tree: bool) -> Skill:
+        """Validate a parsed skill folder and persist it into the canon.
+
+        ``copy_tree`` copies the whole ``src_dir`` (zip: keep sibling files);
+        otherwise only ``SKILL.md`` is written by ``_write``.
+        """
+        self._normalize_skill_dir(src_dir)
+        skill = _skill_from_dir(src_dir)
         if skill is None:
-            raise ValueError("Could not parse the uploaded file as a SKILL.md.")
+            raise ValueError("Could not find a parseable SKILL.md in the upload.")
         if not skill.name:
             raise ValueError("Skill name is missing or invalid.")
         if self._skill_dir(skill.name).exists():
@@ -197,8 +225,48 @@ class SkillService:
         if not skill.description.strip():
             skill.description = skill.display_name or skill.name
 
+        if copy_tree:
+            self._ensure_root()
+            shutil.copytree(src_dir, self._skill_dir(skill.name))
+        # _write (re)writes SKILL.md canonically, stamps updated_at, reconciles
+        # links; with copy_tree the sibling files are already in place.
         self._write(skill)
         return self.get_skill(skill.name)
+
+    @staticmethod
+    def _normalize_skill_dir(src_dir: Path) -> None:
+        """Unwrap a single-element upload so ``SKILL.md`` sits at ``src_dir`` root.
+
+        - A lone wrapping folder (zip packed with its folder) → hoist its
+          contents up one level (repeats for nested wrapping).
+        - A lone ``*.md`` file → rename it to ``SKILL.md``.
+        """
+
+        entries = list(src_dir.iterdir())
+        if len(entries) != 1:
+            return
+        only = entries[0]
+        if only.is_dir():
+            for item in list(only.iterdir()):
+                shutil.move(str(item), str(src_dir / item.name))
+            only.rmdir()
+            return
+        if only.suffix.lower() == ".md" and only.name != SKILL_FILE:
+            only.rename(src_dir / SKILL_FILE)
+
+    @staticmethod
+    def _safe_extract_zip(data: bytes, dest: Path) -> None:
+        """Extract a zip into ``dest``, rejecting any path that escapes it."""
+        dest_resolved = dest.resolve()
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for member in zf.namelist():
+                    target = (dest / member).resolve()
+                    if target != dest_resolved and dest_resolved not in target.parents:
+                        raise ValueError(f"Unsafe path in archive: {member!r}")
+                zf.extractall(dest)
+        except zipfile.BadZipFile:
+            raise ValueError("Uploaded file is not a valid zip archive.")
 
     def delete_skill(self, slug: str) -> bool:
         skill_dir = self._skill_dir(slug)
