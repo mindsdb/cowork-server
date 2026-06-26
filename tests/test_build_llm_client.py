@@ -113,6 +113,18 @@ def test_anthropic_gets_no_base_url_kwarg(build):
     assert "base_url" not in kw  # AnthropicProvider takes no base_url kwarg
 
 
+def test_missing_key_error_names_the_actual_provider(build):
+    # gemini/openai-compatible go through the OpenAIProvider branch but the
+    # "not configured" message must name the real provider, not "OpenAI".
+    settings = UserSettings(
+        planning_provider=Provider.GEMINI,
+        coding_provider=Provider.GEMINI,
+        # no key anywhere → no fallback either
+    )
+    with pytest.raises(ValueError, match="Gemini API key is not configured"):
+        build(settings)
+
+
 def test_openai_compatible_without_base_raises(build):
     # Defense-in-depth: config_status flags an empty OC base, but callers don't
     # all gate on config_ready, so the build site must refuse rather than let
