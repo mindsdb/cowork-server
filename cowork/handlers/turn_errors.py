@@ -91,9 +91,13 @@ def is_token_limit_error(exc: Exception) -> bool:
     # Spent credit balance — a 402 paired with credit/quota keywords.
     # "402 + token" alone is intentionally excluded: a JWT-expiry or session
     # error may produce "402 … token … expired" which is not a quota failure.
-    if "402" in s and ("credit" in s or "quota" in s):
-        return True
-    if "402" in s and re.search(r"token\s+(limit|quota|allowance)", s):
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    is_402 = status == 402 or re.search(r"\b402\b", s) is not None
+    if is_402 and (
+        "credit" in s or "quota" in s or re.search(r"token\s+(limit|quota|allowance)", s)
+    ):
         return True
     if "insufficient" in s and ("credit" in s or "quota" in s):
         return True
