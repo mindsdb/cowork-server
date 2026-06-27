@@ -7,11 +7,13 @@ and all necessary configurations for the Cowork service.
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from cowork.api.v1.router import api_router as v1_router
+from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -104,6 +106,16 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
         max_age=3600,
     )
+
+    # Optional bearer-token auth.  Off by default; enabled when
+    # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
+    # when COWORK_AUTH_TOKEN is not set, then persisted to ~/.cowork/.env
+    # so the desktop app and subsequent server runs share the same secret.
+    if settings.require_auth:
+        env_path = Path.home() / ".cowork" / ".env"
+        token = settings.auth_token or ensure_auth_token(env_path)
+        app.add_middleware(BearerTokenMiddleware, token=token)
+        logger.info("auth: bearer-token authentication enabled")
 
     # Include v1 API routes
     app.include_router(v1_router)
