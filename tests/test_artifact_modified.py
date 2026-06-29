@@ -373,3 +373,121 @@ def test_artifact_status_loose_file_never_leaks_password(tmp_path: Path):
     assert s["accessProtected"] is True
     assert s["publishedUrl"] == "https://4nton.ai/a/rid"
     assert "accessPassword" not in s        # plaintext must never leak
+
+
+# ---------------------------------------------------------------------------
+# Task 1: deterministic publish bundle (anton.publisher._write_scrubbed)
+# ---------------------------------------------------------------------------
+
+import time
+
+from anton.publisher import _zip_fullstack
+
+
+def _make_fullstack(tmp_path: Path) -> Path:
+    """A folder-based fullstack artifact: metadata.json + backend.py +
+    static/index.html (text) + static/logo.png (binary)."""
+    root = tmp_path / "fullstack-art"
+    (root / "static").mkdir(parents=True)
+    (root / "metadata.json").write_text(
+        json.dumps({
+            "id": "fullstack-art",
+            "type": "fullstack-stateful-app",
+            "primary": "static/index.html",
+        }),
+        encoding="utf-8",
+    )
+    (root / "backend.py").write_text("print('hi')\n", encoding="utf-8")
+    (root / "static" / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    (root / "static" / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"fakepng")
+    return root
+
+
+def test_publish_bundle_md5_is_time_independent(tmp_path: Path):
+    """The bundle md5 must depend only on content + arcname, never on the
+    wall clock (the root cause of the false 'Unpublished changes' badge)."""
+    root = _make_fullstack(tmp_path)
+
+    # Two builds under two very different "current times" AND two different
+    # mtimes for the binary asset. A content-deterministic bundle must hash
+    # identically; the old writestr(str, ...) path stamps localtime and fails.
+    t_early = time.struct_time((2020, 1, 1, 0, 0, 0, 2, 1, 0))
+    t_late = time.struct_time((2099, 6, 15, 12, 30, 0, 0, 166, 0))
+
+    with patch("time.localtime", return_value=t_early):
+        _touch(root / "static" / "logo.png", 1_000_000.0)
+        first = hashlib.md5(_zip_fullstack(root)[0]).hexdigest()
+
+    with patch("time.localtime", return_value=t_late):
+        _touch(root / "static" / "logo.png", 2_000_000.0)
+        second = hashlib.md5(_zip_fullstack(root)[0]).hexdigest()
+
+    assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Task 2: backend.log excluded from the mtime gate
+# ---------------------------------------------------------------------------
+
+from cowork.services.artifacts import _HOUSEKEEPING_FILES
+from anton.publisher import _FULLSTACK_EXCLUDED
+
+
+def _publish_fullstack(tmp_path: Path) -> Path:
+    """Make + publish a fullstack artifact, returning its folder. last_md5 is
+    the real bundle md5 (what the server would store)."""
+    root = _make_fullstack(tmp_path)
+    md5 = hashlib.md5(_zip_fullstack(root)[0]).hexdigest()
+    with _patched_publish(tmp_path, md5=md5):
+        publish_mod.publish_artifact(str(root))
+    return root
+
+
+def test_fullstack_modified_false_when_only_backend_log_changes(tmp_path: Path):
+    """A running backend constantly rewrites backend.log; that must NOT make a
+    published artifact look modified."""
+    root = _publish_fullstack(tmp_path)
+    # Simulate the live backend writing its log far into the future.
+    log = root / "backend.log"
+    log.write_text("server started\n", encoding="utf-8")
+    _touch(log, publish_mod._content_mtime(root) + 10_000)
+    with _patch_scan(tmp_path):
+        card = card_for_folder(root)
+    assert card["modified"] is False
+
+
+def test_housekeeping_lists_consistent(tmp_path: Path):
+    """backend.log must be excluded both from the mtime gate (cowork-server)
+    and from the published bundle (anton publisher)."""
+    assert "backend.log" in _HOUSEKEEPING_FILES
+    assert "backend.log" in _FULLSTACK_EXCLUDED
+
+
+# ---------------------------------------------------------------------------
+# Task 3: fullstack modified flag — real change vs content-preserving touch
+# ---------------------------------------------------------------------------
+
+
+def test_fullstack_modified_true_after_real_change(tmp_path: Path):
+    root = _publish_fullstack(tmp_path)
+    idx = root / "static" / "index.html"
+    idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
+    _touch(idx, publish_mod._content_mtime(root) + 100)
+    with _patch_scan(tmp_path):
+        card = card_for_folder(root)
+    assert card["modified"] is True
+
+
+def test_fullstack_binary_touch_self_heals(tmp_path: Path):
+    """Touching a binary asset (no content change) must not raise the badge:
+    the recomputed md5 matches and published_mtime self-heals."""
+    root = _publish_fullstack(tmp_path)
+    pub = root / ".published.json"
+    old = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
+    png = root / "static" / "logo.png"
+    _touch(png, old + 100)  # bump past the gate, identical bytes
+    with _patch_scan(tmp_path):
+        card = card_for_folder(root)
+    assert card["modified"] is False
+    healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
+    assert healed >= old + 100
