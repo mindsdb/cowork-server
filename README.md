@@ -1,4 +1,4 @@
-# Cowork Server
+# MindsHub Cowork - Server
 
 FastAPI backend for [MindsHub Cowork](https://github.com/mindsdb/cowork). Manages projects, conversations, files, scheduling, memory, and agent orchestration with a SQLite-backed data layer.
 
