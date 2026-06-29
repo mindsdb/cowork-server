@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from cowork.api.collab_local import router as collab_local_router
 from cowork.api.v1.router import api_router as v1_router
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
@@ -107,6 +108,7 @@ def create_app() -> FastAPI:
 
     # Include v1 API routes
     app.include_router(v1_router)
+    app.include_router(collab_local_router)
 
     _install_channels(app)
 

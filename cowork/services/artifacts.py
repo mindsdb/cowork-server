@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Iterator
 
 from urllib.parse import quote
+from urllib.parse import urlsplit, urlunsplit
 
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -235,6 +236,41 @@ def _content_mtime(folder: Path) -> int:
         return 0
 
 
+def _normalize_static_view_url(url: str | None) -> str:
+    """Return the routable static report URL shape for legacy viewer hosts."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return raw
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if len(segments) == 3 and segments[0] == "view":
+        path = f"/view/{segments[1]}/{segments[2]}/"
+        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+    return raw
+
+
+def _local_collab_url_for_static(url: str | None) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if len(segments) != 3 or segments[0] != "view":
+        return ""
+    settings = get_app_settings()
+    public_base = getattr(settings, "public_base_url", "") or ""
+    host = getattr(settings, "host", "127.0.0.1")
+    port = getattr(settings, "port", 26866)
+    origin = (public_base or f"http://{host}:{port}").rstrip("/")
+    return f"{origin}/collab/view/{segments[1]}/{segments[2]}"
+
+
 def _published_url_for(folder: Path, primary: Path | None) -> str:
     if primary is None:
         return ""
@@ -245,7 +281,21 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
         # have no `published` field; a url means they're live.
         if not entry.get("published", True):
             return ""
-        return entry.get("url", "") or ""
+        return _normalize_static_view_url(entry.get("url", "") or "")
+    return ""
+
+
+def _published_edit_url_for(folder: Path, primary: Path | None) -> str:
+    if primary is None:
+        return ""
+    entry = _load_published_map(folder).get(primary.name)
+    if isinstance(entry, dict):
+        if not entry.get("published", True):
+            return ""
+        edit_url = entry.get("edit_url") or entry.get("editUrl") or entry.get("collab_url") or entry.get("collabUrl") or ""
+        if edit_url:
+            return edit_url
+        return _local_collab_url_for_static(entry.get("url", "") or "")
     return ""
 
 
@@ -607,6 +657,8 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
         "path": primary_path,
         "primary": meta.get("primary") or None,
         "publishedUrl": _published_url_for(folder, primary),
+        "editUrl": _published_edit_url_for(folder, primary),
+        "collabUrl": _published_edit_url_for(folder, primary),
         "modified": _is_modified(folder, primary, content_mtime),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
         # is the plaintext, returned only to the owner's own session.
@@ -747,6 +799,8 @@ async def mount_preview(path: Path) -> dict:
             # keyed by the primary file name — surface the published state so
             # the viewer shows the "Published" pill for backend artifacts too.
             "publishedUrl": _published_url_for(root, path),
+            "editUrl": _published_edit_url_for(root, path),
+            "collabUrl": _published_edit_url_for(root, path),
             **_published_access_for(root, path),
         }
 
@@ -767,6 +821,8 @@ async def mount_preview(path: Path) -> dict:
         # record reports an empty URL — matching the artifact grid and the
         # fullstack branch, instead of surfacing a dead 4nton.ai link.
         "publishedUrl": _published_url_for(parent, path),
+        "editUrl": _published_edit_url_for(parent, path),
+        "collabUrl": _published_edit_url_for(parent, path),
         **_published_access_for(parent, path),
     }
 
@@ -815,6 +871,8 @@ def html_artifacts() -> list[dict]:
                     "path": str(entry_path),
                     "bytes": entry_path.stat().st_size if entry_path.is_file() else 0,
                     "publishedUrl": _published_url_for(artifact_root, entry_path),
+                    "editUrl": _published_edit_url_for(artifact_root, entry_path),
+                    "collabUrl": _published_edit_url_for(artifact_root, entry_path),
                 })
                 continue
 
@@ -824,6 +882,8 @@ def html_artifacts() -> list[dict]:
                 "path": str(path),
                 "bytes": path.stat().st_size,
                 "publishedUrl": _published_url_for(path.parent, path),
+                "editUrl": _published_edit_url_for(path.parent, path),
+                "collabUrl": _published_edit_url_for(path.parent, path),
             })
     return out[:40]
 

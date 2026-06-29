@@ -99,7 +99,8 @@ def test_publish_markdown_uploads_rendered_html_and_keys_registry_on_md(tmp_path
     # The publisher received a generated index.html, not the raw .md.
     assert captured["src"].name == "index.html"
     assert "<h1" in captured["src_html"] and "body text" in captured["src_html"]
-    assert result["url"] == "https://4nton.ai/view/u/abc"
+    assert result["url"] == "https://4nton.ai/view/u/abc/"
+    assert result["editUrl"] == "http://127.0.0.1:26866/collab/view/u/abc"
 
     # Registry + history key off the ORIGINAL markdown file, not the temp html.
     registry = json.loads((art / ".published.json").read_text())

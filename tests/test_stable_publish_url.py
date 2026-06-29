@@ -29,7 +29,7 @@ def _read_map(folder: Path) -> dict:
 # Task 1: _published_url_for honors the `published` flag
 # ---------------------------------------------------------------------------
 
-from cowork.services.artifacts import _published_url_for
+from cowork.services.artifacts import _published_edit_url_for, _published_url_for
 
 
 def _write_published(folder: Path, entry: dict, name: str = "index.html") -> Path:
@@ -51,6 +51,43 @@ def test_published_url_legacy_entry_without_flag_is_published(tmp_path: Path):
     # Pre-existing entries have no `published` field but a url -> treat as live.
     primary = _write_published(tmp_path, {"report_id": "r1", "url": "https://x/a/r1"})
     assert _published_url_for(tmp_path, primary) == "https://x/a/r1"
+
+
+def test_published_static_view_url_gets_trailing_slash(tmp_path: Path):
+    primary = _write_published(
+        tmp_path,
+        {"report_id": "abc", "url": "https://4nton.ai/view/u/abc", "published": True},
+    )
+    assert _published_url_for(tmp_path, primary) == "https://4nton.ai/view/u/abc/"
+
+
+def test_published_edit_url_prefers_stored_url(tmp_path: Path):
+    primary = _write_published(
+        tmp_path,
+        {"report_id": "r1", "url": "https://x/a/r1", "edit_url": "https://x/a/r1/collab", "published": True},
+    )
+    assert _published_edit_url_for(tmp_path, primary) == "https://x/a/r1/collab"
+
+
+def test_published_edit_url_falls_back_to_local_collab_route(tmp_path: Path):
+    primary = _write_published(tmp_path, {"report_id": "r1", "url": "https://x/a/r1/", "published": True})
+    assert _published_edit_url_for(tmp_path, primary) == ""
+
+
+def test_published_static_edit_url_falls_back_to_local_collab_route(tmp_path: Path):
+    primary = _write_published(
+        tmp_path,
+        {"report_id": "abc", "url": "https://4nton.ai/view/u/abc/", "published": True},
+    )
+    assert _published_edit_url_for(tmp_path, primary).endswith("/collab/view/u/abc")
+
+
+def test_published_edit_url_empty_when_unpublished(tmp_path: Path):
+    primary = _write_published(
+        tmp_path,
+        {"report_id": "r1", "url": "https://x/a/r1", "edit_url": "https://x/a/r1/edit", "published": False},
+    )
+    assert _published_edit_url_for(tmp_path, primary) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +115,7 @@ def _patch_scan(container: Path):
     return patch("cowork.services.artifacts._scan_artifact_dirs", lambda: [container])
 
 
-def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", report_id="uuid-1"):
+def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", report_id="uuid-1", edit_url=None):
     """Context-manager stack patching everything publish_artifact touches."""
     from contextlib import ExitStack
 
@@ -92,7 +129,12 @@ def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", repo
     stack.enter_context(
         patch(
             "anton.publisher.publish",
-            lambda *a, **k: {"view_url": view_url, "report_id": report_id, "md5": "m1"},
+            lambda *a, **k: {
+                "view_url": view_url,
+                "edit_url": edit_url,
+                "report_id": report_id,
+                "md5": "m1",
+            },
         )
     )
     return stack
@@ -100,11 +142,13 @@ def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", repo
 
 def test_publish_artifact_marks_entry_published(tmp_path: Path):
     root = _make_fullstack(tmp_path)
-    with _patched_publish(tmp_path):
-        publish_mod.publish_artifact(str(root))
+    with _patched_publish(tmp_path, edit_url="https://4nton.ai/a/uuid-1/edit"):
+        result = publish_mod.publish_artifact(str(root))
     entry = _read_map(root)["index.html"]
     assert entry["report_id"] == "uuid-1"
     assert entry["url"] == "https://4nton.ai/a/uuid-1"
+    assert entry["edit_url"] == "https://4nton.ai/a/uuid-1/edit"
+    assert result["editUrl"] == "https://4nton.ai/a/uuid-1/edit"
     assert entry["published"] is True
     # Written at the artifact ROOT, not static/ — the divergence the bug came from.
     assert (root / ".published.json").is_file()
