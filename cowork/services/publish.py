@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from pydantic import SecretStr
 
@@ -34,6 +34,46 @@ from cowork.services.artifacts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_static_view_url(url: str | None) -> str:
+    """Ensure static report view URLs hit the deployed viewer route.
+
+    The legacy 4nton static viewer serves `/view/<user>/<id>/`; without the
+    trailing slash the catch-all route redirects to the Anton GitHub repo.
+    Fullstack `/a/<id>` URLs and collaboration `/edit` URLs are left alone.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return raw
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if len(segments) == 3 and segments[0] == "view":
+        path = f"/view/{segments[1]}/{segments[2]}/"
+        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+    return raw
+
+
+def _local_collab_url_for_static(url: str | None) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if len(segments) != 3 or segments[0] != "view":
+        return ""
+    settings = get_app_settings()
+    public_base = getattr(settings, "public_base_url", "") or ""
+    host = getattr(settings, "host", "127.0.0.1")
+    port = getattr(settings, "port", 26866)
+    origin = (public_base or f"http://{host}:{port}").rstrip("/")
+    return f"{origin}/collab/view/{segments[1]}/{segments[2]}"
 
 
 def _cowork_state_dir() -> Path:
@@ -411,13 +451,16 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
 
-    view_url = result.get("view_url", "")
+    view_url = _normalize_static_view_url(result.get("view_url", ""))
+    edit_url = result.get("edit_url") or result.get("collab_url") or _local_collab_url_for_static(view_url)
     returned_report_id = result.get("report_id", "")
     if returned_report_id:
         history_item = {
             "artifact": str(publish_target),
             "artifactName": published_key,
             "url": view_url,
+            "editUrl": edit_url,
+            "collabUrl": edit_url,
             "reportId": returned_report_id,
             "publishedAt": _utc_now_iso(),
         }
@@ -428,6 +471,8 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
+            "edit_url": edit_url,
+            "collab_url": edit_url,
             "last_md5": result.get("md5", ""),
             # Snapshot of the artifact's content mtime at publish time — the
             # cheap gate for the `modified` badge (see card_for_folder). Uses
@@ -448,6 +493,8 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
     return {
         "status": "ok",
         "url": view_url,
+        "editUrl": edit_url,
+        "collabUrl": edit_url,
         "accessMode": owner_side.get("mode", "public"),
         "accessProtected": bool(owner_side.get("requires_password")),
         "accessEmails": owner_side.get("emails", []),
