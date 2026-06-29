@@ -38,6 +38,18 @@ class ArtifactCreated:
     artifact: dict
 
 
+@dataclass
+class SkillCreated:
+    """Synthetic post-turn event: a skill the agent built for the user appeared
+    in the drafts dir during the turn (detected by the harness via a dir diff,
+    not by any agent tool call). Mapped to a `response.skill_created` SSE event
+    below. The payload is self-contained (full SKILL.md + sibling files), so the
+    renderer shows the draft card identically live and on reload — the skill is
+    NOT saved until the user explicitly does so from the card."""
+
+    skill: dict
+
+
 PHASE_LABELS = {
     "planning": "Planning",
     "analyzing": "Analyzing",
@@ -281,6 +293,14 @@ async def format_responses_stream(
                 "type": "response.artifact_created",
                 "sequence_number": seq,
                 "artifact": event.artifact,
+            })
+
+        elif isinstance(event, SkillCreated):
+            seq += 1
+            yield _event("response.skill_created", {
+                "type": "response.skill_created",
+                "sequence_number": seq,
+                "skill": event.skill,
             })
 
         elif isinstance(event, StreamComplete):
