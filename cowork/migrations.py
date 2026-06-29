@@ -52,6 +52,8 @@ _ENV_TO_SETTING: dict[str, str] = {
     # API keys
     "ANTON_ANTHROPIC_API_KEY": "anthropic_api_key",
     "ANTON_OPENAI_API_KEY": "openai_api_key",
+    "ANTON_OPENAI_API_KEY_CUSTOM": "openai_compatible_api_key",
+    "ANTON_GEMINI_API_KEY": "gemini_api_key",
     "ANTON_MINDS_API_KEY": "minds_api_key",
     # Provider / model
     "ANTON_PLANNING_PROVIDER": "planning_provider",
