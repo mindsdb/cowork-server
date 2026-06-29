@@ -277,6 +277,11 @@ def snapshot_stray_skills(project_skills_dir) -> set[str]:
     (see services.skill_links). So a real directory with a SKILL.md is a skill
     the agent wrote directly — the auto-save leak we must not persist. We diff
     this set around the turn and relocate any newcomer into a draft.
+
+    ponytail: symlink-vs-real is the discriminator (POSIX-accurate). On Windows,
+    a non-privileged symlink can fall back to a copy/junction so is_symlink()
+    may miss it and mis-flag an enabled skill as stray. Upgrade path if Windows
+    relocation misfires: compare realpath against the canonical skills root.
     """
     from anton.core.tools.skill_format import SKILL_FILE
 
@@ -346,7 +351,7 @@ def _skill_draft_payload(folder: Path) -> dict | None:
         "name": skill.display_name or skill.name or slug,
         "description": skill.description or "",
         "instructions": skill.instructions or "",
-        "skill_md": raw_md,
+        "skill_md": raw_md[:_DRAFT_FILE_MAX],  # cap like sibling files — keep the SSE payload bounded
         "files": files,
     }
 
