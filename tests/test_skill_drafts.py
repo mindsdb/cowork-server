@@ -84,8 +84,8 @@ def test_stray_auto_saved_skill_is_relocated_into_a_draft(tmp_path: Path):
     assert len(payloads) == 1 and payloads[0]["slug"] == "competitive-analysis"
     # The stray was MOVED out of the live skills dir (not persisted) ...
     assert not (project / "skills" / "competitive-analysis").exists()
-    # ... and now lives as a draft.
-    assert (drafts / "competitive-analysis" / "SKILL.md").exists()
+    # ... staged, payload built, then the staging folder was removed.
+    assert not (drafts / "competitive-analysis").exists()
 
 
 def test_symlinked_skill_is_not_a_stray(tmp_path: Path):

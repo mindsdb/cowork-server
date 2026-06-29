@@ -385,12 +385,18 @@ def finalize_turn_skill_drafts(project_path, before_drafts: set[str], before_str
     except Exception:
         logger.warning("Stray-skill relocation failed", exc_info=True)
 
-    # 2. Diff drafts and build payloads.
+    # 2. Diff drafts, build payloads, then remove each folder — the payload is
+    # self-contained so staging files are not needed after this point.
     after = snapshot_skill_drafts(drafts_base)
     new = sorted(after - set(before_drafts or ()))
     payloads: list[dict] = []
     for slug in new:
-        payload = _skill_draft_payload(drafts_base / slug)
+        folder = drafts_base / slug
+        payload = _skill_draft_payload(folder)
         if payload is not None:
             payloads.append(payload)
+            try:
+                shutil.rmtree(folder)
+            except OSError:
+                logger.warning("Could not remove skill draft folder %r", slug, exc_info=True)
     return payloads
