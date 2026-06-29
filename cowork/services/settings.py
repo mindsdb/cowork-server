@@ -188,3 +188,36 @@ class SettingService:
         invalidate_user_settings_cache()
         return True
 
+    def clear_credentials(self) -> list[str]:
+        """Delete all credential and provider-connectivity keys.
+
+        Used by the logout flow to wipe API keys from the DB so
+        ``config_ready`` returns ``False``.  Provider/model preferences
+        are left intact so they survive a re-login cycle.
+        """
+        credential_keys = [
+            field_name
+            for field_name in UserSettings.model_fields
+            if UserSettings.field_is_sensitive(field_name)
+        ]
+        # Also clear provider connectivity state and the UI provider
+        # cards — stale entries from a previous account shouldn't bleed
+        # into a fresh session.
+        credential_keys += [
+            "openai_base_url",
+            "minds_url",
+            "providers_json",
+            "provider_status",
+            "provider_status_details",
+        ]
+        deleted: list[str] = []
+        for key in credential_keys:
+            row = self._fetch_row(key)
+            if row is not None:
+                self.session.delete(row)
+                deleted.append(key)
+        if deleted:
+            self.session.commit()
+            invalidate_user_settings_cache()
+        return deleted
+

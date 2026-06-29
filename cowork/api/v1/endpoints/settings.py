@@ -112,6 +112,19 @@ def check_configured(session: SessionDep):
     return {"configured": False, "provider": ""}
 
 
+@router.post("/logout")
+def logout_clear_credentials(session: SessionDep):
+    """Clear all stored credentials from the DB.
+
+    Called by the Electron main process during sign-out so that
+    ``/health`` returns ``config_ready: false`` on the next query.
+    Provider and model preferences are kept so they survive a
+    re-login without requiring the onboarding flow to restore them.
+    """
+    deleted = SettingService(session).clear_credentials()
+    return {"ok": True, "deleted": deleted}
+
+
 @router.get("/install-status")
 def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
