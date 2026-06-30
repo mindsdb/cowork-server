@@ -103,6 +103,23 @@ class TaskObjectService:
             ).all()
         )
 
+    # ── deleting ──────────────────────────────────────────────────────
+
+    def delete_for_conversation(self, conversation_id: UUID) -> int:
+        """Drop every object row a conversation owns, so deleting a chat (or
+        clearing its history) doesn't leave dangling rows that keep surfacing
+        artifacts the task no longer has. Stages the deletes on the session;
+        the caller commits as part of its own transaction. Returns the count.
+
+        Only the index is removed — on-disk artifact folders and attached file
+        bytes are left untouched (work products, managed separately)."""
+        rows = self.session.exec(
+            select(TaskObject).where(TaskObject.conversation_id == conversation_id)
+        ).all()
+        for row in rows:
+            self.session.delete(row)
+        return len(rows)
+
     # ── moving ────────────────────────────────────────────────────────
 
     def relocate_to_project(
