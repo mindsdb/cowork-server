@@ -335,7 +335,8 @@ class TestDisplayName:
         monkeypatch.setattr(svc, "_vault", lambda: vault)
         detail = svc.get("gmail", "a-x-com")
         assert detail.display_name == "Support"
-        assert "_label" not in detail.fields            # not rendered as a raw field row
+        assert "_label" not in detail.fields            # not rendered as a raw `_`-field row
+        assert detail.fields["label"] == "Support"      # echoed back so the edit form pre-fills
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # still masked
 
 

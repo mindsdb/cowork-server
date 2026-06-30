@@ -61,7 +61,12 @@ class ConnectionsService:
                 fields[key] = _SENTINEL
 
         display_name = connection_display_name(fields)
-        fields.pop("_label", None)  # surfaced via display_name, not as a field row
+        # Echo the stored label back as the form's `label` field so the edit
+        # form pre-fills "Name this connection" with the current value (the
+        # field is named `label`; the record stores it as `_label`).
+        stored_label = fields.pop("_label", None)
+        if stored_label:
+            fields["label"] = stored_label
         return ConnectionDetailResponse(
             engine=record.get("engine", engine),
             name=record.get("name", name),
