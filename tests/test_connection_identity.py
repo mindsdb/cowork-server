@@ -8,8 +8,11 @@ while the app password is masked.
 from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.handlers.probe import _save_connection_to_vault
+from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.identity import (
+    VAULT_KEEP_SENTINEL,
     derive_connection_name,
+    resolve_keep_sentinels,
     secure_keys_for,
     spec_secret_fields,
 )
@@ -171,3 +174,71 @@ class TestNonDestructiveSave:
         )
         names = {c["name"] for c in vault.list_connections()}
         assert names == {"a-gmail-com", "b-gmail-com"}  # distinct, no suffixes
+
+
+class TestKeepSentinel:
+    """Edit flow: an unchanged secret arrives as the keep-sentinel and must be
+    resolved to the stored value, not persisted literally."""
+
+    def test_resolve_keeps_prior_drops_orphan(self):
+        prior = {"fields": {"email": "old@x.com", "app_password": "REALPW"}}
+        resolved, had = resolve_keep_sentinels(
+            {"email": "new@x.com", "app_password": VAULT_KEEP_SENTINEL}, prior
+        )
+        assert had is True
+        assert resolved == {"email": "new@x.com", "app_password": "REALPW"}
+        # sentinel with no prior value → dropped (never persisted)
+        resolved2, had2 = resolve_keep_sentinels({"x": VAULT_KEEP_SENTINEL}, None)
+        assert had2 is True and resolved2 == {}
+        # no sentinel → unchanged, not an edit
+        resolved3, had3 = resolve_keep_sentinels({"a": "b"}, None)
+        assert had3 is False and resolved3 == {"a": "b"}
+
+    def test_edit_keeps_secret_and_updates_in_place(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        _save_connection_to_vault(
+            vault, "gmail", "app-password", "Inbox",
+            {"email": "u@x.com", "app_password": "REALPW"},
+        )
+        # Edit: keep the password (sentinel), no other change.
+        _save_connection_to_vault(
+            vault, "gmail", "app-password", "Inbox",
+            {"email": "u@x.com", "app_password": VAULT_KEEP_SENTINEL},
+        )
+        assert len(vault.list_connections()) == 1
+        # The real password is preserved — NOT the literal sentinel.
+        assert vault.load("gmail", "Inbox")["app_password"] == "REALPW"
+
+    def test_edit_changing_identity_still_updates_named_record(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        _save_connection_to_vault(
+            vault, "gmail", "app-password", "Inbox",
+            {"email": "a@x.com", "app_password": "PW"},
+        )
+        # Edit changes the email but keeps the password (sentinel) → updates the
+        # SAME record in place (an edit targets the named connection), not a suffix.
+        _save_connection_to_vault(
+            vault, "gmail", "app-password", "Inbox",
+            {"email": "b@x.com", "app_password": VAULT_KEEP_SENTINEL},
+        )
+        assert len(vault.list_connections()) == 1
+        rec = vault.load("gmail", "Inbox")
+        assert rec["email"] == "b@x.com" and rec["app_password"] == "PW"
+
+
+class TestGetMaskingFallback:
+    """The detail endpoint must mask secrets even for legacy records saved
+    before secure_keys was persisted (via the name heuristic)."""
+
+    def test_legacy_record_without_secure_keys_is_masked(self, tmp_path, monkeypatch):
+        vault = LocalDataVault(tmp_path)
+        # Legacy save: no secure_keys written.
+        vault.save(
+            "gmail", "legacy",
+            {"email": "u@x.com", "app_password": "PLAINTEXTPW", "_connector_id": "gmail"},
+        )
+        svc = ConnectionsService()
+        monkeypatch.setattr(svc, "_vault", lambda: vault)
+        detail = svc.get("gmail", "legacy")
+        assert detail.fields["email"] == "u@x.com"            # identity stays readable
+        assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # secret masked

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from anton.core.datasources.data_vault import is_secret_key
+
 from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
+from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL as _SENTINEL
 from cowork.services.connectors.specs._registry import registry
-
-# TODO: A harness-agnostic sentinel value would be better here.
-_SENTINEL = "ANTON_VAULT_KEEP"
 
 
 class ConnectionsService:
@@ -41,8 +41,12 @@ class ConnectionsService:
             return None
 
         fields: dict = dict(record.get("fields") or {})
-        for key in record.get("secure_keys") or []:
-            if key in fields:
+        # Mask secrets. Prefer the record's explicit secure_keys; fall back to the
+        # name heuristic so records saved before secure_keys was persisted don't
+        # leak their secret values through this endpoint.
+        secure_keys = record.get("secure_keys")
+        for key in list(fields):
+            if not key.startswith("_") and is_secret_key(key, secure_keys):
                 fields[key] = _SENTINEL
 
         return ConnectionDetailResponse(
