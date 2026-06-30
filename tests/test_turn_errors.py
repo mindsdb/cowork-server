@@ -239,3 +239,34 @@ def test_collect_raises_400_with_curated_message_for_token_limit():
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
     assert err.value.status_code == 400
     assert err.value.detail == te.TOKEN_LIMIT_USER_MESSAGE
+
+
+# ── Provider auth (401) → provider_auth ──────────────────────────────
+
+
+def test_detects_auth_error_from_anton_401_message():
+    # anton maps a gateway 401 to this ConnectionError message.
+    exc = ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+    assert te.is_auth_error(exc) is True
+
+
+def test_detects_auth_error_unauthorized():
+    assert te.is_auth_error(Exception("Server returned 401 — Unauthorized")) is True
+
+
+def test_auth_error_maps_to_provider_auth_code():
+    code, message = te.friendly_turn_error(
+        ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+    )
+    assert code == te.AUTH_ERROR_CODE == "provider_auth"
+    assert "reconnect" in message.lower()
+
+
+def test_token_limit_wins_over_auth_for_credit_case():
+    # A 429 credit/quota case must stay token_limit, not be misread as auth.
+    code, _ = te.friendly_turn_error(Exception(_TOKEN_LIMIT_MESSAGE))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_non_auth_error_not_flagged():
+    assert te.is_auth_error(Exception("connection reset")) is False

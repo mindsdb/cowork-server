@@ -39,6 +39,21 @@ TOKEN_LIMIT_USER_MESSAGE = (
 # codes so a client can branch on it if it ever wants a richer affordance.
 TOKEN_LIMIT_CODE = "token_limit"
 
+# Curated copy for a provider auth failure — the credential the model gateway
+# sees is invalid (revoked / rotated / never provisioned / org drift), so calls
+# come back 401 mid-conversation. The desktop renders a richer card for the
+# `provider_auth` code (Reconnect MindsHub / Open Settings); this is the fallback
+# text. Distinct from token_limit (out of credits) and from the config-absence
+# case (no provider configured at all).
+AUTH_ERROR_USER_MESSAGE = (
+    "Your MindsHub session is no longer valid — reconnect to keep going, or "
+    "update your provider key in Settings."
+)
+
+# Wire-level code for the auth case. The renderer branches on it to offer a
+# "Reconnect" action (re-provision the key in place) instead of "Subscribe".
+AUTH_ERROR_CODE = "provider_auth"
+
 # Redacted stand-in for any failure we haven't mapped — never the raw
 # provider text.
 GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
@@ -99,14 +114,38 @@ def is_token_limit_error(exc: Exception) -> bool:
     return False
 
 
+def is_auth_error(exc: Exception) -> bool:
+    """Detect a provider **auth** failure — a 401 from the model gateway because
+    the credential it sees is invalid (revoked / rotated / never provisioned /
+    wrong org). anton maps a 401 to ``ConnectionError("Invalid API key — check
+    your OpenAI API key configuration.")`` (the message says "OpenAI" even for
+    MindsHub), so match that plus the general 401/unauthorized signal.
+
+    Deliberately narrow to auth (401): credit/quota exhaustion is a 402/429 and
+    is handled by ``is_token_limit_error`` (checked first), and a missing-provider
+    *config* error is handled separately by the renderer.
+    """
+    s = str(exc).lower()
+    if "invalid api key" in s:
+        return True
+    if "unauthorized" in s:
+        return True
+    if "401" in s and ("api key" in s or "auth" in s or "credential" in s):
+        return True
+    return False
+
+
 def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
     """Map a known, cryptic turn failure to ``(code, user_message)``.
 
     Returns ``None`` when the exception isn't one we have curated copy
     for — the caller then falls back to the generic redacted message.
     """
+    # token_limit first: a 402/429 credit/quota case must not be misread as auth.
     if is_token_limit_error(exc):
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
+    if is_auth_error(exc):
+        return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     if is_image_format_error(exc):
         return "image_format", IMAGE_FORMAT_USER_MESSAGE
     return None
