@@ -16,6 +16,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.schemas.responses import Role
 from cowork.services.connectors.identity import (
     derive_connection_name,
+    resolve_unique_slug,
     secure_keys_for,
 )
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
@@ -37,7 +38,7 @@ def _save_connection_to_vault(vault, connector_id, method, name, credentials) ->
     declared secret fields so the identity (e.g. email) stays readable while
     secrets are masked.
     """
-    slug = (
+    base_slug = (
         (name or "").strip()
         or derive_connection_name(connector_id, method, credentials)
         or f"{connector_id}-{uuid.uuid4().hex[:6]}"
@@ -45,12 +46,11 @@ def _save_connection_to_vault(vault, connector_id, method, name, credentials) ->
     payload = {**credentials, "_connector_id": connector_id}
     if method:
         payload["_method"] = method
-    vault.save(
-        connector_id,
-        slug,
-        payload,
-        secure_keys=secure_keys_for(connector_id, method, payload),
-    )
+    secure_keys = secure_keys_for(connector_id, method, payload)
+    # Non-destructive: reuse the slug only when it's free or holds the same
+    # account; a different account gets a `-N` suffix instead of overwriting.
+    slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
+    vault.save(connector_id, slug, payload, secure_keys=secure_keys)
     return slug
 
 

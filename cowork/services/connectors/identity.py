@@ -95,3 +95,60 @@ def secure_keys_for(connector_id: str, method: str | None, fields: dict) -> list
     return sorted(
         {k for k in fields if k in spec_secrets or is_secret_key(k, None)}
     )
+
+
+def _nonsecret_identity(fields: dict, secure_keys: list[str]) -> dict:
+    """Non-secret, non-bookkeeping fields — the part that identifies an account.
+
+    Drops secrets (so a rotated password still reads as the same account) and
+    ``_``-prefixed meta (``_connector_id`` / ``_method``).
+    """
+    secure = set(secure_keys or [])
+    return {
+        k: v
+        for k, v in (fields or {}).items()
+        if not k.startswith("_")
+        and k not in secure
+        and not is_secret_key(k, secure_keys)
+    }
+
+
+def is_same_account(existing_record: dict | None, payload: dict, secure_keys: list[str]) -> bool:
+    """True when ``payload`` is the *same account* as an existing record.
+
+    Compares only the non-secret identity fields, so a rotated secret / edited
+    connection still matches (update in place) while a genuinely different
+    account does not.
+
+    Caveat: two accounts that share **every** non-secret field and differ only
+    in the secret are indistinguishable from a rotation here. Only slugs derived
+    from a credential-unique field (e.g. ``email``, or ``host``+``database``+
+    ``username``) are fully collision-proof — which is why auto-derivation is
+    kept to those fields and everything else falls back to a random slug.
+    """
+    if not existing_record:
+        return False
+    return _nonsecret_identity(existing_record.get("fields", {}), secure_keys) == \
+        _nonsecret_identity(payload, secure_keys)
+
+
+def resolve_unique_slug(
+    vault, engine: str, base_slug: str, payload: dict, secure_keys: list[str]
+) -> str:
+    """Slug to save under, without ever overwriting a *different* account.
+
+    Reuses ``base_slug`` when it's free or already holds the same account
+    (update in place); otherwise returns the next free ``base_slug-N`` — so
+    naming two distinct accounts the same thing (or a non-unique derived slug)
+    yields ``support`` / ``support-2`` instead of silently clobbering the first.
+    """
+    rec = vault.read_record(engine, base_slug)
+    if rec is None or is_same_account(rec, payload, secure_keys):
+        return base_slug
+    n = 2
+    while True:
+        candidate = f"{base_slug}-{n}"
+        rec = vault.read_record(engine, candidate)
+        if rec is None or is_same_account(rec, payload, secure_keys):
+            return candidate
+        n += 1
