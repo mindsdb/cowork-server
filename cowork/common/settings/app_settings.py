@@ -36,14 +36,22 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
 # Keyed by the Provider enum *value* (the string) rather than the enum
 # itself, so this module stays free of a circular import with user_settings,
 # which owns the Provider enum.
+# gemini has concrete recommended models (see RECOMMENDED_MODELS); openai-
+# compatible is BYO-endpoint with no canonical model, so it deliberately has no
+# entry here. Consequence in resolved_*_model: the user's own model is kept ONLY
+# while openai-compatible is the explicitly selected provider; on a *switch* to
+# it the lookup misses → None (not the prior provider's model), which trips
+# config_status's model gate ("select a model") rather than misrouting.
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
+    "gemini": "gemini-2.5-pro",
     "minds_cloud": "latest:sonnet",
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
+    "gemini": "gemini-2.5-flash",
     "minds_cloud": "latest:haiku",
 }
 

@@ -218,7 +218,6 @@ class AntonHarness:
             "coding_provider", "coding_model",
             "memory_enabled", "memory_mode",
             "episodic_memory", "proactive_dashboards", "act_first",
-            "publish_url",
         ):
             db_val = getattr(user, attr, None)
             if db_val is None:
@@ -237,8 +236,9 @@ class AntonHarness:
             if db_val is not None:
                 setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
 
-        # URLs (skip empty strings so AntonSettings.model_post_init derivations are preserved)
-        for attr in ("minds_url", "openai_base_url"):
+        # URLs (skip empty strings so AntonSettings.model_post_init derivations
+        # and AntonSettings' own publish_url default are preserved)
+        for attr in ("minds_url", "openai_base_url", "publish_url"):
             db_val = getattr(user, attr, None)
             if db_val:
                 setattr(anton_settings, attr, db_val)
