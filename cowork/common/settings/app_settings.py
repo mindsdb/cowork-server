@@ -189,12 +189,12 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        validation_alias=AliasChoices("COWORK_SERVER_PORT", "SERVER_PORT"),
+        validation_alias=AliasChoices("COWORK_SERVER_PORT"),
         description="The port to run the server on",
     )
     host: str = Field(
         default="127.0.0.1",
-        validation_alias=AliasChoices("COWORK_SERVER_HOST", "SERVER_HOST"),
+        validation_alias=AliasChoices("COWORK_SERVER_HOST"),
         description="The host to run the server on",
     )
 
