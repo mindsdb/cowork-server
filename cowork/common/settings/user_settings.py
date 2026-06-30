@@ -23,8 +23,15 @@ class Provider(str, Enum):
         return PROVIDER_LABELS[self]
 
     @property
-    def api_key_field(self) -> str:
-        return _PROVIDER_KEY_FIELDS[self]
+    def ui_value(self) -> str:
+        """Provider id as exposed to the UI / anton (dashes, not underscores).
+
+        Single source for the ``value.replace("_", "-")`` normalization that was
+        otherwise reinvented at every provider boundary (provider_base_url,
+        _resolve_coding, the hermes harness, the AntonSettings bridge). A future
+        provider name can't normalize correctly in one place and wrong in
+        another — the latter silently routes to AnthropicProvider."""
+        return self.value.replace("_", "-")
 
 
 PROVIDER_LABELS: dict["Provider", str] = {
@@ -65,6 +72,42 @@ def provider_api_key(settings: "UserSettings", provider: "Provider"):
     if val is None and field in _SHARED_KEY_FALLBACK_FIELDS:
         return settings.openai_api_key
     return val
+
+
+def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
+    """``provider_api_key`` as a plain unmasked string ('' when unset).
+
+    Most call sites (key reveal, the Test button, hermes env sync, the OC model
+    overlay) just need the raw value to hand to a client. Folding the
+    ``SecretStr → str`` unwrap into one helper removes the per-site inline
+    imports and the subtly different empty-handling variants that had drifted
+    across reveal_key / resolve_stored_key / recommended_models / hermes."""
+    val = provider_api_key(settings, provider)
+    return val.get_secret_value() if isinstance(val, SecretStr) else ""
+
+
+def _resolved_model(
+    resolved_provider: "Provider",
+    preferred_provider: "Provider",
+    user_model: str | None,
+    defaults: dict[str, str],
+) -> str | None:
+    """Resolve a role's model given the readiness resolver's provider switch.
+
+    The single load-bearing rule, shared by resolved_planning_model and
+    resolved_coding_model so it can't drift between the two:
+
+      - provider NOT switched → keep the user's chosen model.
+      - provider switched → use the resolved provider's canonical default.
+        NEVER fall back to the original provider's model — that would hand e.g.
+        a Claude id to an openai-compatible / MindsHub endpoint (misrouting).
+      - resolved provider has no canonical default (openai-compatible) → None,
+        so config_status's model gate reports "select a model" rather than
+        silently running a wrong model.
+    """
+    if resolved_provider == preferred_provider:
+        return user_model
+    return defaults.get(resolved_provider.value)
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
 UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
@@ -254,9 +297,9 @@ class UserSettings(Settings):
         description="How UI updates are applied (manual or auto).",
     )
     publish_url: str = Field(
-        default="https://4nton.ai",
+        default="",
         title="Publish URL",
-        description="URL for publishing artifacts.",
+        description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
     openai_base_url: str = Field(
         default="",
@@ -277,6 +320,16 @@ class UserSettings(Settings):
         default="[]",
         title="Providers",
         description="JSON-encoded list of configured provider entries for the settings UI.",
+    )
+    provider_status: str = Field(
+        default="{}",
+        title="Provider Status",
+        description="JSON-encoded map of provider type → last connectivity-test status (ok|fail). Persisted so the Settings dots survive a reload.",
+    )
+    provider_status_details: str = Field(
+        default="{}",
+        title="Provider Status Details",
+        description="JSON-encoded map of provider type → last connectivity-test detail (e.g. an HTTP code).",
     )
 
     @field_validator("harness")
@@ -341,24 +394,21 @@ class UserSettings(Settings):
 
     @property
     def resolved_planning_model(self) -> str | None:
-        p = self.resolved_planning_provider
-        # Keep the user's chosen model when we didn't switch provider; otherwise
-        # use the resolved provider's default. Do NOT fall back to the original
-        # provider's model on a switch — that would hand e.g. a Claude id to an
-        # openai-compatible / MindsHub endpoint (misrouting). When the resolved
-        # provider has no canonical default (openai-compatible), return None so
-        # config_status's has_model gate reports "select a model" rather than
-        # silently running a wrong model.
-        if p == self.planning_provider:
-            return self.planning_model
-        return PLANNING_MODEL_DEFAULTS.get(p.value)
+        return _resolved_model(
+            self.resolved_planning_provider,
+            self.planning_provider,
+            self.planning_model,
+            PLANNING_MODEL_DEFAULTS,
+        )
 
     @property
     def resolved_coding_model(self) -> str | None:
-        p = self.resolved_coding_provider
-        if p == self.coding_provider:
-            return self.coding_model
-        return CODING_MODEL_DEFAULTS.get(p.value)
+        return _resolved_model(
+            self.resolved_coding_provider,
+            self.coding_provider,
+            self.coding_model,
+            CODING_MODEL_DEFAULTS,
+        )
 
     @property
     def config_status(self) -> dict[str, Any]:
@@ -371,25 +421,40 @@ class UserSettings(Settings):
         on the shared openai_api_key fallback."""
         p = self.resolved_planning_provider
         has_key = provider_api_key(self, p) is not None
-        # Also require a resolvable model. build_llm_client hands
-        # resolved_planning_model to the provider; openai-compatible has no
-        # default model, so a key-but-no-model config would build model=None
-        # and throw at runtime despite reading as "ready". Gate on both so
-        # config_ready ⟹ the client can actually run.
-        has_model = bool(self.resolved_planning_model)
+        # Also require resolvable models. build_llm_client builds BOTH roles and
+        # hands resolved_planning_model AND resolved_coding_model to the
+        # providers; openai-compatible has no canonical default, so either role
+        # can resolve to None and throw at runtime despite reading as "ready".
+        # Gate on both so config_ready ⟹ the client can actually run.
+        planning_model = self.resolved_planning_model
+        coding_model = self.resolved_coding_model
+        # openai-compatible needs a base URL. provider_base_url returns None for
+        # an empty one (it must NOT silently fall back to api.openai.com — that
+        # would leak the BYO key to OpenAI), so build_llm_client would hand the
+        # key to the SDK's default host. Surface the misconfig instead. Checked
+        # for whichever role actually resolves to openai-compatible.
+        oc = Provider.OPENAI_COMPATIBLE
+        needs_base = oc in (p, self.resolved_coding_provider)
+        has_base = bool(self.openai_base_url) if needs_base else True
         label = p.label
         if not has_key:
             error = f"Configure an API key for {label}."
-        elif not has_model:
+        elif not planning_model:
             error = f"Select a model for {label}."
+        elif not coding_model:
+            error = f"Select a coding model for {self.resolved_coding_provider.label}."
+        elif not has_base:
+            error = f"Set a base URL for {oc.label}."
         else:
             error = None
         return {
-            "config_ready": has_key and has_model,
+            "config_ready": (
+                has_key and has_base and bool(planning_model) and bool(coding_model)
+            ),
             "config_error": error,
             "provider": p.value,
             "provider_label": label,
-            "model": self.resolved_planning_model or "",
+            "model": planning_model or "",
         }
 
     @staticmethod

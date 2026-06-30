@@ -1,19 +1,73 @@
-name: Publish to PyPI
+name: Auto-release and publish to PyPI
 
 permissions:
-  contents: read
+  contents: write
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  group: release
+  group: auto-release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CALVER_MAJOR: 0
+
 jobs:
+  unit-tests:
+    uses: ./.github/workflows/tests-unit.yml
+
+  auto-release:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need tags for sequence calculation
+
+      - name: Compute CalVer version
+        id: version
+        run: |
+          set -euo pipefail
+
+          MAJOR=${{ env.CALVER_MAJOR }}
+          YY=$(date -u +%y)    # e.g. 26
+          M=$(date -u +%-m)    # e.g. 6 (no zero-pad)
+          DD=$(date -u +%-d)   # e.g. 23 (no zero-pad)
+
+          # Find the highest sequence for today's date
+          PREFIX="v${MAJOR}.${YY}.${M}.${DD}."
+          SEQ=0
+          for tag in $(git tag -l "${PREFIX}*" | sort -t. -k5 -n); do
+            N="${tag##*.}"
+            if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$SEQ" ]; then
+              SEQ="$N"
+            fi
+          done
+          SEQ=$((SEQ + 1))
+
+          VERSION="${MAJOR}.${YY}.${M}.${DD}.${SEQ}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${VERSION}"
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            --title "${{ steps.version.outputs.tag }}"
+
   publish:
     name: Build and publish to PyPI
+    needs: auto-release
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -21,26 +75,14 @@ jobs:
       id-token: write  # required for trusted publisher (OIDC)
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.auto-release.outputs.tag }}
+          fetch-depth: 0  # hatch-vcs needs tags to derive version
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-
-      - name: Verify tag matches package version
-        run: |
-          PKG_VERSION=$(python -c "
-          import re
-          with open('pyproject.toml') as f:
-              m = re.search(r'version\s*=\s*\"(.+?)\"', f.read())
-              print(m.group(1))
-          ")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: Tag version ($TAG_VERSION) does not match pyproject.toml version ($PKG_VERSION)"
-            exit 1
-          fi
-          echo "Version check passed: $PKG_VERSION"
 
       - name: Build package
         run: uv build
