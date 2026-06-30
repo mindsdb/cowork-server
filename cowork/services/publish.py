@@ -613,6 +613,146 @@ def update_artifact(raw_path: str) -> dict:
     return result
 
 
+def _resolve_report_id(raw_path: str) -> tuple[Path, str, str]:
+    """Resolve (published_json_path, published_key, report_id) for an artifact.
+
+    Raises FileNotFoundError when the artifact has no live publish record.
+    """
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    published_json = published_dir / ".published.json"
+    if not published_json.is_file():
+        raise FileNotFoundError("Artifact has no publish record")
+    try:
+        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Could not read publish record") from exc
+    entry = published_map.get(published_key)
+    report_id = entry.get("report_id") if isinstance(entry, dict) else None
+    if not report_id:
+        raise FileNotFoundError("Artifact is not published")
+    return published_json, published_key, report_id
+
+
+def _publisher_http_detail(exc: Exception) -> str:
+    """Best-effort human message from an upstream HTTPError JSON body."""
+    body = ""
+    try:
+        body = exc.read().decode()  # type: ignore[attr-defined]
+        return json.loads(body).get("error") or body or str(exc)
+    except Exception:
+        return body or str(exc)
+
+
+def list_versions(raw_path: str) -> dict:
+    """List the publish history (versions) of a live artifact.
+
+    Returns {reportId, currentMd5, artifactType, versions: [...]} with versions
+    newest-first, each tagged `isCurrent`.
+    """
+    settings = get_user_settings()
+    publish_url, api_key = _resolve_publish_endpoint(settings)
+    if not api_key:
+        raise ValueError("Configure your provider API key in Settings to view versions")
+
+    _published_json, _key, report_id = _resolve_report_id(raw_path)
+
+    try:
+        from anton.publisher import list_versions as _list_versions
+    except Exception as exc:
+        raise RuntimeError("Anton publisher is unavailable") from exc
+
+    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    from urllib.error import HTTPError
+    try:
+        data = _list_versions(report_id, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
+    except HTTPError as exc:
+        detail = _publisher_http_detail(exc)
+        if exc.code == 404:
+            raise FileNotFoundError(detail or "Report not found")
+        raise RuntimeError(detail or "Could not fetch versions")
+    except Exception as exc:
+        logger.exception("Listing versions failed (report_id=%s)", report_id)
+        raise RuntimeError("Could not fetch versions") from exc
+
+    current = data.get("current_md5") or ""
+    versions = [
+        {
+            "md5": v.get("md5", ""),
+            "publishedAt": v.get("published_at", ""),
+            "title": v.get("title", ""),
+            "isCurrent": v.get("md5") == current,
+        }
+        for v in (data.get("versions") or [])
+    ]
+    versions.reverse()  # newest publish first
+    return {
+        "reportId": data.get("report_id", report_id),
+        "currentMd5": current,
+        "artifactType": data.get("artifact_type"),
+        "versions": versions,
+    }
+
+
+def activate_version(raw_path: str, md5: str) -> dict:
+    """Roll the live URL back to an existing version (flips current_md5).
+
+    On success, rewrites `.published.json` so the `modified` badge reflects the
+    new reality: `last_md5` becomes the now-live version, and `published_mtime`
+    is invalidated (the live content no longer matches the on-disk workspace, so
+    the cheap mtime gate must fall through to the exact md5 comparison).
+    """
+    md5 = (md5 or "").strip()
+    if not md5:
+        raise ValueError("Missing target version (md5)")
+
+    settings = get_user_settings()
+    publish_url, api_key = _resolve_publish_endpoint(settings)
+    if not api_key:
+        raise ValueError("Configure your provider API key in Settings before rolling back")
+
+    published_json, published_key, report_id = _resolve_report_id(raw_path)
+
+    try:
+        from anton.publisher import activate_version as _activate_version
+    except Exception as exc:
+        raise RuntimeError("Anton publisher is unavailable") from exc
+
+    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    from urllib.error import HTTPError
+    try:
+        result = _activate_version(report_id, md5, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
+    except HTTPError as exc:
+        detail = _publisher_http_detail(exc)
+        # 404 (unknown/pruned version), 409 (fullstack not supported), 400 (bad
+        # request) are all caller-correctable → surface the message verbatim.
+        if exc.code in (400, 404, 409):
+            raise ValueError(detail or "Could not roll back to that version")
+        raise RuntimeError(detail or "Roll back failed")
+    except Exception as exc:
+        logger.exception("Activate version failed (report_id=%s md5=%s)", report_id, md5)
+        raise RuntimeError("Roll back failed") from exc
+
+    # Reflect the rollback locally so the `modified` badge recomputes correctly.
+    try:
+        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
+        fresh_entry = fresh_map.get(published_key)
+        if isinstance(fresh_entry, dict):
+            fresh_entry["last_md5"] = md5
+            fresh_entry["published_mtime"] = 0  # force exact md5 check
+            fresh_map[published_key] = fresh_entry
+            published_json.write_text(json.dumps(fresh_map, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "currentMd5": result.get("current_md5", md5),
+        "url": result.get("view_url", ""),
+        "unchanged": bool(result.get("unchanged")),
+    }
+
+
 def published_state(raw_path: str) -> dict:
     """Owner-side publish state for an artifact path, resolved exactly the way
     `publish_artifact` resolves it (so the chat tool and the GUI never disagree
