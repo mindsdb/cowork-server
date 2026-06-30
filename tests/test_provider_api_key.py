@@ -162,13 +162,52 @@ class TestResolverIsolation:
         assert cs["config_ready"] is False
         assert "model" in cs["config_error"].lower()
 
-    def test_openai_compatible_key_with_model_is_ready(self):
+    def test_openai_compatible_fully_configured_is_ready(self):
+        # Key + planning model + coding model + base URL all set → ready.
         s = _settings(
             planning_provider=Provider.OPENAI_COMPATIBLE,
             planning_model="my-model",
+            coding_provider=Provider.OPENAI_COMPATIBLE,
+            coding_model="my-coding-model",
             openai_compatible_api_key=SecretStr("sk-compat"),
+            openai_base_url="https://my-host/v1",
         )
         assert s.config_status["config_ready"] is True
+
+    def test_coding_model_gate_blocks_ready(self):
+        # planning is fully fine (anthropic + key); coding resolves to OC with a
+        # key but no coding model and no canonical default → build_llm_client
+        # builds BOTH roles and would hand coding_model=None to the provider.
+        # config_ready must be False (the coding axis of the planning fix).
+        s = _settings(
+            planning_provider=Provider.ANTHROPIC,
+            anthropic_api_key=SecretStr("sk-ant"),
+            coding_provider=Provider.OPENAI_COMPATIBLE,
+            coding_model=None,
+            openai_compatible_api_key=SecretStr("sk-compat"),
+            openai_base_url="https://my-host/v1",
+        )
+        assert s.resolved_planning_model  # planning side fine
+        assert s.resolved_coding_model is None
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "coding" in cs["config_error"].lower()
+
+    def test_openai_compatible_no_base_is_not_ready(self):
+        # OC fully modeled but no base URL — provider_base_url returns None (it
+        # must NOT silently fall back to api.openai.com, which would leak the BYO
+        # key to OpenAI), so config_status surfaces it instead of reading ready.
+        s = _settings(
+            planning_provider=Provider.OPENAI_COMPATIBLE,
+            planning_model="my-model",
+            coding_provider=Provider.OPENAI_COMPATIBLE,
+            coding_model="my-coding-model",
+            openai_compatible_api_key=SecretStr("sk-compat"),
+            # openai_base_url intentionally unset
+        )
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "base url" in cs["config_error"].lower()
 
 
 class TestCheckConfiguredGeminiOnly:

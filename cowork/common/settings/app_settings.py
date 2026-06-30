@@ -38,7 +38,10 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
 # which owns the Provider enum.
 # gemini has concrete recommended models (see RECOMMENDED_MODELS); openai-
 # compatible is BYO-endpoint with no canonical model, so it deliberately has no
-# default here — resolved_*_model falls back to the user's own model for it.
+# entry here. Consequence in resolved_*_model: the user's own model is kept ONLY
+# while openai-compatible is the explicitly selected provider; on a *switch* to
+# it the lookup misses → None (not the prior provider's model), which trips
+# config_status's model gate ("select a model") rather than misrouting.
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
