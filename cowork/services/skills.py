@@ -145,14 +145,19 @@ class SkillService:
         if instructions is not None:
             skill.instructions = instructions
 
-        if new_slug != skill.name:
-            if self._skill_dir(new_slug).exists():
-                raise ValueError(f"A skill named '{new_slug}' already exists.")
+        renaming = new_slug != skill.name
+        if renaming and self._skill_dir(new_slug).exists():
+            raise ValueError(f"A skill named '{new_slug}' already exists.")
+
+        # Write the updated content into the current dir first, then rename the
+        # whole dir last. A failed _write leaves the old dir intact; the
+        # destructive os.replace only runs once content is safely persisted.
+        skill.metadata = metadata
+        self._write(skill)
+        if renaming:
             self._rename_dir(skill.name, new_slug)
             skill.name = new_slug
 
-        skill.metadata = metadata
-        self._write(skill)
         return self.get_skill(skill.name)
 
     def delete_skill(self, slug: str) -> bool:
