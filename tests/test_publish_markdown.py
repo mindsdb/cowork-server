@@ -56,7 +56,13 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, is_fullstack
     monkeypatch.setenv("ANTON_COWORK_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(
         publish, "get_user_settings",
-        lambda: SimpleNamespace(minds_api_key="key", publish_url="https://4nton.ai"),
+        lambda: SimpleNamespace(
+            minds_api_key="key",
+            minds_url="https://api.mindshub.ai/v1",
+            openai_base_url="",
+            openai_api_key=None,
+            publish_url="",
+        ),
     )
     monkeypatch.setattr(
         publish, "get_app_settings",
