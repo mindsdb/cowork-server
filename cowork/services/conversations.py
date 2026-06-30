@@ -11,6 +11,7 @@ from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
 from cowork.services.projects import GENERAL_PROJECT_ID
+from cowork.services.task_objects import TaskObjectService
 
 # Streaming turns persist user + assistant in one persist() call; on SQLite
 # both rows often share the same created_at (second precision). Tie-break
@@ -102,6 +103,10 @@ class ConversationService:
             ).all():
                 self.session.delete(event)
             self.session.delete(message)
+        # Drop the conversation's object index too — otherwise the rows
+        # outlive the conversation as orphans pointing at artifacts no
+        # task owns anymore.
+        TaskObjectService(self.session).delete_for_conversation(conversation_id)
         self.session.delete(conversation)
         self.session.commit()
         return True
@@ -144,6 +149,14 @@ class ConversationService:
             ).all():
                 self.session.delete(event)
             self.session.delete(msg)
+        # Clearing the whole history (truncate from turn 0) is the UI's
+        # "delete chat history". When nothing remains, the conversation no
+        # longer owns anything it produced — drop its object index so a
+        # cleared chat doesn't keep resurfacing old artifacts. A partial
+        # truncation leaves the index alone (rows aren't turn-scoped, and
+        # surviving turns may still reference the artifact).
+        if cut_from == 0:
+            TaskObjectService(self.session).delete_for_conversation(conversation_id)
         self.session.commit()
         return len(to_delete)
 
