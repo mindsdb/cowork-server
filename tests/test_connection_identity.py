@@ -92,3 +92,42 @@ class TestSaveConnectionToVault:
         rec = vault.read_record("gmail", slug)
         assert "client_secret" in rec["secure_keys"]
         assert "client_id" not in rec["secure_keys"]
+
+
+class TestNonDestructiveSave:
+    """A save must never overwrite a *different* account's record."""
+
+    def test_same_explicit_name_different_account_suffixes(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        a = {"email": "support@acme.com", "app_password": "aaaa bbbb cccc dddd"}
+        b = {"email": "personal@gmail.com", "app_password": "eeee ffff gggg hhhh"}
+        slug_a = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", a)
+        slug_b = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", b)
+        assert slug_a == "Inbox"
+        assert slug_b == "Inbox-2"  # NOT overwritten
+        assert len(vault.list_connections()) == 2
+        assert vault.load("gmail", "Inbox")["email"] == "support@acme.com"
+        assert vault.load("gmail", "Inbox-2")["email"] == "personal@gmail.com"
+
+    def test_same_explicit_name_same_account_updates_in_place(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        a = {"email": "support@acme.com", "app_password": "old1 old1 old1 old1"}
+        rotated = {"email": "support@acme.com", "app_password": "new2 new2 new2 new2"}
+        s1 = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", a)
+        s2 = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", rotated)
+        assert s1 == s2 == "Inbox"  # same identity → update in place
+        assert len(vault.list_connections()) == 1
+        assert vault.load("gmail", "Inbox")["app_password"] == "new2 new2 new2 new2"
+
+    def test_derived_distinct_emails_never_collide(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        _save_connection_to_vault(
+            vault, "gmail", "app-password", "",
+            {"email": "a@gmail.com", "app_password": "aaaa aaaa aaaa aaaa"},
+        )
+        _save_connection_to_vault(
+            vault, "gmail", "app-password", "",
+            {"email": "b@gmail.com", "app_password": "bbbb bbbb bbbb bbbb"},
+        )
+        names = {c["name"] for c in vault.list_connections()}
+        assert names == {"a-gmail-com", "b-gmail-com"}  # distinct, no suffixes
