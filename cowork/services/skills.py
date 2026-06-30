@@ -52,6 +52,20 @@ class SkillService:
         self.root.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
+    def _slug_from_label(label: str) -> str:
+        """Normalize a user-supplied label into a slug, rejecting empties.
+
+        A label made only of symbols/whitespace normalizes to "" — surface a
+        clear validation error instead of letting it resolve to the root dir.
+        """
+        slug = normalize_name(label)
+        if not slug:
+            raise ValueError(
+                f"Skill name {label!r} must contain at least one letter or digit."
+            )
+        return slug
+
+    @staticmethod
     def _build_metadata(
         slug: str,
         name: str | None,
@@ -91,24 +105,20 @@ class SkillService:
         instructions: str,
         description: str | None = None,
     ) -> Skill:
-        slug = normalize_name(label)
-        if not slug:
-            raise ValueError(
-                f"Skill name {label!r} is empty"
-            )
-        if self._skill_dir(slug).exists():
-            raise ValueError(f"A skill named '{slug}' already exists.")
+        label = self._slug_from_label(label)
+        if self._skill_dir(label).exists():
+            raise ValueError(f"A skill named '{label}' already exists.")
 
         skill = Skill(
-            name=slug,
+            name=label,
             instructions=instructions or "",
             # description is required and non-empty by spec; fall back to the
             # display name / slug so we never write an empty value.
-            description=(description or "").strip() or name or slug,
-            metadata=self._build_metadata(slug, name, datetime.now(timezone.utc)),
+            description=(description or "").strip() or name or label,
+            metadata=self._build_metadata(label, name, datetime.now(timezone.utc)),
         )
         self._write(skill)
-        return self.get_skill(slug)
+        return self.get_skill(label)
 
     def update_skill(
         self,
@@ -123,7 +133,7 @@ class SkillService:
 
         new_slug = skill.name
         if label is not None:
-            new_slug = normalize_name(label)
+            new_slug = self._slug_from_label(label)
 
         if name is not None:
             if name and name != new_slug:
