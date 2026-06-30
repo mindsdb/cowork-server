@@ -281,7 +281,7 @@ class SkillService:
             for item in list(only.iterdir()):
                 shutil.move(str(item), str(src_dir / item.name))
             only.rmdir()
-            return
+            return SkillService._normalize_skill_dir(src_dir)
         if only.suffix.lower() == ".md" and only.name != SKILL_FILE:
             only.rename(src_dir / SKILL_FILE)
 
