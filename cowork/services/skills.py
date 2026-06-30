@@ -251,10 +251,17 @@ class SkillService:
 
         if copy_tree:
             self._ensure_root()
-            shutil.copytree(src_dir, self._skill_dir(skill.name))
-        # _write (re)writes SKILL.md canonically, stamps updated_at, reconciles
-        # links; with copy_tree the sibling files are already in place.
-        self._write(skill)
+            dest = self._skill_dir(skill.name)
+            shutil.copytree(src_dir, dest)
+            try:
+                # _write (re)writes SKILL.md canonically, stamps updated_at,
+                # reconciles links; sibling files are already in place.
+                self._write(skill)
+            except Exception:
+                shutil.rmtree(dest, ignore_errors=True)
+                raise
+        else:
+            self._write(skill)
         return self.get_skill(skill.name)
 
     @staticmethod
