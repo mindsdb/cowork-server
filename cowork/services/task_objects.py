@@ -395,8 +395,8 @@ def finalize_turn_skill_drafts(project_path, before_drafts: set[str], before_str
         payload = _skill_draft_payload(folder)
         if payload is not None:
             payloads.append(payload)
-            try:
-                shutil.rmtree(folder)
-            except OSError:
-                logger.warning("Could not remove skill draft folder %r", slug, exc_info=True)
+        try:
+            shutil.rmtree(folder)
+        except OSError:
+            logger.warning("Could not remove skill draft folder %r", slug, exc_info=True)
     return payloads
