@@ -206,6 +206,7 @@ class AntonHarness:
         from .tools import (
             build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
+            build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             # build_cowork_fetch_submission_tool,
             # build_cowork_update_form_tool,
@@ -213,6 +214,7 @@ class AntonHarness:
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
+        LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         # TODO: Determine if these two tools are really needed.
         # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
         # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
@@ -421,6 +423,7 @@ class AntonHarness:
                 PUBLISH_TOOL,
                 LOOKUP_CONNECTOR_TOOL,
                 REQUEST_CREDENTIALS_TOOL,
+                LABEL_CONNECTION_TOOL,
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
             ],

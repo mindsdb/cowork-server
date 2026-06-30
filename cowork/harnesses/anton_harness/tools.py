@@ -704,6 +704,74 @@ def build_cowork_request_credentials_tool():
     )
 
 
+# Label Connection Tool
+# Lets the agent persist a human role label ("Support", "Personal") onto a saved
+# connection — the learn-and-persist half of multi-account identity. The label
+# shows up next to the connection (here and in Connected Data Sources) so the
+# right account can be selected later; it does not change the connection's
+# identity/slug or its secrets.
+
+_LABEL_CONNECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "engine": {"type": "string", "description": "The connection's engine, e.g. 'gmail'."},
+        "name": {
+            "type": "string",
+            "description": "The connection's name/slug exactly as shown in Connected Data Sources.",
+        },
+        "label": {
+            "type": "string",
+            "description": "Human role label to assign, e.g. 'Support' or 'Personal'.",
+        },
+    },
+    "required": ["engine", "name", "label"],
+}
+
+_LABEL_CONNECTION_PROMPT = (
+    "Use `label_connection` to give a saved connection a human role label once "
+    "the user tells you which is which — e.g. when two Gmail accounts are "
+    "connected and the user says `regtr@mail.com` is their support address, call "
+    "`label_connection(engine='gmail', name='<slug>', label='Support')`. The label "
+    "is shown beside the connection in Connected Data Sources so you can pick the "
+    "right account later. Never guess a label — ask the user first, then persist it."
+)
+
+
+async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
+    """Tool handler for `label_connection` — persist a human label on a saved
+    connection (learn-and-persist)."""
+    engine = str(tc_input.get("engine", "")).strip()
+    name = str(tc_input.get("name", "")).strip()
+    label = str(tc_input.get("label", "")).strip()
+    if not engine or not name or not label:
+        return "label_connection: `engine`, `name`, and `label` are all required."
+    try:
+        from cowork.services.connectors.persist import set_connection_label
+
+        ok = set_connection_label(engine, name, label)
+    except Exception as exc:
+        logger.exception("Cowork label_connection failed")
+        return f"label_connection: could not set label ({exc})"
+    if not ok:
+        return f"label_connection: no connection `{engine}/{name}` found."
+    return f"Labeled `{engine}/{name}` as “{label}”."
+
+
+def build_cowork_label_connection_tool():
+    from anton.core.tools.tool_defs import ToolDef
+    return ToolDef(
+        name="label_connection",
+        description=(
+            "Assign a human role label (e.g. 'Support', 'Personal') to a saved "
+            "connection so it can be identified and selected later. Use after the "
+            "user clarifies which account is which — never guess."
+        ),
+        input_schema=_LABEL_CONNECTION_SCHEMA,
+        handler=_cowork_label_connection,
+        prompt=_LABEL_CONNECTION_PROMPT,
+    )
+
+
 # Fetch Submission Tool
 # Pulls staged credential values after the user submits. 
 # Anton uses these to test / save the connection, then either
