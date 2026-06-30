@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "alembic>=1.17.0",
-    "anton-agent>=2.26.6.18.1,<3",
+    "anton-agent>=2.26.6.30.1,<3",
     "cryptography>=48.0.0",
     "fastapi>=0.136.1",
     "hermes-agent>=0.15.2,<1",
