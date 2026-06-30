@@ -31,11 +31,11 @@ class TestProviderBaseUrl:
             == "https://proxy/v1"
         )
 
-    def test_openai_compatible_falls_back_to_openai_when_empty(self):
-        assert (
-            provider_base_url("openai-compatible", openai_base_url="")
-            == "https://api.openai.com/v1"
-        )
+    def test_openai_compatible_empty_base_returns_none_not_openai(self):
+        # An empty openai-compatible base must NOT silently become
+        # api.openai.com — that would leak the BYO key to OpenAI. Returns None
+        # (a misconfig config_status surfaces as "Set a base URL") instead.
+        assert provider_base_url("openai-compatible", openai_base_url="") is None
 
     def test_minds_cloud_derives_from_minds_slot(self):
         assert (

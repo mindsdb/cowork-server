@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import UUID
 
+from cowork.common.datetime_utils import ensure_utc
 from cowork.common.logger import get_logger
 from cowork.db.session import get_open_session
 from cowork.models.schedule import Schedule
+from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 
@@ -15,11 +17,7 @@ logger = get_logger(__name__)
 _POLL_INTERVAL_SECONDS = 30
 _scheduler_task: asyncio.Task | None = None
 
-_CADENCE_DELTAS: dict[str, timedelta] = {
-    Cadence.hourly: timedelta(hours=1),
-    Cadence.daily: timedelta(days=1),
-    Cadence.weekly: timedelta(weeks=1),
-}
+_RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly}
 
 
 def _advance_next_run_at(schedule: Schedule, session) -> None:
@@ -28,19 +26,14 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
         session.add(schedule)
         return
 
-    delta = _CADENCE_DELTAS.get(schedule.cadence)
-    if delta is None:
+    if schedule.cadence not in _RECURRING_CADENCES:
         return
 
-    now = datetime.now(timezone.utc)
-    next_run = schedule.next_run_at
-    if next_run.tzinfo is None:
-        next_run = next_run.replace(tzinfo=timezone.utc)
-
-    while next_run <= now:
-        next_run += delta
-
-    schedule.next_run_at = next_run
+    schedule.next_run_at = next_future_occurrence(
+        schedule.cadence,
+        schedule.next_run_at,
+        schedule.timezone,
+    )
     session.add(schedule)
 
 
@@ -51,9 +44,7 @@ def _handle_missed_runs(session) -> None:
         if not schedule.enabled:
             continue
 
-        next_run = schedule.next_run_at
-        if next_run.tzinfo is None:
-            next_run = next_run.replace(tzinfo=timezone.utc)
+        next_run = ensure_utc(schedule.next_run_at)
 
         if next_run >= now:
             continue
@@ -64,18 +55,22 @@ def _handle_missed_runs(session) -> None:
             session.add(schedule)
             continue
 
-        delta = _CADENCE_DELTAS.get(schedule.cadence)
-        if delta is None:
+        if schedule.cadence not in _RECURRING_CADENCES:
             continue
 
-        overdue_seconds = (now - next_run).total_seconds()
-        missed = int(overdue_seconds // delta.total_seconds())
-        if missed > 0:
+        missed, future = count_missed_occurrences(
+            schedule.cadence,
+            next_run,
+            schedule.timezone,
+            now=now,
+        )
+        # Only fast-forward when more than one occurrence was skipped (app
+        # offline for multiple cadence periods). A single overdue slot
+        # (missed == 1) is still due this poll — advancing here would skip
+        # the run entirely. 
+        if missed > 1:
             schedule.missed_runs += missed
-            # Fast-forward to the next future occurrence
-            while next_run <= now:
-                next_run += delta
-            schedule.next_run_at = next_run
+            schedule.next_run_at = future
             session.add(schedule)
 
     session.commit()
@@ -86,7 +81,6 @@ async def execute_schedule(
     is_manual: bool = False,
     conversation_id: UUID | None = None,
 ) -> None:
-    from cowork.api.v1.endpoints.responses import mark_stream_active, mark_stream_finished
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
@@ -109,18 +103,15 @@ async def execute_schedule(
             )
             conversation_id = conversation.id
 
-        # Mark as in-flight so the client doesn't inject synthetic
-        # continuation prompts while the LLM is still generating.
-        # (May already be marked if the caller pre-created the conversation.)
-        mark_stream_active(str(conversation_id))
-
         request = ResponsesRequest(
             input=schedule.prompt,
             model=schedule.model,
-            stream=False,
+            stream=True,
             conversation=str(conversation_id),
         )
-        await ResponsesHandler(session).handle(request)
+        stream = await ResponsesHandler(session).handle(request)
+        async for _ in stream:
+            pass
 
         # Refresh schedule in case it changed during execution
         schedule = schedule_service.get_schedule(schedule_id)
@@ -146,8 +137,6 @@ async def execute_schedule(
         except Exception:
             pass
     finally:
-        if conversation_id:
-            mark_stream_finished(str(conversation_id))
         try:
             run_service.finish_run(run.id, conversation_id=conversation_id, error=error)
         except Exception:
@@ -163,14 +152,13 @@ async def _scheduler_loop() -> None:
         try:
             _handle_missed_runs(session)
             now = datetime.now(timezone.utc)
+            run_service = ScheduleRunService(session)
             schedules = ScheduleService(session).list_schedules()
             due = [
                 s for s in schedules
-                if s.enabled and (
-                    s.next_run_at.replace(tzinfo=timezone.utc)
-                    if s.next_run_at.tzinfo is None
-                    else s.next_run_at
-                ) <= now
+                if s.enabled
+                and ensure_utc(s.next_run_at) <= now
+                and not run_service.has_running_run(s.id)
             ]
         except Exception:
             logger.exception("Scheduler loop error during poll")
