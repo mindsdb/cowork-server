@@ -91,20 +91,24 @@ class SkillService:
         instructions: str,
         description: str | None = None,
     ) -> Skill:
-        label = normalize_name(label)
-        if self._skill_dir(label).exists():
-            raise ValueError(f"A skill named '{label}' already exists.")
+        slug = normalize_name(label)
+        if not slug:
+            raise ValueError(
+                f"Skill name {label!r} is empty"
+            )
+        if self._skill_dir(slug).exists():
+            raise ValueError(f"A skill named '{slug}' already exists.")
 
         skill = Skill(
-            name=label,
+            name=slug,
             instructions=instructions or "",
             # description is required and non-empty by spec; fall back to the
             # display name / slug so we never write an empty value.
-            description=(description or "").strip() or name or label,
-            metadata=self._build_metadata(label, name, datetime.now(timezone.utc)),
+            description=(description or "").strip() or name or slug,
+            metadata=self._build_metadata(slug, name, datetime.now(timezone.utc)),
         )
         self._write(skill)
-        return self.get_skill(label)
+        return self.get_skill(slug)
 
     def update_skill(
         self,
