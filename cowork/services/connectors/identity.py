@@ -44,18 +44,41 @@ def _spec_name_from(connector_id: str, method: str | None):
     return form.get("name_from") or raw.get("name_from")
 
 
+def _identity_fields(connector_id: str, method: str | None, credentials: dict) -> list[str]:
+    """Field name(s) to build the connection slug from.
+
+    1. The connector's explicit ``name_from`` (curated, authoritative).
+    2. Otherwise a *narrow* heuristic limited to **credential-unique** fields:
+       - ``email`` (one address = one account), or
+       - ``host`` (+ ``database`` + ``username`` when present) for databases.
+
+    Deliberately NOT included: ``project_id`` / ``tenant_id`` / ``subdomain`` /
+    ``account_id`` (identify a tenant/project, not the specific credential — two
+    accounts can share them) and ``base_url`` / ``client_id`` / config fields
+    (constant or opaque). Those stay on the random fallback until curated, so the
+    auto-derived slug can't silently collapse two distinct accounts.
+    """
+    name_from = _spec_name_from(connector_id, method)
+    if name_from:
+        return [name_from] if isinstance(name_from, str) else list(name_from)
+    if str(credentials.get("email", "")).strip():
+        return ["email"]
+    if str(credentials.get("host", "")).strip():
+        return [f for f in ("host", "database", "username") if str(credentials.get(f, "")).strip()]
+    return []
+
+
 def derive_connection_name(
     connector_id: str, method: str | None, credentials: dict
 ) -> str | None:
     """Readable, stable slug from the connector's identity field(s), or None.
 
-    Returns ``None`` when the connector declares no ``name_from`` or none of the
-    identity fields were supplied — the caller then keeps its random fallback.
+    Uses the connector's ``name_from`` if declared, else a narrow
+    credential-unique heuristic (see ``_identity_fields``). Returns ``None`` when
+    no identity field applies or its value is absent — the caller then keeps its
+    random fallback.
     """
-    name_from = _spec_name_from(connector_id, method)
-    if not name_from:
-        return None
-    fields = [name_from] if isinstance(name_from, str) else list(name_from)
+    fields = _identity_fields(connector_id, method, credentials)
     parts = [
         str(credentials.get(f, "")).strip()
         for f in fields

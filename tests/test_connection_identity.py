@@ -39,8 +39,48 @@ class TestDeriveConnectionName:
     def test_missing_identity_field_returns_none(self):
         assert derive_connection_name("gmail", "app-password", {"app_password": "x"}) is None
 
-    def test_unknown_connector_returns_none(self):
-        assert derive_connection_name("does-not-exist", "m", GMAIL_CREDS) is None
+    def test_unknown_connector_with_no_identity_field_returns_none(self):
+        # No name_from and no credential-unique field (email/host) → random fallback.
+        assert derive_connection_name("does-not-exist", "m", {"api_token": "x"}) is None
+
+
+class TestNarrowHeuristic:
+    """When a connector declares no name_from, derive only from
+    credential-unique fields (email, host[+database+username]) — never from
+    tenant/project-level or config fields."""
+
+    def test_email_used_when_no_name_from(self):
+        assert derive_connection_name("zzz", "m", {"email": "u@acme.com"}) == "u-acme-com"
+
+    def test_database_host_database_username_combo(self):
+        assert (
+            derive_connection_name(
+                "postgres",
+                "host-port",
+                {"host": "db.acme.com", "database": "sales", "username": "ro", "password": "x"},
+            )
+            == "db-acme-com-sales-ro"
+        )
+
+    def test_host_alone(self):
+        assert derive_connection_name("zzz", "m", {"host": "db.acme.com"}) == "db-acme-com"
+
+    def test_tenant_level_fields_not_used(self):
+        # Identify a tenant/project, not the specific credential → stay random.
+        for f in ("project_id", "tenant_id", "subdomain", "account_id", "account_name"):
+            assert derive_connection_name("zzz", "m", {f: "shared"}) is None
+
+    def test_base_url_and_client_id_not_used(self):
+        assert derive_connection_name("zzz", "m", {"base_url": "https://api.x.com"}) is None
+        assert derive_connection_name("zzz", "m", {"client_id": "8a93f2c1-7d4e"}) is None
+
+    def test_connection_string_method_has_no_clean_identity(self):
+        assert (
+            derive_connection_name(
+                "postgres", "connection-string", {"connection_string": "postgres://u:p@h/db"}
+            )
+            is None
+        )
 
 
 class TestSecureKeys:
