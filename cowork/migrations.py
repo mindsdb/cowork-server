@@ -330,11 +330,6 @@ def migrate_skills_to_files(session: Session) -> bool:
         taken.add(slug)
 
         # when_to_use is dropped as a field; fold it into the description.
-        description = ". ".join(
-            part
-            for part in ((row.description or "").strip(), (row.when_to_use or "").strip())
-            if part
-        )
         description = (row.description or "").strip()
         when_to_use = (row.when_to_use or "").strip()
         if when_to_use:
