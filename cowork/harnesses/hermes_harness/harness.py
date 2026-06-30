@@ -88,11 +88,6 @@ class HermesHarness:
     label: str = "Hermes"
     formatter = staticmethod(format_hermes_stream)
 
-    async def sync_skills(self, skills: list[Skill]) -> None:
-        # No-op: Hermes's skills dir is symlinked to cowork's canonical (see dev_setup)
-        #  so the Anton runtime already reads the skills files
-        return
-
     async def stream_response(
         self,
         *,
