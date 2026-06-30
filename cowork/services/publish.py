@@ -20,7 +20,7 @@ from pydantic import SecretStr
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.providers import publish_url_for_endpoint
-from cowork.common.settings.user_settings import get_user_settings
+from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from cowork.services.artifacts import (
     _artifact_root_for,
     _content_mtime,
@@ -135,7 +135,8 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     """
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api.") and oai_host.endswith(".mindshub.ai"):
-        endpoint, api_key = settings.openai_base_url, _secret_str(settings.openai_api_key)
+        endpoint = settings.openai_base_url
+        api_key = _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
     return settings.publish_url or publish_url_for_endpoint(endpoint), api_key

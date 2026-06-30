@@ -396,7 +396,6 @@ wheels = [
 
 [[package]]
 name = "cowork-server"
-version = "0.1.10"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
