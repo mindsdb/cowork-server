@@ -10,6 +10,7 @@ from anton.core.datasources.data_vault import LocalDataVault
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL,
+    connection_display_name,
     derive_connection_name,
     resolve_keep_sentinels,
     secure_keys_for,
@@ -297,6 +298,45 @@ class TestConnectionLabel:
     def test_set_connection_label_missing_connection_returns_false(self, tmp_path):
         vault = LocalDataVault(tmp_path)
         assert set_connection_label("gmail", "nope", "X", vault=vault) is False
+
+
+class TestDisplayName:
+    """The card/detail display name: label → identity → (slug fallback client-side)."""
+
+    def test_helper_priority(self):
+        assert connection_display_name({"_label": "Support", "email": "a@x.com"}) == "Support"
+        assert connection_display_name({"email": "a@x.com"}) == "a@x.com"
+        assert connection_display_name({"account_email": "o@x.com"}) == "o@x.com"
+        assert connection_display_name({"host": "h", "database": "d"}) == "h/d"
+        assert connection_display_name({"client_id": "x"}) is None
+
+    def test_list_display_name(self, tmp_path, monkeypatch):
+        vault = LocalDataVault(tmp_path)
+        persist_connection(
+            "gmail", "app-password", "", {"email": "a@x.com", "app_password": "p"},
+            label="Support", vault=vault,
+        )
+        persist_connection(
+            "gmail", "app-password", "", {"email": "b@x.com", "app_password": "p"}, vault=vault,
+        )
+        svc = ConnectionsService()
+        monkeypatch.setattr(svc, "_vault", lambda: vault)
+        by_name = {s.name: s.display_name for s in svc.list()}
+        assert by_name["a-x-com"] == "Support"   # label preferred
+        assert by_name["b-x-com"] == "b@x.com"    # else the identity
+
+    def test_get_surfaces_display_name_and_hides_label_field(self, tmp_path, monkeypatch):
+        vault = LocalDataVault(tmp_path)
+        persist_connection(
+            "gmail", "app-password", "", {"email": "a@x.com", "app_password": "p"},
+            label="Support", vault=vault,
+        )
+        svc = ConnectionsService()
+        monkeypatch.setattr(svc, "_vault", lambda: vault)
+        detail = svc.get("gmail", "a-x-com")
+        assert detail.display_name == "Support"
+        assert "_label" not in detail.fields            # not rendered as a raw field row
+        assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # still masked
 
 
 class TestOAuthIdentity:

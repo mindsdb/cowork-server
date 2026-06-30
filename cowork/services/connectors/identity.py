@@ -118,6 +118,30 @@ def spec_secret_fields(connector_id: str, method: str | None) -> list[str]:
     return sorted(secret)
 
 
+def connection_display_name(fields: dict) -> str | None:
+    """Human-facing name for a saved connection, or None.
+
+    The explicit ``_label`` ("Support") wins; otherwise the non-secret identity
+    (``email`` / ``account_email``, else ``host`` [+ ``database``]). Mirrors
+    anton's ``_connection_identity`` so the UI card and the agent prompt show the
+    same thing. Returns None when there's nothing meaningful — the caller then
+    falls back to the slug.
+    """
+    f = fields or {}
+    label = str(f.get("_label", "")).strip()
+    if label:
+        return label
+    for key in ("email", "account_email"):
+        val = str(f.get(key, "")).strip()
+        if val:
+            return val
+    host = str(f.get("host", "")).strip()
+    if host:
+        database = str(f.get("database", "")).strip()
+        return f"{host}/{database}" if database else host
+    return None
+
+
 def secure_keys_for(connector_id: str, method: str | None, fields: dict) -> list[str]:
     """The ``secure_keys`` to persist: spec-marked secrets ∪ name-heuristic.
 
