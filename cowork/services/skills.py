@@ -83,7 +83,7 @@ class SkillService:
         metadata: dict[str, str] = {}
         if name and name != slug:
             metadata[META_DISPLAY_NAME] = name
-        metadata[META_CREATED_AT] = created_at.replace(tzinfo=None).isoformat()
+        metadata[META_CREATED_AT] = created_at.isoformat()
         return metadata
 
     @staticmethod

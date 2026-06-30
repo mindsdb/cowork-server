@@ -21,6 +21,7 @@ never from the ``.env`` directly.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import shutil
 from pathlib import Path
@@ -344,7 +345,7 @@ def migrate_skills_to_files(session: Session) -> bool:
         if row.name and row.name != slug:
             metadata[META_DISPLAY_NAME] = row.name
         if row.created_at:
-            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=None).isoformat()
+            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=dt.timezone.utc).isoformat()
 
         try:
             skill = Skill(
