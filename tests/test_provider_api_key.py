@@ -98,13 +98,38 @@ class TestResolverIsolation:
         )
         assert s.resolved_planning_provider == Provider.GEMINI
         assert s.config_status["config_ready"] is True
+        # The resolved MODEL must be non-None — otherwise build_llm_client gets
+        # model=None and throws despite config_ready=True (the live bug).
+        assert s.resolved_planning_model == "gemini-2.5-pro"
+        assert s.resolved_coding_model == "gemini-2.5-flash"
 
-    def test_openai_compatible_only_key_resolves_when_planning_is_keyless(self):
+    def test_switch_to_oc_does_not_misroute_the_default_model(self):
+        # Realistic case: planning_provider=anthropic (keyless), only an OC key.
+        # apply_model_defaults fills planning_model with anthropic's DEFAULT
+        # (claude-sonnet-4-6). The resolver switches to OC — but must NOT hand
+        # that Claude id to the OC endpoint. resolved model is None → not ready
+        # → "select a model" (rather than silently misrouting).
         s = _settings(
             planning_provider=Provider.ANTHROPIC,   # keyless
             openai_compatible_api_key=SecretStr("sk-compat-only"),
         )
+        assert s.planning_model == "claude-sonnet-4-6"   # filled by apply_model_defaults
         assert s.resolved_planning_provider == Provider.OPENAI_COMPATIBLE
+        assert s.resolved_planning_model is None          # NOT the Claude id
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "model" in cs["config_error"].lower()
+
+    def test_switch_to_gemini_uses_gemini_default_not_original(self):
+        # Switch to gemini (which HAS a default) must use the gemini default,
+        # never the original provider's model.
+        s = _settings(
+            planning_provider=Provider.ANTHROPIC,   # keyless; planning_model→claude default
+            gemini_api_key=SecretStr("AIza"),
+        )
+        assert s.resolved_planning_provider == Provider.GEMINI
+        assert s.resolved_planning_model == "gemini-2.5-pro"
+        assert s.resolved_coding_model == "gemini-2.5-flash"
         assert s.config_status["config_ready"] is True
 
     def test_legacy_shared_openai_key_still_resolves(self):
@@ -121,6 +146,68 @@ class TestResolverIsolation:
         s = _settings(planning_provider=Provider.ANTHROPIC)
         assert s.resolved_planning_provider == Provider.ANTHROPIC
         assert s.config_status["config_ready"] is False
+
+    def test_openai_compatible_key_but_no_model_is_not_ready(self):
+        # openai-compatible has a key but no model and no canonical default →
+        # build_llm_client would get model=None. config_ready must be False so
+        # we don't claim "ready" for a client that throws on first use.
+        s = _settings(
+            planning_provider=Provider.OPENAI_COMPATIBLE,
+            planning_model=None,
+            openai_compatible_api_key=SecretStr("sk-compat"),
+        )
+        assert s.resolved_planning_provider == Provider.OPENAI_COMPATIBLE
+        assert s.resolved_planning_model is None
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "model" in cs["config_error"].lower()
+
+    def test_openai_compatible_fully_configured_is_ready(self):
+        # Key + planning model + coding model + base URL all set → ready.
+        s = _settings(
+            planning_provider=Provider.OPENAI_COMPATIBLE,
+            planning_model="my-model",
+            coding_provider=Provider.OPENAI_COMPATIBLE,
+            coding_model="my-coding-model",
+            openai_compatible_api_key=SecretStr("sk-compat"),
+            openai_base_url="https://my-host/v1",
+        )
+        assert s.config_status["config_ready"] is True
+
+    def test_coding_model_gate_blocks_ready(self):
+        # planning is fully fine (anthropic + key); coding resolves to OC with a
+        # key but no coding model and no canonical default → build_llm_client
+        # builds BOTH roles and would hand coding_model=None to the provider.
+        # config_ready must be False (the coding axis of the planning fix).
+        s = _settings(
+            planning_provider=Provider.ANTHROPIC,
+            anthropic_api_key=SecretStr("sk-ant"),
+            coding_provider=Provider.OPENAI_COMPATIBLE,
+            coding_model=None,
+            openai_compatible_api_key=SecretStr("sk-compat"),
+            openai_base_url="https://my-host/v1",
+        )
+        assert s.resolved_planning_model  # planning side fine
+        assert s.resolved_coding_model is None
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "coding" in cs["config_error"].lower()
+
+    def test_openai_compatible_no_base_is_not_ready(self):
+        # OC fully modeled but no base URL — provider_base_url returns None (it
+        # must NOT silently fall back to api.openai.com, which would leak the BYO
+        # key to OpenAI), so config_status surfaces it instead of reading ready.
+        s = _settings(
+            planning_provider=Provider.OPENAI_COMPATIBLE,
+            planning_model="my-model",
+            coding_provider=Provider.OPENAI_COMPATIBLE,
+            coding_model="my-coding-model",
+            openai_compatible_api_key=SecretStr("sk-compat"),
+            # openai_base_url intentionally unset
+        )
+        cs = s.config_status
+        assert cs["config_ready"] is False
+        assert "base url" in cs["config_error"].lower()
 
 
 class TestCheckConfiguredGeminiOnly:

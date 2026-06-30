@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.db.session import get_session
@@ -36,6 +36,7 @@ from cowork.common.settings.app_settings import (
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
 )
+from cowork.common.settings.user_settings import Provider, provider_api_key_str
 
 router = APIRouter()
 
@@ -118,8 +119,6 @@ def install_status():
 
 @router.get("/reveal-key/{name}")
 def reveal_key(name: str, session: SessionDep):
-    from cowork.common.settings.user_settings import Provider, provider_api_key
-
     name_map = {
         "anthropic": Provider.ANTHROPIC,
         "openai": Provider.OPENAI,
@@ -132,9 +131,8 @@ def reveal_key(name: str, session: SessionDep):
     if provider is None:
         raise HTTPException(status_code=404, detail="Unknown key name")
     s = SettingService(session).load()
-    # provider_api_key applies the gemini/openai-compatible → openai fallback.
-    val = provider_api_key(s, provider)
-    return {"value": val.get_secret_value() if isinstance(val, SecretStr) else ""}
+    # provider_api_key_str applies the gemini/openai-compatible → openai fallback.
+    return {"value": provider_api_key_str(s, provider)}
 
 
 class _TestProvidersBody(BaseModel):
@@ -143,6 +141,12 @@ class _TestProvidersBody(BaseModel):
 
 @router.post("/test-providers")
 async def test_providers(session: SessionDep, body: _TestProvidersBody | None = None):
+    """Ping the given (or all stored) providers and persist the results.
+
+    Despite the read-only-sounding name this WRITES: each tested provider's
+    status is merged into the persisted `provider_status` /
+    `provider_status_details` settings so the Settings dots survive a reload.
+    """
     s = SettingService(session).load()
 
     if body and body.providers is not None:
@@ -162,6 +166,16 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
 
     statuses, details = await ping_providers(providers)
+
+    # Persist the results merged into the stored map so the Settings dots
+    # survive a reload. Only the tested providers' entries change; every other
+    # provider keeps its last recorded result.
+    merged_status = {**json.loads(s.provider_status or "{}"), **statuses}
+    merged_details = {**json.loads(s.provider_status_details or "{}"), **details}
+    SettingService(session).bulk_upsert({
+        "provider_status": json.dumps(merged_status),
+        "provider_status_details": json.dumps(merged_details),
+    })
     return {"providerStatus": statuses, "providerStatusDetails": details}
 
 
@@ -225,7 +239,10 @@ async def recommended_models(session: SessionDep):
         None,
     )
     if oc_card:
-        oc_key = s.openai_api_key.get_secret_value() if s.openai_api_key else ""
+        # Read the openai-compatible key via provider_api_key_str so a user who
+        # set a dedicated openai_compatible_api_key is used (falls back to the
+        # shared openai_api_key), matching how the provider is actually built.
+        oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
         live, live_efforts = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
         if live:
             recommended["openai-compatible"] = live
