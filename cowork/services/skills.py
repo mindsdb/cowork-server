@@ -51,10 +51,28 @@ class SkillService:
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _skill_dir(self, slug: str) -> Path:
-        return self.root / slug
+        validate_name(slug)
+        skill_dir = (self.root / slug).resolve()
+        if not skill_dir.is_relative_to(self.root.resolve()):
+            raise ValueError(f"Invalid skill name: {slug!r}")
+        return skill_dir
 
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _slug_from_label(label: str) -> str:
+        """Normalize a user-supplied label into a slug, rejecting empties.
+
+        A label made only of symbols/whitespace normalizes to "" — surface a
+        clear validation error instead of letting it resolve to the root dir.
+        """
+        slug = normalize_name(label)
+        if not slug:
+            raise ValueError(
+                f"Skill name {label!r} must contain at least one letter or digit."
+            )
+        return slug
 
     @staticmethod
     def _build_metadata(
@@ -65,7 +83,7 @@ class SkillService:
         metadata: dict[str, str] = {}
         if name and name != slug:
             metadata[META_DISPLAY_NAME] = name
-        metadata[META_CREATED_AT] = created_at.isoformat()
+        metadata[META_CREATED_AT] = created_at.replace(tzinfo=None).isoformat()
         return metadata
 
     @staticmethod
@@ -117,7 +135,7 @@ class SkillService:
         enabled: bool | None = None,
         projects: list[str] | None = None,
     ) -> Skill:
-        label = normalize_name(label)
+        label = self._slug_from_label(label)
         if self._skill_dir(label).exists():
             raise ValueError(f"A skill named '{label}' already exists.")
 
@@ -150,7 +168,7 @@ class SkillService:
 
         new_slug = skill.name
         if label is not None:
-            new_slug = normalize_name(label)
+            new_slug = self._slug_from_label(label)
 
         if name is not None:
             if name and name != new_slug:
@@ -162,15 +180,20 @@ class SkillService:
         if instructions is not None:
             skill.instructions = instructions
 
-        if new_slug != skill.name:
-            if self._skill_dir(new_slug).exists():
-                raise ValueError(f"A skill named '{new_slug}' already exists.")
+        renaming = new_slug != skill.name
+        if renaming and self._skill_dir(new_slug).exists():
+            raise ValueError(f"A skill named '{new_slug}' already exists.")
+
+        # Write the updated content into the current dir first, then rename the
+        # whole dir last. A failed _write leaves the old dir intact; the
+        # destructive os.replace only runs once content is safely persisted.
+        skill.metadata = metadata
+        self._write(skill)
+        if renaming:
             self._rename_dir(skill.name, new_slug)
             remove_skill_links(skill.name)
             skill.name = new_slug
 
-        skill.metadata = metadata
-        self._write(skill)
         return self.get_skill(skill.name)
 
     def import_skill(self, data: bytes, filename: str | None = None) -> Skill:
