@@ -24,6 +24,14 @@ from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.services.connectors.specs._registry import registry
 
+# Placeholder the connections detail endpoint substitutes for masked secrets;
+# the edit form submits it back for any secret the user left unchanged. Single
+# source of truth so the mask (connections.get) and the un-mask
+# (resolve_keep_sentinels) can't drift. NOTE: this is cowork's own sentinel
+# value — distinct from anton's ANTON_VAULT_KEEP ("__anton_vault_keep__"), which
+# is why anton's resolve_modify_merge never matched cowork's masked secrets.
+VAULT_KEEP_SENTINEL = "ANTON_VAULT_KEEP"
+
 
 def _spec_name_from(connector_id: str, method: str | None):
     """Resolve the ``name_from`` declaration for a connector/method.
@@ -153,6 +161,33 @@ def is_same_account(existing_record: dict | None, payload: dict, secure_keys: li
         return False
     return _nonsecret_identity(existing_record.get("fields", {}), secure_keys) == \
         _nonsecret_identity(payload, secure_keys)
+
+
+def resolve_keep_sentinels(
+    credentials: dict, existing_record: dict | None
+) -> tuple[dict, bool]:
+    """Resolve modify-flow "keep" sentinels against the record being updated.
+
+    On an edit, the form submits ``VAULT_KEEP_SENTINEL`` for any secret the user
+    didn't change. Replace each such field with the stored value (so the real
+    secret is preserved instead of the literal sentinel being persisted) and drop
+    sentinels that have no prior value.
+
+    Returns ``(resolved_credentials, had_sentinel)`` — ``had_sentinel`` marks the
+    save as an edit of an existing connection.
+    """
+    prior = (existing_record or {}).get("fields", {}) or {}
+    resolved: dict = {}
+    had_sentinel = False
+    for key, value in credentials.items():
+        if value == VAULT_KEEP_SENTINEL:
+            had_sentinel = True
+            if key in prior:
+                resolved[key] = prior[key]
+            # else: drop — never persist the literal sentinel
+        else:
+            resolved[key] = value
+    return resolved, had_sentinel
 
 
 def resolve_unique_slug(
