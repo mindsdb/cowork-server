@@ -42,7 +42,11 @@ class SkillService:
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _skill_dir(self, slug: str) -> Path:
-        return self.root / slug
+        validate_name(slug)
+        skill_dir = (self.root / slug).resolve()
+        if not skill_dir.is_relative_to(self.root.resolve()):
+            raise ValueError(f"Invalid skill name: {slug!r}")
+        return skill_dir
 
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -56,7 +60,7 @@ class SkillService:
         metadata: dict[str, str] = {}
         if name and name != slug:
             metadata[META_DISPLAY_NAME] = name
-        metadata[META_CREATED_AT] = created_at.isoformat()
+        metadata[META_CREATED_AT] = created_at.replace(tzinfo=None).isoformat()
         return metadata
 
     # ── reads ────────────────────────────────────────────────────────────────
