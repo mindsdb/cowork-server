@@ -233,11 +233,17 @@ class ResponsesHandler:
             # MindsHub" — wrong for BYOK users.
             extra: dict = {}
             if code == AUTH_ERROR_CODE:
-                from cowork.common.settings.user_settings import Provider
-                provider = get_user_settings().resolved_planning_provider
-                reconnectable = provider == Provider.MINDS_CLOUD
-                message = auth_error_detail(provider.label, reconnectable)
-                extra = {"reconnectable": reconnectable, "provider_label": provider.label}
+                # Resolving the provider must never break the error handler —
+                # if it raises we just fall back to the generic auth message
+                # (no reconnectable flag), so the stream still closes cleanly.
+                try:
+                    from cowork.common.settings.user_settings import Provider
+                    provider = get_user_settings().resolved_planning_provider
+                    reconnectable = provider == Provider.MINDS_CLOUD
+                    message = auth_error_detail(provider.label, reconnectable)
+                    extra = {"reconnectable": reconnectable, "provider_label": provider.label}
+                except Exception:
+                    logger.exception("[responses] could not resolve provider for auth error")
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)
