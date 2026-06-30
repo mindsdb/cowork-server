@@ -14,12 +14,44 @@ from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.schemas.responses import Role
+from cowork.services.connectors.identity import (
+    derive_connection_name,
+    secure_keys_for,
+)
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 from cowork.services.conversations import ConversationService
 
 logger = logging.getLogger(__name__)
+
+
+def _save_connection_to_vault(vault, connector_id, method, name, credentials) -> str:
+    """Persist a connection and return the slug used.
+
+    The slug is the user-provided name, else the connector's identity-derived
+    name (e.g. gmail → ``user-gmail-com`` via the spec's ``name_from``), else
+    a random fallback. An identity-derived slug also dedups: re-connecting the
+    same account reuses the slug and updates the record in place rather than
+    leaving a stale duplicate. ``secure_keys`` is recorded from the spec's
+    declared secret fields so the identity (e.g. email) stays readable while
+    secrets are masked.
+    """
+    slug = (
+        (name or "").strip()
+        or derive_connection_name(connector_id, method, credentials)
+        or f"{connector_id}-{uuid.uuid4().hex[:6]}"
+    )
+    payload = {**credentials, "_connector_id": connector_id}
+    if method:
+        payload["_method"] = method
+    vault.save(
+        connector_id,
+        slug,
+        payload,
+        secure_keys=secure_keys_for(connector_id, method, payload),
+    )
+    return slug
 
 
 class ProbeHandler:
@@ -134,11 +166,9 @@ class ProbeHandler:
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
-                    slug = (name or "").strip() or f"{connector_id}-{uuid.uuid4().hex[:6]}"
-                    payload_to_save = {**credentials, "_connector_id": connector_id}
-                    if method:
-                        payload_to_save["_method"] = method
-                    vault.save(connector_id, slug, payload_to_save)
+                    slug = _save_connection_to_vault(
+                        vault, connector_id, method, name, credentials
+                    )
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
                     yield _push("response.completed", {
@@ -294,11 +324,9 @@ class ProbeHandler:
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
-                    slug = (name or "").strip() or f"{connector_id}-{uuid.uuid4().hex[:6]}"
-                    payload_to_save = {**credentials, "_connector_id": connector_id}
-                    if method:
-                        payload_to_save["_method"] = method
-                    vault.save(connector_id, slug, payload_to_save)
+                    slug = _save_connection_to_vault(
+                        vault, connector_id, method, name, credentials
+                    )
                     saved_slug = slug
                 except Exception as exc:
                     logger.exception("Vault save failed despite probe success")
