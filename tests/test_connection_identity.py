@@ -7,7 +7,6 @@ while the app password is masked.
 """
 from anton.core.datasources.data_vault import LocalDataVault
 
-from cowork.handlers.probe import _save_connection_to_vault
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL,
@@ -16,6 +15,12 @@ from cowork.services.connectors.identity import (
     secure_keys_for,
     spec_secret_fields,
 )
+from cowork.services.connectors.persist import persist_connection
+
+
+def _save(vault, *args):
+    """Adapter: persist_connection takes vault as a keyword."""
+    return persist_connection(*args, vault=vault)
 
 GMAIL_CREDS = {"email": "user@gmail.com", "app_password": "abcd efgh ijkl mnop"}
 
@@ -103,7 +108,7 @@ class TestSecureKeys:
 class TestSaveConnectionToVault:
     def test_saves_with_readable_slug_and_secure_keys(self, tmp_path):
         vault = LocalDataVault(tmp_path)
-        slug = _save_connection_to_vault(vault, "gmail", "app-password", "", GMAIL_CREDS)
+        slug = _save(vault, "gmail", "app-password", "", GMAIL_CREDS)
         assert slug == "user-gmail-com"  # not a random gmail-<uuid6>
         rec = vault.read_record("gmail", slug)
         assert rec["fields"]["email"] == "user@gmail.com"
@@ -111,16 +116,16 @@ class TestSaveConnectionToVault:
 
     def test_explicit_name_wins_over_derived(self, tmp_path):
         vault = LocalDataVault(tmp_path)
-        slug = _save_connection_to_vault(vault, "gmail", "app-password", "Support", GMAIL_CREDS)
+        slug = _save(vault, "gmail", "app-password", "Support", GMAIL_CREDS)
         assert slug == "Support"
 
     def test_same_account_dedups_in_place(self, tmp_path):
         vault = LocalDataVault(tmp_path)
-        _save_connection_to_vault(vault, "gmail", "app-password", "", GMAIL_CREDS)
+        _save(vault, "gmail", "app-password", "", GMAIL_CREDS)
         # Re-connect the same address (rotated password) — must update in place,
         # not create a second random-slug duplicate.
         rotated = {**GMAIL_CREDS, "app_password": "zzzz yyyy xxxx wwww"}
-        _save_connection_to_vault(vault, "gmail", "app-password", "", rotated)
+        _save(vault, "gmail", "app-password", "", rotated)
         conns = vault.list_connections()
         assert len(conns) == 1
         assert vault.load("gmail", "user-gmail-com")["app_password"] == "zzzz yyyy xxxx wwww"
@@ -128,7 +133,7 @@ class TestSaveConnectionToVault:
     def test_no_identity_field_falls_back_to_random_slug(self, tmp_path):
         vault = LocalDataVault(tmp_path)
         # OAuth method: no name_from → random fallback (still saved, with secure_keys).
-        slug = _save_connection_to_vault(
+        slug = _save(
             vault, "gmail", "oauth", "", {"client_id": "abc", "client_secret": "shh"}
         )
         assert slug.startswith("gmail-")
@@ -144,8 +149,8 @@ class TestNonDestructiveSave:
         vault = LocalDataVault(tmp_path)
         a = {"email": "support@acme.com", "app_password": "aaaa bbbb cccc dddd"}
         b = {"email": "personal@gmail.com", "app_password": "eeee ffff gggg hhhh"}
-        slug_a = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", a)
-        slug_b = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", b)
+        slug_a = _save(vault, "gmail", "app-password", "Inbox", a)
+        slug_b = _save(vault, "gmail", "app-password", "Inbox", b)
         assert slug_a == "Inbox"
         assert slug_b == "Inbox-2"  # NOT overwritten
         assert len(vault.list_connections()) == 2
@@ -156,19 +161,19 @@ class TestNonDestructiveSave:
         vault = LocalDataVault(tmp_path)
         a = {"email": "support@acme.com", "app_password": "old1 old1 old1 old1"}
         rotated = {"email": "support@acme.com", "app_password": "new2 new2 new2 new2"}
-        s1 = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", a)
-        s2 = _save_connection_to_vault(vault, "gmail", "app-password", "Inbox", rotated)
+        s1 = _save(vault, "gmail", "app-password", "Inbox", a)
+        s2 = _save(vault, "gmail", "app-password", "Inbox", rotated)
         assert s1 == s2 == "Inbox"  # same identity → update in place
         assert len(vault.list_connections()) == 1
         assert vault.load("gmail", "Inbox")["app_password"] == "new2 new2 new2 new2"
 
     def test_derived_distinct_emails_never_collide(self, tmp_path):
         vault = LocalDataVault(tmp_path)
-        _save_connection_to_vault(
+        _save(
             vault, "gmail", "app-password", "",
             {"email": "a@gmail.com", "app_password": "aaaa aaaa aaaa aaaa"},
         )
-        _save_connection_to_vault(
+        _save(
             vault, "gmail", "app-password", "",
             {"email": "b@gmail.com", "app_password": "bbbb bbbb bbbb bbbb"},
         )
@@ -196,12 +201,12 @@ class TestKeepSentinel:
 
     def test_edit_keeps_secret_and_updates_in_place(self, tmp_path):
         vault = LocalDataVault(tmp_path)
-        _save_connection_to_vault(
+        _save(
             vault, "gmail", "app-password", "Inbox",
             {"email": "u@x.com", "app_password": "REALPW"},
         )
         # Edit: keep the password (sentinel), no other change.
-        _save_connection_to_vault(
+        _save(
             vault, "gmail", "app-password", "Inbox",
             {"email": "u@x.com", "app_password": VAULT_KEEP_SENTINEL},
         )
@@ -211,13 +216,13 @@ class TestKeepSentinel:
 
     def test_edit_changing_identity_still_updates_named_record(self, tmp_path):
         vault = LocalDataVault(tmp_path)
-        _save_connection_to_vault(
+        _save(
             vault, "gmail", "app-password", "Inbox",
             {"email": "a@x.com", "app_password": "PW"},
         )
         # Edit changes the email but keeps the password (sentinel) → updates the
         # SAME record in place (an edit targets the named connection), not a suffix.
-        _save_connection_to_vault(
+        _save(
             vault, "gmail", "app-password", "Inbox",
             {"email": "b@x.com", "app_password": VAULT_KEEP_SENTINEL},
         )
@@ -242,3 +247,40 @@ class TestGetMaskingFallback:
         detail = svc.get("gmail", "legacy")
         assert detail.fields["email"] == "u@x.com"            # identity stays readable
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # secret masked
+
+
+class TestOAuthIdentity:
+    """OAuth connections store the account email under `account_email`; it should
+    drive a readable slug, and the email fetch is best-effort (never blocks)."""
+
+    def test_account_email_drives_slug_and_token_masked(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        slug = _save(
+            vault, "google_drive", None, "",
+            {"account_email": "u@acme.com", "access_token": "toktoktok", "auth_type": "oauth"},
+        )
+        assert slug == "u-acme-com"  # not a random google_drive-<uuid6>
+        rec = vault.read_record("google_drive", slug)
+        assert "access_token" in rec["secure_keys"]
+        assert "account_email" not in rec["secure_keys"]  # identity stays readable
+
+    def test_no_account_email_falls_back_to_random(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        slug = _save(
+            vault, "google_drive", None, "",
+            {"access_token": "toktoktok", "auth_type": "oauth"},
+        )
+        assert slug.startswith("google_drive-")  # graceful random fallback
+
+    def test_account_email_helper_is_best_effort(self, monkeypatch):
+        from cowork.services.connectors.oauth.google import google_service
+
+        assert google_service.account_email("") == ""
+        monkeypatch.setattr(google_service, "_fetch_userinfo", lambda t: {"email": "u@acme.com"})
+        assert google_service.account_email("tok") == "u@acme.com"
+
+        def _boom(_t):
+            raise RuntimeError("email scope not granted")
+
+        monkeypatch.setattr(google_service, "_fetch_userinfo", _boom)
+        assert google_service.account_email("tok") == ""  # never raises
