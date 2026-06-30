@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator
+import inspect
 import os
 from pathlib import Path
 import shutil
@@ -157,11 +158,18 @@ class AntonHarness:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
             )
-            async for event in session.turn_stream(
-                self._to_anton_input(input),
-                trace_tags=trace_tags,
-                trace_metadata=trace_metadata,
-            ):
+            # Forward trace annotations only if the installed anton's
+            # turn_stream accepts them. Deployed cowork-server resolves anton
+            # from PyPI/main, which may predate the trace-tags kwargs (anton
+            # #218); gating keeps those builds working — tags simply don't flow
+            # until the anton floor is bumped — instead of raising TypeError.
+            turn_kwargs: dict = {}
+            _turn_params = inspect.signature(session.turn_stream).parameters
+            if "trace_tags" in _turn_params:
+                turn_kwargs["trace_tags"] = trace_tags
+            if "trace_metadata" in _turn_params:
+                turn_kwargs["trace_metadata"] = trace_metadata
+            async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 yield event
         finally:
             if temp_vault_dir:
