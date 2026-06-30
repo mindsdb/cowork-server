@@ -244,14 +244,22 @@ def test_collect_raises_400_with_curated_message_for_token_limit():
 # ── Provider auth (401) → provider_auth ──────────────────────────────
 
 
-def test_detects_auth_error_from_anton_401_message():
-    # anton maps a gateway 401 to this ConnectionError message.
+def test_detects_auth_error_from_openai_401_message():
+    # anton's openai provider maps a gateway 401 to this ConnectionError message.
     exc = ConnectionError("Invalid API key — check your OpenAI API key configuration.")
     assert te.is_auth_error(exc) is True
 
 
-def test_detects_auth_error_unauthorized():
-    assert te.is_auth_error(Exception("Server returned 401 — Unauthorized")) is True
+def test_detects_auth_error_from_anthropic_401_message():
+    exc = ConnectionError("Invalid API key — check your ANTHROPIC_API_KEY environment variable.")
+    assert te.is_auth_error(exc) is True
+
+
+def test_bare_401_not_flagged():
+    # Tightened: a 401/"unauthorized" without anton's specific "Invalid API key"
+    # copy is NOT a provider-auth error (avoids mislabeling e.g. a tool API 401).
+    assert te.is_auth_error(Exception("Server returned 401 — Unauthorized")) is False
+    assert te.is_auth_error(Exception("connection reset")) is False
 
 
 def test_auth_error_maps_to_provider_auth_code():
@@ -268,5 +276,17 @@ def test_token_limit_wins_over_auth_for_credit_case():
     assert code == te.TOKEN_LIMIT_CODE
 
 
-def test_non_auth_error_not_flagged():
-    assert te.is_auth_error(Exception("connection reset")) is False
+def test_auth_error_detail_is_provider_aware():
+    # MindsHub → reconnect; BYOK → fix your own key in Settings (no "reconnect").
+    minds = te.auth_error_detail("MindsHub", reconnectable=True)
+    assert "reconnect" in minds.lower()
+    byok = te.auth_error_detail("OpenAI", reconnectable=False)
+    assert "reconnect" not in byok.lower()
+    assert "OpenAI" in byok and "Settings" in byok
+
+
+def test_response_failed_payload_carries_auth_fields():
+    p = te.response_failed_payload("msg", te.AUTH_ERROR_CODE, reconnectable=True, provider_label="MindsHub")
+    assert p["reconnectable"] is True and p["provider_label"] == "MindsHub"
+    # Unrelated failures keep the original shape (no extra keys).
+    assert "reconnectable" not in te.response_failed_payload("boom", "anton_error")
