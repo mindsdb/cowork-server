@@ -69,8 +69,11 @@ def _identity_fields(connector_id: str, method: str | None, credentials: dict) -
     name_from = _spec_name_from(connector_id, method)
     if name_from:
         return [name_from] if isinstance(name_from, str) else list(name_from)
-    if str(credentials.get("email", "")).strip():
-        return ["email"]
+    # `account_email` is what the OAuth flows store (from userinfo); `email` is
+    # what the credential forms collect. Either is a credential-unique identity.
+    for email_field in ("email", "account_email"):
+        if str(credentials.get(email_field, "")).strip():
+            return [email_field]
     if str(credentials.get("host", "")).strip():
         return [f for f in ("host", "database", "username") if str(credentials.get(f, "")).strip()]
     return []

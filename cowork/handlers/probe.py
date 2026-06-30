@@ -14,54 +14,13 @@ from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.schemas.responses import Role
-from cowork.services.connectors.identity import (
-    derive_connection_name,
-    resolve_keep_sentinels,
-    resolve_unique_slug,
-    secure_keys_for,
-)
+from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 from cowork.services.conversations import ConversationService
 
 logger = logging.getLogger(__name__)
-
-
-def _save_connection_to_vault(vault, connector_id, method, name, credentials) -> str:
-    """Persist a connection and return the slug used.
-
-    The slug is the user-provided name, else the connector's identity-derived
-    name (e.g. gmail → ``user-gmail-com`` via the spec's ``name_from``), else
-    a random fallback. An identity-derived slug also dedups: re-connecting the
-    same account reuses the slug and updates the record in place rather than
-    leaving a stale duplicate. ``secure_keys`` is recorded from the spec's
-    declared secret fields so the identity (e.g. email) stays readable while
-    secrets are masked.
-    """
-    base_slug = (
-        (name or "").strip()
-        or derive_connection_name(connector_id, method, credentials)
-        or f"{connector_id}-{uuid.uuid4().hex[:6]}"
-    )
-    # Resolve modify-flow "keep" sentinels against the record we're updating, so
-    # an unchanged secret keeps its stored value instead of persisting the
-    # literal sentinel (and a probe doesn't run against it).
-    target = vault.read_record(connector_id, base_slug)
-    credentials, is_edit = resolve_keep_sentinels(credentials, target)
-    payload = {**credentials, "_connector_id": connector_id}
-    if method:
-        payload["_method"] = method
-    secure_keys = secure_keys_for(connector_id, method, payload)
-    if is_edit:
-        # An edit targets exactly the named connection — update it in place.
-        slug = base_slug
-    else:
-        # Non-destructive: reuse the slug only when it's free or holds the same
-        # account; a different account gets a `-N` suffix instead of overwriting.
-        slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
-    vault.save(connector_id, slug, payload, secure_keys=secure_keys)
-    return slug
 
 
 class ProbeHandler:
@@ -176,8 +135,8 @@ class ProbeHandler:
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
-                    slug = _save_connection_to_vault(
-                        vault, connector_id, method, name, credentials
+                    slug = persist_connection(
+                        connector_id, method, name, credentials, vault=vault
                     )
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
@@ -334,8 +293,8 @@ class ProbeHandler:
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
-                    slug = _save_connection_to_vault(
-                        vault, connector_id, method, name, credentials
+                    slug = persist_connection(
+                        connector_id, method, name, credentials, vault=vault
                     )
                     saved_slug = slug
                 except Exception as exc:
