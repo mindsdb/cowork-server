@@ -259,14 +259,17 @@ class HermesHarness:
         from anton.core.datasources.data_vault import LocalDataVault
 
         from cowork.common.settings.app_settings import get_app_settings
-        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.common.settings.user_settings import (
+            Provider,
+            get_user_settings,
+            provider_api_key_str,
+        )
         from cowork.harnesses.hermes_harness.tools import (
             finalize_artifact_run_context,
             register_artifact_tools,
             register_connector_tools,
             set_artifact_run_context,
         )
-        from cowork.common.settings.user_settings import Provider
         from cowork.harnesses.hermes_harness.memory_adapter import HermesMemoryAdapter
 
         register_connector_tools()
@@ -296,14 +299,15 @@ class HermesHarness:
         # API key env var must be set.
         settings = get_user_settings()
         model = settings.planning_model
-        provider_value = settings.planning_provider.value if settings.planning_provider != Provider.MINDS_CLOUD else "openai"
-        api_key_value = (
-            settings.minds_api_key.get_secret_value()
-            if settings.planning_provider == Provider.MINDS_CLOUD
-            else getattr(settings, f"{provider_value}_api_key", None)
-        )
-        if api_key_value and hasattr(api_key_value, "get_secret_value"):
-            api_key_value = api_key_value.get_secret_value()
+        planning = settings.planning_provider
+        # AIAgent treats MindsHub as the "openai" provider (OpenAI-compatible
+        # gateway); every other provider passes through by its normalized ui id.
+        provider_value = "openai" if planning == Provider.MINDS_CLOUD else planning.ui_value
+        # Resolve the key via provider_api_key_str so the gemini/openai-compatible
+        # → shared-openai fallback applies here too — a raw getattr on the
+        # dedicated slot would miss it and AIAgent's init check would 401. Matches
+        # the constructor path below (single source of truth).
+        api_key_value = provider_api_key_str(settings, planning)
 
         _sync_hermes_config(provider_value, api_key_value)
 
@@ -348,17 +352,15 @@ class HermesHarness:
         else:
             # The DB enum uses snake_case (openai_compatible) but AIAgent
             # expects kebab-case (openai-compatible).
-            provider = settings.planning_provider.value.replace("_", "-")
+            provider = settings.planning_provider.ui_value
             # Resolve key and base URL through the shared single-source helpers
-            # (providers.provider_base_url / user_settings.provider_api_key) so
-            # the hermes path can't drift from the anton path. provider_api_key
-            # applies the gemini/openai-compatible → openai fallback (avoids a
-            # None.get_secret_value() crash for a user on the shared key).
-            from cowork.common.settings.user_settings import provider_api_key
+            # (providers.provider_base_url / user_settings.provider_api_key_str)
+            # so the hermes path can't drift from the anton path.
+            # provider_api_key_str applies the gemini/openai-compatible → openai
+            # fallback (and returns "" rather than crashing on a shared-key user).
             from cowork.services.providers import provider_base_url
 
-            _key = provider_api_key(settings, settings.planning_provider)
-            api_key = _key.get_secret_value() if _key else ""
+            api_key = provider_api_key_str(settings, settings.planning_provider)
 
             # AIAgent needs an explicit base_url to skip its config.yaml
             # provider-resolution path. provider_base_url returns None for
