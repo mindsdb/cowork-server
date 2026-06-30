@@ -107,6 +107,14 @@
             "required": true,
             "secret": true,
             "description": "16 characters. Spaces are optional — Anton strips them."
+          },
+          {
+            "name": "label",
+            "label": "Name this connection",
+            "type": "text",
+            "required": false,
+            "placeholder": "e.g. Support, Personal",
+            "description": "Optional. A friendly name so you (and Anton) can tell multiple accounts apart. Defaults to the email address."
           }
         ]
       },
@@ -133,6 +141,14 @@
             "required": true,
             "placeholder": "user@yourcompany.com",
             "description": "The user account Anton acts as — must belong to your Workspace domain."
+          },
+          {
+            "name": "label",
+            "label": "Name this connection",
+            "type": "text",
+            "required": false,
+            "placeholder": "e.g. Support, Personal",
+            "description": "Optional. A friendly name so you (and Anton) can tell multiple accounts apart. Defaults to the impersonated email."
           }
         ]
       }

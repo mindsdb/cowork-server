@@ -15,7 +15,10 @@ from cowork.services.connectors.identity import (
     secure_keys_for,
     spec_secret_fields,
 )
-from cowork.services.connectors.persist import persist_connection
+from cowork.services.connectors.persist import (
+    persist_connection,
+    set_connection_label,
+)
 
 
 def _save(vault, *args):
@@ -247,6 +250,53 @@ class TestGetMaskingFallback:
         detail = svc.get("gmail", "legacy")
         assert detail.fields["email"] == "u@x.com"            # identity stays readable
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # secret masked
+
+
+class TestConnectionLabel:
+    """A human label ("Support") names a connection without changing its
+    identity/slug, settable at save time (form field) or after (agent tool)."""
+
+    def test_label_param_stored_as_meta_not_in_slug_or_secrets(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        slug = persist_connection(
+            "gmail", "app-password", "", GMAIL_CREDS, label="Support", vault=vault
+        )
+        assert slug == "user-gmail-com"  # identity slug, not the label
+        rec = vault.read_record("gmail", slug)
+        assert rec["fields"]["_label"] == "Support"
+        assert "_label" not in rec["secure_keys"]
+
+    def test_label_from_credentials_field_is_extracted(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        creds = {**GMAIL_CREDS, "label": "Personal"}
+        slug = persist_connection("gmail", "app-password", "", creds, vault=vault)
+        rec = vault.read_record("gmail", slug)
+        assert rec["fields"]["_label"] == "Personal"
+        # the raw "label" field is not persisted as a credential
+        assert "label" not in rec["fields"]
+
+    def test_label_preserved_when_later_save_omits_it(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        persist_connection("gmail", "app-password", "", GMAIL_CREDS, label="Support", vault=vault)
+        # Re-save (rotate password) without a label → existing label carried forward.
+        persist_connection(
+            "gmail", "app-password", "",
+            {**GMAIL_CREDS, "app_password": "zzzz zzzz zzzz zzzz"}, vault=vault,
+        )
+        assert vault.load("gmail", "user-gmail-com")["_label"] == "Support"
+
+    def test_set_connection_label_updates_in_place(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        slug = persist_connection("gmail", "app-password", "", GMAIL_CREDS, vault=vault)
+        assert set_connection_label("gmail", slug, "Support", vault=vault) is True
+        assert vault.load("gmail", slug)["_label"] == "Support"
+        # identity + secret untouched
+        assert vault.load("gmail", slug)["email"] == "user@gmail.com"
+        assert vault.read_record("gmail", slug)["secure_keys"] == ["app_password"]
+
+    def test_set_connection_label_missing_connection_returns_false(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        assert set_connection_label("gmail", "nope", "X", vault=vault) is False
 
 
 class TestOAuthIdentity:

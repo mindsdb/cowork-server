@@ -114,6 +114,11 @@ class ProbeHandler:
                 k: v for k, v in values.items()
                 if k not in skipped and v is not None and v != ""
             }
+            # `label` is a human display name, not a credential — pull it out so
+            # it never reaches the probe, and hand it to persist as the label.
+            connection_label = str(
+                credentials.pop("label", "") or credentials.pop("_label", "")
+            ).strip()
 
             # Connector spec — absent for agent-handcrafted (non-registry)
             # connectors; those fall back to the form_spec staged with the
@@ -136,7 +141,8 @@ class ProbeHandler:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
                     slug = persist_connection(
-                        connector_id, method, name, credentials, vault=vault
+                        connector_id, method, name, credentials,
+                        label=connection_label, vault=vault,
                     )
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
@@ -294,7 +300,8 @@ class ProbeHandler:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
                     slug = persist_connection(
-                        connector_id, method, name, credentials, vault=vault
+                        connector_id, method, name, credentials,
+                        label=connection_label, vault=vault,
                     )
                     saved_slug = slug
                 except Exception as exc:
