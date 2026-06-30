@@ -303,10 +303,28 @@ def migrate_skills_to_files(session: Session) -> bool:
             n += 1
         return slug
 
+    # Skills already written by a previous (partial) run, keyed by cowork_id, so
+    # a retry skips them instead of re-creating them under a "-2" slug.
+    existing_ids = {
+        s.metadata.get("cowork_id")
+        for s in store.list_skills()
+        if s.metadata.get("cowork_id")
+    }
+
     taken: set[str] = set()
     migrated = 0
+    skipped = 0
     for row in rows:
+        if str(row.id) in existing_ids:
+            skipped += 1
+            continue
+
         base = normalize_name(row.label or row.name or "")
+        if not base:
+            # Symbol/whitespace-only label normalizes to "" — fall back to an
+            # id-derived slug so the skill is migrated rather than silently lost.
+            base = normalize_name(f"skill-{row.id}")
+            logger.warning("Legacy skill %s has no usable name; migrating as %r", row.id, base)
         slug = _unique_slug(store, base, taken)
         taken.add(slug)
 
@@ -326,7 +344,7 @@ def migrate_skills_to_files(session: Session) -> bool:
         if row.name and row.name != slug:
             metadata[META_DISPLAY_NAME] = row.name
         if row.created_at:
-            metadata[META_CREATED_AT] = row.created_at.isoformat()
+            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=None).isoformat()
 
         try:
             skill = Skill(
@@ -342,6 +360,18 @@ def migrate_skills_to_files(session: Session) -> bool:
 
     if migrated:
         logger.info("Migrated %d skill(s) from skills_legacy to files at %s", migrated, store.root)
+
+    # Only mark the migration done when every legacy row is accounted for —
+    # written this run or already present from a prior run. If some _write
+    # failed (e.g. unwritable/unmounted skills dir), leave the sentinel unset so
+    # the next boot retries instead of silently dropping skills.
+    if migrated + skipped != len(rows):
+        logger.warning(
+            "Skill migration incomplete (%d written, %d already present, %d total); "
+            "will retry on next boot",
+            migrated, skipped, len(rows),
+        )
+        return False
 
     session.add(Setting(key=SKILL_MIGRATION_SENTINEL, value="1"))
     session.commit()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from anton.core.tools.skill_format import AgentSkill
@@ -58,9 +58,14 @@ class Skill(AgentSkill):
         if not raw:
             return None
         try:
-            return datetime.fromisoformat(raw)
+            parsed = datetime.fromisoformat(raw)
         except ValueError:
             return None
+        # Migrated skills carry a naive value (SQLite); new ones are aware.
+        # Normalize to UTC-aware so comparisons/sorts never mix the two.
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
 
 class SkillLegacy(BaseSQLModel, table=True):

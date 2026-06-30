@@ -103,10 +103,6 @@ class AntonHarness:
     label: str = "Anton"
     formatter = staticmethod(format_responses_stream)
 
-    async def sync_skills(self, skills: list[Skill]) -> None:
-        # No-op: Anton's skills dir is pointed to cowork's canonical (seedev_setup)
-        return
-
     async def stream_response(
         self,
         *,
