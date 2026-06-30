@@ -115,24 +115,31 @@ def is_token_limit_error(exc: Exception) -> bool:
 
 
 def is_auth_error(exc: Exception) -> bool:
-    """Detect a provider **auth** failure — a 401 from the model gateway because
-    the credential it sees is invalid (revoked / rotated / never provisioned /
-    wrong org). anton maps a 401 to ``ConnectionError("Invalid API key — check
-    your OpenAI API key configuration.")`` (the message says "OpenAI" even for
-    MindsHub), so match that plus the general 401/unauthorized signal.
+    """Detect an **LLM-provider** auth failure — a 401 from the model gateway
+    because the credential it sees is invalid (revoked / rotated / never
+    provisioned / wrong org).
 
-    Deliberately narrow to auth (401): credit/quota exhaustion is a 402/429 and
-    is handled by ``is_token_limit_error`` (checked first), and a missing-provider
-    *config* error is handled separately by the renderer.
+    Matched narrowly on anton's specific 401 copy — both providers raise a
+    ``ConnectionError`` whose message starts ``Invalid API key — …``
+    (``openai.py`` / ``anthropic.py``). Deliberately does NOT match a bare
+    "401"/"unauthorized" anywhere in the text: that would mislabel an unrelated
+    failure (e.g. a connector/tool API 401 that bubbles up) as a provider-auth
+    error and pop the wrong "Reconnect" card. Credit/quota exhaustion (402/429)
+    is handled by ``is_token_limit_error`` (checked first).
     """
-    s = str(exc).lower()
-    if "invalid api key" in s:
-        return True
-    if "unauthorized" in s:
-        return True
-    if "401" in s and ("api key" in s or "auth" in s or "credential" in s):
-        return True
-    return False
+    return "invalid api key" in str(exc).lower()
+
+
+def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
+    """Provider-aware copy for an auth failure.
+
+    MindsHub (managed) → the fix is to re-provision the key in place
+    ("reconnect"); a BYOK provider → the user must fix their own key in Settings,
+    so do NOT tell them to reconnect MindsHub.
+    """
+    if reconnectable:
+        return "Your MindsHub session is no longer valid — reconnect to keep going."
+    return f"Your {provider_label} API key is no longer valid — update it in Settings."
 
 
 def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
@@ -151,16 +158,38 @@ def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
     return None
 
 
-def response_failed_payload(error: str, code: str) -> dict:
-    """Wire payload for a ``response.failed`` event (SSE + DB sidecar)."""
-    return {"type": "response.failed", "code": code, "error": error}
+def response_failed_payload(
+    error: str,
+    code: str,
+    *,
+    reconnectable: bool | None = None,
+    provider_label: str | None = None,
+) -> dict:
+    """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
-
-def response_failed_sse(error: str, code: str) -> str:
-    """Build a ``response.failed`` SSE frame.
-
-    Same wire shape the legacy server emitted, so the renderer's existing
-    parser handles it unchanged: ``{type, code, error}``.
+    ``reconnectable`` / ``provider_label`` are included only for the
+    ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
+    "Open Settings" (BYOK) — omitted otherwise to keep the shape unchanged for
+    every other failure.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
+    if reconnectable is not None:
+        payload["reconnectable"] = reconnectable
+    if provider_label is not None:
+        payload["provider_label"] = provider_label
+    return payload
+
+
+def response_failed_sse(
+    error: str,
+    code: str,
+    *,
+    reconnectable: bool | None = None,
+    provider_label: str | None = None,
+) -> str:
+    """Build a ``response.failed`` SSE frame (same wire shape the renderer's
+    parser already handles, plus the optional auth fields)."""
+    payload = response_failed_payload(
+        error, code, reconnectable=reconnectable, provider_label=provider_label
+    )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"
