@@ -256,6 +256,11 @@ def migrate_skills_to_files(session: Session) -> bool:
             continue
 
         base = normalize_name(row.label or row.name or "")
+        if not base:
+            # Symbol/whitespace-only label normalizes to "" — fall back to an
+            # id-derived slug so the skill is migrated rather than silently lost.
+            base = normalize_name(f"skill-{row.id}")
+            logger.warning("Legacy skill %s has no usable name; migrating as %r", row.id, base)
         slug = _unique_slug(store, base, taken)
         taken.add(slug)
 
