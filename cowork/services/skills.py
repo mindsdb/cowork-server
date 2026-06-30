@@ -193,6 +193,7 @@ class SkillService:
             self._rename_dir(skill.name, new_slug)
             remove_skill_links(skill.name)
             skill.name = new_slug
+            reconcile_skill_links(skill)
 
         return self.get_skill(skill.name)
 
@@ -279,14 +280,20 @@ class SkillService:
 
     @staticmethod
     def _safe_extract_zip(data: bytes, dest: Path) -> None:
-        """Extract a zip into ``dest``, rejecting any path that escapes it."""
+        """Extract a zip into ``dest``, rejecting paths that escape it or are symlinks."""
+        import stat
+
         dest_resolved = dest.resolve()
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                for member in zf.namelist():
-                    target = (dest / member).resolve()
+                for info in zf.infolist():
+                    # Upper 16 bits of external_attr are Unix mode bits (0 on Windows zips).
+                    unix_mode = info.external_attr >> 16
+                    if unix_mode and stat.S_ISLNK(unix_mode):
+                        raise ValueError(f"Archive contains a symlink: {info.filename!r}")
+                    target = (dest / info.filename).resolve()
                     if target != dest_resolved and dest_resolved not in target.parents:
-                        raise ValueError(f"Unsafe path in archive: {member!r}")
+                        raise ValueError(f"Unsafe path in archive: {info.filename!r}")
                 zf.extractall(dest)
         except zipfile.BadZipFile:
             raise ValueError("Uploaded file is not a valid zip archive.")
