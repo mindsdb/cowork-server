@@ -123,4 +123,7 @@ async def submit_form(req: SubmitFormRequest, session: SessionDep) -> StreamingR
     return StreamingResponse(
         handler.run(submission_id, connector_id, method, req.name, req.conversation_id),
         media_type="text/event-stream",
+        # The submission stream can carry connection credentials (DSNs, keys);
+        # keep it out of the client's on-disk HTTP cache. See ENG-462.
+        headers={"Cache-Control": "no-store"},
     )
