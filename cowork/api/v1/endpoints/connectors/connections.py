@@ -8,7 +8,6 @@ from pydantic import BaseModel
 from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse, DirectSaveRequest
 from cowork.services.connectors.connections import service
-from cowork.services.connectors.oauth.google import google_service
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry
 
@@ -33,26 +32,11 @@ def get_connection(engine: str, name: str):
 def save_connection_direct(body: DirectSaveRequest):
     """Persist credentials to the vault without running a probe.
     Used after an OAuth PKCE flow (Electron main-process PKCE) where the
-    token exchange already succeeded. Calls verify_connection before saving."""
+    token exchange already succeeded. Electron verifies the token and resolves
+    account_email before calling this endpoint."""
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
-    access_token = body.values.get("access_token", "")
-    if access_token:
-        try:
-            google_service.verify_connection(body.connector_id, access_token)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
     values = dict(body.values)
-    # Best-effort: capture the authenticated account email so the connection is
-    # identifiable (drives a readable, dedup-able slug). Absent when the email
-    # scope wasn't granted — persist_connection then falls back to a random
-    # slug, so this never blocks the save.
-    if access_token and not values.get("account_email"):
-        email = google_service.account_email(access_token)
-        if email:
-            values["account_email"] = email
     if values.get("access_token") or values.get("refresh_token"):
         values["auth_type"] = "oauth"
     try:
