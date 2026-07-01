@@ -222,6 +222,24 @@ class AppSettings(Settings):
             ]
         return self
 
+    require_auth: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_REQUIRE_AUTH"),
+        description=(
+            "Require a bearer token on all API requests (except /health). "
+            "Set COWORK_AUTH_TOKEN to a fixed token, or leave it empty to "
+            "auto-generate one on first startup (written back to ~/.cowork/.env)."
+        ),
+    )
+    auth_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_AUTH_TOKEN"),
+        description=(
+            "Bearer token clients must send as 'Authorization: Bearer <token>'. "
+            "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
+        ),
+    )
+
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
     master_key_path: str = Field(
