@@ -261,14 +261,6 @@ def seed_builtin_skills(session: Session) -> bool:
     if copied:
         logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)
 
-    # Attach every skill that has no project yet to the general project
-    from cowork.services.projects import GENERAL_PROJECT, ProjectService
-
-    if ProjectService(session).get_project_by_name_or_none(GENERAL_PROJECT) is not None:
-        for skill in store.list_skills():
-            if not skill.projects:
-                store.update_skill(skill.name, projects=[GENERAL_PROJECT])
-
     # Raw Setting row: the sentinel key isn't a UserSettings field, so it must
     # bypass SettingService validation (same pattern as the other migrations).
     if row is None:

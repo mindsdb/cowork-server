@@ -1,9 +1,12 @@
 """Distribute canonical skills into per-project ``skills/`` folders.
 
 Each enabled skill is symlinked from the canonical store
-(``COWORK_SKILLS_DIR/<slug>``) into ``<projects_root>/<project>/skills/<slug>``
-for every project listed in the skill's ``metadata.projects``.
-``enabled=false`` (or an empty project list) means no links.
+(``COWORK_SKILLS_DIR/<slug>``) into ``<projects_root>/<project>/skills/<slug>``.
+
+Scoping rules:
+  - ``enabled=false`` → no links anywhere.
+  - ``metadata.projects`` is empty → link to **all** discovered projects (global skill).
+  - ``metadata.projects`` lists specific projects → link only to those projects.
 
 Projects are discovered by scanning ``project.root_dir`` (no DB), so a skill's
 ``metadata.projects`` entries are matched against project **folder names**.
@@ -51,8 +54,14 @@ def _remove_link(link: Path) -> None:
 def reconcile_skill_links(skill: Skill) -> None:
     """Make each project's ``skills/<slug>`` link match the skill's metadata."""
     canon = _canon_root() / skill.name
-    desired = set(skill.projects) if skill.enabled else set()
-    for project_dir in _project_dirs():
+    all_projects = _project_dirs()
+    if not skill.enabled:
+        desired: set[str] = set()
+    elif skill.projects:
+        desired = set(skill.projects)
+    else:
+        desired = {p.name for p in all_projects}
+    for project_dir in all_projects:
         link = project_dir / "skills" / skill.name
         if project_dir.name in desired and canon.exists():
             _ensure_symlink(link, canon)
