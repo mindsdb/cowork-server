@@ -206,6 +206,16 @@ class AppSettings(Settings):
         description="The host to run the server on",
     )
 
+    owner: str = Field(
+        default=os.environ.get("COWORK_SERVER_OWNER", ""),
+        description=(
+            "Opaque per-install owner token echoed at /health. The desktop app passes the "
+            "token it generated and only adopts a server whose /health owner matches, so one "
+            "OS user's app never adopts another user's sidecar on a shared loopback port "
+            "(ENG-439). Empty means the server advertises no owner and is not adoptable."
+        ),
+    )  # COWORK_SERVER_OWNER
+
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
     master_key_path: str = Field(
