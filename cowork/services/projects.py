@@ -96,6 +96,11 @@ class ProjectService:
         self.session.add(project)
         self.session.commit()
         self.session.refresh(project)
+
+        from cowork.services.skill_links import reconcile_project
+        from cowork.services.skills import SkillService
+        reconcile_project(path, SkillService().list_skills())
+
         return project
 
     def update_project(
