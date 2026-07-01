@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from cowork.api.v1.router import api_router as v1_router
-from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token
+from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -96,7 +96,30 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Configure CORS middleware
+    # Optional bearer-token auth.  Off by default; enabled when
+    # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
+    # when COWORK_AUTH_TOKEN is not set, then persisted to ~/.cowork/.env
+    # so the desktop app and subsequent server runs share the same secret.
+    #
+    # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
+    # the last-added middleware outermost): a 401 from the auth layer still
+    # flows back through CORS and carries Access-Control-Allow-Origin, so the
+    # browser sees the 401 rather than an opaque CORS failure.
+    #
+    # External channel webhooks carry their own signature, not the bearer
+    # token; _install_channels fills this set with their paths so the auth
+    # layer lets them through.
+    channel_webhook_paths: set[str] = set()
+    if settings.require_auth:
+        env_path = Path.home() / ".cowork" / ".env"
+        token = settings.auth_token or ensure_auth_token(env_path)
+        sync_auth_token(env_path, token)
+        app.add_middleware(
+            BearerTokenMiddleware, token=token, exempt_paths=channel_webhook_paths
+        )
+        logger.info("auth: bearer-token authentication enabled")
+
+    # Configure CORS middleware (added last → outermost)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -107,26 +130,16 @@ def create_app() -> FastAPI:
         max_age=3600,
     )
 
-    # Optional bearer-token auth.  Off by default; enabled when
-    # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
-    # when COWORK_AUTH_TOKEN is not set, then persisted to ~/.cowork/.env
-    # so the desktop app and subsequent server runs share the same secret.
-    if settings.require_auth:
-        env_path = Path.home() / ".cowork" / ".env"
-        token = settings.auth_token or ensure_auth_token(env_path)
-        app.add_middleware(BearerTokenMiddleware, token=token)
-        logger.info("auth: bearer-token authentication enabled")
-
     # Include v1 API routes
     app.include_router(v1_router)
 
-    _install_channels(app)
+    _install_channels(app, channel_webhook_paths)
 
     logger.info("Cowork application created successfully")
     return app
 
 
-def _install_channels(app: FastAPI) -> None:
+def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
     """Discover channel plugins, mount their webhook routes, and build the
     Anton-only channel runtime + live-adapter registry.
 
@@ -135,6 +148,10 @@ def _install_channels(app: FastAPI) -> None:
     Webhook routes resolve the live adapter synchronously through the registry's
     cache, which the lifespan populates — so routes are mounted here but only
     serve once a channel is configured (otherwise the route ACK-ignores: 204).
+
+    Every mounted webhook path is recorded in ``webhook_paths`` so the bearer
+    auth layer exempts it — these endpoints are called by external platforms
+    that authenticate with their own signature, not the Cowork token.
     """
     from cowork.channels.ingress import IngressManager
     from cowork.channels.registry import get_registry, load_first_party_plugins
@@ -150,6 +167,12 @@ def _install_channels(app: FastAPI) -> None:
         app.include_router(
             build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
             prefix="/api/v1/channels",
+        )
+        # Mirrors the route path built in webhooks._add_webhook_route:
+        # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
+        webhook_paths.update(
+            f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
+            for webhook in plugin.webhooks
         )
     app.state.channel_adapters = adapters
     app.state.channel_runtime = runtime
