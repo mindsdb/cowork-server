@@ -75,6 +75,19 @@ def remove_skill_links(slug: str) -> None:
         _remove_link(project_dir / "skills" / slug)
 
 
+def reconcile_project(project_dir: Path, skills: list[Skill]) -> None:
+    """Link all applicable skills into a single newly-created project."""
+    canon_root = _canon_root()
+    for skill in skills:
+        if not skill.enabled:
+            continue
+        if skill.projects and project_dir.name not in skill.projects:
+            continue
+        canon = canon_root / skill.name
+        if canon.exists():
+            _ensure_symlink(project_dir / "skills" / skill.name, canon)
+
+
 def reconcile_all(skills: list[Skill]) -> None:
     """Full reconcile of all skills across all projects (boot / seed)."""
     for skill in skills:
