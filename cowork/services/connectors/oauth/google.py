@@ -431,6 +431,20 @@ class GoogleOAuthService:
             headers={"Authorization": f"Bearer {access_token}"},
         )
 
+    def account_email(self, access_token: str) -> str:
+        """Best-effort authenticated account email from userinfo.
+
+        Returns "" when the token is empty, the email scope wasn't granted, or
+        the call fails — never raises, so callers can use it to label a
+        connection without making identity a hard requirement.
+        """
+        if not access_token:
+            return ""
+        try:
+            return str(self._fetch_userinfo(access_token).get("email", "")).strip()
+        except Exception:
+            return ""
+
     def verify_connection(self, connector_id_or_service: str, access_token: str) -> None:
         """Make a lightweight API call to confirm the token works before vault save.
         Accepts either an engine name (e.g. 'google_drive') or a service id
