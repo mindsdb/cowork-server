@@ -15,8 +15,6 @@ from anton.core.tools.skill_format import (
     parse_skill_dir,
     validate_name,
 )
-from sqlmodel import Session
-
 from cowork.common.settings import get_app_settings
 from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
 from cowork.models.skill import (
@@ -45,8 +43,7 @@ class SkillService:
 
 
 
-    def __init__(self, session: Session) -> None:
-        self.session = session
+    def __init__(self) -> None:
         self.root = Path(get_app_settings().skill.root_dir)
 
     # ── helpers ──────────────────────────────────────────────────────────────
