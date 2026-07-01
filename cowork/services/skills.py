@@ -242,6 +242,7 @@ class SkillService:
 
         metadata = dict(skill.metadata)
         metadata.setdefault(META_CREATED_AT, datetime.now(timezone.utc).isoformat())
+        metadata.pop(META_PROJECTS, None)
         skill.metadata = metadata
         if not skill.description.strip():
             skill.description = skill.display_name or skill.name
