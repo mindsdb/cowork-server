@@ -26,8 +26,10 @@ from cowork.schemas.responses import (
     Role,
 )
 from cowork.handlers.turn_errors import (
+    AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
+    auth_error_detail,
     friendly_turn_error,
     response_failed_payload,
     response_failed_sse,
@@ -223,8 +225,26 @@ class ResponsesHandler:
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
-            failed = response_failed_payload(message, code)
-            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            # For an auth failure, tell the client which provider failed so it
+            # offers the right action: "Reconnect" only for MindsHub (we can
+            # re-provision the key in place), "Open Settings" for a BYOK key the
+            # user owns. Without this the renderer would always say "Reconnect
+            # MindsHub" — wrong for BYOK users.
+            extra: dict = {}
+            if code == AUTH_ERROR_CODE:
+                # Resolving the provider must never break the error handler —
+                # if it raises we just fall back to the generic auth message
+                # (no reconnectable flag), so the stream still closes cleanly.
+                try:
+                    from cowork.common.settings.user_settings import Provider
+                    provider = get_user_settings().resolved_planning_provider
+                    reconnectable = provider == Provider.MINDS_CLOUD
+                    message = auth_error_detail(provider.label, reconnectable)
+                    extra = {"reconnectable": reconnectable, "provider_label": provider.label}
+                except Exception:
+                    logger.exception("[responses] could not resolve provider for auth error")
+            failed = response_failed_payload(message, code, **extra)
+            await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)
             persist()
             await buffer.close("error")
