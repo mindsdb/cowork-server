@@ -129,6 +129,14 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class SkillSettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "skills"),
+        validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
+        description="Root directory where agentskills.io-format skill folders are stored",
+    )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
+
+
 class ConnectorSettings(Settings):
     vault_dir: str = Field(
         default=str(Path.home() / ".cowork" / "data-vault"),
@@ -238,6 +246,7 @@ class AppSettings(Settings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
+    skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
 
