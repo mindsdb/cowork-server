@@ -19,7 +19,7 @@ dependencies = [
     "anton-agent>=2.26.6.22.1,<3",
     "cryptography>=48.0.0",
     "fastapi>=0.136.1",
-    "hermes-agent>=0.15.2,<1",
+    "hermes-agent>=0.15.2,<0.18",
     "httpx>=0.27",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
@@ -63,7 +63,7 @@ packages = ["cowork"]
 
 [tool.uv.sources]
 anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
-hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
+hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
 [dependency-groups]
 dev = [
