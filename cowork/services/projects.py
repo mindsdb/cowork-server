@@ -35,12 +35,6 @@ class ProjectService:
     def _project_path(self, name: str) -> Path:
         return self._root_dir() / name
 
-    # TODO: Move this. This should only be done when using Anton.
-    def _scaffold(self, target: Path) -> None:
-        anton_dir = target / ".anton"
-        anton_dir.mkdir(parents=True, exist_ok=True)
-        (anton_dir / "anton.md").touch()
-
     def _unique_name(self, base: str, *, exclude: str | None = None) -> str:
         existing = {
             p.name for p in self.session.exec(select(Project)).all()
@@ -86,13 +80,13 @@ class ProjectService:
     def get_project_by_name_or_none(self, name: str) -> Project | None:
         return self.session.exec(select(Project).where(Project.name == name)).first()
 
-    def create_project(self, name: str) -> Project:
+    def create_project(self, name: str, path: Path | None = None, instructions: str | None = None) -> Project:
         sanitized = self._sanitize_name(name)
         final_name = self._unique_name(sanitized)
-        path = self._project_path(final_name)
-        path.mkdir(parents=True)
-        # self._scaffold(path)
-        project = Project(name=final_name, path=str(path), is_active=False)
+        path = path or self._project_path(final_name)
+        path.mkdir(parents=True, exist_ok=True)
+
+        project = Project(name=final_name, path=str(path), is_active=False, instructions=instructions)
         self.session.add(project)
         self.session.commit()
         self.session.refresh(project)
@@ -103,6 +97,7 @@ class ProjectService:
         project_id: UUID,
         name: str | None = None,
         is_active: bool | None = None,
+        instructions: str | None = None,
     ) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
@@ -112,14 +107,8 @@ class ProjectService:
             if project.name == GENERAL_PROJECT:
                 raise ValueError("Cannot rename the General project")
             sanitized = self._sanitize_name(name)
-            final_name = self._unique_name(sanitized, exclude=project.name)
-            if final_name != project.name:
-                old_path = Path(project.path)
-                new_path = self._project_path(final_name)
-                if old_path.exists():
-                    old_path.rename(new_path)
-                project.name = final_name
-                project.path = str(new_path)
+            final_name = self._unique_name(sanitized)
+            project.name = final_name
 
         if is_active is not None:
             if is_active:
@@ -128,6 +117,9 @@ class ProjectService:
                         other.is_active = False
                         self.session.add(other)
             project.is_active = is_active
+
+        if instructions is not None:
+            project.instructions = instructions or None
 
         self.session.add(project)
         self.session.commit()

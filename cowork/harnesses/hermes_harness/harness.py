@@ -148,8 +148,7 @@ class HermesHarness:
                     str(conversation.id),
                     prompt,
                     history,
-                    project_name=conversation.project.name,
-                    project_path=project_path,
+                    project=conversation.project,
                     conversation_topic=conversation_topic,
                     stream_callback=stream_callback,
                     tool_start_callback=tool_start_callback,
@@ -205,8 +204,7 @@ class HermesHarness:
         prompt: str,
         history: list[dict],
         *,
-        project_name: str,
-        project_path: str,
+        project: Project,
         conversation_topic: str | None = None,
         stream_callback=None,
         tool_start_callback=None,
@@ -237,6 +235,9 @@ class HermesHarness:
 
         register_connector_tools()
         register_artifact_tools()
+
+        project_path = project.path
+        project_name = project.name
 
         # Same folder-per-artifact convention as the Anton harness, so
         # Hermes outputs surface in the (harness-agnostic) Artifacts UI.
@@ -290,6 +291,8 @@ class HermesHarness:
             "The only other files that you are allowed to access are any items that are attached to the conversation."
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
         )
+        if project.instructions:
+            project_context += f"\n\nProject instructions: {project.instructions}"
         datasource_context = _build_datasource_context(vault, disabled_keys)
         memory_context = HermesMemoryAdapter().build_prompt_context(Path(project_path))
         system_context = "\n\n".join(

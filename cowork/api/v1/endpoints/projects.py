@@ -20,14 +20,17 @@ def list_projects(session: SessionDep):
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_project(body: ProjectCreateRequest, session: SessionDep):
-    return ProjectService(session).create_project(body.name)
+    try:
+        return ProjectService(session).create_project(body.name, body.path, body.instructions)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.patch("/{project_id}")
 def update_project(project_id: UUID, body: ProjectUpdateRequest, session: SessionDep):
     try:
         return ProjectService(session).update_project(
-            project_id, name=body.name, is_active=body.is_active
+            project_id, name=body.name, is_active=body.is_active, instructions=body.instructions
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
