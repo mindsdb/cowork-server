@@ -5,7 +5,6 @@ startup for the local SQLite deployment and remains exposed as a CLI helper
 for development/test environments.
 """
 
-import shutil
 from pathlib import Path
 
 from sqlalchemy.engine import make_url
