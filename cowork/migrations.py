@@ -21,18 +21,21 @@ never from the ``.env`` directly.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
+import shutil
 from pathlib import Path
 
 from sqlmodel import Session, select
 from pydantic import ValidationError
 
-from anton.core.tools.skill_format import normalize_name, DESC_MAX
+from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
+from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
@@ -215,6 +218,60 @@ def backfill_minds_url(session: Session) -> bool:
 
 
 
+# Packaged skills shipped with cowork. Bump BUILTIN_SKILLS_VERSION when the
+# set changes; seeding re-runs only when the stored version is lower, so a
+# future release can ship more skills without touching ones the user edited
+# or deleted.
+BUILTIN_SKILLS_DIR = Path(__file__).parent / "skills_builtin"
+BUILTIN_SKILLS_SENTINEL = "_builtin_skills_set"
+BUILTIN_SKILLS_VERSION = 1
+
+
+def seed_builtin_skills(session: Session) -> bool:
+    """Copy packaged builtin skills into the canonical skills store.
+
+    Runs only when the stored set version is below ``BUILTIN_SKILLS_VERSION``.
+    Existing folders are never overwritten, so user edits/deletes survive.
+    Returns True if seeding ran (version advanced), False if skipped.
+    """
+    svc = SettingService(session)
+    row = svc._fetch_row(BUILTIN_SKILLS_SENTINEL)
+    current = int(row.value) if row is not None and row.value.isdigit() else 0
+    if current >= BUILTIN_SKILLS_VERSION:
+        return False
+
+    # remove symlink to global skills if exists
+    link = Path(HermesHarnessSettings().root_dir) / "skills"
+    if link.is_symlink():
+        link.unlink()
+
+    store = SkillService()
+    copied = 0
+    if BUILTIN_SKILLS_DIR.exists():
+        store._ensure_root()
+        for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
+            if not src.is_dir() or not (src / SKILL_FILE).exists():
+                continue
+            dest = store._skill_dir(src.name)
+            if dest.exists():
+                continue  # keep the user-editable copy untouched
+            shutil.copytree(src, dest)
+            copied += 1
+
+    if copied:
+        logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)
+
+    # Raw Setting row: the sentinel key isn't a UserSettings field, so it must
+    # bypass SettingService validation (same pattern as the other migrations).
+    if row is None:
+        row = Setting(key=BUILTIN_SKILLS_SENTINEL, value=str(BUILTIN_SKILLS_VERSION))
+    else:
+        row.value = str(BUILTIN_SKILLS_VERSION)
+    session.add(row)
+    session.commit()
+    return True
+
+
 def migrate_skills_to_files(session: Session) -> bool:
     """Seed skill files from ``skills_legacy`` if not already done.
 
@@ -265,11 +322,6 @@ def migrate_skills_to_files(session: Session) -> bool:
         taken.add(slug)
 
         # when_to_use is dropped as a field; fold it into the description.
-        description = ". ".join(
-            part
-            for part in ((row.description or "").strip(), (row.when_to_use or "").strip())
-            if part
-        )
         description = (row.description or "").strip()
         when_to_use = (row.when_to_use or "").strip()
         if when_to_use:
@@ -280,7 +332,7 @@ def migrate_skills_to_files(session: Session) -> bool:
         if row.name and row.name != slug:
             metadata[META_DISPLAY_NAME] = row.name
         if row.created_at:
-            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=None).isoformat()
+            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=dt.timezone.utc).isoformat()
 
         try:
             skill = Skill(

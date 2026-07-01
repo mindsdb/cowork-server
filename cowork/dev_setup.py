@@ -5,7 +5,6 @@ startup for the local SQLite deployment and remains exposed as a CLI helper
 for development/test environments.
 """
 
-import shutil
 from pathlib import Path
 
 from sqlalchemy.engine import make_url
@@ -72,29 +71,15 @@ def run_dev_setup() -> None:
     ensure_all_layouts()
 
     # Migrate DB-backed skills to agentskills.io files (one-time, idempotent).
-    from cowork.migrations import migrate_skills_to_files
+    from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
 
     with SQLSession(engine) as session:
         migrate_skills_to_files(session)
+        # Seed packaged builtin skills (versioned, idempotent).
+        seed_builtin_skills(session)
+        # Project per-project skills/ links with the canonical store.
+        from cowork.services.skill_links import reconcile_all
+        from cowork.services.skills import SkillService
 
-    _link_hermes_skills_dir()
+        reconcile_all(SkillService().list_skills())
 
-
-def _link_hermes_skills_dir() -> None:
-    """Symlink Hermes's skills dir to cowork's canonical skills folder"""
-    from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
-
-    target = Path(get_app_settings().skill.root_dir)
-    target.mkdir(parents=True, exist_ok=True)
-
-    link = Path(HermesHarnessSettings().root_dir) / "skills"
-    link.parent.mkdir(parents=True, exist_ok=True)
-
-    if link.is_symlink():
-        if link.resolve() == target.resolve():
-            return
-        link.unlink()
-    elif link.exists():
-        shutil.rmtree(link) if link.is_dir() else link.unlink()
-
-    link.symlink_to(target, target_is_directory=True)
