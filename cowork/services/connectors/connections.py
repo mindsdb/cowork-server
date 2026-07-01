@@ -78,6 +78,27 @@ class ConnectionsService:
             fields=fields,
         )
 
+    def patch_token(self, engine: str, name: str, updates: dict) -> bool:
+        """Partially update token fields on an existing vault entry.
+
+        Only ``access_token``, ``expires_at``, and ``status`` are written;
+        ``refresh_token`` is never stored in the vault — it lives in the OS keychain.
+        Returns ``False`` if the entry does not exist.
+        """
+        vault = self._vault()
+        if hasattr(vault, "read_record"):
+            record = vault.read_record(engine, name)
+        else:
+            raw = vault.load(engine, name)
+            record = {"engine": engine, "name": name, "fields": raw} if raw is not None else None
+        if record is None:
+            return False
+        fields = dict(record.get("fields") or {})
+        secure_keys = record.get("secure_keys")
+        fields.update(updates)
+        vault.save(engine, name, fields, secure_keys=secure_keys)
+        return True
+
     def delete(self, engine: str, name: str) -> bool:
         return self._vault().delete(engine, name)
 
