@@ -6,7 +6,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
@@ -116,10 +116,25 @@ class AntonHarness:
         # with its own session id and doesn't tag artifacts with the cowork
         # conversation_id, so we diff the project's artifacts dir around the run
         # (see services.task_objects.finalize_turn_artifacts).
-        from cowork.services.task_objects import finalize_turn_artifacts, snapshot_artifact_slugs
-        artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
+        from cowork.services.task_objects import (
+            finalize_turn_artifacts,
+            finalize_turn_skill_drafts,
+            snapshot_artifact_slugs,
+            snapshot_skill_drafts,
+            snapshot_stray_skills,
+        )
+        project_path = Path(conversation.project.path)
+        artifacts_base = project_path / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Skill drafts surface as cards (never auto-saved). Anton has no
+        # skill-draft tool (it runs anton-core's own registry), so routing is
+        # prompt + dir-diff only — consistent with its artifact flow. The
+        # stray-skills relocation in finalize_turn_skill_drafts is the backstop.
+        skill_drafts_base = project_path / ".anton" / "skill_drafts"
+        before_drafts = snapshot_skill_drafts(skill_drafts_base)
+        before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
+        skill_drafts: list[dict] = []
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
@@ -135,8 +150,13 @@ class AntonHarness:
             cards = finalize_turn_artifacts(
                 conversation.id, conversation.project_id, artifacts_base, before_slugs,
             )
+            skill_drafts = finalize_turn_skill_drafts(
+                project_path, before_drafts, before_strays,
+            )
         for card in cards:
             yield ArtifactCreated(card)
+        for draft in skill_drafts:
+            yield SkillCreated(draft)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -211,8 +231,10 @@ class AntonHarness:
         anton_settings = AntonSettings()
         anton_settings.resolve_workspace(str(base))
 
-        from cowork.common.settings.app_settings import get_app_settings
-        anton_settings.skills_root = Path(get_app_settings().skill.root_dir)
+        # Per-project skills
+        project_skills_dir = base / "skills"
+        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        anton_settings.skills_root = project_skills_dir
 
         user = get_user_settings()
         for attr in (
@@ -259,10 +281,14 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
+        # Skills the agent builds stage here (sibling of artifacts, under the
+        # off-limits .anton/) — never the live skills store, so a built skill is
+        # surfaced as a draft card rather than auto-saved.
+        skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
         project_memory_dir = anton_dir / "memory"
-        for directory in (artifacts_dir, context_dir, episodes_dir, project_memory_dir):
+        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
         llm_client = self._build_llm_client()
@@ -322,6 +348,16 @@ class AntonHarness:
             "`with open(f\"{path}/dashboard.html\", \"w\") as f: ...`\n"
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
         )
+        # A skill is NOT an artifact and is NOT auto-saved. When the agent builds
+        # or improves a skill (e.g. via skill-creator), stage it under the drafts
+        # dir — the turn-end diff surfaces it as a card the user saves/downloads.
+        skill_output_context = (
+            f"Skills you build or improve for the user (e.g. while running the skill-creator skill) "
+            f"are DRAFTS — write each as its own folder under `{str(skill_drafts_dir)}/<skill-name>/SKILL.md` "
+            "(one folder per skill, plus any sibling files). A skill is NOT an artifact: never call "
+            "`create_artifact` for a skill, and NEVER write a skill into the project `skills/` directory. "
+            "The staged skill surfaces as a card the user explicitly saves or downloads; it is not saved until they do."
+        )
 
         from cowork.common.settings.app_settings import get_app_settings
 
@@ -378,6 +414,7 @@ class AntonHarness:
                     "is itself the final answer the user needs."
                     f"{project_context}"
                     f"{output_context}"
+                    f"{skill_output_context}"
                 ),
             ),
             workspace=workspace,
