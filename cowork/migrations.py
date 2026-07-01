@@ -24,13 +24,16 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from sqlmodel import Session, select
 from pydantic import ValidationError
-from sqlmodel import Session
 
+from anton.core.tools.skill_format import normalize_name, DESC_MAX
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
+from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
+from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
 
@@ -209,3 +212,103 @@ def backfill_minds_url(session: Session) -> bool:
             ", ".join(changed),
         )
     return bool(changed)
+
+
+
+def migrate_skills_to_files(session: Session) -> bool:
+    """Seed skill files from ``skills_legacy`` if not already done.
+
+    Returns True if the migration ran, False if it was skipped.
+    """
+
+    SKILL_MIGRATION_SENTINEL = "_skills_migrated"
+
+    svc = SettingService(session)
+    if svc._fetch_row(SKILL_MIGRATION_SENTINEL) is not None:
+        return False
+
+    store = SkillService()
+    rows = list(session.exec(select(SkillLegacy)).all())
+
+    def _unique_slug(svc: SkillService, base: str, taken: set[str]) -> str:
+        slug = base
+        n = 2
+        while slug in taken or svc._skill_dir(slug).exists():
+            suffix = f"-{n}"
+            slug = base[: 64 - len(suffix)].rstrip("-") + suffix
+            n += 1
+        return slug
+
+    # Skills already written by a previous (partial) run, keyed by cowork_id, so
+    # a retry skips them instead of re-creating them under a "-2" slug.
+    existing_ids = {
+        s.metadata.get("cowork_id")
+        for s in store.list_skills()
+        if s.metadata.get("cowork_id")
+    }
+
+    taken: set[str] = set()
+    migrated = 0
+    skipped = 0
+    for row in rows:
+        if str(row.id) in existing_ids:
+            skipped += 1
+            continue
+
+        base = normalize_name(row.label or row.name or "")
+        if not base:
+            # Symbol/whitespace-only label normalizes to "" — fall back to an
+            # id-derived slug so the skill is migrated rather than silently lost.
+            base = normalize_name(f"skill-{row.id}")
+            logger.warning("Legacy skill %s has no usable name; migrating as %r", row.id, base)
+        slug = _unique_slug(store, base, taken)
+        taken.add(slug)
+
+        # when_to_use is dropped as a field; fold it into the description.
+        description = ". ".join(
+            part
+            for part in ((row.description or "").strip(), (row.when_to_use or "").strip())
+            if part
+        )
+        description = (row.description or "").strip()
+        when_to_use = (row.when_to_use or "").strip()
+        if when_to_use:
+            description = f"{description}. {when_to_use}" if description else when_to_use
+        description = description[:DESC_MAX]
+
+        metadata: dict[str, str] = {"cowork_id": str(row.id)}
+        if row.name and row.name != slug:
+            metadata[META_DISPLAY_NAME] = row.name
+        if row.created_at:
+            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=None).isoformat()
+
+        try:
+            skill = Skill(
+                name=slug,
+                instructions=row.instructions or "",
+                description=description or row.name or slug,
+                metadata=metadata,
+            )
+            store._write(skill)
+            migrated += 1
+        except (OSError, ValueError):
+            logger.warning("Failed to migrate skill %r", slug, exc_info=True)
+
+    if migrated:
+        logger.info("Migrated %d skill(s) from skills_legacy to files at %s", migrated, store.root)
+
+    # Only mark the migration done when every legacy row is accounted for —
+    # written this run or already present from a prior run. If some _write
+    # failed (e.g. unwritable/unmounted skills dir), leave the sentinel unset so
+    # the next boot retries instead of silently dropping skills.
+    if migrated + skipped != len(rows):
+        logger.warning(
+            "Skill migration incomplete (%d written, %d already present, %d total); "
+            "will retry on next boot",
+            migrated, skipped, len(rows),
+        )
+        return False
+
+    session.add(Setting(key=SKILL_MIGRATION_SENTINEL, value="1"))
+    session.commit()
+    return True

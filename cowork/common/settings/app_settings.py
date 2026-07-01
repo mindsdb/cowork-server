@@ -3,7 +3,6 @@ from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
 
 
 # ── Global model catalog ───────────────────────────────────────────────
@@ -130,6 +129,14 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class SkillSettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "skills"),
+        validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
+        description="Root directory where agentskills.io-format skill folders are stored",
+    )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
+
+
 class ConnectorSettings(Settings):
     vault_dir: str = Field(
         default=str(Path.home() / ".cowork" / "data-vault"),
@@ -189,12 +196,14 @@ class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
     port: int = Field(
-        default=int(os.environ.get("COWORK_SERVER_PORT", os.environ.get("SERVER_PORT", 26866))),
-        description="The port to run the server on"
+        default=26866,
+        validation_alias=AliasChoices("COWORK_SERVER_PORT"),
+        description="The port to run the server on",
     )
     host: str = Field(
-        default=os.environ.get("COWORK_SERVER_HOST", os.environ.get("SERVER_HOST", "127.0.0.1")),
-        description="The host to run the server on"
+        default="127.0.0.1",
+        validation_alias=AliasChoices("COWORK_SERVER_HOST"),
+        description="The host to run the server on",
     )
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
@@ -237,6 +246,7 @@ class AppSettings(Settings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
+    skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
 

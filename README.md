@@ -102,7 +102,7 @@ Key tables:
 | `message_events` | Streaming event payloads for a message |
 | `files` | Metadata for uploaded files (path points to filesystem) |
 | `schedules` / `schedule_runs` | Recurring prompts and their execution history |
-| `skills` | Agent skill definitions (label, instructions, when-to-use) |
+| `skills` | Agent skill definitions (label, instructions) |
 | `settings` | Key-value user settings; sensitive values Fernet-encrypted |
 | `pins` | User-pinned items (conversations, artifacts, etc.) |
 | `channel_*` | Channel installations, bindings, sessions, and events |
