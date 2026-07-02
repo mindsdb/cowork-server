@@ -112,17 +112,19 @@ _minds_models_cache: dict[str, tuple[float, tuple[Optional[list[str]], dict[str,
 
 async def fetch_minds_models(
     minds_url: str, api_key: str
-) -> tuple[Optional[list[str]], dict[str, dict]]:
+) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
-    Returns ``(ids, efforts)`` where ``ids`` is the model-id list (or None on
-    any failure so the caller falls back to the static list) and ``efforts``
-    maps a model id to ``{"efforts": [...], "default": "..."}`` for every model
-    that advertises ``reasoning_efforts`` — the source of truth for which models
-    accept an effort level and at which levels.
+    Returns ``(ids, efforts, enabled)`` where ``ids`` is the model-id list (or
+    None on any failure so the caller falls back to the static list),
+    ``efforts`` maps a model id to ``{"efforts": [...], "default": "..."}`` for
+    every model that advertises ``reasoning_efforts``, and ``enabled`` maps a
+    model id to its ``enabled`` flag. MindsHub lists models the caller's tier
+    can't use (marked ``"enabled": false``) so the picker can show them as
+    locked upsells; a model missing from ``enabled`` is treated as available.
     """
     if not minds_url or not api_key:
-        return None, {}
+        return None, {}, {}
     base = minds_chat_base_url(minds_url)
 
     now = time.monotonic()
@@ -134,8 +136,8 @@ async def fetch_minds_models(
             return val
 
     def _remember(
-        val: tuple[Optional[list[str]], dict[str, dict]],
-    ) -> tuple[Optional[list[str]], dict[str, dict]]:
+        val: tuple[Optional[list[str]], dict[str, dict], dict[str, bool]],
+    ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
         _minds_models_cache[base] = (time.monotonic(), val)
         return val
 
@@ -155,21 +157,23 @@ async def fetch_minds_models(
             )
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember((None, {}))
+            return _remember((None, {}, {}))
         data = r.json()
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
-        return _remember((None, {}))
+        return _remember((None, {}, {}))
 
     # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
     # Accept a bare list too, defensively. Each row may carry the non-standard
-    # extension fields `reasoning_efforts` (list) and `default_reasoning_effort`
-    # (str) — OpenAI clients ignore unknown keys; we surface them for the picker.
+    # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
+    # (str) and `enabled` (bool) — OpenAI clients ignore unknown keys; we
+    # surface them for the picker.
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return _remember((None, {}))
+        return _remember((None, {}, {}))
     ids: list[str] = []
     efforts: dict[str, dict] = {}
+    enabled: dict[str, bool] = {}
     for row in rows:
         if not isinstance(row, dict) or not row.get("id"):
             continue
@@ -177,6 +181,10 @@ async def fetch_minds_models(
         if not model_id:
             continue
         ids.append(model_id)
+        # A model the caller's tier can't use is listed with enabled=false so the
+        # picker can show it as a locked upsell. Missing → available.
+        if "enabled" in row:
+            enabled[model_id] = bool(row.get("enabled"))
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:
             entry: dict = {"efforts": [str(x) for x in levels]}
@@ -184,7 +192,7 @@ async def fetch_minds_models(
             if default:
                 entry["default"] = str(default)
             efforts[model_id] = entry
-    return _remember(((ids or None), efforts))
+    return _remember(((ids or None), efforts, enabled))
 
 
 # ── Config readiness ─────────────────────────────────────────────────
