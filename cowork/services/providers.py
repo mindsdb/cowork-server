@@ -6,9 +6,9 @@ import logging
 import re
 import time
 from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import urlparse
 
 import httpx
-from pydantic import SecretStr
 
 from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
 
@@ -30,6 +30,27 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
+# Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
+# publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
+# can't map to a non-prod MindsHub env, falls back here.
+PUBLISH_FAILSAFE_URL = "https://4nton.ai"
+
+
+def publish_url_for_endpoint(endpoint_url: str | None) -> str:
+    """Publish base URL for the MindsHub env the given endpoint points at.
+
+    The publish API (root-mounted ``/upload``, ``/list``, ``/delete/{id}``) is
+    served on the *non-prod* MindsHub api hosts, so a provider pointed at
+    ``api.<env>.mindshub.ai`` (dev/staging) publishes to that same host. Prod
+    (``api.mindshub.ai``) has no publish routes, and anything unrecognised
+    (mdb.ai, a custom endpoint, empty) falls back to the legacy ``4nton.ai``
+    host. anton appends the route path; an explicit `publish_url` /
+    `ANTON_PUBLISH_URL` overrides this.
+    """
+    host = (urlparse(endpoint_url or "").hostname or "").lower()
+    if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
+        return f"https://{host}"
+    return PUBLISH_FAILSAFE_URL
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
@@ -54,6 +75,11 @@ def provider_base_url(
       - gemini             → Google's OpenAI-compatible endpoint
       - minds-cloud        → derived from the dedicated ``minds_url`` slot
       - openai-compatible  → the shared slot (this is the one that owns it)
+
+    openai-compatible with an *empty* base returns None, NOT api.openai.com:
+    forcing a BYO endpoint's key onto OpenAI's host would leak that key to the
+    wrong vendor. An empty openai-compatible base is a misconfiguration that
+    config_status surfaces ("Set a base URL") rather than silently routing.
     """
     p = (provider or "").replace("_", "-")
     if p == "minds-cloud":
@@ -61,7 +87,7 @@ def provider_base_url(
     if p == "gemini":
         return GEMINI_BASE_URL
     if p == "openai-compatible":
-        return openai_base_url or "https://api.openai.com/v1"
+        return openai_base_url or None
     # anthropic, openai → SDK default; never inherit the shared openai_base_url.
     return None
 
@@ -86,17 +112,19 @@ _minds_models_cache: dict[str, tuple[float, tuple[Optional[list[str]], dict[str,
 
 async def fetch_minds_models(
     minds_url: str, api_key: str
-) -> tuple[Optional[list[str]], dict[str, dict]]:
+) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
-    Returns ``(ids, efforts)`` where ``ids`` is the model-id list (or None on
-    any failure so the caller falls back to the static list) and ``efforts``
-    maps a model id to ``{"efforts": [...], "default": "..."}`` for every model
-    that advertises ``reasoning_efforts`` — the source of truth for which models
-    accept an effort level and at which levels.
+    Returns ``(ids, efforts, enabled)`` where ``ids`` is the model-id list (or
+    None on any failure so the caller falls back to the static list),
+    ``efforts`` maps a model id to ``{"efforts": [...], "default": "..."}`` for
+    every model that advertises ``reasoning_efforts``, and ``enabled`` maps a
+    model id to its ``enabled`` flag. MindsHub lists models the caller's tier
+    can't use (marked ``"enabled": false``) so the picker can show them as
+    locked upsells; a model missing from ``enabled`` is treated as available.
     """
     if not minds_url or not api_key:
-        return None, {}
+        return None, {}, {}
     base = minds_chat_base_url(minds_url)
 
     now = time.monotonic()
@@ -108,8 +136,8 @@ async def fetch_minds_models(
             return val
 
     def _remember(
-        val: tuple[Optional[list[str]], dict[str, dict]],
-    ) -> tuple[Optional[list[str]], dict[str, dict]]:
+        val: tuple[Optional[list[str]], dict[str, dict], dict[str, bool]],
+    ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
         _minds_models_cache[base] = (time.monotonic(), val)
         return val
 
@@ -129,21 +157,23 @@ async def fetch_minds_models(
             )
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember((None, {}))
+            return _remember((None, {}, {}))
         data = r.json()
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
-        return _remember((None, {}))
+        return _remember((None, {}, {}))
 
     # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
     # Accept a bare list too, defensively. Each row may carry the non-standard
-    # extension fields `reasoning_efforts` (list) and `default_reasoning_effort`
-    # (str) — OpenAI clients ignore unknown keys; we surface them for the picker.
+    # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
+    # (str) and `enabled` (bool) — OpenAI clients ignore unknown keys; we
+    # surface them for the picker.
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return _remember((None, {}))
+        return _remember((None, {}, {}))
     ids: list[str] = []
     efforts: dict[str, dict] = {}
+    enabled: dict[str, bool] = {}
     for row in rows:
         if not isinstance(row, dict) or not row.get("id"):
             continue
@@ -151,6 +181,10 @@ async def fetch_minds_models(
         if not model_id:
             continue
         ids.append(model_id)
+        # A model the caller's tier can't use is listed with enabled=false so the
+        # picker can show it as a locked upsell. Missing → available.
+        if "enabled" in row:
+            enabled[model_id] = bool(row.get("enabled"))
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:
             entry: dict = {"efforts": [str(x) for x in levels]}
@@ -158,7 +192,7 @@ async def fetch_minds_models(
             if default:
                 entry["default"] = str(default)
             efforts[model_id] = entry
-    return _remember(((ids or None), efforts))
+    return _remember(((ids or None), efforts, enabled))
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -388,13 +422,21 @@ def build_llm_client():
         key = provider_api_key(settings, role)
         if role == Provider.MINDS_CLOUD:
             if key is None:
-                raise ValueError("MindsHub API key is not configured")
+                raise ValueError(f"{role.label} API key is not configured")
             return OpenAIProvider(
                 api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             if key is None:
-                raise ValueError("OpenAI API key is not configured")
+                raise ValueError(f"{role.label} API key is not configured")
+            # No base for openai-compatible → OpenAIProvider would silently
+            # default to api.openai.com and leak the BYO key to OpenAI. Fail
+            # loudly instead (config_status surfaces this as "Set a base URL",
+            # but callers don't all gate on config_ready, so enforce it here at
+            # the build site too). gemini always has a base (Google), so this
+            # only guards openai-compatible.
+            if role == Provider.OPENAI_COMPATIBLE and not base:
+                raise ValueError("OpenAI-compatible base URL is not configured")
             return OpenAIProvider(
                 api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
@@ -403,7 +445,7 @@ def build_llm_client():
         if cls is None:
             raise ValueError(f"Unknown provider: {role.value}")
         if key is None:
-            raise ValueError(f"{role.value} API key is not configured")
+            raise ValueError(f"{role.label} API key is not configured")
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
         if cls is OpenAIProvider:
@@ -430,12 +472,11 @@ def resolve_stored_key(settings: UserSettings, ptype: str) -> str:
     """Get the stored (unmasked) API key for a UI provider type."""
     from cowork.common.settings.user_settings import (
         UI_TYPE_TO_PROVIDER,
-        provider_api_key,
+        provider_api_key_str,
     )
     provider = UI_TYPE_TO_PROVIDER.get(ptype)
     if provider is None:
         return ""
-    # provider_api_key applies the gemini/openai-compatible → openai fallback,
+    # provider_api_key_str applies the gemini/openai-compatible → openai fallback,
     # so existing single-key configs still resolve here (Test button, key reveal).
-    val = provider_api_key(settings, provider)
-    return val.get_secret_value() if isinstance(val, SecretStr) else ""
+    return provider_api_key_str(settings, provider)
