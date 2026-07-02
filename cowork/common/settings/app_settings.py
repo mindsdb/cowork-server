@@ -1,9 +1,9 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
 
 
 # ── Global model catalog ───────────────────────────────────────────────
@@ -15,8 +15,9 @@ import os
 # resolved at runtime from MindsHub's OpenAI-compatible `/v1/models` endpoint
 # (see cowork.services.providers.fetch_minds_models) and supplied by the
 # /settings/recommended-models endpoint. It is intentionally left empty here
-# so no `latest:*` aliases are hand-maintained — the working default pair
-# lives in RECOMMENDED_PAIR / *_MODEL_DEFAULTS below.
+# so no aliases are hand-maintained — the working default pair lives in
+# RECOMMENDED_PAIR / *_MODEL_DEFAULTS below. MindsHub aliases are bare
+# (``sonnet``); the older ``latest:`` prefix still resolves but is deprecated.
 RECOMMENDED_MODELS: dict[str, list[str]] = {
     "minds-cloud": [],
     "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
@@ -26,7 +27,7 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 }
 
 RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
-    "minds-cloud": ("latest:sonnet", "latest:haiku"),
+    "minds-cloud": ("sonnet", "haiku"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
     "openai": ("gpt-5.5", "gpt-5.5-mini"),
     "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
@@ -36,15 +37,23 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
 # Keyed by the Provider enum *value* (the string) rather than the enum
 # itself, so this module stays free of a circular import with user_settings,
 # which owns the Provider enum.
+# gemini has concrete recommended models (see RECOMMENDED_MODELS); openai-
+# compatible is BYO-endpoint with no canonical model, so it deliberately has no
+# entry here. Consequence in resolved_*_model: the user's own model is kept ONLY
+# while openai-compatible is the explicitly selected provider; on a *switch* to
+# it the lookup misses → None (not the prior provider's model), which trips
+# config_status's model gate ("select a model") rather than misrouting.
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
-    "minds_cloud": "latest:sonnet",
+    "gemini": "gemini-2.5-pro",
+    "minds_cloud": "sonnet",
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
-    "minds_cloud": "latest:haiku",
+    "gemini": "gemini-2.5-flash",
+    "minds_cloud": "haiku",
 }
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
@@ -122,6 +131,14 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class SkillSettings(Settings):
+    root_dir: str = Field(
+        default=str(Path.home() / ".cowork" / "skills"),
+        validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
+        description="Root directory where agentskills.io-format skill folders are stored",
+    )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
+
+
 class ConnectorSettings(Settings):
     vault_dir: str = Field(
         default=str(Path.home() / ".cowork" / "data-vault"),
@@ -181,13 +198,25 @@ class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
     port: int = Field(
-        default=int(os.environ.get("COWORK_SERVER_PORT", os.environ.get("SERVER_PORT", 26866))),
-        description="The port to run the server on"
+        default=26866,
+        validation_alias=AliasChoices("COWORK_SERVER_PORT"),
+        description="The port to run the server on",
     )
     host: str = Field(
-        default=os.environ.get("COWORK_SERVER_HOST", os.environ.get("SERVER_HOST", "127.0.0.1")),
-        description="The host to run the server on"
+        default="127.0.0.1",
+        validation_alias=AliasChoices("COWORK_SERVER_HOST"),
+        description="The host to run the server on",
     )
+
+    owner: str = Field(
+        default=os.environ.get("COWORK_SERVER_OWNER", ""),
+        description=(
+            "Opaque per-install owner token echoed at /health. The desktop app passes the "
+            "token it generated and only adopts a server whose /health owner matches, so one "
+            "OS user's app never adopts another user's sidecar on a shared loopback port "
+            "(ENG-439). Empty means the server advertises no owner and is not adoptable."
+        ),
+    )  # COWORK_SERVER_OWNER
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
@@ -229,6 +258,7 @@ class AppSettings(Settings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
+    skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
 

@@ -27,8 +27,11 @@ logger = setup_logging()
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
+# no-store (not just no-cache): a chat stream can carry secrets the model
+# echoed (e.g. a raw API key embedded in generated scratchpad code), so it
+# must never be written to a client's on-disk HTTP cache. See ENG-462.
 _SSE_HEADERS = {
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-store",
     "Connection": "keep-alive",
     "Access-Control-Allow-Origin": "*",
 }

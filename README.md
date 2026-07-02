@@ -102,7 +102,6 @@ Key tables:
 | `message_events` | Streaming event payloads for a message |
 | `files` | Metadata for uploaded files (path points to filesystem) |
 | `schedules` / `schedule_runs` | Recurring prompts and their execution history |
-| `skills` | Agent skill definitions (label, instructions, when-to-use) |
 | `settings` | Key-value user settings; sensitive values Fernet-encrypted |
 | `pins` | User-pinned items (conversations, artifacts, etc.) |
 | `channel_*` | Channel installations, bindings, sessions, and events |
@@ -115,10 +114,14 @@ All models use UUID primary keys with auto-tracked `created_at`/`modified_at` ti
 ~/.cowork/
 ├── cowork.db                       # SQLite database
 ├── .master_key                     # Fernet encryption key for settings
+├── skills/                         # COWORK_SKILLS_DIR — canonical SKILL.md store
+│   └── <slug>/SKILL.md             # one folder per skill (see docs/SKILLS.md)
 ├── projects/                       # COWORK_PROJECTS_DIR
 │   ├── general/                    # Default project (always exists)
 │   └── <project-name>/
 │       ├── <user & agent files>    # Working directory visible to agents
+│       ├── skills/                 # symlinks to skills enabled for this project
+│       │   └── <slug> -> ~/.cowork/skills/<slug>
 │       └── .anton/                 # Private agent workspace
 │           ├── artifacts/          # Agent-produced outputs (HTML apps, docs, etc.)
 │           │   └── <slug>/
@@ -136,7 +139,7 @@ All models use UUID primary keys with auto-tracked `created_at`/`modified_at` ti
 
 The **database** holds structured metadata and relationships (which messages belong to which conversation, which conversation belongs to which project). The **filesystem** holds the actual content agents work with — project files, artifacts, memory entries, and uploaded documents. The `files` and `projects` DB tables store filesystem paths that point into the directory tree above.
 
-This split is the result of an ongoing migration from a purely filesystem-based architecture (the original server stored conversations, settings, and skills as files). Structured data that benefits from querying and relationships — conversations, messages, settings, skills, schedules — has been moved into SQLite. Components that are inherently file-based — project working directories, agent artifacts, harness-managed memory, connector vault credentials — remain on the filesystem by design. See [docs/SERVER_MIGRATION.md](docs/SERVER_MIGRATION.md) for the full migration story.
+This split is the result of an ongoing migration from a purely filesystem-based architecture. Structured data that benefits from querying and relationships — conversations, messages, settings, schedules — lives in SQLite. Components that are inherently file-based — project working directories, agent artifacts, harness-managed memory, connector vault credentials, and skills — remain on the filesystem by design. (Skills briefly lived in a DB table; they were moved back to canonical `SKILL.md` files so they can be edited, uploaded, and distributed per project — see [docs/SKILLS.md](docs/SKILLS.md).) See [docs/SERVER_MIGRATION.md](docs/SERVER_MIGRATION.md) for the full migration story.
 
 Agents (via their harness) have read/write access to their project's working directory and the private `.anton/` subdirectory. They do **not** access the SQLite database directly — all DB interaction flows through the service layer.
 

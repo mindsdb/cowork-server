@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.router import api_router as v1_router
 from cowork.common.logger import setup_logging
@@ -76,6 +77,31 @@ async def lifespan(app: FastAPI):
         await close_proxy_client()
 
 
+class _NoStoreMiddleware:
+    """Stamp ``Cache-Control: no-store`` on responses under the given path
+    prefixes so API keys those responses carry are never written to a client's
+    on-disk HTTP cache — e.g. Electron's Cache_Data, where plaintext keys were
+    found lingering (ENG-462). Pure ASGI (not BaseHTTPMiddleware) so it never
+    buffers or breaks the SSE streams.
+    """
+
+    def __init__(self, app, prefixes: tuple[str, ...]) -> None:
+        self.app = app
+        self.prefixes = prefixes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith(self.prefixes):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_no_store(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(raw=message["headers"])["Cache-Control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, send_with_no_store)
+
+
 def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -104,6 +130,11 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
         max_age=3600,
     )
+
+    # Keep secret-bearing settings responses (reveal-key, raw .env, the
+    # providers list) out of clients' on-disk HTTP caches (ENG-462). The chat
+    # and submission SSE streams set no-store at their own routes.
+    app.add_middleware(_NoStoreMiddleware, prefixes=("/api/v1/settings",))
 
     # Include v1 API routes
     app.include_router(v1_router)

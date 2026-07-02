@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.db.session import get_session
@@ -36,6 +36,7 @@ from cowork.common.settings.app_settings import (
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
 )
+from cowork.common.settings.user_settings import Provider, provider_api_key_str
 
 router = APIRouter()
 
@@ -111,6 +112,19 @@ def check_configured(session: SessionDep):
     return {"configured": False, "provider": ""}
 
 
+@router.post("/logout")
+def logout_clear_credentials(session: SessionDep):
+    """Clear all stored credentials from the DB.
+
+    Called by the Electron main process during sign-out so that
+    ``/health`` returns ``config_ready: false`` on the next query.
+    Provider and model preferences are kept so they survive a
+    re-login without requiring the onboarding flow to restore them.
+    """
+    deleted = SettingService(session).clear_credentials()
+    return {"ok": True, "deleted": deleted}
+
+
 @router.get("/install-status")
 def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
@@ -118,8 +132,6 @@ def install_status():
 
 @router.get("/reveal-key/{name}")
 def reveal_key(name: str, session: SessionDep):
-    from cowork.common.settings.user_settings import Provider, provider_api_key
-
     name_map = {
         "anthropic": Provider.ANTHROPIC,
         "openai": Provider.OPENAI,
@@ -132,9 +144,8 @@ def reveal_key(name: str, session: SessionDep):
     if provider is None:
         raise HTTPException(status_code=404, detail="Unknown key name")
     s = SettingService(session).load()
-    # provider_api_key applies the gemini/openai-compatible → openai fallback.
-    val = provider_api_key(s, provider)
-    return {"value": val.get_secret_value() if isinstance(val, SecretStr) else ""}
+    # provider_api_key_str applies the gemini/openai-compatible → openai fallback.
+    return {"value": provider_api_key_str(s, provider)}
 
 
 class _TestProvidersBody(BaseModel):
@@ -143,6 +154,12 @@ class _TestProvidersBody(BaseModel):
 
 @router.post("/test-providers")
 async def test_providers(session: SessionDep, body: _TestProvidersBody | None = None):
+    """Ping the given (or all stored) providers and persist the results.
+
+    Despite the read-only-sounding name this WRITES: each tested provider's
+    status is merged into the persisted `provider_status` /
+    `provider_status_details` settings so the Settings dots survive a reload.
+    """
     s = SettingService(session).load()
 
     if body and body.providers is not None:
@@ -162,6 +179,16 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
 
     statuses, details = await ping_providers(providers)
+
+    # Persist the results merged into the stored map so the Settings dots
+    # survive a reload. Only the tested providers' entries change; every other
+    # provider keeps its last recorded result.
+    merged_status = {**json.loads(s.provider_status or "{}"), **statuses}
+    merged_details = {**json.loads(s.provider_status_details or "{}"), **details}
+    SettingService(session).bulk_upsert({
+        "provider_status": json.dumps(merged_status),
+        "provider_status_details": json.dumps(merged_details),
+    })
     return {"providerStatus": statuses, "providerStatusDetails": details}
 
 
@@ -196,14 +223,21 @@ async def recommended_models(session: SessionDep):
     # win on any key collision.
     model_efforts: dict[str, dict] = {k: dict(v) for k, v in DIRECT_EFFORT_CATALOG.items()}
 
+    # `modelEnabled` maps a model id → bool. MindsHub lists models the caller's
+    # tier can't use (marked enabled:false) so the picker can show them as locked
+    # upsells; a model absent from this map is treated as available. Additive
+    # alongside modelEfforts — consumers that ignore it keep working.
+    model_enabled: dict[str, bool] = {}
+
     s = SettingService(session).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts = await fetch_minds_models(
+        live, live_efforts, live_enabled = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value()
         )
         if live:
             recommended["minds-cloud"] = live
         model_efforts.update(live_efforts)
+        model_enabled.update(live_enabled)
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -225,16 +259,21 @@ async def recommended_models(session: SessionDep):
         None,
     )
     if oc_card:
-        oc_key = s.openai_api_key.get_secret_value() if s.openai_api_key else ""
-        live, live_efforts = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
+        # Read the openai-compatible key via provider_api_key_str so a user who
+        # set a dedicated openai_compatible_api_key is used (falls back to the
+        # shared openai_api_key), matching how the provider is actually built.
+        oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
+        live, live_efforts, live_enabled = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
         if live:
             recommended["openai-compatible"] = live
         model_efforts.update(live_efforts)
+        model_enabled.update(live_enabled)
 
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
         "modelEfforts": model_efforts,
+        "modelEnabled": model_enabled,
     }
 
 
