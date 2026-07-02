@@ -223,14 +223,21 @@ async def recommended_models(session: SessionDep):
     # win on any key collision.
     model_efforts: dict[str, dict] = {k: dict(v) for k, v in DIRECT_EFFORT_CATALOG.items()}
 
+    # `modelEnabled` maps a model id → bool. MindsHub lists models the caller's
+    # tier can't use (marked enabled:false) so the picker can show them as locked
+    # upsells; a model absent from this map is treated as available. Additive
+    # alongside modelEfforts — consumers that ignore it keep working.
+    model_enabled: dict[str, bool] = {}
+
     s = SettingService(session).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts = await fetch_minds_models(
+        live, live_efforts, live_enabled = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value()
         )
         if live:
             recommended["minds-cloud"] = live
         model_efforts.update(live_efforts)
+        model_enabled.update(live_enabled)
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -256,15 +263,17 @@ async def recommended_models(session: SessionDep):
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
+        live, live_efforts, live_enabled = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
         if live:
             recommended["openai-compatible"] = live
         model_efforts.update(live_efforts)
+        model_enabled.update(live_enabled)
 
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
         "modelEfforts": model_efforts,
+        "modelEnabled": model_enabled,
     }
 
 
