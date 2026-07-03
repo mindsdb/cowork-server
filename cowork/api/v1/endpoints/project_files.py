@@ -61,13 +61,11 @@ def _safe_relpath(rel: str, base: Path) -> Path:
     if not rel:
         raise HTTPException(status_code=400, detail="path required")
     cleaned = rel.replace("\\", "/").lstrip("/")
-    candidate = (base / cleaned).resolve()
-    base_resolved = base.resolve()
-    try:
-        candidate.relative_to(base_resolved)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="invalid path") from exc
-    return candidate
+    base_resolved = os.path.normpath(str(base.resolve()))
+    candidate = os.path.normpath(str((base / cleaned).resolve()))
+    if candidate != base_resolved and not candidate.startswith(base_resolved + os.sep):
+        raise HTTPException(status_code=400, detail="invalid path")
+    return Path(candidate)
 
 
 def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:
