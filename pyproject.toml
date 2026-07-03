@@ -63,7 +63,8 @@ packages = ["cowork"]
 
 [tool.uv.sources]
 anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
-hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
+# pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
+hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
 [dependency-groups]
 dev = [
