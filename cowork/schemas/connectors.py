@@ -129,6 +129,8 @@ class ConnectionSummaryResponse(BaseModel):
 
 
 class ConnectionDetailResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     engine: str
     name: str
     display_name: str | None = None
@@ -137,6 +139,9 @@ class ConnectionDetailResponse(BaseModel):
     connector_id: str | None = None
     method: str | None = None
     fields: dict[str, Any] = Field(default_factory=dict)
+    # Names of fields in `fields` that were masked with VAULT_KEEP_SENTINEL —
+    # lets the client show a "saved" indicator instead of the raw sentinel.
+    secure_keys: list[str] = Field(default_factory=list, serialization_alias="secureKeys")
 
 
 class DirectSaveRequest(BaseModel):
