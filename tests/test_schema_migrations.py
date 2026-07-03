@@ -65,6 +65,7 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
 
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE messages DROP COLUMN harness"))
+        connection.execute(text("ALTER TABLE projects DROP COLUMN instructions"))
         # A real pre-Alembic database predates the channel tables too; drop them
         # so the upgrade path recreates them via the channels migration.
         for table in (
