@@ -29,6 +29,10 @@ def advance_occurrence(cadence: str, at: datetime, timezone_name: str) -> dateti
     local = current.astimezone(tz)
     if cadence == Cadence.daily:
         next_date = local.date() + timedelta(days=1)
+    elif cadence == Cadence.weekdays:
+        next_date = local.date() + timedelta(days=1)
+        while next_date.weekday() >= 5:  # Saturday=5, Sunday=6
+            next_date += timedelta(days=1)
     elif cadence == Cadence.weekly:
         next_date = local.date() + timedelta(weeks=1)
     else:
