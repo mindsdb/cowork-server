@@ -37,6 +37,7 @@ class ConnectionsService:
                 label=spec.label if spec else None,
                 logo=spec.logo if spec else None,
                 logo_color=spec.logo_color if spec else None,
+                status=(fields or {}).get("status"),
             ))
         return result
 

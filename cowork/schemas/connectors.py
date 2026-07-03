@@ -126,6 +126,10 @@ class ConnectionSummaryResponse(BaseModel):
     label: str | None = None
     logo: str | None = None
     logo_color: str | None = None
+    # "needs_reconnect" when the connection's token was lost/revoked; absent
+    # when healthy. Lets the catalogue card show a warning without requiring
+    # the client to fetch each connection's full detail first.
+    status: str | None = None
 
 
 class ConnectionDetailResponse(BaseModel):
