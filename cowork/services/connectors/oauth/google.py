@@ -188,8 +188,6 @@ class GoogleOAuthService:
             account_name = str(userinfo.get("name", "")).strip()
             connection_name = account_email or cfg.engine
 
-            self.verify_connection(service, access_token)
-
             expires_in = int(token_data.get("expires_in", 0) or 0)
             expires_at = (
                 (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
