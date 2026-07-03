@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse, DirectSaveRequest
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.oauth.google import google_service
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry
 
