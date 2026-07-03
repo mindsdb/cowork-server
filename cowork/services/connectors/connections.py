@@ -56,9 +56,11 @@ class ConnectionsService:
         # name heuristic so records saved before secure_keys was persisted don't
         # leak their secret values through this endpoint.
         secure_keys = record.get("secure_keys")
+        masked_keys: list[str] = []
         for key in list(fields):
             if not key.startswith("_") and is_secret_key(key, secure_keys):
                 fields[key] = _SENTINEL
+                masked_keys.append(key)
 
         display_name = connection_display_name(fields)
         # Echo the stored label back as the form's `label` field so the edit
@@ -76,6 +78,7 @@ class ConnectionsService:
             connector_id=fields.pop("_connector_id", None),
             method=fields.pop("_method", None),
             fields=fields,
+            secure_keys=masked_keys,
         )
 
     def patch_token(self, engine: str, name: str, updates: dict) -> bool:
