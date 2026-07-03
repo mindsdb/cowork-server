@@ -315,6 +315,9 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
         "accessPassword": "",
         "accessEmails": [],
         "orgAllowed": False,
+        # Composite comments scope {user_dir}/{report_id} (Plan 5); "" when
+        # unpublished or published before the key was persisted.
+        "artifactKey": "",
     }
     if primary is None:
         return out
@@ -332,6 +335,7 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
             # flag for artifacts published before the mode field existed.
             mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
             out["accessMode"] = mode
+            out["artifactKey"] = entry.get("artifact_key", "") or ""
             if mode == "password":
                 out["accessProtected"] = True
                 out["accessPassword"] = entry.get("access_password", "") or ""
@@ -656,6 +660,7 @@ def artifact_status(raw_path: str) -> dict:
         "accessProtected": bool(card.get("accessProtected")),
         "accessEmails": card.get("accessEmails", []),
         "orgAllowed": bool(card.get("orgAllowed")),
+        "artifactKey": card.get("artifactKey", ""),
     }
 
 

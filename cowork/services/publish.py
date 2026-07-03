@@ -429,6 +429,9 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
+            # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
+            # so the comments panel can key threads after an app restart.
+            "artifact_key": result.get("artifact_key", ""),
             "last_md5": result.get("md5", ""),
             # Snapshot of the artifact's content mtime at publish time — the
             # cheap gate for the `modified` badge (see card_for_folder). Uses
@@ -453,6 +456,8 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         "accessProtected": bool(owner_side.get("requires_password")),
         "accessEmails": owner_side.get("emails", []),
         "orgAllowed": bool(owner_side.get("org_allowed")),
+        # Composite comments scope for the panel (Plan 5).
+        "artifactKey": result.get("artifact_key", ""),
         "result": {k: v for k, v in result.items() if k != "file_payload"},
     }
 
