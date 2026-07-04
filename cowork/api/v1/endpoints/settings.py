@@ -268,17 +268,19 @@ async def recommended_models(session: SessionDep):
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
+        live, live_efforts, live_enabled, live_lables = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
         if live:
             recommended["openai-compatible"] = live
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_labels.update(live_lables)
 
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
+        "modelLabels": model_labels,
     }
 
 
