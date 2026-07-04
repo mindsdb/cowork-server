@@ -35,6 +35,7 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
+    MODEL_LABELS,
 )
 from cowork.common.settings.user_settings import Provider, provider_api_key_str
 
@@ -229,16 +230,20 @@ async def recommended_models(session: SessionDep):
     # alongside modelEfforts — consumers that ignore it keep working.
     model_enabled: dict[str, bool] = {}
 
+    # `modelLabels` maps a model id → str. MindsHub inference model labels (e.g. "sonnet") 
+    # are resolved at runtime from the `/v1/models` endpoint.
+    model_labels: dict[str, str] = MODEL_LABELS
+
     s = SettingService(session).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts, live_enabled = await fetch_minds_models(
+        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value()
         )
         if live:
             recommended["minds-cloud"] = live
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
-
+        model_labels.update(live_labels)
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
     # shared openai_base_url setting is also reused by gemini/openai — so read
