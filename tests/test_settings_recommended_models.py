@@ -40,6 +40,7 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
             ["model-a", "model-b"],
             {"model-a": {"efforts": ["low", "high"], "default": "low"}},
             {"model-b": False},
+            {},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -82,7 +83,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
     async def fake_fetch(base_url, api_key):
         nonlocal called
         called = True
-        return ["x"], {}, {}
+        return ["x"], {}, {}, {}
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -112,6 +113,7 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
             ["mindshub_air", "opus", "gpt"],
             {},
             {"mindshub_air": True, "opus": False, "gpt": False},
+            {},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
