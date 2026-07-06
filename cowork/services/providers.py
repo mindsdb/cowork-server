@@ -30,6 +30,24 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
+# MindsHub's router resolves ONLY canonical `latest:<alias>` names (plus the
+# deprecated `_reason_`/`_code_` keys). A bare alias like `haiku` matches no
+# pattern and is rejected with an *uncaught* HTTP 500 ("not a valid passthrough
+# model name") — which surfaced as the Settings row falsely reading "Provider is
+# currently unreachable (HTTP 500)" even when chat worked (ENG-577). The live
+# `/v1/models` picker already returns canonical ids, so a user-selected model is
+# fine as-is; only our hardcoded short-alias defaults (sonnet/haiku/…) need the
+# prefix. Concrete ids (e.g. `claude-haiku-4-5-…`) and already-prefixed names
+# pass through untouched.
+_MINDS_BARE_ALIASES = {"sonnet", "opus", "haiku", "fable", "gpt", "gemini"}
+
+
+def canonical_minds_model(model: str | None) -> str:
+    """Prefix a bare MindsHub alias with `latest:` so the router accepts it."""
+    m = (model or "").strip()
+    return f"latest:{m}" if m in _MINDS_BARE_ALIASES else m
+
+
 # Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
 # publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
 # can't map to a non-prod MindsHub env, falls back here.
@@ -267,7 +285,9 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 return "fail", "missing API key"
             base = (p.get("mindsUrl") or "https://api.mindshub.ai").rstrip("/")
             chat_url = minds_chat_base_url(base)
-            model = (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
+            model = canonical_minds_model(
+                (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
+            )
             return await _chat_probe(
                 f"{chat_url}/chat/completions",
                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -327,7 +347,8 @@ async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict
             r = await client.post(
                 f"{chat_base}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": CODING_MODEL_DEFAULTS["minds_cloud"], "max_tokens": 20,
+                json={"model": canonical_minds_model(CODING_MODEL_DEFAULTS["minds_cloud"]),
+                      "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
             )
         if r.status_code in (401, 403):

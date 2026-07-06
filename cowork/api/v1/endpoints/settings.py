@@ -162,6 +162,20 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
     """
     s = SettingService(session).load()
 
+    # The model the agent actually sends to MindsHub for a role driven by
+    # minds-cloud. Mirror it in the probe so the connectivity test exercises
+    # the same model real chat does — otherwise the probe falls back to a bare
+    # alias the router rejects with a 500, falsely marking the provider
+    # unreachable while chat works (ENG-577).
+    minds_model: str | None = None
+    for prov, model in (
+        (s.resolved_coding_provider, s.resolved_coding_model),
+        (s.resolved_planning_provider, s.resolved_planning_model),
+    ):
+        if prov == Provider.MINDS_CLOUD and model:
+            minds_model = model
+            break
+
     if body and body.providers is not None:
         providers = list(body.providers)
     else:
@@ -177,6 +191,10 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
     for p in providers:
         if p.get("apiKey") in ("***", ""):
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
+        # Fill the minds-cloud probe model from the configured role model when
+        # the caller didn't specify one, so the probe mirrors real chat traffic.
+        if p.get("type") == "minds-cloud" and not (p.get("model") or "").strip() and minds_model:
+            p["model"] = minds_model
 
     statuses, details = await ping_providers(providers)
 
