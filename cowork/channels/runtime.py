@@ -50,8 +50,8 @@ def turn_used_tools(events: list[dict]) -> bool:
     return any(isinstance(event, dict) and "tool_use_id" in event for event in events)
 
 
-def is_new_command(text: str) -> bool:
-    """True for a bare /new message (leading mention tokens and a /new@bot suffix allowed)."""
+def is_new_command(text: str, *, is_mention: bool | None = None) -> bool:
+    """True for a bare /new message; a /new@bot suffix counts unless the platform says the mention isn't us."""
     tokens = [
         t for t in (text or "").split()
         if not (t.startswith("@") or (t.startswith("<@") and t.endswith(">")))
@@ -59,7 +59,9 @@ def is_new_command(text: str) -> bool:
     if len(tokens) != 1:
         return False
     cmd = tokens[0].lower()
-    return cmd == "/new" or cmd.startswith("/new@")
+    if cmd == "/new":
+        return True
+    return cmd.startswith("/new@") and len(cmd) > len("/new@") and is_mention is not False
 
 
 # Platform typing indicators expire after a few seconds, so refresh while
@@ -233,7 +235,7 @@ class AntonChannelRuntime:
             if not self._should_respond(binding, event):
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
-            if is_new_command(self._event_text(event)):
+            if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
                 await self._start_fresh(session, channel_type, binding, event)
                 return
             # Optional hook: adapters with set_typing show a typing indicator

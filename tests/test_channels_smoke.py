@@ -728,8 +728,13 @@ def test_is_new_command_matching():
     assert is_new_command("/new")
     assert is_new_command("  /New ")
     assert is_new_command("/new@MyBot")
+    assert is_new_command("/new@MyBot", is_mention=True)
     assert is_new_command("@mybot /new")
     assert is_new_command("<@U123ABC> /new")
+    assert is_new_command("/new", is_mention=False)
+    # A suffixed command the platform says isn't addressed to us belongs to another bot.
+    assert not is_new_command("/new@OtherBot", is_mention=False)
+    assert not is_new_command("/new@")
     assert not is_new_command("how do I use /new")
     assert not is_new_command("/new please")
     assert not is_new_command("/newer")
