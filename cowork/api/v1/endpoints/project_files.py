@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.common.path_utils import is_relative_to
 from cowork.db.session import get_session
 from cowork.services.projects import ProjectService
 
@@ -61,11 +62,10 @@ def _safe_relpath(rel: str, base: Path) -> Path:
     if not rel:
         raise HTTPException(status_code=400, detail="path required")
     cleaned = rel.replace("\\", "/").lstrip("/")
-    base_resolved = os.path.normpath(str(base.resolve()))
-    candidate = os.path.normpath(str((base / cleaned).resolve()))
-    if candidate != base_resolved and not candidate.startswith(base_resolved + os.sep):
+    candidate = (base / cleaned).resolve()
+    if not is_relative_to(base.resolve(), candidate):
         raise HTTPException(status_code=400, detail="invalid path")
-    return Path(candidate)
+    return candidate
 
 
 def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:

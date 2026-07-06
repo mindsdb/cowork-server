@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlmodel import Session, select
 
+from cowork.common.path_utils import is_relative_to
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.models.project import Project
 
@@ -33,7 +34,11 @@ class ProjectService:
         return Path(get_app_settings().project.root_dir)
 
     def _project_path(self, name: str) -> Path:
-        return self._root_dir() / name
+        root = self._root_dir().resolve()
+        candidate = (self._root_dir() / name).resolve()
+        if not is_relative_to(root, candidate):
+            raise ValueError("Invalid project name")
+        return candidate
 
     # TODO: Move this. This should only be done when using Anton.
     def _scaffold(self, target: Path) -> None:
