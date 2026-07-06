@@ -46,7 +46,9 @@ def resolve_inference_endpoint(settings=None) -> tuple[str, str]:
     settings = settings or get_user_settings()
     oai = settings.openai_base_url or ""
     host = (urlparse(oai).hostname or "").lower()
-    if host.startswith("api.") and host.endswith(".mindshub.ai"):
+    # Any MindsHub host counts — dev/staging use hyphenated subdomains
+    # (e.g. api-gitlab.dev.mindshub.ai), not just the prod `api.` prefix.
+    if host == "mindshub.ai" or host.endswith(".mindshub.ai"):
         return oai.rstrip("/"), _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
     return (settings.minds_url or "").rstrip("/"), _secret_str(settings.minds_api_key)
 
@@ -100,7 +102,14 @@ async def forward_comments_stream(
     client = get_proxy_client()
     url = _upstream_url(base, user_dir, report_id, "stream", request.url.query)
     headers = _forward_headers(api_key)
-    headers["Accept"] = "text/event-stream"
+    # NOT a bare "text/event-stream": the auth-gated ingress runs an nginx
+    # auth_request subrequest to auth (DRF), forwarding this Accept. DRF only
+    # renders application/json|text/html, so a bare event-stream Accept makes
+    # auth return 406 -> nginx turns any non-2xx/401/403 auth status into a 500,
+    # and the request never reaches inference. Append */* so DRF negotiates JSON
+    # for the auth check; inference's StreamingResponse sets the SSE media type
+    # regardless of Accept.
+    headers["Accept"] = "text/event-stream, */*"
     # read=None: the SSE connection is long-lived; a read timeout would sever it.
     upstream_req = client.build_request(
         "GET", url, headers=headers, timeout=httpx.Timeout(30.0, connect=5.0, read=None)
