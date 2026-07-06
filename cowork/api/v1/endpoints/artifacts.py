@@ -7,7 +7,6 @@ agent-produced artifacts.
 from __future__ import annotations
 
 import mimetypes
-import os
 import subprocess
 from pathlib import Path
 from typing import Annotated
@@ -153,13 +152,13 @@ def serve_artifact_file(project_name: str, file_path: str):
     if base is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     try:
-        base_resolved = base.resolve()
-        target = (base / file_path).resolve()
+        base_resolved = base.resolve(strict=False)
+        target = (base_resolved / file_path).resolve(strict=False)
     except OSError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
-    base_normalized = os.path.normpath(str(base_resolved))
-    target_normalized = os.path.normpath(str(target))
-    if target_normalized != base_normalized and not target_normalized.startswith(base_normalized + os.sep):
+    try:
+        target.relative_to(base_resolved)
+    except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path")
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
