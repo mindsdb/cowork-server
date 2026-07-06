@@ -31,11 +31,7 @@ class FakeHarness:
     def __init__(self, tool_event: bool = False, delay: float = 0.0):
         self.tool_event = tool_event
         self.delay = delay
-        self.synced: list[int] = []
         self.inputs: list[list[dict]] = []
-
-    async def sync_skills(self, skills):
-        self.synced.append(len(skills))
 
     async def stream_response(self, *, conversation, input):
         self.inputs.append(input)
@@ -128,8 +124,6 @@ def test_telegram_end_to_end(monkeypatch):
             assert len(inbound_events(s)) == 1
             s.close()
             await drain_background_tasks()
-
-            assert fake_harness.synced, "sync_skills must run before the turn"
 
             s = get_open_session()
             binding = s.exec(select(ChannelBinding)).one()

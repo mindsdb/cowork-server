@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import uuid
-from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -10,6 +8,7 @@ from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse, DirectSaveRequest
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.oauth.google import google_service
+from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -36,7 +35,6 @@ def save_connection_direct(body: DirectSaveRequest):
     token exchange already succeeded. Calls verify_connection before saving."""
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
-    from anton.core.datasources.data_vault import LocalDataVault
     access_token = body.values.get("access_token", "")
     if access_token:
         try:
@@ -45,16 +43,21 @@ def save_connection_direct(body: DirectSaveRequest):
             raise
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
-    slug = body.name.strip() or f"{body.connector_id}-{uuid.uuid4().hex[:6]}"
-    payload: dict = {**body.values, "_connector_id": body.connector_id}
-    if body.method:
-        payload["_method"] = body.method
-    if body.values.get("access_token") or body.values.get("refresh_token"):
-        payload["auth_type"] = "oauth"
+    values = dict(body.values)
+    # Best-effort: capture the authenticated account email so the connection is
+    # identifiable (drives a readable, dedup-able slug). Absent when the email
+    # scope wasn't granted — persist_connection then falls back to a random
+    # slug, so this never blocks the save.
+    if access_token and not values.get("account_email"):
+        email = google_service.account_email(access_token)
+        if email:
+            values["account_email"] = email
+    if values.get("access_token") or values.get("refresh_token"):
+        values["auth_type"] = "oauth"
     try:
-        LocalDataVault(Path(ConnectorSettings().vault_dir)).save(body.connector_id, slug, payload)
+        slug = persist_connection(body.connector_id, body.method, body.name, values)
     except Exception:
-        _log.exception("Failed to save connection %s/%s", body.connector_id, slug)
+        _log.exception("Failed to save connection %s", body.connector_id)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
     return {"ok": True, "name": slug, "label": slug}
 

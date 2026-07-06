@@ -36,7 +36,11 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
 
     async def fake_fetch(base_url, api_key):
         calls.append((base_url, api_key))
-        return ["model-a", "model-b"], {"model-a": {"efforts": ["low", "high"], "default": "low"}}
+        return (
+            ["model-a", "model-b"],
+            {"model-a": {"efforts": ["low", "high"], "default": "low"}},
+            {"model-b": False},
+        )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -56,6 +60,8 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
 
         assert result["recommendedModels"]["openai-compatible"] == ["model-a", "model-b"]
         assert result["modelEfforts"]["model-a"] == {"efforts": ["low", "high"], "default": "low"}
+        # enabled:false surfaces so the picker can render the model as locked.
+        assert result["modelEnabled"] == {"model-b": False}
         # minds-cloud bucket untouched (its static default), confirming only the
         # openai-compatible branch ran.
         assert result["recommendedModels"]["minds-cloud"] == []
@@ -76,7 +82,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
     async def fake_fetch(base_url, api_key):
         nonlocal called
         called = True
-        return ["x"], {}
+        return ["x"], {}, {}
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -87,6 +93,38 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
         result = asyncio.run(recommended_models(session))
 
         assert result["recommendedModels"]["openai-compatible"] == []
+        assert result["modelEnabled"] == {}
         assert called is False
     finally:
+        session.close()
+
+
+def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
+    """A free user's minds-cloud bucket lists paid models flagged enabled:false."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key):
+        # MindsHub lists the whole picker catalog; paid models come back
+        # enabled:false for a free caller so the UI can show them as locked.
+        return (
+            ["mindshub_air", "opus", "gpt"],
+            {},
+            {"mindshub_air": True, "opus": False, "gpt": False},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
+        _delete_settings(session, "providers_json")
+
+        result = asyncio.run(recommended_models(session))
+
+        assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "opus", "gpt"]
+        assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
+    finally:
+        _delete_settings(session, "minds_api_key", "minds_url")
         session.close()

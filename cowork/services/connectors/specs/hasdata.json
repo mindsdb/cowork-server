@@ -1,0 +1,87 @@
+{
+  "id": "hasdata",
+  "label": "HasData",
+  "aliases": [
+    "has data",
+    "hasdata api",
+    "hasdata.com",
+    "google serp scraper",
+    "amazon product api",
+    "airbnb data api",
+    "zillow api",
+    "youtube scraper",
+    "web scraping api"
+  ],
+  "keywords": [
+    "web scraping",
+    "serp",
+    "google search",
+    "amazon",
+    "airbnb",
+    "zillow",
+    "redfin",
+    "real estate",
+    "youtube",
+    "instagram",
+    "google maps",
+    "google trends",
+    "google news",
+    "google shopping",
+    "google flights",
+    "google hotels",
+    "booking.com",
+    "yelp",
+    "indeed",
+    "glassdoor",
+    "jobs",
+    "shopify",
+    "bing",
+    "local business",
+    "reviews",
+    "listings",
+    "ecommerce",
+    "travel",
+    "social media"
+  ],
+  "description": "Access 25+ structured data APIs with a single key — Google SERP, Maps, Trends, News, Shopping, Flights & Hotels, Amazon, Airbnb, Booking.com, Zillow, Redfin, YouTube, Instagram, Indeed, Glassdoor, Yelp, Yellow Pages, Shopify, Bing, and general web scraping.",
+  "category": "public-data",
+  "logo_color": "#6366F1",
+  "form": {
+    "form_id": "hasdata-connector",
+    "title": "Connect HasData",
+    "subtitle": "One API key unlocks 25+ data sources — Google SERP, Amazon, Airbnb, Zillow, YouTube, and more.",
+    "logo_color": "#6366F1",
+    "methods": [
+      {
+        "id": "api-key",
+        "label": "API Key",
+        "description": "Paste your HasData API key. All 25+ APIs share the same key and credit balance.",
+        "recommended": true,
+        "how_to": "## Get a HasData API Key\n\nHasData offers a free trial with credits included — no credit card required to start.\n\n### Steps\n\n1. Go to [https://hasdata.com](https://hasdata.com) and click **Get Started** or **Sign Up**.\n2. Create a free account with your email address.\n3. After signing in, navigate to your **Dashboard** → **API Keys**.\n4. Copy your API key.\n5. Paste it into the **API Key** field below and click **Submit**.\n\n### Available APIs (all use the same key)\n\n- **Search**: Google SERP, Google AI Mode, Bing Search, Google Trends, Google News\n- **Maps & Local**: Google Maps Search/Reviews/Photos/Posts, Yelp, Yellow Pages\n- **E-commerce**: Amazon Products, Google Shopping, Google Immersive Products, Shopify\n- **Travel**: Google Flights, Google Hotels, Airbnb, Booking.com\n- **Jobs**: Indeed, Glassdoor\n- **Real Estate**: Zillow, Redfin\n- **Social & Video**: YouTube, Instagram Profiles\n- **General**: Web Scraping API\n\n### Pricing\n\nAPIs are billed per 1,000 requests. Rates vary by API ($0.07–$1.12/1k). Credits are shared across all APIs. See [https://hasdata.com/pricing](https://hasdata.com/pricing) for full details.\n\n### Notes\n\n- Keep your key private — it controls your full account balance.\n- Each successful request deducts credits; failed/rate-limited requests are not charged.\n- The base URL for all requests is `https://api.hasdata.com`.",
+        "help_url": "https://hasdata.com",
+        "fields": [
+          {
+            "name": "api_key",
+            "label": "API Key",
+            "type": "password",
+            "required": true,
+            "secret": true,
+            "placeholder": "hd_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "description": "Your HasData API key. Found in your dashboard at hasdata.com."
+          },
+          {
+            "name": "base_url",
+            "label": "Base URL",
+            "type": "url",
+            "required": false,
+            "default": "https://api.hasdata.com",
+            "placeholder": "https://api.hasdata.com",
+            "description": "Override only if using a proxy. Leave as default for the public API."
+          }
+        ]
+      }
+    ],
+    "logo_url": "logos/hasdata.svg"
+  },
+  "logo_url": "logos/hasdata.svg"
+}

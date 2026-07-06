@@ -69,3 +69,17 @@ def run_dev_setup() -> None:
         migrate_harness_memory_to_shared(session)
 
     ensure_all_layouts()
+
+    # Migrate DB-backed skills to agentskills.io files (one-time, idempotent).
+    from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
+
+    with SQLSession(engine) as session:
+        migrate_skills_to_files(session)
+        # Seed packaged builtin skills (versioned, idempotent).
+        seed_builtin_skills(session)
+        # Project per-project skills/ links with the canonical store.
+        from cowork.services.skill_links import reconcile_all
+        from cowork.services.skills import SkillService
+
+        reconcile_all(SkillService().list_skills())
+

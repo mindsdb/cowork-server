@@ -1,3 +1,4 @@
+import json
 from enum import Enum
 
 from pydantic import SecretStr, ValidationError
@@ -10,6 +11,26 @@ from cowork.common.settings.user_settings import (
 )
 from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
+
+
+def _mask_provider_keys(providers_json: str) -> str:
+    """Return providers_json with each card's apiKey replaced by '***'.
+
+    providers_json is non-sensitive (so GET /settings/ returns it verbatim),
+    but each card embeds the raw provider key — the same secret that's masked
+    in the sibling key fields. Mask it here so the list/get responses don't
+    leak it (ENG-462). Fails closed: an unparseable value returns '[]' rather
+    than risk echoing a raw key.
+    """
+    try:
+        cards = json.loads(providers_json or "[]")
+    except (ValueError, TypeError):
+        return "[]"
+    if isinstance(cards, list):
+        for card in cards:
+            if isinstance(card, dict) and card.get("apiKey"):
+                card["apiKey"] = "***"
+    return json.dumps(cards)
 
 
 class SettingService:
@@ -63,6 +84,8 @@ class SettingService:
         value = None
         if not is_sensitive and field_val is not None:
             value = field_val.value if isinstance(field_val, Enum) else str(field_val)
+            if key == "providers_json":
+                value = _mask_provider_keys(value)
 
         return SettingResponse(
             key=key,
@@ -164,4 +187,37 @@ class SettingService:
         self.session.commit()
         invalidate_user_settings_cache()
         return True
+
+    def clear_credentials(self) -> list[str]:
+        """Delete all credential and provider-connectivity keys.
+
+        Used by the logout flow to wipe API keys from the DB so
+        ``config_ready`` returns ``False``.  Provider/model preferences
+        are left intact so they survive a re-login cycle.
+        """
+        credential_keys = [
+            field_name
+            for field_name in UserSettings.model_fields
+            if UserSettings.field_is_sensitive(field_name)
+        ]
+        # Also clear provider connectivity state and the UI provider
+        # cards — stale entries from a previous account shouldn't bleed
+        # into a fresh session.
+        credential_keys += [
+            "openai_base_url",
+            "minds_url",
+            "providers_json",
+            "provider_status",
+            "provider_status_details",
+        ]
+        deleted: list[str] = []
+        for key in credential_keys:
+            row = self._fetch_row(key)
+            if row is not None:
+                self.session.delete(row)
+                deleted.append(key)
+        if deleted:
+            self.session.commit()
+            invalidate_user_settings_cache()
+        return deleted
 
