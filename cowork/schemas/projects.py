@@ -11,8 +11,16 @@ class ProjectCreateRequest(CamelRequest):
 
     @field_validator("path")
     @classmethod
-    def validate_path(cls, path: str | None) -> Path | None:
-        return Path(path) if path else None
+    def validate_path(cls, path: Path | None) -> Path | None:
+        # A relative path would be created against the server process's
+        # working directory, and pathlib never expands "~" on its own —
+        # both silently land somewhere the user didn't pick.
+        if path is None or not str(path).strip():
+            return None
+        expanded = Path(path).expanduser()
+        if not expanded.is_absolute():
+            raise ValueError("path must be an absolute path")
+        return expanded
 
 
 class ProjectUpdateRequest(CamelRequest):
