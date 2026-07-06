@@ -13,6 +13,9 @@ client = TestClient(app)
 BASE = "https://api.dev.mindshub.ai/v1"
 KEY = "mdb_testkey"
 
+# Real resolver, captured before the autouse fixture below monkeypatches it away.
+_resolve_inference_endpoint = cp.resolve_inference_endpoint
+
 
 @pytest.fixture(autouse=True)
 def _endpoint(monkeypatch):
@@ -94,7 +97,8 @@ def test_stream_passthrough_is_event_stream(monkeypatch):
     assert b"thread.created" in body
     call = fake.calls["stream"]
     assert call["url"] == f"{BASE}/artifact-comments/alice/rep123/stream?since=x"
-    assert call["headers"]["Accept"] == "text/event-stream"
+    # Includes */* so the auth-gated ingress's DRF auth_request negotiates JSON (not 406).
+    assert call["headers"]["Accept"] == "text/event-stream, */*"
     assert call["headers"]["Authorization"] == f"Bearer {KEY}"
 
 
@@ -103,3 +107,32 @@ def test_503_when_endpoint_unconfigured(monkeypatch):
     monkeypatch.setattr(cp, "get_proxy_client", lambda: _FakeClient())
     r = client.get("/api/v1/artifact-comments/alice/rep123/threads")
     assert r.status_code == 503
+
+
+class _FakeSettings:
+    def __init__(self, openai_base_url, minds_url="https://api.mindshub.ai"):
+        self.openai_base_url = openai_base_url
+        self.minds_url = minds_url
+        self.minds_api_key = "mdb_prodkey"
+
+
+@pytest.mark.parametrize(
+    "openai_base_url,expected_base,expected_key",
+    [
+        # Prod MindsHub OpenAI-compatible endpoint.
+        ("https://api.mindshub.ai/v1", "https://api.mindshub.ai/v1", "mdb_oaikey"),
+        # Hyphenated dev/staging subdomain — must still be recognised as MindsHub.
+        ("https://api-gitlab.dev.mindshub.ai/v1", "https://api-gitlab.dev.mindshub.ai/v1", "mdb_oaikey"),
+        ("https://api.dev.mindshub.ai/v1", "https://api.dev.mindshub.ai/v1", "mdb_oaikey"),
+        # Non-MindsHub / unset custom endpoint → fall back to prod minds_url.
+        ("https://api.openai.com/v1", "https://api.mindshub.ai", "mdb_prodkey"),
+        ("", "https://api.mindshub.ai", "mdb_prodkey"),
+    ],
+)
+def test_resolve_inference_endpoint_host_matching(
+    monkeypatch, openai_base_url, expected_base, expected_key
+):
+    monkeypatch.setattr(cp, "provider_api_key", lambda settings, provider: "mdb_oaikey")
+    base, key = _resolve_inference_endpoint(_FakeSettings(openai_base_url))
+    assert base == expected_base
+    assert key == expected_key
