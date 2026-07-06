@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.common.path_utils import is_relative_to
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
@@ -151,10 +152,12 @@ def serve_artifact_file(project_name: str, file_path: str):
     if base is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     try:
+        base_resolved = base.resolve()
         target = (base / file_path).resolve()
-        target.relative_to(base.resolve())
-    except (ValueError, OSError) as exc:
+    except OSError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
+    if not is_relative_to(base_resolved, target):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path")
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
@@ -192,9 +195,7 @@ def _resolve_reveal_path(path: str, session: Session) -> Path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
     for project in ProjectService(session).list_projects():
         project_dir = Path(project.path).resolve()
-        try:
-            requested.relative_to(project_dir)
-        except ValueError:
+        if not is_relative_to(project_dir, requested):
             continue
         if requested.exists():
             return requested
