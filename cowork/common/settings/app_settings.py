@@ -80,6 +80,50 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 }
 
 
+# ── Environment-aware MindsHub URLs ─────────────────────────────────
+# The URL pattern is:
+#   prod:    api.mindshub.ai    / view.mindshub.ai
+#   staging: api.staging.mindshub.ai / view.staging.mindshub.ai
+#   dev:     api.dev.mindshub.ai    / view.dev.mindshub.ai
+#   local:   same as dev (local dev typically targets the dev env)
+
+
+# The only non-prod environments that have MindsHub sub-domains. Anything
+# else (unset, 'local', 'prod', a typo like 'stagging', or an ambient ENV
+# such as the POSIX shell's ENV=~/.kshrc) resolves to prod rather than being
+# interpolated into a bogus hostname like api.<garbage>.mindshub.ai.
+_KNOWN_ENV_SLUGS = ("staging", "dev")
+
+
+def _env_slug() -> str:
+    """Return the env slug for URL construction, or '' for prod.
+
+    Only the known non-prod slugs in ``_KNOWN_ENV_SLUGS`` produce a sub-domain;
+    every other value (unset, 'local', 'prod', typos, or an ambient ENV from
+    the shell) resolves to '' (production). Desktop installs never set ENV, so
+    they correctly default to prod. Cloud deploys set ENV explicitly.
+    """
+    env = os.environ.get("ENV", "").lower()
+    return env if env in _KNOWN_ENV_SLUGS else ""
+
+
+def default_minds_api_host() -> str:
+    """Environment-aware MindsHub API host (no path)."""
+    slug = _env_slug()
+    return f"https://api.{slug}.mindshub.ai" if slug else "https://api.mindshub.ai"
+
+
+def default_minds_url() -> str:
+    """Environment-aware MindsHub API URL (with /v1 path)."""
+    return f"{default_minds_api_host()}/v1"
+
+
+def default_publish_url() -> str:
+    """Environment-aware MindsHub publish/view URL."""
+    slug = _env_slug()
+    return f"https://view.{slug}.mindshub.ai" if slug else "https://view.mindshub.ai"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         # Global config lives in ~/.cowork/.env now; ~/.anton/.env is kept as

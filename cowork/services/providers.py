@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
+from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS, default_minds_api_host
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
@@ -257,7 +257,7 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
         if ptype == "minds-cloud":
             if not key:
                 return "fail", "missing API key"
-            base = (p.get("mindsUrl") or "https://api.mindshub.ai").rstrip("/")
+            base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
             chat_url = minds_chat_base_url(base)
             model = (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
             return await _chat_probe(
@@ -307,7 +307,8 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
         return {"ok": False, "error": "Cannot connect"}
 
 
-async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict[str, Any]:
+async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
+    base_url = base_url or default_minds_api_host()
     # Probe the real inference path rather than `/models`: listing routes
     # are not deployed on every MindsHub host and 404/401 even for valid
     # keys, which blocked onboarding with a working key. A 1-token chat
@@ -361,7 +362,7 @@ async def validate_provider(provider: str, api_key: str,
     if provider == "anthropic":
         return await validate_anthropic(api_key, model or "claude-sonnet-4-6")
     if provider == "minds":
-        return await validate_minds(api_key, base_url or "https://mdb.ai")
+        return await validate_minds(api_key, base_url or default_minds_api_host())
     if provider == "openai-compatible":
         return await validate_openai_compatible(api_key, base_url or "https://api.openai.com/v1", model)
     return {"ok": False, "error": "Unknown provider"}
