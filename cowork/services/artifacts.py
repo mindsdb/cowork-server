@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import shutil
 import socket
 import subprocess
@@ -360,7 +361,9 @@ def _project_artifacts_base(project_name: str) -> Path | None:
         candidate = (root / project_name).resolve(strict=False)
     except (OSError, ValueError):
         return None
-    if not is_relative_to(root, candidate):
+    root_normalized = os.path.normpath(str(root))
+    candidate_normalized = os.path.normpath(str(candidate))
+    if candidate_normalized != root_normalized and not candidate_normalized.startswith(root_normalized + os.sep):
         return None
     if candidate not in registered:
         return None
