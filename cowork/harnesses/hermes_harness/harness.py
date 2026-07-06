@@ -26,8 +26,15 @@ _PROVIDER_ENV_KEY = {
 }
 
 
-def _sync_hermes_config(provider: str, api_key: str | None) -> None:
-    """Write ~/.cowork/hermes/config.yaml and set the env var that AIAgent expects."""
+def _sync_hermes_config(
+    provider: str,
+    api_key: str | None,
+    skills_dir: str | Path | None = None,
+) -> None:
+    """Write ~/.cowork/hermes/config.yaml and set the env var that AIAgent expects.
+
+    When ``skills_dir`` is given, it is added as a read-only external skill dir (``skills.external_dirs``)
+    """
     import yaml
 
     hermes_home = Path(os.environ.get("HERMES_HOME", HermesHarnessSettings().root_dir))
@@ -41,8 +48,20 @@ def _sync_hermes_config(provider: str, api_key: str | None) -> None:
         except Exception:
             existing = {}
 
+    to_update = False
+
+    external_dirs = [str(Path(skills_dir).expanduser())] if skills_dir else []
     if existing.get("provider") != provider:
         existing["provider"] = provider
+        to_update = True
+
+    skills_cfg = existing.get("skills") if isinstance(existing.get("skills"), dict) else {}
+    if skills_cfg.get("external_dirs") != external_dirs:
+        skills_cfg["external_dirs"] = external_dirs
+        existing["skills"] = skills_cfg
+        to_update = True
+
+    if to_update:
         hermes_home.mkdir(parents=True, exist_ok=True)
         config_path.write_text(yaml.dump(existing, default_flow_style=False))
 
@@ -87,43 +106,6 @@ class HermesHarness:
     id: str = "hermes"
     label: str = "Hermes"
     formatter = staticmethod(format_hermes_stream)
-
-    async def sync_skills(self, skills: list[Skill]) -> None:
-        import shutil
-        import yaml
-
-        settings = HermesHarnessSettings()
-        skills_dir = Path(settings.root_dir) / "skills"
-        skills_dir.mkdir(parents=True, exist_ok=True)
-
-        active_labels: set[str] = set()
-        for skill in skills:
-            skill_dir = skills_dir / skill.label
-            skill_dir.mkdir(parents=True, exist_ok=True)
-
-            frontmatter: dict = {"name": skill.name or skill.label}
-            if skill.description:
-                frontmatter["description"] = skill.description
-            if skill.when_to_use:
-                frontmatter["when_to_use"] = [
-                    line.strip()
-                    for line in skill.when_to_use.splitlines()
-                    if line.strip()
-                ]
-
-            content = (
-                f"---\n"
-                f"{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True)}"
-                f"---\n\n"
-                f"{skill.instructions or ''}"
-            )
-            (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
-            active_labels.add(skill.label)
-
-        # Delete skills that no longer exist in cowork.
-        for existing_dir in skills_dir.iterdir():
-            if existing_dir.is_dir() and existing_dir.name not in active_labels:
-                shutil.rmtree(existing_dir)
 
     async def stream_response(
         self,
@@ -180,9 +162,20 @@ class HermesHarness:
         # Snapshot the artifacts dir before the run so we can index + surface
         # any artifacts this turn produces — the same diff the Anton harness
         # uses, so both harnesses behave identically.
-        from cowork.services.task_objects import finalize_turn_artifacts, snapshot_artifact_slugs
+        from cowork.services.task_objects import (
+            finalize_turn_artifacts,
+            finalize_turn_skill_drafts,
+            snapshot_artifact_slugs,
+            snapshot_skill_drafts,
+            snapshot_stray_skills,
+        )
         artifacts_base = Path(project_path) / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Skill drafts surface as cards (never auto-saved). Snapshot the drafts
+        # dir AND the live skills dir so a stray auto-save is caught + relocated.
+        skill_drafts_base = Path(project_path) / ".anton" / "skill_drafts"
+        before_drafts = snapshot_skill_drafts(skill_drafts_base)
+        before_strays = snapshot_stray_skills(Path(project_path) / "skills")
 
         def run_sync() -> dict:
             try:
@@ -207,6 +200,7 @@ class HermesHarness:
         task = loop.run_in_executor(None, run_sync)
 
         cards: list[dict] = []
+        skill_drafts: list[dict] = []
         result: dict
         try:
             while True:
@@ -224,8 +218,15 @@ class HermesHarness:
             cards = finalize_turn_artifacts(
                 conversation_id, project_id, artifacts_base, before_slugs,
             )
+            # Sibling diff for skills the agent built this turn — relocates any
+            # stray auto-save and returns self-contained draft payloads.
+            skill_drafts = finalize_turn_skill_drafts(
+                project_path, before_drafts, before_strays,
+            )
         for card in cards:
             yield {"type": "artifact_created", "artifact": card}
+        for draft in skill_drafts:
+            yield {"type": "skill_created", "skill": draft}
 
         yield result
 
@@ -273,17 +274,25 @@ class HermesHarness:
             finalize_artifact_run_context,
             register_artifact_tools,
             register_connector_tools,
+            register_skill_tools,
             set_artifact_run_context,
         )
         from cowork.harnesses.hermes_harness.memory_adapter import HermesMemoryAdapter
 
         register_connector_tools()
         register_artifact_tools()
+        register_skill_tools()
 
         # Same folder-per-artifact convention as the Anton harness, so
         # Hermes outputs surface in the (harness-agnostic) Artifacts UI.
         artifacts_root = Path(project_path) / ".anton" / "artifacts"
         artifacts_root.mkdir(parents=True, exist_ok=True)
+
+        # Skills the agent builds for the user stage here (a sibling of the
+        # artifacts dir, under the off-limits .anton/), never the live skills
+        # store — so a built skill is surfaced as a draft card, not auto-saved.
+        skill_drafts_root = Path(project_path) / ".anton" / "skill_drafts"
+        skill_drafts_root.mkdir(parents=True, exist_ok=True)
         artifact_context = (
             "## Artifacts\n"
             f"User-facing outputs (HTML dashboards, reports, CSVs/datasets, images, apps) "
@@ -296,6 +305,21 @@ class HermesHarness:
             "and path, then write into that folder.\n"
             "  3. Never pick artifact folder names yourself, and never write user-facing "
             "outputs anywhere else in the project."
+        )
+
+        # A skill is NOT an artifact and is NOT auto-saved. When the agent builds
+        # or improves a skill (e.g. via skill-creator), it must stage it as a
+        # draft via create_skill_draft — the user saves/downloads it from a card.
+        skill_context = (
+            "## Skills\n"
+            "When you build or improve a skill for the user (e.g. while running the "
+            "skill-creator skill), it is a DRAFT — never auto-saved. Workflow:\n"
+            "  1. Call `create_skill_draft(name, description)` to claim a folder; it returns "
+            "`{slug, path, skill_file}`. Write the SKILL.md to `skill_file` and any sibling "
+            "files into `path`.\n"
+            "  2. A skill is NOT an artifact: never call `create_artifact` for a skill, and "
+            "never write a skill into the project `skills/` directory.\n"
+            "The staged skill surfaces as a card the user explicitly saves or downloads."
         )
 
         # Sync Hermes config.yaml with the user's cowork provider/key settings.
@@ -314,7 +338,10 @@ class HermesHarness:
         # the constructor path below (single source of truth).
         api_key_value = provider_api_key_str(settings, planning)
 
-        _sync_hermes_config(provider_value, api_key_value)
+        # Per-project skills
+        project_skills_dir = Path(project_path) / "skills"
+        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        _sync_hermes_config(provider_value, api_key_value, skills_dir=project_skills_dir)
 
         vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
         disabled_keys = {(d["engine"], d["name"]) for d in (disabled_connections or [])}
@@ -335,7 +362,7 @@ class HermesHarness:
         datasource_context = _build_datasource_context(vault, disabled_keys)
         memory_context = HermesMemoryAdapter().build_prompt_context(Path(project_path))
         system_context = "\n\n".join(
-            part for part in (project_context, memory_context, datasource_context, artifact_context) if part
+            part for part in (project_context, memory_context, datasource_context, artifact_context, skill_context) if part
         )
 
         if settings.planning_provider == Provider.MINDS_CLOUD:
@@ -406,6 +433,7 @@ class HermesHarness:
             conversation_id=session_id,
             conversation_title=conversation_topic,
             turn_summary=prompt,
+            skill_drafts_root=skill_drafts_root,
         )
         try:
             return agent.run_conversation(

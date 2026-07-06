@@ -7,6 +7,8 @@ openai-compatible. openai and gemini never inherit it, so a stale value left
 by a prior provider setup can't misroute another provider's API key.
 """
 
+from urllib.parse import urlparse
+
 from cowork.services.providers import GEMINI_BASE_URL, provider_base_url
 
 CONTAMINATED = "https://api.mindshub.ai/v1"  # e.g. left behind by a MindsHub setup
@@ -23,7 +25,9 @@ class TestProviderBaseUrl:
     def test_gemini_always_targets_google(self):
         # Ignores the shared slot entirely — always Google's endpoint.
         assert provider_base_url("gemini", openai_base_url=CONTAMINATED) == GEMINI_BASE_URL
-        assert "googleapis.com" in GEMINI_BASE_URL
+        hostname = urlparse(GEMINI_BASE_URL).hostname
+        assert hostname is not None
+        assert hostname == "googleapis.com" or hostname.endswith(".googleapis.com")
 
     def test_openai_compatible_owns_the_slot(self):
         assert (

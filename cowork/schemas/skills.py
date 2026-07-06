@@ -1,33 +1,37 @@
 from datetime import datetime
-from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, Field
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
 
 class SkillCreateRequest(CamelRequest):
     label: str
-    name: str
+    name: str | None = None
     description: str | None = None
-    when_to_use: str | None = None
     instructions: str | None = Field(default=None, alias="declarative")
+    enabled: bool | None = None
+    projects: list[str] | None = None
 
 
 class SkillUpdateRequest(CamelRequest):
     label: str | None = None
     name: str | None = None
     description: str | None = None
-    when_to_use: str | None = None
     instructions: str | None = Field(default=None, alias="declarative")
+    enabled: bool | None = None
+    projects: list[str] | None = None
 
 
 class SkillResponse(CamelResponse):
-    id: UUID
+    id: str  # the slug
     label: str
-    name: str
+    # get "name" (is the human-readable display name) from skill.display_name
+    name: str = Field(validation_alias=AliasChoices("display_name", "name"))
     description: str | None
-    when_to_use: str | None
     instructions: str = Field(serialization_alias="declarative")
     created_at: datetime | None
-    modified_at: datetime | None
+    updated_at: datetime | None
+    enabled: bool
+    projects: list[str]
+

@@ -37,9 +37,6 @@ class HarnessProvider(Protocol):
     ) -> AsyncIterator[str]:
         ...
 
-    async def sync_skills(self, skills: list[Skill]) -> None:
-        ...
-
 
 _registry: dict[str, type[HarnessProvider]] = {}
 

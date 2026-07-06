@@ -119,6 +119,9 @@ class SaveConnectionResponse(BaseModel):
 class ConnectionSummaryResponse(BaseModel):
     engine: str
     name: str
+    # Human-facing name for the card (label or derived identity); falls back to
+    # `name` (the slug) client-side when null.
+    display_name: str | None = None
     created_at: str | None = None
     label: str | None = None
     logo: str | None = None
@@ -128,6 +131,7 @@ class ConnectionSummaryResponse(BaseModel):
 class ConnectionDetailResponse(BaseModel):
     engine: str
     name: str
+    display_name: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     connector_id: str | None = None

@@ -21,16 +21,24 @@ never from the ``.env`` directly.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
+import shutil
 from pathlib import Path
 
-from pydantic import ValidationError
-from sqlmodel import Session
+from cowork.common.settings.app_settings import default_minds_api_host
 
+from sqlmodel import Session, select
+from pydantic import ValidationError
+
+from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
+from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
+from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
+from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +54,8 @@ _ENV_TO_SETTING: dict[str, str] = {
     # API keys
     "ANTON_ANTHROPIC_API_KEY": "anthropic_api_key",
     "ANTON_OPENAI_API_KEY": "openai_api_key",
+    "ANTON_OPENAI_API_KEY_CUSTOM": "openai_compatible_api_key",
+    "ANTON_GEMINI_API_KEY": "gemini_api_key",
     "ANTON_MINDS_API_KEY": "minds_api_key",
     # Provider / model
     "ANTON_PLANNING_PROVIDER": "planning_provider",
@@ -174,11 +184,10 @@ def migrate_env_to_db(session: Session) -> bool:
 # with a failing provider ("Endpoint not found — check the base URL") and no
 # UI field to correct it. This backfill closes that gap.
 _LEGACY_MINDS_HOSTS = ("https://mdb.ai", "http://mdb.ai")
-_CANONICAL_MINDS_URL = "https://api.mindshub.ai"
 
 
 def backfill_minds_url(session: Session) -> bool:
-    """Rewrite the legacy MindsHub host (mdb.ai) to api.mindshub.ai.
+    """Rewrite the legacy MindsHub host (mdb.ai) to the env-appropriate host.
 
     Touches both ``providers_json`` (the per-provider ``mindsUrl`` the
     Test/ping uses) and the top-level ``minds_url``. Idempotent and
@@ -188,6 +197,7 @@ def backfill_minds_url(session: Session) -> bool:
 
     Returns True if any row was rewritten.
     """
+    canonical = default_minds_api_host()
     svc = SettingService(session)
     changed: list[str] = []
     for key in ("providers_json", "minds_url"):
@@ -196,7 +206,7 @@ def backfill_minds_url(session: Session) -> bool:
             continue
         new_val = row.value
         for legacy in _LEGACY_MINDS_HOSTS:
-            new_val = new_val.replace(legacy, _CANONICAL_MINDS_URL)
+            new_val = new_val.replace(legacy, canonical)
         if new_val != row.value:
             row.value = new_val
             session.add(row)
@@ -205,7 +215,156 @@ def backfill_minds_url(session: Session) -> bool:
         session.commit()
         invalidate_user_settings_cache()
         logger.info(
-            "Backfilled legacy MindsHub host (mdb.ai -> api.mindshub.ai) in: %s",
-            ", ".join(changed),
+            "Backfilled legacy MindsHub host (mdb.ai -> %s) in: %s",
+            canonical, ", ".join(changed),
         )
     return bool(changed)
+
+
+
+# Packaged skills shipped with cowork. Bump BUILTIN_SKILLS_VERSION when the
+# set changes; seeding re-runs only when the stored version is lower, so a
+# future release can ship more skills without touching ones the user edited
+# or deleted.
+BUILTIN_SKILLS_DIR = Path(__file__).parent / "skills_builtin"
+BUILTIN_SKILLS_SENTINEL = "_builtin_skills_set"
+BUILTIN_SKILLS_VERSION = 1
+
+
+def seed_builtin_skills(session: Session) -> bool:
+    """Copy packaged builtin skills into the canonical skills store.
+
+    Runs only when the stored set version is below ``BUILTIN_SKILLS_VERSION``.
+    Existing folders are never overwritten, so user edits/deletes survive.
+    Returns True if seeding ran (version advanced), False if skipped.
+    """
+    svc = SettingService(session)
+    row = svc._fetch_row(BUILTIN_SKILLS_SENTINEL)
+    current = int(row.value) if row is not None and row.value.isdigit() else 0
+    if current >= BUILTIN_SKILLS_VERSION:
+        return False
+
+    # remove symlink to global skills if exists
+    link = Path(HermesHarnessSettings().root_dir) / "skills"
+    if link.is_symlink():
+        link.unlink()
+
+    store = SkillService()
+    copied = 0
+    if BUILTIN_SKILLS_DIR.exists():
+        store._ensure_root()
+        for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
+            if not src.is_dir() or not (src / SKILL_FILE).exists():
+                continue
+            dest = store._skill_dir(src.name)
+            if dest.exists():
+                continue  # keep the user-editable copy untouched
+            shutil.copytree(src, dest)
+            copied += 1
+
+    if copied:
+        logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)
+
+    # Raw Setting row: the sentinel key isn't a UserSettings field, so it must
+    # bypass SettingService validation (same pattern as the other migrations).
+    if row is None:
+        row = Setting(key=BUILTIN_SKILLS_SENTINEL, value=str(BUILTIN_SKILLS_VERSION))
+    else:
+        row.value = str(BUILTIN_SKILLS_VERSION)
+    session.add(row)
+    session.commit()
+    return True
+
+
+def migrate_skills_to_files(session: Session) -> bool:
+    """Seed skill files from ``skills_legacy`` if not already done.
+
+    Returns True if the migration ran, False if it was skipped.
+    """
+
+    SKILL_MIGRATION_SENTINEL = "_skills_migrated"
+
+    svc = SettingService(session)
+    if svc._fetch_row(SKILL_MIGRATION_SENTINEL) is not None:
+        return False
+
+    store = SkillService()
+    rows = list(session.exec(select(SkillLegacy)).all())
+
+    def _unique_slug(svc: SkillService, base: str, taken: set[str]) -> str:
+        slug = base
+        n = 2
+        while slug in taken or svc._skill_dir(slug).exists():
+            suffix = f"-{n}"
+            slug = base[: 64 - len(suffix)].rstrip("-") + suffix
+            n += 1
+        return slug
+
+    # Skills already written by a previous (partial) run, keyed by cowork_id, so
+    # a retry skips them instead of re-creating them under a "-2" slug.
+    existing_ids = {
+        s.metadata.get("cowork_id")
+        for s in store.list_skills()
+        if s.metadata.get("cowork_id")
+    }
+
+    taken: set[str] = set()
+    migrated = 0
+    skipped = 0
+    for row in rows:
+        if str(row.id) in existing_ids:
+            skipped += 1
+            continue
+
+        base = normalize_name(row.label or row.name or "")
+        if not base:
+            # Symbol/whitespace-only label normalizes to "" — fall back to an
+            # id-derived slug so the skill is migrated rather than silently lost.
+            base = normalize_name(f"skill-{row.id}")
+            logger.warning("Legacy skill %s has no usable name; migrating as %r", row.id, base)
+        slug = _unique_slug(store, base, taken)
+        taken.add(slug)
+
+        # when_to_use is dropped as a field; fold it into the description.
+        description = (row.description or "").strip()
+        when_to_use = (row.when_to_use or "").strip()
+        if when_to_use:
+            description = f"{description}. {when_to_use}" if description else when_to_use
+        description = description[:DESC_MAX]
+
+        metadata: dict[str, str] = {"cowork_id": str(row.id)}
+        if row.name and row.name != slug:
+            metadata[META_DISPLAY_NAME] = row.name
+        if row.created_at:
+            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=dt.timezone.utc).isoformat()
+
+        try:
+            skill = Skill(
+                name=slug,
+                instructions=row.instructions or "",
+                description=description or row.name or slug,
+                metadata=metadata,
+            )
+            store._write(skill)
+            migrated += 1
+        except (OSError, ValueError):
+            logger.warning("Failed to migrate skill %r", slug, exc_info=True)
+
+    if migrated:
+        logger.info("Migrated %d skill(s) from skills_legacy to files at %s", migrated, store.root)
+
+    # Only mark the migration done when every legacy row is accounted for —
+    # written this run or already present from a prior run. If some _write
+    # failed (e.g. unwritable/unmounted skills dir), leave the sentinel unset so
+    # the next boot retries instead of silently dropping skills.
+    if migrated + skipped != len(rows):
+        logger.warning(
+            "Skill migration incomplete (%d written, %d already present, %d total); "
+            "will retry on next boot",
+            migrated, skipped, len(rows),
+        )
+        return False
+
+    session.add(Setting(key=SKILL_MIGRATION_SENTINEL, value="1"))
+    session.commit()
+    return True
