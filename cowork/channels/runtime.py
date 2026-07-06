@@ -22,9 +22,11 @@ from cowork.harnesses.base import get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
+from cowork.models.project import Project
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import list_artifacts
+from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -46,6 +48,18 @@ _DEFAULT_THREAD_KEY = "__default__"
 def turn_used_tools(events: list[dict]) -> bool:
     """Tool/scratchpad activity rides on stream events as ``tool_use_id``."""
     return any(isinstance(event, dict) and "tool_use_id" in event for event in events)
+
+
+def is_new_command(text: str) -> bool:
+    """True for a bare /new message (leading mention tokens and a /new@bot suffix allowed)."""
+    tokens = [
+        t for t in (text or "").split()
+        if not (t.startswith("@") or (t.startswith("<@") and t.endswith(">")))
+    ]
+    if len(tokens) != 1:
+        return False
+    cmd = tokens[0].lower()
+    return cmd == "/new" or cmd.startswith("/new@")
 
 
 # Platform typing indicators expire after a few seconds, so refresh while
@@ -219,6 +233,9 @@ class AntonChannelRuntime:
             if not self._should_respond(binding, event):
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
+            if is_new_command(self._event_text(event)):
+                await self._start_fresh(session, channel_type, binding, event)
+                return
             # Optional hook: adapters with set_typing show a typing indicator
             # for the duration of the turn; others are untouched.
             adapter = self._adapters.get(channel_type)
@@ -254,6 +271,17 @@ class AntonChannelRuntime:
         finally:
             session.close()
 
+
+    async def _start_fresh(self, session: Session, channel_type: str, binding: ChannelBinding, event: Any) -> None:
+        """Handle /new: detach the pinned conversation and confirm deterministically instead of running a turn."""
+        ChannelBindingService(session).detach_conversation(binding)
+        project = session.get(Project, binding.anton_project_id or self._default_project_id)
+        name = project.name if project else "general"
+        log.info("channel %s: /new detached conversation for binding %s", channel_type, binding.id)
+        await self._deliver(
+            channel_type, event,
+            f'Starting fresh — your next message begins a new conversation in the "{name}" project.',
+        )
 
     def _resolve_or_create_binding(self, session: Session, channel_type: str, event: Any) -> ChannelBinding:
         group_id = event.address.platform_id

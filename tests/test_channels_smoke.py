@@ -722,6 +722,129 @@ def test_channel_agent_switch_resets_bound_conversations():
         session.close()
 
 
+def test_is_new_command_matching():
+    from cowork.channels.runtime import is_new_command
+
+    assert is_new_command("/new")
+    assert is_new_command("  /New ")
+    assert is_new_command("/new@MyBot")
+    assert is_new_command("@mybot /new")
+    assert is_new_command("<@U123ABC> /new")
+    assert not is_new_command("how do I use /new")
+    assert not is_new_command("/new please")
+    assert not is_new_command("/newer")
+    assert not is_new_command("new")
+    assert not is_new_command("")
+
+
+def test_new_command_starts_fresh_conversation(monkeypatch):
+    fake_harness = FakeHarness()
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: fake_harness)
+
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s", "bot_username": "b"})
+
+    def event(update_id, text):
+        return asyncio.run(bridge.parse_inbound(
+            body=telegram_update(update_id, 777, 1, text), headers={}, route_name=None,
+        ))[0]
+
+    adapters = LiveAdapterRegistry(registry)
+    adapter = FakeAdapter()
+    adapters._cache["telegram"] = adapter
+    runtime = AntonChannelRuntime(adapters)
+
+    asyncio.run(runtime.handle("telegram", event(100, "hi")))
+    s = get_open_session()
+    stmt = select(ChannelBinding).where(ChannelBinding.external_group_id == "777")
+    binding = s.exec(stmt).one()
+    first_conv = binding.anton_conversation_id
+    assert first_conv is not None
+
+    asyncio.run(runtime.handle("telegram", event(101, "/new")))
+    s.expire_all()
+    binding = s.exec(stmt).one()
+    assert binding.anton_conversation_id is None
+    assert not s.exec(select(ChannelSession).where(ChannelSession.binding_id == binding.id)).all()
+    # Deterministic confirmation naming the project; the harness never ran for this turn.
+    assert adapter.delivered[-1] == ("777", 'Starting fresh — your next message begins a new conversation in the "general" project.')
+    assert len(fake_harness.inputs) == 1
+
+    asyncio.run(runtime.handle("telegram", event(102, "hi again")))
+    s.expire_all()
+    binding = s.exec(stmt).one()
+    assert binding.anton_conversation_id is not None
+    assert binding.anton_conversation_id != first_conv
+    assert adapter.delivered[-1] == ("777", REPLY)
+    s.close()
+
+
+def test_binding_project_change_detaches_conversation():
+    from cowork.models.channel import ChannelBinding
+    from cowork.models.project import Project
+    from cowork.schemas.channels import BindingUpdateRequest
+    from cowork.services.channel_bindings import ChannelBindingService
+    from cowork.services.conversations import ConversationService
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    session = get_open_session()
+    bid = None
+    other = None
+    try:
+        other = Project(name="reroute-target", path="/tmp/reroute-target")
+        session.add(other)
+        conv = ConversationService(session).create_conversation(topic="chan", project_id=GENERAL_PROJECT_ID)
+        binding = ChannelBinding(
+            channel_type="telegram",
+            external_group_id="reroute-test",
+            external_thread_key="__default__",
+            anton_conversation_id=conv.id,
+            anton_project_id=GENERAL_PROJECT_ID,
+            trigger_rule="always",
+        )
+        session.add(binding)
+        session.commit()
+        session.refresh(binding)
+        session.refresh(other)
+        bid = binding.id
+        session.add(ChannelSession(binding_id=bid, external_session_key="__default__"))
+        session.commit()
+
+        svc = ChannelBindingService(session)
+
+        # Same project: conversation stays pinned.
+        svc.update(bid, BindingUpdateRequest(anton_project_id=GENERAL_PROJECT_ID))
+        session.expire_all()
+        assert session.get(ChannelBinding, bid).anton_conversation_id == conv.id
+
+        # New project: conversation and session rows are detached.
+        svc.update(bid, BindingUpdateRequest(anton_project_id=other.id))
+        session.expire_all()
+        row = session.get(ChannelBinding, bid)
+        assert row.anton_project_id == other.id
+        assert row.anton_conversation_id is None
+        assert not session.exec(select(ChannelSession).where(ChannelSession.binding_id == bid)).all()
+
+        # Explicit conversation in the same request wins over the detach.
+        svc.update(bid, BindingUpdateRequest(anton_project_id=GENERAL_PROJECT_ID, anton_conversation_id=conv.id))
+        session.expire_all()
+        row = session.get(ChannelBinding, bid)
+        assert row.anton_project_id == GENERAL_PROJECT_ID
+        assert row.anton_conversation_id == conv.id
+    finally:
+        if bid is not None:
+            row = session.get(ChannelBinding, bid)
+            if row is not None:
+                session.delete(row)
+        if other is not None and other.id is not None:
+            row = session.get(Project, other.id)
+            if row is not None:
+                session.delete(row)
+        session.commit()
+        session.close()
+
+
 def test_plugin_capabilities_match_declared_hooks():
     registry = PluginRegistry()
     load_first_party_plugins(registry)
