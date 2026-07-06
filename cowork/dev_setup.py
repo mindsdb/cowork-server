@@ -49,10 +49,15 @@ def run_dev_setup() -> None:
             session.commit()
 
     # Migrate .env settings to DB (one-time, idempotent).
-    from cowork.migrations import migrate_env_to_db
+    from cowork.migrations import backfill_minds_url, migrate_env_to_db
 
     with SQLSession(engine) as session:
         migrate_env_to_db(session)
+        # Rewrite the legacy MindsHub host (mdb.ai -> api.mindshub.ai) for
+        # users who configured MindsHub before the default flipped. Idempotent;
+        # runs every boot (not gated by the env-migration sentinel, since
+        # affected users already passed it).
+        backfill_minds_url(session)
 
     # Migrate harness-local memory into ~/.cowork/memory, then wire runtime symlinks.
     import cowork.harnesses  # noqa: F401 — registers memory adapters
@@ -64,3 +69,17 @@ def run_dev_setup() -> None:
         migrate_harness_memory_to_shared(session)
 
     ensure_all_layouts()
+
+    # Migrate DB-backed skills to agentskills.io files (one-time, idempotent).
+    from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
+
+    with SQLSession(engine) as session:
+        migrate_skills_to_files(session)
+        # Seed packaged builtin skills (versioned, idempotent).
+        seed_builtin_skills(session)
+        # Project per-project skills/ links with the canonical store.
+        from cowork.services.skill_links import reconcile_all
+        from cowork.services.skills import SkillService
+
+        reconcile_all(SkillService().list_skills())
+

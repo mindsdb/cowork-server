@@ -103,6 +103,23 @@ class TaskObjectService:
             ).all()
         )
 
+    # ── deleting ──────────────────────────────────────────────────────
+
+    def delete_for_conversation(self, conversation_id: UUID) -> int:
+        """Drop every object row a conversation owns, so deleting a chat (or
+        clearing its history) doesn't leave dangling rows that keep surfacing
+        artifacts the task no longer has. Stages the deletes on the session;
+        the caller commits as part of its own transaction. Returns the count.
+
+        Only the index is removed — on-disk artifact folders and attached file
+        bytes are left untouched (work products, managed separately)."""
+        rows = self.session.exec(
+            select(TaskObject).where(TaskObject.conversation_id == conversation_id)
+        ).all()
+        for row in rows:
+            self.session.delete(row)
+        return len(rows)
+
     # ── moving ────────────────────────────────────────────────────────
 
     def relocate_to_project(
@@ -240,3 +257,163 @@ def finalize_turn_artifacts(conversation_id, project_id, artifacts_base, before:
         if card is not None:
             cards.append(card)
     return cards
+
+
+# ── skill-draft attribution ────────────────────────────────────────────────
+# A skill the agent builds for the user (via the `skill-creator` skill) must NOT
+# auto-persist to the skills store and must NOT surface as an artifact — the
+# user explicitly Saves or Downloads it. We stage drafts under
+# `<project>/.anton/skill_drafts/<slug>/` (a sibling of `.anton/artifacts`, both
+# under the already-off-limits `.anton/` dir, so a draft is invisible to BOTH
+# the artifacts scan and skill-discovery) and surface each as a self-contained
+# `response.skill_created` event. Mirrors the artifact snapshot/diff above, but
+# is deliberately NOT indexed as a TaskObject — a draft is transient until Save.
+
+# A skill folder is a draft iff it holds the canonical SKILL.md filename.
+_DRAFT_FILE_MAX = 200_000  # per sibling file; skills are small text — cap defensively
+
+
+def snapshot_skill_drafts(drafts_base) -> set[str]:
+    """The set of skill-draft folder names under `.anton/skill_drafts`."""
+    from anton.core.tools.skill_format import SKILL_FILE
+
+    base = Path(drafts_base)
+    if not base.is_dir():
+        return set()
+    return {
+        child.name
+        for child in base.iterdir()
+        if child.is_dir() and (child / SKILL_FILE).is_file()
+    }
+
+
+def snapshot_stray_skills(project_skills_dir) -> set[str]:
+    """The set of *real* (non-symlink) skill folders under `<project>/skills`.
+
+    Every legitimately-enabled skill is a SYMLINK into the canonical store
+    (see services.skill_links). So a real directory with a SKILL.md is a skill
+    the agent wrote directly — the auto-save leak we must not persist. We diff
+    this set around the turn and relocate any newcomer into a draft.
+
+    ponytail: symlink-vs-real is the discriminator (POSIX-accurate). On Windows,
+    a non-privileged symlink can fall back to a copy/junction so is_symlink()
+    may miss it and mis-flag an enabled skill as stray. Upgrade path if Windows
+    relocation misfires: compare realpath against the canonical skills root.
+    """
+    from anton.core.tools.skill_format import SKILL_FILE
+
+    base = Path(project_skills_dir)
+    if not base.is_dir():
+        return set()
+    return {
+        child.name
+        for child in base.iterdir()
+        if child.is_dir() and not child.is_symlink() and (child / SKILL_FILE).is_file()
+    }
+
+
+def _unique_draft_dir(drafts_base: Path, slug: str) -> Path:
+    """A non-colliding destination folder inside `drafts_base` for `slug`."""
+    dest = drafts_base / slug
+    if not dest.exists():
+        return dest
+    i = 2
+    while (drafts_base / f"{slug}-{i}").exists():
+        i += 1
+    return drafts_base / f"{slug}-{i}"
+
+
+def _skill_draft_payload(folder: Path) -> dict | None:
+    """Build a SELF-CONTAINED skill-draft payload from a staged folder.
+
+    Carries everything the UI needs to render the card/modal AND to Save
+    (POST /skills) or Download offline — so replay-on-reload needs zero staging
+    files. Reuses the shared `parse_skill_dir` + `Skill` model rather than
+    re-parsing YAML.
+    """
+    from anton.core.tools.skill_format import SKILL_FILE, parse_skill_dir
+
+    from cowork.models.skill import Skill
+
+    skill_md_path = folder / SKILL_FILE
+    if not skill_md_path.is_file():
+        return None
+    try:
+        agent = parse_skill_dir(folder)
+    except Exception:
+        logger.warning("Could not parse skill draft %r", folder.name, exc_info=True)
+        return None
+    if agent is None:
+        return None
+
+    skill = Skill.model_construct(**dict(agent))
+    slug = folder.name
+    raw_md = skill_md_path.read_text(encoding="utf-8", errors="replace")
+
+    # Sibling text files (multi-file skills). Skip binaries — skills are text;
+    # a binary sibling is out of scope (download falls back to SKILL.md only).
+    files: list[dict] = []
+    for child in sorted(folder.iterdir()):
+        if child.name == SKILL_FILE or not child.is_file():
+            continue
+        try:
+            text = child.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        files.append({"name": child.name, "text": text[:_DRAFT_FILE_MAX]})
+
+    return {
+        "slug": slug,
+        "label": skill.name or slug,
+        "name": skill.display_name or skill.name or slug,
+        "description": skill.description or "",
+        "instructions": skill.instructions or "",
+        "skill_md": raw_md[:_DRAFT_FILE_MAX],  # cap like sibling files — keep the SSE payload bounded
+        "files": files,
+    }
+
+
+def finalize_turn_skill_drafts(project_path, before_drafts: set[str], before_strays: set[str]) -> list[dict]:
+    """End-of-turn skill-draft handling from a single dir diff.
+
+    1. Relocate any NEW stray (non-symlink) skill folder the agent wrote into
+       `<project>/skills` over into the drafts dir — kills the auto-save leak
+       even if the prompt/tool routing failed. Moving it in makes it show up in
+       the drafts diff below, so it travels the same card path.
+    2. Diff the drafts dir and return a self-contained payload per new draft.
+
+    Returns `[]` when nothing new. Best-effort: every step is guarded so a draft
+    can never break a turn.
+    """
+    base = Path(project_path)
+    drafts_base = base / ".anton" / "skill_drafts"
+    skills_dir = base / "skills"
+
+    # 1. Relocate stray auto-saved skills into drafts.
+    try:
+        new_strays = sorted(snapshot_stray_skills(skills_dir) - set(before_strays or ()))
+        if new_strays:
+            drafts_base.mkdir(parents=True, exist_ok=True)
+        for slug in new_strays:
+            try:
+                shutil.move(str(skills_dir / slug), str(_unique_draft_dir(drafts_base, slug)))
+            except OSError:
+                logger.warning("Could not relocate stray skill %r into drafts", slug, exc_info=True)
+    except Exception:
+        logger.warning("Stray-skill relocation failed", exc_info=True)
+
+    # 2. Diff drafts, build payloads, then remove each folder — the payload is
+    # self-contained so staging files are not needed after this point.
+    after = snapshot_skill_drafts(drafts_base)
+    new = sorted(after - set(before_drafts or ()))
+    payloads: list[dict] = []
+    for slug in new:
+        folder = drafts_base / slug
+        payload = _skill_draft_payload(folder)
+        if payload is not None:
+            payloads.append(payload)
+        try:
+            shutil.rmtree(folder)
+        except OSError:
+            logger.warning("Could not remove skill draft folder %r", slug, exc_info=True)
+    return payloads

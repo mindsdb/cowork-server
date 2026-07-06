@@ -220,13 +220,82 @@ def _load_published_map(folder: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _content_mtime(folder: Path) -> int:
+    """Max mtime (int seconds) across an artifact's user content files.
+
+    Disk-derived, so it reflects in-place edits the metadata.json mtime
+    misses. Housekeeping files (`metadata.json`, `README.md`,
+    `.published.json`) are excluded — they're not user content. Used both as
+    the renderer's cache-bust token and as the cheap "changed since publish"
+    gate for the `modified` badge.
+    """
+    try:
+        return int(max((p.stat().st_mtime for p in _user_files(folder)), default=0.0))
+    except OSError:
+        return 0
+
+
 def _published_url_for(folder: Path, primary: Path | None) -> str:
     if primary is None:
         return ""
     entry = _load_published_map(folder).get(primary.name)
     if isinstance(entry, dict):
+        # `published: False` is a soft-deleted record (kept so re-publish can
+        # reuse report_id) — it must not surface as a live URL. Legacy entries
+        # have no `published` field; a url means they're live.
+        if not entry.get("published", True):
+            return ""
         return entry.get("url", "") or ""
     return ""
+
+
+def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool:
+    """Whether a *published* artifact's content diverged from what was published.
+
+    Hybrid mtime→md5 (see the 2026-06-23 design):
+      1. Not published → not modified.
+      2. Cheap gate: content_mtime <= published_mtime → not modified.
+      3. Exact: recompute the bundle md5; compare to last_md5.
+         - differ → modified;
+         - equal (mtime bumped, content identical) → not modified, and
+           self-heal published_mtime so the next listing hits the cheap gate.
+    A md5 we can't recompute (None) is treated as "can't tell" → not modified,
+    so the badge never appears on a false positive.
+    """
+    if primary is None:
+        return False
+    pmap = _load_published_map(folder)
+    entry = pmap.get(primary.name)
+    if not isinstance(entry, dict) or not entry.get("published", True):
+        return False
+    if not entry.get("report_id"):
+        return False
+
+    published_mtime = entry.get("published_mtime")
+    if isinstance(published_mtime, (int, float)) and content_mtime <= published_mtime:
+        return False  # cheap gate — nothing touched since publish
+
+    # Local import: publish imports this module, so import lazily to avoid a
+    # circular import (mirrors _unpublish_folder below).
+    from cowork.services.publish import compute_publish_md5
+
+    current_md5 = compute_publish_md5(str(folder))
+    if current_md5 is None:
+        return False  # can't tell — don't raise a false "modified"
+    if current_md5 != entry.get("last_md5"):
+        return True
+
+    # Content identical despite the bumped mtime — heal the snapshot so we
+    # don't re-zip on every future listing. Best-effort.
+    entry["published_mtime"] = content_mtime
+    pmap[primary.name] = entry
+    try:
+        (folder / ".published.json").write_text(
+            json.dumps(pmap, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        pass
+    return False
 
 
 def _published_access_for(folder: Path, primary: Path | None) -> dict:
@@ -255,7 +324,10 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
     try:
         pmap = json.loads(published_index.read_text(encoding="utf-8"))
         entry = pmap.get(primary.name)
-        if isinstance(entry, dict):
+        # A soft-deleted record (published=False) is no longer live, so it must
+        # not report a password/restricted mode — that would draw a lock icon on
+        # an artifact whose publishedUrl is empty. Legacy entries have no flag.
+        if isinstance(entry, dict) and entry.get("published", True):
             # `mode` is authoritative; fall back to the legacy requires_password
             # flag for artifacts published before the mode field existed.
             mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
@@ -432,6 +504,12 @@ def _unpublish_folder(folder: Path) -> None:
     for name, entry in published_map.items():
         if not isinstance(entry, dict):
             continue
+        # Soft-deleted records keep their report_id so a re-publish can reuse
+        # the URL, but they're already gone from the remote — re-unpublishing
+        # would fire a redundant delete (and a transient 5xx/timeout would
+        # raise and block the artifact delete).
+        if entry.get("published") is False:
+            continue
         if not (entry.get("report_id") or entry.get("last_md5")):
             continue
         # The path-based unpublish needs the file present; a stale record
@@ -509,13 +587,8 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
 
     # Max mtime across the artifact's content files — a precise
     # "content changed" signal for the renderer's preview viewer to
-    # cache-bust/reload on (ENG-375). Disk-derived, so it reflects
-    # in-place edits that the metadata.json mtime / `updated` string
-    # miss. Rounded to an int so it's a stable cache-buster token.
-    try:
-        content_mtime = int(max((p.stat().st_mtime for p in files), default=0.0))
-    except OSError:
-        content_mtime = 0
+    # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
+    content_mtime = _content_mtime(folder)
 
     return {
         "id": meta.get("id") or folder.name,
@@ -534,10 +607,55 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
         "path": primary_path,
         "primary": meta.get("primary") or None,
         "publishedUrl": _published_url_for(folder, primary),
+        "modified": _is_modified(folder, primary, content_mtime),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
         # is the plaintext, returned only to the owner's own session.
         **_published_access_for(folder, primary),
         "serveUrl": serve_url_for(primary_path),
+    }
+
+
+def artifact_status(raw_path: str) -> dict:
+    """Fresh owner-side status for a single artifact path: its published URL,
+    the stale-since-publish ``modified`` flag, and access settings.
+
+    Reuses ``card_for_folder`` so the preview viewer's in-place refresh can
+    never disagree with the listing. Returns the published/modified/access
+    subset only — the cheap read the viewer polls on window focus to light up
+    the "Update" button when the artifact changes underneath an open preview.
+    """
+    blank = {
+        "publishedUrl": "", "modified": False, "accessMode": "public",
+        "accessProtected": False, "accessEmails": [], "orgAllowed": False,
+    }
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    except Exception:
+        return dict(blank)
+    if artifact is None:
+        return dict(blank)
+    folder = artifact if artifact.is_dir() else artifact.parent
+    card = card_for_folder(folder)
+    if card is None:
+        # Loose / legacy file (no metadata.json). When card_for_folder
+        # returns None the resolved path is always a FILE — a dir would
+        # carry metadata.json per resolve_artifact_path's allow_dir contract.
+        card = {
+            "publishedUrl": _published_url_for(artifact.parent, artifact),
+            "modified": False,
+            **_published_access_for(artifact.parent, artifact),
+        }
+    # One response shape for BOTH branches: explicitly the published /
+    # modified / access subset, and NEVER `accessPassword` — that owner-only
+    # plaintext (which `_published_access_for` and the card both carry) must
+    # not leave this endpoint.
+    return {
+        "publishedUrl": card.get("publishedUrl", ""),
+        "modified": bool(card.get("modified")),
+        "accessMode": card.get("accessMode", "public"),
+        "accessProtected": bool(card.get("accessProtected")),
+        "accessEmails": card.get("accessEmails", []),
+        "orgAllowed": bool(card.get("orgAllowed")),
     }
 
 
@@ -639,18 +757,16 @@ async def mount_preview(path: Path) -> dict:
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
 
-    published_url = ""
-    entry = _load_published_map(parent).get(path.name)
-    if isinstance(entry, dict):
-        published_url = entry.get("url", "") or ""
-
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
         "serveUrl": serve_url_for(path),
-        "publishedUrl": published_url,
+        # Route through _published_url_for so a soft-deleted (published=False)
+        # record reports an empty URL — matching the artifact grid and the
+        # fullstack branch, instead of surfacing a dead 4nton.ai link.
+        "publishedUrl": _published_url_for(parent, path),
         **_published_access_for(parent, path),
     }
 
