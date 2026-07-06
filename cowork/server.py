@@ -116,8 +116,11 @@ def create_app() -> FastAPI:
 
     # Keep secret-bearing settings responses (reveal-key, raw .env, the
     # providers list) out of clients' on-disk HTTP caches (ENG-462). The chat
-    # and submission SSE streams set no-store at their own routes.
-    app.add_middleware(_NoStoreMiddleware, prefixes=("/api/v1/settings",))
+    # and submission SSE streams set no-store at their own routes. OAuth is
+    # swept in too: GET .../oauth/{engine}/credentials returns a raw
+    # client_secret and, being a plain GET with no explicit cache directive,
+    # is cacheable by default wherever it's fetched from.
+    app.add_middleware(_NoStoreMiddleware, prefixes=("/api/v1/settings", "/api/v1/connectors/oauth"))
 
     # Include v1 API routes
     app.include_router(v1_router)
