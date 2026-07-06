@@ -78,7 +78,10 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
         yield "event: response.created\ndata: {}\n\n"
         raise exc
 
-    async def _stream_response(*, conversation, input, disabled_connections=None):
+    async def _stream_response(
+        *, conversation, input, disabled_connections=None,
+        trace_tags=None, trace_metadata=None,
+    ):
         if False:
             yield
 
