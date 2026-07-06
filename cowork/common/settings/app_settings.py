@@ -16,8 +16,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # (see cowork.services.providers.fetch_minds_models) and supplied by the
 # /settings/recommended-models endpoint. It is intentionally left empty here
 # so no aliases are hand-maintained — the working default pair lives in
-# RECOMMENDED_PAIR / *_MODEL_DEFAULTS below. MindsHub aliases are bare
-# (``sonnet``); the older ``latest:`` prefix still resolves but is deprecated.
+# RECOMMENDED_PAIR / *_MODEL_DEFAULTS below. NOTE: MindsHub's router resolves
+# only the canonical ``latest:<alias>`` form; a bare alias (``sonnet``/``haiku``)
+# is rejected with an uncaught HTTP 500 (ENG-577). The pairs below are kept bare
+# for display, and callers that hit the router normalize via
+# ``providers.canonical_minds_model`` (the live ``/v1/models`` ids are already
+# canonical). If these defaults ever reach the router unnormalized, prefix them.
 RECOMMENDED_MODELS: dict[str, list[str]] = {
     "minds-cloud": [],
     "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
