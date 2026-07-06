@@ -89,6 +89,17 @@ def validate_settings(session: SessionDep):
 
 @router.get("/configured")
 def check_configured(session: SessionDep):
+    from cowork.services.provider_registry import ProviderRegistryService
+
+    # The provider registry is checked first — it's the source of truth
+    # build_llm_client() actually routes on. Falling through to the
+    # legacy single-slot fields keeps this endpoint correct for installs
+    # that haven't touched the registry yet.
+    registry_rows = ProviderRegistryService(session).list(include_disabled=False)
+    for row in registry_rows:
+        if row.models:
+            return {"configured": True, "provider": row.type}
+
     s = SettingService(session).load()
     if s.anthropic_api_key is not None:
         return {"configured": True, "provider": "anthropic"}

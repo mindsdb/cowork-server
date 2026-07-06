@@ -238,17 +238,67 @@ class UserSettings(Settings):
 
     @property
     def config_status(self) -> dict[str, Any]:
-        """Whether the active planning provider has an API key configured."""
-        p = self.planning_provider
-        key_field = p.api_key_field
-        has_key = getattr(self, key_field, None) is not None
-        label = p.label
+        """Whether ANY execution path exists for a chat turn.
+
+        Coworker-architecture-aware (2026-07-04): ready when either
+          1. an installed CLI coworker exists (Claude Code / Antigravity /
+             Codex — run on the user's subscription login, no key), or
+          2. the provider registry has an enabled entry with a key+models.
+
+        The legacy single-slot provider fields (planning_provider +
+        *_api_key, incl. MindsHub) no longer gate anything — a stale
+        `planning_provider=minds_cloud` row used to hard-block every send
+        behind a "Subscribe with MindsHub" card even when Claude Code was
+        selected and working. Imports are lazy to avoid the
+        user_settings ⇄ harnesses import cycle.
+        """
+        # 1. Installed CLI coworker?
+        try:
+            from cowork.harnesses.base import _registry
+            for cls in _registry.values():
+                find_cli = getattr(cls, "find_cli", None)
+                if find_cli is None:
+                    continue
+                harness = cls()
+                if harness.find_cli() is not None:
+                    return {
+                        "config_ready": True,
+                        "config_error": None,
+                        "provider": "cli",
+                        "provider_label": harness.label,
+                        "model": "",
+                    }
+        except Exception:
+            pass  # registry unavailable during early boot — fall through
+
+        # 2. Usable provider-registry entry?
+        try:
+            from cowork.db.session import get_open_session
+            from cowork.services.provider_registry import ProviderRegistryService
+
+            session = get_open_session()
+            try:
+                rows = ProviderRegistryService(session).list(include_disabled=False)
+            finally:
+                session.close()
+            usable = next((r for r in rows if r.api_key_encrypted and r.models), None)
+            if usable is not None:
+                return {
+                    "config_ready": True,
+                    "config_error": None,
+                    "provider": usable.type,
+                    "provider_label": usable.label,
+                    "model": usable.models[0] if usable.models else "",
+                }
+        except Exception:
+            pass
+
         return {
-            "config_ready": has_key,
-            "config_error": None if has_key else f"Configure {key_field} for {label}.",
-            "provider": p.value,
-            "provider_label": label,
-            "model": self.planning_model or "",
+            "config_ready": False,
+            "config_error": "No coworker available — install a CLI agent (e.g. Claude Code) or add a model source in Settings.",
+            "provider": "none",
+            "provider_label": "None",
+            "model": "",
         }
 
     @staticmethod

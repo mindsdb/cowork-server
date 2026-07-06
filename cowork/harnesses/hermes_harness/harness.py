@@ -63,6 +63,46 @@ def _sync_hermes_config(provider: str, api_key: str | None) -> None:
         os.environ[env_var] = api_key
 
 
+def _resolve_hermes_model_override(model_override: str):
+    """Resolve a '{provider_slug}/{model_id}' composer pick to the
+    (provider, base_url, api_key, model) tuple AIAgent expects.
+
+    Unlike the Anton harness, Hermes wraps a single external AIAgent
+    instance per turn — there is no failover chain here. If the resolved
+    candidate's request fails, the turn fails; the registry's other
+    entries are only used as failover when running through Anton.
+    Returns None if the string doesn't resolve, so the caller falls back
+    to the legacy Settings-derived provider.
+    """
+    from cowork.db.session import get_open_session
+    from cowork.services.provider_registry import ProviderRegistryService
+    from cowork.services.providers import minds_chat_base_url
+
+    slug, _, model_id = model_override.partition("/")
+    if not model_id:
+        return None
+
+    session = get_open_session()
+    try:
+        row = ProviderRegistryService(session).get(slug)
+        if row is None or not row.enabled:
+            return None
+        api_key = ProviderRegistryService.decrypt_key(row)
+    finally:
+        session.close()
+    if not api_key:
+        return None
+
+    if row.type == "minds-cloud":
+        provider = "openai"
+        base_url = minds_chat_base_url(row.base_url or "https://api.mindshub.ai")
+    else:
+        provider = row.type  # already kebab-case: anthropic | openai | gemini | openai-compatible
+        base_url = row.base_url or _PROVIDER_BASE_URLS.get(provider)
+
+    return provider, base_url, api_key, model_id
+
+
 def _build_datasource_context(vault, disabled_keys: set[tuple[str, str]]) -> str:
     """Build a system-prompt section listing connected data sources and their DS_* env var names."""
     try:
@@ -103,6 +143,14 @@ class HermesHarness:
     id: str = "hermes"
     label: str = "Hermes"
     formatter = staticmethod(format_hermes_stream)
+
+    category = "Agent"
+    priority = 20
+    tags = ("free-forever", "independent-tools")
+
+    @classmethod
+    def configuration_schema(cls) -> list[dict]:
+        return [{"type": "model-picker", "id": "model"}]
 
     async def sync_skills(self, skills: list[Skill]) -> None:
         import shutil
@@ -187,7 +235,7 @@ class HermesHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
@@ -235,6 +283,7 @@ class HermesHarness:
                     history,
                     project_path=project_path,
                     conversation_topic=conversation_topic,
+                    model_override=model,
                     stream_callback=stream_callback,
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
@@ -276,6 +325,7 @@ class HermesHarness:
         *,
         project_path: str,
         conversation_topic: str | None = None,
+        model_override: str | None = None,
         stream_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -320,21 +370,46 @@ class HermesHarness:
             "outputs anywhere else in the project."
         )
 
-        # Sync Hermes config.yaml with the user's cowork provider/key settings.
-        # AIAgent validates config.yaml at init time (before using constructor
-        # args), so the file must reflect the active provider and the matching
-        # API key env var must be set.
-        settings = get_user_settings()
-        model = settings.planning_model
-        provider_value = settings.planning_provider.value if settings.planning_provider != Provider.MINDS_CLOUD else "openai"
-        api_key_value = (
-            settings.minds_api_key.get_secret_value()
-            if settings.planning_provider == Provider.MINDS_CLOUD
-            else getattr(settings, f"{provider_value}_api_key", None)
-        )
-        if api_key_value and hasattr(api_key_value, "get_secret_value"):
-            api_key_value = api_key_value.get_secret_value()
+        # Resolve which provider/model serves this turn: the composer's
+        # per-turn registry pick if it resolves, else the legacy Settings
+        # fields — unchanged behavior for installs that haven't added any
+        # registry entries.
+        resolved = _resolve_hermes_model_override(model_override) if model_override else None
+        if resolved is not None:
+            provider_value, base_url, api_key_value, model = resolved
+        else:
+            settings = get_user_settings()
+            model = settings.planning_model
+            if settings.planning_provider == Provider.MINDS_CLOUD:
+                from cowork.services.providers import minds_chat_base_url
+                provider_value = "openai"
+                base_url = minds_chat_base_url(settings.minds_url)
+                api_key_value = settings.minds_api_key.get_secret_value() if settings.minds_api_key else None
+            else:
+                # The DB enum uses snake_case (openai_compatible) but AIAgent
+                # expects kebab-case (openai-compatible).
+                provider_value = settings.planning_provider.value.replace("_", "-")
+                key_field = settings.planning_provider.api_key_field
+                key_obj = getattr(settings, key_field)
+                api_key_value = key_obj.get_secret_value() if key_obj else None
+                # AIAgent needs both api_key AND base_url to skip its
+                # config.yaml provider-resolution path. Anthropic is handled
+                # separately by AIAgent (auto-detects provider="anthropic").
+                base_url = _PROVIDER_BASE_URLS.get(provider_value)
+                if provider_value == "openai-compatible" and settings.openai_base_url:
+                    base_url = settings.openai_base_url
 
+        # Sync Hermes config.yaml with the resolved provider/key. AIAgent
+        # validates config.yaml at init time (before using constructor
+        # args), so the file must reflect the active provider and the
+        # matching API key env var must be set.
+        #
+        # KNOWN LIMITATION: this writes a process-wide env var
+        # (os.environ) per turn, so two concurrent Hermes turns picking
+        # different providers can race. Low-impact for single-user
+        # desktop/web use; would need per-turn subprocess isolation to
+        # fix properly, which is out of scope here since hermes-agent is
+        # an external dependency, not a submodule we own.
         _sync_hermes_config(provider_value, api_key_value)
 
         vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
@@ -346,54 +421,22 @@ class HermesHarness:
         datasource_context = _build_datasource_context(vault, disabled_keys)
         system_context = f"{datasource_context}\n\n{artifact_context}"
 
-        if settings.planning_provider == Provider.MINDS_CLOUD:
-            from cowork.services.providers import minds_chat_base_url
-            agent = AIAgent(
-                session_id=session_id,
-                provider="openai",
-                base_url=minds_chat_base_url(settings.minds_url),
-                model=model,
-                api_key=settings.minds_api_key.get_secret_value(),
-                quiet_mode=True,
-                ephemeral_system_prompt=system_context,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                # tool_progress_callback=tool_progress_callback,  -- This seems to fire on start and end too.
-                reasoning_callback=reasoning_callback,
-                thinking_callback=thinking_callback,
-            )
-        else:
-            # The DB enum uses snake_case (openai_compatible) but AIAgent
-            # expects kebab-case (openai-compatible).
-            provider = settings.planning_provider.value.replace("_", "-")
-            key_field = settings.planning_provider.api_key_field
-            api_key = getattr(settings, key_field).get_secret_value()
+        kwargs = dict(
+            session_id=session_id,
+            provider=provider_value,
+            model=model,
+            api_key=api_key_value,
+            quiet_mode=True,
+            ephemeral_system_prompt=system_context,
+            tool_start_callback=tool_start_callback,
+            tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
+            thinking_callback=thinking_callback,
+        )
+        if base_url:
+            kwargs["base_url"] = base_url
 
-            # AIAgent needs both api_key AND base_url to skip its config.yaml
-            # provider-resolution path.  For providers that use the OpenAI-
-            # compatible API (openai, gemini, openai-compatible), we must
-            # supply a base_url. Anthropic is handled separately by AIAgent
-            # (it detects provider="anthropic" and switches to the Anthropic
-            # Messages API internally).
-            base_url = _PROVIDER_BASE_URLS.get(provider)
-            if provider == "openai-compatible" and settings.openai_base_url:
-                base_url = settings.openai_base_url
-
-            kwargs = dict(
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                quiet_mode=True,
-                ephemeral_system_prompt=system_context,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                reasoning_callback=reasoning_callback,
-                thinking_callback=thinking_callback,
-            )
-            if base_url:
-                kwargs["base_url"] = base_url
-
-            agent = AIAgent(**kwargs)
+        agent = AIAgent(**kwargs)
 
         # The conversation id doubles as run_agent's task_id: dispatch
         # forwards it to every tool handler (including on the concurrent

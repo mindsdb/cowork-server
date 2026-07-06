@@ -45,6 +45,14 @@ class AntonHarness:
     label: str = "Anton"
     formatter = staticmethod(format_responses_stream)
 
+    category = "Agent"
+    priority = 10
+    tags = ("free-forever", "memory", "tools")
+
+    @classmethod
+    def configuration_schema(cls) -> list[dict]:
+        return [{"type": "model-picker", "id": "model"}]
+
     async def sync_skills(self, skills: list[Skill]) -> None:
         from datetime import datetime, timezone
         from anton.core.memory.skills import Skill as AntonSkill, SkillStore
@@ -167,13 +175,13 @@ class AntonHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
         try:
             session, temp_vault_dir = await self._build_chat_session(
-                conversation, disabled_connections=disabled_connections or []
+                conversation, model=model, disabled_connections=disabled_connections or []
             )
             async for event in session.turn_stream(self._to_anton_input(input)):
                 yield event
@@ -201,7 +209,7 @@ class AntonHarness:
     async def _build_chat_session(
         self,
         conversation: Conversation,
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
@@ -305,7 +313,7 @@ class AntonHarness:
         for directory in (artifacts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client()
+        llm_client = self._build_llm_client(model)
         self_awareness = SelfAwarenessContext(context_dir)
         global_memory_dir = Path(AntonHarnessSettings().global_memory_root_dir)
         global_memory_dir.mkdir(parents=True, exist_ok=True)
@@ -418,6 +426,6 @@ class AntonHarness:
         return ChatSession(config), temp_vault_dir
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(model: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
+        return build_llm_client(model)

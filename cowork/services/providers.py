@@ -95,6 +95,52 @@ async def fetch_minds_models(minds_url: str, api_key: str) -> Optional[list[str]
     return _remember(ids or None)
 
 
+async def fetch_openai_compatible_models(base_url: str, api_key: str) -> Optional[list[str]]:
+    """Fetch model ids from any OpenAI-compatible `/models` endpoint (NVIDIA
+    NIM, Gemini's AI-Studio endpoint, OpenAI itself, generic openai-compatible).
+    Returns None on any failure so callers fall back to a manually-typed list."""
+    if not base_url or not api_key:
+        return None
+    base = base_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), follow_redirects=True) as client:
+            r = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {api_key}"})
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+    except Exception as exc:
+        logger.debug("openai-compatible /models fetch failed for %s: %s", base, exc)
+        return None
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return None
+    ids = [str(row.get("id")).strip() for row in rows if isinstance(row, dict) and row.get("id")]
+    ids = [i for i in ids if i]
+    return ids or None
+
+
+async def fetch_anthropic_models(api_key: str) -> Optional[list[str]]:
+    if not api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            r = await client.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            )
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+    except Exception as exc:
+        logger.debug("anthropic /models fetch failed: %s", exc)
+        return None
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return None
+    ids = [str(row.get("id")).strip() for row in rows if isinstance(row, dict) and row.get("id")]
+    return ids or None
+
+
 # ── Config readiness ─────────────────────────────────────────────────
 
 
@@ -242,19 +288,148 @@ async def validate_provider(provider: str, api_key: str,
     return {"ok": False, "error": "Unknown provider"}
 
 
-def build_llm_client():
-    """Build an Anton LLMClient from the current user settings.
+# ── Provider registry — multi-source failover ───────────────────────
+#
+# Registry entries (cowork.models.provider_config.ProviderConfig) are
+# each one API key + base URL + model list, keyed by a stable slug.
+# `build_llm_client(model="{slug}/{model_id}")` resolves that pick as
+# the primary candidate and appends every other enabled registry entry
+# as a failover fallback (see FailoverLLMProvider) — a free-tier 429 on
+# the chosen model degrades to the next free source instead of failing
+# the turn. When the registry is empty, behavior is byte-for-byte the
+# legacy single-slot path (`_build_legacy_llm_client`), so a fresh
+# install with only the old Settings fields configured keeps working
+# unchanged.
+
+_REGISTRY_DEFAULT_BASE_URLS = {
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "openai": "https://api.openai.com/v1",
+}
+
+
+def _provider_for_row(row):
+    """Build an LLMProvider for one registry row, or None if it can't be used
+    (missing key, or a base_url-requiring type with no base_url set)."""
+    from anton.core.llm.anthropic import AnthropicProvider
+    from anton.core.llm.openai import OpenAIProvider
+    from cowork.services.provider_registry import ProviderRegistryService
+
+    key = ProviderRegistryService.decrypt_key(row)
+    if not key:
+        return None
+    if row.type == "anthropic":
+        return AnthropicProvider(api_key=key)
+
+    base_url = row.base_url or _REGISTRY_DEFAULT_BASE_URLS.get(row.type)
+    if not base_url:
+        logger.warning("Provider '%s' (type=%s) has no base_url configured — skipping", row.slug, row.type)
+        return None
+    return OpenAIProvider(api_key=key, base_url=base_url)
+
+
+def _candidates_for_rows(rows, *, pick_last_model: bool):
+    from cowork.services.failover_provider import Candidate
+
+    candidates = []
+    for row in rows:
+        if not row.enabled or not row.models:
+            continue
+        provider = _provider_for_row(row)
+        if provider is None:
+            continue
+        model_id = row.models[-1] if pick_last_model and len(row.models) > 1 else row.models[0]
+        candidates.append(Candidate(provider=provider, model=model_id, label=f"{row.slug}/{model_id}"))
+    return candidates
+
+
+def _resolve_model_override(rows, model: str):
+    """Resolve a '{slug}/{model_id}' request string to (Candidate, slug), or None."""
+    from cowork.services.failover_provider import Candidate
+
+    slug, _, model_id = model.partition("/")
+    if not model_id:
+        return None
+    row = next((r for r in rows if r.slug == slug and r.enabled), None)
+    if row is None:
+        return None
+    provider = _provider_for_row(row)
+    if provider is None:
+        return None
+    return Candidate(provider=provider, model=model_id, label=f"{row.slug}/{model_id}"), slug
+
+
+def build_llm_client(model: str | None = None):
+    """Build an Anton LLMClient, optionally pinned to a specific registered
+    model for this turn, with automatic failover across the rest of the
+    enabled provider registry.
+
+    `model` is a "{slug}/{model_id}" string as offered by the composer's
+    model picker (see ProviderRegistryService). When it doesn't resolve
+    (unknown slug, disabled provider, or None), falls back to priority-
+    ordered default routing across the registry, and if the registry has
+    no entries at all, to the legacy single-slot Settings fields —
+    unchanged behavior for installs that haven't touched the new registry.
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
     """
     from anton.core.llm.client import LLMClient
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.session import get_open_session
+    from cowork.services.failover_provider import FailoverLLMProvider
+    from cowork.services.provider_registry import ProviderRegistryService
+
+    settings = get_user_settings()
+    session = get_open_session()
+    try:
+        rows = ProviderRegistryService(session).list(include_disabled=False)
+    finally:
+        session.close()
+
+    if not rows:
+        return _build_legacy_llm_client(settings)
+
+    rows_sorted = sorted(rows, key=lambda r: (r.priority, r.slug))
+
+    if model:
+        resolved = _resolve_model_override(rows_sorted, model)
+        if resolved is not None:
+            primary, primary_slug = resolved
+            fallback = _candidates_for_rows(
+                [r for r in rows_sorted if r.slug != primary_slug], pick_last_model=False
+            )
+            provider = FailoverLLMProvider([primary, *fallback])
+            return LLMClient(
+                planning_provider=provider,
+                planning_model=primary.model,
+                coding_provider=provider,
+                coding_model=primary.model,
+            )
+        logger.warning("Requested model '%s' did not resolve to a registered provider; using default routing", model)
+
+    planning_candidates = _candidates_for_rows(rows_sorted, pick_last_model=False)
+    if not planning_candidates:
+        return _build_legacy_llm_client(settings)
+    coding_candidates = _candidates_for_rows(rows_sorted, pick_last_model=True) or planning_candidates
+
+    planning_provider = FailoverLLMProvider(planning_candidates)
+    coding_provider = FailoverLLMProvider(coding_candidates)
+    return LLMClient(
+        planning_provider=planning_provider,
+        planning_model=planning_candidates[0].model,
+        coding_provider=coding_provider,
+        coding_model=coding_candidates[0].model,
+    )
+
+
+def _build_legacy_llm_client(settings):
+    """The original single-slot provider resolution, kept verbatim as the
+    fallback path for installs with an empty provider registry."""
+    from anton.core.llm.client import LLMClient
     from anton.core.llm.anthropic import AnthropicProvider
     from anton.core.llm.openai import OpenAIProvider
 
-    from cowork.common.settings.user_settings import get_user_settings, Provider
-
-    settings = get_user_settings()
+    from cowork.common.settings.user_settings import Provider
 
     def _make_provider(role: Provider):
         if role == Provider.MINDS_CLOUD:

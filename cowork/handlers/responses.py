@@ -41,6 +41,16 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+        # A per-conversation coworker pick (composer) overrides the global
+        # default. Resolved here (not in __init__) so the same handler
+        # instance's default construction cost is only paid once per
+        # request regardless of whether an override is present.
+        if request.harness:
+            try:
+                self.harness = get_harness(request.harness)
+            except ValueError:
+                logger.warning("Requested harness '%s' is not registered; using default '%s'",
+                                request.harness, self.harness.id)
         await self.harness.sync_skills(SkillService(self.session).list_skills())
 
         conversation_service = ConversationService(self.session)
@@ -98,13 +108,14 @@ class ResponsesHandler:
         self.session.commit()
         self.session.refresh(user_message)
 
-        # The model provided as part of the request is ignored for now, because the Cowork
-        # UI does not currently provide a way to specify it when making each request.
-        # It is only extracted from the values specified in the settings.
+        # `request.model` is a "{provider_slug}/{model_id}" pick from the
+        # composer's model picker (see cowork.services.provider_registry).
+        # When absent or unresolvable, each harness falls back to its own
+        # default routing.
         stream = self.harness.stream_response(
             conversation=conversation,
             input=harness_input,
-            # model=request.model,
+            model=request.model,
             disabled_connections=[dc.model_dump() for dc in request.disabled_connections]
             if request.disabled_connections else None,
         )

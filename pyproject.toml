@@ -53,7 +53,7 @@ packages = ["cowork"]
 
 [tool.uv.sources]
 anton = { git = "https://github.com/mindsdb/anton.git", tag = "v2.26.5.29.3" }
-hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
+hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "d880b5be098893e7d766a9179da3501181c6fdb8" }
 
 [dependency-groups]
 dev = [

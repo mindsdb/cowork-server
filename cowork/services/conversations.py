@@ -143,13 +143,24 @@ class ConversationService:
         events: list[dict],
         harness: str | None = None,
     ) -> None:
-        """Persist an assistant message and its streaming events."""
-        if not text:
+        """Persist an assistant message and its streaming events.
+
+        A turn that produced no text (every provider rate-limited, a CLI
+        coworker errored before output, etc.) must still leave an
+        assistant row: the user message was already committed, so
+        dropping the turn would put two consecutive user messages in the
+        history — which downstream harnesses reject or mishandle (the
+        "consecutive Role.user" warning). Persist a visible placeholder
+        instead so `(user, assistant)` pairing always holds. Empty turns
+        that carry no events at all (nothing happened) are still skipped.
+        """
+        if not text and not events:
             return
+        content = text or "[No response was produced for this turn.]"
         assistant_msg = Message(
             conversation_id=conversation_id,
             role="assistant",
-            content=text,
+            content=content,
             harness=harness,
         )
         self.session.add(assistant_msg)
