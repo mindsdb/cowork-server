@@ -6,7 +6,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
@@ -103,33 +103,6 @@ class AntonHarness:
     label: str = "Anton"
     formatter = staticmethod(format_responses_stream)
 
-    async def sync_skills(self, skills: list[Skill]) -> None:
-        from datetime import datetime, timezone
-        from anton.core.memory.skills import Skill as AntonSkill, SkillStore
-        
-        from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
-
-        settings = AntonHarnessSettings()
-        store = SkillStore(Path(settings.skills_root_dir))
-        active_labels: set[str] = set()
-        for skill in skills:
-            anton_skill = AntonSkill(
-                label=skill.label,
-                name=skill.name,
-                description=skill.description or "",
-                when_to_use=skill.when_to_use or "",
-                declarative_md=skill.instructions,
-                created_at=skill.created_at.isoformat() if skill.created_at else datetime.now(timezone.utc).isoformat(),
-                provenance="cowork",  # Helps track which skills originated from cowork.
-            )
-            store.save(anton_skill)
-            active_labels.add(skill.label)
-
-        # Delete any existing Anton skills that are not in the current list.
-        for existing in store.list_all():
-            if existing.provenance == "cowork" and existing.label not in active_labels:
-                store.delete(existing.label)
-
     async def stream_response(
         self,
         *,
@@ -143,10 +116,25 @@ class AntonHarness:
         # with its own session id and doesn't tag artifacts with the cowork
         # conversation_id, so we diff the project's artifacts dir around the run
         # (see services.task_objects.finalize_turn_artifacts).
-        from cowork.services.task_objects import finalize_turn_artifacts, snapshot_artifact_slugs
-        artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
+        from cowork.services.task_objects import (
+            finalize_turn_artifacts,
+            finalize_turn_skill_drafts,
+            snapshot_artifact_slugs,
+            snapshot_skill_drafts,
+            snapshot_stray_skills,
+        )
+        project_path = Path(conversation.project.path)
+        artifacts_base = project_path / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Skill drafts surface as cards (never auto-saved). Anton has no
+        # skill-draft tool (it runs anton-core's own registry), so routing is
+        # prompt + dir-diff only — consistent with its artifact flow. The
+        # stray-skills relocation in finalize_turn_skill_drafts is the backstop.
+        skill_drafts_base = project_path / ".anton" / "skill_drafts"
+        before_drafts = snapshot_skill_drafts(skill_drafts_base)
+        before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
+        skill_drafts: list[dict] = []
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation, disabled_connections=disabled_connections or []
@@ -162,8 +150,13 @@ class AntonHarness:
             cards = finalize_turn_artifacts(
                 conversation.id, conversation.project_id, artifacts_base, before_slugs,
             )
+            skill_drafts = finalize_turn_skill_drafts(
+                project_path, before_drafts, before_strays,
+            )
         for card in cards:
             yield ArtifactCreated(card)
+        for draft in skill_drafts:
+            yield SkillCreated(draft)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -206,6 +199,7 @@ class AntonHarness:
         from .tools import (
             build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
+            build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             # build_cowork_fetch_submission_tool,
             # build_cowork_update_form_tool,
@@ -213,6 +207,7 @@ class AntonHarness:
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
+        LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         # TODO: Determine if these two tools are really needed.
         # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
         # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
@@ -233,8 +228,13 @@ class AntonHarness:
         from cowork.common.settings.user_settings import get_user_settings
         from pydantic import SecretStr
 
-        settings = AntonSettings()
-        settings.resolve_workspace(str(base))
+        anton_settings = AntonSettings()
+        anton_settings.resolve_workspace(str(base))
+
+        # Per-project skills
+        project_skills_dir = base / "skills"
+        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        anton_settings.skills_root = project_skills_dir
 
         user = get_user_settings()
         for attr in (
@@ -242,7 +242,6 @@ class AntonHarness:
             "coding_provider", "coding_model",
             "memory_enabled", "memory_mode",
             "episodic_memory", "proactive_dashboards", "act_first",
-            "publish_url",
         ):
             db_val = getattr(user, attr, None)
             if db_val is None:
@@ -253,19 +252,20 @@ class AntonHarness:
             # (openai-compatible, minds-cloud).
             if hasattr(db_val, "value"):
                 db_val = db_val.value.replace("_", "-")
-            setattr(settings, attr, db_val)
+            setattr(anton_settings, attr, db_val)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
             db_val = getattr(user, attr, None)
             if db_val is not None:
-                setattr(settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
+                setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
 
-        # URLs (skip empty strings so AntonSettings.model_post_init derivations are preserved)
-        for attr in ("minds_url", "openai_base_url"):
+        # URLs (skip empty strings so AntonSettings.model_post_init derivations
+        # and AntonSettings' own publish_url default are preserved)
+        for attr in ("minds_url", "openai_base_url", "publish_url"):
             db_val = getattr(user, attr, None)
             if db_val:
-                setattr(settings, attr, db_val)
+                setattr(anton_settings, attr, db_val)
 
         workspace = Workspace(base)
         workspace.initialize()
@@ -281,10 +281,14 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
-        context_dir = _settings_path(getattr(settings, "context_dir", None), anton_dir / "context")
+        # Skills the agent builds stage here (sibling of artifacts, under the
+        # off-limits .anton/) — never the live skills store, so a built skill is
+        # surfaced as a draft card rather than auto-saved.
+        skill_drafts_dir = anton_dir / "skill_drafts"
+        context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
         project_memory_dir = anton_dir / "memory"
-        for directory in (artifacts_dir, context_dir, episodes_dir, project_memory_dir):
+        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
         llm_client = self._build_llm_client()
@@ -297,7 +301,7 @@ class AntonHarness:
         cortex = Cortex(
             global_hc=Hippocampus(global_memory_dir),
             project_hc=Hippocampus(project_memory_dir),
-            mode=settings.memory_mode if settings.memory_enabled else "off",
+            mode=anton_settings.memory_mode if anton_settings.memory_enabled else "off",
             llm_client=llm_client,
         )
         # TODO: Is episodic memory required given that we are handling history outside of the harness?
@@ -344,6 +348,16 @@ class AntonHarness:
             "`with open(f\"{path}/dashboard.html\", \"w\") as f: ...`\n"
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
         )
+        # A skill is NOT an artifact and is NOT auto-saved. When the agent builds
+        # or improves a skill (e.g. via skill-creator), stage it under the drafts
+        # dir — the turn-end diff surfaces it as a card the user saves/downloads.
+        skill_output_context = (
+            f"Skills you build or improve for the user (e.g. while running the skill-creator skill) "
+            f"are DRAFTS — write each as its own folder under `{str(skill_drafts_dir)}/<skill-name>/SKILL.md` "
+            "(one folder per skill, plus any sibling files). A skill is NOT an artifact: never call "
+            "`create_artifact` for a skill, and NEVER write a skill into the project `skills/` directory. "
+            "The staged skill surfaces as a card the user explicitly saves or downloads; it is not saved until they do."
+        )
 
         from cowork.common.settings.app_settings import get_app_settings
 
@@ -368,16 +382,30 @@ class AntonHarness:
         cells = extract_scratchpad_cells_from_message_events(conversation.messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
-        history = [message.to_openai_message() for message in conversation.messages if message.role in {"user", "assistant"}]
+        # Per-message timestamps: embed each message's created_at so the agent
+        # always knows WHEN something was said (even resuming a conversation
+        # days/weeks later). Absolute stamps are fixed per message, so the
+        # history prefix stays byte-stable across turns (cache-safe).
+        def _stamped(m):
+            om = m.to_openai_message().model_dump()
+            ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+            if ts and isinstance(om.get("content"), str) and om["content"]:
+                om["content"] = f"[{ts}] {om['content']}"
+            return om
+
+        initial_history = [
+            _stamped(m) for m in conversation.messages
+            if m.role in {"user", "assistant"}
+        ]
 
         config = ChatSessionConfig(
             llm_client=llm_client,
-            settings=settings,
+            settings=anton_settings,
             self_awareness=self_awareness,
             cortex=cortex,
             # episodic=episodic,
             system_prompt_context=SystemPromptContext(
-                runtime_context=build_runtime_context(settings),
+                runtime_context=build_runtime_context(anton_settings),
                 suffix=(
                     "The Anton CoWork desktop UI displays progress, tool usage, and actions "
                     "as separate structured activity rows. Keep assistant text focused on the "
@@ -386,23 +414,29 @@ class AntonHarness:
                     "is itself the final answer the user needs."
                     f"{project_context}"
                     f"{output_context}"
+                    f"{skill_output_context}"
                 ),
             ),
             workspace=workspace,
             data_vault=data_vault,
-            initial_history=[message.model_dump() for message in history],
+            initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
-            proactive_dashboards=settings.proactive_dashboards,
-            act_first=settings.act_first,
+            proactive_dashboards=anton_settings.proactive_dashboards,
+            act_first=anton_settings.act_first,
+            # "Conversation started" stamp for the cache-stable prompt prefix
+            # (anton 2a). The live current time is rendered separately in the
+            # volatile tail, so resuming days later still reports the real "now".
+            started_at=conversation.created_at,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
                 PUBLISH_TOOL,
                 LOOKUP_CONNECTOR_TOOL,
                 REQUEST_CREDENTIALS_TOOL,
+                LABEL_CONNECTION_TOOL,
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
             ],

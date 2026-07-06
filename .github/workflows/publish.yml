@@ -16,11 +16,12 @@ env:
   CALVER_MAJOR: 0
 
 jobs:
+  unit-tests:
+    uses: ./.github/workflows/tests-unit.yml
+
   auto-release:
+    needs: unit-tests
     runs-on: ubuntu-latest
-    # Skip auto-version commits to prevent loops (belt-and-suspenders;
-    # GITHUB_TOKEN commits don't trigger workflows anyway)
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:

@@ -1,10 +1,11 @@
-"""Publish service — publish HTML artifacts to 4nton.ai.
+"""Publish service — publish HTML artifacts to MindsHub.
 
 Ported from cowork/server/routes/utilities.py (publish section).
 Uses a local JSON state file for publish history tracking.
 """
 from __future__ import annotations
 
+import hashlib
 import html as _html
 import json
 import logging
@@ -13,15 +14,19 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import SecretStr
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import get_user_settings
+from cowork.services.providers import publish_url_for_endpoint
+from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from cowork.services.artifacts import (
     _artifact_root_for,
+    _content_mtime,
     _fullstack_types,
     _load_metadata,
+    _load_published_map,
     _pick_primary,
     _user_files,
     html_artifacts,
@@ -36,7 +41,9 @@ def _cowork_state_dir() -> Path:
     if base:
         path = Path(base).expanduser()
     else:
-        path = Path.home() / ".anton" / "cowork"
+        # Consolidated under ~/.cowork (was ~/.anton/cowork); the desktop app
+        # migrates the existing state.json on first run.
+        path = Path.home() / ".cowork"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -117,13 +124,32 @@ def _resolve_publish_target(artifact: Path) -> tuple[Path, Path, str, bool]:
     return artifact_root, artifact_root, "index.html", False
 
 
+def _resolve_publish_endpoint(settings) -> tuple[str, str]:
+    """Resolve the (publish base URL, api key) for the active provider's env.
+
+    Publishing follows the env the provider points at: a custom OpenAI-compatible
+    MindsHub endpoint (dev/staging) wins over the default minds_url (prod) and
+    authenticates with that provider's own key — so pointing the provider at
+    dev/staging publishes there too. An explicit `publish_url` setting still
+    overrides the derived host. api key is "" when the chosen provider has none.
+    """
+    oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
+    if oai_host.startswith("api.") and oai_host.endswith(".mindshub.ai"):
+        endpoint = settings.openai_base_url
+        api_key = _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
+    else:
+        endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
+    return settings.publish_url or publish_url_for_endpoint(endpoint), api_key
+
+
 def list_publishable() -> dict:
     settings = get_user_settings()
     state = _load_state()
+    publish_url, api_key = _resolve_publish_endpoint(settings)
     return {
         "artifacts": html_artifacts(),
-        "publishReady": bool(_secret_str(settings.minds_api_key)),
-        "publishUrl": settings.publish_url or "https://4nton.ai",
+        "publishReady": bool(api_key),
+        "publishUrl": publish_url,
         "history": state.get("publish_history", [])[:40],
     }
 
@@ -214,7 +240,7 @@ def _resolve_access(
     return {"mode": "public"}, pwd_version, access_version, {"mode": "public", "requires_password": False}
 
 
-# Static artifact extensions a user can publish to a 4nton.ai web page.
+# Static artifact extensions a user can publish to a MindsHub web page.
 # `.html` is served as-is; `.md` is rendered to a styled HTML page first
 # (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
 # publish their directory regardless of the primary file's suffix.
@@ -319,9 +345,9 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
 
 def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None) -> dict:
     settings = get_user_settings()
-    api_key = _secret_str(settings.minds_api_key)
+    publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
-        raise ValueError("Configure your Minds API key in Settings before publishing")
+        raise ValueError("Configure your provider API key in Settings before publishing")
 
     # The request path is either the artifact folder (folder-based
     # artifacts) or a single file (legacy loose-HTML / chat-bubble / the
@@ -362,7 +388,6 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
         publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
 
-    publish_url = settings.publish_url or "https://4nton.ai"
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
         result = publish(
@@ -405,6 +430,11 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             "report_id": returned_report_id,
             "url": view_url,
             "last_md5": result.get("md5", ""),
+            # Snapshot of the artifact's content mtime at publish time — the
+            # cheap gate for the `modified` badge (see card_for_folder). Uses
+            # the SAME basis as the card's `mtime` so the comparison is exact.
+            "published_mtime": _content_mtime(published_dir),
+            "published": True,
             **owner_side,
         }
         published_map[published_key] = entry
@@ -427,11 +457,53 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
     }
 
 
+def compute_publish_md5(raw_path: str) -> str | None:
+    """Recompute the md5 of the publish bundle for an artifact path.
+
+    Matches the `last_md5` the lambda stores at publish time (md5 of the zip
+    bytes `anton.publisher` produces). Mirrors `publish_artifact`'s source
+    resolution exactly: markdown renders to a throwaway index.html first;
+    static publishes the single primary file; fullstack publishes the
+    artifact directory.
+
+    Returns None when the artifact can't be resolved or bundled — the caller
+    treats None as "can't tell" and does not flag the artifact as modified.
+    """
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(artifact)
+    except Exception:
+        return None
+    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+        return None
+    try:
+        from anton.publisher import _zip_fullstack, _zip_html
+    except Exception:
+        return None
+
+    md_tmp_dir: tempfile.TemporaryDirectory | None = None
+    try:
+        publish_source = publish_target
+        if not is_fullstack and publish_target.suffix.lower() == ".md":
+            md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-md5-")
+            publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+        if is_fullstack:
+            zipped, _included = _zip_fullstack(publish_source)
+        else:
+            zipped = _zip_html(publish_source)
+    except Exception:
+        return None
+    finally:
+        if md_tmp_dir is not None:
+            md_tmp_dir.cleanup()
+    return hashlib.md5(zipped).hexdigest()
+
+
 def unpublish_artifact(raw_path: str) -> dict:
     settings = get_user_settings()
-    api_key = _secret_str(settings.minds_api_key)
+    publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
-        raise ValueError("Configure your Minds API key in Settings before unpublishing")
+        raise ValueError("Configure your provider API key in Settings before unpublishing")
 
     artifact = resolve_artifact_path(raw_path, allow_dir=True)
     # Mirror publish: resolve the same .published.json location + key
@@ -458,7 +530,6 @@ def unpublish_artifact(raw_path: str) -> dict:
     except Exception as exc:
         raise RuntimeError("Anton publisher is unavailable") from exc
 
-    publish_url = settings.publish_url or "https://4nton.ai"
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
         unpublish(
@@ -475,12 +546,239 @@ def unpublish_artifact(raw_path: str) -> dict:
             logger.exception("Unpublishing failed (identifier=%s)", identifier)
             raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
-    published_map.pop(published_key, None)
-    try:
-        if published_map:
+    # Soft-delete: keep report_id (and url) so a later re-publish reuses the
+    # same public URL. Only flip `published` off so readers stop showing it as
+    # live. The backend object is gone, but lambda re-mints at the same id when
+    # we resend report_id on the next publish.
+    if isinstance(entry, dict):
+        entry["published"] = False
+        published_map[published_key] = entry
+        try:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
-        else:
-            published_json.unlink()
+        except Exception:
+            pass
+    return {"status": "ok"}
+
+
+def update_artifact(raw_path: str) -> dict:
+    """Re-publish an already-published artifact, preserving its URL and access.
+
+    `publish_artifact` reuses the stored report_id (→ the lambda mints a new
+    version at the same URL), but it would reset access to public if handed no
+    access object. So reconstruct the prior access from `.published.json` and
+    pass it through. After republish, refresh `published_mtime` so the badge
+    clears. Raises FileNotFoundError when there's nothing published to update.
+    """
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    published_json = published_dir / ".published.json"
+    if not published_json.is_file():
+        raise FileNotFoundError("Artifact has no publish record")
+    try:
+        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Could not read publish record") from exc
+
+    entry = published_map.get(published_key)
+    if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
+        raise FileNotFoundError("No published version to update")
+
+    # Rebuild the cowork→publish access shape from the stored owner-side state.
+    mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
+    if mode == "password":
+        access = {"mode": "password", "password": entry.get("access_password", "") or ""}
+    elif mode == "restricted":
+        access = {
+            "mode": "restricted",
+            "emails": entry.get("emails", []) or [],
+            "org_allowed": bool(entry.get("org_allowed")),
+        }
+    else:
+        access = {"mode": "public"}
+
+    # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
+    result = publish_artifact(raw_path, access=access)
+
+    # Refresh the mtime snapshot so the cheap gate clears the `modified` badge.
+    try:
+        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
+        fresh_entry = fresh_map.get(published_key)
+        if isinstance(fresh_entry, dict):
+            fresh_entry["published_mtime"] = _content_mtime(published_dir)
+            fresh_map[published_key] = fresh_entry
+            published_json.write_text(json.dumps(fresh_map, indent=2) + "\n", encoding="utf-8")
     except Exception:
         pass
-    return {"status": "ok"}
+
+    return result
+
+
+def _resolve_report_id(raw_path: str) -> tuple[Path, str, str]:
+    """Resolve (published_json_path, published_key, report_id) for an artifact.
+
+    Raises FileNotFoundError when the artifact has no live publish record.
+    """
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    published_json = published_dir / ".published.json"
+    if not published_json.is_file():
+        raise FileNotFoundError("Artifact has no publish record")
+    try:
+        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Could not read publish record") from exc
+    entry = published_map.get(published_key)
+    report_id = entry.get("report_id") if isinstance(entry, dict) else None
+    if not report_id:
+        raise FileNotFoundError("Artifact is not published")
+    return published_json, published_key, report_id
+
+
+def _publisher_http_detail(exc: Exception) -> str:
+    """Best-effort human message from an upstream HTTPError JSON body."""
+    body = ""
+    try:
+        body = exc.read().decode()  # type: ignore[attr-defined]
+        return json.loads(body).get("error") or body or str(exc)
+    except Exception:
+        return body or str(exc)
+
+
+def list_versions(raw_path: str) -> dict:
+    """List the publish history (versions) of a live artifact.
+
+    Returns {reportId, currentMd5, artifactType, versions: [...]} with versions
+    newest-first, each tagged `isCurrent`.
+    """
+    settings = get_user_settings()
+    publish_url, api_key = _resolve_publish_endpoint(settings)
+    if not api_key:
+        raise ValueError("Configure your provider API key in Settings to view versions")
+
+    _published_json, _key, report_id = _resolve_report_id(raw_path)
+
+    try:
+        from anton.publisher import list_versions as _list_versions
+    except Exception as exc:
+        raise RuntimeError("Anton publisher is unavailable") from exc
+
+    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    from urllib.error import HTTPError
+    try:
+        data = _list_versions(report_id, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
+    except HTTPError as exc:
+        detail = _publisher_http_detail(exc)
+        if exc.code == 404:
+            raise FileNotFoundError(detail or "Report not found")
+        raise RuntimeError(detail or "Could not fetch versions")
+    except Exception as exc:
+        logger.exception("Listing versions failed (report_id=%s)", report_id)
+        raise RuntimeError("Could not fetch versions") from exc
+
+    current = data.get("current_md5") or ""
+    versions = [
+        {
+            "md5": v.get("md5", ""),
+            "publishedAt": v.get("published_at", ""),
+            "title": v.get("title", ""),
+            "isCurrent": v.get("md5") == current,
+        }
+        for v in (data.get("versions") or [])
+    ]
+    versions.reverse()  # newest publish first
+    return {
+        "reportId": data.get("report_id", report_id),
+        "currentMd5": current,
+        "artifactType": data.get("artifact_type"),
+        "versions": versions,
+    }
+
+
+def activate_version(raw_path: str, md5: str) -> dict:
+    """Roll the live URL back to an existing version (flips current_md5).
+
+    On success, rewrites `.published.json` so the `modified` badge reflects the
+    new reality: `last_md5` becomes the now-live version, and `published_mtime`
+    is invalidated (the live content no longer matches the on-disk workspace, so
+    the cheap mtime gate must fall through to the exact md5 comparison).
+    """
+    md5 = (md5 or "").strip()
+    if not md5:
+        raise ValueError("Missing target version (md5)")
+
+    settings = get_user_settings()
+    publish_url, api_key = _resolve_publish_endpoint(settings)
+    if not api_key:
+        raise ValueError("Configure your provider API key in Settings before rolling back")
+
+    published_json, published_key, report_id = _resolve_report_id(raw_path)
+
+    try:
+        from anton.publisher import activate_version as _activate_version
+    except Exception as exc:
+        raise RuntimeError("Anton publisher is unavailable") from exc
+
+    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    from urllib.error import HTTPError
+    try:
+        result = _activate_version(report_id, md5, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
+    except HTTPError as exc:
+        detail = _publisher_http_detail(exc)
+        # 404 (unknown/pruned version), 409 (fullstack not supported), 400 (bad
+        # request) are all caller-correctable → surface the message verbatim.
+        if exc.code in (400, 404, 409):
+            raise ValueError(detail or "Could not roll back to that version")
+        raise RuntimeError(detail or "Roll back failed")
+    except Exception as exc:
+        logger.exception("Activate version failed (report_id=%s md5=%s)", report_id, md5)
+        raise RuntimeError("Roll back failed") from exc
+
+    # Reflect the rollback locally so the `modified` badge recomputes correctly.
+    try:
+        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
+        fresh_entry = fresh_map.get(published_key)
+        if isinstance(fresh_entry, dict):
+            fresh_entry["last_md5"] = md5
+            fresh_entry["published_mtime"] = 0  # force exact md5 check
+            fresh_map[published_key] = fresh_entry
+            published_json.write_text(json.dumps(fresh_map, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "currentMd5": result.get("current_md5", md5),
+        "url": result.get("view_url", ""),
+        "unchanged": bool(result.get("unchanged")),
+    }
+
+
+def published_state(raw_path: str) -> dict:
+    """Owner-side publish state for an artifact path, resolved exactly the way
+    `publish_artifact` resolves it (so the chat tool and the GUI never disagree
+    on where `.published.json` lives).
+
+    Returns ``{"report_id", "url", "published"}``. `url` is blank unless the
+    record is currently live (`published is True` and a url exists). `report_id`
+    is returned even for soft-deleted records so a re-publish can reuse it.
+    """
+    blank = {"report_id": "", "url": "", "published": False}
+    # resolve_artifact_path raises (not returns None) for paths outside a known
+    # artifacts dir, so guard the whole resolution — the documented contract is
+    # to return the blank default for any unresolvable path, never to raise.
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    except Exception:
+        return dict(blank)
+    if artifact is None:
+        return dict(blank)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    entry = _load_published_map(published_dir).get(published_key)
+    if not isinstance(entry, dict):
+        return dict(blank)
+    live = bool(entry.get("published", True)) and bool(entry.get("url"))
+    return {
+        "report_id": str(entry.get("report_id") or ""),
+        "url": str(entry.get("url") or "") if live else "",
+        "published": live,
+    }
