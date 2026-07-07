@@ -118,6 +118,7 @@ async def _collect_produce_sse(handler: ResponsesHandler) -> list[str]:
         conv_svc.return_value.get_conversation.return_value = MagicMock()
         await handler._produce(
             conv_id=conv_id,
+            turn_id=0,
             harness_input=[{"type": "text", "text": "hi"}],
             original_content="hi",
             model="anton",
