@@ -10,12 +10,21 @@ from urllib.parse import urlparse
 
 import httpx
 
-from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS, default_minds_api_host
+from cowork.common.settings.app_settings import default_minds_api_host
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
+
+# Model used to probe MindsHub connectivity/auth (health test + onboarding
+# validation). MUST be tier-universal: MindsHub gates paid models per plan, so
+# a free-tier key gets a 403 for haiku/sonnet/etc. mindshub_air is the free
+# baseline and is present in EVERY tier's registry, so it resolves for all
+# accounts — the probe then reflects reachability + key validity only, not
+# model availability. Using a paid model here caused ENG-576 (free-tier
+# "MindsHub failed its last test" / "Invalid API key" false-negatives).
+MINDS_PROBE_MODEL = "mindshub_air"
 
 
 def minds_chat_base_url(minds_url: str) -> str:
@@ -267,11 +276,21 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 return "fail", "missing API key"
             base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
             chat_url = minds_chat_base_url(base)
-            model = (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
+            # Probe with a TIER-UNIVERSAL model, never the configured/default
+            # one. This is a connectivity + auth check for the provider, not a
+            # model-availability check — and MindsHub tier-gates paid models
+            # (free tier gets a 403 for e.g. haiku/sonnet). The old default was
+            # CODING_MODEL_DEFAULTS["minds_cloud"] = "haiku" (paid), so every
+            # free-tier account saw "MindsHub failed its last test" even though
+            # chat worked on mindshub_air (ENG-576). mindshub_air is the free
+            # baseline and is present in EVERY tier's registry, so it resolves
+            # for all accounts — the dot then reflects reachability/key validity
+            # only. (Testing the user's role model was also rejected in the
+            # ENG-577 review for adding false-negatives + token cost.)
             return await _chat_probe(
                 f"{chat_url}/chat/completions",
                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                model,
+                MINDS_PROBE_MODEL,
             )
     except httpx.HTTPError as e:
         return "fail", f"{type(e).__name__}: {e}"
@@ -328,7 +347,7 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
             r = await client.post(
                 f"{chat_base}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": CODING_MODEL_DEFAULTS["minds_cloud"], "max_tokens": 20,
+                json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
             )
         if r.status_code in (401, 403):
