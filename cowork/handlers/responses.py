@@ -227,18 +227,24 @@ class ResponsesHandler:
             if persisted:
                 return
             persisted = True
-            log_turn_summary({
-                "conversation_id": str(conv_id),
-                "turn_id": turn_id,
-                "calls": usage_totals["calls"],
-                "input_tokens": usage_totals["input_tokens"],
-                "output_tokens": usage_totals["output_tokens"],
-                "max_context_pressure": round(usage_totals["max_context_pressure"], 4),
-                "ttft_ms": (first_delta_ms - created_ms)
-                if first_delta_ms is not None and created_ms is not None else None,
-                "duration_ms": (last_event_ms - created_ms)
-                if last_event_ms is not None and created_ms is not None else None,
-            })
+            # Isolated so telemetry can never block turn persistence — the
+            # `persisted` guard is already set, so a raise here would
+            # short-circuit the retry in the error path and lose the turn.
+            try:
+                log_turn_summary({
+                    "conversation_id": str(conv_id),
+                    "turn_id": turn_id,
+                    "calls": usage_totals["calls"],
+                    "input_tokens": usage_totals["input_tokens"],
+                    "output_tokens": usage_totals["output_tokens"],
+                    "max_context_pressure": round(usage_totals["max_context_pressure"], 4),
+                    "ttft_ms": (first_delta_ms - created_ms)
+                    if first_delta_ms is not None and created_ms is not None else None,
+                    "duration_ms": (last_event_ms - created_ms)
+                    if last_event_ms is not None and created_ms is not None else None,
+                })
+            except Exception:
+                pass
             try:
                 own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
                 own.commit()
