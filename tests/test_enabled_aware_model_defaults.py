@@ -187,3 +187,11 @@ def test_recommended_models_failed_fetch_preserves_cache(monkeypatch):
     finally:
         _delete_settings(session, "minds_api_key", "minds_model_enabled")
         session.close()
+
+
+def test_enabled_map_accepts_only_real_bools():
+    # bool("false") is True, so a stringy value must be dropped rather than
+    # misread as enabled. A dropped entry is absent, which the consumers treat
+    # as "available" — the map's own convention, so this can't over-lock.
+    s = _minds(minds_model_enabled=json.dumps({"mindshub_air": True, "opus": "false", "gpt": 1}))
+    assert s._minds_enabled_map() == {"mindshub_air": True}

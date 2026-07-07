@@ -128,3 +128,77 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
     finally:
         _delete_settings(session, "minds_api_key", "minds_url")
         session.close()
+
+
+def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
+    """A fetch returning ids but no enabled flags (gateway version skew) must
+    NOT overwrite a previously-good availability map with {} — that would
+    re-lock the canonical default, the exact ENG-597 bug. Guard is on
+    live_enabled, not the id list."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    async def fake_fetch(base_url, api_key):
+        return (["mindshub_air", "opus"], {}, {})  # ids present, enabled EMPTY
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        good = json.dumps({"mindshub_air": True, "opus": False})
+        _set_settings(
+            session,
+            minds_api_key="mdb_free",
+            minds_url="https://api.mindshub.ai",
+            minds_model_enabled=good,
+        )
+        _delete_settings(session, "providers_json")
+
+        asyncio.run(recommended_models(session))
+
+        stored = SettingService(session).get_setting("minds_model_enabled").value
+        assert json.loads(stored) == {"mindshub_air": True, "opus": False}
+    finally:
+        _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+
+
+def test_recommended_models_writes_map_only_on_change(monkeypatch):
+    """upsert_setting commits a row + invalidates the settings cache, and this
+    endpoint runs on every boot/settings-open — so the map is written only when
+    it actually changed, not unconditionally."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    async def fake_fetch(base_url, api_key):
+        return (["mindshub_air", "opus"], {}, {"mindshub_air": True, "opus": False})
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
+        _delete_settings(session, "providers_json", "minds_model_enabled")
+
+        # Spy AFTER seeding settings so only the endpoint's writes are counted.
+        writes: list[str] = []
+        real_upsert = SettingService.upsert_setting
+
+        def spy_upsert(self, key, value):
+            if key == "minds_model_enabled":
+                writes.append(value)
+            return real_upsert(self, key, value)
+
+        monkeypatch.setattr(SettingService, "upsert_setting", spy_upsert)
+
+        asyncio.run(recommended_models(session))  # map absent → 1 write
+        asyncio.run(recommended_models(session))  # identical map stored → no write
+
+        assert len(writes) == 1, writes
+    finally:
+        _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
