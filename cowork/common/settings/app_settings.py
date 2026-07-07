@@ -5,7 +5,6 @@ from pathlib import Path
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # ── Global model catalog ───────────────────────────────────────────────
 # Recommended models and per-provider model defaults are global,
 # application-level configuration — the same for every user — so they live

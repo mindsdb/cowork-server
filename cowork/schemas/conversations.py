@@ -1,8 +1,6 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field
-
 from cowork.schemas.base import CamelRequest, CamelResponse
 
 

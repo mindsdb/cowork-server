@@ -300,11 +300,12 @@ async def _hermes_request_credentials(args: dict, **kwargs) -> str:
 
 def register_connector_tools() -> None:
     from tools.registry import registry
+
     from cowork.harnesses.anton_harness.tools import (
-        _LOOKUP_CONNECTOR_SCHEMA,
         _LOOKUP_CONNECTOR_PROMPT,
-        _REQUEST_CREDENTIALS_SCHEMA,
+        _LOOKUP_CONNECTOR_SCHEMA,
         _REQUEST_CREDENTIALS_PROMPT,
+        _REQUEST_CREDENTIALS_SCHEMA,
     )
 
     if registry.get_entry("lookup_connector") is None:

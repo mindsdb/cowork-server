@@ -15,8 +15,6 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Optional
-
 
 MAX_PADS = int(os.environ.get("ANTON_SERVER_MAX_PADS", "5"))
 
@@ -30,7 +28,7 @@ def _touch_activity() -> None:
     last_activity = time.time()
 
 
-def _resolve_workspace(workspace_path: Optional[str]) -> Path:
+def _resolve_workspace(workspace_path: str | None) -> Path:
     return (
         Path(workspace_path).expanduser().resolve()
         if workspace_path
@@ -102,7 +100,7 @@ def _resolve_coding(
 def _make_runtime(
     name: str,
     *,
-    workspace_path: Optional[str],
+    workspace_path: str | None,
     coding_provider: str,
     coding_model: str,
     coding_api_key: str,
@@ -128,7 +126,7 @@ def get(name: str):
 def get_or_create(
     name: str,
     *,
-    workspace_path: Optional[str] = None,
+    workspace_path: str | None = None,
     coding_provider: str = "",
     coding_model: str = "",
     coding_api_key: str = "",
@@ -202,7 +200,7 @@ class WorkspaceScopedPool:
     def __init__(self, workspace_path: str):
         self._workspace_path = workspace_path
 
-    async def venv_python(self, name: str) -> Optional[str]:
+    async def venv_python(self, name: str) -> str | None:
         pad = get_or_create(name, workspace_path=self._workspace_path)
         # Off-thread because `_ensure_venv` may shell out to `uv venv` /
         # `python -m venv` on first call (cold-start cost is seconds).

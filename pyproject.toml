@@ -72,8 +72,24 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=7.1.0",
+    "ruff>=0.15.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Starter ruleset: high-signal and overwhelmingly auto-fixable. Deliberately
+# lean for this first adoption PR. Deferred to follow-ups: the ruff formatter
+# (whole-repo reformat) and E501 line-length that comes with it; B/SIM
+# (bugbear/simplify) which need manual judgement; and UP042 (str+Enum →
+# StrEnum), a behavior-adjacent migration worth its own review.
+select = ["E", "F", "W", "I", "UP", "C4"]
+# E501 (line-too-long) is left to the formatter follow-up — wrapping by hand is
+# noise. UP042 (str+Enum → StrEnum) is a behavior-adjacent migration.
+ignore = ["E501", "UP042"]

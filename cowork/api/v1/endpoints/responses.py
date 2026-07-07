@@ -21,7 +21,6 @@ from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import registry
 
-
 logger = setup_logging()
 
 router = APIRouter()

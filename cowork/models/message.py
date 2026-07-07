@@ -6,8 +6,8 @@ from sqlalchemy import JSON
 from sqlmodel import Column, Field, Relationship
 
 from cowork.models.base import BaseSQLModel
-from cowork.schemas.responses import Role, Message as OpenAIMessage
-
+from cowork.schemas.responses import Message as OpenAIMessage
+from cowork.schemas.responses import Role
 
 if TYPE_CHECKING:
     from cowork.models.message_event import MessageEvent

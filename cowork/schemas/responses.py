@@ -1,7 +1,7 @@
 import time
-from typing import Any
 import uuid
 from enum import Enum
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_serializer

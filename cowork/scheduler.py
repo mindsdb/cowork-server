@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from cowork.common.datetime_utils import ensure_utc
@@ -38,7 +38,7 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
 
 
 def _handle_missed_runs(session) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     schedules = ScheduleService(session).list_schedules()
     for schedule in schedules:
         if not schedule.enabled:
@@ -67,7 +67,7 @@ def _handle_missed_runs(session) -> None:
         # Only fast-forward when more than one occurrence was skipped (app
         # offline for multiple cadence periods). A single overdue slot
         # (missed == 1) is still due this poll — advancing here would skip
-        # the run entirely. 
+        # the run entirely.
         if missed > 1:
             schedule.missed_runs += missed
             schedule.next_run_at = future
@@ -115,7 +115,7 @@ async def execute_schedule(
 
         # Refresh schedule in case it changed during execution
         schedule = schedule_service.get_schedule(schedule_id)
-        schedule.last_run_at = datetime.now(timezone.utc)
+        schedule.last_run_at = datetime.now(UTC)
         schedule.last_result_conversation_id = conversation_id
         schedule.last_error = None
         schedule.missed_runs = 0
@@ -151,7 +151,7 @@ async def _scheduler_loop() -> None:
         session = get_open_session()
         try:
             _handle_missed_runs(session)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             run_service = ScheduleRunService(session)
             schedules = ScheduleService(session).list_schedules()
             due = [

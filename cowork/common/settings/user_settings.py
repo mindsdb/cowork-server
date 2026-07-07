@@ -1,5 +1,6 @@
+from collections.abc import Callable
 from enum import Enum
-from typing import Annotated, Any, Callable, get_args
+from typing import Annotated, Any, get_args
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 

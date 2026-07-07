@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable, Optional
 
 from cowork.schemas.responses import (
     Response,
@@ -107,7 +107,7 @@ def classify_cell_status(content: str) -> str:
 async def format_responses_stream(
     event_stream: AsyncIterator,
     model: str,
-    event_sink: Optional[Callable[[str, dict], None]] = None,
+    event_sink: Callable[[str, dict], None] | None = None,
 ) -> AsyncIterator[str]:
     """Yield Responses-API SSE strings derived from ChatSession events.
 

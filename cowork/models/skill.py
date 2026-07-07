@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 from anton.core.tools.skill_format import AgentSkill
 from sqlmodel import Field
 
 from .base import BaseSQLModel
-
 
 META_DISPLAY_NAME = "display_name"
 META_CREATED_AT = "created_at"
@@ -64,7 +63,7 @@ class Skill(AgentSkill):
         # Migrated skills carry a naive value (SQLite); new ones are aware.
         # Normalize to UTC-aware so comparisons/sorts never mix the two.
         if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
+            return parsed.replace(tzinfo=UTC)
         return parsed
 
 

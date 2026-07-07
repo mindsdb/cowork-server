@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from uuid import UUID
@@ -12,19 +13,6 @@ from sqlmodel import Session
 
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.session import get_open_session
-from cowork.harnesses.base import get_harness
-from cowork.models.message import Message as DBMessage
-from cowork.streaming import new_buffer, registry
-from cowork.schemas.responses import (
-    Content,
-    ContentType,
-    Response,
-    ResponseOutput,
-    ResponseOutputContent,
-    ResponseStatus,
-    ResponsesRequest,
-    Role,
-)
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
@@ -34,13 +22,22 @@ from cowork.handlers.turn_errors import (
     response_failed_payload,
     response_failed_sse,
 )
+from cowork.harnesses.base import get_harness
+from cowork.models.message import Message as DBMessage
+from cowork.schemas.responses import (
+    Content,
+    ContentType,
+    Response,
+    ResponseOutput,
+    ResponseOutputContent,
+    ResponsesRequest,
+    ResponseStatus,
+    Role,
+)
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
-from cowork.services.skills import SkillService
-
-
-import logging
+from cowork.streaming import new_buffer, registry
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +262,7 @@ class ResponsesHandler:
         if "response.created" in sse_string and "conversation_id" not in sse_string:
             try:
                 lines = sse_string.strip().split("\n")
-                data_line = next(l for l in lines if l.startswith("data:"))
+                data_line = next(ln for ln in lines if ln.startswith("data:"))
                 payload = json.loads(data_line[5:])
                 payload["conversation_id"] = str(conversation_id)
                 if harness_id:

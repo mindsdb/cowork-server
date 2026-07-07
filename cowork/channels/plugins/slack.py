@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -112,7 +112,7 @@ class SlackBridge:
             raise SignatureError("non-integer slack timestamp") from exc
         if abs(int(time.time()) - ts) > _REPLAY_WINDOW_S:
             raise SignatureError("slack timestamp outside replay window")
-        base = f"v0:{timestamp}:".encode("utf-8") + body
+        base = f"v0:{timestamp}:".encode() + body
         digest = "v0=" + hmac.new(signing_secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(digest, signature):
             raise SignatureError("slack signature mismatch")
@@ -207,9 +207,9 @@ class SlackBridge:
         thread_ts = event.get("thread_ts")
         ts = event.get("ts", "") or ""
         try:
-            timestamp = datetime.fromtimestamp(float(ts), timezone.utc) if ts else datetime.now(timezone.utc)
+            timestamp = datetime.fromtimestamp(float(ts), UTC) if ts else datetime.now(UTC)
         except (TypeError, ValueError):
-            timestamp = datetime.now(timezone.utc)
+            timestamp = datetime.now(UTC)
         is_group = not channel.startswith("D")
         return InboundEvent(
             address=PlatformAddress(channel_type=CHANNEL_TYPE, platform_id=channel, thread_id=thread_ts),

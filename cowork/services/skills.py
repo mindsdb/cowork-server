@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from anton.core.tools.skill_format import (
@@ -15,8 +15,8 @@ from anton.core.tools.skill_format import (
     parse_skill_dir,
     validate_name,
 )
+
 from cowork.common.settings import get_app_settings
-from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
 from cowork.models.skill import (
     META_CREATED_AT,
     META_DISPLAY_NAME,
@@ -25,6 +25,7 @@ from cowork.models.skill import (
     META_UPDATED_AT,
     Skill,
 )
+from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
 
 
 def _skill_from_dir(skill_dir: Path) -> Skill | None:
@@ -136,7 +137,7 @@ class SkillService:
         if self._skill_dir(label).exists():
             raise ValueError(f"A skill named '{label}' already exists.")
 
-        metadata = self._build_metadata(label, name, datetime.now(timezone.utc))
+        metadata = self._build_metadata(label, name, datetime.now(UTC))
         self._apply_metadata_flags(metadata, enabled, projects)
         skill = Skill(
             name=label,
@@ -241,7 +242,7 @@ class SkillService:
             raise FileExistsError(f"A skill named '{skill.name}' already exists.")
 
         metadata = dict(skill.metadata)
-        metadata.setdefault(META_CREATED_AT, datetime.now(timezone.utc).isoformat())
+        metadata.setdefault(META_CREATED_AT, datetime.now(UTC).isoformat())
         metadata.pop(META_PROJECTS, None)
         skill.metadata = metadata
         if not skill.description.strip():
@@ -314,7 +315,7 @@ class SkillService:
     # ── low-level fs ─────────────────────────────────────────────────────────
     def _write(self, skill: Skill) -> None:
         self._ensure_root()
-        skill.metadata[META_UPDATED_AT] = datetime.now(timezone.utc).isoformat()
+        skill.metadata[META_UPDATED_AT] = datetime.now(UTC).isoformat()
         skill_dir = self._skill_dir(skill.name)
         skill_dir.mkdir(parents=True, exist_ok=True)
         target = skill_dir / SKILL_FILE

@@ -8,7 +8,6 @@ from cowork.db.session import get_session
 from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
 from cowork.services.projects import ProjectService
 
-
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 

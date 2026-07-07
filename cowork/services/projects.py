@@ -10,7 +10,6 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.models.project import Project
 
-
 GENERAL_PROJECT = "general"
 GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
 

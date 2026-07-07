@@ -5,7 +5,7 @@ import json
 import logging
 import secrets
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -237,12 +237,12 @@ class TelegramBridge:
         date = msg.get("date")
         try:
             timestamp = (
-                datetime.fromtimestamp(float(date), timezone.utc)
+                datetime.fromtimestamp(float(date), UTC)
                 if date
-                else datetime.now(timezone.utc)
+                else datetime.now(UTC)
             )
         except (TypeError, ValueError):
-            timestamp = datetime.now(timezone.utc)
+            timestamp = datetime.now(UTC)
 
         bot_username = self._secrets.get("bot_username", "")
         is_mention = (not is_group) or bool(bot_username and f"@{bot_username}" in text)

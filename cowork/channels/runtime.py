@@ -8,28 +8,27 @@ import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from anton.core.dispatch import OutboundMessage
 from sqlmodel import select
 
-from anton.core.dispatch import OutboundMessage
 from cowork.channels.registry import PluginRegistry, get_registry
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
-from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import list_artifacts
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.skills import SkillService
 
 if TYPE_CHECKING:
     from sqlmodel import Session
@@ -324,7 +323,7 @@ class AntonChannelRuntime:
                 ChannelSession.external_session_key == key,
             )
         ).first()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if row is None:
             row = ChannelSession(
                 binding_id=binding.id,

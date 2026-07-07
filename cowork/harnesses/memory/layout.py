@@ -1,5 +1,5 @@
 """
-This module is responsible for ensuring that the canonical memory files and 
+This module is responsible for ensuring that the canonical memory files and
 harness runtime symlinks exist.
 """
 

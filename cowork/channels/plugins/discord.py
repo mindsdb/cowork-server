@@ -5,7 +5,7 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -182,7 +182,7 @@ class DiscordBridge:
             message=InboundMessage(
                 id=interaction_id,
                 content=utterance,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
                 kind="chat",
                 sender_id=str(user_obj.get("id", "")) or None,
                 is_mention=True,
@@ -284,9 +284,9 @@ class DiscordBridge:
         )
         raw_ts = d.get("timestamp")
         try:
-            timestamp = datetime.fromisoformat(raw_ts) if raw_ts else datetime.now(timezone.utc)
+            timestamp = datetime.fromisoformat(raw_ts) if raw_ts else datetime.now(UTC)
         except (TypeError, ValueError):
-            timestamp = datetime.now(timezone.utc)
+            timestamp = datetime.now(UTC)
 
         message_id = str(d.get("id", "") or "")
         event = InboundEvent(

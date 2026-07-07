@@ -1,12 +1,10 @@
 from logging.config import fileConfig
 from pathlib import Path
 
+from alembic import context
 from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import make_url
 from sqlmodel import SQLModel
-
-from alembic import context
-from cowork.common.settings.app_settings import get_app_settings
 
 # Import models so SQLModel.metadata is fully populated for autogenerate.
 import cowork.models.conversation  # noqa: F401
@@ -18,6 +16,7 @@ import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
 import cowork.models.skill  # noqa: F401
+from cowork.common.settings.app_settings import get_app_settings
 
 
 def _ensure_sqlite_dir(url: str) -> None:

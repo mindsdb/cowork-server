@@ -7,7 +7,6 @@ from cowork.db.session import get_session
 from cowork.schemas.pins import PinRequest
 from cowork.services.pins import PinService
 
-
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 

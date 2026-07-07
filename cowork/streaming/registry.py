@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
 
 from cowork.streaming.buffer import StreamBuffer
 
@@ -97,7 +96,7 @@ class RunRegistry:
             self._by_cid[conversation_id] = handle
             return handle
 
-    def get(self, conversation_id: str) -> Optional[RunHandle]:
+    def get(self, conversation_id: str) -> RunHandle | None:
         """Current handle (incl. recently-finished, useful for replay)."""
         return self._by_cid.get(conversation_id)
 

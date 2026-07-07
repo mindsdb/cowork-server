@@ -9,7 +9,6 @@ from cowork.db.session import get_session
 from cowork.schemas.files import FileListResponse, FileResponse
 from cowork.services.files import FileService
 
-
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 

@@ -4,7 +4,6 @@ from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.memory.adapter import BaseMemoryAdapter, register
 from cowork.harnesses.memory.registry import MemorySlot
 
-
 settings = HermesHarnessSettings()
 
 memory_dir = Path(settings.root_dir) / "memories"

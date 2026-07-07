@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlmodel import Session, select
@@ -98,7 +98,7 @@ class ScheduleRunService:
     def create_run(self, schedule_id: UUID, is_manual: bool = False) -> ScheduleRun:
         run = ScheduleRun(
             schedule_id=schedule_id,
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
             status=RunStatus.running,
             is_manual=is_manual,
         )
@@ -116,7 +116,7 @@ class ScheduleRunService:
             select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.running)
-            .where(ScheduleRun.is_manual == False)
+            .where(ScheduleRun.is_manual.is_(False))
             .limit(1)
         ).first()
         return run is not None
@@ -130,9 +130,9 @@ class ScheduleRunService:
         run = self.session.get(ScheduleRun, run_id)
         if run is None:
             raise ValueError("ScheduleRun not found")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         run.finished_at = now
-        started_at = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=timezone.utc)
+        started_at = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=UTC)
         run.duration_ms = int((now - started_at).total_seconds() * 1000)
         run.status = RunStatus.failed if error else RunStatus.success
         run.error = error

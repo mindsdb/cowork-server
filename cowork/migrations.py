@@ -26,18 +26,17 @@ import logging
 import shutil
 from pathlib import Path
 
-from cowork.common.settings.app_settings import default_minds_api_host
-
-from sqlmodel import Session, select
+from anton.core.tools.skill_format import DESC_MAX, SKILL_FILE, normalize_name
 from pydantic import ValidationError
+from sqlmodel import Session, select
 
-from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.settings import invalidate_user_settings_cache
+from cowork.common.settings.app_settings import default_minds_api_host
 from cowork.common.settings.user_settings import UserSettings
+from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
-from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
@@ -336,7 +335,7 @@ def migrate_skills_to_files(session: Session) -> bool:
         if row.name and row.name != slug:
             metadata[META_DISPLAY_NAME] = row.name
         if row.created_at:
-            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=dt.timezone.utc).isoformat()
+            metadata[META_CREATED_AT] = row.created_at.replace(tzinfo=dt.UTC).isoformat()
 
         try:
             skill = Skill(

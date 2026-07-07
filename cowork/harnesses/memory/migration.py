@@ -1,5 +1,5 @@
 """
-This module performs a one-time migration of harness-local memory files into 
+This module performs a one-time migration of harness-local memory files into
 the shared canonical store.
 At the moment this was written, only Anton and Hermes were supported as harnesses.
 As a result, only the memory files for these two harnesses are migrated.
@@ -15,7 +15,6 @@ from sqlmodel import Session, select
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import SharedMemoryStore
 from cowork.models.setting import Setting
-
 
 logger = logging.getLogger(__name__)
 
