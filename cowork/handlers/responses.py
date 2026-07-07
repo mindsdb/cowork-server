@@ -29,8 +29,11 @@ from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
+    MODEL_ACCESS_DENIED_CODE,
+    MODEL_DISABLED_CODE,
     auth_error_detail,
     friendly_turn_error,
+    model_unavailable_info,
     response_failed_payload,
     response_failed_sse,
 )
@@ -243,6 +246,19 @@ class ResponsesHandler:
                     extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
+            elif code in (MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE):
+                # Model-403: tell the client WHICH model was rejected so the
+                # card can name it ("Sonnet isn't included in your plan").
+                # Same never-break rule as the auth extras above.
+                try:
+                    info = model_unavailable_info(exc)
+                    provider = get_user_settings().resolved_planning_provider
+                    extra = {
+                        "model": info[1] if info else "",
+                        "provider_label": provider.label,
+                    }
+                except Exception:
+                    logger.exception("[responses] could not build model-unavailable extras")
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)

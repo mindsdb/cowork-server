@@ -290,3 +290,103 @@ def test_response_failed_payload_carries_auth_fields():
     assert p["reconnectable"] is True and p["provider_label"] == "MindsHub"
     # Unrelated failures keep the original shape (no extra keys).
     assert "reconnectable" not in te.response_failed_payload("boom", "anton_error")
+
+
+# ── Model-403 (model_access_denied / model_disabled) → plan card ──────
+#
+# The gateway rejecting the requested MODEL (tier gate or admin kill switch)
+# used to surface as the generic "Server returned 403 — temporarily
+# unavailable" prose. anton now raises ModelUnavailableError carrying the
+# gateway's structured code + the model alias; these tests pin the mapping.
+# Detection is typed-or-duck-typed on the code/model attributes — the venv's
+# anton may predate the class (version skew), which is exactly what the duck
+# path covers. NO string matching: a message merely mentioning "model_disabled"
+# must never trigger the plan card.
+
+
+class _FakeModelErr(ConnectionError):
+    """Duck-typed stand-in for anton's ModelUnavailableError."""
+
+    def __init__(self, message, code, model):
+        super().__init__(message)
+        self.code = code
+        self.model = model
+
+
+_PLAN_MSG = (
+    "The model 'sonnet' isn't included in your current MindsHub plan. "
+    "Visit https://console.mindshub.ai to upgrade, or switch models in Settings."
+)
+
+
+def test_model_unavailable_detected_via_duck_typing():
+    info = te.model_unavailable_info(_FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet"))
+    assert info == ("model_access_denied", "sonnet")
+    info = te.model_unavailable_info(_FakeModelErr("x", "model_disabled", "opus"))
+    assert info == ("model_disabled", "opus")
+
+
+def test_model_unavailable_requires_the_structured_code():
+    # Unknown code attr, non-string code, or a message that merely mentions
+    # the code → not a model-403.
+    assert te.model_unavailable_info(_FakeModelErr("x", "other_code", "sonnet")) is None
+    assert te.model_unavailable_info(_FakeModelErr("x", 403, "sonnet")) is None
+    assert te.model_unavailable_info(Exception("error code model_disabled happened")) is None
+    assert te.model_unavailable_info(ConnectionError("Server returned 403")) is None
+
+
+def test_model_unavailable_maps_code_and_passes_message_through():
+    # anton's message is already curated user copy — surfaced verbatim.
+    code, message = te.friendly_turn_error(_FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet"))
+    assert code == te.MODEL_ACCESS_DENIED_CODE == "model_access_denied"
+    assert message == _PLAN_MSG
+
+
+def test_model_unavailable_empty_message_gets_fallback_copy():
+    code, message = te.friendly_turn_error(_FakeModelErr("", "model_disabled", "sonnet"))
+    assert code == te.MODEL_DISABLED_CODE
+    assert message == te.MODEL_UNAVAILABLE_FALLBACK_MESSAGE
+
+
+def test_token_limit_wins_over_model_403():
+    # A quota failure carrying a model-ish code attr must stay token_limit.
+    exc = _FakeModelErr(_TOKEN_LIMIT_MESSAGE, "model_disabled", "sonnet")
+    code, _ = te.friendly_turn_error(exc)
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_auth_error_not_shadowed_by_model_mapping():
+    exc = ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+    code, _ = te.friendly_turn_error(exc)
+    assert code == te.AUTH_ERROR_CODE
+
+
+def test_response_failed_payload_carries_model_field():
+    p = te.response_failed_payload(
+        "msg", te.MODEL_ACCESS_DENIED_CODE, model="sonnet", provider_label="MindsHub"
+    )
+    assert p["model"] == "sonnet" and p["provider_label"] == "MindsHub"
+    # Unrelated failures keep the original shape (no extra keys).
+    assert "model" not in te.response_failed_payload("boom", "anton_error")
+
+
+async def test_stream_emits_model_unavailable_with_extras():
+    exc = _FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet")
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == "model_access_denied"
+    assert payload["error"] == _PLAN_MSG
+    assert payload["model"] == "sonnet"
+    assert "provider_label" in payload
+
+
+def test_collect_raises_400_with_plan_message_for_model_403():
+    handler = _handler_with_raising_formatter(
+        _FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet")
+    )
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
+    assert err.value.status_code == 400
+    assert err.value.detail == _PLAN_MSG
