@@ -1,8 +1,9 @@
-from typing import AsyncIterator, Literal, Protocol
+from collections.abc import AsyncIterator
+from typing import Literal, Protocol
+
 from typing_extensions import TypedDict
 
 from cowork.models.conversation import Conversation
-from cowork.models.skill import Skill
 
 
 class TextInputBlock(TypedDict):

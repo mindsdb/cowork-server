@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import html as html_lib
 import json
-from datetime import datetime, timedelta, timezone
+import logging as _logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -18,8 +19,6 @@ from cowork.schemas.connectors import OAuthStartResponse
 from cowork.services.connectors.oauth import pkce as pkce_utils
 from cowork.services.connectors.oauth.config import GOOGLE_SERVICES
 from cowork.services.connectors.oauth.state import OAuthStateStore
-
-import logging as _logging
 
 _GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 _GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
@@ -72,7 +71,7 @@ class GoogleOAuthService:
         challenge = pkce_utils.generate_challenge(verifier)
         state = pkce_utils.generate_state()
         redirect_uri = self._redirect_uri(service, settings)
-        started_at = datetime.now(timezone.utc).isoformat()
+        started_at = datetime.now(UTC).isoformat()
 
         self._store(settings).set_pending(
             service,
@@ -161,7 +160,7 @@ class GoogleOAuthService:
         if started_at:
             try:
                 started_dt = datetime.fromisoformat(started_at)
-                if datetime.now(timezone.utc) - started_dt > timedelta(minutes=20):
+                if datetime.now(UTC) - started_dt > timedelta(minutes=20):
                     store.clear_pending(service, error="Google sign-in timed out before it completed.")
                     return _callback_page(
                         f"{service_label} sign-in expired",
@@ -190,7 +189,7 @@ class GoogleOAuthService:
 
             expires_in = int(token_data.get("expires_in", 0) or 0)
             expires_at = (
-                (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+                (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat()
                 if expires_in else ""
             )
 

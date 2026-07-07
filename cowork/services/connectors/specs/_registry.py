@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
     ConnectorSpecResponse,

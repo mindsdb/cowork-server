@@ -5,20 +5,19 @@ Revises:
 Create Date: 2026-05-14 11:36:12.372376
 
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 
-
 # revision identifiers, used by Alembic.
 revision: str = "93375a6617f4"
-down_revision: Union[str, Sequence[str], None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

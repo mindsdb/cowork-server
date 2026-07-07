@@ -13,7 +13,6 @@ from uuid import UUID
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.schemas.responses import Role
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry

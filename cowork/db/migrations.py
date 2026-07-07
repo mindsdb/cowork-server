@@ -7,7 +7,6 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.engine import Engine
 
-
 INITIAL_REVISION = "93375a6617f4"
 INITIAL_SCHEMA_TABLES = {
     "conversations",

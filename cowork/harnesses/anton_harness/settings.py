@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from pydantic import Field
 
 from cowork.common.settings import Settings

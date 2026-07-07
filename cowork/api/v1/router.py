@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
     artifacts,
+    channels,
     conversations,
     files,
     health,
@@ -23,24 +24,6 @@ from cowork.api.v1.endpoints import (
     settings,
     skills,
 )
-from cowork.api.v1.endpoints.connectors import (
-    connections,
-    oauth,
-    specs,
-    submissions,
-)
-from cowork.api.v1.endpoints import (
-    channels,
-    conversations,
-    files,
-    memory,
-    pins,
-    projects,
-    responses,
-    schedules,
-    settings,
-    skills
-)
 
 # SHIM:client-compat — compat imports; remove this block and the
 # "Compat routes" section below when the client is updated.
@@ -49,6 +32,12 @@ from cowork.api.v1.endpoints.compat.stubs import (
     browse_router,
     integrations_router,
     scratchpad_router,
+)
+from cowork.api.v1.endpoints.connectors import (
+    connections,
+    oauth,
+    specs,
+    submissions,
 )
 
 # Create the v1 API router

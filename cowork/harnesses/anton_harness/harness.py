@@ -1,18 +1,16 @@
-from collections.abc import AsyncIterator
 import inspect
 import os
-from pathlib import Path
 import shutil
 import tempfile
+from collections.abc import AsyncIterator
+from pathlib import Path
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
-from cowork.models.conversation import Conversation
-from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
-
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
+from cowork.models.conversation import Conversation
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
@@ -44,6 +42,7 @@ def _conversation_attachment_context(conversation) -> str:
     """
     try:
         from sqlalchemy.orm import object_session
+
         from cowork.services.files import FileService, attachment_purpose
 
         db_session = object_session(conversation)
@@ -192,7 +191,7 @@ class AntonHarness:
                     "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
                 })
         return anton_blocks
-        
+
     async def _build_chat_session(
         self,
         conversation: Conversation,
@@ -204,20 +203,23 @@ class AntonHarness:
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
         from anton.core.memory.cortex import Cortex
+
         # from anton.core.memory.episodes import EpisodicMemory
         from anton.core.memory.hippocampus import Hippocampus
         from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
+
         # from anton.memory.history_store import HistoryStore
         from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
+
         # Cowork override — anton's stock PUBLISH_TOOL prints to a Rich
         # Console and pops a webbrowser, both of which die in the FastAPI
         # process. The wrapper exposes the same schema to the LLM but
         # routes through a server-aware handler.
         from .tools import (
-            build_cowork_publish_tool,
-            build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
+            build_cowork_lookup_connector_tool,
+            build_cowork_publish_tool,
             build_cowork_request_credentials_tool,
             # build_cowork_fetch_submission_tool,
             # build_cowork_update_form_tool,
@@ -243,8 +245,9 @@ class AntonHarness:
         # overlap between AntonSettings and UserSettings (API keys,
         # provider, model, memory flags, etc.) so the DB is the single
         # source of truth — no .env reload needed.
-        from cowork.common.settings.user_settings import get_user_settings
         from pydantic import SecretStr
+
+        from cowork.common.settings.user_settings import get_user_settings
 
         anton_settings = AntonSettings()
         anton_settings.resolve_workspace(str(base))

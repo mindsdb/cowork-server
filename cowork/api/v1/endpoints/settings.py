@@ -14,12 +14,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.common.settings.app_settings import (
+    DIRECT_EFFORT_CATALOG,
+    RECOMMENDED_MODELS,
+    RECOMMENDED_PAIR,
+)
+from cowork.common.settings.user_settings import Provider, provider_api_key_str
 from cowork.db.session import get_session
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
@@ -28,15 +34,11 @@ from cowork.services.providers import (
     fetch_minds_models,
     ping_providers,
     resolve_stored_key,
+)
+from cowork.services.providers import (
     validate_provider as validate_provider_svc,
 )
 from cowork.services.settings import SettingService
-from cowork.common.settings.app_settings import (
-    DIRECT_EFFORT_CATALOG,
-    RECOMMENDED_MODELS,
-    RECOMMENDED_PAIR,
-)
-from cowork.common.settings.user_settings import Provider, provider_api_key_str
 
 router = APIRouter()
 
@@ -149,7 +151,7 @@ def reveal_key(name: str, session: SessionDep):
 
 
 class _TestProvidersBody(BaseModel):
-    providers: Optional[list[dict[str, Any]]] = None
+    providers: list[dict[str, Any]] | None = None
 
 
 @router.post("/test-providers")
@@ -195,8 +197,8 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
 class _ValidateProviderBody(CamelRequest):
     provider: str
     api_key: str
-    base_url: Optional[str] = None
-    model: Optional[str] = None
+    base_url: str | None = None
+    model: str | None = None
 
 
 @router.post("/validate-provider")

@@ -10,8 +10,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator
-from typing import Callable, Optional
+from collections.abc import AsyncIterator, Callable
 
 from cowork.schemas.responses import Role
 
@@ -19,7 +18,7 @@ from cowork.schemas.responses import Role
 async def format_hermes_stream(
     event_stream: AsyncIterator,
     model: str,
-    event_sink: Optional[Callable[[str, dict], None]] = None,
+    event_sink: Callable[[str, dict], None] | None = None,
 ) -> AsyncIterator[str]:
     resp_id = f"resp-{uuid.uuid4().hex[:12]}"
     msg_id = f"msg-{uuid.uuid4().hex[:12]}"

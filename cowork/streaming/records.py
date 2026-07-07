@@ -7,7 +7,7 @@ terminal record tells them when to stop.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 # Terminal reasons a turn can end with. The buffer always writes exactly
@@ -45,4 +45,4 @@ class TurnRecord:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

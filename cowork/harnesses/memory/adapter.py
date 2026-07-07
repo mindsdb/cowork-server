@@ -16,13 +16,13 @@ slots. This is used to create the symlinks in the harness's memory directory.
 inject the read-only canonical content into the system prompt.
 
 The Symlinks will be created automatically based on the given definitions.
-The prompt, however, will need to be injected within each harness by calling the 
+The prompt, however, will need to be injected within each harness by calling the
 build_prompt_context method.
 """
 from pathlib import Path
 
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.harnesses.memory.store import ProjectMemoryStore, PROJECT_SLOTS, SharedMemoryStore
+from cowork.harnesses.memory.store import PROJECT_SLOTS, ProjectMemoryStore, SharedMemoryStore
 
 
 class BaseMemoryAdapter:

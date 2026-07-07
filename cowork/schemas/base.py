@@ -1,4 +1,5 @@
 from datetime import datetime
+
 from pydantic import BaseModel, model_validator
 from pydantic.alias_generators import to_camel
 

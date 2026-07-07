@@ -19,14 +19,22 @@ from sqlmodel import Session
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
-    artifact_status as _artifact_status,
-    delete_artifact as _delete_artifact,
     get_preview_mount,
-    list_artifacts as _list_artifacts,
     mount_preview,
-    preview_artifact as _preview_artifact,
     resolve_artifact_path,
     reveal_in_file_manager,
+)
+from cowork.services.artifacts import (
+    artifact_status as _artifact_status,
+)
+from cowork.services.artifacts import (
+    delete_artifact as _delete_artifact,
+)
+from cowork.services.artifacts import (
+    list_artifacts as _list_artifacts,
+)
+from cowork.services.artifacts import (
+    preview_artifact as _preview_artifact,
 )
 from cowork.services.projects import ProjectService
 

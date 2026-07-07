@@ -5,7 +5,7 @@ This module defines the memory stores for canonical slot files on disk.
 from pathlib import Path
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
+from cowork.harnesses.memory.registry import SLOT_REGISTRY, MemorySlot
 
 PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
 

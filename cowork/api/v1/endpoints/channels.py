@@ -6,13 +6,15 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
+from cowork.channels.ingress import sync_channel_ingress
+from cowork.channels.lifecycle import LifecycleError
 from cowork.db.session import get_session
 from cowork.schemas.channels import (
-    ChannelAgentResponse,
-    ChannelAgentUpdateRequest,
     BindingCreateRequest,
     BindingResponse,
     BindingUpdateRequest,
+    ChannelAgentResponse,
+    ChannelAgentUpdateRequest,
     ChannelConfigResponse,
     ChannelConfigUpdateRequest,
     ChannelInstallationResponse,
@@ -21,8 +23,6 @@ from cowork.schemas.channels import (
     ChannelStatusResponse,
     PluginResponse,
 )
-from cowork.channels.lifecycle import LifecycleError
-from cowork.channels.ingress import sync_channel_ingress
 from cowork.services.channel_bindings import (
     BindingConflictError,
     BindingNotFoundError,

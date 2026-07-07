@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cowork.common.datetime_utils import ensure_utc
@@ -35,7 +35,7 @@ def advance_occurrence(cadence: str, at: datetime, timezone_name: str) -> dateti
         raise ValueError(f"Unsupported cadence for recurrence: {cadence}")
 
     next_local = datetime.combine(next_date, local.time(), tzinfo=tz)
-    return next_local.astimezone(timezone.utc)
+    return next_local.astimezone(UTC)
 
 
 def next_future_occurrence(
@@ -46,7 +46,7 @@ def next_future_occurrence(
     now: datetime | None = None,
 ) -> datetime:
     """Fast-forward ``next_run_at`` to the first occurrence after ``now``."""
-    reference = ensure_utc(now or datetime.now(timezone.utc))
+    reference = ensure_utc(now or datetime.now(UTC))
     cursor = ensure_utc(next_run_at)
     if reference is None or cursor is None:
         raise ValueError("next_run_at and now must be datetimes")
@@ -64,7 +64,7 @@ def count_missed_occurrences(
     now: datetime | None = None,
 ) -> tuple[int, datetime]:
     """Count overdue occurrences and return the first future ``next_run_at``."""
-    reference = ensure_utc(now or datetime.now(timezone.utc))
+    reference = ensure_utc(now or datetime.now(UTC))
     cursor = ensure_utc(next_run_at)
     if reference is None or cursor is None:
         raise ValueError("next_run_at and now must be datetimes")
