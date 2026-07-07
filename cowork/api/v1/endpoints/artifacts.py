@@ -152,8 +152,10 @@ def serve_artifact_file(project_name: str, file_path: str):
     if base_path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     try:
-        target = (base_path / file_path).resolve()  # codeql[py/path-injection] -- bounded by relative_to() below
-        target.relative_to(base_path.resolve())  # codeql[py/path-injection] -- raises ValueError if target escapes base_path
+        # codeql[py/path-injection]
+        target = (base_path / file_path).resolve()
+        # codeql[py/path-injection]
+        target.relative_to(base_path.resolve())
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
     if not target.is_file():
