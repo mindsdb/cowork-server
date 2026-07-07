@@ -2,7 +2,7 @@ import json
 from enum import Enum
 from typing import Annotated, Any, Callable, get_args
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
@@ -377,6 +377,10 @@ class UserSettings(Settings):
         ),
     )
 
+    # Memoized parse of `minds_model_enabled` (see `_minds_enabled_map`). Not a
+    # settings field — never validated or serialized.
+    _enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
+
     @field_validator("harness")
     @classmethod
     def validate_harness(cls, v: str) -> str:
@@ -393,14 +397,27 @@ class UserSettings(Settings):
         recommended-models endpoint refreshes from ``/v1/models`` on every
         settings load — so it tracks plan changes (e.g. an upgrade re-enables
         sonnet on the next fetch) without any network call here.
+
+        Parsed once per instance and memoized: this is called from
+        ``apply_model_defaults`` and both ``resolved_*_model`` properties.
         """
+        if self._enabled_map_cache is not None:
+            return self._enabled_map_cache
         try:
             raw = json.loads(self.minds_model_enabled or "{}")
         except (ValueError, TypeError):
-            return {}
-        if not isinstance(raw, dict):
-            return {}
-        return {k: bool(v) for k, v in raw.items() if isinstance(k, str)}
+            raw = {}
+        # Accept only real booleans. The map is written from real bools, but a
+        # stringy value (corruption / a future writer) must not be misread —
+        # ``bool("false")`` is True. A dropped entry is simply absent, which the
+        # consumers already treat as "available", so this can't over-lock.
+        result = (
+            {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, bool)}
+            if isinstance(raw, dict)
+            else {}
+        )
+        self._enabled_map_cache = result
+        return result
 
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
