@@ -140,7 +140,7 @@ class Settings(BaseSettings):
 
 class DatabaseSettings(Settings):
     uri: str = Field(
-        default=f"sqlite:///{str(Path.home() / ".cowork" / "cowork.db")}", description="The database connection URI"
+        default=f"sqlite:///{str(Path.home() / '.cowork' / 'cowork.db')}", description="The database connection URI"
     )  # DATABASE_URI
 
     # Connection pool configurations
