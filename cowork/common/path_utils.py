@@ -13,3 +13,11 @@ def is_relative_to(base: Path, path: Path) -> bool:
     base_normalized = os.path.normpath(str(base))
     path_normalized = os.path.normpath(str(path))
     return path_normalized == base_normalized or path_normalized.startswith(base_normalized + os.sep)
+
+
+def is_single_path_segment(path: str) -> bool:
+
+    if path in {".", "..", ''}:
+        return False
+
+    return path == Path(path).name

@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.common.path_utils import is_relative_to
+from cowork.common.path_utils import is_relative_to, is_single_path_segment
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
@@ -148,6 +148,9 @@ def serve_artifact_file(project_name: str, file_path: str):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
     and new-tab open both work in web deployments."""
+
+    if not is_single_path_segment(project_name):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     base = _project_artifacts_base(project_name)
     if base is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
