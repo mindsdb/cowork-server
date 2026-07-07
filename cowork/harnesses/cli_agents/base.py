@@ -89,8 +89,44 @@ class BaseCliHarness:
 
     # ── Behavior hooks subclasses implement ──────────────────────────────
 
+    def preferred_paths(self) -> tuple[str, ...]:
+        """Canonical install locations to check before falling back to a
+        PATH scan. Override when this CLI's own installer always writes
+        to a well-known location — otherwise an unrelated same-named
+        tool earlier on PATH (e.g. an old `npm i -g` shim) can silently
+        shadow the real binary the moment PATH gets reordered for any
+        reason (a different launch mechanism, a PATH change made for a
+        completely different coworker)."""
+        return ()
+
+    @classmethod
+    def search_path(cls) -> str:
+        """PATH used for CLI discovery and spawning, independent of how
+        the server process was launched. The Electron app, a service
+        wrapper, and a terminal all hand the server different PATHs —
+        coworkers must not appear/disappear based on that accident, so
+        the user-level dirs where coworker CLIs actually install are
+        appended when missing."""
+        base = os.environ.get("PATH", "")
+        if os.name != "nt":
+            return base
+        extras = (
+            os.path.expandvars(r"%USERPROFILE%\.local\bin"),
+            os.path.expandvars(r"%APPDATA%\npm"),
+            os.path.expandvars(r"%LOCALAPPDATA%\agy\bin"),
+        )
+        parts = base.split(os.pathsep) if base else []
+        seen = {p.lower() for p in parts}
+        for extra in extras:
+            if extra.lower() not in seen and os.path.isdir(extra):
+                parts.append(extra)
+        return os.pathsep.join(parts)
+
     def find_cli(self) -> str | None:
-        return shutil.which(self.config.executable)
+        for candidate in self.preferred_paths():
+            if os.path.isfile(candidate):
+                return candidate
+        return shutil.which(self.config.executable, path=self.search_path())
 
     @staticmethod
     def spawn_argv(cli: str) -> list[str]:
@@ -261,6 +297,10 @@ class BaseCliHarness:
         for key in self.env_removals():
             env.pop(key, None)
         env.update(self.env_overrides())
+        # Same PATH the CLI was discovered with — a CLI that find_cli()
+        # located via search_path()'s appended dirs must also be able to
+        # re-resolve itself/its helpers when it spawns children.
+        env["PATH"] = self.search_path()
 
         Path(request.cwd).mkdir(parents=True, exist_ok=True)
 
@@ -304,11 +344,22 @@ class BaseCliHarness:
             emit(NormalizedEvent(type="completed", final_text=""))
             return
         finally:
+            # Never leak the child: a parse_line bug or generator teardown
+            # mid-stream must not leave a headless CLI running (leaked
+            # children accumulate and eventually make ALL spawns flaky —
+            # 0xC0000142-style init failures under resource pressure).
+            if proc.poll() is None:
+                proc.kill()
             try:
                 if proc.stderr is not None:
                     stderr_tail = proc.stderr.read()[-2000:]
             except Exception:
                 pass
+
+        # 0xC0000142 (STATUS_DLL_INIT_FAILED): Windows refused to even
+        # initialize the process — transient resource pressure, not a CLI
+        # or login problem. Nothing executed, so one retry is safe.
+        WIN_INIT_FAILED = 3221225794
 
         if proc.returncode not in (0, None) and not got_any_output:
             # A resume against a session the CLI doesn't know (e.g. its
@@ -318,6 +369,18 @@ class BaseCliHarness:
                 logger.warning("%s --resume failed (rc=%s); retrying as a new session. stderr: %s",
                                 self.label, proc.returncode, stderr_tail)
                 self._run_cli(cli=cli, request=request, resume=False, emit=emit, allow_retry=False)
+                return
+            if proc.returncode == WIN_INIT_FAILED and allow_retry:
+                logger.warning("%s failed to initialize (0xC0000142); retrying once.", self.label)
+                self._run_cli(cli=cli, request=request, resume=resume, emit=emit, allow_retry=False)
+                return
+            if proc.returncode == WIN_INIT_FAILED:
+                emit(NormalizedEvent(type="error", detail=(
+                    f"{self.label} could not start (Windows process-init failure 0xC0000142). "
+                    "This is a transient system condition, not a login issue — try sending again; "
+                    "if it persists, close unused apps or restart the machine."
+                )))
+                emit(NormalizedEvent(type="completed", final_text=""))
                 return
             emit(NormalizedEvent(type="error", detail=(
                 f"{self.label} exited with code {proc.returncode}. "

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 from cowork.harnesses.base import register
 from cowork.harnesses.cli_agents.base import BaseCliHarness
@@ -44,14 +45,28 @@ class ClaudeCodeHarness(BaseCliHarness):
         # the way full model ids (claude-fable-5, …) would.
         return ("fable", "opus", "sonnet", "haiku")
 
+    def preferred_paths(self) -> tuple[str, ...]:
+        # The native Claude Code installer always writes here. Checked
+        # before a PATH scan so an unrelated `npm i -g` shim elsewhere
+        # on PATH (a stale/different claude install, e.g. the deprecated
+        # @anthropic-ai/claude-code package) can never shadow it — bit
+        # us for real: adding npm's global bin to PATH for Codex support
+        # made shutil.which('claude') resolve a months-old npm shim
+        # instead, breaking auth-status and turns for the default coworker.
+        bin_dir = Path.home() / ".local" / "bin"
+        return (str(bin_dir / "claude.exe"), str(bin_dir / "claude"))
+
     def check_status(self) -> dict:
         base = super().check_status()
         if not base["installed"]:
             return base
         try:
+            # 30s not 15s: CLI cold start under system load was observed
+            # exceeding 15s, turning a logged-in install into a spurious
+            # "could not read auth status" in the CLI Agents panel.
             result = subprocess.run(
                 [*self.spawn_argv(base["path"]), "auth", "status"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=30,
             )
             status = json.loads(result.stdout)
         except Exception as exc:

@@ -89,7 +89,7 @@ class CodexHarness(BaseCliHarness):
         try:
             result = subprocess.run(
                 [*self.spawn_argv(base["path"]), "login", "status"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=30,
             )
         except Exception as exc:
             base["detail"] = f"Could not check login status: {exc}"

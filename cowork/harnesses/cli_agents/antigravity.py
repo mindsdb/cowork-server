@@ -53,16 +53,26 @@ class AntigravityHarness(BaseCliHarness):
     def available_models(cls) -> tuple[str, ...]:
         if cls._models_cache is not None:
             return cls._models_cache
-        cli = shutil.which(cls.config.executable)
+        cli = shutil.which(cls.config.executable, path=cls.search_path())
         if cli is None:
             return ()  # not installed — don't cache, it may appear later
-        try:
-            result = subprocess.run(
-                [*cls.spawn_argv(cli), "models"],
-                capture_output=True, text=True, timeout=20,
-            )
-        except Exception:
-            return ()
+        # Two attempts at 45s each: `agy models` reconnects to its own
+        # backend on a cold start (idle overnight, first call after boot)
+        # — observed ~35s once and an outright exit-1 flake another time,
+        # both of which a single tight-timeout call misreports as "no
+        # models", emptying the composer's model list for this coworker.
+        for attempt in (1, 2):
+            try:
+                result = subprocess.run(
+                    [*cls.spawn_argv(cli), "models"],
+                    capture_output=True, text=True, timeout=45,
+                )
+            except Exception:
+                if attempt == 2:
+                    return ()
+                continue
+            if result.returncode == 0:
+                break
         if result.returncode != 0:
             return ()
         models = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
@@ -81,13 +91,25 @@ class AntigravityHarness(BaseCliHarness):
         base = super().check_status()
         if not base["installed"]:
             return base
-        try:
-            result = subprocess.run(
-                [base["path"], "models"], capture_output=True, text=True, timeout=20,
-            )
-        except Exception as exc:
-            base["detail"] = f"Could not check status: {exc}"
-            return base
+        # Two attempts: agy's first invocation after an idle period
+        # reconnects to its backend and routinely fails or runs 30s+
+        # (observed exit-1 in 2s, then success on immediate retry). One
+        # retry converts that cold-start flake into a correct answer
+        # instead of a false "Not responding" in the CLI Agents panel.
+        result = None
+        for attempt in (1, 2):
+            try:
+                result = subprocess.run(
+                    [*self.spawn_argv(base["path"]), "models"],
+                    capture_output=True, text=True, timeout=45,
+                )
+            except Exception as exc:
+                if attempt == 2:
+                    base["detail"] = f"Could not check status: {exc}"
+                    return base
+                continue
+            if result.returncode == 0 and result.stdout.strip():
+                break
         base["loggedIn"] = result.returncode == 0 and bool(result.stdout.strip())
         base["detail"] = (
             "Responding normally (no dedicated login-status command exists for this CLI)."
