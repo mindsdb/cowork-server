@@ -221,7 +221,10 @@ class ResponsesHandler:
             await buffer.close("cancelled")
             return
         except Exception as exc:
-            friendly = friendly_turn_error(exc)
+            # Resolve the model-403 info once and hand it to friendly_turn_error
+            # so it isn't computed twice on this path (reused by the extras below).
+            model_info = model_unavailable_info(exc)
+            friendly = friendly_turn_error(exc, model_info=model_info)
             if friendly is not None:
                 code, message = friendly
                 logger.info("[responses] user-facing turn error: %s", exc)
@@ -247,18 +250,12 @@ class ResponsesHandler:
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
             elif code in (MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE):
-                # Model-403: tell the client WHICH model was rejected so the
-                # card can name it ("Sonnet isn't included in your plan").
-                # Same never-break rule as the auth extras above.
-                try:
-                    info = model_unavailable_info(exc)
-                    provider = get_user_settings().resolved_planning_provider
-                    extra = {
-                        "model": info[1] if info else "",
-                        "provider_label": provider.label,
-                    }
-                except Exception:
-                    logger.exception("[responses] could not build model-unavailable extras")
+                # Model-403: tell the client WHICH model was rejected so the card
+                # can name it ("Sonnet isn't included in your plan"). No
+                # provider_label — the ModelUnavailableCard doesn't render it, and
+                # resolved_planning_provider would name the wrong provider when
+                # the *coding* model was the one rejected.
+                extra = {"model": model_info[1] if model_info else ""}
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)

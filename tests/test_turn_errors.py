@@ -379,7 +379,9 @@ async def test_stream_emits_model_unavailable_with_extras():
     assert payload["code"] == "model_access_denied"
     assert payload["error"] == _PLAN_MSG
     assert payload["model"] == "sonnet"
-    assert "provider_label" in payload
+    # No provider_label on the model-403 path — the card doesn't render it and
+    # it would name the wrong provider when the coding model was rejected.
+    assert "provider_label" not in payload
 
 
 def test_collect_raises_400_with_plan_message_for_model_403():

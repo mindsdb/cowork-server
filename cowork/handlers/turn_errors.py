@@ -183,22 +183,31 @@ def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
     return f"Your {provider_label} API key is no longer valid — update it in Settings."
 
 
-def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
+_UNSET: object = object()
+
+
+def friendly_turn_error(
+    exc: Exception, model_info: tuple[str, str] | None | object = _UNSET
+) -> tuple[str, str] | None:
     """Map a known, cryptic turn failure to ``(code, user_message)``.
 
     Returns ``None`` when the exception isn't one we have curated copy
     for — the caller then falls back to the generic redacted message.
+
+    ``model_info`` lets a caller that already resolved ``model_unavailable_info``
+    (the streaming handler needs the rejected model for the card) pass it in so
+    it isn't computed twice; omit it and it's resolved on demand.
     """
     # token_limit first: a 402/429 credit/quota case must not be misread as
     # auth or as a model gate.
     if is_token_limit_error(exc):
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
-    model_info = model_unavailable_info(exc)
+    if model_info is _UNSET:
+        model_info = model_unavailable_info(exc)
     if model_info is not None:
-        code, _model = model_info
         # anton's ModelUnavailableError message is already curated user copy
         # (plan guidance / hedged kill-switch wording) — pass it through.
-        return code, str(exc) or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
+        return model_info[0], str(exc) or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if is_auth_error(exc):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     if is_image_format_error(exc):
