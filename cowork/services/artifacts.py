@@ -25,7 +25,7 @@ from typing import Iterator
 
 from urllib.parse import quote
 
-from cowork.common.path_utils import is_relative_to
+from cowork.common.path_utils import is_relative_to, is_single_path_segment
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -357,6 +357,8 @@ def _project_artifacts_base(project_name: str) -> Path | None:
         return None
     registered = set(_registered_project_dirs())
     root = _projects_root().resolve(strict=False)
+    if not is_single_path_segment(project_name):
+        return None
     try:
         candidate = (root / project_name).resolve(strict=False)
     except (OSError, ValueError):
