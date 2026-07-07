@@ -9,6 +9,7 @@ vet_). SSE is streamed straight through (httpx stream -> StreamingResponse).
 
 from __future__ import annotations
 
+import logging
 from urllib.parse import urlparse
 
 import httpx
@@ -18,6 +19,8 @@ from pydantic import SecretStr
 
 from cowork.common.http_client import get_proxy_client
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+
+logger = logging.getLogger(__name__)
 
 _SSE_HEADERS = {
     "Cache-Control": "no-store",
@@ -83,7 +86,8 @@ async def forward_comments_rest(
             request.method, url, headers=_forward_headers(api_key), content=body
         )
     except httpx.RequestError as exc:
-        return PlainTextResponse(f"Proxy error: {exc}", status_code=502)
+        logger.warning("comments proxy REST upstream error: %s", exc)
+        return PlainTextResponse("upstream connection error", status_code=502)
     out_headers = {k: v for k, v in r.headers.items() if k.lower() not in _HOP_HEADERS}
     return Response(
         content=r.content,
@@ -117,7 +121,8 @@ async def forward_comments_stream(
     try:
         upstream = await client.send(upstream_req, stream=True)
     except httpx.RequestError as exc:
-        return PlainTextResponse(f"Proxy error: {exc}", status_code=502)
+        logger.warning("comments proxy stream upstream error: %s", exc)
+        return PlainTextResponse("upstream connection error", status_code=502)
 
     async def body_iter():
         try:
