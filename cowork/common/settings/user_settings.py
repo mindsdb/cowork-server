@@ -1,3 +1,4 @@
+import json
 from enum import Enum
 from typing import Annotated, Any, Callable, get_args
 
@@ -86,11 +87,43 @@ def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
 
 
+def _enabled_aware_default(
+    provider_value: str,
+    defaults: dict[str, str],
+    enabled_map: dict[str, bool],
+) -> str | None:
+    """The provider's canonical default model, adjusted for tier availability.
+
+    MindsHub gates models per plan tier (a free-tier key gets sonnet/haiku as
+    ``enabled: false`` from ``/v1/models``), so blindly handing out the
+    canonical default would 403 every turn for a free account. When the cached
+    availability map (``minds_model_enabled``) marks the default as disabled,
+    fall back to the first enabled model in the map — the map preserves the
+    gateway's ``/v1/models`` ordering, which lists the tier's baseline model
+    first. Applies only to minds-cloud: direct (BYOK) providers have no tier
+    gating and no map entries.
+
+    Deliberately conservative: an absent/empty map, a default missing from the
+    map, or a map with nothing enabled all leave the canonical default
+    untouched — degraded metadata must never change behavior for paid users.
+    """
+    default = defaults.get(provider_value)
+    if provider_value != Provider.MINDS_CLOUD.value or not enabled_map:
+        return default
+    if default is None or enabled_map.get(default, True):
+        return default
+    for model_id, enabled in enabled_map.items():
+        if enabled:
+            return model_id
+    return default
+
+
 def _resolved_model(
     resolved_provider: "Provider",
     preferred_provider: "Provider",
     user_model: str | None,
     defaults: dict[str, str],
+    enabled_map: dict[str, bool] | None = None,
 ) -> str | None:
     """Resolve a role's model given the readiness resolver's provider switch.
 
@@ -98,7 +131,9 @@ def _resolved_model(
     resolved_coding_model so it can't drift between the two:
 
       - provider NOT switched → keep the user's chosen model.
-      - provider switched → use the resolved provider's canonical default.
+      - provider switched → use the resolved provider's canonical default
+        (tier-adjusted via _enabled_aware_default, so switching a free-tier
+        account onto minds-cloud never lands on a locked model).
         NEVER fall back to the original provider's model — that would hand e.g.
         a Claude id to an openai-compatible / MindsHub endpoint (misrouting).
       - resolved provider has no canonical default (openai-compatible) → None,
@@ -107,7 +142,7 @@ def _resolved_model(
     """
     if resolved_provider == preferred_provider:
         return user_model
-    return defaults.get(resolved_provider.value)
+    return _enabled_aware_default(resolved_provider.value, defaults, enabled_map or {})
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
 UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
@@ -331,6 +366,16 @@ class UserSettings(Settings):
         title="Provider Status Details",
         description="JSON-encoded map of provider type → last connectivity-test detail (e.g. an HTTP code).",
     )
+    minds_model_enabled: str = Field(
+        default="{}",
+        title="MindsHub Model Availability",
+        description=(
+            "JSON-encoded map of MindsHub model id → enabled flag, cached from "
+            "/v1/models whenever recommended-models fetches it live. Lets model "
+            "defaults avoid tier-locked models without a network call in the "
+            "turn path."
+        ),
+    )
 
     @field_validator("harness")
     @classmethod
@@ -341,12 +386,39 @@ class UserSettings(Settings):
             raise ValueError(f"Unknown harness '{v}'. Available: {available}")
         return v
 
+    def _minds_enabled_map(self) -> dict[str, bool]:
+        """The cached MindsHub model-availability map (id → enabled), or {}.
+
+        Sourced from the ``minds_model_enabled`` setting, which the
+        recommended-models endpoint refreshes from ``/v1/models`` on every
+        settings load — so it tracks plan changes (e.g. an upgrade re-enables
+        sonnet on the next fetch) without any network call here.
+        """
+        try:
+            raw = json.loads(self.minds_model_enabled or "{}")
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {k: bool(v) for k, v in raw.items() if isinstance(k, str)}
+
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
+        # Defaults are tier-aware for minds-cloud: a free-tier account (sonnet /
+        # haiku locked) falls back to the first enabled model instead of a
+        # guaranteed-403 default. Only applies while the user hasn't picked a
+        # model (None) — an explicit choice is never rewritten, and since
+        # nothing persists the value assigned here, an upgrade flips the
+        # default back to the canonical model on the next settings load.
+        enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
-            self.planning_model = PLANNING_MODEL_DEFAULTS.get(self.planning_provider.value)
+            self.planning_model = _enabled_aware_default(
+                self.planning_provider.value, PLANNING_MODEL_DEFAULTS, enabled_map
+            )
         if self.coding_model is None:
-            self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
+            self.coding_model = _enabled_aware_default(
+                self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
+            )
         return self
 
     def _has_key(self, p: Provider) -> bool:
@@ -399,6 +471,7 @@ class UserSettings(Settings):
             self.planning_provider,
             self.planning_model,
             PLANNING_MODEL_DEFAULTS,
+            self._minds_enabled_map(),
         )
 
     @property
@@ -408,6 +481,7 @@ class UserSettings(Settings):
             self.coding_provider,
             self.coding_model,
             CODING_MODEL_DEFAULTS,
+            self._minds_enabled_map(),
         )
 
     @property

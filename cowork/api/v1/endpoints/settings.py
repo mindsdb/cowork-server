@@ -236,6 +236,16 @@ async def recommended_models(session: SessionDep):
         )
         if live:
             recommended["minds-cloud"] = live
+            # Cache the availability map so model-default resolution
+            # (UserSettings._minds_enabled_map) can avoid tier-locked models
+            # without a network call in the turn path. Refreshed on every
+            # successful live fetch — a plan upgrade re-enables the canonical
+            # defaults on the next settings load. Only written when the fetch
+            # succeeded (`live` non-empty) so a transient failure can't wipe
+            # a previously-good map.
+            SettingService(session).upsert_setting(
+                "minds_model_enabled", json.dumps(live_enabled)
+            )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
 
