@@ -10,6 +10,7 @@ from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
+from cowork.services.llm_telemetry import build_prompt_anatomy, log_prompt_anatomy
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
@@ -460,7 +461,29 @@ class AntonHarness:
             ],
             cells=cells
         )
-        return ChatSession(config), temp_vault_dir
+        session = ChatSession(config)
+        # Prompt anatomy (ENG-642): size every component we control or can
+        # measure statically, once per turn. `_build_tools()` only populates
+        # the registry turn_stream would build anyway. The true per-call
+        # total comes from the [llm_usage] records; this explains it.
+        # Never let telemetry break a turn.
+        try:
+            log_prompt_anatomy(build_prompt_anatomy(
+                conversation_id=conversation.id,
+                turn_id=len(conversation.messages),
+                initial_history=initial_history,
+                suffix_parts={
+                    "runtime_context": config.system_prompt_context.runtime_context,
+                    "project_context": project_context,
+                    "output_context": output_context,
+                    "skill_output_context": skill_output_context,
+                    "attachment_context": attachment_context,
+                },
+                tool_defs=session._build_tools(),
+            ))
+        except Exception:
+            logger.debug("[prompt_anatomy] logging failed", exc_info=True)
+        return session, temp_vault_dir
 
     @staticmethod
     def _build_llm_client():

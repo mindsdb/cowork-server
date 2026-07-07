@@ -42,6 +42,8 @@ from cowork.services.skills import SkillService
 
 import logging
 
+from cowork.services.llm_telemetry import log_llm_usage, log_turn_summary
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,6 +126,7 @@ class ResponsesHandler:
                 buffer=buffer,
                 producer_coro=self._produce(
                     conv_id=conversation.id,
+                    turn_id=turn_id,
                     harness_input=harness_input,
                     original_content=original_content,
                     model=request.model,
@@ -162,6 +165,7 @@ class ResponsesHandler:
         self,
         *,
         conv_id: UUID,
+        turn_id: int,
         harness_input: list[dict],
         original_content,
         model: str,
@@ -183,17 +187,58 @@ class ResponsesHandler:
         collected_text: list[str] = []
         collected_events: list[dict] = []
         persisted = False
+        # Turn-level consumption/timing telemetry (ENG-642), derived from the
+        # events already flowing through the sink. `at_ms` is stamped on every
+        # event by the formatter.
+        created_ms: int | None = None
+        first_delta_ms: int | None = None
+        last_event_ms: int | None = None
+        usage_totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                        "max_context_pressure": 0.0}
 
         def event_sink(event_type: str, data: dict) -> None:
+            nonlocal created_ms, first_delta_ms, last_event_ms
             collected_events.append(data)
+            at_ms = data.get("at_ms")
+            if isinstance(at_ms, int):
+                last_event_ms = at_ms
+                if created_ms is None and event_type == "response.created":
+                    created_ms = at_ms
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
+                if first_delta_ms is None and isinstance(at_ms, int):
+                    first_delta_ms = at_ms
+            elif event_type == "response.usage":
+                usage_totals["calls"] += 1
+                usage_totals["input_tokens"] += data.get("input_tokens") or 0
+                usage_totals["output_tokens"] += data.get("output_tokens") or 0
+                usage_totals["max_context_pressure"] = max(
+                    usage_totals["max_context_pressure"],
+                    data.get("context_pressure") or 0.0,
+                )
+                log_llm_usage({
+                    "conversation_id": str(conv_id),
+                    "turn_id": turn_id,
+                    **data,
+                })
 
         def persist() -> None:
             nonlocal persisted
             if persisted:
                 return
             persisted = True
+            log_turn_summary({
+                "conversation_id": str(conv_id),
+                "turn_id": turn_id,
+                "calls": usage_totals["calls"],
+                "input_tokens": usage_totals["input_tokens"],
+                "output_tokens": usage_totals["output_tokens"],
+                "max_context_pressure": round(usage_totals["max_context_pressure"], 4),
+                "ttft_ms": (first_delta_ms - created_ms)
+                if first_delta_ms is not None and created_ms is not None else None,
+                "duration_ms": (last_event_ms - created_ms)
+                if last_event_ms is not None and created_ms is not None else None,
+            })
             try:
                 own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
                 own.commit()

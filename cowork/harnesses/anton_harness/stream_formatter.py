@@ -133,6 +133,7 @@ async def format_responses_stream(
     seq = 0
     last_progress = 0.0
     collected_text: list[str] = []
+    llm_call_seq = 0
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -304,7 +305,30 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamComplete):
-            pass
+            # Per-LLM-call token usage (ENG-642). Anton emits one
+            # StreamComplete per underlying API call (initial, each tool
+            # round, verifier). Recorded via `_event` so it reaches the
+            # event_sink (per-call [llm_usage] logging + persistence with
+            # the turn's MessageEvents) but deliberately NOT yielded — the
+            # wire protocol is unchanged, and the renderer's type-dispatch
+            # ignores unknown event types on replay. No sequence_number:
+            # wire events keep their contiguous numbering; `at_ms` orders
+            # this record. cache_* fields are None until anton's provider
+            # reports them (context-optimization step 2, prompt caching).
+            llm_call_seq += 1
+            usage = getattr(event.response, "usage", None)
+            if usage is not None:
+                _event("response.usage", {
+                    "type": "response.usage",
+                    "call_seq": llm_call_seq,
+                    "model": model,
+                    "input_tokens": getattr(usage, "input_tokens", None),
+                    "output_tokens": getattr(usage, "output_tokens", None),
+                    "context_pressure": getattr(usage, "context_pressure", None),
+                    "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
+                    "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None),
+                    "stop_reason": getattr(event.response, "stop_reason", None),
+                })
 
     full_text = "".join(collected_text)
     resp_completed = Response(
