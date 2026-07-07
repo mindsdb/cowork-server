@@ -160,9 +160,10 @@ def serve_artifact_file(project_name: str, file_path: str):
             raise ValueError("Invalid artifact path")
         base_resolved = base.resolve(strict=False)
         target = (base_resolved / rel_path).resolve(strict=False)
-        target.relative_to(base_resolved)
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
+    if not is_relative_to(base_resolved, target):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path")
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
