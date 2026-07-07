@@ -35,9 +35,19 @@ def test_reveal_key_sends_no_store():
 
 
 def test_non_settings_route_is_not_forced_no_store():
-    # The middleware is scoped to /settings; health must not be swept in.
+    # The middleware is scoped to /settings and /connectors/oauth; health
+    # must not be swept in.
     r = client.get("/api/v1/health/")
     assert r.headers.get("cache-control") != "no-store"
+
+
+def test_oauth_credentials_sends_no_store():
+    # GET .../oauth/{engine}/credentials returns a raw client_secret. Even on
+    # a 404 (unknown engine) the middleware must still stamp no-store, since
+    # it applies by path prefix regardless of status code.
+    r = client.get("/api/v1/connectors/oauth/unknown-engine/credentials")
+    assert r.status_code == 404
+    assert r.headers.get("cache-control") == "no-store"
 
 
 def test_mask_provider_keys_helper():

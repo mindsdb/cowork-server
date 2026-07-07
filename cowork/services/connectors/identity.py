@@ -142,16 +142,30 @@ def connection_display_name(fields: dict) -> str | None:
     return None
 
 
+# OAuth token-response/metadata field names that trip anton's generic
+# name-based secret heuristic (`token_url` contains "token", `auth_type`
+# contains "auth") but aren't actually secret — they're safe to show verbatim
+# in the connection details panel. An explicit spec `secret: true` flag still
+# overrides this list (see the `k in spec_secrets` check below).
+_KNOWN_NONSECRET_FIELDS = frozenset({"token_url", "auth_type", "token_type"})
+
+
 def secure_keys_for(connector_id: str, method: str | None, fields: dict) -> list[str]:
     """The ``secure_keys`` to persist: spec-marked secrets ∪ name-heuristic.
 
     Union so we never *under*-mask: an explicit spec flag classifies a field
     whose name the heuristic would miss, and the heuristic catches any extra
-    secret-shaped field the spec didn't mark.
+    secret-shaped field the spec didn't mark. ``_KNOWN_NONSECRET_FIELDS`` is
+    subtracted from the heuristic side only, so a spec can still force one of
+    those names secret explicitly if a future connector needs to.
     """
     spec_secrets = set(spec_secret_fields(connector_id, method))
     return sorted(
-        {k for k in fields if k in spec_secrets or is_secret_key(k, None)}
+        {
+            k for k in fields
+            if k in spec_secrets
+            or (k not in _KNOWN_NONSECRET_FIELDS and is_secret_key(k, None))
+        }
     )
 
 
