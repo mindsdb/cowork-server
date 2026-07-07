@@ -148,22 +148,14 @@ def serve_artifact_file(project_name: str, file_path: str):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
     and new-tab open both work in web deployments."""
-
-    if not is_single_path_segment(project_name):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
-    base = _project_artifacts_base(project_name)
-    if base is None:
+    base_path = _project_artifacts_base(project_name)
+    if base_path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     try:
-        rel_path = Path(file_path)
-        if not rel_path.parts or rel_path.is_absolute() or any(part in (".", "..") for part in rel_path.parts):
-            raise ValueError("Invalid artifact path")
-        base_resolved = base.resolve(strict=False)
-        target = (base_resolved / rel_path).resolve(strict=False)
+        target = (base_path / file_path).resolve()
+        target.relative_to(base_path.resolve())
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
-    if not is_relative_to(base_resolved, target):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path")
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
