@@ -59,7 +59,9 @@ class TestUsageCapture:
         assert usage[0]["input_tokens"] == 16000
         assert usage[1]["output_tokens"] == 80
         assert usage[0]["model"] == "test-model"
-        assert usage[0]["cache_read_input_tokens"] is None  # until caching lands
+        # None on anton builds predating prompt caching; 0 once Usage has
+        # the cache fields (they only go positive on real cache hits).
+        assert usage[0]["cache_read_input_tokens"] in (None, 0)
         assert all(isinstance(u.get("at_ms"), int) for u in usage)
         # Wire protocol unchanged: usage is recorded, never streamed.
         assert not any("response.usage" in chunk for chunk in sse)

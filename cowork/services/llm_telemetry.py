@@ -20,7 +20,18 @@ import json
 import logging
 from functools import lru_cache
 
+# Telemetry must be visible regardless of the app's LOG_LEVEL (the default
+# setup_logging() level is WARNING, which would swallow these INFO lines —
+# found in end-to-end verification). Dedicated stderr handler, no
+# propagation: this is a machine-readable stream for context_report.py,
+# deliberately separated from the app's console/file logging.
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
+    logger.addHandler(_handler)
+logger.propagate = False
 
 USAGE_TAG = "[llm_usage]"
 TURN_TAG = "[turn_summary]"
