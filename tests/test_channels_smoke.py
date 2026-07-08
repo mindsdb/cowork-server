@@ -32,9 +32,11 @@ class FakeHarness:
         self.tool_event = tool_event
         self.delay = delay
         self.inputs: list[list[dict]] = []
+        self.channel_contexts: list = []
 
-    async def stream_response(self, *, conversation, input):
+    async def stream_response(self, *, conversation, input, channel_context=None):
         self.inputs.append(input)
+        self.channel_contexts.append(channel_context)
         if False:
             yield
 
