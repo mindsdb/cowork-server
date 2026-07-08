@@ -285,6 +285,23 @@ class AntonHarness:
             if db_val:
                 setattr(anton_settings, attr, db_val)
 
+        # Routing & summarization role → anton's thalamus_* fields. The names
+        # differ by design (cowork exposes it as "router"; anton calls it the
+        # "thalamus"), so this can't ride the same-name copy loop above. The
+        # LLM client is actually built by build_llm_client (which reads the
+        # resolved router model directly), so this only keeps AntonSettings
+        # consistent for any path that reads it. Guarded so an anton build
+        # predating ENG-648 (no thalamus_* fields) doesn't raise.
+        router_provider = getattr(user, "router_provider", None)
+        if router_provider is not None and hasattr(anton_settings, "thalamus_provider"):
+            anton_settings.thalamus_provider = (
+                router_provider.value.replace("_", "-")
+                if hasattr(router_provider, "value") else router_provider
+            )
+        router_model = getattr(user, "router_model", None)
+        if router_model is not None and hasattr(anton_settings, "thalamus_model"):
+            anton_settings.thalamus_model = router_model
+
         workspace = Workspace(base)
         workspace.initialize()
         workspace.apply_env_to_process()

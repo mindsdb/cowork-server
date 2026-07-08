@@ -62,6 +62,8 @@ _ENV_TO_SETTING: dict[str, str] = {
     "ANTON_PLANNING_MODEL": "planning_model",
     "ANTON_CODING_PROVIDER": "coding_provider",
     "ANTON_CODING_MODEL": "coding_model",
+    "ANTON_ROUTER_PROVIDER": "router_provider",
+    "ANTON_ROUTER_MODEL": "router_model",
     # URLs
     "ANTON_MINDS_URL": "minds_url",
     "ANTON_OPENAI_BASE_URL": "openai_base_url",
