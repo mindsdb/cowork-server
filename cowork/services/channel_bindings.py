@@ -58,6 +58,7 @@ class ChannelBindingService:
             display_name=req.display_name,
             trigger_rule=req.trigger_rule.value,
             trigger_pattern=req.trigger_pattern,
+            instructions=req.instructions,
             anton_project_id=req.anton_project_id,
             anton_conversation_id=req.anton_conversation_id,
         )
@@ -95,6 +96,8 @@ class ChannelBindingService:
             binding.trigger_rule = req.trigger_rule.value
         if "trigger_pattern" in provided:
             binding.trigger_pattern = req.trigger_pattern
+        if "instructions" in provided:
+            binding.instructions = req.instructions
         if "anton_project_id" in provided:
             # Detach the pinned conversation on project change, else the runtime keeps serving the old project's conversation.
             project_changed = req.anton_project_id != binding.anton_project_id
