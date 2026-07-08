@@ -32,6 +32,7 @@ def test_channel_variant_swaps_desktop_guidance():
     assert "group chat" in text
     assert "plain-text" in text
     assert "sent into this chat automatically" in text
+    assert "prefixed with the sender's name" in text
     assert "desktop UI displays" not in text and "activity rows" not in text
 
 
@@ -40,6 +41,7 @@ def test_dm_variant_includes_display_name():
         ChannelContext(channel_type="whatsapp", is_group=False, display_name="Lead chat")
     )
     assert "one-on-one direct chat" in text and "(Lead chat)" in text
+    assert "prefixed with the sender's name" not in text
 
 
 def test_operator_instructions_appended_only_when_set():

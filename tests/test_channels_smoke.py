@@ -748,7 +748,7 @@ def group_telegram_update(
 ) -> bytes:
     msg = {
         "message_id": message_id,
-        "from": {"id": 42, "is_bot": False},
+        "from": {"id": 42, "is_bot": False, "first_name": "Alice", "last_name": "Realtor"},
         "chat": {"id": chat_id, "type": "supergroup"},
         "date": 1700000000,
         "text": text,
@@ -802,6 +802,19 @@ def test_telegram_group_mention_only_flow(monkeypatch):
     assert fake_harness.channel_contexts == [
         ChannelContext(channel_type="telegram", is_group=True, display_name=None, instructions=None)
     ]
+    # Group turns carry speaker attribution: harness input and stored history
+    # are prefixed with the sender's name.
+    assert fake_harness.inputs[0] == [
+        {"type": "text", "text": "Alice Realtor: @antonbot show me listings"}
+    ]
+    s = get_open_session()
+    binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "-100123")).one()
+    user_msgs = [
+        m for m in s.exec(select(Message).where(Message.conversation_id == binding.anton_conversation_id)).all()
+        if m.role == "user"
+    ]
+    assert user_msgs and user_msgs[0].content == "Alice Realtor: @antonbot show me listings"
+    s.close()
 
     # Replying to one of the bot's messages addresses it too.
     asyncio.run(inbound(group_telegram_update(
@@ -842,9 +855,10 @@ def test_telegram_group_mention_detection(monkeypatch):
     )))
     assert ev.message.is_mention is True
 
-    # Plain group text with no mention → not a mention.
+    # Plain group text with no mention → not a mention; sender name captured.
     ev = asyncio.run(parse(bridge, group_telegram_update(82, -200, 3, "hello all")))
     assert ev.message.is_mention is False
+    assert ev.message.sender_name == "Alice Realtor"
 
     # Private chats are always mentions and never trigger getMe.
     fresh = telegram_plugin.TelegramBridge({"bot_token": "x"})

@@ -317,6 +317,10 @@ class TelegramBridge:
 
         is_mention = (not is_group) or self._detect_group_mention(msg, text)
 
+        sender_name = " ".join(
+            part for part in (sender.get("first_name"), sender.get("last_name")) if part
+        ) or sender.get("username") or None
+
         message_id = str(msg.get("message_id", ""))
         event = InboundEvent(
             address=PlatformAddress(channel_type=CHANNEL_TYPE, platform_id=chat_id, thread_id=None),
@@ -326,6 +330,7 @@ class TelegramBridge:
                 timestamp=timestamp,
                 kind="chat",
                 sender_id=str(sender.get("id", "")) or None,
+                sender_name=sender_name,
                 is_mention=is_mention,
                 is_group=is_group,
                 attachments=attachments,

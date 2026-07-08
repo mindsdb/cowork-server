@@ -374,6 +374,13 @@ class AntonChannelRuntime:
             harness = get_harness(harness_id)
 
         text = self._event_text(event)
+        # In a group, several people share one conversation — prefix each
+        # message with the sender's name so the model (and the stored history)
+        # can tell who said what. Applied after trigger gating, so regex rules
+        # keep matching the raw text.
+        sender_name = getattr(event.message, "sender_name", None)
+        if text and event.message.is_group and sender_name:
+            text = f"{sender_name}: {text}"
         blocks = await self.build_input_blocks(session, adapter, event, text)
 
         _ = conversation.messages
