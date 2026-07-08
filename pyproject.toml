@@ -1,7 +1,7 @@
 [project]
 name = "cowork-server"
-dynamic = ["version"]
-description = "FastAPI backend for the MindsHub Cowork desktop app"
+version = "0.1.5"
+description = "FastAPI backend for the Cowork desktop app"
 readme = "README.md"
 license = "LicenseRef-Proprietary"
 requires-python = ">=3.12,<3.14"
@@ -62,9 +62,8 @@ fallback-version = "0.0.0-dev"
 packages = ["cowork"]
 
 [tool.uv.sources]
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
-# pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
-hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
+anton = { git = "https://github.com/mindsdb/anton.git", tag = "v2.26.5.29.3" }
+hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "d880b5be098893e7d766a9179da3501181c6fdb8" }
 
 [dependency-groups]
 dev = [

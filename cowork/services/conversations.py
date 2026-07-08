@@ -22,6 +22,10 @@ _MESSAGE_ORDER = (
     Message.id,
 )
 
+# Visible stand-in for a turn that produced no assistant text — keeps the
+# (user, assistant) pairing intact (see save_assistant_turn docstring).
+EMPTY_TURN_PLACEHOLDER = "[No response was produced for this turn.]"
+
 
 class ConversationService:
     def __init__(self, session: Session) -> None:
@@ -167,17 +171,24 @@ class ConversationService:
         events: list[dict],
         harness: str | None = None,
     ) -> None:
-        """Persist an assistant message and its streaming events."""
-        # Persist when there's body text OR any events — an artifact-only turn
-        # (the agent writes a file and says little/nothing) carries no text but
-        # emits a `response.artifact_created` event, and that event must survive
-        # reload so the inline card replays identically.
+        """Persist an assistant message and its streaming events.
+
+        A turn that produced no text (every provider rate-limited, a CLI
+        coworker errored before output, etc.) must still leave an
+        assistant row: the user message was already committed, so
+        dropping the turn would put two consecutive user messages in the
+        history — which downstream harnesses reject or mishandle (the
+        "consecutive Role.user" warning). Persist a visible placeholder
+        instead so `(user, assistant)` pairing always holds. Empty turns
+        that carry no events at all (nothing happened) are still skipped.
+        """
         if not text and not events:
             return
+        content = text or EMPTY_TURN_PLACEHOLDER
         assistant_msg = Message(
             conversation_id=conversation_id,
             role="assistant",
-            content=text,
+            content=content,
             harness=harness,
         )
         self.session.add(assistant_msg)
@@ -192,6 +203,83 @@ class ConversationService:
             ))
         if events:
             self.session.commit()
+
+    def begin_assistant_turn(
+        self,
+        conversation_id: UUID,
+        harness: str | None = None,
+    ) -> Message:
+        """Create the assistant row up front so streamed events have a
+        durable parent before their SSE strings leave the server
+        (write-ahead persistence — see ResponsesHandler._stream).
+
+        Content starts as the placeholder and is overwritten by
+        finalize_assistant_turn once the turn's text is known, so even a
+        crash mid-turn leaves a well-formed (user, assistant) pair whose
+        events replay the progress made so far.
+        """
+        assistant_msg = Message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=EMPTY_TURN_PLACEHOLDER,
+            harness=harness,
+        )
+        self.session.add(assistant_msg)
+        self.session.commit()
+        self.session.refresh(assistant_msg)
+        return assistant_msg
+
+    def append_event(
+        self,
+        message_id: UUID,
+        sequence_number: int,
+        event_data: dict,
+    ) -> None:
+        """Durably persist one streaming event (committed immediately).
+
+        Callers rely on write-ahead ordering: this must be called BEFORE
+        the event's SSE string is yielded to the client, so a disconnect
+        can only lose bytes on the wire — never recorded progress.
+        """
+        self.session.add(MessageEvent(
+            message_id=message_id,
+            sequence_number=sequence_number,
+            event_data=event_data,
+        ))
+        self.session.commit()
+
+    def finalize_assistant_turn(self, message_id: UUID, text: str) -> None:
+        """Stamp the assistant text once the stream ends (or is cut)."""
+        message = self.session.get(Message, message_id)
+        if message is None:
+            return
+        message.content = text or EMPTY_TURN_PLACEHOLDER
+        self.session.add(message)
+        self.session.commit()
+
+    def latest_assistant_message(self, conversation_id: UUID) -> Message | None:
+        """Newest assistant turn of a conversation — the turn
+        /responses/tail replays."""
+        return self.session.exec(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.role == "assistant")
+            .order_by(Message.created_at.desc(), Message.id.desc())  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+
+    def get_turn_events(self, message_id: UUID, from_seq: int = 0) -> list[MessageEvent]:
+        """Events of one assistant turn from `from_seq` on, in sequence
+        order — the replay path /responses/tail serves. Sequence numbers
+        are the 0-based message_events row numbering (same numbering
+        save_assistant_turn and append_event write), so a client that
+        resumes with `from_seq = last_seen + 1` gets a gapless tail."""
+        return list(self.session.exec(
+            select(MessageEvent)
+            .where(MessageEvent.message_id == message_id)
+            .where(MessageEvent.sequence_number >= from_seq)
+            .order_by(MessageEvent.sequence_number)
+        ).all())
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found

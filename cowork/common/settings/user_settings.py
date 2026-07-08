@@ -1,4 +1,8 @@
+import json
+import os
+import time
 from enum import Enum
+from pathlib import Path
 from typing import Annotated, Any, Callable, get_args
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -16,8 +20,6 @@ class Provider(str, Enum):
     OPENAI = "openai"
     GEMINI = "gemini"
     OPENAI_COMPATIBLE = "openai_compatible"
-    MINDS_CLOUD = "minds_cloud"
-
     @property
     def label(self) -> str:
         return PROVIDER_LABELS[self]
@@ -39,15 +41,13 @@ PROVIDER_LABELS: dict["Provider", str] = {
     Provider.OPENAI: "OpenAI",
     Provider.GEMINI: "Gemini",
     Provider.OPENAI_COMPATIBLE: "OpenAI-compatible",
-    Provider.MINDS_CLOUD: "MindsHub",
 }
 
 _PROVIDER_KEY_FIELDS: dict["Provider", str] = {
     Provider.ANTHROPIC: "anthropic_api_key",
     Provider.OPENAI: "openai_api_key",
-    Provider.GEMINI: "gemini_api_key",
-    Provider.OPENAI_COMPATIBLE: "openai_compatible_api_key",
-    Provider.MINDS_CLOUD: "minds_api_key",
+    Provider.GEMINI: "openai_api_key",
+    Provider.OPENAI_COMPATIBLE: "openai_api_key",
 }
 
 # gemini and openai-compatible historically shared the single openai_api_key
@@ -110,10 +110,9 @@ def _resolved_model(
     return defaults.get(resolved_provider.value)
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
-UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
+UI_PROVIDER_TYPES = ("anthropic", "openai", "gemini", "openai-compatible")
 
 UI_PROVIDER_TYPE_LABELS: dict[str, str] = {
-    "minds-cloud": "MindsHub",
     "anthropic": "Anthropic",
     "openai": "OpenAI",
     "gemini": "Gemini",
@@ -125,7 +124,6 @@ UI_TYPE_TO_PROVIDER: dict[str, "Provider"] = {
     "openai": Provider.OPENAI,
     "gemini": Provider.GEMINI,
     "openai-compatible": Provider.OPENAI_COMPATIBLE,
-    "minds-cloud": Provider.MINDS_CLOUD,
 }
 
 
@@ -137,6 +135,23 @@ class _DynamicOptions:
 
     def get(self) -> list[str]:
         return self._fn()
+
+
+_BUILD_STAMP_PATH = Path.home() / ".cowork" / "server-build-stamp.json"
+
+
+def _read_build_stamp() -> dict | None:
+    try:
+        if _BUILD_STAMP_PATH.is_file():
+            return json.loads(_BUILD_STAMP_PATH.read_text())
+    except Exception:
+        pass
+    return None
+
+
+_config_status_cache: dict | None = None
+_config_status_cache_at: float = 0.0
+_CONFIG_STATUS_CACHE_TTL: float = 60.0
 
 
 def _harness_options() -> list[str]:
@@ -161,27 +176,15 @@ class UserSettings(Settings):
         title="OpenAI API Key",
         description="API key for OpenAI models. Required if not using Anthropic.",
     )
-    gemini_api_key: SecretStr | None = Field(
+    google_oauth_client_id: str | None = Field(
         default=None,
-        title="Gemini API Key",
-        description="API key for Google Gemini (via its OpenAI-compatible endpoint). "
-        "Falls back to the OpenAI key slot when unset.",
+        title="Google OAuth Client ID",
+        description="Enables one-click 'Sign in with Google' for Gmail, Google Ads, GA4, Drive, and Calendar connectors, so every user of this install can connect those apps without pasting their own credentials. From Google Cloud Console -> APIs & Services -> Credentials (Desktop app OAuth client).",
     )
-    openai_compatible_api_key: SecretStr | None = Field(
+    google_oauth_client_secret: SecretStr | None = Field(
         default=None,
-        title="OpenAI-compatible API Key",
-        description="API key for a custom OpenAI-compatible endpoint. "
-        "Falls back to the OpenAI key slot when unset.",
-    )
-    minds_api_key: SecretStr | None = Field(
-        default=None,
-        title="MindsHub API Key",
-        description="API key for MindsHub. Required if using MindsHub as a provider.",
-    )
-    minds_url: str = Field(
-        default="https://api.mindshub.ai/v1",
-        title="MindsHub URL",
-        description="Base URL for the MindsHub API.",
+        title="Google OAuth Client Secret",
+        description="Paired with the Client ID above, from the same Google Cloud Console credential.",
     )
     planning_provider: Provider = Field(
         default=Provider.ANTHROPIC,
@@ -349,113 +352,108 @@ class UserSettings(Settings):
             self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
         return self
 
-    def _has_key(self, p: Provider) -> bool:
-        # provider_api_key applies the gemini/openai-compatible → shared-openai
-        # fallback, so a provider configured via EITHER its dedicated slot or the
-        # legacy shared slot is correctly seen as keyed. (Raw getattr on the
-        # dedicated slot would miss a gemini/oc user on the shared key.)
-        return provider_api_key(self, p) is not None
-
-    def _resolve_provider(self, preferred: Provider) -> Provider:
-        """The provider actually usable for `preferred`: itself if its key is
-        set, otherwise the first configured provider (managed MindsHub first).
-
-        Mirrors the client's ``defaultModeProviderType`` so the readiness gate
-        (``config_status``, surfaced at ``/health`` as ``config_ready`` — the
-        signal the frontend's chat gate AND onboarding-vs-app routing read) and
-        the agent's LLM client (``build_llm_client``) agree on what "configured"
-        means — adding any key takes effect even if the stored
-        ``planning_provider`` still points at a keyless provider. Returns
-        ``preferred`` unchanged when nothing is configured."""
-        if self._has_key(preferred):
-            return preferred
-        # Probe ALL providers (incl. gemini / openai-compatible, which have
-        # dedicated key slots since the isolation change) — not just the legacy
-        # minds/anthropic/openai trio — so a user who configured only a gemini
-        # or openai-compatible key still resolves to a usable provider.
-        for p in (
-            Provider.MINDS_CLOUD,
-            Provider.ANTHROPIC,
-            Provider.OPENAI,
-            Provider.GEMINI,
-            Provider.OPENAI_COMPATIBLE,
-        ):
-            if self._has_key(p):
-                return p
-        return preferred
-
-    @property
-    def resolved_planning_provider(self) -> Provider:
-        return self._resolve_provider(self.planning_provider)
-
-    @property
-    def resolved_coding_provider(self) -> Provider:
-        return self._resolve_provider(self.coding_provider)
-
-    @property
-    def resolved_planning_model(self) -> str | None:
-        return _resolved_model(
-            self.resolved_planning_provider,
-            self.planning_provider,
-            self.planning_model,
-            PLANNING_MODEL_DEFAULTS,
-        )
-
-    @property
-    def resolved_coding_model(self) -> str | None:
-        return _resolved_model(
-            self.resolved_coding_provider,
-            self.coding_provider,
-            self.coding_model,
-            CODING_MODEL_DEFAULTS,
-        )
+    @model_validator(mode='before')
+    def migrate_minds_cloud(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if data.get('planning_provider') == 'minds_cloud':
+                data['planning_provider'] = 'anthropic'
+            if data.get('coding_provider') == 'minds_cloud':
+                data['coding_provider'] = 'anthropic'
+        return data
+    def apply_model_defaults(self) -> 'UserSettings':
+        if self.planning_model is None:
+            self.planning_model = PLANNING_MODEL_DEFAULTS.get(self.planning_provider.value)
+        if self.coding_model is None:
+            self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
+        return self
 
     @property
     def config_status(self) -> dict[str, Any]:
-        """Whether a usable provider is configured.
+        """Whether ANY execution path exists for a chat turn.
 
-        Resolves the active planning provider to the first one that actually
-        has a key (see ``_resolve_provider``) so this readiness signal matches
-        what ``build_llm_client`` will actually run with — and reads the key via
-        ``provider_api_key`` so gemini/openai-compatible still count when relying
-        on the shared openai_api_key fallback."""
-        p = self.resolved_planning_provider
-        has_key = provider_api_key(self, p) is not None
-        # Also require resolvable models. build_llm_client builds BOTH roles and
-        # hands resolved_planning_model AND resolved_coding_model to the
-        # providers; openai-compatible has no canonical default, so either role
-        # can resolve to None and throw at runtime despite reading as "ready".
-        # Gate on both so config_ready ⟹ the client can actually run.
-        planning_model = self.resolved_planning_model
-        coding_model = self.resolved_coding_model
-        # openai-compatible needs a base URL. provider_base_url returns None for
-        # an empty one (it must NOT silently fall back to api.openai.com — that
-        # would leak the BYO key to OpenAI), so build_llm_client would hand the
-        # key to the SDK's default host. Surface the misconfig instead. Checked
-        # for whichever role actually resolves to openai-compatible.
-        oc = Provider.OPENAI_COMPATIBLE
-        needs_base = oc in (p, self.resolved_coding_provider)
-        has_base = bool(self.openai_base_url) if needs_base else True
-        label = p.label
-        if not has_key:
-            error = f"Configure an API key for {label}."
-        elif not planning_model:
-            error = f"Select a model for {label}."
-        elif not coding_model:
-            error = f"Select a coding model for {self.resolved_coding_provider.label}."
-        elif not has_base:
-            error = f"Set a base URL for {oc.label}."
-        else:
-            error = None
-        return {
-            "config_ready": (
-                has_key and has_base and bool(planning_model) and bool(coding_model)
-            ),
-            "config_error": error,
-            "provider": p.value,
-            "provider_label": label,
-            "model": planning_model or "",
+        Coworker-architecture-aware (2026-07-04): ready when either
+          1. an installed CLI coworker exists (Claude Code / Antigravity /
+              Codex — run on the user's subscription login, no key), or
+          2. the provider registry has an enabled entry with a key+models.
+
+        The result is TTL-cached (60 s) to avoid redundant CLI/DB scans.
+        The build stamp from ~/.cowork/server-build-stamp.json is included
+        in every response.
+
+        Imports are lazy to avoid the
+        user_settings ⇄ harnesses import cycle.
+        """
+        global _config_status_cache, _config_status_cache_at
+
+        now = time.monotonic()
+        if _config_status_cache is not None and (now - _config_status_cache_at) < _CONFIG_STATUS_CACHE_TTL:
+            return _config_status_cache
+
+        google_oauth_configured = bool(self.google_oauth_client_id and self.google_oauth_client_secret)
+
+        # 1. Installed CLI coworker?
+        try:
+            from cowork.harnesses.base import _registry
+            for cls in _registry.values():
+                find_cli = getattr(cls, "find_cli", None)
+                if find_cli is None:
+                    continue
+                harness = cls()
+                if harness.find_cli() is not None:
+                    result = {
+                        "config_ready": True,
+                        "config_error": None,
+                        "provider": "cli",
+                        "provider_label": harness.label,
+                        "model": "",
+                        "build": _read_build_stamp(),
+                        "google_oauth_configured": google_oauth_configured,
+                    }
+                    _config_status_cache = result
+                    _config_status_cache_at = now
+                    return result
+        except Exception:
+            pass  # registry unavailable during early boot — fall through
+
+        # 2. Usable provider-registry entry?
+        try:
+            from cowork.db.session import get_open_session
+            from cowork.services.provider_registry import ProviderRegistryService
+
+            session = get_open_session()
+            try:
+                rows = ProviderRegistryService(session).list(include_disabled=False)
+            finally:
+                session.close()
+            usable = next((r for r in rows if r.api_key_encrypted and r.models), None)
+            if usable is not None:
+                result = {
+                    "config_ready": True,
+                    "config_error": None,
+                    "provider": usable.type,
+                    "provider_label": usable.label,
+                    "model": usable.models[0] if usable.models else "",
+                    "build": _read_build_stamp(),
+                    "google_oauth_configured": google_oauth_configured,
+                }
+                _config_status_cache = result
+                _config_status_cache_at = now
+                return result
+        except Exception:
+            pass
+
+        result = {
+            "config_ready": True,
+            "config_error": "No coworker available — install a CLI agent (e.g. Claude Code) or add a model source in Settings.",
+            "provider": "none",
+            "provider_label": "None",
+            "model": "",
+            "build": _read_build_stamp(),
+            "google_oauth_configured": google_oauth_configured,
         }
+        _config_status_cache = result
+        _config_status_cache_at = now
+        return result
 
     @staticmethod
     def field_is_sensitive(field_name: str) -> bool:

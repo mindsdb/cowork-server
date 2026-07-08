@@ -240,8 +240,7 @@ class GoogleOAuthService:
                 success=False,
             )
 
-        store.clear_pending(service)
-        store.set_outcome(state, {"status": "success", "name": connection_name})
+        store.clear_pending(service, connection_name=connection_name)
         return _callback_page(
             f"{service_label} connected",
             f"{account_name or account_email or 'Your Google account'} is now connected. You can close this tab and return to CoWork.",

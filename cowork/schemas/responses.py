@@ -139,6 +139,10 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Model name for the chat completion request"
     )
+    harness: str | None = Field(
+        default=None,
+        description="Per-conversation coworker override (e.g. 'claude-code'). Falls back to the global default harness setting when absent or unresolvable.",
+    )
     stream: bool | None = Field(
         default=False,
         description="Whether the chat completion request is streaming or not",

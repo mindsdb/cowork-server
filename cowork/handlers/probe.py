@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from fastapi import HTTPException
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -133,10 +136,144 @@ class ProbeHandler:
             if method:
                 form_spec["selected_method"] = method
 
-            # Save without probe only when there is no registry spec —
-            # there is no engine to verify a handcrafted connector against.
-            # Missing conversation context is fine: a temp workspace is created below.
-            if spec is None:
+            if spec is not None and method:
+                method_spec = next((m for m in spec.form.methods if m.id == method), None)
+                if getattr(method_spec, "submit_action", None) == "oauth_launch":
+                    from cowork.services.settings import SettingService
+                    from cowork.services.connectors.oauth.google import google_service
+                    from cowork.common.settings.app_settings import OAuthSettings
+                    from cowork.services.connectors.oauth.config import GOOGLE_SERVICES
+                    from cowork.services.connectors.oauth.state import OAuthStateStore
+
+                    service_key = next((k for k, v in GOOGLE_SERVICES.items() if v.engine == connector_id), None)
+                    if not service_key:
+                        yield _patch_delta({
+                            "form_id": form_id,
+                            "form_error": f"OAuth is not configured for {connector_id}.",
+                            "status_text": None,
+                            "_is_probing": False,
+                        })
+                        yield _push("response.completed", {
+                            "type": "response.completed",
+                            "response": {"id": response_id, "status": "retry"},
+                        })
+                        self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                        return
+
+                    user_settings = SettingService(self.session).load()
+                    client_id = credentials.get("client_id") or getattr(user_settings, "google_oauth_client_id", "")
+                    client_secret = credentials.get("client_secret") or getattr(user_settings, "google_oauth_client_secret", "")
+                    if hasattr(client_secret, "get_secret_value"):
+                        client_secret = client_secret.get_secret_value()
+
+                    oauth_settings = OAuthSettings(
+                        google_client_id=str(client_id or ""),
+                        google_client_secret=str(client_secret or ""),
+                    )
+
+                    try:
+                        start_res = google_service.start(service_key, oauth_settings)
+                    except HTTPException as exc:
+                        if exc.status_code == 400:
+                            yield _patch_delta({
+                                "form_id": form_id,
+                                "form_error": "Google sign-in isn't unlocked yet on this install. Paste a Google OAuth client ID + secret in Settings \u2192 Model Sources (one-time, ~10 min) and try again.",
+                                "status_text": None,
+                                "_is_probing": False,
+                            })
+                            yield _push("response.completed", {
+                                "type": "response.completed",
+                                "response": {"id": response_id, "status": "retry"},
+                            })
+                            self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                            return
+                        yield _patch_delta({
+                            "form_id": form_id,
+                            "form_error": f"OAuth start failed: {exc.detail}",
+                            "status_text": None,
+                            "_is_probing": False,
+                        })
+                        yield _push("response.completed", {
+                            "type": "response.completed",
+                            "response": {"id": response_id, "status": "retry"},
+                        })
+                        self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                        return
+
+                    yield _delta(f"Opening Google sign-in for **{service_key}**\u2026\n\n")
+                    yield _patch_delta({
+                        "form_id": form_id,
+                        "_oauth_url": start_res.auth_url,
+                        "status_text": "Waiting for Google sign-in in your browser\u2026",
+                        "_is_probing": True,
+                        "form_error": None,
+                    })
+
+                    state_store = OAuthStateStore(oauth_settings.state_path)
+                    poll_start = time.monotonic()
+                    poll_timeout = 300
+                    poll_interval = 2
+
+                    while True:
+                        elapsed = time.monotonic() - poll_start
+                        if elapsed > poll_timeout:
+                            yield _patch_delta({
+                                "form_id": form_id,
+                                "form_error": "Sign-in timed out \u2014 try again.",
+                                "status_text": None,
+                                "_is_probing": False,
+                            })
+                            yield _push("response.completed", {
+                                "type": "response.completed",
+                                "response": {"id": response_id, "status": "retry"},
+                            })
+                            self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                            return
+
+                        await asyncio.sleep(poll_interval)
+
+                        entry = state_store._load().get(service_key, {})
+                        last_success = entry.get("lastSuccessAt", "")
+                        last_error = entry.get("lastError", "")
+                        last_error_at = entry.get("lastErrorAt", "")
+
+                        if last_success and (not last_error_at or last_success > last_error_at):
+                            connection_name = entry.get("connectionName", service_key)
+                            yield _patch_delta({
+                                "form_id": form_id,
+                                "title": f"Connected \u2014 {connection_name}",
+                                "subtitle": None,
+                                "status_text": None,
+                                "_is_probing": False,
+                                "_is_success": True,
+                                "form_error": None,
+                                "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
+                            })
+                            yield _push("response.completed", {
+                                "type": "response.completed",
+                                "response": {"id": response_id, "status": "success"},
+                            })
+                            self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                            return
+
+                        if last_error_at and (not last_success or last_error_at > last_success):
+                            yield _patch_delta({
+                                "form_id": form_id,
+                                "form_error": last_error,
+                                "status_text": None,
+                                "_is_probing": False,
+                            })
+                            yield _push("response.completed", {
+                                "type": "response.completed",
+                                "response": {"id": response_id, "status": "retry"},
+                            })
+                            self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                            return
+
+            # Save without probe when there is no conversation context, or no
+            # registry spec — there is no engine to verify a handcrafted
+            # connector against.
+            if db_conversation_id is None or spec is None:
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
@@ -152,11 +289,11 @@ class ProbeHandler:
                     })
                     self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
                     return
-                reason = "connector is not in the registry"
-                yield _delta(f"Saved as `{slug}` (no live probe — {reason}).\n\n")
+                reason = "no conversation context" if db_conversation_id is None else "connector is not in the registry"
+                yield _delta(f"Saved as `{slug}` (no live probe \u2014 {reason}).\n\n")
                 yield _patch_delta({
                     "form_id": form_id,
-                    "title": f"Saved — {slug}",
+                    "title": f"Saved \u2014 {slug}",
                     "subtitle": "Stored in the vault. No live verification was performed.",
                     "status_text": None,
                     "_is_probing": False,
@@ -200,11 +337,11 @@ class ProbeHandler:
                 return
 
             # Intro + initial probing patch
-            yield _delta(f"Trying to connect to **{connector_id}**…\n\n")
+            yield _delta(f"Trying to connect to **{connector_id}**\u2026\n\n")
             yield _patch_delta({
                 "form_id": form_id,
                 "_is_probing": True,
-                "status_text": "Starting probe…",
+                "status_text": "Starting probe\u2026",
                 "form_error": None,
             })
 
@@ -314,7 +451,7 @@ class ProbeHandler:
                 yield _delta(f"\n\n{summary}\n")
                 yield _patch_delta({
                     "form_id": form_id,
-                    "title": f"Connected — {saved_slug}",
+                    "title": f"Connected \u2014 {saved_slug}",
                     "subtitle": summary,
                     "status_text": None,
                     "form_error": None,

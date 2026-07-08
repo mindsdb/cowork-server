@@ -11,23 +11,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # application-level configuration — the same for every user — so they live
 # here rather than as per-user fields on UserSettings.
 #
-# minds-cloud model names are owned by MindsHub, not this repo. The list is
-# resolved at runtime from MindsHub's OpenAI-compatible `/v1/models` endpoint
-# (see cowork.services.providers.fetch_minds_models) and supplied by the
-# /settings/recommended-models endpoint. It is intentionally left empty here
-# so no aliases are hand-maintained — the working default pair lives in
-# RECOMMENDED_PAIR / *_MODEL_DEFAULTS below. MindsHub aliases are bare
-# (``sonnet``); the older ``latest:`` prefix still resolves but is deprecated.
 RECOMMENDED_MODELS: dict[str, list[str]] = {
-    "minds-cloud": [],
-    "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "anthropic": ["claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
     "openai": ["gpt-5.5", "gpt-5.5-mini", "o3", "o4-mini"],
     "gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-flash-preview"],
     "openai-compatible": [],
 }
 
 RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
-    "minds-cloud": ("sonnet", "haiku"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
     "openai": ("gpt-5.5", "gpt-5.5-mini"),
     "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
@@ -46,38 +37,10 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
-    "gemini": "gemini-2.5-pro",
-    "minds_cloud": "sonnet",
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
-    "gemini": "gemini-2.5-flash",
-    "minds_cloud": "haiku",
-}
-
-# Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
-# advertises its levels live via MindsHub's `/v1/models`; direct Anthropic/OpenAI
-# have no such endpoint, so the levels are hand-maintained here. Keyed by exact
-# model id → {"efforts": [<display order>], "default": <one of efforts>}. A model
-# absent from this map (e.g. claude-haiku) is treated as not supporting effort —
-# the UI hides the picker for it. Levels mirror what each provider accepts:
-# Anthropic via output_config={"effort": ...}; OpenAI via reasoning_effort /
-# reasoning={"effort": ...}.
-#
-# Anthropic effort ladder (per the Claude API reference): default is "high";
-# "max" is supported on Opus 4.6+ and Sonnet 4.6 (not Haiku/older Sonnets);
-# "xhigh" was added in Opus 4.7, so only Opus 4.7/4.8 carry it. Haiku 4.5 has no
-# effort support and is intentionally absent.
-DIRECT_EFFORT_CATALOG: dict[str, dict] = {
-    "claude-opus-4-8":   {"efforts": ["low", "medium", "high", "xhigh", "max"], "default": "high"},
-    "claude-opus-4-7":   {"efforts": ["low", "medium", "high", "xhigh", "max"], "default": "high"},
-    "claude-opus-4-6":   {"efforts": ["low", "medium", "high", "max"], "default": "high"},
-    "claude-sonnet-4-6": {"efforts": ["low", "medium", "high", "max"], "default": "high"},
-    "gpt-5.5":      {"efforts": ["minimal", "low", "medium", "high"], "default": "medium"},
-    "gpt-5.5-mini": {"efforts": ["minimal", "low", "medium", "high"], "default": "medium"},
-    "o3":      {"efforts": ["low", "medium", "high"], "default": "medium"},
-    "o4-mini": {"efforts": ["low", "medium", "high"], "default": "medium"},
 }
 
 

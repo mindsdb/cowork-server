@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlparse
 
@@ -18,181 +17,50 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def minds_chat_base_url(minds_url: str) -> str:
-    """Derive the OpenAI-compatible chat base URL from a raw minds_url.
-
-    mdb.ai needs /api/v1, api.mindshub.ai needs /v1.  If the URL
-    already ends with /v1, return it as-is.
-    """
-    base = minds_url.rstrip("/")
-    if base.endswith("/v1"):
-        return base
-    return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
-
-
-# Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
-# publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
-# can't map to a non-prod MindsHub env, falls back here.
-PUBLISH_FAILSAFE_URL = "https://4nton.ai"
-
-
-def publish_url_for_endpoint(endpoint_url: str | None) -> str:
-    """Publish base URL for the MindsHub env the given endpoint points at.
-
-    The publish API (root-mounted ``/upload``, ``/list``, ``/delete/{id}``) is
-    served on the *non-prod* MindsHub api hosts, so a provider pointed at
-    ``api.<env>.mindshub.ai`` (dev/staging) publishes to that same host. Prod
-    (``api.mindshub.ai``) has no publish routes, and anything unrecognised
-    (mdb.ai, a custom endpoint, empty) falls back to the legacy ``4nton.ai``
-    host. anton appends the route path; an explicit `publish_url` /
-    `ANTON_PUBLISH_URL` overrides this.
-    """
-    host = (urlparse(endpoint_url or "").hostname or "").lower()
-    if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
-        return f"https://{host}"
-    return PUBLISH_FAILSAFE_URL
-# Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-
-
-def provider_base_url(
-    provider: str, *, openai_base_url: str = "", minds_url: str = ""
-) -> str | None:
-    """Single source of truth for a provider's inference base URL.
-
-    Returns the base URL the OpenAIProvider should use, or ``None`` to let the
-    SDK use its built-in default (direct Anthropic/OpenAI hosts).
-
-    The crux: ``openai_base_url`` is a *shared* DB slot reused by the openai,
-    gemini, and openai-compatible cards. Only **openai-compatible** legitimately
-    needs a user-supplied base. If openai or gemini were allowed to read that
-    shared slot, a value left behind by a prior provider setup (e.g. MindsHub
-    writing ``https://api.mindshub.ai/v1``) would silently misroute the next
-    provider's request — and its API key — to the wrong vendor. So each
-    provider's base is derived deterministically here and never inherited:
-
-      - anthropic / openai → ``None`` (SDK default host; never the shared slot)
-      - gemini             → Google's OpenAI-compatible endpoint
-      - minds-cloud        → derived from the dedicated ``minds_url`` slot
-      - openai-compatible  → the shared slot (this is the one that owns it)
-
-    openai-compatible with an *empty* base returns None, NOT api.openai.com:
-    forcing a BYO endpoint's key onto OpenAI's host would leak that key to the
-    wrong vendor. An empty openai-compatible base is a misconfiguration that
-    config_status surfaces ("Set a base URL") rather than silently routing.
-    """
-    p = (provider or "").replace("_", "-")
-    if p == "minds-cloud":
-        return minds_chat_base_url(minds_url)
-    if p == "gemini":
-        return GEMINI_BASE_URL
-    if p == "openai-compatible":
-        return openai_base_url or None
-    # anthropic, openai → SDK default; never inherit the shared openai_base_url.
-    return None
-
-
-# ── Live model listing ───────────────────────────────────────────────
-
-# MindsHub exposes an OpenAI-compatible `/v1/models` route. We surface
-# that list in the Settings model picker so cowork tracks whatever the
-# router currently supports instead of a hand-maintained constant —
-# app_settings.RECOMMENDED_MODELS["minds-cloud"] is intentionally empty,
-# so this live list is the only source of minds-cloud model names. The
-# deprecated MindsHub sentinel aliases are hidden from this route by design.
-#
-# Cached so a rapid sequence of Settings opens doesn't re-hit the
-# network. Failures are cached too — with a shorter TTL — so a route
-# that isn't deployed yet doesn't add a round-trip to every load.
-_MINDS_MODELS_TTL = 300.0       # successful fetch
-_MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-# Cache value: (timestamp, (ids, efforts_map)). ids is None on failure.
-_minds_models_cache: dict[str, tuple[float, tuple[Optional[list[str]], dict[str, dict]]]] = {}
-
-
-async def fetch_minds_models(
-    minds_url: str, api_key: str
-) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
-    """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
-
-    Returns ``(ids, efforts, enabled)`` where ``ids`` is the model-id list (or
-    None on any failure so the caller falls back to the static list),
-    ``efforts`` maps a model id to ``{"efforts": [...], "default": "..."}`` for
-    every model that advertises ``reasoning_efforts``, and ``enabled`` maps a
-    model id to its ``enabled`` flag. MindsHub lists models the caller's tier
-    can't use (marked ``"enabled": false``) so the picker can show them as
-    locked upsells; a model missing from ``enabled`` is treated as available.
-    """
-    if not minds_url or not api_key:
-        return None, {}, {}
-    base = minds_chat_base_url(minds_url)
-
-    now = time.monotonic()
-    cached = _minds_models_cache.get(base)
-    if cached:
-        ts, val = cached
-        ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
-        if (now - ts) < ttl:
-            return val
-
-    def _remember(
-        val: tuple[Optional[list[str]], dict[str, dict], dict[str, bool]],
-    ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
-        _minds_models_cache[base] = (time.monotonic(), val)
-        return val
-
+async def fetch_openai_compatible_models(base_url: str, api_key: str) -> Optional[list[str]]:
+    """Fetch model ids from any OpenAI-compatible `/models` endpoint (NVIDIA
+    NIM, Gemini's AI-Studio endpoint, OpenAI itself, generic openai-compatible).
+    Returns None on any failure so callers fall back to a manually-typed list."""
+    if not base_url or not api_key:
+        return None
+    base = base_url.rstrip("/")
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(6.0), follow_redirects=True
-        ) as client:
-            # Trailing slash is required: the MindsHub router serves the
-            # listing at `/models/` and a recent minds-inference release
-            # stopped cleanly redirecting the slashless `/models`, which
-            # left this fetch empty and emptied the model picker. Hitting
-            # `/models/` directly is what the other frameworks' shared
-            # model-catalog helper already does.
-            r = await client.get(
-                f"{base}/models/",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), follow_redirects=True) as client:
+            r = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {api_key}"})
         if r.status_code >= 400:
-            logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember((None, {}, {}))
+            return None
         data = r.json()
     except Exception as exc:
-        logger.debug("minds /models fetch failed: %s", exc)
-        return _remember((None, {}, {}))
-
-    # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
-    # Accept a bare list too, defensively. Each row may carry the non-standard
-    # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
-    # (str) and `enabled` (bool) — OpenAI clients ignore unknown keys; we
-    # surface them for the picker.
+        logger.debug("openai-compatible /models fetch failed for %s: %s", base, exc)
+        return None
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return _remember((None, {}, {}))
-    ids: list[str] = []
-    efforts: dict[str, dict] = {}
-    enabled: dict[str, bool] = {}
-    for row in rows:
-        if not isinstance(row, dict) or not row.get("id"):
-            continue
-        model_id = str(row.get("id")).strip()
-        if not model_id:
-            continue
-        ids.append(model_id)
-        # A model the caller's tier can't use is listed with enabled=false so the
-        # picker can show it as a locked upsell. Missing → available.
-        if "enabled" in row:
-            enabled[model_id] = bool(row.get("enabled"))
-        levels = row.get("reasoning_efforts")
-        if isinstance(levels, list) and levels:
-            entry: dict = {"efforts": [str(x) for x in levels]}
-            default = row.get("default_reasoning_effort")
-            if default:
-                entry["default"] = str(default)
-            efforts[model_id] = entry
-    return _remember(((ids or None), efforts, enabled))
+        return None
+    ids = [str(row.get("id")).strip() for row in rows if isinstance(row, dict) and row.get("id")]
+    ids = [i for i in ids if i]
+    return ids or None
+
+
+async def fetch_anthropic_models(api_key: str) -> Optional[list[str]]:
+    if not api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            r = await client.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            )
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+    except Exception as exc:
+        logger.debug("anthropic /models fetch failed: %s", exc)
+        return None
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return None
+    ids = [str(row.get("id")).strip() for row in rows if isinstance(row, dict) and row.get("id")]
+    return ids or None
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -262,17 +130,6 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 return "fail", "missing base URL"
             headers = {"Authorization": f"Bearer {key}"} if key else {}
             return await _check(f"{base}/models", headers)
-        if ptype == "minds-cloud":
-            if not key:
-                return "fail", "missing API key"
-            base = (p.get("mindsUrl") or "https://api.mindshub.ai").rstrip("/")
-            chat_url = minds_chat_base_url(base)
-            model = (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
-            return await _chat_probe(
-                f"{chat_url}/chat/completions",
-                {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                model,
-            )
     except httpx.HTTPError as e:
         return "fail", f"{type(e).__name__}: {e}"
     except Exception as e:
@@ -315,31 +172,6 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
         return {"ok": False, "error": "Cannot connect"}
 
 
-async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict[str, Any]:
-    # Probe the real inference path rather than `/models`: listing routes
-    # are not deployed on every MindsHub host and 404/401 even for valid
-    # keys, which blocked onboarding with a working key. A 1-token chat
-    # completion is the same surface a real task exercises.
-    try:
-        chat_base = minds_chat_base_url(base_url.rstrip("/"))
-        timeout = httpx.Timeout(15.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.post(
-                f"{chat_base}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": CODING_MODEL_DEFAULTS["minds_cloud"], "max_tokens": 20,
-                      "messages": [{"role": "user", "content": "ping"}]},
-            )
-        if r.status_code in (401, 403):
-            return {"ok": False, "error": "Invalid API key"}
-        if 200 <= r.status_code < 300:
-            return {"ok": True}
-        msg = r.json().get("error", {}).get("message", f"HTTP {r.status_code}") if r.content else f"HTTP {r.status_code}"
-        return {"ok": False, "error": msg}
-    except Exception:
-        return {"ok": False, "error": "Cannot connect"}
-
-
 async def validate_openai_compatible(api_key: str, base_url: str = "https://api.openai.com/v1",
                                      model: str | None = None) -> dict[str, Any]:
     try:
@@ -368,15 +200,92 @@ async def validate_provider(provider: str, api_key: str,
     """Validate credentials for a given provider type."""
     if provider == "anthropic":
         return await validate_anthropic(api_key, model or "claude-sonnet-4-6")
-    if provider == "minds":
-        return await validate_minds(api_key, base_url or "https://mdb.ai")
     if provider == "openai-compatible":
         return await validate_openai_compatible(api_key, base_url or "https://api.openai.com/v1", model)
     return {"ok": False, "error": "Unknown provider"}
 
 
-def build_llm_client():
-    """Build an Anton LLMClient from the current user settings.
+# ── Provider registry — multi-source failover ───────────────────────
+#
+# Registry entries (cowork.models.provider_config.ProviderConfig) are
+# each one API key + base URL + model list, keyed by a stable slug.
+# `build_llm_client(model="{slug}/{model_id}")` resolves that pick as
+# the primary candidate and appends every other enabled registry entry
+# as a failover fallback (see FailoverLLMProvider) — a free-tier 429 on
+# the chosen model degrades to the next free source instead of failing
+# the turn. When the registry is empty, behavior is byte-for-byte the
+# legacy single-slot path (`_build_legacy_llm_client`), so a fresh
+# install with only the old Settings fields configured keeps working
+# unchanged.
+
+_REGISTRY_DEFAULT_BASE_URLS = {
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "openai": "https://api.openai.com/v1",
+}
+
+
+def _provider_for_row(row):
+    """Build an LLMProvider for one registry row, or None if it can't be used
+    (missing key, or a base_url-requiring type with no base_url set)."""
+    from anton.core.llm.anthropic import AnthropicProvider
+    from anton.core.llm.openai import OpenAIProvider
+    from cowork.services.provider_registry import ProviderRegistryService
+
+    key = ProviderRegistryService.decrypt_key(row)
+    if not key:
+        return None
+    if row.type == "anthropic":
+        return AnthropicProvider(api_key=key)
+
+    base_url = row.base_url or _REGISTRY_DEFAULT_BASE_URLS.get(row.type)
+    if not base_url:
+        logger.warning("Provider '%s' (type=%s) has no base_url configured — skipping", row.slug, row.type)
+        return None
+    return OpenAIProvider(api_key=key, base_url=base_url)
+
+
+def _candidates_for_rows(rows, *, pick_last_model: bool):
+    from cowork.services.failover_provider import Candidate
+
+    candidates = []
+    for row in rows:
+        if not row.enabled or not row.models:
+            continue
+        provider = _provider_for_row(row)
+        if provider is None:
+            continue
+        model_id = row.models[-1] if pick_last_model and len(row.models) > 1 else row.models[0]
+        candidates.append(Candidate(provider=provider, model=model_id, label=f"{row.slug}/{model_id}"))
+    return candidates
+
+
+def _resolve_model_override(rows, model: str):
+    """Resolve a '{slug}/{model_id}' request string to (Candidate, slug), or None."""
+    from cowork.services.failover_provider import Candidate
+
+    slug, _, model_id = model.partition("/")
+    if not model_id:
+        return None
+    row = next((r for r in rows if r.slug == slug and r.enabled), None)
+    if row is None:
+        return None
+    provider = _provider_for_row(row)
+    if provider is None:
+        return None
+    return Candidate(provider=provider, model=model_id, label=f"{row.slug}/{model_id}"), slug
+
+
+def build_llm_client(model: str | None = None):
+    """Build an Anton LLMClient, optionally pinned to a specific registered
+    model for this turn, with automatic failover across the rest of the
+    enabled provider registry.
+
+    `model` is a "{slug}/{model_id}" string as offered by the composer's
+    model picker (see ProviderRegistryService). When it doesn't resolve
+    (unknown slug, disabled provider, or None), falls back to priority-
+    ordered default routing across the registry, and if the registry has
+    no entries at all, to the legacy single-slot Settings fields —
+    unchanged behavior for installs that haven't touched the new registry.
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
@@ -389,43 +298,64 @@ def build_llm_client():
     the model's own default.
     """
     from anton.core.llm.client import LLMClient
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.session import get_open_session
+    from cowork.services.failover_provider import FailoverLLMProvider
+    from cowork.services.provider_registry import ProviderRegistryService
+
+    settings = get_user_settings()
+    session = get_open_session()
+    try:
+        rows = ProviderRegistryService(session).list(include_disabled=False)
+    finally:
+        session.close()
+
+    if not rows:
+        return _build_legacy_llm_client(settings)
+
+    rows_sorted = sorted(rows, key=lambda r: (r.priority, r.slug))
+
+    if model:
+        resolved = _resolve_model_override(rows_sorted, model)
+        if resolved is not None:
+            primary, primary_slug = resolved
+            fallback = _candidates_for_rows(
+                [r for r in rows_sorted if r.slug != primary_slug], pick_last_model=False
+            )
+            provider = FailoverLLMProvider([primary, *fallback])
+            return LLMClient(
+                planning_provider=provider,
+                planning_model=primary.model,
+                coding_provider=provider,
+                coding_model=primary.model,
+            )
+        logger.warning("Requested model '%s' did not resolve to a registered provider; using default routing", model)
+
+    planning_candidates = _candidates_for_rows(rows_sorted, pick_last_model=False)
+    if not planning_candidates:
+        return _build_legacy_llm_client(settings)
+    coding_candidates = _candidates_for_rows(rows_sorted, pick_last_model=True) or planning_candidates
+
+    planning_provider = FailoverLLMProvider(planning_candidates)
+    coding_provider = FailoverLLMProvider(coding_candidates)
+    return LLMClient(
+        planning_provider=planning_provider,
+        planning_model=planning_candidates[0].model,
+        coding_provider=coding_provider,
+        coding_model=coding_candidates[0].model,
+    )
+
+
+def _build_legacy_llm_client(settings):
+    """The original single-slot provider resolution, kept verbatim as the
+    fallback path for installs with an empty provider registry."""
+    from anton.core.llm.client import LLMClient
     from anton.core.llm.anthropic import AnthropicProvider
     from anton.core.llm.openai import OpenAIProvider
 
-    from cowork.common.settings.user_settings import (
-        get_user_settings,
-        provider_api_key,
-        Provider,
-    )
+    from cowork.common.settings.user_settings import Provider
 
-    settings = get_user_settings()
-
-    def _make_provider(role: Provider, effort: str | None = None):
-        # Only pass reasoning_effort when it's actually set. This keeps
-        # build_llm_client compatible with anton builds whose provider __init__
-        # predates the kwarg (passing reasoning_effort=None unconditionally would
-        # TypeError on every call, taking the whole agent down — not just effort
-        # users) and avoids handing an unset effort to a provider that can't take it.
-        effort_kw = {"reasoning_effort": effort} if effort else {}
-        # Base URL is derived per-provider via provider_base_url() — never by
-        # blindly reading the shared openai_base_url slot — so one provider's
-        # stale base can't misroute another provider's key (see that helper).
-        base = provider_base_url(
-            role.value,
-            openai_base_url=settings.openai_base_url or "",
-            minds_url=settings.minds_url,
-        )
-        # Key is resolved per-provider via provider_api_key() — each provider
-        # reads its own slot (gemini/openai-compatible fall back to the shared
-        # openai slot when unset), so configuring one provider can't overwrite
-        # or misroute another's key.
-        key = provider_api_key(settings, role)
-        if role == Provider.MINDS_CLOUD:
-            if key is None:
-                raise ValueError(f"{role.label} API key is not configured")
-            return OpenAIProvider(
-                api_key=key.get_secret_value(), base_url=base, **effort_kw
-            )
+    def _make_provider(role: Provider):
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")

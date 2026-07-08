@@ -25,7 +25,6 @@ from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
 from cowork.services.providers import (
     check_config_status,
-    fetch_minds_models,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -95,6 +94,17 @@ def validate_settings(session: SessionDep):
 
 @router.get("/configured")
 def check_configured(session: SessionDep):
+    from cowork.services.provider_registry import ProviderRegistryService
+
+    # The provider registry is checked first — it's the source of truth
+    # build_llm_client() actually routes on. Falling through to the
+    # legacy single-slot fields keeps this endpoint correct for installs
+    # that haven't touched the registry yet.
+    registry_rows = ProviderRegistryService(session).list(include_disabled=False)
+    for row in registry_rows:
+        if row.models:
+            return {"configured": True, "provider": row.type}
+
     s = SettingService(session).load()
     if s.minds_api_key is not None:
         return {"configured": True, "provider": "minds-cloud"}
@@ -102,13 +112,6 @@ def check_configured(session: SessionDep):
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
-    # gemini / openai-compatible have dedicated key slots now — a user who
-    # configured only one of those (no shared openai key) must still read as
-    # configured (this endpoint gates app startup).
-    if s.gemini_api_key is not None:
-        return {"configured": True, "provider": "gemini"}
-    if s.openai_compatible_api_key is not None:
-        return {"configured": True, "provider": "openai-compatible"}
     return {"configured": False, "provider": ""}
 
 
@@ -132,13 +135,10 @@ def install_status():
 
 @router.get("/reveal-key/{name}")
 def reveal_key(name: str, session: SessionDep):
-    name_map = {
-        "anthropic": Provider.ANTHROPIC,
-        "openai": Provider.OPENAI,
-        "gemini": Provider.GEMINI,
-        "openai-compatible": Provider.OPENAI_COMPATIBLE,
-        "minds": Provider.MINDS_CLOUD,
-        "minds-cloud": Provider.MINDS_CLOUD,
+    field_map = {
+        "anthropic": "anthropic_api_key",
+        "openai": "openai_api_key",
+        "google_oauth_client_secret": "google_oauth_client_secret",
     }
     provider = name_map.get(name.lower())
     if provider is None:
@@ -171,9 +171,6 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
             providers.append({"type": "anthropic", "apiKey": ""})
         if s.openai_api_key is not None:
             providers.append({"type": "openai", "apiKey": ""})
-        if s.minds_api_key is not None:
-            providers.append({"type": "minds-cloud", "apiKey": "", "mindsUrl": s.minds_url})
-
     for p in providers:
         if p.get("apiKey") in ("***", ""):
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
@@ -208,73 +205,10 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
 async def recommended_models(session: SessionDep):
     """Per-provider model picker options for the Settings UI.
 
-    Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
-    the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
-    when a Minds key + URL are configured. Falls back to the static list
-    (the `latest:*` aliases) when the key is absent or the endpoint can't
-    be reached."""
+    Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps."""
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
-
-    # `modelEfforts` maps a model id → {"efforts": [...], "default": "..."} and is
-    # the single capability surface for the UI: a model accepts an effort level
-    # iff it has an entry here. Direct (BYOK) provider levels are hand-maintained
-    # in DIRECT_EFFORT_CATALOG; minds-cloud levels come live from /v1/models and
-    # win on any key collision.
-    model_efforts: dict[str, dict] = {k: dict(v) for k, v in DIRECT_EFFORT_CATALOG.items()}
-
-    # `modelEnabled` maps a model id → bool. MindsHub lists models the caller's
-    # tier can't use (marked enabled:false) so the picker can show them as locked
-    # upsells; a model absent from this map is treated as available. Additive
-    # alongside modelEfforts — consumers that ignore it keep working.
-    model_enabled: dict[str, bool] = {}
-
-    s = SettingService(session).load()
-    if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts, live_enabled = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value()
-        )
-        if live:
-            recommended["minds-cloud"] = live
-        model_efforts.update(live_efforts)
-        model_enabled.update(live_enabled)
-
-    # Overlay a configured custom OpenAI-compatible endpoint the same way as
-    # minds-cloud. The provider card's own baseUrl is authoritative — the
-    # shared openai_base_url setting is also reused by gemini/openai — so read
-    # it from providers_json. fetch_minds_models is just an OpenAI-compatible
-    # /models fetch and returns None on failure, leaving the bucket empty so
-    # the picker falls back to a free-text model input.
-    try:
-        provider_cards = json.loads(s.providers_json or "[]")
-    except (ValueError, TypeError):
-        provider_cards = []
-    oc_card = next(
-        (
-            c for c in provider_cards
-            if isinstance(c, dict)
-            and c.get("type") in ("openai-compatible", "openai_compatible")
-            and (c.get("baseUrl") or "").strip()
-        ),
-        None,
-    )
-    if oc_card:
-        # Read the openai-compatible key via provider_api_key_str so a user who
-        # set a dedicated openai_compatible_api_key is used (falls back to the
-        # shared openai_api_key), matching how the provider is actually built.
-        oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
-        if live:
-            recommended["openai-compatible"] = live
-        model_efforts.update(live_efforts)
-        model_enabled.update(live_enabled)
-
-    return {
-        "recommendedModels": recommended,
-        "recommendedPair": pair,
-        "modelEfforts": model_efforts,
-        "modelEnabled": model_enabled,
-    }
+    return {"recommendedModels": recommended, "recommendedPair": pair}
 
 
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
