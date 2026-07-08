@@ -38,6 +38,17 @@ def test_layer_js_has_no_script_terminator():
     assert "</script>" not in LAYER_JS
 
 
+def test_layer_supports_edit_delete_protocol():
+    # Owner-only edit/delete affordances + the outbound message types they post,
+    # plus the fields (author_user_id, edited_at) and viewer gating they rely on.
+    for token in [
+        "'edit'", "'delete'", "'edit-reply'", "'delete-reply'",
+        "author_user_id", "edited_at", "isMine", "viewer",
+        "Удалить эту цепочку комментариев", "Удалить этот комментарий",
+    ]:
+        assert token in LAYER_JS, token
+
+
 def _make_project(tmp: str):
     project_dir = Path(tmp) / "proj"
     artifacts = project_dir / ".anton" / "artifacts"

@@ -21,8 +21,8 @@ async def comments_stream(user_dir: str, report_id: str, request: Request):
 
 @router.api_route(
     "/{user_dir}/{report_id}/{subpath:path}",
-    methods=["GET", "POST", "OPTIONS"],
+    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
 )
 async def comments_rest(user_dir: str, report_id: str, subpath: str, request: Request):
-    # threads (list/create), threads/{id}/replies, threads/{id}/status.
+    # threads (list/create/edit/delete), replies (add/edit/delete), status.
     return await forward_comments_rest(request, user_dir, report_id, subpath)

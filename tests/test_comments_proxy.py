@@ -102,6 +102,24 @@ def test_stream_passthrough_is_event_stream(monkeypatch):
     assert call["headers"]["Authorization"] == f"Bearer {KEY}"
 
 
+@pytest.mark.parametrize("method", ["PATCH", "DELETE"])
+def test_rest_forwards_patch_and_delete(monkeypatch, method):
+    resp = httpx.Response(200, json={"id": "t1", "type": "thread.updated"})
+    fake = _FakeClient(response=resp)
+    monkeypatch.setattr(cp, "get_proxy_client", lambda: fake)
+
+    r = client.request(
+        method,
+        "/api/v1/artifact-comments/alice/rep123/threads/tid-1",
+        content=b"{}" if method == "PATCH" else None,
+    )
+    assert r.status_code == 200
+    call = fake.calls["rest"]
+    assert call["method"] == method
+    assert call["url"] == f"{BASE}/artifact-comments/alice/rep123/threads/tid-1"
+    assert call["headers"]["Authorization"] == f"Bearer {KEY}"
+
+
 def test_503_when_endpoint_unconfigured(monkeypatch):
     monkeypatch.setattr(cp, "resolve_inference_endpoint", lambda settings=None: ("", ""))
     monkeypatch.setattr(cp, "get_proxy_client", lambda: _FakeClient())
