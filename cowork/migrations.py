@@ -36,14 +36,12 @@ _ENV_TO_SETTING: dict[str, str] = {
     # API keys
     "ANTON_ANTHROPIC_API_KEY": "anthropic_api_key",
     "ANTON_OPENAI_API_KEY": "openai_api_key",
-    "ANTON_MINDS_API_KEY": "minds_api_key",
     # Provider / model
     "ANTON_PLANNING_PROVIDER": "planning_provider",
     "ANTON_PLANNING_MODEL": "planning_model",
     "ANTON_CODING_PROVIDER": "coding_provider",
     "ANTON_CODING_MODEL": "coding_model",
     # URLs
-    "ANTON_MINDS_URL": "minds_url",
     "ANTON_OPENAI_BASE_URL": "openai_base_url",
     # Behavioral settings
     "ANTON_MEMORY_ENABLED": "memory_enabled",
@@ -75,16 +73,9 @@ def _normalize_provider_value(val: str, dotenv: dict[str, str]) -> str:
     """Translate .env provider strings to DB enum values.
 
     The .env may use hyphens (``openai-compatible``) or underscores
-    (``openai_compatible``).  The DB ``Provider`` enum uses underscores
-    and has a dedicated ``minds_cloud`` value.
+    (``openai_compatible``).
     """
-    # Canonicalize to underscores first so both forms are handled.
-    canonical = val.replace("-", "_")
-    # Detect MindsHub: if the user has a Minds key and the provider is
-    # "openai_compatible", this is really minds_cloud.
-    if canonical == "openai_compatible" and dotenv.get("ANTON_MINDS_API_KEY"):
-        return "minds_cloud"
-    return canonical
+    return val.replace("-", "_")
 
 
 def migrate_env_to_db(session: Session) -> bool:

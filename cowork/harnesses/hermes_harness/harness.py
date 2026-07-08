@@ -76,8 +76,6 @@ def _resolve_hermes_model_override(model_override: str):
     """
     from cowork.db.session import get_open_session
     from cowork.services.provider_registry import ProviderRegistryService
-    from cowork.services.providers import minds_chat_base_url
-
     slug, _, model_id = model_override.partition("/")
     if not model_id:
         return None
@@ -93,12 +91,8 @@ def _resolve_hermes_model_override(model_override: str):
     if not api_key:
         return None
 
-    if row.type == "minds-cloud":
-        provider = "openai"
-        base_url = minds_chat_base_url(row.base_url or "https://api.mindshub.ai")
-    else:
-        provider = row.type  # already kebab-case: anthropic | openai | gemini | openai-compatible
-        base_url = row.base_url or _PROVIDER_BASE_URLS.get(provider)
+    provider = row.type  # already kebab-case: anthropic | openai | gemini | openai-compatible
+    base_url = row.base_url or _PROVIDER_BASE_URLS.get(provider)
 
     return provider, base_url, api_key, model_id
 
@@ -347,8 +341,6 @@ class HermesHarness:
             register_connector_tools,
             set_artifact_run_context,
         )
-        from cowork.common.settings.user_settings import Provider
-
         register_connector_tools()
         register_artifact_tools()
 
@@ -380,24 +372,18 @@ class HermesHarness:
         else:
             settings = get_user_settings()
             model = settings.planning_model
-            if settings.planning_provider == Provider.MINDS_CLOUD:
-                from cowork.services.providers import minds_chat_base_url
-                provider_value = "openai"
-                base_url = minds_chat_base_url(settings.minds_url)
-                api_key_value = settings.minds_api_key.get_secret_value() if settings.minds_api_key else None
-            else:
-                # The DB enum uses snake_case (openai_compatible) but AIAgent
-                # expects kebab-case (openai-compatible).
-                provider_value = settings.planning_provider.value.replace("_", "-")
-                key_field = settings.planning_provider.api_key_field
-                key_obj = getattr(settings, key_field)
-                api_key_value = key_obj.get_secret_value() if key_obj else None
-                # AIAgent needs both api_key AND base_url to skip its
-                # config.yaml provider-resolution path. Anthropic is handled
-                # separately by AIAgent (auto-detects provider="anthropic").
-                base_url = _PROVIDER_BASE_URLS.get(provider_value)
-                if provider_value == "openai-compatible" and settings.openai_base_url:
-                    base_url = settings.openai_base_url
+            # The DB enum uses snake_case (openai_compatible) but AIAgent
+            # expects kebab-case (openai-compatible).
+            provider_value = settings.planning_provider.value.replace("_", "-")
+            key_field = settings.planning_provider.api_key_field
+            key_obj = getattr(settings, key_field)
+            api_key_value = key_obj.get_secret_value() if key_obj else None
+            # AIAgent needs both api_key AND base_url to skip its
+            # config.yaml provider-resolution path. Anthropic is handled
+            # separately by AIAgent (auto-detects provider="anthropic").
+            base_url = _PROVIDER_BASE_URLS.get(provider_value)
+            if provider_value == "openai-compatible" and settings.openai_base_url:
+                base_url = settings.openai_base_url
 
         # Sync Hermes config.yaml with the resolved provider/key. AIAgent
         # validates config.yaml at init time (before using constructor

@@ -24,7 +24,6 @@ from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
 from cowork.services.providers import (
     check_config_status,
-    fetch_minds_models,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -105,8 +104,6 @@ def check_configured(session: SessionDep):
         return {"configured": True, "provider": "anthropic"}
     if s.openai_api_key is not None:
         return {"configured": True, "provider": "openai"}
-    if s.minds_api_key is not None:
-        return {"configured": True, "provider": "minds"}
     return {"configured": False, "provider": ""}
 
 
@@ -120,7 +117,7 @@ def reveal_key(name: str, session: SessionDep):
     field_map = {
         "anthropic": "anthropic_api_key",
         "openai": "openai_api_key",
-        "minds": "minds_api_key",
+        "google_oauth_client_secret": "google_oauth_client_secret",
     }
     field = field_map.get(name.lower())
     if field is None:
@@ -147,9 +144,6 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
             providers.append({"type": "anthropic", "apiKey": ""})
         if s.openai_api_key is not None:
             providers.append({"type": "openai", "apiKey": ""})
-        if s.minds_api_key is not None:
-            providers.append({"type": "minds-cloud", "apiKey": "", "mindsUrl": s.minds_url})
-
     for p in providers:
         if p.get("apiKey") in ("***", ""):
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
@@ -174,22 +168,9 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
 async def recommended_models(session: SessionDep):
     """Per-provider model picker options for the Settings UI.
 
-    Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
-    the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
-    when a Minds key + URL are configured. Falls back to the static list
-    (the `latest:*` aliases) when the key is absent or the endpoint can't
-    be reached."""
+    Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps."""
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
-
-    s = SettingService(session).load()
-    if s.minds_api_key is not None and s.minds_url:
-        live = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value()
-        )
-        if live:
-            recommended["minds-cloud"] = live
-
     return {"recommendedModels": recommended, "recommendedPair": pair}
 
 

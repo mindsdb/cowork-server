@@ -132,37 +132,67 @@ class ResponsesHandler:
         model: str,
     ) -> AsyncGenerator[str, None]:
         collected_text: list[str] = []
-        collected_events: list[dict] = []
+        pending_events: list[dict] = []
 
         def event_sink(event_type: str, data: dict) -> None:
-            collected_events.append(data)
+            pending_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
-        event_count = 0
-        async for sse_string in self.harness.formatter(stream, model, event_sink):
-            event_count += 1
-            if event_count <= 3 or "response.completed" in sse_string:
-                logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
-            # Inject conversation_id and harness into the response.created
-            # event so the client learns the canonical id and which agent
-            # generated this response.
-            if "response.created" in sse_string and "conversation_id" not in sse_string:
-                try:
-                    lines = sse_string.strip().split("\n")
-                    data_line = next(l for l in lines if l.startswith("data:"))
-                    payload = json.loads(data_line[5:])
-                    payload["conversation_id"] = str(conversation_id)
-                    harness_id = getattr(self.harness, 'id', None)
-                    if harness_id:
-                        payload["harness"] = harness_id
-                    sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
-                except Exception:
-                    pass
-            yield sse_string
+        conversation_service = ConversationService(self.session)
+        harness_id = getattr(self.harness, 'id', None)
+        assistant_message_id: UUID | None = None
+        next_seq = 0
 
-        logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
-        self._save_assistant_turn(conversation_id, "".join(collected_text), collected_events)
+        event_count = 0
+        try:
+            async for sse_string in self.harness.formatter(stream, model, event_sink):
+                event_count += 1
+                if event_count <= 3 or "response.completed" in sse_string:
+                    logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
+                # Inject conversation_id and harness into the response.created
+                # event so the client learns the canonical id and which agent
+                # generated this response.
+                if "response.created" in sse_string and "conversation_id" not in sse_string:
+                    try:
+                        lines = sse_string.strip().split("\n")
+                        data_line = next(l for l in lines if l.startswith("data:"))
+                        payload = json.loads(data_line[5:])
+                        payload["conversation_id"] = str(conversation_id)
+                        if harness_id:
+                            payload["harness"] = harness_id
+                        sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
+                    except Exception:
+                        pass
+                # Write-ahead: durably commit every event the formatter
+                # recorded for this SSE string BEFORE it reaches the client.
+                # A disconnect mid-turn can then only lose bytes on the
+                # wire — never recorded progress — so the tail/items replay
+                # from message_events is always complete. The assistant row
+                # is created lazily on the first event so an eventless turn
+                # still leaves no row (matches save_assistant_turn).
+                if pending_events:
+                    if assistant_message_id is None:
+                        assistant_message_id = conversation_service.begin_assistant_turn(
+                            conversation_id, harness=harness_id,
+                        ).id
+                    for event_data in pending_events:
+                        conversation_service.append_event(
+                            assistant_message_id, next_seq, event_data,
+                        )
+                        next_seq += 1
+                    pending_events.clear()
+                yield sse_string
+
+            logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
+        finally:
+            # Runs on normal completion AND when the client disconnects or
+            # cancels (GeneratorExit/CancelledError at the yield above).
+            # Events are already durable; stamp the text collected so far.
+            if assistant_message_id is not None:
+                conversation_service.finalize_assistant_turn(
+                    assistant_message_id, "".join(collected_text),
+                )
 
     async def _collect(
         self,

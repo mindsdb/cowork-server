@@ -228,13 +228,11 @@ class AntonHarness:
         # process. The wrapper exposes the same schema to the LLM but
         # routes through a server-aware handler.
         from .tools import (
-            build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
             build_cowork_request_credentials_tool,
             # build_cowork_fetch_submission_tool,
             # build_cowork_update_form_tool,
         )
-        PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         # TODO: Determine if these two tools are really needed.
@@ -274,21 +272,20 @@ class AntonHarness:
             if db_val is None:
                 continue
             # Provider enum -> string value for AntonSettings.
-            # The DB enum uses snake_case (openai_compatible, minds_cloud)
-            # but AntonSettings / LLMClient expect kebab-case
-            # (openai-compatible, minds-cloud).
+            # The DB enum uses snake_case (openai_compatible) but
+            # AntonSettings / LLMClient expect kebab-case (openai-compatible).
             if hasattr(db_val, "value"):
                 db_val = db_val.value.replace("_", "-")
             setattr(settings, attr, db_val)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
-        for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
+        for attr in ("anthropic_api_key", "openai_api_key"):
             db_val = getattr(user, attr, None)
             if db_val is not None:
                 setattr(settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
 
         # URLs (skip empty strings so AntonSettings.model_post_init derivations are preserved)
-        for attr in ("minds_url", "openai_base_url"):
+        for attr in ("openai_base_url",):
             db_val = getattr(user, attr, None)
             if db_val:
                 setattr(settings, attr, db_val)
@@ -415,7 +412,6 @@ class AntonHarness:
             proactive_dashboards=settings.proactive_dashboards,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
-                PUBLISH_TOOL,
                 LOOKUP_CONNECTOR_TOOL,
                 REQUEST_CREDENTIALS_TOOL,
                 # FETCH_SUBMISSION_TOOL,

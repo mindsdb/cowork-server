@@ -17,7 +17,7 @@ from cowork.common.encryption import decrypt, encrypt
 from cowork.models.provider_config import ProviderConfig
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]?$")
-VALID_TYPES = {"anthropic", "openai", "gemini", "openai-compatible", "minds-cloud"}
+VALID_TYPES = {"anthropic", "openai", "gemini", "openai-compatible"}
 
 
 def validate_slug(slug: str) -> None:

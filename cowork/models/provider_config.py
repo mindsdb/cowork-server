@@ -25,7 +25,7 @@ class ProviderConfig(BaseSQLModel, table=True):
     )
     type: str = Field(
         max_length=32,
-        description="anthropic | openai | gemini | openai-compatible | minds-cloud",
+        description="anthropic | openai | gemini | openai-compatible",
     )
     label: str = Field(max_length=128, description="Display name in the model picker.")
     api_key_encrypted: str | None = Field(default=None, description="Fernet-encrypted API key.")

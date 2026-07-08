@@ -20,7 +20,6 @@ from cowork.services.provider_registry import ProviderRegistryService
 from cowork.services.providers import (
     fetch_anthropic_models,
     fetch_openai_compatible_models,
-    minds_chat_base_url,
     ping_provider,
 )
 
@@ -112,8 +111,6 @@ async def ping_provider_endpoint(slug: str, session: SessionDep):
     base_url = row.base_url or _TYPE_DEFAULT_BASE_URLS.get(row.type)
     ping_type = "openai-compatible" if row.type == "gemini" else row.type
     payload = {"type": ping_type, "apiKey": key, "baseUrl": base_url}
-    if row.type == "minds-cloud":
-        payload["mindsUrl"] = base_url or "https://api.mindshub.ai"
     status_str, detail = await ping_provider(payload)
     return {"status": status_str, "detail": detail}
 
@@ -132,8 +129,6 @@ async def list_provider_models(slug: str, session: SessionDep):
         return {"models": models}
 
     base_url = row.base_url or _TYPE_DEFAULT_BASE_URLS.get(row.type)
-    if row.type == "minds-cloud":
-        base_url = minds_chat_base_url(base_url or "https://api.mindshub.ai")
     if not base_url:
         return {"models": None}
     models = await fetch_openai_compatible_models(base_url, key)

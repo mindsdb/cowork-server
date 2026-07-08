@@ -50,7 +50,7 @@ class OAuthStateStore:
         pending = entry.get("pending") or {}
         return pending if pending else None
 
-    def clear_pending(self, service: str, *, error: str = "") -> None:
+    def clear_pending(self, service: str, *, error: str = "", connection_name: str = "") -> None:
         data = self._load()
         entry = data.get(service) or {}
         entry["pending"] = {}
@@ -62,5 +62,7 @@ class OAuthStateStore:
             entry["lastSuccessAt"] = now
             entry["lastError"] = ""
             entry["lastErrorAt"] = ""
+            if connection_name:
+                entry["connectionName"] = connection_name
         data[service] = entry
         self._save(data)

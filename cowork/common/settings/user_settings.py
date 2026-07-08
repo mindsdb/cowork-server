@@ -1,4 +1,8 @@
+import json
+import os
+import time
 from enum import Enum
+from pathlib import Path
 from typing import Annotated, Any, Callable, get_args
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -16,8 +20,6 @@ class Provider(str, Enum):
     OPENAI = "openai"
     GEMINI = "gemini"
     OPENAI_COMPATIBLE = "openai_compatible"
-    MINDS_CLOUD = "minds_cloud"
-
     @property
     def label(self) -> str:
         return PROVIDER_LABELS[self]
@@ -32,7 +34,6 @@ PROVIDER_LABELS: dict["Provider", str] = {
     Provider.OPENAI: "OpenAI",
     Provider.GEMINI: "Gemini",
     Provider.OPENAI_COMPATIBLE: "OpenAI-compatible",
-    Provider.MINDS_CLOUD: "MindsHub",
 }
 
 _PROVIDER_KEY_FIELDS: dict["Provider", str] = {
@@ -40,14 +41,12 @@ _PROVIDER_KEY_FIELDS: dict["Provider", str] = {
     Provider.OPENAI: "openai_api_key",
     Provider.GEMINI: "openai_api_key",
     Provider.OPENAI_COMPATIBLE: "openai_api_key",
-    Provider.MINDS_CLOUD: "minds_api_key",
 }
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
-UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
+UI_PROVIDER_TYPES = ("anthropic", "openai", "gemini", "openai-compatible")
 
 UI_PROVIDER_TYPE_LABELS: dict[str, str] = {
-    "minds-cloud": "MindsHub",
     "anthropic": "Anthropic",
     "openai": "OpenAI",
     "gemini": "Gemini",
@@ -59,7 +58,6 @@ UI_TYPE_TO_PROVIDER: dict[str, "Provider"] = {
     "openai": Provider.OPENAI,
     "gemini": Provider.GEMINI,
     "openai-compatible": Provider.OPENAI_COMPATIBLE,
-    "minds-cloud": Provider.MINDS_CLOUD,
 }
 
 
@@ -71,6 +69,23 @@ class _DynamicOptions:
 
     def get(self) -> list[str]:
         return self._fn()
+
+
+_BUILD_STAMP_PATH = Path.home() / ".cowork" / "server-build-stamp.json"
+
+
+def _read_build_stamp() -> dict | None:
+    try:
+        if _BUILD_STAMP_PATH.is_file():
+            return json.loads(_BUILD_STAMP_PATH.read_text())
+    except Exception:
+        pass
+    return None
+
+
+_config_status_cache: dict | None = None
+_config_status_cache_at: float = 0.0
+_CONFIG_STATUS_CACHE_TTL: float = 60.0
 
 
 def _harness_options() -> list[str]:
@@ -95,15 +110,15 @@ class UserSettings(Settings):
         title="OpenAI API Key",
         description="API key for OpenAI models. Required if not using Anthropic.",
     )
-    minds_api_key: SecretStr | None = Field(
+    google_oauth_client_id: str | None = Field(
         default=None,
-        title="MindsHub API Key",
-        description="API key for MindsHub. Required if using MindsHub as a provider.",
+        title="Google OAuth Client ID",
+        description="Enables one-click 'Sign in with Google' for Gmail, Google Ads, GA4, Drive, and Calendar connectors, so every user of this install can connect those apps without pasting their own credentials. From Google Cloud Console -> APIs & Services -> Credentials (Desktop app OAuth client).",
     )
-    minds_url: str = Field(
-        default="https://api.mindshub.ai/v1",
-        title="MindsHub URL",
-        description="Base URL for the MindsHub API.",
+    google_oauth_client_secret: SecretStr | None = Field(
+        default=None,
+        title="Google OAuth Client Secret",
+        description="Paired with the Client ID above, from the same Google Cloud Console credential.",
     )
     planning_provider: Provider = Field(
         default=Provider.ANTHROPIC,
@@ -236,22 +251,45 @@ class UserSettings(Settings):
             self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
         return self
 
+    @model_validator(mode='before')
+    def migrate_minds_cloud(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if data.get('planning_provider') == 'minds_cloud':
+                data['planning_provider'] = 'anthropic'
+            if data.get('coding_provider') == 'minds_cloud':
+                data['coding_provider'] = 'anthropic'
+        return data
+    def apply_model_defaults(self) -> 'UserSettings':
+        if self.planning_model is None:
+            self.planning_model = PLANNING_MODEL_DEFAULTS.get(self.planning_provider.value)
+        if self.coding_model is None:
+            self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
+        return self
+
     @property
     def config_status(self) -> dict[str, Any]:
         """Whether ANY execution path exists for a chat turn.
 
         Coworker-architecture-aware (2026-07-04): ready when either
           1. an installed CLI coworker exists (Claude Code / Antigravity /
-             Codex — run on the user's subscription login, no key), or
+              Codex — run on the user's subscription login, no key), or
           2. the provider registry has an enabled entry with a key+models.
 
-        The legacy single-slot provider fields (planning_provider +
-        *_api_key, incl. MindsHub) no longer gate anything — a stale
-        `planning_provider=minds_cloud` row used to hard-block every send
-        behind a "Subscribe with MindsHub" card even when Claude Code was
-        selected and working. Imports are lazy to avoid the
+        The result is TTL-cached (60 s) to avoid redundant CLI/DB scans.
+        The build stamp from ~/.cowork/server-build-stamp.json is included
+        in every response.
+
+        Imports are lazy to avoid the
         user_settings ⇄ harnesses import cycle.
         """
+        global _config_status_cache, _config_status_cache_at
+
+        now = time.monotonic()
+        if _config_status_cache is not None and (now - _config_status_cache_at) < _CONFIG_STATUS_CACHE_TTL:
+            return _config_status_cache
+
+        google_oauth_configured = bool(self.google_oauth_client_id and self.google_oauth_client_secret)
+
         # 1. Installed CLI coworker?
         try:
             from cowork.harnesses.base import _registry
@@ -261,13 +299,18 @@ class UserSettings(Settings):
                     continue
                 harness = cls()
                 if harness.find_cli() is not None:
-                    return {
+                    result = {
                         "config_ready": True,
                         "config_error": None,
                         "provider": "cli",
                         "provider_label": harness.label,
                         "model": "",
+                        "build": _read_build_stamp(),
+                        "google_oauth_configured": google_oauth_configured,
                     }
+                    _config_status_cache = result
+                    _config_status_cache_at = now
+                    return result
         except Exception:
             pass  # registry unavailable during early boot — fall through
 
@@ -283,23 +326,33 @@ class UserSettings(Settings):
                 session.close()
             usable = next((r for r in rows if r.api_key_encrypted and r.models), None)
             if usable is not None:
-                return {
+                result = {
                     "config_ready": True,
                     "config_error": None,
                     "provider": usable.type,
                     "provider_label": usable.label,
                     "model": usable.models[0] if usable.models else "",
+                    "build": _read_build_stamp(),
+                    "google_oauth_configured": google_oauth_configured,
                 }
+                _config_status_cache = result
+                _config_status_cache_at = now
+                return result
         except Exception:
             pass
 
-        return {
-            "config_ready": False,
+        result = {
+            "config_ready": True,
             "config_error": "No coworker available — install a CLI agent (e.g. Claude Code) or add a model source in Settings.",
             "provider": "none",
             "provider_label": "None",
             "model": "",
+            "build": _read_build_stamp(),
+            "google_oauth_configured": google_oauth_configured,
         }
+        _config_status_cache = result
+        _config_status_cache_at = now
+        return result
 
     @staticmethod
     def field_is_sensitive(field_name: str) -> bool:
