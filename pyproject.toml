@@ -62,10 +62,7 @@ fallback-version = "0.0.0-dev"
 packages = ["cowork"]
 
 [tool.uv.sources]
-# dev: pointed at the local checkout in ../anton (google_picker_api branch)
-# to iterate on the PICKED_FILES prompt fix — revert to the git source
-# before merging.
-anton-agent = { path = "../anton", editable = true }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
