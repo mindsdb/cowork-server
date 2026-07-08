@@ -7,6 +7,7 @@ real credentials, network, or LLM.
 """
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 from sqlmodel import select
@@ -17,6 +18,7 @@ from cowork.channels.registry import PluginRegistry, load_first_party_plugins
 from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
 from cowork.channels.webhooks import drain_background_tasks
 from cowork.db.session import get_open_session
+from cowork.harnesses.base import ChannelContext
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.models.message import Message
 from cowork.server import create_app
@@ -736,3 +738,179 @@ def test_plugin_capabilities_match_declared_hooks():
             assert plugin.lifecycle is not None, f"{plugin.channel_type}: lifecycle capability without lifecycle"
         if caps.supports_webhook_ingress:
             assert plugin.webhooks, f"{plugin.channel_type}: webhook capability without webhook routes"
+
+
+# --- ENG-591: group mention gating + channel context ------------------------
+
+def group_telegram_update(
+    update_id: int, chat_id: int, message_id: int, text: str,
+    *, entities=None, reply_to=None,
+) -> bytes:
+    msg = {
+        "message_id": message_id,
+        "from": {"id": 42, "is_bot": False},
+        "chat": {"id": chat_id, "type": "supergroup"},
+        "date": 1700000000,
+        "text": text,
+    }
+    if entities is not None:
+        msg["entities"] = entities
+    if reply_to is not None:
+        msg["reply_to_message"] = reply_to
+    return json.dumps({"update_id": update_id, "message": msg}).encode()
+
+
+def test_telegram_group_mention_only_flow(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call(bot_token, method, payload):
+        calls.append((method, dict(payload)))
+        if method == "getMe":
+            return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+        return {"ok": True, "result": {"message_id": 1}}
+
+    fake_harness = FakeHarness()
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: fake_harness)
+
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
+    # No bot_username credential: identity must come from getMe.
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    adapters = LiveAdapterRegistry(registry)
+    adapter = FakeAdapter()
+    adapters._cache["telegram"] = adapter
+    runtime = AntonChannelRuntime(adapters)
+
+    async def inbound(body):
+        for event in await bridge.parse_inbound(body=body, headers={}, route_name=None):
+            await runtime.handle("telegram", event)
+
+    # Plain group message: binding auto-created as mention_only, turn skipped.
+    asyncio.run(inbound(group_telegram_update(70, -100123, 1, "what listings are there?")))
+    s = get_open_session()
+    binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "-100123")).one()
+    assert binding.trigger_rule == "mention_only"
+    assert binding.anton_conversation_id is None
+    s.close()
+    assert adapter.delivered == []
+
+    # @mention (case differs from getMe's username) → served, with the group
+    # channel context handed to the harness.
+    asyncio.run(inbound(group_telegram_update(71, -100123, 2, "@antonbot show me listings")))
+    assert len(adapter.delivered) == 1
+    assert fake_harness.channel_contexts == [
+        ChannelContext(channel_type="telegram", is_group=True, display_name=None, instructions=None)
+    ]
+
+    # Replying to one of the bot's messages addresses it too.
+    asyncio.run(inbound(group_telegram_update(
+        72, -100123, 3, "and the price?", reply_to={"from": {"id": 999, "is_bot": True}},
+    )))
+    assert len(adapter.delivered) == 2
+
+    # Identity fetched once, then cached.
+    assert [m for (m, _p) in calls if m == "getMe"] == ["getMe"]
+
+
+def test_telegram_group_mention_detection(monkeypatch):
+    getme_methods: list[str] = []
+
+    async def fake_call(bot_token, method, payload):
+        getme_methods.append(method)
+        return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+
+    async def parse(bridge, body):
+        return (await bridge.parse_inbound(body=body, headers={}, route_name=None))[0]
+
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+
+    # text_mention entities carry the target user, matched by bot id.
+    ev = asyncio.run(parse(bridge, group_telegram_update(
+        80, -200, 1, "Anton what's new?",
+        entities=[{"type": "text_mention", "offset": 0, "length": 5, "user": {"id": 999}}],
+    )))
+    assert ev.message.is_mention is True
+
+    # Entity offsets are UTF-16 code units: non-BMP text before the mention
+    # must not shift the matched window.
+    ev = asyncio.run(parse(bridge, group_telegram_update(
+        81, -200, 2, "\U0001F44D\U0001F44D @AntonBot hi",
+        entities=[{"type": "mention", "offset": 5, "length": 9}],
+    )))
+    assert ev.message.is_mention is True
+
+    # Plain group text with no mention → not a mention.
+    ev = asyncio.run(parse(bridge, group_telegram_update(82, -200, 3, "hello all")))
+    assert ev.message.is_mention is False
+
+    # Private chats are always mentions and never trigger getMe.
+    fresh = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    before = len(getme_methods)
+    ev = asyncio.run(parse(fresh, telegram_update(83, 5, 4, "hi")))
+    assert ev.message.is_mention is True
+    assert len(getme_methods) == before
+
+
+def test_telegram_mention_falls_back_to_credential_when_getme_fails(monkeypatch):
+    async def failing_call(bot_token, method, payload):
+        raise ConnectionError("api down")
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(failing_call))
+
+    async def parse(bridge, body):
+        return (await bridge.parse_inbound(body=body, headers={}, route_name=None))[0]
+
+    with_cred = telegram_plugin.TelegramBridge({"bot_token": "x", "bot_username": "AntonBot"})
+    ev = asyncio.run(parse(with_cred, group_telegram_update(90, -300, 1, "hey @antonbot")))
+    assert ev.message.is_mention is True
+
+    without = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    ev = asyncio.run(parse(without, group_telegram_update(91, -300, 2, "hey @antonbot")))
+    assert ev.message.is_mention is False
+
+
+def test_should_respond_matrix():
+    def event(text="hi", is_mention=False):
+        return SimpleNamespace(message=SimpleNamespace(content=text, is_mention=is_mention))
+
+    def binding(rule, pattern=None):
+        return SimpleNamespace(trigger_rule=rule, trigger_pattern=pattern)
+
+    should = AntonChannelRuntime._should_respond
+    assert should(binding("always"), event()) is True
+    assert should(binding("mention_only"), event(is_mention=True)) is True
+    assert should(binding("mention_only"), event(is_mention=False)) is False
+    assert should(binding("regex", r"listing"), event("any listings?")) is True
+    assert should(binding("regex", r"listing"), event("hello")) is False
+    assert should(binding("regex", None), event("hello")) is False
+    assert should(binding("regex", "("), event("hello")) is False
+
+
+def test_binding_instructions_roundtrip():
+    app = create_app()
+
+    async def flow():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.post("/api/v1/channels/bindings", json={
+                "channel_type": "telegram",
+                "external_group_id": "-400500",
+                "instructions": "You are the listings concierge.",
+            })
+            assert r.status_code == 201
+            body = r.json()
+            assert body["instructions"] == "You are the listings concierge."
+
+            r = await client.patch(
+                f"/api/v1/channels/bindings/{body['id']}", json={"instructions": "Be brief."}
+            )
+            assert r.status_code == 200 and r.json()["instructions"] == "Be brief."
+
+            r = await client.get("/api/v1/channels/bindings", params={"channel_type": "telegram"})
+            row = next(b for b in r.json() if b["id"] == body["id"])
+            assert row["instructions"] == "Be brief."
+
+    asyncio.run(flow())
