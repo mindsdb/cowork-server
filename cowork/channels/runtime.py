@@ -234,6 +234,7 @@ class AntonChannelRuntime:
                     channel_type=channel_type,
                     is_group=bool(event.message.is_group),
                     display_name=binding.display_name,
+                    instructions=binding.instructions,
                 )
                 reply, used_tools = await self._run_anton(
                     session, conversation, event, adapter, channel_context=channel_context
