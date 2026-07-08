@@ -53,6 +53,17 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+        # A per-conversation coworker pick (composer) overrides the global
+        # default. Resolved here (not in __init__) so the same handler
+        # instance's default construction cost is only paid once per
+        # request regardless of whether an override is present.
+        if request.harness:
+            try:
+                self.harness = get_harness(request.harness)
+            except ValueError:
+                logger.warning("Requested harness '%s' is not registered; using default '%s'",
+                                request.harness, self.harness.id)
+        await self.harness.sync_skills(SkillService(self.session).list_skills())
 
         conversation_service = ConversationService(self.session)
         project_id = self._resolve_project_id(request)
@@ -147,10 +158,16 @@ class ResponsesHandler:
         self.session.commit()
         self.session.refresh(user_message)
 
+        # `request.model` is a "{provider_slug}/{model_id}" pick from the
+        # composer's model picker (see cowork.services.provider_registry).
+        # When absent or unresolvable, each harness falls back to its own
+        # default routing.
         stream = self.harness.stream_response(
             conversation=conversation,
             input=harness_input,
-            disabled_connections=disabled,
+            model=request.model,
+            disabled_connections=[dc.model_dump() for dc in request.disabled_connections]
+            if request.disabled_connections else None,
         )
         return await self._collect(stream, conversation.id, request.model, str(user_message.id))
 
@@ -175,98 +192,67 @@ class ResponsesHandler:
         """
         own = get_open_session()
         collected_text: list[str] = []
-        collected_events: list[dict] = []
-        persisted = False
+        pending_events: list[dict] = []
 
         def event_sink(event_type: str, data: dict) -> None:
-            collected_events.append(data)
+            pending_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
-        def persist() -> None:
-            nonlocal persisted
-            if persisted:
-                return
-            persisted = True
-            try:
-                own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
-                own.commit()
-                ConversationService(own).save_assistant_turn(
-                    conv_id, "".join(collected_text), collected_events, harness=harness_id,
-                )
-            except Exception:
-                logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
+        conversation_service = ConversationService(self.session)
+        harness_id = getattr(self.harness, 'id', None)
+        assistant_message_id: UUID | None = None
+        next_seq = 0
 
+        event_count = 0
         try:
-            conv = ConversationService(own).get_conversation(conv_id)
-            harness = get_harness(harness_name)
-            stream = harness.stream_response(
-                conversation=conv, input=harness_input, disabled_connections=disabled,
-            )
-            event_count = 0
-            async for sse_string in harness.formatter(stream, model, event_sink):
+            async for sse_string in self.harness.formatter(stream, model, event_sink):
                 event_count += 1
-                sse_string = self._inject_created(sse_string, conv_id, harness_id)
-                await buffer.append("sse", {"sse": sse_string})
-            logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
-            persist()
-            await buffer.close("completed")
-        except asyncio.CancelledError:
-            # Nothing special is emitted on cancellation.
-            # The partial text and evennts generated before cancellation are persisted.
-            persist()
-            await buffer.close("cancelled")
-            return
-        except Exception as exc:
-            friendly = friendly_turn_error(exc)
-            if friendly is not None:
-                code, message = friendly
-                logger.info("[responses] user-facing turn error: %s", exc)
-            else:
-                code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
-                logger.exception("[responses] turn failed for conversation %s", conv_id)
-            # For an auth failure, tell the client which provider failed so it
-            # offers the right action: "Reconnect" only for MindsHub (we can
-            # re-provision the key in place), "Open Settings" for a BYOK key the
-            # user owns. Without this the renderer would always say "Reconnect
-            # MindsHub" — wrong for BYOK users.
-            extra: dict = {}
-            if code == AUTH_ERROR_CODE:
-                # Resolving the provider must never break the error handler —
-                # if it raises we just fall back to the generic auth message
-                # (no reconnectable flag), so the stream still closes cleanly.
-                try:
-                    from cowork.common.settings.user_settings import Provider
-                    provider = get_user_settings().resolved_planning_provider
-                    reconnectable = provider == Provider.MINDS_CLOUD
-                    message = auth_error_detail(provider.label, reconnectable)
-                    extra = {"reconnectable": reconnectable, "provider_label": provider.label}
-                except Exception:
-                    logger.exception("[responses] could not resolve provider for auth error")
-            failed = response_failed_payload(message, code, **extra)
-            await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
-            collected_events.append(failed)
-            persist()
-            await buffer.close("error")
-        finally:
-            own.close()
+                if event_count <= 3 or "response.completed" in sse_string:
+                    logger.info("[responses] SSE event #%d (first 120 chars): %s", event_count, sse_string[:120].replace('\n', '\\n'))
+                # Inject conversation_id and harness into the response.created
+                # event so the client learns the canonical id and which agent
+                # generated this response.
+                if "response.created" in sse_string and "conversation_id" not in sse_string:
+                    try:
+                        lines = sse_string.strip().split("\n")
+                        data_line = next(l for l in lines if l.startswith("data:"))
+                        payload = json.loads(data_line[5:])
+                        payload["conversation_id"] = str(conversation_id)
+                        if harness_id:
+                            payload["harness"] = harness_id
+                        sse_string = f"event: response.created\ndata: {json.dumps(payload)}\n\n"
+                    except Exception:
+                        pass
+                # Write-ahead: durably commit every event the formatter
+                # recorded for this SSE string BEFORE it reaches the client.
+                # A disconnect mid-turn can then only lose bytes on the
+                # wire — never recorded progress — so the tail/items replay
+                # from message_events is always complete. The assistant row
+                # is created lazily on the first event so an eventless turn
+                # still leaves no row (matches save_assistant_turn).
+                if pending_events:
+                    if assistant_message_id is None:
+                        assistant_message_id = conversation_service.begin_assistant_turn(
+                            conversation_id, harness=harness_id,
+                        ).id
+                    for event_data in pending_events:
+                        conversation_service.append_event(
+                            assistant_message_id, next_seq, event_data,
+                        )
+                        next_seq += 1
+                    pending_events.clear()
+                yield sse_string
 
-    @staticmethod
-    def _inject_created(sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
-        """Inject conversation_id + harness into the response.created event so
-        the client learns the canonical id and which agent generated this."""
-        if "response.created" in sse_string and "conversation_id" not in sse_string:
-            try:
-                lines = sse_string.strip().split("\n")
-                data_line = next(l for l in lines if l.startswith("data:"))
-                payload = json.loads(data_line[5:])
-                payload["conversation_id"] = str(conversation_id)
-                if harness_id:
-                    payload["harness"] = harness_id
-                return f"event: response.created\ndata: {json.dumps(payload)}\n\n"
-            except Exception:
-                pass
-        return sse_string
+            logger.info("[responses] stream finished — %d events, %d chars of text", event_count, len("".join(collected_text)))
+        finally:
+            # Runs on normal completion AND when the client disconnects or
+            # cancels (GeneratorExit/CancelledError at the yield above).
+            # Events are already durable; stamp the text collected so far.
+            if assistant_message_id is not None:
+                conversation_service.finalize_assistant_turn(
+                    assistant_message_id, "".join(collected_text),
+                )
 
     async def _collect(
         self,

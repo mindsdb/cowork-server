@@ -69,32 +69,7 @@ class OAuthStateStore:
         pending = entry.get("pending") or {}
         return pending if pending else None
 
-    def set_outcome(self, state: str, outcome: dict[str, Any]) -> None:
-        data = self._load()
-        outcomes = data.setdefault("_outcomes", {})
-        outcomes[state] = {**outcome, "_ts": datetime.now(timezone.utc).isoformat()}
-        self._save(data)
-
-    def get_outcome(self, state: str) -> dict[str, Any] | None:
-        data = self._load()
-        entry = data.get("_outcomes", {}).get(state)
-        if entry is None:
-            return None
-        try:
-            ts = datetime.fromisoformat(entry["_ts"])
-            if datetime.now(timezone.utc) - ts > _OUTCOME_TTL:
-                self.clear_outcome(state)
-                return None
-        except (KeyError, ValueError) as exc:
-            _log.debug("Could not parse outcome timestamp for state %r: %s", state, exc)
-        return {k: v for k, v in entry.items() if k != "_ts"}
-
-    def clear_outcome(self, state: str) -> None:
-        data = self._load()
-        data.get("_outcomes", {}).pop(state, None)
-        self._save(data)
-
-    def clear_pending(self, service: str, *, error: str = "") -> None:
+    def clear_pending(self, service: str, *, error: str = "", connection_name: str = "") -> None:
         data = self._load()
         entry = data.get(service) or {}
         entry["pending"] = {}
@@ -106,5 +81,7 @@ class OAuthStateStore:
             entry["lastSuccessAt"] = now
             entry["lastError"] = ""
             entry["lastErrorAt"] = ""
+            if connection_name:
+                entry["connectionName"] = connection_name
         data[service] = entry
         self._save(data)

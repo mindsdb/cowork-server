@@ -8,6 +8,7 @@ with a `from_seq` cursor and resumes from where it left off. Only an
 explicit POST /responses/cancel halts the producer.
 """
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -19,7 +20,7 @@ from cowork.common.logger import setup_logging
 from cowork.db.session import get_session
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.schemas.responses import ResponsesRequest
-from cowork.streaming import registry
+from cowork.services.conversations import ConversationService
 
 
 logger = setup_logging()
@@ -106,18 +107,48 @@ async def cancel_response(req: CancelRequest):
 
 @router.get("/tail")
 async def tail_response(
-    conversation_id: str = Query(..., description="Conversation to tail."),
-    from_seq: int = Query(0, ge=0, description="Resume from this seq; records with seq >= from_seq are replayed, then live-tail."),
+    session: SessionDep,
+    conversation_id: str | None = None,
+    from_seq: int = 0,
 ):
-    """Reconnect to an in-flight (or just-finished) turn: replay from
-    `from_seq` then live-tail to the terminal record. 404 when no buffer is
-    registered — the client should fall back to GET /conversations/{id}/items
-    for the persisted history."""
-    handle = registry.get(conversation_id)
-    if handle is None:
-        return JSONResponse(status_code=404, content={"status": "not_found"})
-    return StreamingResponse(
-        sse_from_buffer(handle.buffer, from_seq),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
-    )
+    """Tail/reconnect to a conversation's latest turn with event replay.
+
+    Replays the durably persisted events of the newest assistant turn,
+    starting at `from_seq` (the 0-based message_events sequence number).
+    Events are committed BEFORE they are yielded to the live SSE stream
+    (write-ahead — see ResponsesHandler._stream), so this replay is
+    complete even when the client disconnected mid-turn. While the turn
+    is still streaming `status` is "active"; poll again with the returned
+    `next_seq` for a gapless continuation. Full history remains at
+    GET /conversations/{id}/items.
+    """
+    if not conversation_id:
+        return {"status": "not_found"}
+    try:
+        conv_uuid = UUID(conversation_id)
+    except ValueError:
+        return {"status": "not_found"}
+
+    active = conversation_id in get_active_stream_ids()
+    service = ConversationService(session)
+    message = service.latest_assistant_message(conv_uuid)
+    if message is None:
+        if not active:
+            return {"status": "not_found"}
+        # Stream registered but no event persisted yet — nothing to replay.
+        return {
+            "status": "active",
+            "conversation_id": conversation_id,
+            "events": [],
+            "next_seq": from_seq,
+        }
+
+    events = service.get_turn_events(message.id, from_seq)
+    next_seq = (events[-1].sequence_number + 1) if events else from_seq
+    return {
+        "status": "active" if active else "completed",
+        "conversation_id": conversation_id,
+        "message_id": str(message.id),
+        "events": [e.event_data for e in events],
+        "next_seq": next_seq,
+    }

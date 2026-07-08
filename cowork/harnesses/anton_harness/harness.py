@@ -103,12 +103,137 @@ class AntonHarness:
     label: str = "Anton"
     formatter = staticmethod(format_responses_stream)
 
+    category = "Agent"
+    priority = 10
+    tags = ("free-forever", "memory", "tools")
+
+    @classmethod
+    def configuration_schema(cls) -> list[dict]:
+        return [{"type": "model-picker", "id": "model"}]
+
+    async def sync_skills(self, skills: list[Skill]) -> None:
+        from datetime import datetime, timezone
+        from anton.core.memory.skills import Skill as AntonSkill, SkillStore
+        
+        from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+
+        settings = AntonHarnessSettings()
+        store = SkillStore(Path(settings.skills_root_dir))
+        active_labels: set[str] = set()
+        for skill in skills:
+            anton_skill = AntonSkill(
+                label=skill.label,
+                name=skill.name,
+                description=skill.description or "",
+                when_to_use=skill.when_to_use or "",
+                declarative_md=skill.instructions,
+                created_at=skill.created_at.isoformat() if skill.created_at else datetime.now(timezone.utc).isoformat(),
+                provenance="cowork",  # Helps track which skills originated from cowork.
+            )
+            store.save(anton_skill)
+            active_labels.add(skill.label)
+
+        # Delete any existing Anton skills that are not in the current list.
+        for existing in store.list_all():
+            if existing.provenance == "cowork" and existing.label not in active_labels:
+                store.delete(existing.label)
+    
+    async def overwrite_memory(self, scope: MemoryScope, category: str, content: str, project: Project | None = None) -> None:
+        # Validate provided category.
+        # This is not done at the schema (request) level because each harness supports different categories.
+        category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
+
+        if scope == MemoryScope.global_:
+            await self._write_to_global_memory(category_enum, content)
+        elif scope == MemoryScope.project:
+            await self._write_to_project_memory(project, category_enum, content)
+
+    async def _write_to_global_memory(self, category: AntonMemoryCategory, content: str) -> None:
+        global_memory_dir = Path(settings.global_memory_root_dir)
+        global_memory_dir.mkdir(parents=True, exist_ok=True)
+        
+        memory_file = self._resolve_memory_path(global_memory_dir, category)
+        memory_file.write_text(content + "\n", encoding="utf-8")
+
+    async def _write_to_project_memory(self, project: Project, category: AntonMemoryCategory, content: str) -> None:
+        project_memory_dir = Path(project.path) / ".anton" / "memory"
+        project_memory_dir.mkdir(parents=True, exist_ok=True)
+
+        memory_file = self._resolve_memory_path(project_memory_dir, category)
+        memory_file.write_text(content + "\n", encoding="utf-8")
+
+    def _resolve_memory_path(self, root_dir: Path, category: AntonMemoryCategory) -> Path:
+        # TODO: Topics are not handled at the moment because there are some discrepancies in
+        # how they are handled in Cowork Vs what Anton actually expects.
+        scope_to_path = {
+            AntonMemoryCategory.lesson: root_dir / "lessons.md",
+            AntonMemoryCategory.rule: root_dir / "rules.md",
+        }
+        return scope_to_path[category]
+    
+    async def retrieve_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> str:
+        category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
+
+        if scope == MemoryScope.global_:
+            return await self._read_from_global_memory(category_enum)
+        elif scope == MemoryScope.project:
+            return await self._read_from_project_memory(project, category_enum)
+        else:
+            raise ValueError(f"Unsupported memory scope: {scope}")
+
+    async def _read_from_global_memory(self, category: AntonMemoryCategory) -> str:
+        global_memory_dir = Path(settings.global_memory_root_dir)
+        memory_file = self._resolve_memory_path(global_memory_dir, category)
+        if not memory_file.is_file():
+            return ""
+        return memory_file.read_text(encoding="utf-8")
+    
+    async def _read_from_project_memory(self, project: Project, category: AntonMemoryCategory) -> str:
+        project_memory_dir = Path(project.path) / ".anton" / "memory"
+        memory_file = self._resolve_memory_path(project_memory_dir, category)
+        if not memory_file.is_file():
+            return ""
+        return memory_file.read_text(encoding="utf-8")
+
+    async def list_memory(self, projects: list[Project]) -> list:
+        from cowork.harnesses.base import MemoryItem
+        supported = [AntonMemoryCategory.lesson, AntonMemoryCategory.rule]
+        results = []
+        for category in supported:
+            content = await self._read_from_global_memory(category)
+            results.append(MemoryItem(scope=MemoryScope.global_, category=category.value, content=content, project=None))
+        for project in projects:
+            for category in supported:
+                content = await self._read_from_project_memory(project, category)
+                results.append(MemoryItem(scope=MemoryScope.project, category=category.value, content=content, project=project))
+        return results
+
+    async def delete_memory(self, scope: MemoryScope, category: str, project: Project | None = None) -> None:
+        category_enum = AntonMemoryCategory(category)  # This will raise a ValueError if the category is not supported.
+
+        if scope == MemoryScope.global_:
+            await self._delete_global_memory(category_enum)
+        elif scope == MemoryScope.project:
+            await self._delete_project_memory(project, category_enum)
+
+    async def _delete_global_memory(self, category: AntonMemoryCategory) -> None:
+        global_memory_dir = Path(settings.global_memory_root_dir)
+        memory_file = self._resolve_memory_path(global_memory_dir, category)
+        if memory_file.is_file():
+            memory_file.unlink()
+
+    async def _delete_project_memory(self, project: Project, category: AntonMemoryCategory) -> None:
+        project_memory_dir = Path(project.path) / ".anton" / "memory"
+        memory_file = self._resolve_memory_path(project_memory_dir, category)
+        if memory_file.is_file():
+            memory_file.unlink()
+
     async def stream_response(
         self,
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
@@ -137,7 +262,7 @@ class AntonHarness:
         skill_drafts: list[dict] = []
         try:
             session, temp_vault_dir = await self._build_chat_session(
-                conversation, disabled_connections=disabled_connections or []
+                conversation, model=model, disabled_connections=disabled_connections or []
             )
             async for event in session.turn_stream(self._to_anton_input(input)):
                 yield event
@@ -178,7 +303,7 @@ class AntonHarness:
     async def _build_chat_session(
         self,
         conversation: Conversation,
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
@@ -197,14 +322,12 @@ class AntonHarness:
         # process. The wrapper exposes the same schema to the LLM but
         # routes through a server-aware handler.
         from .tools import (
-            build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             # build_cowork_fetch_submission_tool,
             # build_cowork_update_form_tool,
         )
-        PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
@@ -247,22 +370,20 @@ class AntonHarness:
             if db_val is None:
                 continue
             # Provider enum -> string value for AntonSettings.
-            # The DB enum uses snake_case (openai_compatible, minds_cloud)
-            # but AntonSettings / LLMClient expect kebab-case
-            # (openai-compatible, minds-cloud).
+            # The DB enum uses snake_case (openai_compatible) but
+            # AntonSettings / LLMClient expect kebab-case (openai-compatible).
             if hasattr(db_val, "value"):
                 db_val = db_val.value.replace("_", "-")
             setattr(anton_settings, attr, db_val)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
-        for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
+        for attr in ("anthropic_api_key", "openai_api_key"):
             db_val = getattr(user, attr, None)
             if db_val is not None:
                 setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
 
-        # URLs (skip empty strings so AntonSettings.model_post_init derivations
-        # and AntonSettings' own publish_url default are preserved)
-        for attr in ("minds_url", "openai_base_url", "publish_url"):
+        # URLs (skip empty strings so AntonSettings.model_post_init derivations are preserved)
+        for attr in ("openai_base_url",):
             db_val = getattr(user, attr, None)
             if db_val:
                 setattr(anton_settings, attr, db_val)
@@ -291,7 +412,7 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client()
+        llm_client = self._build_llm_client(model)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -433,7 +554,6 @@ class AntonHarness:
             started_at=conversation.created_at,
             tools=[
                 CONNECT_DATASOURCE_TOOL,
-                PUBLISH_TOOL,
                 LOOKUP_CONNECTOR_TOOL,
                 REQUEST_CREDENTIALS_TOOL,
                 LABEL_CONNECTION_TOOL,
@@ -445,6 +565,6 @@ class AntonHarness:
         return ChatSession(config), temp_vault_dir
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(model: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
+        return build_llm_client(model)

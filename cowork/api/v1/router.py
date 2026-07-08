@@ -11,12 +11,13 @@ from cowork.api.v1.endpoints import (
     artifacts,
     conversations,
     files,
+    harnesses,
     health,
     memory,
     pins,
     project_files,
     projects,
-    publish,
+    providers,
     responses,
     schedules,
     search,
@@ -71,8 +72,9 @@ api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
-api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
+api_router.include_router(providers.router, prefix="/providers", tags=["providers"])
+api_router.include_router(harnesses.router, prefix="/harnesses", tags=["harnesses"])
 api_router.include_router(search.router, prefix="/search", tags=["search"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────

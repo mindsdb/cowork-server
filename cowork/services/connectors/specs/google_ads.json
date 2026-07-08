@@ -37,26 +37,9 @@
         "label": "In-Browser Connect",
         "description": "Enter your Google Ads developer token, then click Connect to authorize via Google sign-in.",
         "recommended": true,
-        "hidden": true,
-        "fields": [
-          {
-            "name": "developer_token",
-            "label": "Developer Token",
-            "type": "password",
-            "required": true,
-            "secret": true,
-            "placeholder": "ABCDE-FGHIJ-KLMNO",
-            "description": "Found in Google Ads Manager → Tools & Settings → Setup → API Center. Required for every Google Ads API call."
-          },
-          {
-            "name": "login_customer_id",
-            "label": "Login Customer ID (MCC)",
-            "type": "text",
-            "required": false,
-            "placeholder": "1234567890",
-            "description": "10-digit manager account (MCC) customer ID — no dashes. Required only if you manage multiple accounts through an MCC. Leave blank for single-account setups."
-          }
-        ]
+        "submit_action": "oauth_launch",
+        "fields": [],
+        "hidden": false
       },
       {
         "id": "oauth-byok",
