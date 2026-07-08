@@ -2,13 +2,25 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from sqlalchemy import case
 from sqlmodel import Session, select
 
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
+from cowork.schemas.responses import Role
 from cowork.services.projects import GENERAL_PROJECT_ID
+from cowork.services.task_objects import TaskObjectService
+
+# Streaming turns persist user + assistant in one persist() call; on SQLite
+# both rows often share the same created_at (second precision). Tie-break
+# user before assistant, then id.
+_MESSAGE_ORDER = (
+    Message.created_at,
+    case((Message.role == Role.user, 0), else_=1),
+    Message.id,
+)
 
 
 class ConversationService:
@@ -83,7 +95,7 @@ class ConversationService:
         messages = self.session.exec(
             select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at)
+            .order_by(*_MESSAGE_ORDER)
         ).all()
         for message in messages:
             for event in self.session.exec(
@@ -91,6 +103,10 @@ class ConversationService:
             ).all():
                 self.session.delete(event)
             self.session.delete(message)
+        # Drop the conversation's object index too — otherwise the rows
+        # outlive the conversation as orphans pointing at artifacts no
+        # task owns anymore.
+        TaskObjectService(self.session).delete_for_conversation(conversation_id)
         self.session.delete(conversation)
         self.session.commit()
         return True
@@ -107,7 +123,7 @@ class ConversationService:
             self.session.exec(
                 select(Message)
                 .where(Message.conversation_id == conversation_id)
-                .order_by(Message.created_at)
+                .order_by(*_MESSAGE_ORDER)
             ).all()
         )
         # Find the Nth assistant message (0-based).
@@ -133,6 +149,14 @@ class ConversationService:
             ).all():
                 self.session.delete(event)
             self.session.delete(msg)
+        # Clearing the whole history (truncate from turn 0) is the UI's
+        # "delete chat history". When nothing remains, the conversation no
+        # longer owns anything it produced — drop its object index so a
+        # cleared chat doesn't keep resurfacing old artifacts. A partial
+        # truncation leaves the index alone (rows aren't turn-scoped, and
+        # surviving turns may still reference the artifact).
+        if cut_from == 0:
+            TaskObjectService(self.session).delete_for_conversation(conversation_id)
         self.session.commit()
         return len(to_delete)
 
@@ -174,7 +198,7 @@ class ConversationService:
         messages = self.session.exec(
             select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at, Message.id)
+            .order_by(*_MESSAGE_ORDER)
         ).all()
         result = []
         for message in messages:

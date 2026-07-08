@@ -119,20 +119,33 @@ class SaveConnectionResponse(BaseModel):
 class ConnectionSummaryResponse(BaseModel):
     engine: str
     name: str
+    # Human-facing name for the card (label or derived identity); falls back to
+    # `name` (the slug) client-side when null.
+    display_name: str | None = None
     created_at: str | None = None
     label: str | None = None
     logo: str | None = None
     logo_color: str | None = None
+    # "needs_reconnect" when the connection's token was lost/revoked; absent
+    # when healthy. Lets the catalogue card show a warning without requiring
+    # the client to fetch each connection's full detail first.
+    status: str | None = None
 
 
 class ConnectionDetailResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     engine: str
     name: str
+    display_name: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     connector_id: str | None = None
     method: str | None = None
     fields: dict[str, Any] = Field(default_factory=dict)
+    # Names of fields in `fields` that were masked with VAULT_KEEP_SENTINEL —
+    # lets the client show a "saved" indicator instead of the raw sentinel.
+    secure_keys: list[str] = Field(default_factory=list, serialization_alias="secureKeys")
 
 
 class DirectSaveRequest(BaseModel):

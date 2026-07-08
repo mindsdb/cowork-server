@@ -62,7 +62,10 @@ import cowork.services.publish as publish_mod
 
 class _FakeUserSettings:
     minds_api_key = SecretStr("test-key")
-    publish_url = "https://4nton.ai"
+    minds_url = "https://api.mindshub.ai/v1"
+    openai_base_url = ""
+    openai_api_key = None
+    publish_url = ""  # empty → derived from the provider endpoint
 
 
 class _FakeAppSettings:

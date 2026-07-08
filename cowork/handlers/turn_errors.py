@@ -39,6 +39,21 @@ TOKEN_LIMIT_USER_MESSAGE = (
 # codes so a client can branch on it if it ever wants a richer affordance.
 TOKEN_LIMIT_CODE = "token_limit"
 
+# Curated copy for a provider auth failure — the credential the model gateway
+# sees is invalid (revoked / rotated / never provisioned / org drift), so calls
+# come back 401 mid-conversation. The desktop renders a richer card for the
+# `provider_auth` code (Reconnect MindsHub / Open Settings); this is the fallback
+# text. Distinct from token_limit (out of credits) and from the config-absence
+# case (no provider configured at all).
+AUTH_ERROR_USER_MESSAGE = (
+    "Your MindsHub session is no longer valid — reconnect to keep going, or "
+    "update your provider key in Settings."
+)
+
+# Wire-level code for the auth case. The renderer branches on it to offer a
+# "Reconnect" action (re-provision the key in place) instead of "Subscribe".
+AUTH_ERROR_CODE = "provider_auth"
+
 # Redacted stand-in for any failure we haven't mapped — never the raw
 # provider text.
 GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
@@ -99,24 +114,82 @@ def is_token_limit_error(exc: Exception) -> bool:
     return False
 
 
+def is_auth_error(exc: Exception) -> bool:
+    """Detect an **LLM-provider** auth failure — a 401 from the model gateway
+    because the credential it sees is invalid (revoked / rotated / never
+    provisioned / wrong org).
+
+    Matched narrowly on anton's specific 401 copy — both providers raise a
+    ``ConnectionError`` whose message starts ``Invalid API key — …``
+    (``openai.py`` / ``anthropic.py``). Deliberately does NOT match a bare
+    "401"/"unauthorized" anywhere in the text: that would mislabel an unrelated
+    failure (e.g. a connector/tool API 401 that bubbles up) as a provider-auth
+    error and pop the wrong "Reconnect" card. Credit/quota exhaustion (402/429)
+    is handled by ``is_token_limit_error`` (checked first).
+    """
+    return "invalid api key" in str(exc).lower()
+
+
+def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
+    """Provider-aware copy for an auth failure.
+
+    MindsHub (managed) → the fix is to re-provision the key in place
+    ("reconnect"); a BYOK provider → the user must fix their own key in Settings,
+    so do NOT tell them to reconnect MindsHub.
+    """
+    if reconnectable:
+        return "Your MindsHub session is no longer valid — reconnect to keep going."
+    return f"Your {provider_label} API key is no longer valid — update it in Settings."
+
+
 def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
     """Map a known, cryptic turn failure to ``(code, user_message)``.
 
     Returns ``None`` when the exception isn't one we have curated copy
     for — the caller then falls back to the generic redacted message.
     """
+    # token_limit first: a 402/429 credit/quota case must not be misread as auth.
     if is_token_limit_error(exc):
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
+    if is_auth_error(exc):
+        return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     if is_image_format_error(exc):
         return "image_format", IMAGE_FORMAT_USER_MESSAGE
     return None
 
 
-def response_failed_sse(error: str, code: str) -> str:
-    """Build a ``response.failed`` SSE frame.
+def response_failed_payload(
+    error: str,
+    code: str,
+    *,
+    reconnectable: bool | None = None,
+    provider_label: str | None = None,
+) -> dict:
+    """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
-    Same wire shape the legacy server emitted, so the renderer's existing
-    parser handles it unchanged: ``{type, code, error}``.
+    ``reconnectable`` / ``provider_label`` are included only for the
+    ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
+    "Open Settings" (BYOK) — omitted otherwise to keep the shape unchanged for
+    every other failure.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
+    if reconnectable is not None:
+        payload["reconnectable"] = reconnectable
+    if provider_label is not None:
+        payload["provider_label"] = provider_label
+    return payload
+
+
+def response_failed_sse(
+    error: str,
+    code: str,
+    *,
+    reconnectable: bool | None = None,
+    provider_label: str | None = None,
+) -> str:
+    """Build a ``response.failed`` SSE frame (same wire shape the renderer's
+    parser already handles, plus the optional auth fields)."""
+    payload = response_failed_payload(
+        error, code, reconnectable=reconnectable, provider_label=provider_label
+    )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"
