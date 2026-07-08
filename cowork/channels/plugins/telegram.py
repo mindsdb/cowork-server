@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Mapping
@@ -110,7 +111,7 @@ class TelegramBridge:
             (credentials.get("bot_username") or "").strip().lstrip("@") or None
         )
         self._bot_id: str | None = None
-        self._identity_attempt_at: float = 0.0
+        self._identity_attempt_at: float | None = None
 
     @property
     def channel_type(self) -> str:
@@ -224,7 +225,10 @@ class TelegramBridge:
         if self._bot_id is not None and self._bot_username:
             return
         now = time.monotonic()
-        if now - self._identity_attempt_at < IDENTITY_RETRY_S:
+        # None = never attempted. A 0.0 sentinel would read as "in cooldown"
+        # whenever machine uptime < IDENTITY_RETRY_S (monotonic counts from
+        # boot), silently disabling getMe on freshly provisioned instances.
+        if self._identity_attempt_at is not None and now - self._identity_attempt_at < IDENTITY_RETRY_S:
             return
         self._identity_attempt_at = now
         bot_token = (self._secrets.get("bot_token") or "").strip()
@@ -261,7 +265,11 @@ class TelegramBridge:
             return True
         if username and (reply_from.get("username") or "").lower() == username:
             return True
-        return bool(username) and f"@{username}" in text.lower()
+        # Boundary check so "@antonbot" doesn't match a mention of
+        # "@antonbotdev" (usernames are [A-Za-z0-9_]).
+        return bool(username) and re.search(
+            rf"@{re.escape(username)}(?![A-Za-z0-9_])", text, re.IGNORECASE
+        ) is not None
 
     async def parse_inbound(
         self, *, body: bytes, headers: Mapping[str, str], route_name: str | None
