@@ -155,6 +155,29 @@ class DirectSaveRequest(BaseModel):
     values: dict[str, Any] = Field(default_factory=dict)
 
 
+class PickedFile(BaseModel):
+    """A Drive file the user explicitly granted access to via the Google
+    Picker — drive.file scope only covers files the app created itself,
+    so this is how existing files become accessible."""
+
+    id: str
+    name: str
+    mime_type: str | None = Field(default=None, alias="mimeType")
+    icon_url: str | None = Field(default=None, alias="iconUrl")
+    url: str | None = None
+    # Required by Drive API alongside `id` for many files not owned by the
+    # connecting account (link-shared docs especially) — without it,
+    # files.get()/files.export() return 404 notFound even with a valid,
+    # correctly-granted token.
+    resource_key: str | None = Field(default=None, alias="resourceKey")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PatchPickedFilesBody(BaseModel):
+    files: list[PickedFile] = Field(default_factory=list)
+
+
 class OAuthStartRequest(BaseModel):
     client_id: str = ""
     client_secret: str = ""

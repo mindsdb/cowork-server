@@ -207,6 +207,10 @@ class OAuthSettings(Settings):
     google_analytics_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_ID"))
     google_analytics_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_SECRET"))
 
+    # Browser-side key for the Google Picker widget (drive.file scope only
+    # grants access to files the user explicitly picks via this UI).
+    google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
+
     server_origin: str = Field(
         default="http://127.0.0.1:26866",
         validation_alias=AliasChoices("COWORK_SERVER_ORIGIN"),
