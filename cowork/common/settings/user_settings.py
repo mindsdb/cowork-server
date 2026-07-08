@@ -6,6 +6,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     PLANNING_MODEL_DEFAULTS,
+    ROUTER_MODEL_DEFAULTS,
     Settings,
     default_minds_url,
     get_app_settings,
@@ -221,6 +222,25 @@ class UserSettings(Settings):
             "model's default. Only meaningful for models that advertise effort levels."
         ),
     )
+    # Router role = anton's "thalamus": the cheap front-model that gates each
+    # turn (respond-vs-delegate) and runs history summarization. Selectable so
+    # a user can point routing + summarization at a cheap model independently
+    # of the coding (scratchpad) model. Falls back to the coding role in anton
+    # when unset, so leaving these at defaults is behavior-preserving.
+    router_provider: Provider = Field(
+        default=Provider.ANTHROPIC,
+        title="Routing & Summarization Provider",
+        description="The provider for the routing/summarization model.",
+    )
+    router_model: str | None = Field(
+        default=None,
+        title="Routing & Summarization Model",
+        description=(
+            "The cheap model used for respond-vs-delegate routing and history "
+            "summarization. Defaults to the recommended model for the selected "
+            "provider (MindsHub → kimi; other providers → their smallest model)."
+        ),
+    )
     harness: Annotated[str, _DynamicOptions(_harness_options)] = Field(
         default="anton",
         title="Harness",
@@ -348,6 +368,8 @@ class UserSettings(Settings):
             self.planning_model = PLANNING_MODEL_DEFAULTS.get(self.planning_provider.value)
         if self.coding_model is None:
             self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
+        if self.router_model is None:
+            self.router_model = ROUTER_MODEL_DEFAULTS.get(self.router_provider.value)
         return self
 
     def _has_key(self, p: Provider) -> bool:
@@ -409,6 +431,19 @@ class UserSettings(Settings):
             self.coding_provider,
             self.coding_model,
             CODING_MODEL_DEFAULTS,
+        )
+
+    @property
+    def resolved_router_provider(self) -> Provider:
+        return self._resolve_provider(self.router_provider)
+
+    @property
+    def resolved_router_model(self) -> str | None:
+        return _resolved_model(
+            self.resolved_router_provider,
+            self.router_provider,
+            self.router_model,
+            ROUTER_MODEL_DEFAULTS,
         )
 
     @property
