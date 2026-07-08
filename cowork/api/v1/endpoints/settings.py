@@ -250,11 +250,16 @@ async def recommended_models(session: SessionDep):
             # upsert_setting commits a row + invalidates the settings cache, so
             # an unconditional write churns every UserSettings reader.
             if live_enabled:
-                desired = json.dumps(live_enabled, sort_keys=True)
+                # Persist ORDER-PRESERVING JSON — never sort_keys. The
+                # first-enabled default fallback (_enabled_aware_default)
+                # iterates the map in insertion order, relying on /v1/models
+                # listing the tier's baseline model first; an alphabetized map
+                # could silently promote the wrong model. The compare is
+                # order-sensitive too, so a gateway re-ranking (same set, new
+                # baseline first) also counts as a change and refreshes the map.
+                desired = json.dumps(live_enabled)
                 try:
-                    stored = json.dumps(
-                        json.loads(s.minds_model_enabled or "{}"), sort_keys=True
-                    )
+                    stored = json.dumps(json.loads(s.minds_model_enabled or "{}"))
                 except (ValueError, TypeError):
                     stored = "{}"
                 if desired != stored:

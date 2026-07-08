@@ -202,3 +202,38 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
     finally:
         _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
         session.close()
+
+
+def test_recommended_models_write_preserves_map_order(monkeypatch):
+    """The persisted map must keep /v1/models order (baseline model first) —
+    the first-enabled default fallback iterates in insertion order. A sorted
+    write would alphabetize it and could silently promote the wrong model
+    (e.g. an enabled 'air-mini' sorting before the baseline)."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    async def fake_fetch(base_url, api_key):
+        # Baseline listed FIRST by the gateway, but sorting alphabetically
+        # would put 'air-mini' ahead of it.
+        return (
+            ["zephyr_base", "air-mini", "sonnet"],
+            {},
+            {"zephyr_base": True, "air-mini": True, "sonnet": False},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
+        _delete_settings(session, "providers_json", "minds_model_enabled")
+
+        asyncio.run(recommended_models(session))
+
+        stored = SettingService(session).get_setting("minds_model_enabled").value
+        assert list(json.loads(stored).keys()) == ["zephyr_base", "air-mini", "sonnet"]
+    finally:
+        _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
