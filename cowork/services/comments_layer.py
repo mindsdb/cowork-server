@@ -231,6 +231,17 @@ LAYER_JS = r"""
     return {top: r.top + window.scrollY, left: r.left + window.scrollX,
             right: r.right + window.scrollX, width: r.width, height: r.height};
   }
+  // An element that is `display:none` (e.g. an inactive carousel slide) or
+  // detached still matches querySelector but has no client rects, and its
+  // getBoundingClientRect() collapses to zero — which would strand a marker at
+  // the document's scroll origin. Treat "no client rects" as not shown.
+  function isShown(el){ return !!(el && el.getClientRects().length); }
+  // Resolve a comment's anchor only when it currently matches AND is visible.
+  function anchorEl(selector){
+    if (!selector) return null;
+    var el; try { el = document.querySelector(selector); } catch (e) { el = null; }
+    return isShown(el) ? el : null;
+  }
 
   function isClosed(c){ return c.status === 'resolved' || c.status === 'dismissed'; }
 
@@ -241,8 +252,8 @@ LAYER_JS = r"""
   function placeMarkers(){
     clearMarkers();
     comments.forEach(function(c){
-      if (!c.selector || isClosed(c)) return;
-      var el; try { el = document.querySelector(c.selector); } catch (e) { el = null; }
+      if (isClosed(c)) return;
+      var el = anchorEl(c.selector);
       if (!el) return;
       var r = rectOf(el);
       var m = document.createElement('div');
@@ -447,11 +458,47 @@ LAYER_JS = r"""
   });
   window.addEventListener('scroll', scheduleMarkers, true);
   window.addEventListener('resize', scheduleMarkers);
+  // Slide decks / tabs / accordions toggle visibility via class or style
+  // changes and node swaps — none of which fire scroll or resize. Watch the
+  // DOM so markers follow their anchors (and hidden ones drop out) on those
+  // transitions too. rAF-throttled through scheduleMarkers.
+  if (window.MutationObserver) {
+    // placeMarkers() itself adds/removes .ac-marker nodes under <body>; ignore
+    // mutations that only touch our own layer nodes, or the observer would
+    // retrigger itself every frame.
+    function isOwnNode(n){
+      return !!(n && n.nodeType === 1 && n.classList && (
+        n.classList.contains('ac-marker') || n.classList.contains('ac-pop')
+        || n.classList.contains('ac-hl')));
+    }
+    function touchesArtifact(recs){
+      for (var i = 0; i < recs.length; i++) {
+        var rec = recs[i];
+        if (rec.type === 'attributes') { if (!isOwnNode(rec.target)) return true; continue; }
+        if (isOwnNode(rec.target)) continue; // e.g. rebuilding a popover's innards
+        var lists = [rec.addedNodes, rec.removedNodes];
+        for (var j = 0; j < lists.length; j++) {
+          for (var k = 0; k < lists[j].length; k++) {
+            if (!isOwnNode(lists[j][k])) return true;
+          }
+        }
+      }
+      return false;
+    }
+    try {
+      new MutationObserver(function(recs){
+        if (touchesArtifact(recs)) scheduleMarkers();
+      }).observe(document.body, {
+        childList: true, subtree: true,
+        attributes: true, attributeFilter: ['class', 'style', 'hidden']
+      });
+    } catch (e) {}
+  }
 
   function focusComment(id, openThreadToo){
     var c = comments.filter(function(x){ return x.id === id; })[0];
     if (!c || !c.selector) return;
-    var el; try { el = document.querySelector(c.selector); } catch (e) { el = null; }
+    var el = anchorEl(c.selector);
     if (!el) return;
     el.scrollIntoView({behavior:'smooth', block:'center'});
     var r = rectOf(el);
@@ -478,7 +525,7 @@ LAYER_JS = r"""
       if (mode) return;
       var hc = comments.filter(function(x){ return x.id === d.commentId; })[0];
       if (!hc || !hc.selector) { hl.style.display = 'none'; return; }
-      var hel; try { hel = document.querySelector(hc.selector); } catch (e) { hel = null; }
+      var hel = anchorEl(hc.selector);
       if (!hel) { hl.style.display = 'none'; return; }
       var hr = rectOf(hel);
       hl.style.display = 'block';
