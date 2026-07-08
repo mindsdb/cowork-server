@@ -20,16 +20,21 @@ postMessage contract (both sides tag messages ``source:"anton-comments"``):
                     {type:"create", selector, text}
                     {type:"reply", id, text}
                     {type:"status", id, status}
+                    {type:"edit", id, text}                    // edit root comment
+                    {type:"delete", id}                        // delete whole thread
+                    {type:"edit-reply", id, replyId, text}
+                    {type:"delete-reply", id, replyId}
                     {type:"count", count}
                     {type:"mode", active}
-  parent -> layer : {type:"list", comments:[...]}   // full normalized set
+  parent -> layer : {type:"list", comments:[...], viewer}   // full normalized set + viewer id
                     {type:"enter-mode"|"exit-mode"}
                     {type:"focus", commentId}
                     {type:"hl-on"|"hl-off", commentId}
 
 The normalized comment shape the layer renders (parent produces it):
-  {id, selector, status, author, text, created_at (epoch s),
-   replies:[{author, text, created_at}]}
+  {id, selector, status, author, author_user_id, text, edited_at, created_at (epoch s),
+   replies:[{id, author, author_user_id, text, edited_at, created_at}]}
+Owner-only edit/delete affordances render when author_user_id === viewer.user_id.
 """
 
 import re
@@ -42,7 +47,7 @@ LAYER_JS = r"""
 (function(){
   if (window.__antonCommentsLayer) return;
   window.__antonCommentsLayer = true;
-  var mode = false, comments = [], hoverEl = null, pop = null;
+  var mode = false, comments = [], hoverEl = null, pop = null, viewer = null;
 
   var css = document.createElement('style');
   css.textContent = ""
@@ -132,6 +137,15 @@ LAYER_JS = r"""
     + ".ac-pop button.ac-primary:hover{background:#33eaff;}"
     + ".ac-pop button.ac-primary:disabled{opacity:.45;cursor:default;}"
     + ".ac-hint{font-size:10.5px;color:#6c7a87;margin-right:auto;}"
+    + ".ac-pop .ac-edited{font-size:11px;color:#6c7a87;margin-left:6px;font-weight:400;}"
+    + ".ac-pop .ac-mini{width:24px;height:24px;border-radius:6px;border:1px solid #2a3a48;"
+    + "background:transparent;color:#9fb0bd;display:inline-flex;align-items:center;"
+    + "justify-content:center;cursor:pointer;}"
+    + ".ac-pop .ac-mini:hover{border-color:#3a4a58;color:#c7d3dd;}"
+    + ".ac-pop .ac-mini svg{width:13px;height:13px;}"
+    + ".ac-pop .ac-mini.ac-danger{border-color:#4a2530;color:#e0556a;}"
+    + ".ac-pop .ac-mini.ac-danger:hover{background:rgba(224,85,106,0.12);}"
+    + ".ac-pop .ac-reply-actions{display:inline-flex;gap:4px;margin-left:6px;vertical-align:middle;}"
     + "body.ac-mode, body.ac-mode *{cursor:crosshair !important;}";
   document.head.appendChild(css);
 
@@ -174,6 +188,26 @@ LAYER_JS = r"""
   var CANCEL_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" '
     + 'stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line>'
     + '<line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+  var EDIT_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    + 'stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path>'
+    + '<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>';
+  var TRASH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    + 'stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline>'
+    + '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>'
+    + '<path d="M10 11v6M14 11v6"></path></svg>';
+
+  // Authorship for UI gating only (server re-checks). `entry` is a normalized
+  // comment or reply; both carry author_user_id. `viewer` is the server-echoed id.
+  function isMine(entry){
+    return !!(viewer && viewer.user_id && entry && entry.author_user_id
+      && String(entry.author_user_id) === String(viewer.user_id));
+  }
+  function editedMark(at){
+    if (!at) return '';
+    var title = 'Edited';
+    try { title = 'Edited ' + new Date(at).toLocaleString(); } catch (e) {}
+    return ' <span class="ac-edited" title="' + esc(title) + '">(edited)</span>';
+  }
 
   function cssPath(el){
     if (!(el instanceof Element)) return null;
@@ -265,12 +299,18 @@ LAYER_JS = r"""
   function openThread(c, r){
     var p = popUnderMarker(r);
     var replies = (c.replies || []).map(function(rep){
-      return '<div class="ac-reply">'
+      var repActions = (isMine(rep) && rep.id)
+        ? '<span class="ac-reply-actions">'
+          + '<button class="ac-mini ac-edit-reply" data-rid="' + esc(rep.id) + '" title="Edit reply">' + EDIT_SVG + '</button>'
+          + '<button class="ac-mini ac-danger ac-del-reply" data-rid="' + esc(rep.id) + '" title="Delete reply">' + TRASH_SVG + '</button>'
+          + '</span>'
+        : '';
+      return '<div class="ac-reply" data-rid="' + esc(rep.id) + '">'
         + '<span class="ac-reply-avatar" style="background:' + avatarColor(rep.author) + '">'
         + esc(initials(rep.author)) + '</span>'
         + '<div class="ac-reply-body"><div class="ac-reply-head">'
         + '<span class="ac-reply-name">' + esc(displayName(rep.author)) + '</span> '
-        + esc(timeAgo(rep.created_at)) + '</div>'
+        + esc(timeAgo(rep.created_at)) + editedMark(rep.edited_at) + repActions + '</div>'
         + '<div class="ac-reply-txt">' + esc(rep.text) + '</div></div></div>';
     }).join('');
     var repliesHtml = replies ? '<div class="ac-replies">' + replies + '</div>' : '';
@@ -286,12 +326,16 @@ LAYER_JS = r"""
         + CHECK_SVG + '<span>Resolve</span></button>'
         + '<button class="ac-pill ac-status" data-to="dismissed">Dismiss</button>';
     }
+    var ownerActions = isMine(c)
+      ? '<button class="ac-mini ac-edit-root" title="Edit comment">' + EDIT_SVG + '</button>'
+        + '<button class="ac-mini ac-danger ac-del-root" title="Delete thread">' + TRASH_SVG + '</button>'
+      : '';
     p.innerHTML = '<div class="ac-top"><div class="ac-author">'
       + '<span class="ac-avatar" style="background:' + avatarColor(c.author) + '">'
       + esc(initials(c.author)) + '</span>'
-      + '<div style="min-width:0;"><div class="ac-name">' + esc(displayName(c.author)) + '</div>'
+      + '<div style="min-width:0;"><div class="ac-name">' + esc(displayName(c.author)) + editedMark(c.edited_at) + '</div>'
       + '<div class="ac-time">' + esc(timeAgo(c.created_at)) + '</div></div></div>'
-      + '<div class="ac-actions">' + actions + '</div></div>'
+      + '<div class="ac-actions">' + ownerActions + actions + '</div></div>'
       + '<div class="ac-ctext">' + esc(c.text) + '</div>'
       + repliesHtml
       + '<div class="ac-reply-row">'
@@ -302,6 +346,25 @@ LAYER_JS = r"""
     p.querySelector('.ac-cancel').onclick = closePop;
     Array.prototype.forEach.call(p.querySelectorAll('.ac-status'), function(btn){
       btn.onclick = function(){ send({type: 'status', id: c.id, status: btn.getAttribute('data-to')}); closePop(); };
+    });
+    var editRoot = p.querySelector('.ac-edit-root');
+    if (editRoot) editRoot.onclick = function(){ openEditRoot(c, r); };
+    var delRoot = p.querySelector('.ac-del-root');
+    if (delRoot) delRoot.onclick = function(){
+      if (window.confirm('Удалить эту цепочку комментариев?')) { send({type: 'delete', id: c.id}); closePop(); }
+    };
+    Array.prototype.forEach.call(p.querySelectorAll('.ac-edit-reply'), function(btn){
+      btn.onclick = function(){
+        var rid = btn.getAttribute('data-rid');
+        var rep = (c.replies || []).filter(function(x){ return String(x.id) === String(rid); })[0];
+        if (rep) openEditReply(c, rep, r);
+      };
+    });
+    Array.prototype.forEach.call(p.querySelectorAll('.ac-del-reply'), function(btn){
+      btn.onclick = function(){
+        var rid = btn.getAttribute('data-rid');
+        if (window.confirm('Удалить этот комментарий?')) { send({type: 'delete-reply', id: c.id, replyId: rid}); closePop(); }
+      };
     });
     function submit(){
       var text = (input.value || '').trim(); if (!text) return;
@@ -314,6 +377,36 @@ LAYER_JS = r"""
       if (e.key === 'Enter') { e.preventDefault(); submit(); } });
     input.focus();
   }
+
+  // Shared inline editor popover for root/reply edits: a prefilled textarea with
+  // Save/Cancel that posts `evt` (with `text`) to the parent.
+  function openEditor(r, initial, evt){
+    var p = popUnderMarker(r);
+    p.innerHTML = '<textarea class="ac-edit-ta"></textarea>'
+      + '<div class="ac-row"><span class="ac-hint">⌘↵ to save</span>'
+      + '<button class="ac-text-btn ac-cancel">Cancel</button>'
+      + '<button class="ac-text-btn ac-primary ac-save">Save</button></div>';
+    var ta = p.querySelector('.ac-edit-ta');
+    var saveBtn = p.querySelector('.ac-save');
+    ta.value = initial || '';
+    saveBtn.disabled = !ta.value.trim();
+    ta.addEventListener('input', function(){ saveBtn.disabled = !ta.value.trim(); });
+    ta.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveBtn.click(); }
+    });
+    ta.focus();
+    p.querySelector('.ac-cancel').onclick = closePop;
+    saveBtn.onclick = function(){
+      var text = ta.value.trim(); if (!text) return;
+      // No-op edit: don't bump edited_at / show "(edited)" for an unchanged save.
+      if (text === String(initial || '').trim()) { closePop(); return; }
+      evt.text = text;
+      send(evt);
+      closePop();
+    };
+  }
+  function openEditRoot(c, r){ openEditor(r, c.text, {type: 'edit', id: c.id}); }
+  function openEditReply(c, rep, r){ openEditor(r, rep.text, {type: 'edit-reply', id: c.id, replyId: rep.id}); }
 
   function setMode(on){
     mode = on;
@@ -374,6 +467,7 @@ LAYER_JS = r"""
     if (d.source !== 'anton-comments') return;
     if (d.type === 'list') {
       comments = Array.isArray(d.comments) ? d.comments : [];
+      if ('viewer' in d) viewer = d.viewer || null;
       placeMarkers();
       send({type:'count', count: comments.length});
     }
