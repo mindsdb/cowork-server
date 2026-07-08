@@ -928,3 +928,42 @@ def test_binding_instructions_roundtrip():
             assert row["instructions"] == "Be brief."
 
     asyncio.run(flow())
+
+
+def test_telegram_identity_fetch_runs_on_fresh_boot(monkeypatch):
+    # Regression (PR #177 review): a 0.0 cooldown sentinel with time.monotonic
+    # (which counts from boot) skipped the very first getMe whenever machine
+    # uptime < IDENTITY_RETRY_S — fresh CI VMs and just-provisioned agent
+    # boxes ignored group mentions for their first ~5 minutes.
+    methods: list[str] = []
+
+    async def fake_call(bot_token, method, payload):
+        methods.append(method)
+        return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+    monkeypatch.setattr(telegram_plugin, "time", SimpleNamespace(monotonic=lambda: 120.0))
+
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    ev = asyncio.run(bridge.parse_inbound(
+        body=group_telegram_update(95, -500, 1, "hey @antonbot"), headers={}, route_name=None,
+    ))[0]
+    assert "getMe" in methods
+    assert ev.message.is_mention is True
+
+
+def test_telegram_mention_fallback_requires_username_boundary(monkeypatch):
+    # "@antonbot" must not match a mention aimed at "@antonbotdev".
+    async def fake_call(bot_token, method, payload):
+        return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+
+    async def parse(bridge, body):
+        return (await bridge.parse_inbound(body=body, headers={}, route_name=None))[0]
+
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    ev = asyncio.run(parse(bridge, group_telegram_update(96, -600, 1, "@antonbotdev please help")))
+    assert ev.message.is_mention is False
+    ev = asyncio.run(parse(bridge, group_telegram_update(97, -600, 2, "hey @antonbot, listings?")))
+    assert ev.message.is_mention is True
