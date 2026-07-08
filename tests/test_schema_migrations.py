@@ -1,12 +1,17 @@
 import sqlite3
 
+import pytest
 from sqlalchemy import create_engine, text
 from sqlmodel import SQLModel
 
 from alembic.script import ScriptDirectory
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.migrations import _alembic_config, run_schema_migrations
+from cowork.db.migrations import (
+    DatabaseSchemaAheadError,
+    _alembic_config,
+    run_schema_migrations,
+)
 
 # Import models so SQLModel.metadata can create a pre-Alembic legacy schema.
 import cowork.models.conversation  # noqa: F401
@@ -34,6 +39,12 @@ def _alembic_version(path) -> str:
         return connection.execute("select version_num from alembic_version").fetchone()[0]
 
 
+def _set_alembic_version(path, revision: str) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("update alembic_version set version_num = ?", (revision,))
+        connection.commit()
+
+
 def expected_head() -> str:
     # Resolve the head from the script directory so new migrations don't
     # require updating a hardcoded revision here.
@@ -52,6 +63,43 @@ def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
 
     assert "harness" in _message_columns(db_path)
     assert _alembic_version(db_path) == expected_head()
+
+
+def test_schema_migrations_rerun_on_up_to_date_database_is_noop(tmp_path, monkeypatch):
+    # A database already at head must upgrade cleanly a second time (no raise).
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "current.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    run_schema_migrations(engine, uri)
+    run_schema_migrations(engine, uri)  # should not raise
+
+    assert _alembic_version(db_path) == expected_head()
+
+
+def test_schema_migrations_rejects_database_from_newer_build(tmp_path, monkeypatch):
+    # Simulate ENG-324: a newer app stamped the DB at a revision this build
+    # doesn't ship. The guard must raise a legible error instead of letting
+    # Alembic fail deep inside upgrade with "Can't locate revision".
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "ahead.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    run_schema_migrations(engine, uri)
+    _set_alembic_version(db_path, "ffffffffffff_from_the_future")
+
+    with pytest.raises(DatabaseSchemaAheadError) as excinfo:
+        run_schema_migrations(engine, uri)
+
+    assert "ffffffffffff_from_the_future" in str(excinfo.value)
+    # The DB is left untouched — still stamped at the future revision.
+    assert _alembic_version(db_path) == "ffffffffffff_from_the_future"
 
 
 def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
