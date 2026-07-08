@@ -7,6 +7,7 @@ from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     PLANNING_MODEL_DEFAULTS,
     Settings,
+    default_minds_url,
     get_app_settings,
 )
 
@@ -23,8 +24,15 @@ class Provider(str, Enum):
         return PROVIDER_LABELS[self]
 
     @property
-    def api_key_field(self) -> str:
-        return _PROVIDER_KEY_FIELDS[self]
+    def ui_value(self) -> str:
+        """Provider id as exposed to the UI / anton (dashes, not underscores).
+
+        Single source for the ``value.replace("_", "-")`` normalization that was
+        otherwise reinvented at every provider boundary (provider_base_url,
+        _resolve_coding, the hermes harness, the AntonSettings bridge). A future
+        provider name can't normalize correctly in one place and wrong in
+        another — the latter silently routes to AnthropicProvider."""
+        return self.value.replace("_", "-")
 
 
 PROVIDER_LABELS: dict["Provider", str] = {
@@ -38,10 +46,69 @@ PROVIDER_LABELS: dict["Provider", str] = {
 _PROVIDER_KEY_FIELDS: dict["Provider", str] = {
     Provider.ANTHROPIC: "anthropic_api_key",
     Provider.OPENAI: "openai_api_key",
-    Provider.GEMINI: "openai_api_key",
-    Provider.OPENAI_COMPATIBLE: "openai_api_key",
+    Provider.GEMINI: "gemini_api_key",
+    Provider.OPENAI_COMPATIBLE: "openai_compatible_api_key",
     Provider.MINDS_CLOUD: "minds_api_key",
 }
+
+# gemini and openai-compatible historically shared the single openai_api_key
+# slot (alongside openai), which meant configuring one could overwrite/misroute
+# another provider's key. They now have dedicated slots, but we fall back to the
+# shared openai_api_key when a dedicated slot is empty so existing single-key
+# configs keep working with no migration; isolation kicks in once a distinct key
+# is set in the new field.
+_SHARED_KEY_FALLBACK_FIELDS = frozenset({"gemini_api_key", "openai_compatible_api_key"})
+
+
+def provider_api_key(settings: "UserSettings", provider: "Provider"):
+    """Resolve a provider's API key from its dedicated slot.
+
+    Returns the SecretStr in the provider's own key field; for gemini /
+    openai-compatible, falls back to the shared ``openai_api_key`` when their
+    dedicated slot is unset (backward compatibility — see above). Returns None
+    when nothing is configured.
+    """
+    field = _PROVIDER_KEY_FIELDS[provider]
+    val = getattr(settings, field, None)
+    if val is None and field in _SHARED_KEY_FALLBACK_FIELDS:
+        return settings.openai_api_key
+    return val
+
+
+def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
+    """``provider_api_key`` as a plain unmasked string ('' when unset).
+
+    Most call sites (key reveal, the Test button, hermes env sync, the OC model
+    overlay) just need the raw value to hand to a client. Folding the
+    ``SecretStr → str`` unwrap into one helper removes the per-site inline
+    imports and the subtly different empty-handling variants that had drifted
+    across reveal_key / resolve_stored_key / recommended_models / hermes."""
+    val = provider_api_key(settings, provider)
+    return val.get_secret_value() if isinstance(val, SecretStr) else ""
+
+
+def _resolved_model(
+    resolved_provider: "Provider",
+    preferred_provider: "Provider",
+    user_model: str | None,
+    defaults: dict[str, str],
+) -> str | None:
+    """Resolve a role's model given the readiness resolver's provider switch.
+
+    The single load-bearing rule, shared by resolved_planning_model and
+    resolved_coding_model so it can't drift between the two:
+
+      - provider NOT switched → keep the user's chosen model.
+      - provider switched → use the resolved provider's canonical default.
+        NEVER fall back to the original provider's model — that would hand e.g.
+        a Claude id to an openai-compatible / MindsHub endpoint (misrouting).
+      - resolved provider has no canonical default (openai-compatible) → None,
+        so config_status's model gate reports "select a model" rather than
+        silently running a wrong model.
+    """
+    if resolved_provider == preferred_provider:
+        return user_model
+    return defaults.get(resolved_provider.value)
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
 UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
@@ -95,13 +162,25 @@ class UserSettings(Settings):
         title="OpenAI API Key",
         description="API key for OpenAI models. Required if not using Anthropic.",
     )
+    gemini_api_key: SecretStr | None = Field(
+        default=None,
+        title="Gemini API Key",
+        description="API key for Google Gemini (via its OpenAI-compatible endpoint). "
+        "Falls back to the OpenAI key slot when unset.",
+    )
+    openai_compatible_api_key: SecretStr | None = Field(
+        default=None,
+        title="OpenAI-compatible API Key",
+        description="API key for a custom OpenAI-compatible endpoint. "
+        "Falls back to the OpenAI key slot when unset.",
+    )
     minds_api_key: SecretStr | None = Field(
         default=None,
         title="MindsHub API Key",
         description="API key for MindsHub. Required if using MindsHub as a provider.",
     )
     minds_url: str = Field(
-        default="https://api.mindshub.ai/v1",
+        default_factory=default_minds_url,
         title="MindsHub URL",
         description="Base URL for the MindsHub API.",
     )
@@ -219,9 +298,9 @@ class UserSettings(Settings):
         description="How UI updates are applied (manual or auto).",
     )
     publish_url: str = Field(
-        default="https://4nton.ai",
+        default="",
         title="Publish URL",
-        description="URL for publishing artifacts.",
+        description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
     openai_base_url: str = Field(
         default="",
@@ -243,6 +322,16 @@ class UserSettings(Settings):
         title="Providers",
         description="JSON-encoded list of configured provider entries for the settings UI.",
     )
+    provider_status: str = Field(
+        default="{}",
+        title="Provider Status",
+        description="JSON-encoded map of provider type → last connectivity-test status (ok|fail). Persisted so the Settings dots survive a reload.",
+    )
+    provider_status_details: str = Field(
+        default="{}",
+        title="Provider Status Details",
+        description="JSON-encoded map of provider type → last connectivity-test detail (e.g. an HTTP code).",
+    )
 
     @field_validator("harness")
     @classmethod
@@ -261,19 +350,112 @@ class UserSettings(Settings):
             self.coding_model = CODING_MODEL_DEFAULTS.get(self.coding_provider.value)
         return self
 
+    def _has_key(self, p: Provider) -> bool:
+        # provider_api_key applies the gemini/openai-compatible → shared-openai
+        # fallback, so a provider configured via EITHER its dedicated slot or the
+        # legacy shared slot is correctly seen as keyed. (Raw getattr on the
+        # dedicated slot would miss a gemini/oc user on the shared key.)
+        return provider_api_key(self, p) is not None
+
+    def _resolve_provider(self, preferred: Provider) -> Provider:
+        """The provider actually usable for `preferred`: itself if its key is
+        set, otherwise the first configured provider (managed MindsHub first).
+
+        Mirrors the client's ``defaultModeProviderType`` so the readiness gate
+        (``config_status``, surfaced at ``/health`` as ``config_ready`` — the
+        signal the frontend's chat gate AND onboarding-vs-app routing read) and
+        the agent's LLM client (``build_llm_client``) agree on what "configured"
+        means — adding any key takes effect even if the stored
+        ``planning_provider`` still points at a keyless provider. Returns
+        ``preferred`` unchanged when nothing is configured."""
+        if self._has_key(preferred):
+            return preferred
+        # Probe ALL providers (incl. gemini / openai-compatible, which have
+        # dedicated key slots since the isolation change) — not just the legacy
+        # minds/anthropic/openai trio — so a user who configured only a gemini
+        # or openai-compatible key still resolves to a usable provider.
+        for p in (
+            Provider.MINDS_CLOUD,
+            Provider.ANTHROPIC,
+            Provider.OPENAI,
+            Provider.GEMINI,
+            Provider.OPENAI_COMPATIBLE,
+        ):
+            if self._has_key(p):
+                return p
+        return preferred
+
+    @property
+    def resolved_planning_provider(self) -> Provider:
+        return self._resolve_provider(self.planning_provider)
+
+    @property
+    def resolved_coding_provider(self) -> Provider:
+        return self._resolve_provider(self.coding_provider)
+
+    @property
+    def resolved_planning_model(self) -> str | None:
+        return _resolved_model(
+            self.resolved_planning_provider,
+            self.planning_provider,
+            self.planning_model,
+            PLANNING_MODEL_DEFAULTS,
+        )
+
+    @property
+    def resolved_coding_model(self) -> str | None:
+        return _resolved_model(
+            self.resolved_coding_provider,
+            self.coding_provider,
+            self.coding_model,
+            CODING_MODEL_DEFAULTS,
+        )
+
     @property
     def config_status(self) -> dict[str, Any]:
-        """Whether the active planning provider has an API key configured."""
-        p = self.planning_provider
-        key_field = p.api_key_field
-        has_key = getattr(self, key_field, None) is not None
+        """Whether a usable provider is configured.
+
+        Resolves the active planning provider to the first one that actually
+        has a key (see ``_resolve_provider``) so this readiness signal matches
+        what ``build_llm_client`` will actually run with — and reads the key via
+        ``provider_api_key`` so gemini/openai-compatible still count when relying
+        on the shared openai_api_key fallback."""
+        p = self.resolved_planning_provider
+        has_key = provider_api_key(self, p) is not None
+        # Also require resolvable models. build_llm_client builds BOTH roles and
+        # hands resolved_planning_model AND resolved_coding_model to the
+        # providers; openai-compatible has no canonical default, so either role
+        # can resolve to None and throw at runtime despite reading as "ready".
+        # Gate on both so config_ready ⟹ the client can actually run.
+        planning_model = self.resolved_planning_model
+        coding_model = self.resolved_coding_model
+        # openai-compatible needs a base URL. provider_base_url returns None for
+        # an empty one (it must NOT silently fall back to api.openai.com — that
+        # would leak the BYO key to OpenAI), so build_llm_client would hand the
+        # key to the SDK's default host. Surface the misconfig instead. Checked
+        # for whichever role actually resolves to openai-compatible.
+        oc = Provider.OPENAI_COMPATIBLE
+        needs_base = oc in (p, self.resolved_coding_provider)
+        has_base = bool(self.openai_base_url) if needs_base else True
         label = p.label
+        if not has_key:
+            error = f"Configure an API key for {label}."
+        elif not planning_model:
+            error = f"Select a model for {label}."
+        elif not coding_model:
+            error = f"Select a coding model for {self.resolved_coding_provider.label}."
+        elif not has_base:
+            error = f"Set a base URL for {oc.label}."
+        else:
+            error = None
         return {
-            "config_ready": has_key,
-            "config_error": None if has_key else f"Configure {key_field} for {label}.",
+            "config_ready": (
+                has_key and has_base and bool(planning_model) and bool(coding_model)
+            ),
+            "config_error": error,
             "provider": p.value,
             "provider_label": label,
-            "model": self.planning_model or "",
+            "model": planning_model or "",
         }
 
     @staticmethod

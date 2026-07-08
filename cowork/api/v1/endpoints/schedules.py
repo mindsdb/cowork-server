@@ -92,11 +92,6 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: B
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    # Create the conversation eagerly so we can mark it in-flight
-    # *before* the background task starts. This closes the race where
-    # the client sees the new conversation, polls /in-flight-list,
-    # doesn't find it yet, and injects a "got interrupted" prompt.
-    from cowork.api.v1.endpoints.responses import mark_stream_active
     from cowork.scheduler import execute_schedule
     from cowork.services.conversations import ConversationService
 
@@ -104,7 +99,6 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: B
         topic=schedule.title,
         project_id=schedule.project_id,
     )
-    mark_stream_active(str(conversation.id))
 
     background_tasks.add_task(
         execute_schedule, schedule_id, is_manual=True,

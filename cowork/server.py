@@ -5,43 +5,27 @@ This module sets up the FastAPI application with middleware, routing,
 and all necessary configurations for the Cowork service.
 """
 
-import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.router import api_router as v1_router
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
 from cowork.common.logger import setup_logging
-from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
-from cowork.services.connectors.oauth.google import google_service
 
 
 # Set up logging
 logger = setup_logging()
 
 
-async def _token_refresh_loop() -> None:
-    while True:
-        await asyncio.sleep(30 * 60)
-        logger.info("Running Google token refresh check")
-        try:
-            google_service.refresh_all_tokens(ConnectorSettings(), OAuthSettings())
-        except Exception:
-            logger.exception("Token refresh loop error")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        token_refresh_task = asyncio.create_task(_token_refresh_loop())
-    except Exception:
-        logger.exception("Failed to start token refresh loop")
-        token_refresh_task = None
     run_dev_setup()
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
@@ -76,6 +60,31 @@ async def lifespan(app: FastAPI):
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
+
+
+class _NoStoreMiddleware:
+    """Stamp ``Cache-Control: no-store`` on responses under the given path
+    prefixes so API keys those responses carry are never written to a client's
+    on-disk HTTP cache — e.g. Electron's Cache_Data, where plaintext keys were
+    found lingering (ENG-462). Pure ASGI (not BaseHTTPMiddleware) so it never
+    buffers or breaks the SSE streams.
+    """
+
+    def __init__(self, app, prefixes: tuple[str, ...]) -> None:
+        self.app = app
+        self.prefixes = prefixes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith(self.prefixes):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_no_store(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(raw=message["headers"])["Cache-Control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, send_with_no_store)
 
 
 def create_app() -> FastAPI:
@@ -129,6 +138,14 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
         max_age=3600,
     )
+
+    # Keep secret-bearing settings responses (reveal-key, raw .env, the
+    # providers list) out of clients' on-disk HTTP caches (ENG-462). The chat
+    # and submission SSE streams set no-store at their own routes. OAuth is
+    # swept in too: GET .../oauth/{engine}/credentials returns a raw
+    # client_secret and, being a plain GET with no explicit cache directive,
+    # is cacheable by default wherever it's fetched from.
+    app.add_middleware(_NoStoreMiddleware, prefixes=("/api/v1/settings", "/api/v1/connectors/oauth"))
 
     # Include v1 API routes
     app.include_router(v1_router)

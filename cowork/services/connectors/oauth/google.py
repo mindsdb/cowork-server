@@ -39,15 +39,6 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
 _ENGINE_TO_SERVICE: dict[str, str] = {cfg.engine: svc for svc, cfg in GOOGLE_SERVICES.items()}
 
-_VERIFY_URLS: dict[str, str] = {
-    "google-drive":     "https://www.googleapis.com/drive/v3/about?fields=user",
-    "gmail":            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
-    "google-calendar":  "https://www.googleapis.com/calendar/v3/colors",
-    "google-ads":       "https://www.googleapis.com/oauth2/v3/userinfo",
-    "google-analytics": "https://www.googleapis.com/oauth2/v3/userinfo",
-}
-
-
 class GoogleOAuthService:
     def _resolve_credentials(self, service: str, settings: OAuthSettings) -> tuple[str, str]:
         id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
@@ -197,8 +188,6 @@ class GoogleOAuthService:
             account_name = str(userinfo.get("name", "")).strip()
             connection_name = account_email or cfg.engine
 
-            self.verify_connection(service, access_token)
-
             expires_in = int(token_data.get("expires_in", 0) or 0)
             expires_at = (
                 (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
@@ -285,76 +274,6 @@ class GoogleOAuthService:
         except Exception as exc:
             _log.warning("Could not revoke Google token for %s/%s: %s", engine, name, exc)
 
-    def refresh_all_tokens(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> None:
-        try:
-            vault = LocalDataVault(Path(connector_settings.vault_dir))
-            all_connections = vault.list_connections() or []
-        except Exception:
-            return
-
-        now = datetime.now(timezone.utc)
-        threshold = now + timedelta(minutes=10)
-
-        for item in all_connections:
-            engine = item.get("engine", "")
-            name = item.get("name", "")
-            if engine not in _ENGINE_TO_SERVICE or not name:
-                continue
-            try:
-                fields = vault.load(engine, name) or {}
-            except Exception:
-                continue
-            if fields.get("auth_type") != "oauth":
-                continue
-            refresh_token = fields.get("refresh_token", "").strip()
-            if not refresh_token:
-                continue
-
-            expires_at_str = fields.get("expires_at", "").strip()
-            if expires_at_str:
-                try:
-                    expires_dt = datetime.fromisoformat(expires_at_str)
-                    if expires_dt.tzinfo is None:
-                        expires_dt = expires_dt.replace(tzinfo=timezone.utc)
-                    if expires_dt > threshold:
-                        continue
-                except ValueError:
-                    pass
-
-            service_id = _ENGINE_TO_SERVICE[engine]
-            try:
-                cid, csecret = self._resolve_credentials(service_id, oauth_settings)
-            except HTTPException:
-                continue
-
-            try:
-                token_data = _json_request(
-                    _GOOGLE_TOKEN_ENDPOINT,
-                    method="POST",
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": cid,
-                        "client_secret": csecret,
-                    },
-                )
-                new_access_token = str(token_data.get("access_token", "")).strip()
-                if not new_access_token:
-                    continue
-                expires_in = int(token_data.get("expires_in", 0) or 0)
-                new_expires_at = (
-                    (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
-                    if expires_in else ""
-                )
-                updated = {**fields, "access_token": new_access_token, "expires_at": new_expires_at}
-                new_refresh = str(token_data.get("refresh_token", "")).strip()
-                if new_refresh:
-                    updated["refresh_token"] = new_refresh
-                vault.save(engine, name, updated)
-                _log.info("Refreshed token for %s/%s", engine, name)
-            except Exception as exc:
-                _log.warning("Could not refresh token for %s/%s: %s", engine, name, exc)
-
     def get_catalogue(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> list[dict]:
         try:
             vault = LocalDataVault(Path(connector_settings.vault_dir))
@@ -430,18 +349,6 @@ class GoogleOAuthService:
             _GOOGLE_USERINFO_ENDPOINT,
             headers={"Authorization": f"Bearer {access_token}"},
         )
-
-    def verify_connection(self, connector_id_or_service: str, access_token: str) -> None:
-        """Make a lightweight API call to confirm the token works before vault save.
-        Accepts either an engine name (e.g. 'google_drive') or a service id
-        (e.g. 'google-drive') — maps engine names via _ENGINE_TO_SERVICE.
-        Raises HTTPException(502) on failure. No-ops for services not in _VERIFY_URLS."""
-        service = _ENGINE_TO_SERVICE.get(connector_id_or_service, connector_id_or_service)
-        url = _VERIFY_URLS.get(service)
-        if url is None:
-            return
-        _json_request(url, headers={"Authorization": f"Bearer {access_token}"})
-
 
 def _json_request(
     url: str,

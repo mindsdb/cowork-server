@@ -26,9 +26,12 @@ from cowork.schemas.responses import (
     Role,
 )
 from cowork.handlers.turn_errors import (
+    AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
+    auth_error_detail,
     friendly_turn_error,
+    response_failed_payload,
     response_failed_sse,
 )
 from cowork.services.conversations import ConversationService
@@ -50,7 +53,6 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
-        await self.harness.sync_skills(SkillService(self.session).list_skills())
 
         conversation_service = ConversationService(self.session)
         project_id = self._resolve_project_id(request)
@@ -129,6 +131,8 @@ class ResponsesHandler:
                     harness_name=get_user_settings().harness,
                     harness_id=getattr(self.harness, "id", None),
                     buffer=buffer,
+                    trace_tags=request.trace_tags,
+                    trace_metadata=request.trace_metadata,
                 ),
             )
             return sse_from_buffer(buffer, 0)
@@ -149,6 +153,8 @@ class ResponsesHandler:
             conversation=conversation,
             input=harness_input,
             disabled_connections=disabled,
+            trace_tags=request.trace_tags,
+            trace_metadata=request.trace_metadata,
         )
         return await self._collect(stream, conversation.id, request.model, str(user_message.id))
 
@@ -163,6 +169,8 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -200,6 +208,7 @@ class ResponsesHandler:
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,
+                trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):
@@ -210,9 +219,8 @@ class ResponsesHandler:
             persist()
             await buffer.close("completed")
         except asyncio.CancelledError:
-            # Explicit /cancel (Stop button). Buffer writes are synchronous
-            # for the file backend, so they complete despite cancellation.
-            await buffer.append("sse", {"sse": response_failed_sse("Stopped by user.", "cancelled")})
+            # Nothing special is emitted on cancellation.
+            # The partial text and evennts generated before cancellation are persisted.
             persist()
             await buffer.close("cancelled")
             return
@@ -224,7 +232,27 @@ class ResponsesHandler:
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
-            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            # For an auth failure, tell the client which provider failed so it
+            # offers the right action: "Reconnect" only for MindsHub (we can
+            # re-provision the key in place), "Open Settings" for a BYOK key the
+            # user owns. Without this the renderer would always say "Reconnect
+            # MindsHub" — wrong for BYOK users.
+            extra: dict = {}
+            if code == AUTH_ERROR_CODE:
+                # Resolving the provider must never break the error handler —
+                # if it raises we just fall back to the generic auth message
+                # (no reconnectable flag), so the stream still closes cleanly.
+                try:
+                    from cowork.common.settings.user_settings import Provider
+                    provider = get_user_settings().resolved_planning_provider
+                    reconnectable = provider == Provider.MINDS_CLOUD
+                    message = auth_error_detail(provider.label, reconnectable)
+                    extra = {"reconnectable": reconnectable, "provider_label": provider.label}
+                except Exception:
+                    logger.exception("[responses] could not resolve provider for auth error")
+            failed = response_failed_payload(message, code, **extra)
+            await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
+            collected_events.append(failed)
             persist()
             await buffer.close("error")
         finally:
