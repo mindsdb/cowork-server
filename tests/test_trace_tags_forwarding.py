@@ -40,7 +40,7 @@ def _run_harness(monkeypatch, session):
     monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", lambda *_a, **_k: set())
     monkeypatch.setattr(task_objects, "finalize_turn_artifacts", lambda *_a, **_k: [])
 
-    async def _fake_build(self, conversation, disabled_connections):
+    async def _fake_build(self, conversation, disabled_connections, channel_context=None):
         return session, None
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
