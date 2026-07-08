@@ -1,5 +1,6 @@
 """Schema migration helpers."""
 
+import logging
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -9,9 +10,7 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy.engine import Engine
 
-from cowork.common.logger import setup_logging
-
-logger = setup_logging()
+logger = logging.getLogger(__name__)
 
 
 class DatabaseSchemaAheadError(RuntimeError):
