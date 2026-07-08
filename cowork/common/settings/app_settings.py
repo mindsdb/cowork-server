@@ -2,7 +2,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -252,6 +252,56 @@ class AppSettings(Settings):
         description="The host to run the server on",
     )
 
+    # Port the Vite renderer dev server listens on — included in the default
+    # CORS allowed origins so `make dev` / `make watch` work out of the box.
+    renderer_port: int = Field(
+        default=5173,
+        validation_alias=AliasChoices("COWORK_RENDERER_PORT", "VITE_RENDERER_PORT"),
+        description="Vite dev server port (used to build default CORS allowed origins).",
+    )
+
+    # CORS allowed origins.  When empty the validator below fills in localhost
+    # on both configured ports.  Packaged Electron loads from file:// with
+    # webSecurity:false so no Origin header is sent — not needed here.
+    # Override for cloud/VPC:  COWORK_ALLOWED_ORIGINS='["https://app.example.com"]'
+    # Use ["*"] only when an ingress controller enforces origin filtering upstream.
+    allowed_origins: list[str] = Field(
+        default=[],
+        validation_alias=AliasChoices("COWORK_ALLOWED_ORIGINS"),
+        description=(
+            "CORS allowed origins (JSON array). "
+            "Defaults to localhost on COWORK_SERVER_PORT and COWORK_RENDERER_PORT."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _default_allowed_origins(self) -> "AppSettings":
+        if not self.allowed_origins:
+            self.allowed_origins = [
+                f"http://localhost:{self.port}",
+                f"http://127.0.0.1:{self.port}",
+                f"http://localhost:{self.renderer_port}",
+                f"http://127.0.0.1:{self.renderer_port}",
+            ]
+        return self
+
+    require_auth: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_REQUIRE_AUTH"),
+        description=(
+            "Require a bearer token on all API requests (except /health). "
+            "Set COWORK_AUTH_TOKEN to a fixed token, or leave it empty to "
+            "auto-generate one on first startup (written back to ~/.cowork/.env)."
+        ),
+    )
+    auth_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_AUTH_TOKEN"),
+        description=(
+            "Bearer token clients must send as 'Authorization: Bearer <token>'. "
+            "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
+        ),
+    )
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(
