@@ -48,6 +48,11 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
         else "a one-on-one direct chat"
     )
     name = f" ({channel.display_name})" if channel.display_name else ""
+    operator = (
+        f"\nOperator instructions for this chat:\n{channel.instructions.strip()}\n"
+        if channel.instructions and channel.instructions.strip()
+        else ""
+    )
     return (
         f"You are replying inside {setting}{name} on {channel.channel_type} — a live "
         "messaging conversation, not the Anton CoWork desktop UI. Act as a concise, "
@@ -63,6 +68,7 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
         "- Files you create as artifacts are sent into this chat automatically right after "
         "your reply — tell the user you're sending the file rather than describing where it "
         "lives.\n"
+        f"{operator}"
     )
 
 
