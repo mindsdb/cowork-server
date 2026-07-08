@@ -63,9 +63,14 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
         "- If a request is ambiguous, ask one short clarifying question instead of guessing.\n"
         "- Do not narrate internal work (\"let me check\", \"I'll query\"), and never mention "
         "the scratchpad, tools, internal file paths, or the desktop UI.\n"
-        "- Several people can read your replies in a group — keep them professional and "
-        "self-contained.\n"
-        "- Files you create as artifacts are sent into this chat automatically right after "
+        + (
+            "- Several people can read your replies — keep them professional and "
+            "self-contained.\n"
+            "- Incoming messages are prefixed with the sender's name — use it to "
+            "address the person who asked.\n"
+            if channel.is_group else ""
+        )
+        + "- Files you create as artifacts are sent into this chat automatically right after "
         "your reply — tell the user you're sending the file rather than describing where it "
         "lives.\n"
         f"{operator}"
