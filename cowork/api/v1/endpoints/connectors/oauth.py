@@ -31,7 +31,10 @@ def get_oauth_credentials(engine: str):
     client_secret = getattr(settings, secret_attr, "")
     if not client_id or not client_secret:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"OAuth credentials not configured for {engine!r}.")
-    return {"client_id": client_id, "client_secret": client_secret}
+    response = {"client_id": client_id, "client_secret": client_secret}
+    if engine == "google_drive" and settings.google_picker_api_key:
+        response["picker_api_key"] = settings.google_picker_api_key
+    return response
 
 
 @router.get("/catalogue")

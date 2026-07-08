@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.common.settings.app_settings import ConnectorSettings
@@ -102,6 +104,43 @@ class ConnectionsService:
         fields.update(updates)
         vault.save(engine, name, fields, secure_keys=secure_keys)
         return True
+
+    def merge_picked_files(self, engine: str, name: str, files: list[dict]) -> list[dict] | None:
+        """Merge newly Google-Picker-granted files into the connection's
+        persisted `picked_files` list (deduped by id, new entries win on
+        conflict), and store it back as a JSON string field.
+
+        Storing it as a vault field (not a side table) means it flows
+        through the existing `inject_env` namespacing for free — the
+        agent sees it as DS_<ENGINE>_<NAME>__PICKED_FILES alongside the
+        connection's other credentials, without any extra plumbing.
+
+        Returns the merged list, or None if the connection doesn't exist.
+        """
+        vault = self._vault()
+        if hasattr(vault, "read_record"):
+            record = vault.read_record(engine, name)
+        else:
+            raw = vault.load(engine, name)
+            record = {"engine": engine, "name": name, "fields": raw} if raw is not None else None
+        if record is None:
+            return None
+
+        fields = dict(record.get("fields") or {})
+        secure_keys = record.get("secure_keys")
+        try:
+            existing = json.loads(fields.get("picked_files") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            existing = []
+
+        by_id = {f["id"]: f for f in existing if isinstance(f, dict) and "id" in f}
+        for f in files:
+            by_id[f["id"]] = f
+        merged = list(by_id.values())
+
+        fields["picked_files"] = json.dumps(merged)
+        vault.save(engine, name, fields, secure_keys=secure_keys)
+        return merged
 
     def delete(self, engine: str, name: str) -> bool:
         return self._vault().delete(engine, name)
