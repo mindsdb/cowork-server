@@ -28,8 +28,8 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import AsyncIterator, Iterator
 
 from cowork.streaming.records import (
     REASON_TO_TYPE,

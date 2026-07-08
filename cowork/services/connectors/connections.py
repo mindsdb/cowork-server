@@ -6,6 +6,8 @@ from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
+)
+from cowork.services.connectors.identity import (
     connection_display_name,
 )
 from cowork.services.connectors.specs._registry import registry
@@ -14,6 +16,7 @@ from cowork.services.connectors.specs._registry import registry
 class ConnectionsService:
     def _vault(self):
         from pathlib import Path
+
         from anton.core.datasources.data_vault import LocalDataVault
         return LocalDataVault(Path(ConnectorSettings().vault_dir))
 

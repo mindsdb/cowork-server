@@ -11,16 +11,14 @@ import mimetypes
 import os
 from pathlib import Path
 from typing import Annotated, Any
-from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.db.session import get_session
 from cowork.services.projects import ProjectService
-
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

@@ -6,7 +6,7 @@ import json
 import logging
 import mimetypes
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -142,9 +142,9 @@ class WhatsAppBridge:
         if (not text and not attachments) or not sender or not message_id:
             return None
         try:
-            timestamp = datetime.fromtimestamp(int(msg.get("timestamp", "")), timezone.utc)
+            timestamp = datetime.fromtimestamp(int(msg.get("timestamp", "")), UTC)
         except (TypeError, ValueError):
-            timestamp = datetime.now(timezone.utc)
+            timestamp = datetime.now(UTC)
         self._last_inbound[sender] = timestamp
         event = InboundEvent(
             address=PlatformAddress(channel_type=CHANNEL_TYPE, platform_id=sender, thread_id=None),
@@ -264,7 +264,7 @@ class WhatsAppBridge:
 
     def require_care_window(self, recipient: str) -> None:
         last = self._last_inbound.get(recipient)
-        if last is None or (datetime.now(timezone.utc) - last) > _CUSTOMER_CARE_WINDOW:
+        if last is None or (datetime.now(UTC) - last) > _CUSTOMER_CARE_WINDOW:
             raise RuntimeError(
                 "whatsapp customer-care window expired for this contact; "
                 "only pre-approved templates can be sent"

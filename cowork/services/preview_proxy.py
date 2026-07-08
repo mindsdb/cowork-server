@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 import httpx
 from starlette.requests import Request
@@ -59,7 +58,7 @@ _CORS_RESPONSE_HEADERS = {
 _UPSTREAM_BLOCKED_REQUEST_HEADERS = {"content-length", "host"}
 
 
-def _read_backend_port(artifact_dir: Path) -> Optional[int]:
+def _read_backend_port(artifact_dir: Path) -> int | None:
     try:
         meta = json.loads((artifact_dir / "metadata.json").read_text(encoding="utf-8"))
     except Exception:

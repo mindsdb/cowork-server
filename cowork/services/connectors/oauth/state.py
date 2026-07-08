@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +72,7 @@ class OAuthStateStore:
     def set_outcome(self, state: str, outcome: dict[str, Any]) -> None:
         data = self._load()
         outcomes = data.setdefault("_outcomes", {})
-        outcomes[state] = {**outcome, "_ts": datetime.now(timezone.utc).isoformat()}
+        outcomes[state] = {**outcome, "_ts": datetime.now(UTC).isoformat()}
         self._save(data)
 
     def get_outcome(self, state: str) -> dict[str, Any] | None:
@@ -82,7 +82,7 @@ class OAuthStateStore:
             return None
         try:
             ts = datetime.fromisoformat(entry["_ts"])
-            if datetime.now(timezone.utc) - ts > _OUTCOME_TTL:
+            if datetime.now(UTC) - ts > _OUTCOME_TTL:
                 self.clear_outcome(state)
                 return None
         except (KeyError, ValueError) as exc:
@@ -98,7 +98,7 @@ class OAuthStateStore:
         data = self._load()
         entry = data.get(service) or {}
         entry["pending"] = {}
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         if error:
             entry["lastError"] = error
             entry["lastErrorAt"] = now

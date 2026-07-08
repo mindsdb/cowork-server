@@ -19,9 +19,8 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
-
 from urllib.parse import quote
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -85,9 +84,12 @@ TEXT_EXTENSIONS = {
 
 def _human_mtime(path: Path) -> str:
     secs = time.time() - path.stat().st_mtime
-    if secs < 60:    return "updated just now"
-    if secs < 3600:  return f"updated {int(secs // 60)}m ago"
-    if secs < 86400: return f"updated {int(secs // 3600)}h ago"
+    if secs < 60:
+        return "updated just now"
+    if secs < 3600:
+        return f"updated {int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"updated {int(secs // 3600)}h ago"
     return f"updated {int(secs // 86400)}d ago"
 
 

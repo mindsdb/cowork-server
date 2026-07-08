@@ -10,7 +10,6 @@ from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
-from cowork.models.skill import Skill
 
 # Redirect all Hermes data (skills, sessions, config) to ~/.cowork/hermes before
 # run_agent is first imported, so its module-level get_hermes_home() call lands here.
@@ -261,8 +260,8 @@ class HermesHarness:
     ) -> dict:
         from pathlib import Path
 
-        from run_agent import AIAgent
         from anton.core.datasources.data_vault import LocalDataVault
+        from run_agent import AIAgent
 
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import (
@@ -270,6 +269,7 @@ class HermesHarness:
             get_user_settings,
             provider_api_key_str,
         )
+        from cowork.harnesses.hermes_harness.memory_adapter import HermesMemoryAdapter
         from cowork.harnesses.hermes_harness.tools import (
             finalize_artifact_run_context,
             register_artifact_tools,
@@ -277,7 +277,6 @@ class HermesHarness:
             register_skill_tools,
             set_artifact_run_context,
         )
-        from cowork.harnesses.hermes_harness.memory_adapter import HermesMemoryAdapter
 
         register_connector_tools()
         register_artifact_tools()
@@ -406,17 +405,17 @@ class HermesHarness:
             if base_url is None and provider == "openai":
                 base_url = "https://api.openai.com/v1"
 
-            kwargs = dict(
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                quiet_mode=True,
-                ephemeral_system_prompt=system_context,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                reasoning_callback=reasoning_callback,
-                thinking_callback=thinking_callback,
-            )
+            kwargs = {
+                "provider": provider,
+                "model": model,
+                "api_key": api_key,
+                "quiet_mode": True,
+                "ephemeral_system_prompt": system_context,
+                "tool_start_callback": tool_start_callback,
+                "tool_complete_callback": tool_complete_callback,
+                "reasoning_callback": reasoning_callback,
+                "thinking_callback": thinking_callback,
+            }
             if base_url:
                 kwargs["base_url"] = base_url
 

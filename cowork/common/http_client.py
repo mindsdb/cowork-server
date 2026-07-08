@@ -8,12 +8,10 @@ in the same UI session. Closed during FastAPI lifespan shutdown.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
 
 import httpx
 
-
-_client: Optional[httpx.AsyncClient] = None
+_client: httpx.AsyncClient | None = None
 _lock = asyncio.Lock()
 
 

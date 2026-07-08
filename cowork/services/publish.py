@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -19,7 +19,6 @@ from urllib.parse import urlparse
 from pydantic import SecretStr
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from cowork.services.artifacts import (
     _artifact_root_for,
@@ -32,6 +31,7 @@ from cowork.services.artifacts import (
     html_artifacts,
     resolve_artifact_path,
 )
+from cowork.services.providers import publish_url_for_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def _secret_str(val: SecretStr | str | None) -> str:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _resolve_publish_target(artifact: Path) -> tuple[Path, Path, str, bool]:

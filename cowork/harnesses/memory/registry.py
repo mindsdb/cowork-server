@@ -5,8 +5,8 @@ These slots have been based on the Anton's memory system.
 When a new harness is onboarded, it's memory mechanim should be mapped to these canonical slots.
 If a particular aspect of a new harness's memory does not adhere to these slots, a new slot can be created.
 """
-from enum import StrEnum
 from dataclasses import dataclass
+from enum import StrEnum
 
 
 class MemorySlot(StrEnum):

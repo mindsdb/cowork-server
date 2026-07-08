@@ -85,7 +85,7 @@ async def drain_background_tasks(*, timeout: float = 3.0) -> None:
         return
     try:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         log.warning("%d channel inbound task(s) did not finish within %.1fs", len(tasks), timeout)
 
 

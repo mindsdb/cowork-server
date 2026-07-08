@@ -5,7 +5,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
@@ -116,12 +116,12 @@ def provider_base_url(
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
 # Cache value: (timestamp, (ids, efforts_map)). ids is None on failure.
-_minds_models_cache: dict[str, tuple[float, tuple[Optional[list[str]], dict[str, dict]]]] = {}
+_minds_models_cache: dict[str, tuple[float, tuple[list[str] | None, dict[str, dict]]]] = {}
 
 
 async def fetch_minds_models(
     minds_url: str, api_key: str
-) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
+) -> tuple[list[str] | None, dict[str, dict], dict[str, bool]]:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
     Returns ``(ids, efforts, enabled)`` where ``ids`` is the model-id list (or
@@ -145,8 +145,8 @@ async def fetch_minds_models(
             return val
 
     def _remember(
-        val: tuple[Optional[list[str]], dict[str, dict], dict[str, bool]],
-    ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
+        val: tuple[list[str] | None, dict[str, dict], dict[str, bool]],
+    ) -> tuple[list[str] | None, dict[str, dict], dict[str, bool]]:
         _minds_models_cache[base] = (time.monotonic(), val)
         return val
 
@@ -408,14 +408,14 @@ def build_llm_client():
     ``output_config``, OpenAI ``reasoning`` / ``reasoning_effort``); None leaves
     the model's own default.
     """
-    from anton.core.llm.client import LLMClient
     from anton.core.llm.anthropic import AnthropicProvider
+    from anton.core.llm.client import LLMClient
     from anton.core.llm.openai import OpenAIProvider
 
     from cowork.common.settings.user_settings import (
+        Provider,
         get_user_settings,
         provider_api_key,
-        Provider,
     )
 
     settings = get_user_settings()

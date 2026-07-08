@@ -23,9 +23,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from pathlib import Path
 from typing import Any
-import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -186,8 +186,8 @@ def build_cowork_publish_tool():
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
     """
-    from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
+    from anton.tools import PUBLISH_TOOL
 
     return ToolDef(
         name=PUBLISH_TOOL.name,
@@ -773,7 +773,7 @@ def build_cowork_label_connection_tool():
 
 
 # Fetch Submission Tool
-# Pulls staged credential values after the user submits. 
+# Pulls staged credential values after the user submits.
 # Anton uses these to test / save the connection, then either
 # presents a new form (with errors) or moves on.
 

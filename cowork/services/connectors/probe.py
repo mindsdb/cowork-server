@@ -14,9 +14,10 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class CredentialProbe:
         self._outcome.follow_up = (tc_input.get("reason") or "").strip()
         self._outcome.method_id = (tc_input.get("method_id") or "").strip() or None
         return "ok"
-    
+
     def _summarize_field_list(self, fields: list, filled_names: set[str], skipped_set: set[str], indent: str = "  ") -> str:
         if not fields:
             return f"{indent}(no fields)"
@@ -263,11 +264,15 @@ class CredentialProbe:
     # ── Main entry point ─────────────────────────────────────────────
 
     async def run(self) -> AsyncIterator[tuple[str, Any]]:
-        from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
         from anton.core.llm.provider import (
-            StreamTextDelta, StreamToolResult,
-            StreamToolUseStart, StreamToolUseEnd, StreamToolUseDelta, StreamComplete,
+            StreamComplete,
+            StreamTextDelta,
+            StreamToolResult,
+            StreamToolUseDelta,
+            StreamToolUseEnd,
+            StreamToolUseStart,
         )
+        from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
         from anton.core.tools.tool_defs import ToolDef
 
         env_path, var_names = self._write_credentials_env()
@@ -489,7 +494,7 @@ class CredentialProbe:
                     evt = await asyncio.wait_for(gen.__anext__(), timeout=remaining)
                 except StopAsyncIteration:
                     break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self._outcome.status = "failure"
                     self._outcome.error = f"Probe timed out after {int(self.timeout_seconds)}s."
                     self._outcome.follow_up = "Try again, or check that the service is reachable."
