@@ -127,15 +127,31 @@ def default_publish_url() -> str:
     return f"https://view.{slug}.mindshub.ai" if slug else "https://view.mindshub.ai"
 
 
+def _env_file_chain() -> list[str]:
+    """The ``.env`` search path (pydantic-settings is "last wins").
+
+    ``<COWORK_HOME>/.env`` is the current global config, with a local ``.env``
+    highest for dev overrides. The legacy ``~/.anton/.env`` is a fallback for
+    un-migrated installs — but ONLY for the default (prod) home. An isolated
+    build (``COWORK_HOME`` set) must NOT inherit that prod-era file: a path var
+    living there (``DATABASE_URI``, ``MASTER_KEY_PATH``, ``COWORK_PROJECTS_DIR``,
+    …) would resolve every build back onto the same DB/paths and defeat the
+    isolation (the exact ENG-324 shared-DB failure this exists to prevent).
+
+    COWORK_HOME is read at import; the desktop app sets it before the server
+    process starts, so an isolated build reads its own .env.
+    """
+    files = [str(cowork_home() / ".env"), ".env"]
+    if not os.environ.get("COWORK_HOME"):
+        # Prod (default home) still consults the legacy file, ordered BEFORE
+        # <COWORK_HOME>/.env so the migrated file wins (fresh over stale).
+        files.insert(0, str(Path.home() / ".anton" / ".env"))
+    return files
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        # Global config lives in <COWORK_HOME>/.env now; ~/.anton/.env is kept
-        # as a fallback for un-migrated installs. Order matters: pydantic-settings
-        # is "last wins", so <COWORK_HOME>/.env must come AFTER ~/.anton/.env
-        # (fresh over stale), with local ".env" highest for dev overrides.
-        # COWORK_HOME is read at import; the desktop app sets it before the
-        # server process starts, so an isolated build reads its own .env.
-        env_file=[str(Path.home() / ".anton" / ".env"), str(cowork_home() / ".env"), ".env"],
+        env_file=_env_file_chain(),
         env_file_encoding="utf-8",
         env_nested_delimiter="_",
         extra="ignore",

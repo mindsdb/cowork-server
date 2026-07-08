@@ -11,6 +11,7 @@ from cowork.common.settings.app_settings import (
     AppSettings,
     OAuthSettings,
     StreamSettings,
+    _env_file_chain,
     get_app_settings,
 )
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
@@ -30,6 +31,25 @@ def test_cowork_home_honors_env_var(monkeypatch, tmp_path):
 def test_cowork_home_expands_user(monkeypatch):
     monkeypatch.setenv("COWORK_HOME", "~/.cowork-preview")
     assert cowork_home() == Path.home() / ".cowork-preview"
+
+
+def test_isolated_build_does_not_inherit_legacy_anton_env(monkeypatch, tmp_path):
+    # An isolated build (COWORK_HOME set) must NOT read ~/.anton/.env — a path
+    # var there (DATABASE_URI, …) would resolve every build onto the same DB
+    # and defeat the isolation. Only <COWORK_HOME>/.env and local .env apply.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "cowork-preview"))
+    legacy = str(Path.home() / ".anton" / ".env")
+    assert legacy not in _env_file_chain()
+
+
+def test_prod_build_still_reads_legacy_anton_env(monkeypatch):
+    # The default (prod) home keeps the legacy fallback for un-migrated
+    # installs, ordered BEFORE <COWORK_HOME>/.env so the migrated file wins.
+    monkeypatch.delenv("COWORK_HOME", raising=False)
+    chain = _env_file_chain()
+    legacy = str(Path.home() / ".anton" / ".env")
+    assert legacy in chain
+    assert chain.index(legacy) < chain.index(str(cowork_home() / ".env"))
 
 
 # Per-resource env vars that, when set, intentionally win over the
