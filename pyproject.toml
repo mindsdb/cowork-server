@@ -1,7 +1,7 @@
 [project]
 name = "cowork-server"
 version = "0.1.5"
-description = "FastAPI backend for the MindsHub Cowork desktop app"
+description = "FastAPI backend for the Cowork desktop app"
 readme = "README.md"
 license = "LicenseRef-Proprietary"
 requires-python = ">=3.12,<3.14"
