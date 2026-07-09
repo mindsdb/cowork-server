@@ -107,8 +107,17 @@ class ConnectionsService:
 
     def merge_picked_files(self, engine: str, name: str, files: list[dict]) -> list[dict] | None:
         """Merge newly Google-Picker-granted files into the connection's
-        persisted `picked_files` list (deduped by id, new entries win on
-        conflict), and store it back as a JSON string field.
+        persisted `picked_files` list (deduped by id), and store it back
+        as a JSON string field.
+
+        Each file carries a `projects` list — the project(s) it was
+        explicitly added to (empty when picked from connection-details,
+        which has no project context). On conflict (same file id picked
+        again, possibly for a different project), the two `projects`
+        lists are UNIONed rather than one overwriting the other — a file
+        already showing under Project A shouldn't disappear from it just
+        because it was also just added to Project B. Every other field
+        (name, mimeType, etc.) is refreshed from the newest pick.
 
         Storing it as a vault field (not a side table) means it flows
         through the existing `inject_env` namespacing for free — the
@@ -135,7 +144,17 @@ class ConnectionsService:
 
         by_id = {f["id"]: f for f in existing if isinstance(f, dict) and "id" in f}
         for f in files:
-            by_id[f["id"]] = f
+            fid = f.get("id")
+            if fid is None:
+                continue
+            prior = by_id.get(fid)
+            if prior:
+                prior_projects = prior.get("projects") or []
+                incoming_projects = f.get("projects") or []
+                merged_projects = list(dict.fromkeys([*prior_projects, *incoming_projects]))
+                by_id[fid] = {**prior, **f, "projects": merged_projects}
+            else:
+                by_id[fid] = f
         merged = list(by_id.values())
 
         fields["picked_files"] = json.dumps(merged)
