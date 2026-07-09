@@ -29,8 +29,11 @@ from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
+    MODEL_ACCESS_DENIED_CODE,
+    MODEL_DISABLED_CODE,
     auth_error_detail,
     friendly_turn_error,
+    model_unavailable_info,
     response_failed_payload,
     response_failed_sse,
 )
@@ -131,6 +134,8 @@ class ResponsesHandler:
                     harness_name=get_user_settings().harness,
                     harness_id=getattr(self.harness, "id", None),
                     buffer=buffer,
+                    trace_tags=request.trace_tags,
+                    trace_metadata=request.trace_metadata,
                 ),
             )
             return sse_from_buffer(buffer, 0)
@@ -151,6 +156,8 @@ class ResponsesHandler:
             conversation=conversation,
             input=harness_input,
             disabled_connections=disabled,
+            trace_tags=request.trace_tags,
+            trace_metadata=request.trace_metadata,
         )
         return await self._collect(stream, conversation.id, request.model, str(user_message.id))
 
@@ -165,6 +172,8 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -202,6 +211,7 @@ class ResponsesHandler:
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled, interactive=True,
+                trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):
@@ -218,7 +228,10 @@ class ResponsesHandler:
             await buffer.close("cancelled")
             return
         except Exception as exc:
-            friendly = friendly_turn_error(exc)
+            # Resolve the model-403 info once and hand it to friendly_turn_error
+            # so it isn't computed twice on this path (reused by the extras below).
+            model_info = model_unavailable_info(exc)
+            friendly = friendly_turn_error(exc, model_info=model_info)
             if friendly is not None:
                 code, message = friendly
                 logger.info("[responses] user-facing turn error: %s", exc)
@@ -243,6 +256,13 @@ class ResponsesHandler:
                     extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
+            elif code in (MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE):
+                # Model-403: tell the client WHICH model was rejected so the card
+                # can name it ("Sonnet isn't included in your plan"). No
+                # provider_label — the ModelUnavailableCard doesn't render it, and
+                # resolved_planning_provider would name the wrong provider when
+                # the *coding* model was the one rejected.
+                extra = {"model": model_info[1] if model_info else ""}
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)

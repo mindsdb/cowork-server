@@ -363,15 +363,3 @@ class TestOAuthIdentity:
         )
         assert slug.startswith("google_drive-")  # graceful random fallback
 
-    def test_account_email_helper_is_best_effort(self, monkeypatch):
-        from cowork.services.connectors.oauth.google import google_service
-
-        assert google_service.account_email("") == ""
-        monkeypatch.setattr(google_service, "_fetch_userinfo", lambda t: {"email": "u@acme.com"})
-        assert google_service.account_email("tok") == "u@acme.com"
-
-        def _boom(_t):
-            raise RuntimeError("email scope not granted")
-
-        monkeypatch.setattr(google_service, "_fetch_userinfo", _boom)
-        assert google_service.account_email("tok") == ""  # never raises

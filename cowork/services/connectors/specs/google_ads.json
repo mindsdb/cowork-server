@@ -56,7 +56,21 @@
             "placeholder": "1234567890",
             "description": "10-digit manager account (MCC) customer ID — no dashes. Required only if you manage multiple accounts through an MCC. Leave blank for single-account setups."
           }
-        ]
+        ],
+        "oauth": {
+          "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+          "token_url": "https://oauth2.googleapis.com/token",
+          "scopes": [
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/adwords"
+          ],
+          "extra_auth_params": {
+            "access_type": "offline",
+            "prompt": "consent"
+          }
+        }
       },
       {
         "id": "oauth-byok",

@@ -17,7 +17,7 @@ logger = get_logger(__name__)
 _POLL_INTERVAL_SECONDS = 30
 _scheduler_task: asyncio.Task | None = None
 
-_RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly}
+_RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
 
 
 def _advance_next_run_at(schedule: Schedule, session) -> None:

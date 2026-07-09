@@ -10,12 +10,21 @@ from urllib.parse import urlparse
 
 import httpx
 
-from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
+from cowork.common.settings.app_settings import default_minds_api_host
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
+
+# Model used to probe MindsHub connectivity/auth (health test + onboarding
+# validation). MUST be tier-universal: MindsHub gates paid models per plan, so
+# a free-tier key gets a 403 for haiku/sonnet/etc. mindshub_air is the free
+# baseline and is present in EVERY tier's registry, so it resolves for all
+# accounts — the probe then reflects reachability + key validity only, not
+# model availability. Using a paid model here caused ENG-576 (free-tier
+# "MindsHub failed its last test" / "Invalid API key" false-negatives).
+MINDS_PROBE_MODEL = "mindshub_air"
 
 
 def minds_chat_base_url(minds_url: str) -> str:
@@ -265,13 +274,23 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
         if ptype == "minds-cloud":
             if not key:
                 return "fail", "missing API key"
-            base = (p.get("mindsUrl") or "https://api.mindshub.ai").rstrip("/")
+            base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
             chat_url = minds_chat_base_url(base)
-            model = (p.get("model") or "").strip() or CODING_MODEL_DEFAULTS["minds_cloud"]
+            # Probe with a TIER-UNIVERSAL model, never the configured/default
+            # one. This is a connectivity + auth check for the provider, not a
+            # model-availability check — and MindsHub tier-gates paid models
+            # (free tier gets a 403 for e.g. haiku/sonnet). The old default was
+            # CODING_MODEL_DEFAULTS["minds_cloud"] = "haiku" (paid), so every
+            # free-tier account saw "MindsHub failed its last test" even though
+            # chat worked on mindshub_air (ENG-576). mindshub_air is the free
+            # baseline and is present in EVERY tier's registry, so it resolves
+            # for all accounts — the dot then reflects reachability/key validity
+            # only. (Testing the user's role model was also rejected in the
+            # ENG-577 review for adding false-negatives + token cost.)
             return await _chat_probe(
                 f"{chat_url}/chat/completions",
                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                model,
+                MINDS_PROBE_MODEL,
             )
     except httpx.HTTPError as e:
         return "fail", f"{type(e).__name__}: {e}"
@@ -315,7 +334,8 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
         return {"ok": False, "error": "Cannot connect"}
 
 
-async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict[str, Any]:
+async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
+    base_url = base_url or default_minds_api_host()
     # Probe the real inference path rather than `/models`: listing routes
     # are not deployed on every MindsHub host and 404/401 even for valid
     # keys, which blocked onboarding with a working key. A 1-token chat
@@ -327,7 +347,7 @@ async def validate_minds(api_key: str, base_url: str = "https://mdb.ai") -> dict
             r = await client.post(
                 f"{chat_base}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": CODING_MODEL_DEFAULTS["minds_cloud"], "max_tokens": 20,
+                json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
             )
         if r.status_code in (401, 403):
@@ -369,7 +389,7 @@ async def validate_provider(provider: str, api_key: str,
     if provider == "anthropic":
         return await validate_anthropic(api_key, model or "claude-sonnet-4-6")
     if provider == "minds":
-        return await validate_minds(api_key, base_url or "https://mdb.ai")
+        return await validate_minds(api_key, base_url or default_minds_api_host())
     if provider == "openai-compatible":
         return await validate_openai_compatible(api_key, base_url or "https://api.openai.com/v1", model)
     return {"ok": False, "error": "Unknown provider"}
