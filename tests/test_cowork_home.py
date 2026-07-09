@@ -52,6 +52,14 @@ def test_prod_build_still_reads_legacy_anton_env(monkeypatch):
     assert chain.index(legacy) < chain.index(str(cowork_home() / ".env"))
 
 
+def test_default_home_set_explicitly_still_reads_legacy_anton_env(monkeypatch):
+    # The desktop prod build may set COWORK_HOME=~/.cowork *explicitly*. That is
+    # still the default home, so the legacy fallback MUST remain — the gate is
+    # the effective home, not "is COWORK_HOME set". (Guards the #312 interaction.)
+    monkeypatch.setenv("COWORK_HOME", str(Path.home() / ".cowork"))
+    assert str(Path.home() / ".anton" / ".env") in _env_file_chain()
+
+
 # Per-resource env vars that, when set, intentionally win over the
 # COWORK_HOME-derived default. The test harness (conftest) injects some of
 # these, so clear them all to observe the pure derivation.

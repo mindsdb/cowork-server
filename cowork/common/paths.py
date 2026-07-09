@@ -28,3 +28,16 @@ def cowork_home() -> Path:
     """
     raw = os.environ.get("COWORK_HOME")
     return Path(raw).expanduser() if raw else _DEFAULT_HOME
+
+
+def is_default_home() -> bool:
+    """True when the effective home is the default ``~/.cowork``.
+
+    Use this — not ``"COWORK_HOME" in os.environ`` — to decide whether behavior
+    scoped to the *production* install applies (e.g. the legacy ``~/.anton/.env``
+    fallback). The desktop prod build sets ``COWORK_HOME`` explicitly to
+    ``~/.cowork``, so "is the var set?" would misclassify prod as an isolated
+    build; "is the effective home the default?" is the correct invariant and is
+    robust regardless of who sets the var (desktop, cloud, tests).
+    """
+    return cowork_home() == _DEFAULT_HOME
