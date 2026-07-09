@@ -117,11 +117,21 @@ async def execute_schedule(
             )
             conversation_id = conversation.id
 
+        # Stamp the run's identity on the Langfuse trace (existing pass-through
+        # seam) so incident forensics don't have to reconstruct which schedule/
+        # trigger produced a turn from timestamps.
+        trigger = "manual" if is_manual else "cron"
         request = ResponsesRequest(
             input=schedule.prompt,
             model=schedule.model,
             stream=True,
             conversation=str(conversation_id),
+            trace_tags=["scheduled_task", f"trigger:{trigger}"],
+            trace_metadata={
+                "schedule_id": str(schedule_id),
+                "schedule_run_id": str(run.id),
+                "trigger_type": trigger,
+            },
         )
         stream = await ResponsesHandler(session).handle(request)
         async for _ in stream:

@@ -174,3 +174,61 @@ def test_has_active_run_counts_manual_runs():
 
     run_service.finish_run(run.id)
     assert run_service.has_active_run(schedule.id) is False
+
+
+# --- ENG-688: schedule/run identity stamped on the turn's trace.
+
+def test_execute_schedule_stamps_trace_identity(monkeypatch):
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.services.schedules import ScheduleService
+
+    captured: list = []
+
+    class FakeHandler:
+        def __init__(self, session):
+            pass
+
+        async def handle(self, request):
+            captured.append(request)
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(session).create_schedule(
+        title="trace stamp test",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        asyncio.run(execute_schedule(schedule_id, is_manual=True))
+
+        cron_req, manual_req = captured
+        assert cron_req.trace_tags == ["scheduled_task", "trigger:cron"]
+        assert manual_req.trace_tags == ["scheduled_task", "trigger:manual"]
+        for req, trigger in ((cron_req, "cron"), (manual_req, "manual")):
+            assert req.trace_metadata["schedule_id"] == str(schedule_id)
+            assert req.trace_metadata["trigger_type"] == trigger
+            assert req.trace_metadata["schedule_run_id"]
+    finally:
+        s = get_open_session()
+        ScheduleService(s).delete_schedule(schedule_id)
+        s.close()
