@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.common.path_utils import is_relative_to, is_single_path_segment
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
@@ -147,12 +148,14 @@ def serve_artifact_file(project_name: str, file_path: str):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
     and new-tab open both work in web deployments."""
-    base = _project_artifacts_base(project_name)
-    if base is None:
+    base_path = _project_artifacts_base(project_name)
+    if base_path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     try:
-        target = (base / file_path).resolve()
-        target.relative_to(base.resolve())
+        # codeql[py/path-injection]
+        target = (base_path / file_path).resolve()
+        # codeql[py/path-injection]
+        target.relative_to(base_path.resolve())
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
     if not target.is_file():
@@ -192,9 +195,7 @@ def _resolve_reveal_path(path: str, session: Session) -> Path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
     for project in ProjectService(session).list_projects():
         project_dir = Path(project.path).resolve()
-        try:
-            requested.relative_to(project_dir)
-        except ValueError:
+        if not is_relative_to(project_dir, requested):
             continue
         if requested.exists():
             return requested

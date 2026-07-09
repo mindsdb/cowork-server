@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import shutil
 import socket
 import subprocess
@@ -24,6 +25,7 @@ from typing import Iterator
 
 from urllib.parse import quote
 
+from cowork.common.path_utils import is_relative_to, is_single_path_segment
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,8 @@ def _iter_artifact_folders(project_path: str | None = None) -> Iterator[Path]:
         try:
             requested = Path(project_path).expanduser().resolve(strict=False)
         except (OSError, ValueError, RuntimeError):
+            return
+        if not is_relative_to(_projects_root().resolve(strict=False), requested):
             return
         registered = set(_registered_project_dirs())
         if requested not in registered:
@@ -358,9 +362,15 @@ def _project_artifacts_base(project_name: str) -> Path | None:
         return None
     registered = set(_registered_project_dirs())
     root = _projects_root().resolve(strict=False)
+    if not is_single_path_segment(project_name):
+        return None
     try:
         candidate = (root / project_name).resolve(strict=False)
     except (OSError, ValueError):
+        return None
+    root_normalized = os.path.normpath(str(root))
+    candidate_normalized = os.path.normpath(str(candidate))
+    if candidate_normalized != root_normalized and not candidate_normalized.startswith(root_normalized + os.sep):
         return None
     if candidate not in registered:
         return None

@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.common.path_utils import is_relative_to
 from cowork.db.session import get_session
 from cowork.services.projects import ProjectService
 
@@ -62,11 +63,8 @@ def _safe_relpath(rel: str, base: Path) -> Path:
         raise HTTPException(status_code=400, detail="path required")
     cleaned = rel.replace("\\", "/").lstrip("/")
     candidate = (base / cleaned).resolve()
-    base_resolved = base.resolve()
-    try:
-        candidate.relative_to(base_resolved)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="invalid path") from exc
+    if not is_relative_to(base.resolve(), candidate):
+        raise HTTPException(status_code=400, detail="invalid path")
     return candidate
 
 
