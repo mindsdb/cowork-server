@@ -475,51 +475,33 @@ _REQUEST_CREDENTIALS_SCHEMA = {
     "properties": {
         "form_id": {
             "type": "string",
-            "description": "Stable identifier for this form. Generate a new one for a new question; reuse the same one when re-asking the same form (so the user's typed values persist).",
+            "description": "Stable form identifier. Reuse the same id when re-asking the same form so the user's typed values persist.",
         },
         "engine": {
             "type": "string",
-            "description": "REQUIRED. A short slug for the connector (e.g. 'postgres', 'mysql', 'snowflake', 'github', 'posthog', 'salesforce', 'gmail', 'google_calendar'). Use the closest convention; ANY value is accepted — engines not in anton's built-in registry are saved as 'custom' connections with whatever fields you list here. Don't gate on whether it's a known engine.",
+            "description": "REQUIRED. Connector slug (e.g. 'postgres', 'gmail'). Any value is accepted — unknown engines are saved as 'custom' connections.",
         },
         "_connector_id": {
             "type": "string",
-            "description": "OPTIONAL. The slug of the canonical connector spec (from `lookup_connector`) this form was built from. When set, submissions go to POST /v1/connectors/{id}/save (which bypasses anton-core's built-in datasource registry — required for OAuth-shaped saves). ALWAYS set this when the form spec came from `lookup_connector`; leave unset when handcrafting a one-off spec.",
+            "description": "Slug of the canonical spec returned by `lookup_connector`. ALWAYS copy it over when the spec came from lookup (routes submissions to the registry-aware save endpoint); omit for handcrafted specs.",
         },
+        "title": {"type": "string", "description": "Short headline (e.g. 'Connect to Postgres')."},
+        "subtitle": {"type": "string"},
         "how_to": {
             "type": "string",
-            "description": "OPTIONAL. Markdown-formatted setup instructions for SINGLE-method forms (use the per-method `how_to` for multi-method specs). The form panel shows a 'How to?' link in the actions row that opens a centered modal with this content.",
+            "description": "Markdown setup walkthrough, shown behind a 'How to?' link (single-method forms; multi-method forms use per-method `how_to`).",
         },
-        "help_url": {
-            "type": "string",
-            "description": "OPTIONAL. External help URL for SINGLE-method forms (use the per-method `help_url` for multi-method specs). Used as a fallback when no `how_to` markdown is provided.",
-        },
+        "help_url": {"type": "string", "description": "External help URL fallback when no `how_to` is given."},
         "logo": {
             "type": "string",
-            "description": "Optional icon name from the app's palette — use one of: 'database', 'globe', 'cube', 'doc', 'code', 'image', 'folder', 'brain', 'sparkle', 'wifi', 'key', 'link', 'mindsdb'. URLs are NOT supported; pick the closest semantic match for the connector. Defaults to 'database' when omitted.",
+            "description": "Icon name: database|globe|cube|doc|code|image|folder|brain|sparkle|wifi|key|link|mindsdb. No URLs. Default 'database'.",
         },
-        "logo_color": {
-            "type": "string",
-            "description": "Optional CSS color for the icon (e.g. '#3b82f6', 'var(--accent)').",
-        },
-        "title": {
-            "type": "string",
-            "description": "Short headline (e.g. 'Connect to Postgres').",
-        },
-        "subtitle": {
-            "type": "string",
-            "description": "Optional one-liner under the title (e.g. 'Anton needs read-only access — credentials never leave your machine.').",
-        },
-        "form_warning": {
-            "type": "string",
-            "description": "Optional amber banner above the fields. Use for cautionary notes ('Last attempt timed out…').",
-        },
-        "form_error": {
-            "type": "string",
-            "description": "Optional red banner above the fields. Use when a previous attempt failed at the form level (e.g. wrong engine selected).",
-        },
+        "logo_color": {"type": "string", "description": "CSS color for the icon."},
+        "form_warning": {"type": "string", "description": "Amber banner above the fields."},
+        "form_error": {"type": "string", "description": "Red banner above the fields (previous attempt failed)."},
         "fields": {
             "type": "array",
-            "description": "Field specs the user fills in (single-method form). Order matters — render top to bottom. For services with MULTIPLE auth options (Gmail = OAuth + app-password + service-account, etc.) prefer `methods` instead.",
+            "description": "Input fields, rendered in order (single-method form). Prefer `methods` when the service has several auth options.",
             "items": {
                 "type": "object",
                 "properties": {
@@ -532,19 +514,16 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                     "required": {"type": "boolean"},
                     "placeholder": {"type": "string"},
                     "default": {},
-                    "value": {"description": "Pre-fill on re-render (e.g. preserve what the user typed last attempt)."},
+                    "value": {"description": "Pre-fill on re-render."},
                     "options": {
                         "type": "array",
-                        "description": "For type=select.",
-                        "items": {
-                            "type": "object",
-                            "properties": {"value": {"type": "string"}, "label": {"type": "string"}},
-                        },
+                        "description": "For type=select: [{value, label}].",
+                        "items": {"type": "object"},
                     },
-                    "error": {"type": "string", "description": "Per-field red text under the input. Set on a retry to call out which field needs attention."},
-                    "warning": {"type": "string", "description": "Per-field amber text under the input."},
-                    "help": {"type": "string", "description": "Muted helper text under the input."},
-                    "skipable": {"type": "boolean", "description": "Defaults to true. Pass false ONLY for absolute requirements where skipping makes no sense."},
+                    "error": {"type": "string", "description": "Red per-field text — set on a retry to flag the failing field."},
+                    "warning": {"type": "string"},
+                    "help": {"type": "string"},
+                    "skipable": {"type": "boolean", "description": "Default true; false only for absolute requirements."},
                 },
                 "required": ["name", "label", "type"],
             },
@@ -553,41 +532,34 @@ _REQUEST_CREDENTIALS_SCHEMA = {
             "type": "array",
             "description": (
                 "Use INSTEAD of `fields` when the engine supports multiple auth methods "
-                "(e.g. Gmail can be reached via OAuth, App Password, or Service Account). "
-                "The user picks one method first, then fills in just that method's fields. "
-                "Each method should have a clear label, a 1-2 sentence description, and "
-                "its own fields. Mark the easiest one with `recommended: true`. If the "
-                "user has already signalled a preference (\"I have an app password\"), "
-                "set `selected_method` at the form's top level so we skip the picker."
+                "(e.g. Gmail: OAuth / App Password / Service Account). The user picks a "
+                "method, then fills only that method's fields. Mark the easiest one "
+                "`recommended: true`."
             ),
             "items": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Stable id for this method (e.g. 'oauth', 'app-password', 'service-account'). Anton's probe uses this id to decide which auth flow to test, and the vault stamps it onto the saved record as `_method`."},
-                    "label": {"type": "string", "description": "Card title (e.g. 'App Password')."},
-                    "description": {"type": "string", "description": "1-2 sentence description shown on the picker card. Mention prereqs and difficulty when relevant."},
-                    "recommended": {"type": "boolean", "description": "Mark the easiest/most common method. Renders a 'Recommended' pill on the card."},
-                    "how_to": {"type": "string", "description": "Optional markdown-formatted setup instructions for THIS method. Picker cards show a 'How to?' affordance that opens a centered modal with this content; the same link travels into the form-fill stage. Prefer this over `help_url` when you can write a good walkthrough."},
-                    "help_url": {"type": "string", "description": "Optional external help URL for THIS method. Used when no `how_to` markdown is provided."},
+                    "id": {"type": "string", "description": "Stable method id (e.g. 'oauth', 'app-password'); drives the auth probe and is saved as `_method`."},
+                    "label": {"type": "string"},
+                    "description": {"type": "string", "description": "1-2 sentences for the picker card."},
+                    "recommended": {"type": "boolean"},
+                    "how_to": {"type": "string", "description": "Markdown walkthrough for THIS method."},
+                    "help_url": {"type": "string"},
                     "submit_action": {
                         "type": "string",
                         "enum": ["oauth_launch"],
-                        "description": "Optional. When set to `oauth_launch`, the panel runs a PKCE OAuth flow on the user's machine when they click Submit (spawns a loopback HTTP server, opens the browser to the consent screen, exchanges the code for tokens, and saves the refresh_token to the vault). Required for any OAuth method. Pair with the `oauth` block.",
+                        "description": "Set for OAuth methods — Submit runs a local PKCE browser flow and saves the refresh_token to the vault. Pair with `oauth`.",
                     },
                     "oauth": {
                         "type": "object",
-                        "description": "Required when `submit_action` is `oauth_launch`. Provides everything the desktop's PKCE helper needs to run the flow without the LLM in the loop. Anton spawns a loopback server, opens the browser, exchanges the code, and stores the refresh_token in the vault under this connector.",
+                        "description": "Required when submit_action=oauth_launch.",
                         "properties": {
-                            "auth_url": {"type": "string", "description": "OAuth 2.0 authorization endpoint (e.g. https://accounts.google.com/o/oauth2/v2/auth)."},
-                            "token_url": {"type": "string", "description": "OAuth 2.0 token endpoint (e.g. https://oauth2.googleapis.com/token)."},
-                            "scopes": {
-                                "type": "array",
-                                "description": "Scopes to request. Provider-specific.",
-                                "items": {"type": "string"},
-                            },
+                            "auth_url": {"type": "string"},
+                            "token_url": {"type": "string"},
+                            "scopes": {"type": "array", "items": {"type": "string"}},
                             "extra_auth_params": {
                                 "type": "object",
-                                "description": "Extra query params on the auth URL (e.g. {access_type: 'offline', prompt: 'consent'} for Google to force a refresh_token).",
+                                "description": "Extra auth-URL query params (e.g. {access_type: 'offline', prompt: 'consent'} for Google).",
                                 "additionalProperties": {"type": "string"},
                             },
                         },
@@ -595,32 +567,28 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                     },
                     "fields": {
                         "type": "array",
-                        "description": "Fields specific to this method. Same shape as the top-level `fields` items. For `oauth_launch` methods, fields are typically `client_id` + `client_secret` (Pattern B — bring-your-own-OAuth-client) and may be empty when the connector ships a hosted client.",
+                        "description": "Same shape as top-level `fields` items. Often just client_id/client_secret for OAuth; may be empty when the connector ships a hosted client.",
                         "items": {"type": "object"},
                     },
-                    "actions": {
-                        "type": "array",
-                        "description": "OPTIONAL — per-method action buttons. Falls back to the form's top-level actions, then to a default Submit + Cancel pair.",
-                        "items": {"type": "object"},
-                    },
+                    "actions": {"type": "array", "items": {"type": "object"}},
                 },
                 "required": ["id", "label", "fields"],
             },
         },
         "selected_method": {
             "type": "string",
-            "description": "Pre-pick a method id from `methods[]` (skips the picker, jumps straight to that method's fields). Set when the user has clearly indicated a preference. The user can still hit 'change' to re-open the picker.",
+            "description": "Pre-pick a method id from `methods[]` (skips the picker). Set only when the user clearly signalled a preference.",
         },
         "actions": {
             "type": "array",
-            "description": "Optional. Defaults to a single primary 'Submit' action plus 'Cancel'. Use to surface custom actions like 'Try OAuth' or per-field skip shortcuts.",
+            "description": "Optional custom buttons; defaults to Submit + Cancel.",
             "items": {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
                     "label": {"type": "string"},
                     "kind": {"type": "string", "enum": ["primary", "skip", "cancel"]},
-                    "field": {"type": "string", "description": "Only for kind='skip' — the field name to mark skipped."},
+                    "field": {"type": "string", "description": "Only for kind='skip'."},
                 },
                 "required": ["id", "label"],
             },
@@ -632,60 +600,24 @@ _REQUEST_CREDENTIALS_SCHEMA = {
 
 _REQUEST_CREDENTIALS_PROMPT = (
     "DATA VAULT WORKFLOW — when the user asks to connect to a service or database:\n"
-    "1. ALWAYS call `lookup_connector` FIRST with the user's wording (e.g. 'gmail', "
-    "'google mail', 'postgres'). When it returns a `form` spec, that is the SAME "
-    "spec the in-app Connector Picker uses — pass it to `request_credentials` "
-    "VERBATIM (only tweak `selected_method` if the user has clearly signalled a "
-    "preference, or `subtitle` to match the conversation context). Registry specs "
-    "ship with `methods[]`, OAuth blocks (`submit_action: 'oauth_launch'` + "
-    "`oauth: {...}`), `how_to` markdown, and `help_url` already filled in — do "
-    "not strip those, do not paraphrase them. ALSO copy `_connector_id` (the "
-    "lookup tool returns it) onto the form spec so submissions go to the "
-    "registry-aware save endpoint.\n"
-    "2. ONLY when `lookup_connector` returns no match, handcraft the spec. The "
-    "schema documents OAuth, `how_to`, and `help_url` fields — use them when you "
-    "know the auth shape (e.g. an OAuth provider). Better to write a good "
-    "registry-grade spec than a bare username/password prompt.\n"
-    "3. Call `request_credentials` with the (registry or handcrafted) spec the "
-    "FIRST time. Include the returned markdown block VERBATIM (with blank lines "
-    "around the fence) so the form renders in the side panel.\n"
-    # "4. Wait for the user's submission. The follow-up message has a `submission_id` "
-    # "and the names of any skipped fields. For OAuth methods, the desktop runs the "
-    # "browser flow itself — you'll just receive the submission with the refresh "
-    # "token already in the vault.\n"
-    # "5. Call `fetch_submission(submission_id)` to retrieve the staged values. Test "
-    # "the connection (`connect_datasource` or a scratchpad probe).\n"
-    # "6. ON FAILURE — DO NOT re-emit the full form. Use `update_form` (which "
-    # "returns a `data-vault-form-patch` block) to attach an `error` to the failing "
-    # "field and tweak `subtitle` / `form_warning` if useful. The user's existing "
-    # "inputs stay in the panel; only the changed bits update. NEVER include `value` "
-    # "fields in a patch or full re-emit — that would echo credentials into chat "
-    # "history. The user re-types what they want to fix.\n"
-    # "7. On success, summarize what you connected and stop. Do NOT call "
-    # "`request_credentials` again unless the user asks for another connection.\n\n"
-    "4. Your job is done. The server tests the connection and saves credentials "
-    "automatically once the user submits. Do NOT call `request_credentials` again "
-    "unless the user asks to connect to a different service or explicitly requests "
-    "a new form.\n\n"
-    "MULTI-METHOD SHAPE — for engines with several auth options (Gmail can be "
-    "reached via OAuth, App Password, or Service Account; Postgres might support "
-    "password auth + IAM, etc.) emit a `methods[]` array INSTEAD of `fields[]`. "
-    "Each method has its own id, label, description, fields, and (when relevant) "
-    "`how_to` markdown / `help_url` / OAuth block. Mark the simplest one with "
-    "`recommended: true`. The form panel renders a picker first; the user "
-    "chooses, then types only the fields for the chosen method. If the user has "
-    "CLEARLY signalled a preference (\"I already have an app password\"), "
-    "pre-set `selected_method` to skip the picker.\n\n"
-    "STRICT RULES:\n"
-    "- Field VALUES never appear in chat. Don't echo them, don't include them in "
-    "any form spec, don't paraphrase them.\n"
-    # "- The fetch tool is the only read path.\n"
-    # "- Use `update_form` for any retry / error / status change after the initial "
-    # "form is up. Reserve `request_credentials` for first emission and for fully "
-    # "switching to a different connector.\n"
-    "- The chat-emitted form and the picker-emitted form must FEEL identical to "
-    "the user — same methods, same OAuth flow, same how-to docs. The registry "
-    "lookup is what guarantees that parity; use it."
+    "1. Call `lookup_connector` FIRST with the user's wording. When it returns a "
+    "`form` spec, pass it to `request_credentials` VERBATIM (tweak only "
+    "`selected_method` or `subtitle`), and copy `_connector_id` onto the spec. "
+    "Registry specs already carry `methods[]`, OAuth blocks, `how_to`, and "
+    "`help_url` — never strip or paraphrase them.\n"
+    "2. Handcraft a spec ONLY when the registry has no match, using your own "
+    "knowledge of the service's auth shape (host/port/user/password, API key, or "
+    "OAuth). For engines with several auth options emit `methods[]` instead of "
+    "`fields[]` and mark the simplest `recommended: true`; pre-set "
+    "`selected_method` if the user already signalled a preference.\n"
+    "3. Include the markdown block the tool returns VERBATIM in your next message "
+    "(blank lines around the fence) so the form renders in the side panel.\n"
+    "4. Your job is done — the server tests the connection and saves credentials "
+    "on submit. Do NOT call `request_credentials` again unless the user asks to "
+    "connect a different service or explicitly requests a new form.\n"
+    "STRICT: field VALUES never appear in chat — don't echo, embed, or paraphrase "
+    "them. The chat-emitted form must FEEL identical to the in-app Connector "
+    "Picker; the registry lookup is what guarantees that parity."
 )
 
 
