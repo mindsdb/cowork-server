@@ -62,7 +62,9 @@ build-backend = "hatchling.build"
 packages = ["cowork"]
 
 [tool.uv.sources]
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
+# Branch-local repoint to the local anton fork carrying the additive USD cost
+# meter (feat/nocloud/agent-runtime-cost). Branch-only — do not merge upstream.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "feat/nocloud/agent-runtime-cost" }
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
 
 [dependency-groups]
