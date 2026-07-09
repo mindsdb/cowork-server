@@ -54,6 +54,23 @@ AUTH_ERROR_USER_MESSAGE = (
 # "Reconnect" action (re-provision the key in place) instead of "Subscribe".
 AUTH_ERROR_CODE = "provider_auth"
 
+# Wire-level codes for the model-403 case — the gateway rejected the requested
+# MODEL (the credential itself is fine). Two distinct codes because the
+# remedies differ: access_denied is a plan gate (an upgrade fixes it),
+# disabled is an admin kill switch (an upgrade does not). They mirror the
+# gateway's own ``error.code`` values so nothing is lost in translation, and
+# the renderer keys its card (Upgrade vs Switch-model affordances) on them.
+MODEL_ACCESS_DENIED_CODE = "model_access_denied"
+MODEL_DISABLED_CODE = "model_disabled"
+_MODEL_UNAVAILABLE_CODES = frozenset({MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE})
+
+# Fallback copy if the exception somehow carries no usable message — anton
+# normally supplies curated, user-facing copy which we pass through verbatim.
+MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
+    "The selected model isn't available on your MindsHub plan. Switch models "
+    "in Settings, or upgrade your plan."
+)
+
 # Redacted stand-in for any failure we haven't mapped — never the raw
 # provider text.
 GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
@@ -114,6 +131,30 @@ def is_token_limit_error(exc: Exception) -> bool:
     return False
 
 
+def model_unavailable_info(exc: Exception) -> tuple[str, str] | None:
+    """``(code, model)`` when the turn died on the gateway's structured
+    model-403 — anton's ``ModelUnavailableError`` carrying
+    ``code ∈ {model_access_denied, model_disabled}`` and the model alias.
+
+    Prefers the typed check; falls back to duck-typing on the ``code``/
+    ``model`` attributes so a version-skewed anton (type not importable /
+    moved) still maps correctly. Deliberately NO string matching: a message
+    mentioning "model" or "403" must never trigger the plan card — only the
+    structured code the gateway emitted can.
+    """
+    try:
+        from anton.core.llm.provider import ModelUnavailableError
+
+        if isinstance(exc, ModelUnavailableError):
+            return exc.code, exc.model
+    except Exception:
+        pass
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code in _MODEL_UNAVAILABLE_CODES:
+        return code, str(getattr(exc, "model", "") or "")
+    return None
+
+
 def is_auth_error(exc: Exception) -> bool:
     """Detect an **LLM-provider** auth failure — a 401 from the model gateway
     because the credential it sees is invalid (revoked / rotated / never
@@ -142,15 +183,31 @@ def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
     return f"Your {provider_label} API key is no longer valid — update it in Settings."
 
 
-def friendly_turn_error(exc: Exception) -> tuple[str, str] | None:
+_UNSET: object = object()
+
+
+def friendly_turn_error(
+    exc: Exception, model_info: tuple[str, str] | None | object = _UNSET
+) -> tuple[str, str] | None:
     """Map a known, cryptic turn failure to ``(code, user_message)``.
 
     Returns ``None`` when the exception isn't one we have curated copy
     for — the caller then falls back to the generic redacted message.
+
+    ``model_info`` lets a caller that already resolved ``model_unavailable_info``
+    (the streaming handler needs the rejected model for the card) pass it in so
+    it isn't computed twice; omit it and it's resolved on demand.
     """
-    # token_limit first: a 402/429 credit/quota case must not be misread as auth.
+    # token_limit first: a 402/429 credit/quota case must not be misread as
+    # auth or as a model gate.
     if is_token_limit_error(exc):
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
+    if model_info is _UNSET:
+        model_info = model_unavailable_info(exc)
+    if model_info is not None:
+        # anton's ModelUnavailableError message is already curated user copy
+        # (plan guidance / hedged kill-switch wording) — pass it through.
+        return model_info[0], str(exc) or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if is_auth_error(exc):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     if is_image_format_error(exc):
@@ -164,19 +221,23 @@ def response_failed_payload(
     *,
     reconnectable: bool | None = None,
     provider_label: str | None = None,
+    model: str | None = None,
 ) -> dict:
     """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
     ``reconnectable`` / ``provider_label`` are included only for the
     ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
-    "Open Settings" (BYOK) — omitted otherwise to keep the shape unchanged for
-    every other failure.
+    "Open Settings" (BYOK); ``model`` only for the model-403 case so the card
+    can name the locked model ("Sonnet isn't included in your plan") — omitted
+    otherwise to keep the shape unchanged for every other failure.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:
         payload["reconnectable"] = reconnectable
     if provider_label is not None:
         payload["provider_label"] = provider_label
+    if model is not None:
+        payload["model"] = model
     return payload
 
 
@@ -186,10 +247,15 @@ def response_failed_sse(
     *,
     reconnectable: bool | None = None,
     provider_label: str | None = None,
+    model: str | None = None,
 ) -> str:
     """Build a ``response.failed`` SSE frame (same wire shape the renderer's
-    parser already handles, plus the optional auth fields)."""
+    parser already handles, plus the optional auth/model fields)."""
     payload = response_failed_payload(
-        error, code, reconnectable=reconnectable, provider_label=provider_label
+        error,
+        code,
+        reconnectable=reconnectable,
+        provider_label=provider_label,
+        model=model,
     )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"

@@ -73,7 +73,12 @@ BG_CYCLE = [
     "linear-gradient(135deg, #fff, var(--stone-150))",
 ]
 
-_HOUSEKEEPING_FILES = {"metadata.json", "README.md", ".published.json"}
+# Files that aren't user content for the `modified` badge's mtime gate.
+# Keep in sync with anton.publisher._FULLSTACK_EXCLUDED — the running
+# backend's runtime log (`backend.log`) is excluded from the published
+# bundle there, so it must not count toward content mtime here either,
+# or it would constantly trip the gate and force a false badge.
+_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json"}
 
 TEXT_EXTENSIONS = {
     ".html", ".md", ".txt", ".csv", ".json", ".py", ".js",

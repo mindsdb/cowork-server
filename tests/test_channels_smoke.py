@@ -7,6 +7,7 @@ real credentials, network, or LLM.
 """
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 from sqlmodel import select
@@ -17,6 +18,7 @@ from cowork.channels.registry import PluginRegistry, load_first_party_plugins
 from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
 from cowork.channels.webhooks import drain_background_tasks
 from cowork.db.session import get_open_session
+from cowork.harnesses.base import ChannelContext
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.models.message import Message
 from cowork.server import create_app
@@ -32,9 +34,11 @@ class FakeHarness:
         self.tool_event = tool_event
         self.delay = delay
         self.inputs: list[list[dict]] = []
+        self.channel_contexts: list = []
 
-    async def stream_response(self, *, conversation, input):
+    async def stream_response(self, *, conversation, input, channel_context=None):
         self.inputs.append(input)
+        self.channel_contexts.append(channel_context)
         if False:
             yield
 
@@ -722,6 +726,134 @@ def test_channel_agent_switch_resets_bound_conversations():
         session.close()
 
 
+def test_is_new_command_matching():
+    from cowork.channels.runtime import is_new_command
+
+    assert is_new_command("/new")
+    assert is_new_command("  /New ")
+    assert is_new_command("/new@MyBot")
+    assert is_new_command("/new@MyBot", is_mention=True)
+    assert is_new_command("@mybot /new")
+    assert is_new_command("<@U123ABC> /new")
+    assert is_new_command("/new", is_mention=False)
+    # A suffixed command the platform says isn't addressed to us belongs to another bot.
+    assert not is_new_command("/new@OtherBot", is_mention=False)
+    assert not is_new_command("/new@")
+    assert not is_new_command("how do I use /new")
+    assert not is_new_command("/new please")
+    assert not is_new_command("/newer")
+    assert not is_new_command("new")
+    assert not is_new_command("")
+
+
+def test_new_command_starts_fresh_conversation(monkeypatch):
+    fake_harness = FakeHarness()
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: fake_harness)
+
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s", "bot_username": "b"})
+
+    def event(update_id, text):
+        return asyncio.run(bridge.parse_inbound(
+            body=telegram_update(update_id, 777, 1, text), headers={}, route_name=None,
+        ))[0]
+
+    adapters = LiveAdapterRegistry(registry)
+    adapter = FakeAdapter()
+    adapters._cache["telegram"] = adapter
+    runtime = AntonChannelRuntime(adapters)
+
+    asyncio.run(runtime.handle("telegram", event(100, "hi")))
+    s = get_open_session()
+    stmt = select(ChannelBinding).where(ChannelBinding.external_group_id == "777")
+    binding = s.exec(stmt).one()
+    first_conv = binding.anton_conversation_id
+    assert first_conv is not None
+
+    asyncio.run(runtime.handle("telegram", event(101, "/new")))
+    s.expire_all()
+    binding = s.exec(stmt).one()
+    assert binding.anton_conversation_id is None
+    assert not s.exec(select(ChannelSession).where(ChannelSession.binding_id == binding.id)).all()
+    # Deterministic confirmation naming the project; the harness never ran for this turn.
+    assert adapter.delivered[-1] == ("777", 'Starting fresh — your next message begins a new conversation in the "general" project.')
+    assert len(fake_harness.inputs) == 1
+
+    asyncio.run(runtime.handle("telegram", event(102, "hi again")))
+    s.expire_all()
+    binding = s.exec(stmt).one()
+    assert binding.anton_conversation_id is not None
+    assert binding.anton_conversation_id != first_conv
+    assert adapter.delivered[-1] == ("777", REPLY)
+    s.close()
+
+
+def test_binding_project_change_detaches_conversation():
+    from cowork.models.channel import ChannelBinding
+    from cowork.models.project import Project
+    from cowork.schemas.channels import BindingUpdateRequest
+    from cowork.services.channel_bindings import ChannelBindingService
+    from cowork.services.conversations import ConversationService
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    session = get_open_session()
+    bid = None
+    other = None
+    try:
+        other = Project(name="reroute-target", path="/tmp/reroute-target")
+        session.add(other)
+        conv = ConversationService(session).create_conversation(topic="chan", project_id=GENERAL_PROJECT_ID)
+        binding = ChannelBinding(
+            channel_type="telegram",
+            external_group_id="reroute-test",
+            external_thread_key="__default__",
+            anton_conversation_id=conv.id,
+            anton_project_id=GENERAL_PROJECT_ID,
+            trigger_rule="always",
+        )
+        session.add(binding)
+        session.commit()
+        session.refresh(binding)
+        session.refresh(other)
+        bid = binding.id
+        session.add(ChannelSession(binding_id=bid, external_session_key="__default__"))
+        session.commit()
+
+        svc = ChannelBindingService(session)
+
+        # Same project: conversation stays pinned.
+        svc.update(bid, BindingUpdateRequest(anton_project_id=GENERAL_PROJECT_ID))
+        session.expire_all()
+        assert session.get(ChannelBinding, bid).anton_conversation_id == conv.id
+
+        # New project: conversation and session rows are detached.
+        svc.update(bid, BindingUpdateRequest(anton_project_id=other.id))
+        session.expire_all()
+        row = session.get(ChannelBinding, bid)
+        assert row.anton_project_id == other.id
+        assert row.anton_conversation_id is None
+        assert not session.exec(select(ChannelSession).where(ChannelSession.binding_id == bid)).all()
+
+        # Explicit conversation in the same request wins over the detach.
+        svc.update(bid, BindingUpdateRequest(anton_project_id=GENERAL_PROJECT_ID, anton_conversation_id=conv.id))
+        session.expire_all()
+        row = session.get(ChannelBinding, bid)
+        assert row.anton_project_id == GENERAL_PROJECT_ID
+        assert row.anton_conversation_id == conv.id
+    finally:
+        if bid is not None:
+            row = session.get(ChannelBinding, bid)
+            if row is not None:
+                session.delete(row)
+        if other is not None and other.id is not None:
+            row = session.get(Project, other.id)
+            if row is not None:
+                session.delete(row)
+        session.commit()
+        session.close()
+
+
 def test_plugin_capabilities_match_declared_hooks():
     registry = PluginRegistry()
     load_first_party_plugins(registry)
@@ -734,3 +866,232 @@ def test_plugin_capabilities_match_declared_hooks():
             assert plugin.lifecycle is not None, f"{plugin.channel_type}: lifecycle capability without lifecycle"
         if caps.supports_webhook_ingress:
             assert plugin.webhooks, f"{plugin.channel_type}: webhook capability without webhook routes"
+
+
+# --- ENG-591: group mention gating + channel context ------------------------
+
+def group_telegram_update(
+    update_id: int, chat_id: int, message_id: int, text: str,
+    *, entities=None, reply_to=None,
+) -> bytes:
+    msg = {
+        "message_id": message_id,
+        "from": {"id": 42, "is_bot": False, "first_name": "Alice", "last_name": "Realtor"},
+        "chat": {"id": chat_id, "type": "supergroup"},
+        "date": 1700000000,
+        "text": text,
+    }
+    if entities is not None:
+        msg["entities"] = entities
+    if reply_to is not None:
+        msg["reply_to_message"] = reply_to
+    return json.dumps({"update_id": update_id, "message": msg}).encode()
+
+
+def test_telegram_group_mention_only_flow(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call(bot_token, method, payload):
+        calls.append((method, dict(payload)))
+        if method == "getMe":
+            return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+        return {"ok": True, "result": {"message_id": 1}}
+
+    fake_harness = FakeHarness()
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: fake_harness)
+
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
+    # No bot_username credential: identity must come from getMe.
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    adapters = LiveAdapterRegistry(registry)
+    adapter = FakeAdapter()
+    adapters._cache["telegram"] = adapter
+    runtime = AntonChannelRuntime(adapters)
+
+    async def inbound(body):
+        for event in await bridge.parse_inbound(body=body, headers={}, route_name=None):
+            await runtime.handle("telegram", event)
+
+    # Plain group message: binding auto-created as mention_only, turn skipped.
+    asyncio.run(inbound(group_telegram_update(70, -100123, 1, "what listings are there?")))
+    s = get_open_session()
+    binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "-100123")).one()
+    assert binding.trigger_rule == "mention_only"
+    assert binding.anton_conversation_id is None
+    s.close()
+    assert adapter.delivered == []
+
+    # @mention (case differs from getMe's username) → served, with the group
+    # channel context handed to the harness.
+    asyncio.run(inbound(group_telegram_update(71, -100123, 2, "@antonbot show me listings")))
+    assert len(adapter.delivered) == 1
+    assert fake_harness.channel_contexts == [
+        ChannelContext(channel_type="telegram", is_group=True, display_name=None, instructions=None)
+    ]
+    # Group turns carry speaker attribution: harness input and stored history
+    # are prefixed with the sender's name.
+    assert fake_harness.inputs[0] == [
+        {"type": "text", "text": "Alice Realtor: @antonbot show me listings"}
+    ]
+    s = get_open_session()
+    binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "-100123")).one()
+    user_msgs = [
+        m for m in s.exec(select(Message).where(Message.conversation_id == binding.anton_conversation_id)).all()
+        if m.role == "user"
+    ]
+    assert user_msgs and user_msgs[0].content == "Alice Realtor: @antonbot show me listings"
+    s.close()
+
+    # Replying to one of the bot's messages addresses it too.
+    asyncio.run(inbound(group_telegram_update(
+        72, -100123, 3, "and the price?", reply_to={"from": {"id": 999, "is_bot": True}},
+    )))
+    assert len(adapter.delivered) == 2
+
+    # Identity fetched once, then cached.
+    assert [m for (m, _p) in calls if m == "getMe"] == ["getMe"]
+
+
+def test_telegram_group_mention_detection(monkeypatch):
+    getme_methods: list[str] = []
+
+    async def fake_call(bot_token, method, payload):
+        getme_methods.append(method)
+        return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+
+    async def parse(bridge, body):
+        return (await bridge.parse_inbound(body=body, headers={}, route_name=None))[0]
+
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+
+    # text_mention entities carry the target user, matched by bot id.
+    ev = asyncio.run(parse(bridge, group_telegram_update(
+        80, -200, 1, "Anton what's new?",
+        entities=[{"type": "text_mention", "offset": 0, "length": 5, "user": {"id": 999}}],
+    )))
+    assert ev.message.is_mention is True
+
+    # Entity offsets are UTF-16 code units: non-BMP text before the mention
+    # must not shift the matched window.
+    ev = asyncio.run(parse(bridge, group_telegram_update(
+        81, -200, 2, "\U0001F44D\U0001F44D @AntonBot hi",
+        entities=[{"type": "mention", "offset": 5, "length": 9}],
+    )))
+    assert ev.message.is_mention is True
+
+    # Plain group text with no mention → not a mention; sender name captured.
+    ev = asyncio.run(parse(bridge, group_telegram_update(82, -200, 3, "hello all")))
+    assert ev.message.is_mention is False
+    assert ev.message.sender_name == "Alice Realtor"
+
+    # Private chats are always mentions and never trigger getMe.
+    fresh = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    before = len(getme_methods)
+    ev = asyncio.run(parse(fresh, telegram_update(83, 5, 4, "hi")))
+    assert ev.message.is_mention is True
+    assert len(getme_methods) == before
+
+
+def test_telegram_mention_falls_back_to_credential_when_getme_fails(monkeypatch):
+    async def failing_call(bot_token, method, payload):
+        raise ConnectionError("api down")
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(failing_call))
+
+    async def parse(bridge, body):
+        return (await bridge.parse_inbound(body=body, headers={}, route_name=None))[0]
+
+    with_cred = telegram_plugin.TelegramBridge({"bot_token": "x", "bot_username": "AntonBot"})
+    ev = asyncio.run(parse(with_cred, group_telegram_update(90, -300, 1, "hey @antonbot")))
+    assert ev.message.is_mention is True
+
+    without = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    ev = asyncio.run(parse(without, group_telegram_update(91, -300, 2, "hey @antonbot")))
+    assert ev.message.is_mention is False
+
+
+def test_should_respond_matrix():
+    def event(text="hi", is_mention=False):
+        return SimpleNamespace(message=SimpleNamespace(content=text, is_mention=is_mention))
+
+    def binding(rule, pattern=None):
+        return SimpleNamespace(trigger_rule=rule, trigger_pattern=pattern)
+
+    should = AntonChannelRuntime._should_respond
+    assert should(binding("always"), event()) is True
+    assert should(binding("mention_only"), event(is_mention=True)) is True
+    assert should(binding("mention_only"), event(is_mention=False)) is False
+    assert should(binding("regex", r"listing"), event("any listings?")) is True
+    assert should(binding("regex", r"listing"), event("hello")) is False
+    assert should(binding("regex", None), event("hello")) is False
+    assert should(binding("regex", "("), event("hello")) is False
+
+
+def test_binding_instructions_roundtrip():
+    app = create_app()
+
+    async def flow():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.post("/api/v1/channels/bindings", json={
+                "channel_type": "telegram",
+                "external_group_id": "-400500",
+                "instructions": "You are the listings concierge.",
+            })
+            assert r.status_code == 201
+            body = r.json()
+            assert body["instructions"] == "You are the listings concierge."
+
+            r = await client.patch(
+                f"/api/v1/channels/bindings/{body['id']}", json={"instructions": "Be brief."}
+            )
+            assert r.status_code == 200 and r.json()["instructions"] == "Be brief."
+
+            r = await client.get("/api/v1/channels/bindings", params={"channel_type": "telegram"})
+            row = next(b for b in r.json() if b["id"] == body["id"])
+            assert row["instructions"] == "Be brief."
+
+    asyncio.run(flow())
+
+
+def test_telegram_identity_fetch_runs_on_fresh_boot(monkeypatch):
+    # Regression (PR #177 review): a 0.0 cooldown sentinel with time.monotonic
+    # (which counts from boot) skipped the very first getMe whenever machine
+    # uptime < IDENTITY_RETRY_S — fresh CI VMs and just-provisioned agent
+    # boxes ignored group mentions for their first ~5 minutes.
+    methods: list[str] = []
+
+    async def fake_call(bot_token, method, payload):
+        methods.append(method)
+        return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+    monkeypatch.setattr(telegram_plugin, "time", SimpleNamespace(monotonic=lambda: 120.0))
+
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    ev = asyncio.run(bridge.parse_inbound(
+        body=group_telegram_update(95, -500, 1, "hey @antonbot"), headers={}, route_name=None,
+    ))[0]
+    assert "getMe" in methods
+    assert ev.message.is_mention is True
+
+
+def test_telegram_mention_fallback_requires_username_boundary(monkeypatch):
+    # "@antonbot" must not match a mention aimed at "@antonbotdev".
+    async def fake_call(bot_token, method, payload):
+        return {"ok": True, "result": {"id": 999, "username": "AntonBot"}}
+
+    monkeypatch.setattr(telegram_plugin.TelegramBridge, "_call", staticmethod(fake_call))
+
+    async def parse(bridge, body):
+        return (await bridge.parse_inbound(body=body, headers={}, route_name=None))[0]
+
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
+    ev = asyncio.run(parse(bridge, group_telegram_update(96, -600, 1, "@antonbotdev please help")))
+    assert ev.message.is_mention is False
+    ev = asyncio.run(parse(bridge, group_telegram_update(97, -600, 2, "hey @antonbot, listings?")))
+    assert ev.message.is_mention is True
