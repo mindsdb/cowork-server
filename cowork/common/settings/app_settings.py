@@ -5,6 +5,8 @@ from pathlib import Path
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from cowork.common.paths import cowork_home
+
 
 # ── Global model catalog ───────────────────────────────────────────────
 # Recommended models and per-provider model defaults are global,
@@ -125,13 +127,31 @@ def default_publish_url() -> str:
     return f"https://view.{slug}.mindshub.ai" if slug else "https://view.mindshub.ai"
 
 
+def _env_file_chain() -> list[str]:
+    """The ``.env`` search path (pydantic-settings is "last wins").
+
+    ``<COWORK_HOME>/.env`` is the current global config, with a local ``.env``
+    highest for dev overrides. The legacy ``~/.anton/.env`` is a fallback for
+    un-migrated installs — but ONLY for the default (prod) home. An isolated
+    build (``COWORK_HOME`` set) must NOT inherit that prod-era file: a path var
+    living there (``DATABASE_URI``, ``MASTER_KEY_PATH``, ``COWORK_PROJECTS_DIR``,
+    …) would resolve every build back onto the same DB/paths and defeat the
+    isolation (the exact ENG-324 shared-DB failure this exists to prevent).
+
+    COWORK_HOME is read at import; the desktop app sets it before the server
+    process starts, so an isolated build reads its own .env.
+    """
+    files = [str(cowork_home() / ".env"), ".env"]
+    if not os.environ.get("COWORK_HOME"):
+        # Prod (default home) still consults the legacy file, ordered BEFORE
+        # <COWORK_HOME>/.env so the migrated file wins (fresh over stale).
+        files.insert(0, str(Path.home() / ".anton" / ".env"))
+    return files
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        # Global config lives in ~/.cowork/.env now; ~/.anton/.env is kept as
-        # a fallback for un-migrated installs. Order matters: pydantic-settings
-        # is "last wins", so ~/.cowork/.env must come AFTER ~/.anton/.env (fresh
-        # over stale), with local ".env" highest for dev overrides.
-        env_file=[str(Path.home() / ".anton" / ".env"), str(Path.home() / ".cowork" / ".env"), ".env"],
+        env_file=_env_file_chain(),
         env_file_encoding="utf-8",
         env_nested_delimiter="_",
         extra="ignore",
@@ -140,7 +160,8 @@ class Settings(BaseSettings):
 
 class DatabaseSettings(Settings):
     uri: str = Field(
-        default=f"sqlite:///{str(Path.home() / '.cowork' / 'cowork.db')}", description="The database connection URI"
+        default_factory=lambda: f"sqlite:///{cowork_home() / 'cowork.db'}",
+        description="The database connection URI",
     )  # DATABASE_URI
 
     # Connection pool configurations
@@ -161,7 +182,7 @@ class DatabaseSettings(Settings):
 
 class ProjectSettings(Settings):
     root_dir: str = Field(
-        default=str(Path.home() / ".cowork" / "projects"),
+        default_factory=lambda: str(cowork_home() / "projects"),
         validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECTS_ROOT_DIR"),
         description="Root directory where project folders are stored",
     )  # PROJECT_ROOT_DIR or COWORK_PROJECTS_DIR or PROJECTS_ROOT_DIR
@@ -169,7 +190,7 @@ class ProjectSettings(Settings):
 
 class FileSettings(Settings):
     root_dir: str = Field(
-        default=str(Path.home() / ".cowork" / "files"),
+        default_factory=lambda: str(cowork_home() / "files"),
         validation_alias=AliasChoices("COWORK_FILES_DIR", "FILES_ROOT_DIR"),
         description="Root directory where uploaded files are stored",
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
@@ -177,7 +198,7 @@ class FileSettings(Settings):
 
 class SkillSettings(Settings):
     root_dir: str = Field(
-        default=str(Path.home() / ".cowork" / "skills"),
+        default_factory=lambda: str(cowork_home() / "skills"),
         validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
         description="Root directory where agentskills.io-format skill folders are stored",
     )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
@@ -185,7 +206,7 @@ class SkillSettings(Settings):
 
 class ConnectorSettings(Settings):
     vault_dir: str = Field(
-        default=str(Path.home() / ".cowork" / "data-vault"),
+        default_factory=lambda: str(cowork_home() / "data-vault"),
         validation_alias=AliasChoices("COWORK_VAULT_DIR", "CONNECTOR_VAULT_DIR"),
         description="Root directory for the local data vault (saved connector credentials)",
     )
@@ -213,14 +234,14 @@ class OAuthSettings(Settings):
         description="Public base URL of this server, used to build OAuth redirect URIs",
     )
     state_path: str = Field(
-        default=str(Path.home() / ".cowork" / "oauth_state.json"),
+        default_factory=lambda: str(cowork_home() / "oauth_state.json"),
         description="Path to the file used to persist pending OAuth state",
     )
 
 
 class MemorySettings(Settings):
     root_dir: str = Field(
-        default=str(Path.home() / ".cowork" / "memory"),
+        default_factory=lambda: str(cowork_home() / "memory"),
         description="Root directory for all memory files",
     )
 
@@ -232,7 +253,7 @@ class StreamSettings(Settings):
         description="Turn-stream buffer backend: 'file' (desktop / single-instance cloud) or 'redis' (multi-instance cloud, WIP)",
     )
     dir: str = Field(
-        default=str(Path.home() / ".cowork" / "streams"),
+        default_factory=lambda: str(cowork_home() / "streams"),
         validation_alias=AliasChoices("COWORK_STREAMS_DIR"),
         description="Root directory for file-backed turn-stream buffers",
     )
@@ -315,7 +336,7 @@ class AppSettings(Settings):
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
     master_key_path: str = Field(
-        default=str(Path.home() / ".cowork" / ".master_key"),
+        default_factory=lambda: str(cowork_home() / ".master_key"),
         description="Path to the Fernet master key file used to encrypt sensitive settings",
     )  # MASTER_KEY_PATH
 
