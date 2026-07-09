@@ -61,6 +61,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
+    if not _has_table("task_objects"):
+        return
     op.drop_index("ix_task_objects_ref", table_name="task_objects")
     op.drop_index("ix_task_objects_project_id", table_name="task_objects")
     op.drop_index("ix_task_objects_conversation_id", table_name="task_objects")
