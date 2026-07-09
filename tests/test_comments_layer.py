@@ -72,6 +72,12 @@ def test_layer_hidden_popover_and_hover():
     assert "!hel || !isShown(hel)" in LAYER_JS             # hl-on гасит скрытый
 
 
+def test_orphan_notice_skipped_for_general_comments():
+    # A thread created without a selector is an intentional general comment —
+    # the "element was removed or changed" notice must not render for it.
+    assert "orphan && c.selector" in LAYER_JS
+
+
 def _make_project(tmp: str):
     project_dir = Path(tmp) / "proj"
     artifacts = project_dir / ".anton" / "artifacts"
