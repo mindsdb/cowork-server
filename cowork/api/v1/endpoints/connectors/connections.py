@@ -112,3 +112,14 @@ def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody):
     if merged is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "files": merged}
+
+
+@router.delete("/{engine}/{name}/picked-files/{file_id}")
+def delete_picked_file(engine: str, name: str, file_id: str):
+    """Remove one file from the connection's persisted `picked_files`
+    list — the "un-pick" counterpart to patch_picked_files, used by the
+    Project files rail's delete action on a Drive reference row."""
+    remaining = service.remove_picked_file(engine, name, file_id)
+    if remaining is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
+    return {"ok": True, "files": remaining}
