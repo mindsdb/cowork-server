@@ -20,6 +20,18 @@ async def upload_file(
     purpose: Annotated[str, Form()],
     session: SessionDep,
 ):
+    # The "attachment:" namespace is server-owned: conversation attachments
+    # are tagged "attachment:{conversation_id}" by the compat routes, and the
+    # legacy-format rekey (cowork.db.migrations) rewrites multi-colon rows in
+    # that namespace on boot. A client-minted purpose like "attachment:a:b"
+    # would be silently mangled by that pass (ENG-338 review) — reject the
+    # prefix here so every attachment tag is provably server-shaped.
+    if purpose.startswith("attachment:"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The 'attachment:' purpose namespace is reserved; upload "
+            "conversation attachments via /v1/attachments/… instead.",
+        )
     return await FileService(session).create_file(file, purpose)
 
 

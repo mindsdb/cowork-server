@@ -54,8 +54,10 @@ def rekeyed_purpose(purpose: str) -> str | None:
 def upgrade() -> None:
     """Upgrade schema."""
     bind = op.get_bind()
+    # Only old-format rows (two or more colons) — already-new-format rows
+    # never leave the database.
     rows = bind.execute(
-        sa.text("SELECT id, purpose FROM files WHERE purpose LIKE 'attachment:%'")
+        sa.text("SELECT id, purpose FROM files WHERE purpose LIKE 'attachment:%:%'")
     ).fetchall()
     for row_id, purpose in rows:
         new = rekeyed_purpose(purpose)
@@ -64,34 +66,39 @@ def upgrade() -> None:
                 sa.text("UPDATE files SET purpose = :new WHERE id = :id"),
                 {"new": new, "id": row_id},
             )
+    # Index the purpose column: every attachment lookup is an exact match on
+    # it, and the every-boot stray-row scan (cowork.db.migrations) uses an
+    # index-friendly range predicate. Until now it was an unindexed TEXT scan.
+    op.create_index("ix_files_purpose", "files", ["purpose"])
 
 
 def downgrade() -> None:
     """Best-effort restore of "attachment:{project}:{session}" tags.
 
-    Resolves each new-format tag's session id against conversations (ids are
-    stored as 32-char hex on SQLite, while tags carry the dashed string form,
-    so both spellings are tried) and prepends the owning project's name.
-    Unresolvable rows are left as-is (see module docstring).
+    Resolves the new-format tags' session ids against conversations in one
+    batched query (ids are stored as 32-char hex on SQLite while tags carry
+    the dashed string form, so the join strips dashes) and prepends the
+    owning project's name. Unresolvable rows are left as-is (see module
+    docstring).
     """
+    op.drop_index("ix_files_purpose", table_name="files")
     bind = op.get_bind()
+    # One round trip: resolve every new-format row to its project name via
+    # the conversation embedded in the tag. substr(purpose, 12) drops the
+    # 11-char "attachment:" prefix; replace(...) matches the hex id spelling.
     rows = bind.execute(
-        sa.text("SELECT id, purpose FROM files WHERE purpose LIKE 'attachment:%'")
+        sa.text(
+            "SELECT f.id, substr(f.purpose, 12) AS sid, p.name AS project_name "
+            "FROM files f "
+            "JOIN conversations c ON c.id = replace(substr(f.purpose, 12), '-', '') "
+            "     OR c.id = substr(f.purpose, 12) "
+            "JOIN projects p ON p.id = c.project_id "
+            "WHERE f.purpose LIKE 'attachment:%' "
+            "  AND substr(f.purpose, 12) NOT LIKE '%:%'"
+        )
     ).fetchall()
-    for row_id, purpose in rows:
-        rest = purpose[len("attachment:"):]
-        if ":" in rest:
-            continue  # already old-format (or colon-bearing legacy id) — leave
-        project_name = bind.execute(
-            sa.text(
-                "SELECT p.name FROM conversations c "
-                "JOIN projects p ON p.id = c.project_id "
-                "WHERE c.id IN (:sid, :sid_hex)"
-            ),
-            {"sid": rest, "sid_hex": rest.replace("-", "")},
-        ).scalar()
-        if project_name is not None:
-            bind.execute(
-                sa.text("UPDATE files SET purpose = :old WHERE id = :id"),
-                {"old": f"attachment:{project_name}:{rest}", "id": row_id},
-            )
+    for row_id, sid, project_name in rows:
+        bind.execute(
+            sa.text("UPDATE files SET purpose = :old WHERE id = :id"),
+            {"old": f"attachment:{project_name}:{sid}", "id": row_id},
+        )

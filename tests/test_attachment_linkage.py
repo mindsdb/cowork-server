@@ -205,3 +205,34 @@ def test_upload_rejects_colon_bearing_session_ids():
             assert "':'" in r.json()["detail"]
 
     asyncio.run(flow())
+
+
+def test_generic_files_endpoint_rejects_reserved_attachment_namespace():
+    """POST /v1/files must not mint 'attachment:*' purposes — a client-minted
+    'attachment:a:b' would be mangled by the boot-time legacy rekey
+    (ENG-338 review). Non-reserved free-form purposes still work."""
+    import asyncio
+
+    import httpx
+
+    from cowork.server import create_app
+
+    async def flow():
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post(
+                "/api/v1/files/",
+                data={"purpose": "attachment:room:42"},
+                files={"file": ("a.txt", b"hi", "text/plain")},
+            )
+            assert r.status_code == 422
+            assert "reserved" in r.json()["detail"]
+
+            r = await client.post(
+                "/api/v1/files/",
+                data={"purpose": "assistants"},
+                files={"file": ("a.txt", b"hi", "text/plain")},
+            )
+            assert r.status_code == 201
+
+    asyncio.run(flow())
