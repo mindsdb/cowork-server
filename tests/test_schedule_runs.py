@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine
 from sqlmodel import Session, SQLModel
@@ -63,3 +63,81 @@ def test_has_running_run_ignores_manual_run_in_progress():
 
     run_service.finish_run(run.id)
     assert run_service.has_running_run(schedule.id) is False
+
+
+# --- ENG-688: freshness guard — a due cron slot is skipped when a successful
+# run (typically a manual "run now") finished within the cadence window.
+
+def _finish_at(session: Session, run_id, when: datetime) -> None:
+    from cowork.models.schedule import ScheduleRun
+
+    run = session.get(ScheduleRun, run_id)
+    run.finished_at = when
+    session.add(run)
+    session.commit()
+
+
+def test_last_successful_finish_ignores_failures_and_running():
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+
+    assert run_service.last_successful_finish(schedule.id) is None
+
+    failed = run_service.create_run(schedule.id, is_manual=True)
+    run_service.finish_run(failed.id, error="boom")
+    run_service.create_run(schedule.id, is_manual=False)  # still running
+    assert run_service.last_successful_finish(schedule.id) is None
+
+    ok = run_service.create_run(schedule.id, is_manual=True)
+    run_service.finish_run(ok.id)
+    finished = run_service.last_successful_finish(schedule.id)
+    assert finished is not None and finished.tzinfo is not None
+
+
+def test_due_slot_skipped_and_advanced_after_recent_manual_success():
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    schedule = _schedule(session)  # daily, due at 2026-06-25 09:00 UTC
+    run_service = ScheduleRunService(session)
+
+    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
+    run = run_service.create_run(schedule.id, is_manual=True)
+    run_service.finish_run(run.id)
+    _finish_at(session, run.id, now - timedelta(minutes=50))
+
+    assert _due_schedules(session, now) == []
+    session.refresh(schedule)
+    # Slot consumed: advanced past the skipped occurrence to the next day.
+    assert schedule.next_run_at.replace(tzinfo=timezone.utc) > now
+
+
+def test_due_slot_runs_when_last_success_is_old():
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+
+    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
+    run = run_service.create_run(schedule.id, is_manual=True)
+    run_service.finish_run(run.id)
+    _finish_at(session, run.id, now - timedelta(hours=2))
+
+    assert [s.id for s in _due_schedules(session, now)] == [schedule.id]
+
+
+def test_due_slot_runs_when_recent_run_failed():
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+
+    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
+    run = run_service.create_run(schedule.id, is_manual=True)
+    run_service.finish_run(run.id, error="boom")
+    _finish_at(session, run.id, now - timedelta(minutes=10))
+
+    assert [s.id for s in _due_schedules(session, now)] == [schedule.id]
