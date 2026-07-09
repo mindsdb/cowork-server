@@ -12,6 +12,7 @@ from pathlib import Path
 
 from sqlmodel import Session, select
 
+from cowork.common.paths import cowork_home
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import SharedMemoryStore
 from cowork.models.setting import Setting
@@ -22,11 +23,11 @@ logger = logging.getLogger(__name__)
 _MEMORY_MIGRATION_SENTINEL = "_memory_migrated"
 
 _MIGRATION_SOURCES: list[tuple[Path, MemorySlot]] = [
-    (Path.home() / ".cowork/anton/memory/rules.md", MemorySlot.RULES),
-    (Path.home() / ".cowork/anton/memory/lessons.md", MemorySlot.LESSONS),
-    (Path.home() / ".cowork/anton/memory/profile.md", MemorySlot.PROFILE),
-    (Path.home() / ".cowork/hermes/memories/USER.md", MemorySlot.PROFILE),
-    (Path.home() / ".cowork/hermes/memories/MEMORY.md", MemorySlot.LESSONS),
+    (cowork_home() / "anton/memory/rules.md", MemorySlot.RULES),
+    (cowork_home() / "anton/memory/lessons.md", MemorySlot.LESSONS),
+    (cowork_home() / "anton/memory/profile.md", MemorySlot.PROFILE),
+    (cowork_home() / "hermes/memories/USER.md", MemorySlot.PROFILE),
+    (cowork_home() / "hermes/memories/MEMORY.md", MemorySlot.LESSONS),
 ]
 
 

@@ -13,13 +13,12 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Annotated, Any, Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.common.paths import cowork_home
 from cowork.db.session import get_session
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
@@ -290,7 +289,7 @@ async def recommended_models(session: SessionDep):
 
 # ── Raw .env access (legacy, used by Onboarding) ─────────────────────
 
-_ENV_PATH = Path.home() / ".cowork" / ".env"
+_ENV_PATH = cowork_home() / ".env"
 
 
 def _parse_dotenv_content(content: str) -> dict[str, str]:

@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 
 from pydantic import SecretStr
 
+from cowork.common.paths import cowork_home
+
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
@@ -41,9 +43,9 @@ def _cowork_state_dir() -> Path:
     if base:
         path = Path(base).expanduser()
     else:
-        # Consolidated under ~/.cowork (was ~/.anton/cowork); the desktop app
-        # migrates the existing state.json on first run.
-        path = Path.home() / ".cowork"
+        # Consolidated under the cowork data root (was ~/.anton/cowork); the
+        # desktop app migrates the existing state.json on first run.
+        path = cowork_home()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
