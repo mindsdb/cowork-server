@@ -100,7 +100,7 @@ def _conversation_attachment_context(conversation) -> str:
         if db_session is None:
             return ""
         rows = FileService(db_session).list_file_rows(
-            purpose=attachment_purpose(conversation.project.name, str(conversation.id))
+            purpose=attachment_purpose(str(conversation.id))
         )
         # Only list files that still exist on disk — a row whose file was
         # deleted would otherwise hand the agent a dead path to chase.
