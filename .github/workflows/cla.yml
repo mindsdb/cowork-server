@@ -25,4 +25,4 @@ jobs:
           path-to-signatures: 'assets/contributions-agreement/signatures/cla.json'
           path-to-document: 'https://github.com/mindsdb/minds/blob/main/assets/contributions-agreement/individual-contributor.md'
           branch: 'cla'
-          allowlist: bot*, ZoranPandovski, torrmal, Stpmax, mindsdbadmin, ea-rus, hamishfagg, MinuraPunchihewa, martyna-mindsdb, tino097, lucas-koontz, pnewsam, SailingSF, ianu82, hazemahmedx0, alecantu7
+          allowlist: bot*, ZoranPandovski, torrmal, Stpmax, mindsdbadmin, ea-rus, hamishfagg, MinuraPunchihewa, martyna-mindsdb, tino097, lucas-koontz, pnewsam, SailingSF, ianu82, hazemahmedx0, alecantu7, sejubar
