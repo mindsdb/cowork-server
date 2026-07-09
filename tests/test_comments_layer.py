@@ -44,7 +44,7 @@ def test_layer_supports_edit_delete_protocol():
     for token in [
         "'edit'", "'delete'", "'edit-reply'", "'delete-reply'",
         "author_user_id", "edited_at", "isMine", "viewer",
-        "Удалить эту цепочку комментариев", "Удалить этот комментарий",
+        "Delete this comment thread?", "Delete this reply?",
     ]:
         assert token in LAYER_JS, token
 
