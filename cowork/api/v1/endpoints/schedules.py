@@ -20,10 +20,17 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
+def _serialize(schedule, session: Session) -> dict:
+    """ScheduleResponse plus the live `running` flag (any in-flight run)."""
+    data = ScheduleResponse.serialize(schedule)
+    data["running"] = ScheduleRunService(session).has_active_run(schedule.id)
+    return data
+
+
 @router.get("/")
 def list_schedules(session: SessionDep, project_id: UUID | None = None):
     schedules = ScheduleService(session).list_schedules(project_id=project_id)
-    return {"schedules": [ScheduleResponse.serialize(s) for s in schedules]}
+    return {"schedules": [_serialize(s, session) for s in schedules]}
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -38,13 +45,13 @@ def create_schedule(body: ScheduleCreateRequest, session: SessionDep):
         project_id=body.project_id,
         enabled=body.enabled,
     )
-    return ScheduleResponse.serialize(schedule)
+    return _serialize(schedule, session)
 
 
 @router.get("/{schedule_id}")
 def get_schedule(schedule_id: UUID, session: SessionDep):
     try:
-        return ScheduleResponse.serialize(ScheduleService(session).get_schedule(schedule_id))
+        return _serialize(ScheduleService(session).get_schedule(schedule_id), session)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -59,7 +66,7 @@ def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, session: Ses
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return ScheduleResponse.serialize(schedule)
+    return _serialize(schedule, session)
 
 
 @router.delete("/{schedule_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -72,7 +79,7 @@ def delete_schedule(schedule_id: UUID, session: SessionDep):
 @router.post("/{schedule_id}/pause")
 def pause_schedule(schedule_id: UUID, session: SessionDep):
     try:
-        return ScheduleResponse.serialize(ScheduleService(session).pause_schedule(schedule_id))
+        return _serialize(ScheduleService(session).pause_schedule(schedule_id), session)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -80,7 +87,7 @@ def pause_schedule(schedule_id: UUID, session: SessionDep):
 @router.post("/{schedule_id}/resume")
 def resume_schedule(schedule_id: UUID, session: SessionDep):
     try:
-        return ScheduleResponse.serialize(ScheduleService(session).resume_schedule(schedule_id))
+        return _serialize(ScheduleService(session).resume_schedule(schedule_id), session)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 

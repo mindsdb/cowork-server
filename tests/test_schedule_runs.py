@@ -141,3 +141,36 @@ def test_due_slot_runs_when_recent_run_failed():
     _finish_at(session, run.id, now - timedelta(minutes=10))
 
     assert [s.id for s in _due_schedules(session, now)] == [schedule.id]
+
+
+# --- ENG-688: cancelled-run status + the UI-facing "running" flag.
+
+def test_finish_run_status_override_records_cancelled():
+    from cowork.schemas.schedules import RunStatus
+
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+
+    run = run_service.create_run(schedule.id, is_manual=False)
+    finished = run_service.finish_run(run.id, status=RunStatus.cancelled)
+    assert finished.status == RunStatus.cancelled
+    assert finished.error is None
+    # A cancelled run is not a success: it neither blocks via the freshness
+    # guard nor counts as the last successful finish.
+    assert run_service.last_successful_finish(schedule.id) is None
+
+
+def test_has_active_run_counts_manual_runs():
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+
+    assert run_service.has_active_run(schedule.id) is False
+    run = run_service.create_run(schedule.id, is_manual=True)
+    # Manual runs are invisible to the cron-overlap guard but visible here.
+    assert run_service.has_running_run(schedule.id) is False
+    assert run_service.has_active_run(schedule.id) is True
+
+    run_service.finish_run(run.id)
+    assert run_service.has_active_run(schedule.id) is False
