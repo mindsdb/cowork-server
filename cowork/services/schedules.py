@@ -121,6 +121,23 @@ class ScheduleRunService:
         ).first()
         return run is not None
 
+    def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
+        """When the schedule's most recent successful run (manual or cron)
+        finished, or None if it never succeeded. Used by the scheduler's
+        freshness guard to skip a due slot right after e.g. a manual run.
+        """
+        run = self.session.exec(
+            select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status == RunStatus.success)
+            .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+        if run is None or run.finished_at is None:
+            return None
+        finished = run.finished_at
+        return finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
+
     def finish_run(
         self,
         run_id: UUID,

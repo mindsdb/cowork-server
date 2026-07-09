@@ -19,6 +19,19 @@ _scheduler_task: asyncio.Task | None = None
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
 
+# Freshness guard (ENG-688): if a successful run — typically a manual
+# "run now" — finished this recently before a due cron slot, the slot is
+# skipped instead of executed, so both runs don't publish the same output
+# twice. Hourly gets a tighter window so consecutive slots never suppress
+# each other even when a run finishes mid-hour.
+_FRESHNESS_WINDOW_SECONDS = {
+    Cadence.once: 60 * 60,
+    Cadence.hourly: 30 * 60,
+    Cadence.daily: 60 * 60,
+    Cadence.weekdays: 60 * 60,
+    Cadence.weekly: 60 * 60,
+}
+
 
 def _advance_next_run_at(schedule: Schedule, session) -> None:
     if schedule.cadence == Cadence.once:
@@ -144,6 +157,40 @@ async def execute_schedule(
         session.close()
 
 
+def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: datetime) -> bool:
+    window = _FRESHNESS_WINDOW_SECONDS.get(schedule.cadence)
+    if not window:
+        return False
+    last = run_service.last_successful_finish(schedule.id)
+    return last is not None and (now - last).total_seconds() < window
+
+
+def _due_schedules(session, now: datetime) -> list[Schedule]:
+    """Enabled schedules whose slot is due and should actually execute.
+
+    A due slot with a successful run inside the freshness window is skipped
+    and advanced to its next occurrence instead of returned.
+    """
+    run_service = ScheduleRunService(session)
+    due: list[Schedule] = []
+    skipped = False
+    for s in ScheduleService(session).list_schedules():
+        if not s.enabled or ensure_utc(s.next_run_at) > now or run_service.has_running_run(s.id):
+            continue
+        if _ran_recently(s, run_service, now):
+            logger.info(
+                f"Schedule {s.id}: skipping due slot — a successful run "
+                "finished within the freshness window"
+            )
+            _advance_next_run_at(s, session)
+            skipped = True
+            continue
+        due.append(s)
+    if skipped:
+        session.commit()
+    return due
+
+
 async def _scheduler_loop() -> None:
     logger.info("Scheduler loop started")
     while True:
@@ -151,15 +198,7 @@ async def _scheduler_loop() -> None:
         session = get_open_session()
         try:
             _handle_missed_runs(session)
-            now = datetime.now(timezone.utc)
-            run_service = ScheduleRunService(session)
-            schedules = ScheduleService(session).list_schedules()
-            due = [
-                s for s in schedules
-                if s.enabled
-                and ensure_utc(s.next_run_at) <= now
-                and not run_service.has_running_run(s.id)
-            ]
+            due = _due_schedules(session, datetime.now(timezone.utc))
         except Exception:
             logger.exception("Scheduler loop error during poll")
             due = []
