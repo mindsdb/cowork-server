@@ -48,8 +48,11 @@ _SessionDep = Annotated[Session, Depends(get_session)]
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:
+    # `project_name` is still part of the client-facing route but is
+    # deliberately ignored: purposes are keyed by conversation id only, so a
+    # project rename can't strand attachments (ENG-338).
     from cowork.services.files import attachment_purpose
-    return attachment_purpose(project_name, session_id)
+    return attachment_purpose(session_id)
 
 
 def _to_attachment(file) -> dict:
