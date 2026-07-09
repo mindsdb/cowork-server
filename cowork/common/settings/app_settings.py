@@ -5,7 +5,7 @@ from pathlib import Path
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, is_default_home
 
 
 # ── Global model catalog ───────────────────────────────────────────────
@@ -133,16 +133,19 @@ def _env_file_chain() -> list[str]:
     ``<COWORK_HOME>/.env`` is the current global config, with a local ``.env``
     highest for dev overrides. The legacy ``~/.anton/.env`` is a fallback for
     un-migrated installs — but ONLY for the default (prod) home. An isolated
-    build (``COWORK_HOME`` set) must NOT inherit that prod-era file: a path var
+    build (a relocated home) must NOT inherit that prod-era file: a path var
     living there (``DATABASE_URI``, ``MASTER_KEY_PATH``, ``COWORK_PROJECTS_DIR``,
     …) would resolve every build back onto the same DB/paths and defeat the
     isolation (the exact ENG-324 shared-DB failure this exists to prevent).
 
-    COWORK_HOME is read at import; the desktop app sets it before the server
-    process starts, so an isolated build reads its own .env.
+    Gated on :func:`is_default_home`, NOT on whether ``COWORK_HOME`` is set: the
+    desktop prod build may set ``COWORK_HOME=~/.cowork`` explicitly, which is
+    still the default home and must keep the legacy fallback. COWORK_HOME is
+    read at import; the desktop app sets it before the server process starts,
+    so an isolated build reads its own .env.
     """
     files = [str(cowork_home() / ".env"), ".env"]
-    if not os.environ.get("COWORK_HOME"):
+    if is_default_home():
         # Prod (default home) still consults the legacy file, ordered BEFORE
         # <COWORK_HOME>/.env so the migrated file wins (fresh over stale).
         files.insert(0, str(Path.home() / ".anton" / ".env"))
