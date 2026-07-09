@@ -49,6 +49,29 @@ def test_layer_supports_edit_delete_protocol():
         assert token in LAYER_JS, token
 
 
+def test_layer_reports_anchor_states():
+    # Классификация видимости якоря и её отправка наружу (для пометки "hidden"
+    # в инбоксе). anchored не репортится; scroll-путь исключён.
+    for token in [
+        "isShown",
+        "'anchor-states'",
+        "function reportAnchors",
+        "function scheduleReport",
+        "getClientRects().length",
+        "attributeFilter: ['style', 'class', 'hidden']",
+    ]:
+        assert token in LAYER_JS, token
+
+
+def test_layer_hidden_popover_and_hover():
+    # Скрытый якорь (резолвится, но не показан) открывает центрированный попап
+    # с отдельным hidden-нотисом; hover не рисует нулевой бокс.
+    assert "isShown(m.target)" in LAYER_JS
+    assert "to see it in place" in LAYER_JS                 # hidden-нотис (contiguous chunk)
+    assert "el && isShown(el)" in LAYER_JS                 # focus не скроллит к скрытому
+    assert "!hel || !isShown(hel)" in LAYER_JS             # hl-on гасит скрытый
+
+
 def _make_project(tmp: str):
     project_dir = Path(tmp) / "proj"
     artifacts = project_dir / ".anton" / "artifacts"

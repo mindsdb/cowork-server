@@ -454,6 +454,11 @@ LAYER_JS = r"""
 
   function isClosed(c){ return c.status === 'resolved' || c.status === 'dismissed'; }
 
+  // A resolvable but not-laid-out anchor (inactive slide/tab, collapsed
+  // section) has zero client rects; isShown() distinguishes it from a truly
+  // detached/removed element.
+  function isShown(el){ return !!(el && el.getClientRects().length); }
+
   // ── Markers ──────────────────────────────────────────────────────────────
   // One DOM node per live anchored thread, keyed by id and repositioned via
   // transform in a measure-then-write rAF batch (no per-marker reflow).
@@ -500,6 +505,7 @@ LAYER_JS = r"""
       m.target = live[id].el;
     });
     positionMarkers();
+    reportAnchors();
   }
   // Measure phase then write phase — avoids interleaved layout thrash.
   function positionMarkers(){
@@ -545,15 +551,41 @@ LAYER_JS = r"""
     if (syncRAF) return;
     syncRAF = requestAnimationFrame(function(){ syncRAF = 0; syncMarkers(); });
   }
+  // Classify anchored threads for the inbox: 'orphan' (selector no longer
+  // resolves) or 'hidden' (resolves but not currently laid out — e.g. an
+  // inactive slide/tab). 'anchored' is the norm and is NOT reported (absence
+  // == anchored). isShown changes only via mutation/resize, never scroll, so
+  // this is wired to those paths — not the scroll-bound positionMarkers.
+  var _lastAnchorSig = '';
+  function reportAnchors(){
+    var states = {}, sig = [];
+    comments.forEach(function(c){
+      if (c.status === 'dismissed' || !c.selector) return;
+      var el; try { el = document.querySelector(c.selector); } catch (e) { el = null; }
+      var st = !el ? 'orphan' : (isShown(el) ? null : 'hidden');
+      if (st) { states[c.id] = st; sig.push(c.id + ':' + st); }
+    });
+    sig = sig.sort().join('|');
+    if (sig === _lastAnchorSig) return;   // signature-gate: silent on scroll / no-op mutations
+    _lastAnchorSig = sig;
+    send({type:'anchor-states', states: states});
+  }
+  var repRAF = 0;
+  function scheduleReport(){
+    if (repRAF) return;
+    repRAF = requestAnimationFrame(function(){ repRAF = 0; reportAnchors(); });
+  }
   // Keep positions honest across scrolls (incl. nested containers), resizes
   // and late layout shifts (images loading, DOM mutations).
+  // scroll never changes isShown (only rect position) → reposition only.
   window.addEventListener('scroll', scheduleMarkers, {capture: true, passive: true});
-  window.addEventListener('resize', scheduleMarkers, {passive: true});
-  window.addEventListener('load', scheduleMarkers);
+  // resize / mutations / late layout CAN change visibility → also reclassify.
+  window.addEventListener('resize', function(){ scheduleMarkers(); scheduleReport(); }, {passive: true});
+  window.addEventListener('load', function(){ scheduleMarkers(); scheduleReport(); });
   if (document.fonts && document.fonts.ready)
-    document.fonts.ready.then(scheduleMarkers);
+    document.fonts.ready.then(function(){ scheduleMarkers(); scheduleReport(); });
   if (typeof ResizeObserver !== 'undefined')
-    new ResizeObserver(scheduleMarkers).observe(document.documentElement);
+    new ResizeObserver(function(){ scheduleMarkers(); scheduleReport(); }).observe(document.documentElement);
   if (typeof MutationObserver !== 'undefined')
     new MutationObserver(function(muts){
       for (var i = 0; i < muts.length; i++){
@@ -562,10 +594,10 @@ LAYER_JS = r"""
         // otherwise trigger a full marker re-measure per frame.
         if (t === mk || (t.closest && t.closest('#act-mk,.act-pop,.act-menu,.act-hl')))
           continue;
-        scheduleMarkers(); return;
+        scheduleMarkers(); scheduleReport(); return;
       }
     }).observe(document.body, {childList: true, subtree: true, attributes: true,
-                               attributeFilter: ['style', 'class']});
+                               attributeFilter: ['style', 'class', 'hidden']});
 
   // ── Popovers ─────────────────────────────────────────────────────────────
   var menuBtn = null, ghost = null, pendingCreate = false;
@@ -748,7 +780,7 @@ LAYER_JS = r"""
     if (!c) return;
     var m = markerEls[id];
     var p, orphan = false;
-    if (m && m.target && m.target.isConnected) {
+    if (m && m.target && isShown(m.target)) {
       var r = rectOf(m.target);
       p = popNextToMarker(r.right, r.top - 28);
     } else {
@@ -762,10 +794,17 @@ LAYER_JS = r"""
     }
     var resolved = c.status === 'resolved';
     var mine = isMine(c);
+    var _el = null;
+    if (c.selector) { try { _el = document.querySelector(c.selector); } catch (e) {} }
+    var hiddenAnchor = !!(_el && !isShown(_el));
     var notice = orphan
-      ? '<div class="act-orphan">' + ICONS.unlink
-        + '<span>The annotated element was removed, changed, or is not currently '
-        + 'visible.</span></div>'
+      ? (hiddenAnchor
+          ? '<div class="act-orphan">' + ICONS.unlink
+            + '<span>This comment is pinned to a part of the page that is not visible '
+            + 'right now — open that slide or section to see it in place.</span></div>'
+          : '<div class="act-orphan">' + ICONS.unlink
+            + '<span>The annotated element was removed or changed, so this comment '
+            + 'is no longer attached to the page.</span></div>')
       : '';
     var msgs = msgHTML({author: c.author, created_at: c.created_at, text: c.text,
                         edited_at: c.edited_at, mine: mine});
@@ -1008,11 +1047,11 @@ LAYER_JS = r"""
       if (!c) return;
       var el = null;
       if (c.selector) { try { el = document.querySelector(c.selector); } catch (e) {} }
-      if (el) {
+      if (el && isShown(el)) {
         el.scrollIntoView({behavior:'smooth', block:'center'});
         setTimeout(function(){ openThread(c.id); }, 250);
       } else {
-        // Unanchored / orphaned: open at the asking card if coords came along.
+        // Unanchored / orphaned / hidden (on another slide): center + notice.
         openThread(c.id, d.at || null);
       }
     }
@@ -1021,7 +1060,7 @@ LAYER_JS = r"""
       var hc = comments.filter(function(x){ return x.id === d.commentId; })[0];
       var hel = null;
       if (hc && hc.selector) { try { hel = document.querySelector(hc.selector); } catch (e) {} }
-      if (!hel) { hl.style.opacity = '0'; return; }
+      if (!hel || !isShown(hel)) { hl.style.opacity = '0'; return; }
       var hr = rectOf(hel);
       hl.style.opacity = '1';
       hl.style.top = hr.top + 'px'; hl.style.left = hr.left + 'px';
