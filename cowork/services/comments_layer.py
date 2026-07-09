@@ -797,7 +797,7 @@ LAYER_JS = r"""
     var _el = null;
     if (c.selector) { try { _el = document.querySelector(c.selector); } catch (e) {} }
     var hiddenAnchor = !!(_el && !isShown(_el));
-    var notice = orphan
+    var notice = (orphan && c.selector)
       ? (hiddenAnchor
           ? '<div class="act-orphan">' + ICONS.unlink
             + '<span>This comment is pinned to a part of the page that is not visible '
