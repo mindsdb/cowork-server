@@ -147,11 +147,10 @@ def test_project_rename_keeps_attachments_reachable(session, tmp_path, monkeypat
     from cowork.api.v1.endpoints.compat.stubs import list_attachments
     from cowork.services.projects import ProjectService
 
-    projects_root = tmp_path / "projects"
-    projects_root.mkdir()
-    monkeypatch.setattr(
-        ProjectService, "_project_path", lambda self, name: projects_root / name,
-    )
+    # Sanctioned filesystem isolation (same pattern as test_schema_migrations):
+    # settings-level projects dir, not a private-method patch.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
 
     psvc = ProjectService(session)
     project = psvc.create_project(name="Campaign-Monitoring-2026")
@@ -170,24 +169,39 @@ def test_project_rename_keeps_attachments_reachable(session, tmp_path, monkeypat
     assert [r["name"] for r in rows] == ["report.csv"]
 
 
-def test_migration_rekeys_old_format_purposes():
-    """The data migration keeps only the trailing session id — including for
-    project names that themselves contain colons — and leaves new-format
-    and non-attachment purposes alone (idempotent)."""
-    import importlib.util
-    from pathlib import Path
-
-    path = Path(__file__).parent.parent / (
-        "cowork/db/alembic/versions/f7d2b9e4a1c6_attachment_purpose_by_id.py"
-    )
-    spec = importlib.util.spec_from_file_location("mig_f7d2b9e4a1c6", path)
-    mig = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mig)
+def test_legacy_purpose_rekey_parsing():
+    """The legacy-format parser keeps only the trailing session id — including
+    for project names that themselves contain colons — and leaves new-format
+    and non-attachment purposes alone. (The alembic migration's frozen twin is
+    exercised end-to-end in test_schema_migrations.py.)"""
+    from cowork.db.migrations import rekey_legacy_attachment_purpose as rekey
 
     sid = "d6ad2000-915b-4915-baf4-369e2db05f17"
-    assert mig.rekeyed_purpose(f"attachment:My Project:{sid}") == f"attachment:{sid}"
-    assert mig.rekeyed_purpose(f"attachment:odd:name:with:colons:{sid}") == f"attachment:{sid}"
+    assert rekey(f"attachment:My Project:{sid}") == f"attachment:{sid}"
+    assert rekey(f"attachment:odd:name:with:colons:{sid}") == f"attachment:{sid}"
     # Already new-format → untouched.
-    assert mig.rekeyed_purpose(f"attachment:{sid}") is None
+    assert rekey(f"attachment:{sid}") is None
     # Non-attachment purposes → untouched.
-    assert mig.rekeyed_purpose("assistants") is None
+    assert rekey("assistants") is None
+
+
+def test_upload_rejects_colon_bearing_session_ids():
+    """Colon-bearing session ids would make old-format tags unparseable for
+    the legacy rekey — the upload route refuses them up front (ENG-338)."""
+    import asyncio
+
+    import httpx
+
+    from cowork.server import create_app
+
+    async def flow():
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post(
+                "/api/v1/attachments/general/bad:id/upload",
+                files={"files": ("a.txt", b"hi", "text/plain")},
+            )
+            assert r.status_code == 422
+            assert "':'" in r.json()["detail"]
+
+    asyncio.run(flow())

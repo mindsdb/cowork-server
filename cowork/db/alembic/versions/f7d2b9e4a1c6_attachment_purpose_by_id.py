@@ -4,15 +4,21 @@ Old format: "attachment:{project_name}:{session_id}" — coupling the tag to
 the mutable project name stranded every existing attachment the moment a
 project was renamed (ENG-338). New format: "attachment:{session_id}".
 
-Rewrites every old-format row by keeping only the segment after the LAST
-colon (project names may themselves contain colons; session ids never do —
-they are UUIDs or client-allocated ids minted without colons). Rows already
-in the new format (exactly one colon) and non-attachment purposes are left
-untouched, so the migration is idempotent.
+Upgrade rewrites every old-format row by keeping only the segment after the
+LAST colon (project names may themselves contain colons; session ids from
+real clients — UUIDs or the legacy timestamp allocator — never do, and the
+upload route now rejects colon-bearing ids). Rows already in the new format
+and non-attachment purposes are untouched, so re-applying is a no-op.
+`cowork.db.migrations` also runs the same rewrite on every boot as a safety
+net for old-format rows written by an older build after this migration ran.
 
-Downgrade is a no-op: the project-name segment is not recoverable from the
-tag alone, and the old code can still relink by conversation id, so nothing
-is lost by leaving new-format tags in place.
+Downgrade is BEST-EFFORT: the project-name segment can usually be
+reconstructed by resolving the tag's conversation id to its project
+(files.purpose → conversations.project_id → projects.name). Rows whose
+conversation no longer exists (or was never adopted) stay in the new
+format — old code cannot see those either way, so nothing further is lost —
+which makes rolling the app back after upgrading lossy for exactly that
+subset. Prefer roll-forward.
 
 Revision ID: f7d2b9e4a1c6
 Revises: e8b3c5d7a9f1
@@ -33,7 +39,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def rekeyed_purpose(purpose: str) -> str | None:
     """New-format tag for an old-format attachment purpose, or None if the
-    row needs no rewrite. Pure so it can be unit-tested directly."""
+    row needs no rewrite. Frozen twin of
+    cowork.db.migrations.rekey_legacy_attachment_purpose (migrations stay
+    self-contained; the live copy backs the every-boot safety net)."""
     if not purpose.startswith("attachment:"):
         return None
     rest = purpose[len("attachment:"):]
@@ -59,4 +67,31 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema — intentionally a no-op (see module docstring)."""
+    """Best-effort restore of "attachment:{project}:{session}" tags.
+
+    Resolves each new-format tag's session id against conversations (ids are
+    stored as 32-char hex on SQLite, while tags carry the dashed string form,
+    so both spellings are tried) and prepends the owning project's name.
+    Unresolvable rows are left as-is (see module docstring).
+    """
+    bind = op.get_bind()
+    rows = bind.execute(
+        sa.text("SELECT id, purpose FROM files WHERE purpose LIKE 'attachment:%'")
+    ).fetchall()
+    for row_id, purpose in rows:
+        rest = purpose[len("attachment:"):]
+        if ":" in rest:
+            continue  # already old-format (or colon-bearing legacy id) — leave
+        project_name = bind.execute(
+            sa.text(
+                "SELECT p.name FROM conversations c "
+                "JOIN projects p ON p.id = c.project_id "
+                "WHERE c.id IN (:sid, :sid_hex)"
+            ),
+            {"sid": rest, "sid_hex": rest.replace("-", "")},
+        ).scalar()
+        if project_name is not None:
+            bind.execute(
+                sa.text("UPDATE files SET purpose = :old WHERE id = :id"),
+                {"old": f"attachment:{project_name}:{rest}", "id": row_id},
+            )

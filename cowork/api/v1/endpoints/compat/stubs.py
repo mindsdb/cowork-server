@@ -96,6 +96,15 @@ async def upload_attachment(
     files: list[UploadFile] = File(...),
 ):
     from cowork.services.files import FileService
+    if ":" in session_id:
+        # Real clients mint UUIDs (or the legacy timestamp format) — neither
+        # contains a colon. Rejecting colon-bearing ids keeps every
+        # "attachment:{session_id}" tag unambiguously parseable by the
+        # legacy-format rekey in cowork.db.migrations (ENG-338).
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="session_id must not contain ':'",
+        )
     svc = FileService(session)
     purpose = _attachment_purpose(project_name, session_id)
     results = []
