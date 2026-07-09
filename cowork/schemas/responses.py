@@ -156,3 +156,17 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Connections to exclude from this turn (client sends on every request)",
     )
+    # Generic observability pass-through. Whatever a caller puts here is
+    # forwarded verbatim to the harness → LLM router → Langfuse trace, so new
+    # eval / telemetry use-cases can attach data without changing this server or
+    # the harness. `trace_tags` become Langfuse trace tags (indexed, filterable
+    # — e.g. an eval run id); `trace_metadata` becomes free-form trace metadata.
+    # Both are optional and ignored by harnesses that don't emit traces.
+    trace_tags: list[str] | None = Field(
+        default=None,
+        description="Tags to attach to this turn's LLM trace (e.g. an eval run id).",
+    )
+    trace_metadata: dict[str, str] | None = Field(
+        default=None,
+        description="Arbitrary key/value metadata to attach to this turn's LLM trace.",
+    )

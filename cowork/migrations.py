@@ -26,10 +26,13 @@ import logging
 import shutil
 from pathlib import Path
 
+from cowork.common.settings.app_settings import default_minds_api_host
+
 from sqlmodel import Session, select
 from pydantic import ValidationError
 
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
+from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
@@ -40,7 +43,7 @@ from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
 
-_ENV_PATH = Path.home() / ".cowork" / ".env"
+_ENV_PATH = cowork_home() / ".env"
 
 # v2: path corrected from ~/.anton/.env to ~/.cowork/.env; bumped so users
 # with the old sentinel (which may have found nothing) get a fresh run.
@@ -182,11 +185,10 @@ def migrate_env_to_db(session: Session) -> bool:
 # with a failing provider ("Endpoint not found — check the base URL") and no
 # UI field to correct it. This backfill closes that gap.
 _LEGACY_MINDS_HOSTS = ("https://mdb.ai", "http://mdb.ai")
-_CANONICAL_MINDS_URL = "https://api.mindshub.ai"
 
 
 def backfill_minds_url(session: Session) -> bool:
-    """Rewrite the legacy MindsHub host (mdb.ai) to api.mindshub.ai.
+    """Rewrite the legacy MindsHub host (mdb.ai) to the env-appropriate host.
 
     Touches both ``providers_json`` (the per-provider ``mindsUrl`` the
     Test/ping uses) and the top-level ``minds_url``. Idempotent and
@@ -196,6 +198,7 @@ def backfill_minds_url(session: Session) -> bool:
 
     Returns True if any row was rewritten.
     """
+    canonical = default_minds_api_host()
     svc = SettingService(session)
     changed: list[str] = []
     for key in ("providers_json", "minds_url"):
@@ -204,7 +207,7 @@ def backfill_minds_url(session: Session) -> bool:
             continue
         new_val = row.value
         for legacy in _LEGACY_MINDS_HOSTS:
-            new_val = new_val.replace(legacy, _CANONICAL_MINDS_URL)
+            new_val = new_val.replace(legacy, canonical)
         if new_val != row.value:
             row.value = new_val
             session.add(row)
@@ -213,8 +216,8 @@ def backfill_minds_url(session: Session) -> bool:
         session.commit()
         invalidate_user_settings_cache()
         logger.info(
-            "Backfilled legacy MindsHub host (mdb.ai -> api.mindshub.ai) in: %s",
-            ", ".join(changed),
+            "Backfilled legacy MindsHub host (mdb.ai -> %s) in: %s",
+            canonical, ", ".join(changed),
         )
     return bool(changed)
 

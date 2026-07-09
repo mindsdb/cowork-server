@@ -7,6 +7,7 @@ from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     PLANNING_MODEL_DEFAULTS,
     Settings,
+    default_minds_url,
     get_app_settings,
 )
 
@@ -179,7 +180,7 @@ class UserSettings(Settings):
         description="API key for MindsHub. Required if using MindsHub as a provider.",
     )
     minds_url: str = Field(
-        default="https://api.mindshub.ai/v1",
+        default_factory=default_minds_url,
         title="MindsHub URL",
         description="Base URL for the MindsHub API.",
     )

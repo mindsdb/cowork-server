@@ -63,6 +63,7 @@ class BindingCreateRequest(BaseModel):
     display_name: str | None = None
     trigger_rule: TriggerRule = TriggerRule.always
     trigger_pattern: str | None = None
+    instructions: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
 
@@ -73,6 +74,7 @@ class BindingUpdateRequest(BaseModel):
     display_name: str | None = None
     trigger_rule: TriggerRule | None = None
     trigger_pattern: str | None = None
+    instructions: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
 
@@ -85,6 +87,7 @@ class BindingResponse(BaseModel):
     display_name: str | None = None
     trigger_rule: TriggerRule
     trigger_pattern: str | None = None
+    instructions: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
     created_at: datetime | None = None
