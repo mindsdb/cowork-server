@@ -122,10 +122,21 @@ def _rekey_stray_legacy_attachment_rows(connection: sa.Connection) -> int:
     ahead-guard) can boot against an already-migrated DB and write NEW
     old-format rows; on re-upgrade ``command.upgrade`` is a no-op and those
     rows would be invisible forever. Running the same rewrite on every boot
-    heals them. Costs one indexed-free LIKE scan; normally rewrites nothing.
+    heals them. The range predicate walks ix_files_purpose (created by
+    f7d2b9e4a1c6) — a prefix-wildcard LIKE alone would full-scan — so a clean
+    boot costs one index seek over the attachment tags; normally it rewrites
+    nothing. Only server-shaped tags can be multi-colon: the compat upload
+    route rejects colon-bearing session ids and POST /v1/files rejects the
+    "attachment:" namespace outright, so anything this matches is a legacy
+    "attachment:{project}:{session}" row by construction.
     """
     rows = connection.execute(
-        sa.text("SELECT id, purpose FROM files WHERE purpose LIKE 'attachment:%:%'")
+        # ';' is ':' + 1 — the half-open range covers exactly the namespace.
+        sa.text(
+            "SELECT id, purpose FROM files "
+            "WHERE purpose >= 'attachment:' AND purpose < 'attachment;' "
+            "AND purpose LIKE 'attachment:%:%'"
+        )
     ).fetchall()
     rekeyed = 0
     for row_id, purpose in rows:

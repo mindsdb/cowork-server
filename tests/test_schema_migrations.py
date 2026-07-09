@@ -249,6 +249,10 @@ def test_attachment_rekey_upgrade_rewrites_old_format_rows(tmp_path, monkeypatch
     assert purposes["02" * 16] == f"attachment:{SID}"
     assert purposes["03" * 16] == f"attachment:{SID}"
     assert purposes["04" * 16] == "assistants"
+    # The migration also creates the purpose index the boot-time rekey walks.
+    with sqlite3.connect(db_path) as connection:
+        indexes = {row[1] for row in connection.execute("pragma index_list(files)")}
+    assert "ix_files_purpose" in indexes
 
 
 def test_attachment_rekey_downgrade_restores_names_best_effort(tmp_path, monkeypatch):

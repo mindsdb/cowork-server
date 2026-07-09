@@ -126,7 +126,7 @@ class TaskObjectService:
         conversation: Conversation,
         source: Project,
         dest: Project,
-    ) -> dict:
+    ) -> int:
         """Move everything the task owns from `source` to `dest`:
           • artifact folders are physically moved into the destination's
             artifacts tree (prefixed on a name collision; `.published.json`
@@ -138,8 +138,7 @@ class TaskObjectService:
         Best-effort: a failure on one object is logged and skipped rather
         than aborting the whole move. Returns the moved-artifact count.
         """
-        moved_artifacts = self._relocate_artifacts(conversation, source, dest)
-        return {"artifacts": moved_artifacts}
+        return self._relocate_artifacts(conversation, source, dest)
 
     def _relocate_artifacts(self, conversation: Conversation, source: Project, dest: Project) -> int:
         rows = self.reconcile_conversation(conversation, source)
