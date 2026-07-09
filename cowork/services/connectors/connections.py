@@ -142,6 +142,37 @@ class ConnectionsService:
         vault.save(engine, name, fields, secure_keys=secure_keys)
         return merged
 
+    def remove_picked_file(self, engine: str, name: str, file_id: str) -> list[dict] | None:
+        """Drop one file from the connection's persisted `picked_files`
+        list — the inverse of merge_picked_files. Only revokes our own
+        bookkeeping of the grant (stops the agent from being told about
+        the file); does not necessarily revoke Google's own server-side
+        record of it.
+
+        Returns the resulting list, or None if the connection doesn't exist.
+        """
+        vault = self._vault()
+        if hasattr(vault, "read_record"):
+            record = vault.read_record(engine, name)
+        else:
+            raw = vault.load(engine, name)
+            record = {"engine": engine, "name": name, "fields": raw} if raw is not None else None
+        if record is None:
+            return None
+
+        fields = dict(record.get("fields") or {})
+        secure_keys = record.get("secure_keys")
+        try:
+            existing = json.loads(fields.get("picked_files") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            existing = []
+
+        remaining = [f for f in existing if not (isinstance(f, dict) and f.get("id") == file_id)]
+
+        fields["picked_files"] = json.dumps(remaining)
+        vault.save(engine, name, fields, secure_keys=secure_keys)
+        return remaining
+
     def delete(self, engine: str, name: str) -> bool:
         return self._vault().delete(engine, name)
 
