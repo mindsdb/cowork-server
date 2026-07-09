@@ -37,7 +37,7 @@ def _make_conversation(session: Session, project_name: str) -> Conversation:
 def test_context_lists_attached_file_paths(tmp_path):
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-1")
-        purpose = attachment_purpose("Cyberdeck-ctx-1", str(conv.id))
+        purpose = attachment_purpose(str(conv.id))
         # Real files on disk — the helper only lists paths that exist.
         files = {}
         for name in ("README.md", "Kyle_Logo.png"):
@@ -61,7 +61,7 @@ def test_context_lists_attached_file_paths(tmp_path):
 def test_context_skips_files_missing_from_disk(tmp_path):
     with _session() as session:
         conv = _make_conversation(session, "ctx-miss")
-        purpose = attachment_purpose("ctx-miss", str(conv.id))
+        purpose = attachment_purpose(str(conv.id))
         present = tmp_path / "here.md"
         present.write_text("x")
         session.add(File(filename="here.md", content_type="text/plain", size=1, purpose=purpose, path=str(present)))
@@ -134,7 +134,7 @@ def test_context_skips_one_corrupt_row_keeps_others(tmp_path, monkeypatch):
 
     with _session() as session:
         conv = _make_conversation(session, "ctx-corrupt")
-        purpose = attachment_purpose("ctx-corrupt", str(conv.id))
+        purpose = attachment_purpose(str(conv.id))
         session.add(File(filename="good.md", content_type="text/plain", size=1, purpose=purpose, path=str(good)))
         session.add(File(filename="bad.md", content_type="text/plain", size=1, purpose=purpose, path=bad_path))
         session.commit()

@@ -11,7 +11,6 @@ from sqlmodel import Session, select
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
-from cowork.services.files import FileService, attachment_purpose
 
 logger = logging.getLogger(__name__)
 
@@ -132,14 +131,15 @@ class TaskObjectService:
           • artifact folders are physically moved into the destination's
             artifacts tree (prefixed on a name collision; `.published.json`
             rides along inside the folder so the public URL is preserved);
-          • attachment files are re-tagged to the destination project
-            (their bytes live outside any project dir, so no file move).
+          • attachment files need no re-tagging: purposes are keyed by the
+            conversation id, not the project (ENG-338), so they follow the
+            conversation automatically (their bytes live outside any project
+            dir, so no file move either).
         Best-effort: a failure on one object is logged and skipped rather
         than aborting the whole move. Returns counts.
         """
         moved_artifacts = self._relocate_artifacts(conversation, source, dest)
-        relinked_files = self._relink_files(conversation, source, dest)
-        return {"artifacts": moved_artifacts, "files": relinked_files}
+        return {"artifacts": moved_artifacts, "files": 0}
 
     def _relocate_artifacts(self, conversation: Conversation, source: Project, dest: Project) -> int:
         rows = self.reconcile_conversation(conversation, source)
@@ -182,13 +182,6 @@ class TaskObjectService:
         while (dest_base / f"{prefixed}-{i}").exists():
             i += 1
         return f"{prefixed}-{i}"[:255]
-
-    def _relink_files(self, conversation: Conversation, source: Project, dest: Project) -> int:
-        old_purpose = attachment_purpose(source.name, str(conversation.id))
-        new_purpose = attachment_purpose(dest.name, str(conversation.id))
-        if old_purpose == new_purpose:
-            return 0
-        return FileService(self.session).relink_purpose(old_purpose, new_purpose)
 
 
 # ── run-boundary attribution ──────────────────────────────────────────────

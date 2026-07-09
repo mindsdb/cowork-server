@@ -12,12 +12,19 @@ from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 
 
-def attachment_purpose(project_name: str, session_id: str) -> str:
+def attachment_purpose(session_id: str) -> str:
     """Canonical purpose tag for conversation attachments. The composer
     uploads against a client-allocated conversation id, and the rail's
     Task Uploads list queries by the live conversation id — both must
-    derive the tag from here or uploads strand (ENG-264)."""
-    return f"attachment:{project_name}:{session_id}"
+    derive the tag from here or uploads strand (ENG-264).
+
+    Keyed by the conversation/session id ONLY — never by the project name.
+    The name is mutable, so embedding it stranded every attachment on a
+    project rename (ENG-338) and let long names overflow the purpose column
+    (ENG-333); the id is stable and fixed-width. Old-format tags
+    ("attachment:{project}:{session}") are rewritten by migration
+    f7d2b9e4a1c6."""
+    return f"attachment:{session_id}"
 
 
 class FileService:
