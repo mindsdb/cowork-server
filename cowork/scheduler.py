@@ -9,7 +9,7 @@ from cowork.common.logger import get_logger
 from cowork.db.session import get_open_session
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
-from cowork.schemas.schedules import Cadence
+from cowork.schemas.schedules import Cadence, RunStatus
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 
 logger = get_logger(__name__)
@@ -104,6 +104,7 @@ async def execute_schedule(
     run = run_service.create_run(schedule_id, is_manual=is_manual)
 
     error: str | None = None
+    final_status: RunStatus | None = None
     try:
         schedule = schedule_service.get_schedule(schedule_id)
 
@@ -126,18 +127,34 @@ async def execute_schedule(
         async for _ in stream:
             pass
 
-        # Refresh schedule in case it changed during execution
-        schedule = schedule_service.get_schedule(schedule_id)
-        schedule.last_run_at = datetime.now(timezone.utc)
-        schedule.last_result_conversation_id = conversation_id
-        schedule.last_error = None
-        schedule.missed_runs = 0
-        session.add(schedule)
+        # A user cancel (/responses/cancel) closes the stream normally from
+        # the consumer's side, so ask the run registry whether the producer
+        # was cancelled — otherwise the run would be recorded as success.
+        from cowork.streaming.registry import registry
 
-        if not is_manual:
-            _advance_next_run_at(schedule, session)
+        handle = registry.get(str(conversation_id))
+        if handle is not None and handle.task.cancelled():
+            final_status = RunStatus.cancelled
+            logger.info(f"Schedule {schedule_id} run was cancelled")
+            # Still consume the cron slot: the schedule stays due otherwise
+            # and the loop would immediately restart the run the user killed.
+            schedule = schedule_service.get_schedule(schedule_id)
+            if not is_manual:
+                _advance_next_run_at(schedule, session)
+            session.commit()
+        else:
+            # Refresh schedule in case it changed during execution
+            schedule = schedule_service.get_schedule(schedule_id)
+            schedule.last_run_at = datetime.now(timezone.utc)
+            schedule.last_result_conversation_id = conversation_id
+            schedule.last_error = None
+            schedule.missed_runs = 0
+            session.add(schedule)
 
-        session.commit()
+            if not is_manual:
+                _advance_next_run_at(schedule, session)
+
+            session.commit()
 
     except Exception as exc:
         error = str(exc)
@@ -151,7 +168,9 @@ async def execute_schedule(
             pass
     finally:
         try:
-            run_service.finish_run(run.id, conversation_id=conversation_id, error=error)
+            run_service.finish_run(
+                run.id, conversation_id=conversation_id, error=error, status=final_status
+            )
         except Exception:
             logger.exception(f"Failed to finish run record for schedule {schedule_id}")
         session.close()
