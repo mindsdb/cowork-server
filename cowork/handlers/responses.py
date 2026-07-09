@@ -385,7 +385,7 @@ class ResponsesHandler:
         """Repoint attachments uploaded against a client-side session id to
         the conversation that actually got created, so the Task Uploads
         rail (which queries by the live conversation id) still finds them."""
-        from cowork.services.files import FileService, attachment_purpose
+        from cowork.services.files import attachment_purpose
 
         moved = FileService(self.session).relink_purpose(
             attachment_purpose(client_session_id),
