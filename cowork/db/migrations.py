@@ -95,6 +95,67 @@ def _assert_db_not_ahead(config: Config, connection: sa.Connection) -> None:
         )
 
 
+def rekey_legacy_attachment_purpose(purpose: str) -> str | None:
+    """New-format tag for an old-format attachment purpose, or None if the
+    row needs no rewrite.
+
+    Old format: "attachment:{project_name}:{session_id}"; new format:
+    "attachment:{session_id}" (ENG-338). Keeps the segment after the LAST
+    colon — project names may contain colons; session ids from real clients
+    (UUIDs, the legacy timestamp allocator) never do, and the upload route
+    rejects colon-bearing ids to keep it that way. Twin of the frozen copy
+    inside migration f7d2b9e4a1c6.
+    """
+    if not purpose.startswith("attachment:"):
+        return None
+    rest = purpose[len("attachment:"):]
+    if ":" not in rest:
+        return None  # already new-format
+    return f"attachment:{rest.rsplit(':', 1)[1]}"
+
+
+def _rekey_stray_legacy_attachment_rows(connection: sa.Connection) -> int:
+    """Idempotent safety net behind migration f7d2b9e4a1c6.
+
+    The alembic migration rewrites old-format rows exactly once — but a
+    rolled-back build from the skip-on-unknown-revision era (pre ENG-324
+    ahead-guard) can boot against an already-migrated DB and write NEW
+    old-format rows; on re-upgrade ``command.upgrade`` is a no-op and those
+    rows would be invisible forever. Running the same rewrite on every boot
+    heals them. The range predicate walks ix_files_purpose (created by
+    f7d2b9e4a1c6) — a prefix-wildcard LIKE alone would full-scan — so a clean
+    boot costs one index seek over the attachment tags; normally it rewrites
+    nothing. Only server-shaped tags can be multi-colon: the compat upload
+    route rejects colon-bearing session ids and POST /v1/files rejects the
+    "attachment:" namespace outright, so anything this matches is a legacy
+    "attachment:{project}:{session}" row by construction.
+    """
+    rows = connection.execute(
+        # ';' is ':' + 1 — the half-open range covers exactly the namespace.
+        sa.text(
+            "SELECT id, purpose FROM files "
+            "WHERE purpose >= 'attachment:' AND purpose < 'attachment;' "
+            "AND purpose LIKE 'attachment:%:%'"
+        )
+    ).fetchall()
+    rekeyed = 0
+    for row_id, purpose in rows:
+        new = rekey_legacy_attachment_purpose(purpose)
+        if new is not None:
+            connection.execute(
+                sa.text("UPDATE files SET purpose = :new WHERE id = :id"),
+                {"new": new, "id": row_id},
+            )
+            rekeyed += 1
+    if rekeyed:
+        logger.warning(
+            "Re-keyed %d stray legacy attachment purpose row(s) — likely "
+            "written by an older build against this database (ENG-338).",
+            rekeyed,
+        )
+    return rekeyed
+
+
 def run_schema_migrations(engine: Engine, db_uri: str) -> None:
     """Run schema migrations, baselining pre-Alembic local databases."""
     config = _alembic_config(db_uri)
@@ -103,3 +164,4 @@ def run_schema_migrations(engine: Engine, db_uri: str) -> None:
         _stamp_existing_schema(config, connection)
         _assert_db_not_ahead(config, connection)
         command.upgrade(config, "head")
+        _rekey_stray_legacy_attachment_rows(connection)

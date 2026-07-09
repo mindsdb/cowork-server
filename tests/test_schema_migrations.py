@@ -180,3 +180,121 @@ def test_task_objects_downgrade_guards_missing_table(tmp_path, monkeypatch):
     _downgrade_to(engine, uri, "c4e7a1b9d2f0")  # must not raise
 
     assert _alembic_version(db_path) == "c4e7a1b9d2f0"
+
+
+# ── ENG-338: attachment purpose re-keying (f7d2b9e4a1c6) ─────────────────
+
+ATTACH_REKEY_REV = "f7d2b9e4a1c6"
+SID = "d6ad2000-915b-4915-baf4-369e2db05f17"
+ORPHAN_SID = "e7be3111-026c-5026-cbf5-47af3ec16f28"
+
+
+def _upgrade_to(engine, uri: str, revision: str) -> None:
+    config = _alembic_config(uri)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, revision)
+
+
+def _insert_file(path, file_id: str, purpose: str) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO files (id, filename, content_type, size, purpose, path,"
+            " created_at, modified_at) VALUES (?, 'f.csv', 'text/csv', 1, ?, '',"
+            " CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            (file_id, purpose),
+        )
+        connection.commit()
+
+
+def _purposes(path) -> dict[str, str]:
+    with sqlite3.connect(path) as connection:
+        return dict(connection.execute("SELECT id, purpose FROM files"))
+
+
+def _seed_conversation(path, sid: str, project_name: str) -> None:
+    """Project + conversation the downgrade join can resolve. Uuid columns
+    store 32-char hex (see the init migration's GENERAL_PROJECT_ID.hex)."""
+    project_hex = "aa" * 16
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO projects (id, name, path, is_active) VALUES (?, ?, '', 0)",
+            (project_hex, project_name),
+        )
+        connection.execute(
+            "INSERT INTO conversations (id, topic, project_id) VALUES (?, 't', ?)",
+            (sid.replace("-", ""), project_hex),
+        )
+        connection.commit()
+
+
+def test_attachment_rekey_upgrade_rewrites_old_format_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "rekey.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "e8b3c5d7a9f1")  # the revision before the rekey
+
+    _insert_file(db_path, "01" * 16, f"attachment:My Project:{SID}")
+    _insert_file(db_path, "02" * 16, f"attachment:odd:name:with:colons:{SID}")
+    _insert_file(db_path, "03" * 16, f"attachment:{SID}")  # already new-format
+    _insert_file(db_path, "04" * 16, "assistants")  # non-attachment
+
+    _upgrade_to(engine, uri, "head")
+
+    purposes = _purposes(db_path)
+    assert purposes["01" * 16] == f"attachment:{SID}"
+    assert purposes["02" * 16] == f"attachment:{SID}"
+    assert purposes["03" * 16] == f"attachment:{SID}"
+    assert purposes["04" * 16] == "assistants"
+    # The migration also creates the purpose index the boot-time rekey walks.
+    with sqlite3.connect(db_path) as connection:
+        indexes = {row[1] for row in connection.execute("pragma index_list(files)")}
+    assert "ix_files_purpose" in indexes
+
+
+def test_attachment_rekey_downgrade_restores_names_best_effort(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "rekey-down.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    _seed_conversation(db_path, SID, "Campaign-Q3")
+    _insert_file(db_path, "01" * 16, f"attachment:{SID}")
+    # No conversation row for this one — downgrade can't resolve a project.
+    _insert_file(db_path, "02" * 16, f"attachment:{ORPHAN_SID}")
+
+    _downgrade_to(engine, uri, "e8b3c5d7a9f1")
+
+    purposes = _purposes(db_path)
+    assert purposes["01" * 16] == f"attachment:Campaign-Q3:{SID}"
+    assert purposes["02" * 16] == f"attachment:{ORPHAN_SID}"  # left as-is
+
+    # Round-trip: re-upgrading rewrites the restored row back to new-format.
+    _upgrade_to(engine, uri, "head")
+    assert _purposes(db_path)["01" * 16] == f"attachment:{SID}"
+
+
+def test_startup_rekeys_stray_rows_written_by_old_builds(tmp_path, monkeypatch):
+    # A rolled-back skip-on-unknown-revision build can write old-format rows
+    # AFTER f7d2b9e4a1c6 already ran; `alembic upgrade head` is then a no-op,
+    # so run_schema_migrations must heal them itself on every boot.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "stray.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _alembic_version(db_path) == expected_head()
+
+    _insert_file(db_path, "05" * 16, f"attachment:Renamed Project:{SID}")
+
+    run_schema_migrations(engine, uri)  # simulated next boot
+
+    assert _purposes(db_path)["05" * 16] == f"attachment:{SID}"
