@@ -11,6 +11,7 @@ from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence, RunStatus
 from cowork.services.schedules import ScheduleRunService, ScheduleService
+from cowork.streaming.registry import registry
 
 logger = get_logger(__name__)
 
@@ -117,6 +118,8 @@ async def execute_schedule(
             )
             conversation_id = conversation.id
 
+        run_service.set_run_conversation(run.id, conversation_id)
+
         # Stamp the run's identity on the Langfuse trace (existing pass-through
         # seam) so incident forensics don't have to reconstruct which schedule/
         # trigger produced a turn from timestamps.
@@ -137,34 +140,38 @@ async def execute_schedule(
         async for _ in stream:
             pass
 
-        # A user cancel (/responses/cancel) closes the stream normally from
-        # the consumer's side, so ask the run registry whether the producer
-        # was cancelled — otherwise the run would be recorded as success.
-        from cowork.streaming.registry import registry
+        # A cancel or a producer failure closes the stream normally from the
+        # consumer's side (the producer runs detached and even swallows its
+        # own CancelledError, so handle.task.cancelled() stays False). The
+        # buffer's terminal record is the only truthful signal of how the
+        # turn ended — without it every run is recorded as success.
+        reason = await _turn_terminal_reason(str(conversation_id))
 
-        handle = registry.get(str(conversation_id))
-        if handle is not None and handle.task.cancelled():
+        # Refresh schedule in case it changed during execution
+        schedule = schedule_service.get_schedule(schedule_id)
+        if reason == "cancelled":
             final_status = RunStatus.cancelled
             logger.info(f"Schedule {schedule_id} run was cancelled")
-            # Still consume the cron slot: the schedule stays due otherwise
-            # and the loop would immediately restart the run the user killed.
-            schedule = schedule_service.get_schedule(schedule_id)
-            if not is_manual:
-                _advance_next_run_at(schedule, session)
-            session.commit()
+        elif reason is not None and reason != "completed":
+            final_status = RunStatus.failed
+            error = "Run did not complete — open the run's task for details."
+            schedule.last_error = error
+            session.add(schedule)
         else:
-            # Refresh schedule in case it changed during execution
-            schedule = schedule_service.get_schedule(schedule_id)
             schedule.last_run_at = datetime.now(timezone.utc)
             schedule.last_result_conversation_id = conversation_id
             schedule.last_error = None
             schedule.missed_runs = 0
             session.add(schedule)
 
-            if not is_manual:
-                _advance_next_run_at(schedule, session)
+        # Always consume the cron slot: the schedule stays due otherwise and
+        # the loop would immediately restart the run the user killed (a
+        # cancelled/failed run isn't a success, so the freshness guard
+        # wouldn't block the restart).
+        if not is_manual:
+            _advance_next_run_at(schedule, session)
 
-            session.commit()
+        session.commit()
 
     except Exception as exc:
         error = str(exc)
@@ -184,6 +191,27 @@ async def execute_schedule(
         except Exception:
             logger.exception(f"Failed to finish run record for schedule {schedule_id}")
         session.close()
+
+
+async def _turn_terminal_reason(conversation_id: str) -> str | None:
+    """Terminal reason ("completed" | "cancelled" | "error" | …) of the turn
+    that just ended on this conversation, or None when unavailable.
+
+    Only call after the turn's stream has been fully drained: the buffer is
+    closed then, so tailing from the last record returns immediately."""
+    handle = registry.get(conversation_id)
+    if handle is None or not handle.buffer.is_closed:
+        return None
+    try:
+        buffer = handle.buffer
+        async for rec in buffer.tail(max(buffer.latest_seq - 1, 0)):
+            if rec.is_terminal:
+                return str(rec.data.get("reason") or "") or None
+    except Exception:
+        logger.exception(
+            f"Could not read terminal state for conversation {conversation_id}"
+        )
+    return None
 
 
 def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: datetime) -> bool:

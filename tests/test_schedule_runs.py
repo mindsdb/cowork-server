@@ -232,3 +232,197 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
         s = get_open_session()
         ScheduleService(s).delete_schedule(schedule_id)
         s.close()
+
+
+# --- ENG-688: how the run actually ended comes from the stream buffer's
+# terminal record. The producer runs detached and swallows its own
+# cancellation (task.cancelled() stays False), so the terminal record is the
+# only truthful signal — without it a cancelled or failed run is recorded as
+# success.
+
+def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import cowork.scheduler as scheduler_mod
+    from cowork.streaming.buffer import FileStreamBuffer
+
+    buf = FileStreamBuffer(tmp_path / "turn.jsonl")
+
+    async def _fill():
+        await buf.append("sse", {"sse": "event: response.created"})
+        await buf.close("cancelled")
+
+    asyncio.run(_fill())
+    monkeypatch.setattr(
+        scheduler_mod, "registry",
+        SimpleNamespace(get=lambda cid: SimpleNamespace(buffer=buf)),
+    )
+    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) == "cancelled"
+
+
+def test_turn_terminal_reason_none_without_handle(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import cowork.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "registry", SimpleNamespace(get=lambda cid: None))
+    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
+
+
+def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
+    """Run execute_schedule with a no-op turn and a forced terminal reason;
+    return the resulting run/schedule state as plain values."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    import cowork.scheduler as scheduler_mod
+    from cowork.common.datetime_utils import ensure_utc
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.services.schedules import ScheduleService
+
+    class FakeHandler:
+        def __init__(self, session):
+            pass
+
+        async def handle(self, request):
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    async def _terminal(_conversation_id):
+        return reason
+
+    monkeypatch.setattr(scheduler_mod, "_turn_terminal_reason", _terminal)
+
+    session = get_open_session()
+    schedule = ScheduleService(session).create_schedule(
+        title="terminal mapping test",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    original_next = ensure_utc(schedule.next_run_at)
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=is_manual))
+        check = get_open_session()
+        fresh = ScheduleService(check).get_schedule(schedule_id)
+        run = ScheduleRunService(check).list_runs(schedule_id)[0]
+        state = {
+            "run_status": run.status,
+            "run_error": run.error,
+            "run_conversation_id": run.conversation_id,
+            "last_error": fresh.last_error,
+            "last_run_at": fresh.last_run_at,
+            "next_advanced": ensure_utc(fresh.next_run_at) > original_next,
+        }
+        check.close()
+        return state
+    finally:
+        s = get_open_session()
+        ScheduleService(s).delete_schedule(schedule_id)
+        s.close()
+
+
+def test_execute_schedule_records_cancelled_and_consumes_slot(monkeypatch):
+    from cowork.schemas.schedules import RunStatus
+
+    state = _execute_with_terminal(monkeypatch, "cancelled")
+    assert state["run_status"] == RunStatus.cancelled
+    assert state["run_error"] is None
+    assert state["last_error"] is None
+    assert state["last_run_at"] is None
+    # The slot is consumed — otherwise the next tick restarts the run the
+    # user just killed (a cancelled run isn't a success, so the freshness
+    # guard wouldn't block it).
+    assert state["next_advanced"] is True
+
+
+def test_execute_schedule_records_producer_error_as_failed(monkeypatch):
+    from cowork.schemas.schedules import RunStatus
+
+    state = _execute_with_terminal(monkeypatch, "error")
+    assert state["run_status"] == RunStatus.failed
+    assert state["run_error"]
+    assert state["last_error"]
+    assert state["next_advanced"] is True
+
+
+def test_execute_schedule_completed_is_success(monkeypatch):
+    from cowork.schemas.schedules import RunStatus
+
+    state = _execute_with_terminal(monkeypatch, "completed")
+    assert state["run_status"] == RunStatus.success
+    assert state["run_error"] is None
+    assert state["last_error"] is None
+    assert state["last_run_at"] is not None
+    assert state["next_advanced"] is True
+
+
+def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
+    """The run's conversation is recorded as soon as it exists — not at
+    finish — so the runs list can open a run that is still executing."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.services.schedules import ScheduleService
+
+    session = get_open_session()
+    schedule = ScheduleService(session).create_schedule(
+        title="early link test",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    seen: dict = {}
+
+    class FakeHandler:
+        def __init__(self, session):
+            pass
+
+        async def handle(self, request):
+            check = get_open_session()
+            run = ScheduleRunService(check).list_runs(schedule_id)[0]
+            seen["conversation_id_during_turn"] = (
+                str(run.conversation_id) if run.conversation_id else None
+            )
+            seen["request_conversation"] = request.conversation
+            check.close()
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert seen["conversation_id_during_turn"] == seen["request_conversation"]
+    finally:
+        s = get_open_session()
+        ScheduleService(s).delete_schedule(schedule_id)
+        s.close()
