@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -9,6 +10,8 @@ from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.models.project import Project
+
+logger = logging.getLogger(__name__)
 
 
 GENERAL_PROJECT = "general"
@@ -173,7 +176,16 @@ class ProjectService:
             ).all()
         )
         for cid in conv_ids:
-            conv_svc.delete_conversation(cid)
+            # Fault-isolated: one conversation failing to delete must not abort
+            # the whole project delete and leave it half-cascaded. Log and move
+            # on — a skipped conversation just retains today's orphan behavior.
+            try:
+                conv_svc.delete_conversation(cid)
+            except Exception:
+                logger.warning(
+                    "delete_project: failed to delete conversation %s; skipping", cid,
+                    exc_info=True,
+                )
         path = Path(project.path)
         if path.exists():
             shutil.rmtree(path)
