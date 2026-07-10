@@ -110,6 +110,20 @@ _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 _REASON_UNKNOWN_MODEL = "unknown_model"
 
+# Wire-level code for a transient provider incident that didn't clear within
+# anton's retry budget (ENG-673) — the model provider (or an upstream it depends
+# on) was overloaded/erroring mid-stream and backoff-retry ran out of time. The
+# renderer keys a card on it (retry, and — for BYOK/direct users — a MindsHub
+# cross-provider-failover nudge), so it's distinct from the model-gate codes.
+PROVIDER_OVERLOADED_CODE = "provider_overloaded"
+
+# Fallback copy if the exception carries no usable message — anton normally
+# supplies curated, user-facing copy which we pass through verbatim.
+PROVIDER_OVERLOADED_FALLBACK_MESSAGE = (
+    "The model provider is having a temporary incident and didn't recover in "
+    "time. Try again in a moment."
+)
+
 # Redacted stand-in for any failure we haven't mapped — never the raw
 # provider text.
 GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
@@ -191,6 +205,28 @@ def model_unavailable_info(exc: Exception) -> tuple[str, str] | None:
         pass
     code = getattr(exc, "code", None)
     if isinstance(code, str) and code in _MODEL_UNAVAILABLE_CODES:
+        return code, str(getattr(exc, "model", "") or "")
+    return None
+
+
+def provider_overloaded_info(exc: Exception) -> tuple[str, str] | None:
+    """``(code, model)`` when the turn died on a transient provider incident
+    that outlasted anton's retry budget — anton's ``ProviderOverloadedError``
+    carrying ``code == provider_overloaded`` and the model alias (ENG-673).
+
+    Prefers the typed check; falls back to duck-typing on ``code``/``model`` so a
+    version-skewed anton (type not importable / moved) still maps. Deliberately
+    NO string matching — only the structured code triggers the card.
+    """
+    try:
+        from anton.core.llm.provider import ProviderOverloadedError
+
+        if isinstance(exc, ProviderOverloadedError):
+            return exc.code, str(getattr(exc, "model", "") or "")
+    except Exception:
+        pass
+    code = getattr(exc, "code", None)
+    if code == PROVIDER_OVERLOADED_CODE:
         return code, str(getattr(exc, "model", "") or "")
     return None
 
@@ -409,6 +445,11 @@ def friendly_turn_error(
             return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
 
+    # A transient-incident timeout (ENG-673) — anton's message is already curated
+    # ("<provider> is experiencing an incident…"); pass it through.
+    overloaded = provider_overloaded_info(exc)
+    if overloaded is not None:
+        return overloaded[0], str(exc) or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
     if model_info is _UNSET:
         model_info = model_unavailable_info(exc)
     if model_info is not None:
