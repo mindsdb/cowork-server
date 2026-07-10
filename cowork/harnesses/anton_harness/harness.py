@@ -447,36 +447,54 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            for conn in data_vault.list_connections():
-                data_vault.inject_env(conn["engine"], conn["name"])
 
         # Google Drive's google_drive connector uses the drive.file OAuth
         # scope, which only covers files the app created itself, plus files
         # the user explicitly granted access to via the Google Picker
-        # (persisted as a `picked_files` vault field — see
+        # (persisted as a `_picked_files` vault field — see
         # cowork/api/v1/endpoints/connectors/connections.py). A plain
         # files.list()/files.search() call does NOT return the latter, so
         # without calling them out by name here the agent has no way to
-        # know they're reachable at all — inject_env() above only puts the
+        # know they're reachable at all — inject_env() below only puts the
         # raw JSON in an env var, which isn't enough on its own for the
         # agent to notice or act on.
+        #
+        # One pass over list_connections() does both inject_env() (every
+        # connection) and the picked-files extraction (google_drive only)
+        # — this runs on every chat turn, so a second full vault scan here
+        # would double the directory I/O and JSON parsing for no reason.
         integration_guidance = ""
+        picked_by_connection: dict[str, list[dict]] = {}
         if data_vault is not None:
-            picked_by_connection: dict[str, list[dict]] = {}
             for conn in data_vault.list_connections():
-                if conn.get("engine") != "google_drive":
+                engine, name = conn["engine"], conn["name"]
+                data_vault.inject_env(engine, name)
+                if engine != "google_drive":
                     continue
-                name = conn.get("name")
-                fields = data_vault.load(conn["engine"], name) or {}
-                raw_picked = fields.get("picked_files")
+                fields = data_vault.load(engine, name) or {}
+                raw_picked = fields.get("_picked_files")
                 if not raw_picked:
                     continue
                 try:
                     files = json.loads(raw_picked)
                 except (json.JSONDecodeError, TypeError):
                     files = []
-                if files:
-                    picked_by_connection[name] = files
+                # Surface a file if it's untagged (picked via connection-
+                # details with no project context — a connection-wide grant
+                # meant to be usable everywhere, same as the connection's
+                # other credentials) OR explicitly tagged to THIS project.
+                # A file tagged to a DIFFERENT project only is not this
+                # conversation's to see — that's the actual leak this scoping
+                # closes. Only the Project files RAIL's display (a UI list,
+                # not the agent's access) hides untagged files outside every
+                # project; the agent must still be able to use them anywhere.
+                scoped_files = [
+                    f for f in files
+                    if isinstance(f, dict)
+                    and (not f.get("projects") or conversation.project.name in f["projects"])
+                ]
+                if scoped_files:
+                    picked_by_connection[name] = scoped_files
 
             if picked_by_connection:
                 def _describe(f: dict, conn_name: str) -> str:
