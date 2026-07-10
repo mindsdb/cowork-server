@@ -84,6 +84,7 @@ def test_partial_turn_delete_keeps_task_objects(session):
 from pathlib import Path  # noqa: E402
 
 from cowork.models.conversation import Conversation  # noqa: E402
+from cowork.models.project import Project  # noqa: E402
 from cowork.services.files import FileService, attachment_purpose  # noqa: E402
 from cowork.services.projects import ProjectService  # noqa: E402
 
@@ -144,3 +145,32 @@ def test_delete_project_cascades_conversations_and_attachments(session):
     # … along with its attachment rows + bytes.
     assert _attachment_rows(session, conv.id) == []
     assert not path.exists()
+
+
+def test_delete_project_survives_one_conversation_delete_failure(session, monkeypatch):
+    """Fault isolation: if one conversation fails to delete, the project delete
+    must still complete and clean up the rest — not abort half-cascaded."""
+    proj = ProjectService(session).create_project("eng701-fault-test")
+    svc = ConversationService(session)
+    bad = svc.create_conversation("bad", project_id=proj.id)
+    good = svc.create_conversation("good", project_id=proj.id)
+    _attach(session, bad.id)
+    good_file = _attach(session, good.id)
+
+    real = ConversationService.delete_conversation
+
+    def flaky(self, cid):
+        if str(cid) == str(bad.id):
+            raise RuntimeError("boom")
+        return real(self, cid)
+
+    monkeypatch.setattr(ConversationService, "delete_conversation", flaky)
+
+    assert ProjectService(session).delete_project(proj.id) is True
+    assert session.get(Project, proj.id) is None, "project deleted despite one failure"
+    # The good conversation + its attachment were still cleaned …
+    assert session.get(Conversation, good.id) is None
+    assert _attachment_rows(session, good.id) == []
+    assert not Path(good_file.path).exists()
+    # … the failed one is skipped (logged), left as it was — not fatal.
+    assert session.get(Conversation, bad.id) is not None
