@@ -29,6 +29,26 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
     return filtered
 
 
+def _scratchpad_env_allowlist(data_vault) -> set[str]:
+    """Inject the vault's connections into the process env and return the
+    DS_* var names set — the env allowlist for the scratchpad subprocess.
+
+    Always a set, never None: inject_env() side-effects persist in the
+    server process, so a conversation that yields zero keys (empty vault,
+    all connections disabled) must still get an explicit empty allowlist —
+    None would mean anton's legacy full-env copy, leaking DS_* creds
+    injected by other conversations.
+    """
+    keys: set[str] = set()
+    if data_vault is None:
+        return keys
+    for conn in data_vault.list_connections():
+        injected = data_vault.inject_env(conn["engine"], conn["name"])
+        if injected:
+            keys.update(injected)
+    return keys
+
+
 def _turn_style_context(channel: ChannelContext | None) -> str:
     """Lead block of the system-prompt suffix: desktop activity-row guidance
     for UI turns, support-chat guidance for channel turns.
@@ -446,8 +466,7 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            for conn in data_vault.list_connections():
-                data_vault.inject_env(conn["engine"], conn["name"])
+        scratchpad_env_keys = _scratchpad_env_allowlist(data_vault)
 
         # TODO: Add guidance for integrations
 
@@ -508,7 +527,13 @@ class AntonHarness:
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
             ],
-            cells=cells
+            cells=cells,
+            # Only expose DS_* env vars for connections enabled in this
+            # conversation — prevents unrelated credentials from leaking
+            # into the scratchpad subprocess. Always an explicit set (never
+            # None, anton's legacy copy-everything mode) so the boundary is
+            # enforced even when the conversation yields no keys.
+            scratchpad_env_keys=scratchpad_env_keys,
         )
         return ChatSession(config), temp_vault_dir
 
