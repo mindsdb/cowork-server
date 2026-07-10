@@ -47,6 +47,10 @@ class ChannelBinding(BaseSQLModel, table=True):
     display_name: str | None = Field(default=None, description="Human-facing label for the bound chat")
     trigger_rule: str = Field(default="always", description="always | mention_only | regex")
     trigger_pattern: str | None = Field(default=None, description="Regex source when trigger_rule = regex")
+    instructions: str | None = Field(
+        default=None,
+        description="Operator instructions (persona, tone, scope) for turns served through this binding",
+    )
     anton_project_id: UUID | None = Field(
         default=None,
         foreign_key="projects.id",

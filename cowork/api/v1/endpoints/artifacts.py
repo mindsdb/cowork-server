@@ -19,6 +19,7 @@ from sqlmodel import Session
 from cowork.db.session import get_session
 from cowork.services.artifacts import (
     _project_artifacts_base,
+    artifact_status as _artifact_status,
     delete_artifact as _delete_artifact,
     get_preview_mount,
     list_artifacts as _list_artifacts,
@@ -42,6 +43,13 @@ async def list_artifacts(project_path: str | None = Query(default=None)):
     return _list_artifacts(project_path)
 
 
+@router.get("/status")
+async def artifact_status(path: str = Query(...)):
+    # Cheap published/modified/access read for the preview viewer's in-place
+    # refresh. Never raises for an unknown path — returns the blank default.
+    return _artifact_status(path)
+
+
 @router.get("/preview")
 async def preview_artifact(path: str = Query(...)):
     try:
@@ -56,6 +64,35 @@ async def preview_artifact(path: str = Query(...)):
         raise HTTPException(status_code=415, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not read artifact") from e
+
+
+class _ExportBody(BaseModel):
+    path: str
+    format: str  # 'pdf' | 'docx' | 'html'
+
+
+@router.post("/export")
+async def export_artifact_endpoint(req: _ExportBody):
+    """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
+    the result into the same artifact folder. Returns the new file's path so
+    the client can open or download it."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from cowork.services.artifact_export import ExportError, export_artifact
+
+    try:
+        source = resolve_artifact_path(req.path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    try:
+        out = await run_in_threadpool(export_artifact, source, req.format)
+    except ExportError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Export failed") from e
+    return {"path": str(out), "filename": out.name}
 
 
 @router.post("/preview-mount")

@@ -30,25 +30,16 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
-def _read_published_state(file_path: Path) -> dict[str, str]:
-    """Return `{report_id, url, last_md5}` for the given artifact file,
-    pulled from its parent dir's `.published.json` registry. Empty
-    dict if the file isn't a known publish target."""
-    try:
-        registry = file_path.parent / ".published.json"
-        if not registry.is_file():
-            return {}
-        data = json.loads(registry.read_text(encoding="utf-8"))
-        entry = data.get(file_path.name) if isinstance(data, dict) else None
-        if isinstance(entry, dict):
-            return {
-                "report_id": str(entry.get("report_id") or ""),
-                "url": str(entry.get("url") or ""),
-                "last_md5": str(entry.get("last_md5") or ""),
-            }
-    except Exception:
-        logger.debug("Could not read .published.json next to %s", file_path, exc_info=True)
-    return {}
+def _published_state(raw_path: str) -> dict:
+    """Delegate to the publish service so the tool and GUI agree on where
+    `.published.json` lives. Imported lazily to avoid a startup import cycle."""
+    from cowork.services.publish import published_state
+    return published_state(raw_path)
+
+
+def _publish_artifact(raw_path: str) -> dict:
+    from cowork.services.publish import publish_artifact
+    return publish_artifact(raw_path)
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
@@ -80,6 +71,9 @@ COWORK_PUBLISH_PROMPT = (
     "  publishing or re-publishing.\n"
     "- Re-running with `action: 'publish'` on a file that was already published reuses its\n"
     "  `report_id` so the public URL stays stable across edits.\n"
+    "- NEVER attempt to publish via scratchpad code. There is no `_get_env`, `publish_or_preview`,\n"
+    "  or publish helper available in the scratchpad namespace — calling them will raise NameError.\n"
+    "  The tool handles credential resolution internally; you do not need to fetch or pass an API key.\n"
     "- Do NOT upload, post, or share generated files (HTML, data, images) to external hosting\n"
     "  services (paste sites, gists, CDNs, file hosts) via scratchpad code — unless the user\n"
     "  explicitly names the service and confirms. This rule applies only to sharing generated\n"
@@ -118,126 +112,63 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     if not file_path.exists():
         return f"File not found: {file_path}"
 
-    # 'ask' and 'preview' are non-destructive — the artifact is already
-    # visible in the Live Artifacts panel. We use these calls to also
-    # report the publish state so the LLM can decide on the next step
-    # (re-publish vs publish-for-first-time) without a separate tool.
+    abs_path = str(file_path)
+
+    # 'ask'/'preview' are non-destructive: report current publish state so the
+    # LLM can choose publish-vs-re-publish. State is resolved by the service so
+    # fullstack (.published.json at the artifact root) and static (next to the
+    # primary file) never disagree — the desync that gave fullstack a new URL
+    # on every re-publish.
     #
-    # Why this is worded so directly: the previous version of this
-    # message told the LLM "the user can publish from the Live
-    # Artifacts panel — they don't need a /publish command". The LLM
-    # read that as "publishing is the user's job, not mine" and never
-    # called the tool with action='publish' even when the user
-    # explicitly asked for it. The fix is to spell out the publish
-    # path so the LLM knows it CAN act.
+    # Why the publish path is spelled out so directly: an earlier version told
+    # the LLM "the user can publish from the Live Artifacts panel", which it
+    # read as "publishing is the user's job" and never called action='publish'
+    # even when explicitly asked. The wording below makes clear it CAN act.
     if action in ("ask", "preview"):
-        existing = _read_published_state(file_path)
-        if existing.get("url"):
+        state = _published_state(abs_path)
+        if state.get("published") and state.get("url"):
             return (
-                f"{title} is already published at {existing['url']}. "
+                f"{title} is already published at {state['url']}. "
                 f"It is also visible inline + in the Live Artifacts panel. "
-                f"If the user asks to re-publish (overwrite the public copy), "
-                f"call this tool again with action='publish' — the same "
-                f"report_id will be reused so the URL stays stable."
+                f"If the user asks to re-publish, call this tool again with "
+                f"action='publish' — the same report_id is reused so the URL stays stable."
             )
         return (
             f"{title} is at {file_path} and visible in the Live Artifacts "
-            f"panel. It has NOT been published to the public web yet. "
-            f"If the user asks to publish / share / make it public, call "
-            f"this tool again with action='publish' — MindsHub publishing "
-            f"works directly from chat in the desktop app, no slash "
-            f"command needed."
+            f"panel. It has NOT been published to the public web yet. If the "
+            f"user asks to publish / share / make it public, call this tool "
+            f"again with action='publish' — MindsHub publishing works directly "
+            f"from chat in the desktop app, no slash command needed."
         )
 
     if action != "publish":
         return f"publish_or_preview: unknown action '{action}'"
 
-    # ── action == 'publish' ───────────────────────────────────────────
-    # Read the API key the same way the cowork HTTP endpoint does so
-    # both code paths agree on what's "configured".
-    #
-    # The settings helper lives in `routes.settings` (one level up
-    # from this package). A long-standing typo here pointed at a
-    # `.settings` module that doesn't exist inside `anton_api/`,
-    # so every publish call hit `PUBLISH FAILED: settings module
-    # unavailable (...)`. The LLM then recovered by telling the
-    # user to publish via the Live Artifacts panel — which made
-    # the bug look like a missing-publish-flow, not a typo.
-    from .settings import AntonHarnessSettings
-
-    api_key = _get_env("ANTON_MINDS_API_KEY")
-    if not api_key:
-        return (
-            "STOP: No Minds API key configured. Tell the user to set their "
-            "Minds API key in Settings (or in their .env) before publishing. "
-            "Do NOT call this tool again until they confirm the key is set."
-        )
-
-    settings = AntonHarnessSettings()
-    publish_url = settings.publish_url
-    ssl_verify = settings.publish_ssl_verify
-
+    # action == 'publish' — delegate to the service (single source of truth for
+    # target resolution, fullstack bundling, vault secrets, access, history,
+    # and report_id reuse). The tool always publishes public.
     try:
-        from anton.publisher import publish
-    except Exception as exc:
-        logger.exception("Cowork publish tool could not import anton.publisher")
-        return f"PUBLISH FAILED: anton.publisher unavailable ({exc})"
-
-    output_dir = file_path.parent
-    published_json_path = output_dir / ".published.json"
-    published_map: dict[str, Any] = {}
-    if published_json_path.is_file():
-        try:
-            published_map = json.loads(published_json_path.read_text(encoding="utf-8"))
-        except Exception:
-            published_map = {}
-
-    file_key = file_path.name
-    prev = published_map.get(file_key)
-    report_id = prev.get("report_id") if isinstance(prev, dict) else None
-
-    def _do_publish(rid: str | None):
-        return publish(
-            file_path,
-            api_key=api_key,
-            report_id=rid,
-            publish_url=publish_url,
-            ssl_verify=ssl_verify,
-        )
-
-    try:
-        result = _do_publish(report_id)
-    except Exception as exc:
-        # If we tried to update an existing report and the upstream
-        # rejected it (e.g. report was deleted), retry as a fresh one
-        # — same recovery path anton's CLI tool uses.
-        if report_id:
-            try:
-                result = _do_publish(None)
-            except Exception as retry_exc:
-                logger.exception("Cowork publish retry failed")
-                return f"PUBLISH FAILED: {retry_exc}"
-        else:
-            logger.exception("Cowork publish failed")
-            return f"PUBLISH FAILED: {exc}"
-
-    view_url = result.get("view_url", "") if isinstance(result, dict) else ""
-    returned_report_id = result.get("report_id", "") if isinstance(result, dict) else ""
-
-    if returned_report_id:
-        published_map[file_key] = {
-            "report_id": returned_report_id,
-            "url": view_url,
-            "last_md5": result.get("md5", "") if isinstance(result, dict) else "",
-        }
-        try:
-            published_json_path.write_text(
-                json.dumps(published_map, indent=2) + "\n",
-                encoding="utf-8",
+        result = _publish_artifact(abs_path)
+    except ValueError as exc:
+        # The service raises ValueError for several distinct reasons. Only the
+        # missing-API-key case warrants the STOP/"go configure a key" directive;
+        # others (unsupported file type, unresolvable path) are real publish
+        # failures — surfacing them as STOP would send the user chasing a key
+        # they already have and block a legitimate retry.
+        if "api key" in str(exc).lower():
+            logger.info("Cowork publish blocked: %s", exc)
+            return (
+                "STOP: No Minds API key configured. Tell the user to set their "
+                "Minds API key in Settings (or in their .env) before publishing. "
+                "Do NOT call this tool again until they confirm the key is set."
             )
-        except Exception:
-            logger.debug("Could not persist .published.json", exc_info=True)
+        logger.info("Cowork publish rejected: %s", exc)
+        return f"PUBLISH FAILED: {exc}"
+    except Exception as exc:
+        logger.exception("Cowork publish tool failed")
+        return f"PUBLISH FAILED: {exc}"
 
+    view_url = result.get("url", "") if isinstance(result, dict) else ""
     if not view_url:
         return "Published, but no view URL was returned."
     return f"Published successfully! View URL: {view_url}"
@@ -770,6 +701,74 @@ def build_cowork_request_credentials_tool():
         input_schema=_REQUEST_CREDENTIALS_SCHEMA,
         handler=_cowork_request_credentials,
         prompt=_REQUEST_CREDENTIALS_PROMPT,
+    )
+
+
+# Label Connection Tool
+# Lets the agent persist a human role label ("Support", "Personal") onto a saved
+# connection — the learn-and-persist half of multi-account identity. The label
+# shows up next to the connection (here and in Connected Data Sources) so the
+# right account can be selected later; it does not change the connection's
+# identity/slug or its secrets.
+
+_LABEL_CONNECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "engine": {"type": "string", "description": "The connection's engine, e.g. 'gmail'."},
+        "name": {
+            "type": "string",
+            "description": "The connection's name/slug exactly as shown in Connected Data Sources.",
+        },
+        "label": {
+            "type": "string",
+            "description": "Human role label to assign, e.g. 'Support' or 'Personal'.",
+        },
+    },
+    "required": ["engine", "name", "label"],
+}
+
+_LABEL_CONNECTION_PROMPT = (
+    "Use `label_connection` to give a saved connection a human role label once "
+    "the user tells you which is which — e.g. when two Gmail accounts are "
+    "connected and the user says `regtr@mail.com` is their support address, call "
+    "`label_connection(engine='gmail', name='<slug>', label='Support')`. The label "
+    "is shown beside the connection in Connected Data Sources so you can pick the "
+    "right account later. Never guess a label — ask the user first, then persist it."
+)
+
+
+async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
+    """Tool handler for `label_connection` — persist a human label on a saved
+    connection (learn-and-persist)."""
+    engine = str(tc_input.get("engine", "")).strip()
+    name = str(tc_input.get("name", "")).strip()
+    label = str(tc_input.get("label", "")).strip()
+    if not engine or not name or not label:
+        return "label_connection: `engine`, `name`, and `label` are all required."
+    try:
+        from cowork.services.connectors.persist import set_connection_label
+
+        ok = set_connection_label(engine, name, label)
+    except Exception as exc:
+        logger.exception("Cowork label_connection failed")
+        return f"label_connection: could not set label ({exc})"
+    if not ok:
+        return f"label_connection: no connection `{engine}/{name}` found."
+    return f"Labeled `{engine}/{name}` as “{label}”."
+
+
+def build_cowork_label_connection_tool():
+    from anton.core.tools.tool_defs import ToolDef
+    return ToolDef(
+        name="label_connection",
+        description=(
+            "Assign a human role label (e.g. 'Support', 'Personal') to a saved "
+            "connection so it can be identified and selected later. Use after the "
+            "user clarifies which account is which — never guess."
+        ),
+        input_schema=_LABEL_CONNECTION_SCHEMA,
+        handler=_cowork_label_connection,
+        prompt=_LABEL_CONNECTION_PROMPT,
     )
 
 

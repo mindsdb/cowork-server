@@ -45,19 +45,57 @@ def _resolve_coding(
     coding_api_key: str,
     coding_base_url: str,
 ) -> tuple[str, str, str, str]:
-    """Fill in any blank coding fields from AntonSettings."""
-    from anton.config.settings import AntonSettings
+    """Fill in any blank coding fields from cowork's UserSettings.
 
-    s = AntonSettings()
-    provider = coding_provider or s.coding_provider or ""
-    model = coding_model or s.coding_model or ""
+    UserSettings is the authoritative store and owns the dedicated gemini /
+    openai-compatible key slots, so the key/base resolve through the same single-
+    source helpers (provider_api_key_str / provider_base_url) the agent path
+    uses. AntonSettings carries only the three legacy slots (anthropic / openai /
+    minds), so reading keys from it would hand a dedicated-only gemini /
+    openai-compatible user an empty key — the gap SailingSF flagged on #111.
+    """
+    from cowork.common.settings.user_settings import (
+        UI_TYPE_TO_PROVIDER,
+        get_user_settings,
+        provider_api_key_str,
+    )
+    from cowork.services.providers import provider_base_url
+
+    us = get_user_settings()
+    # Normalize to the dash form up front so every return value (and the lookups
+    # below) is consistent — anton's scratchpad_boot only understands the dash
+    # spellings; the snake form would silently fall through to AnthropicProvider.
+    provider = (coding_provider or us.coding_provider.ui_value).replace("_", "-")
+    model = coding_model or us.coding_model or ""
+    enum_provider = UI_TYPE_TO_PROVIDER.get(provider)
+
+    # Resolve the API key from the correct dedicated slot (gemini/openai-
+    # compatible fall back to the shared openai key). An explicit coding_api_key
+    # always wins.
     if coding_api_key:
         api_key = coding_api_key
-    elif provider == "anthropic":
-        api_key = s.anthropic_api_key or ""
+    elif enum_provider is not None:
+        api_key = provider_api_key_str(us, enum_provider)
     else:
-        api_key = s.openai_api_key or ""
-    base_url = coding_base_url or (s.openai_base_url or "")
+        api_key = ""
+
+    # Derive the base URL deterministically per provider (see
+    # providers.provider_base_url): openai/gemini never inherit the shared
+    # openai_base_url slot, so a stale value left by another provider can't
+    # misroute this key. An explicit coding_base_url always wins. Empty string
+    # means "let anton's OpenAIProvider use its SDK default host".
+    base_url = coding_base_url or provider_base_url(
+        provider, openai_base_url=us.openai_base_url or "", minds_url=us.minds_url
+    ) or ""
+
+    # anton's scratchpad (scratchpad_boot.py) only understands "openai" /
+    # "openai-compatible" → OpenAIProvider; every other string falls through to
+    # AnthropicProvider. minds-cloud and gemini are OpenAI-compatible gateways,
+    # so present them as "openai-compatible" (with their correct base above) —
+    # otherwise the scratchpad would silently hit Anthropic with the wrong key.
+    if provider in ("minds-cloud", "gemini"):
+        provider = "openai-compatible"
+
     return provider, model, api_key, base_url
 
 
