@@ -1,4 +1,4 @@
-"""Publish API endpoints — publish/unpublish HTML artifacts to 4nton.ai.
+"""Publish API endpoints — publish/unpublish HTML artifacts to MindsHub.
 
 Ported from cowork/server/routes/utilities.py (publish section).
 """
@@ -10,9 +10,12 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
 from cowork.services.publish import (
+    activate_version as _activate_version,
     list_publishable,
+    list_versions as _list_versions,
     publish_artifact as _publish,
     unpublish_artifact as _unpublish,
+    update_artifact as _update,
 )
 
 router = APIRouter()
@@ -39,6 +42,15 @@ class _PublishBody(BaseModel):
     access: _AccessBody | None = None
 
 
+class _UpdateBody(BaseModel):
+    path: str
+
+
+class _ActivateBody(BaseModel):
+    path: str
+    md5: str
+
+
 @router.get("/")
 async def list_publishable_endpoint():
     return list_publishable()
@@ -59,10 +71,57 @@ async def publish_artifact(req: _PublishBody):
         raise HTTPException(status_code=502, detail=detail)
 
 
+@router.post("/update")
+async def update_artifact(req: _UpdateBody):
+    try:
+        return _update(req.path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        detail = str(e)
+        if "unavailable" in detail.lower():
+            raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
+
+
 @router.delete("/")
 async def unpublish_artifact(path: str = Query(..., description="Absolute path to the published HTML artifact")):
     try:
         return _unpublish(path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        detail = str(e)
+        if "unavailable" in detail.lower():
+            raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
+
+
+@router.get("/versions")
+async def list_versions_endpoint(
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    try:
+        return _list_versions(path)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        detail = str(e)
+        if "unavailable" in detail.lower():
+            raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
+
+
+@router.post("/activate")
+async def activate_version_endpoint(req: _ActivateBody):
+    try:
+        return _activate_version(req.path, req.md5)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:

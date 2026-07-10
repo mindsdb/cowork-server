@@ -4,6 +4,7 @@ from cowork.common.settings.app_settings import (
     FileSettings,
     ProjectSettings,
     Settings,
+    SkillSettings,
     get_app_settings,
 )
 from cowork.common.settings.user_settings import (
@@ -17,6 +18,7 @@ __all__ = [
     "FileSettings",
     "ProjectSettings",
     "Settings",
+    "SkillSettings",
     "get_app_settings",
     "get_user_settings",
     "invalidate_user_settings_cache",

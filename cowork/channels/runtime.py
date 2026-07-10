@@ -18,13 +18,15 @@ from sqlmodel import select
 from anton.core.dispatch import OutboundMessage
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.session import get_open_session
-from cowork.harnesses.base import get_harness
+from cowork.harnesses.base import ChannelContext, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
+from cowork.models.project import Project
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import list_artifacts
+from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -46,6 +48,20 @@ _DEFAULT_THREAD_KEY = "__default__"
 def turn_used_tools(events: list[dict]) -> bool:
     """Tool/scratchpad activity rides on stream events as ``tool_use_id``."""
     return any(isinstance(event, dict) and "tool_use_id" in event for event in events)
+
+
+def is_new_command(text: str, *, is_mention: bool | None = None) -> bool:
+    """True for a bare /new message; a /new@bot suffix counts unless the platform says the mention isn't us."""
+    tokens = [
+        t for t in (text or "").split()
+        if not (t.startswith("@") or (t.startswith("<@") and t.endswith(">")))
+    ]
+    if len(tokens) != 1:
+        return False
+    cmd = tokens[0].lower()
+    if cmd == "/new":
+        return True
+    return cmd.startswith("/new@") and len(cmd) > len("/new@") and is_mention is not False
 
 
 # Platform typing indicators expire after a few seconds, so refresh while
@@ -219,6 +235,9 @@ class AntonChannelRuntime:
             if not self._should_respond(binding, event):
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
+            if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
+                await self._start_fresh(session, channel_type, binding, event)
+                return
             # Optional hook: adapters with set_typing show a typing indicator
             # for the duration of the turn; others are untouched.
             adapter = self._adapters.get(channel_type)
@@ -230,7 +249,15 @@ class AntonChannelRuntime:
             try:
                 conversation = self._ensure_conversation(session, binding)
                 self._touch_channel_session(session, binding, conversation, event)
-                reply, used_tools = await self._run_anton(session, conversation, event, adapter)
+                channel_context = ChannelContext(
+                    channel_type=channel_type,
+                    is_group=bool(event.message.is_group),
+                    display_name=binding.display_name,
+                    instructions=binding.instructions,
+                )
+                reply, used_tools = await self._run_anton(
+                    session, conversation, event, adapter, channel_context=channel_context
+                )
             finally:
                 if typing is not None:
                     typing.cancel()
@@ -254,6 +281,17 @@ class AntonChannelRuntime:
         finally:
             session.close()
 
+
+    async def _start_fresh(self, session: Session, channel_type: str, binding: ChannelBinding, event: Any) -> None:
+        """Handle /new: detach the pinned conversation and confirm deterministically instead of running a turn."""
+        ChannelBindingService(session).detach_conversation(binding)
+        project = session.get(Project, binding.anton_project_id or self._default_project_id)
+        name = project.name if project else "general"
+        log.info("channel %s: /new detached conversation for binding %s", channel_type, binding.id)
+        await self._deliver(
+            channel_type, event,
+            f'Starting fresh — your next message begins a new conversation in the "{name}" project.',
+        )
 
     def _resolve_or_create_binding(self, session: Session, channel_type: str, event: Any) -> ChannelBinding:
         group_id = event.address.platform_id
@@ -353,7 +391,8 @@ class AntonChannelRuntime:
         return (get_user_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
 
     async def _run_anton(
-        self, session: Session, conversation: Conversation, event: Any, adapter: Any = None
+        self, session: Session, conversation: Conversation, event: Any, adapter: Any = None,
+        *, channel_context: ChannelContext | None = None,
     ) -> tuple[str, bool]:
         """Run one channel turn; returns the reply text and whether tools ran."""
         harness_id = self.resolve_turn_harness(session, conversation)
@@ -363,8 +402,15 @@ class AntonChannelRuntime:
             log.warning("harness %r is not registered; falling back to %s", harness_id, DEFAULT_CHANNEL_HARNESS)
             harness_id = DEFAULT_CHANNEL_HARNESS
             harness = get_harness(harness_id)
-        await harness.sync_skills(SkillService(session).list_skills())
+
         text = self._event_text(event)
+        # In a group, several people share one conversation — prefix each
+        # message with the sender's name so the model (and the stored history)
+        # can tell who said what. Applied after trigger gating, so regex rules
+        # keep matching the raw text.
+        sender_name = getattr(event.message, "sender_name", None)
+        if text and event.message.is_group and sender_name:
+            text = f"{sender_name}: {text}"
         blocks = await self.build_input_blocks(session, adapter, event, text)
 
         _ = conversation.messages
@@ -384,6 +430,7 @@ class AntonChannelRuntime:
         stream = harness.stream_response(
             conversation=conversation,
             input=blocks,
+            channel_context=channel_context,
         )
         async for _chunk in harness.formatter(stream, harness_id, event_sink):
             pass

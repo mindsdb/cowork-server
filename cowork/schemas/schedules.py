@@ -13,6 +13,7 @@ class Cadence(str, Enum):
     once = "once"
     hourly = "hourly"
     daily = "daily"
+    weekdays = "weekdays"
     weekly = "weekly"
 
 

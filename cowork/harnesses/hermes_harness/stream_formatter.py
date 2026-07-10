@@ -100,6 +100,22 @@ async def format_hermes_stream(
                 "subtype": item.get("subtype"),
             })
 
+        elif item_type == "artifact_created":
+            seq += 1
+            yield _event("response.artifact_created", {
+                "type": "response.artifact_created",
+                "sequence_number": seq,
+                "artifact": item.get("artifact") or {},
+            })
+
+        elif item_type == "skill_created":
+            seq += 1
+            yield _event("response.skill_created", {
+                "type": "response.skill_created",
+                "sequence_number": seq,
+                "skill": item.get("skill") or {},
+            })
+
         else:
             # Final result dict — fallback if stream_callback was never fired
             fallback = item.get("final_response", "")

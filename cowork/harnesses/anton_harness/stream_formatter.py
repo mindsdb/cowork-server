@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Optional
 
 from cowork.schemas.responses import (
@@ -23,6 +24,30 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+
+
+@dataclass
+class ArtifactCreated:
+    """Synthetic post-turn event: an artifact folder appeared during the
+    turn (detected by the harness via the artifacts-dir diff, not by any
+    agent tool call). Rides the same stream as Anton's `Stream*` events and
+    is mapped to a `response.artifact_created` SSE event below, so the
+    renderer shows an inline card for every artifact type, identically and
+    deterministically — live and on reload."""
+
+    artifact: dict
+
+
+@dataclass
+class SkillCreated:
+    """Synthetic post-turn event: a skill the agent built for the user appeared
+    in the drafts dir during the turn (detected by the harness via a dir diff,
+    not by any agent tool call). Mapped to a `response.skill_created` SSE event
+    below. The payload is self-contained (full SKILL.md + sibling files), so the
+    renderer shows the draft card identically live and on reload — the skill is
+    NOT saved until the user explicitly does so from the card."""
+
+    skill: dict
 
 
 PHASE_LABELS = {
@@ -260,6 +285,22 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "thought_role": Role.thought_context_compacted.value,
                 "content": event.message,
+            })
+
+        elif isinstance(event, ArtifactCreated):
+            seq += 1
+            yield _event("response.artifact_created", {
+                "type": "response.artifact_created",
+                "sequence_number": seq,
+                "artifact": event.artifact,
+            })
+
+        elif isinstance(event, SkillCreated):
+            seq += 1
+            yield _event("response.skill_created", {
+                "type": "response.skill_created",
+                "sequence_number": seq,
+                "skill": event.skill,
             })
 
         elif isinstance(event, StreamComplete):

@@ -35,10 +35,42 @@
       {
         "id": "browser_oauth_builtin",
         "label": "In-Browser Connect",
-        "description": "Opens Google sign-in in your browser. No credentials required — just click Connect.",
+        "description": "Enter your Google Ads developer token, then click Connect to authorize via Google sign-in.",
         "recommended": true,
-        "fields": [],
-        "hidden": true
+        "hidden": true,
+        "fields": [
+          {
+            "name": "developer_token",
+            "label": "Developer Token",
+            "type": "password",
+            "required": true,
+            "secret": true,
+            "placeholder": "ABCDE-FGHIJ-KLMNO",
+            "description": "Found in Google Ads Manager → Tools & Settings → Setup → API Center. Required for every Google Ads API call."
+          },
+          {
+            "name": "login_customer_id",
+            "label": "Login Customer ID (MCC)",
+            "type": "text",
+            "required": false,
+            "placeholder": "1234567890",
+            "description": "10-digit manager account (MCC) customer ID — no dashes. Required only if you manage multiple accounts through an MCC. Leave blank for single-account setups."
+          }
+        ],
+        "oauth": {
+          "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+          "token_url": "https://oauth2.googleapis.com/token",
+          "scopes": [
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/adwords"
+          ],
+          "extra_auth_params": {
+            "access_type": "offline",
+            "prompt": "consent"
+          }
+        }
       },
       {
         "id": "oauth-byok",
@@ -50,8 +82,10 @@
           "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
           "token_url": "https://oauth2.googleapis.com/token",
           "scopes": [
-            "https://www.googleapis.com/auth/adwords",
-            "https://www.googleapis.com/auth/userinfo.email"
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/adwords"
           ],
           "extra_auth_params": {
             "access_type": "offline",
