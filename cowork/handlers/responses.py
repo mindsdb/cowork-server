@@ -30,9 +30,11 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_ACCESS_DENIED_CODE,
     MODEL_DISABLED_CODE,
+    PROVIDER_OVERLOADED_CODE,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
+    provider_overloaded_info,
     response_failed_payload,
     response_failed_sse,
 )
@@ -273,6 +275,22 @@ class ResponsesHandler:
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
+            elif code == PROVIDER_OVERLOADED_CODE:
+                # Transient-incident timeout (ENG-673): give the card the failing
+                # model AND the active provider, and flag whether the user is
+                # already routed through MindsHub. reconnectable=True → on managed
+                # (all upstreams down; just Retry); False → BYOK/direct, so the
+                # card can nudge toward MindsHub's cross-provider failover. Never
+                # break the handler — fall back to the bare message on any error.
+                overloaded_info = provider_overloaded_info(exc)
+                extra = {"model": overloaded_info[1] if overloaded_info else ""}
+                try:
+                    from cowork.common.settings.user_settings import Provider
+                    provider = get_user_settings().resolved_planning_provider
+                    extra["provider_label"] = provider.label
+                    extra["reconnectable"] = provider == Provider.MINDS_CLOUD
+                except Exception:
+                    logger.exception("[responses] could not resolve provider for overload error")
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)
