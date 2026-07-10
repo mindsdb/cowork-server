@@ -32,7 +32,7 @@ def get_oauth_credentials(engine: str):
     if not client_id or not client_secret:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"OAuth credentials not configured for {engine!r}.")
     response = {"client_id": client_id, "client_secret": client_secret}
-    if engine == "google_drive" and settings.google_picker_api_key:
+    if GOOGLE_SERVICES[service_id].uses_picker and settings.google_picker_api_key:
         response["picker_api_key"] = settings.google_picker_api_key
     return response
 
