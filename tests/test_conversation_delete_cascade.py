@@ -78,3 +78,69 @@ def test_partial_turn_delete_keeps_task_objects(session):
 
     svc.delete_turn(conv.id, 1)  # drop only the second turn
     assert _rows_for(session, conv.id), "partial delete must keep the index"
+
+
+# ── ENG-701: attachment cleanup on conversation / project delete ──────────
+from pathlib import Path  # noqa: E402
+
+from cowork.models.conversation import Conversation  # noqa: E402
+from cowork.services.files import FileService, attachment_purpose  # noqa: E402
+from cowork.services.projects import ProjectService  # noqa: E402
+
+
+def _attach(session, conversation_id, name="doc.txt"):
+    return FileService(session).create_file_from_bytes(
+        filename=name, content_type="text/plain", data=b"hello",
+        purpose=attachment_purpose(str(conversation_id)),
+    )
+
+
+def _attachment_rows(session, conversation_id):
+    return FileService(session).list_file_rows(attachment_purpose(str(conversation_id)))
+
+
+def test_delete_conversation_removes_attachment_rows_and_bytes(session):
+    svc = ConversationService(session)
+    conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+    f = _attach(session, conv.id)
+    path = Path(f.path)
+    assert path.exists() and _attachment_rows(session, conv.id), "precondition"
+
+    assert svc.delete_conversation(conv.id) is True
+    assert _attachment_rows(session, conv.id) == [], "rows gone with the conversation"
+    assert not path.exists(), "bytes unlinked"
+
+
+def test_delete_conversation_leaves_other_conversations_and_purposes(session):
+    svc = ConversationService(session)
+    keep = svc.create_conversation("keep", project_id=GENERAL_PROJECT_ID)
+    doomed = svc.create_conversation("doomed", project_id=GENERAL_PROJECT_ID)
+    keep_file = _attach(session, keep.id)
+    _attach(session, doomed.id)
+    # A non-attachment purpose must never be touched.
+    other = FileService(session).create_file_from_bytes(
+        filename="c.bin", content_type="application/octet-stream",
+        data=b"x", purpose="channel:some-channel",
+    )
+
+    svc.delete_conversation(doomed.id)
+
+    assert _attachment_rows(session, keep.id) and Path(keep_file.path).exists()
+    assert FileService(session).list_file_rows("channel:some-channel"), "non-attachment untouched"
+    assert Path(other.path).exists()
+
+
+def test_delete_project_cascades_conversations_and_attachments(session):
+    proj = ProjectService(session).create_project("eng701-cascade-test")
+    svc = ConversationService(session)
+    conv = svc.create_conversation("topic", project_id=proj.id)
+    f = _attach(session, conv.id)
+    path = Path(f.path)
+    assert path.exists()
+
+    assert ProjectService(session).delete_project(proj.id) is True
+    # The conversation itself is gone (no more orphaned rows) …
+    assert session.get(Conversation, conv.id) is None
+    # … along with its attachment rows + bytes.
+    assert _attachment_rows(session, conv.id) == []
+    assert not path.exists()
