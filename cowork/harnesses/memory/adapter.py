@@ -45,7 +45,7 @@ class BaseMemoryAdapter:
         # Header and footer are added to avoid trailing lines being absorbed into the project context.
         if not parts:
             return ""
-        return f"{"# Project Memory"}\n\n" + "\n\n".join(parts) + "\n\nEnd of Project Memory."
+        return "# Project Memory\n\n" + "\n\n".join(parts) + "\n\nEnd of Project Memory."
 
     def _format_global_prompt_context(self) -> str:
         store = SharedMemoryStore()

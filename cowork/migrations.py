@@ -32,6 +32,7 @@ from sqlmodel import Session, select
 from pydantic import ValidationError
 
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
+from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
@@ -42,7 +43,7 @@ from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
 
-_ENV_PATH = Path.home() / ".cowork" / ".env"
+_ENV_PATH = cowork_home() / ".env"
 
 # v2: path corrected from ~/.anton/.env to ~/.cowork/.env; bumped so users
 # with the old sentinel (which may have found nothing) get a fresh run.
