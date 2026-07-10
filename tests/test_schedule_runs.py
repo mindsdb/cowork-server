@@ -128,6 +128,26 @@ def test_due_slot_runs_when_last_success_is_old():
     assert [s.id for s in _due_schedules(session, now)] == [schedule.id]
 
 
+def test_due_slot_deferred_while_manual_run_in_flight():
+    """PR #181 review issue 3: a manual run still executing when the cron
+    slot comes due must block the slot — otherwise both publish the same
+    output. Deferred, not consumed: the slot stays due, and once the manual
+    run finishes the freshness guard decides whether it still fires."""
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    schedule = _schedule(session)  # daily, due at 2026-06-25 09:00 UTC
+    run_service = ScheduleRunService(session)
+    run_service.create_run(schedule.id, is_manual=True)  # still running
+
+    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
+    assert _due_schedules(session, now) == []
+    session.refresh(schedule)
+    assert schedule.next_run_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 6, 25, 9, 0, tzinfo=timezone.utc
+    )
+
+
 def test_due_slot_runs_when_recent_run_failed():
     from cowork.scheduler import _due_schedules
 
@@ -259,6 +279,48 @@ def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
         SimpleNamespace(get=lambda cid: SimpleNamespace(buffer=buf)),
     )
     assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) == "cancelled"
+
+
+def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
+    """End-to-end through the real registry: cancel a producer that swallows
+    its CancelledError the way handlers/responses._produce does. The task
+    ends NOT-cancelled — which is exactly why task state can't be the
+    signal — while the buffer terminal record says "cancelled"."""
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+    from cowork.streaming.buffer import FileStreamBuffer
+    from cowork.streaming.registry import registry
+
+    buf = FileStreamBuffer(tmp_path / "turn.jsonl")
+    conversation_id = "eng688-real-cancel-test"
+
+    async def main():
+        started = asyncio.Event()
+
+        async def producer():
+            try:
+                await buf.append("sse", {"sse": "event: response.created"})
+                started.set()
+                await asyncio.sleep(30)
+                await buf.close("completed")
+            except asyncio.CancelledError:
+                await buf.close("cancelled")
+                return
+
+        handle = await registry.start(
+            conversation_id=conversation_id,
+            turn_id=0,
+            buffer=buf,
+            producer_coro=producer(),
+        )
+        await started.wait()
+        await registry.cancel(conversation_id)
+        assert handle.task.done()
+        assert handle.task.cancelled() is False  # the swallowed cancel
+        return await scheduler_mod._turn_terminal_reason(conversation_id)
+
+    assert asyncio.run(main()) == "cancelled"
 
 
 def test_turn_terminal_reason_none_without_handle(monkeypatch):

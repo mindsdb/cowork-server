@@ -109,8 +109,9 @@ class ScheduleRunService:
 
     def has_running_run(self, schedule_id: UUID) -> bool:
         """
-        Check if the schedule has a running run.
-        This is used to prevent overlapping scheduled runs. Manual runs are not relevant here.
+        Check if the schedule has a running non-manual (cron) run.
+        The scheduler's due-check gates on has_active_run instead, so a
+        manual run in flight also defers the slot (PR #181 review).
         """
         run = self.session.exec(
             select(ScheduleRun)
