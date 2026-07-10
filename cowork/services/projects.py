@@ -157,6 +157,23 @@ class ProjectService:
             return False
         if project.name == GENERAL_PROJECT:
             raise ValueError("Cannot delete the General project")
+        # Cascade to the project's conversations FIRST (ENG-701). Deleting a
+        # project used to only rmtree its dir + drop the row, orphaning every
+        # conversation in it — and their messages, events, task objects, and
+        # uploaded attachments (whose bytes live OUTSIDE the project dir, so the
+        # rmtree never reached them). There's no DB-level FK cascade. Deleting
+        # each conversation cleans all of that up (incl. attachments), and does
+        # it while the conversation still exists so the cleanup is safe.
+        from cowork.models.conversation import Conversation
+        from cowork.services.conversations import ConversationService
+        conv_svc = ConversationService(self.session)
+        conv_ids = list(
+            self.session.exec(
+                select(Conversation.id).where(Conversation.project_id == project_id)
+            ).all()
+        )
+        for cid in conv_ids:
+            conv_svc.delete_conversation(cid)
         path = Path(project.path)
         if path.exists():
             shutil.rmtree(path)
