@@ -232,7 +232,12 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     due: list[Schedule] = []
     skipped = False
     for s in ScheduleService(session).list_schedules():
-        if not s.enabled or ensure_utc(s.next_run_at) > now or run_service.has_running_run(s.id):
+        # Gate on ANY in-flight run, manual included: a manual run still
+        # executing when the slot comes due would otherwise run alongside the
+        # cron run and publish the same output twice. The slot is deferred,
+        # not consumed — once the run finishes, the freshness guard decides
+        # whether it still fires.
+        if not s.enabled or ensure_utc(s.next_run_at) > now or run_service.has_active_run(s.id):
             continue
         if _ran_recently(s, run_service, now):
             logger.info(
