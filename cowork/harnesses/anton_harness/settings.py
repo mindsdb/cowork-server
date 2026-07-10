@@ -1,6 +1,6 @@
-from pathlib import Path
 from pydantic import Field
 
+from cowork.common.paths import cowork_home
 from cowork.common.settings import Settings
 from cowork.common.settings.app_settings import default_publish_url
 
@@ -18,7 +18,7 @@ class AntonHarnessSettings(Settings):
     )  # ANTON_SSL_VERIFY
     # Skills are global, they are not scoped to any particular project.
     skills_root_dir: str = Field(
-        default=str(Path.home() / ".cowork" / "anton" / "skills"),
+        default_factory=lambda: str(cowork_home() / "anton" / "skills"),
         description="The root directory where the Anton harness will store skill-related files",
         validation_alias="ANTON_SKILLS_ROOT_DIR",
     )  # ANTON_SKILLS_ROOT_DIR

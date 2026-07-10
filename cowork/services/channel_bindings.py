@@ -58,6 +58,7 @@ class ChannelBindingService:
             display_name=req.display_name,
             trigger_rule=req.trigger_rule.value,
             trigger_pattern=req.trigger_pattern,
+            instructions=req.instructions,
             anton_project_id=req.anton_project_id,
             anton_conversation_id=req.anton_conversation_id,
         )
@@ -95,8 +96,15 @@ class ChannelBindingService:
             binding.trigger_rule = req.trigger_rule.value
         if "trigger_pattern" in provided:
             binding.trigger_pattern = req.trigger_pattern
+        if "instructions" in provided:
+            binding.instructions = req.instructions
         if "anton_project_id" in provided:
+            # Detach the pinned conversation on project change, else the runtime keeps serving the old project's conversation.
+            project_changed = req.anton_project_id != binding.anton_project_id
             binding.anton_project_id = req.anton_project_id
+            if project_changed and "anton_conversation_id" not in provided:
+                binding.anton_conversation_id = None
+                self._drop_sessions(binding.id)
         if "anton_conversation_id" in provided:
             binding.anton_conversation_id = req.anton_conversation_id
 
@@ -104,6 +112,13 @@ class ChannelBindingService:
         self.session.commit()
         self.session.refresh(binding)
         return self._dto(binding)
+
+    def detach_conversation(self, binding: ChannelBinding) -> None:
+        """Unpin the binding's conversation so the next inbound message starts a fresh one."""
+        binding.anton_conversation_id = None
+        self.session.add(binding)
+        self._drop_sessions(binding.id)
+        self.session.commit()
 
     def reset_conversations(self, channel_type: str | None = None) -> int:
         """Detach bindings from their current conversation so the next inbound
@@ -123,10 +138,7 @@ class ChannelBindingService:
             self.session.add(binding)
             # Drop the session rows too so a fresh one is recorded against the
             # new conversation on the next message.
-            for sess in self.session.exec(
-                select(ChannelSession).where(ChannelSession.binding_id == binding.id)
-            ).all():
-                self.session.delete(sess)
+            self._drop_sessions(binding.id)
             reset += 1
         if reset:
             self.session.commit()
@@ -137,13 +149,16 @@ class ChannelBindingService:
         if binding is None:
             return False
 
+        self._drop_sessions(binding_id)
+        self.session.delete(binding)
+        self.session.commit()
+        return True
+
+    def _drop_sessions(self, binding_id: UUID) -> None:
         for sess in self.session.exec(
             select(ChannelSession).where(ChannelSession.binding_id == binding_id)
         ).all():
             self.session.delete(sess)
-        self.session.delete(binding)
-        self.session.commit()
-        return True
 
     def _find(self, channel_type: str, group_id: str, thread_key: str) -> ChannelBinding | None:
         return self.session.exec(

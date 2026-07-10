@@ -96,10 +96,12 @@ def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, 
 @router.post("/{conversation_id}/move")
 def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, session: SessionDep):
     """Move a task to another project. With `move_objects` (default), the
-    artifacts the task created are relocated into the destination project
-    and its attachment files are re-tagged; otherwise only the task's
-    project pointer changes. The destination project must already exist
-    (the client creates a new one first, then moves to its id)."""
+    artifacts the task created are relocated into the destination project;
+    otherwise only the task's project pointer changes. Attachment files
+    follow the conversation automatically — purpose tags are keyed by
+    conversation id, not project (ENG-338). The destination project must
+    already exist (the client creates a new one first, then moves to its
+    id)."""
     svc = ConversationService(session)
     try:
         conversation = svc.get_conversation(conversation_id)

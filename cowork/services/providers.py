@@ -115,8 +115,10 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-# Cache value: (timestamp, (ids, efforts_map)). ids is None on failure.
-_minds_models_cache: dict[str, tuple[float, tuple[Optional[list[str]], dict[str, dict]]]] = {}
+# Cache value: (timestamp, (ids, efforts_map, enabled_map)). ids is None on failure.
+_minds_models_cache: dict[
+    str, tuple[float, tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]]
+] = {}
 
 
 async def fetch_minds_models(
