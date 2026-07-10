@@ -149,6 +149,16 @@ class ScheduleRunService:
         finished = run.finished_at
         return finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
 
+    def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> None:
+        """Attach the run's conversation as soon as it is known — before the
+        turn executes — so the UI can open a run that is still in flight."""
+        run = self.session.get(ScheduleRun, run_id)
+        if run is None:
+            return
+        run.conversation_id = conversation_id
+        self.session.add(run)
+        self.session.commit()
+
     def finish_run(
         self,
         run_id: UUID,
@@ -165,7 +175,8 @@ class ScheduleRunService:
         run.duration_ms = int((now - started_at).total_seconds() * 1000)
         run.status = status or (RunStatus.failed if error else RunStatus.success)
         run.error = error
-        run.conversation_id = conversation_id
+        if conversation_id is not None:
+            run.conversation_id = conversation_id
         self.session.add(run)
         self.session.commit()
         self.session.refresh(run)
