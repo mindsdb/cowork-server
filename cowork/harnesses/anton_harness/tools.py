@@ -438,6 +438,36 @@ def _ensure_form_id(spec: dict) -> dict:
     return out
 
 
+def _scrub_secret_values(spec: dict) -> dict:
+    """Strip pre-filled `value`s from secret fields before the spec is
+    serialized into the chat-visible ```data-vault-form``` block.
+
+    `value` legitimately preserves non-secret inputs across re-renders, but a
+    password value in the spec would persist a plaintext credential in chat
+    history — guarantee in code what the prompt asks for in prose.
+    """
+
+    def scrub_fields(fields):
+        out = []
+        for f in fields:
+            if isinstance(f, dict) and f.get("type") == "password" and "value" in f:
+                f = {k: v for k, v in f.items() if k != "value"}
+            out.append(f)
+        return out
+
+    out = dict(spec)
+    if isinstance(out.get("fields"), list):
+        out["fields"] = scrub_fields(out["fields"])
+    if isinstance(out.get("methods"), list):
+        methods = []
+        for m in out["methods"]:
+            if isinstance(m, dict) and isinstance(m.get("fields"), list):
+                m = {**m, "fields": scrub_fields(m["fields"])}
+            methods.append(m)
+        out["methods"] = methods
+    return out
+
+
 async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
     """Tool handler for `request_credentials`.
 
@@ -451,7 +481,7 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
     if not isinstance(spec, dict):
         return "request_credentials: invalid spec — must be a JSON object with `title` and `fields`"
 
-    spec = _ensure_form_id(spec)
+    spec = _scrub_secret_values(_ensure_form_id(spec))
     block = "```data-vault-form\n" + json.dumps(spec, indent=2) + "\n```"
     return (
         "Form ready. Include the following markdown block VERBATIM in your "
@@ -462,10 +492,10 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         "fence and AFTER the closing fence. Do not concatenate the fence "
         "onto the end of a sentence — markdown parsers won't recognise it "
         "as a code block if it isn't at the start of a line.\n\n"
-        "After the user submits, you'll receive a continuation message "
-        "with `submission_id` (and any skipped field names). Call "
-        "`fetch_submission(submission_id)` to retrieve the staged values "
-        "when you need them.\n\n"
+        "After the user submits, the server tests the connection and saves "
+        "the credentials automatically — your job is done. Do not call any "
+        "tool to retrieve the submitted values, and do not re-emit the form "
+        "unless the user asks for a new one.\n\n"
         f"{block}"
     )
 
@@ -514,7 +544,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                     "required": {"type": "boolean"},
                     "placeholder": {"type": "string"},
                     "default": {},
-                    "value": {"description": "Pre-fill on re-render."},
+                    "value": {"description": "Pre-fill on re-render. NEVER for secrets — password values are scrubbed server-side."},
                     "options": {
                         "type": "array",
                         "description": "For type=select: [{value, label}].",
@@ -615,9 +645,10 @@ _REQUEST_CREDENTIALS_PROMPT = (
     "4. Your job is done — the server tests the connection and saves credentials "
     "on submit. Do NOT call `request_credentials` again unless the user asks to "
     "connect a different service or explicitly requests a new form.\n"
-    "STRICT: field VALUES never appear in chat — don't echo, embed, or paraphrase "
-    "them. The chat-emitted form must FEEL identical to the in-app Connector "
-    "Picker; the registry lookup is what guarantees that parity."
+    "STRICT: field VALUES never appear in chat — don't echo them, don't include "
+    "them in any form spec, don't paraphrase them. The chat-emitted form must "
+    "FEEL identical to the in-app Connector Picker; the registry lookup is what "
+    "guarantees that parity."
 )
 
 
@@ -703,187 +734,3 @@ def build_cowork_label_connection_tool():
         prompt=_LABEL_CONNECTION_PROMPT,
     )
 
-
-# Fetch Submission Tool
-# Pulls staged credential values after the user submits. 
-# Anton uses these to test / save the connection, then either
-# presents a new form (with errors) or moves on.
-
-# async def _cowork_fetch_submission(session: Any, tc_input: dict) -> str:
-#     """Tool handler for `fetch_submission` — return staged values for
-#     a previously-submitted form, by submission_id.
-#     """
-#     sid = tc_input.get("submission_id") or tc_input.get("id")
-#     if not sid:
-#         return "fetch_submission: missing submission_id"
-#     try:
-#         from . import datavault_submissions
-#     except Exception as exc:
-#         logger.exception("Cowork fetch_submission could not import store")
-#         return f"fetch_submission: store unavailable ({exc})"
-#     entry = datavault_submissions.get_submission(sid)
-#     if not entry:
-#         return (
-#             f"fetch_submission: submission `{sid}` not found or expired. "
-#             f"Submissions TTL after 24h. Ask the user to resubmit the form."
-#         )
-#     return json.dumps({
-#         "submission_id": entry.get("submission_id"),
-#         "form_id": entry.get("form_id"),
-#         "values": entry.get("values", {}),
-#         "skipped": entry.get("skipped", []),
-#     })
-
-
-# _FETCH_SUBMISSION_SCHEMA = {
-#     "type": "object",
-#     "properties": {
-#         "submission_id": {
-#             "type": "string",
-#             "description": "The id from the user's continuation message after they submitted the form.",
-#         },
-#     },
-#     "required": ["submission_id"],
-# }
-
-
-# def build_cowork_fetch_submission_tool():
-#     from anton.core.tools.tool_defs import ToolDef
-#     return ToolDef(
-#         name="fetch_submission",
-#         description=(
-#             "Retrieve the staged values from a `data-vault-form` submission. "
-#             "Returns JSON with `values`, `skipped`, and `form_id`. Field values "
-#             "never appear in chat history — this tool is the only way to read them."
-#         ),
-#         input_schema=_FETCH_SUBMISSION_SCHEMA,
-#         handler=_cowork_fetch_submission,
-#         prompt=None,
-#     )
-
-
-# # ── update_form ───────────────────────────────────────────────────────
-# # Patch dialect for in-place form updates. Anton uses this on retry
-# # loops and any time the form needs a field-level error / warning /
-# # label change without re-emitting the whole spec. The patch never
-# # carries `value` fields — the user's existing inputs are preserved
-# # client-side by the form panel.
-
-# async def _cowork_update_form(session: Any, tc_input: dict) -> str:
-#     """Tool handler for `update_form` — emit a patch dialect block
-#     that the renderer merges into the active form for this
-#     conversation.
-#     """
-#     patch = tc_input.get("patch") if isinstance(tc_input.get("patch"), dict) else tc_input
-#     if not isinstance(patch, dict):
-#         return "update_form: invalid patch — must be a JSON object with `form_id`"
-#     if not patch.get("form_id"):
-#         return "update_form: `form_id` is required (must match the form you previously emitted via request_credentials)"
-
-#     # Strip any `value` keys that snuck in — patches must NEVER carry
-#     # credential material. We log + drop rather than fail the call so
-#     # an over-eager LLM doesn't get stuck retrying.
-#     fields_obj = patch.get("fields")
-#     if isinstance(fields_obj, dict):
-#         sanitized_fields = {}
-#         for name, fp in fields_obj.items():
-#             if not isinstance(fp, dict):
-#                 continue
-#             cleaned = {k: v for k, v in fp.items() if k != "value"}
-#             if "value" in fp:
-#                 logger.info(
-#                     "update_form: stripped `value` from field %r — patches must not carry credentials",
-#                     name,
-#                 )
-#             sanitized_fields[name] = cleaned
-#         patch = {**patch, "fields": sanitized_fields}
-
-#     block = "```data-vault-form-patch\n" + json.dumps(patch, indent=2) + "\n```"
-#     return (
-#         "Patch ready. Include the following markdown block VERBATIM in your "
-#         "next message (with blank lines around the fence). The form panel "
-#         "will merge it into the existing form — the user's typed values are "
-#         "preserved.\n\n"
-#         f"{block}"
-#     )
-
-
-# _UPDATE_FORM_SCHEMA = {
-#     "type": "object",
-#     "properties": {
-#         "form_id": {
-#             "type": "string",
-#             "description": "Must match the `form_id` of the form currently shown in the side panel.",
-#         },
-#         "title": {"type": "string", "description": "Optional. Replace the form title."},
-#         "subtitle": {"type": "string", "description": "Optional. Replace the subtitle."},
-#         "form_warning": {"type": "string", "description": "Optional. Set the amber form-level banner. Pass null to clear."},
-#         "form_error": {"type": "string", "description": "Optional. Set the red form-level banner. Pass null to clear."},
-#         "fields": {
-#             "type": "object",
-#             "description": (
-#                 "Map of field NAME → partial field spec. Only the keys you "
-#                 "include override the existing field's properties. Pass `null` "
-#                 "for a key to clear that property (e.g. `error: null` to dismiss "
-#                 "an error). Add a brand-new field by including its full spec "
-#                 "under a name not already in the form. NEVER include `value` — "
-#                 "the user's input is preserved client-side."
-#             ),
-#             "additionalProperties": {
-#                 "type": "object",
-#                 "properties": {
-#                     "label": {"type": "string"},
-#                     "error": {"type": ["string", "null"], "description": "Per-field red text. Set on retry."},
-#                     "warning": {"type": ["string", "null"], "description": "Per-field amber text."},
-#                     "help": {"type": ["string", "null"]},
-#                     "placeholder": {"type": ["string", "null"]},
-#                     "required": {"type": "boolean"},
-#                     "skipable": {"type": "boolean"},
-#                 },
-#             },
-#         },
-#         "actions": {
-#             "type": "array",
-#             "description": "Optional. Replace the actions list.",
-#             "items": {
-#                 "type": "object",
-#                 "properties": {
-#                     "id": {"type": "string"},
-#                     "label": {"type": "string"},
-#                     "kind": {"type": "string", "enum": ["primary", "skip", "cancel"]},
-#                     "field": {"type": "string"},
-#                 },
-#                 "required": ["id", "label"],
-#             },
-#         },
-#     },
-#     "required": ["form_id"],
-# }
-
-
-# _UPDATE_FORM_PROMPT = (
-#     "Use `update_form` for ANY change to a form already shown by "
-#     "`request_credentials`. Common cases:\n"
-#     "  • Connection failed → set `fields: { <name>: { error: 'message' } }` "
-#     "and `subtitle` to explain.\n"
-#     "  • Need an extra field → add it under a new key in `fields`.\n"
-#     "  • Need to clear a previous error → `fields: { <name>: { error: null } }`.\n"
-#     "Never include `value` — the user's typed input is preserved. The patch "
-#     "is far cheaper than a full re-emit and avoids leaking credentials into "
-#     "chat history."
-# )
-
-
-# def build_cowork_update_form_tool():
-#     from anton.core.tools.tool_defs import ToolDef
-#     return ToolDef(
-#         name="update_form",
-#         description=(
-#             "Patch the active data-vault-form for this conversation in place. "
-#             "Use this for retry loops, error messages, and any field-level "
-#             "tweak — the user's typed values are preserved client-side."
-#         ),
-#         input_schema=_UPDATE_FORM_SCHEMA,
-#         handler=_cowork_update_form,
-#         prompt=_UPDATE_FORM_PROMPT,
-#     )
