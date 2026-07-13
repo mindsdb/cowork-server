@@ -10,7 +10,7 @@ vet_). SSE is streamed straight through (httpx stream -> StreamingResponse).
 from __future__ import annotations
 
 import logging
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import Request
@@ -56,10 +56,31 @@ def resolve_inference_endpoint(settings=None) -> tuple[str, str]:
     return (settings.minds_url or "").rstrip("/"), _secret_str(settings.minds_api_key)
 
 
+# Segments that would traverse out of the /artifact-comments/ prefix on the
+# upstream (httpx sends dot-segments verbatim; nginx normalizes them away).
+_BAD_SEGMENTS = {"", ".", ".."}
+
+
+def _clean_segments(user_dir: str, report_id: str, subpath: str) -> list[str]:
+    """Path segments for the upstream URL, or raise ValueError on traversal.
+
+    user_dir/report_id are single router segments (the [^/]+ converter already
+    forbids '/'); subpath is a {path} param and may hold several '/'-joined
+    segments. Reject any empty or dot-segment, and any residual slash/backslash
+    (an encoded %2F/%5C that slipped through), so a caller can't climb above the
+    prefix or smuggle extra path structure. Each survivor is percent-encoded so
+    stray '?'/'#'/'%' can't rewrite the URL either.
+    """
+    segments = [user_dir, report_id, *(subpath.split("/") if subpath else [])]
+    for seg in segments:
+        if seg in _BAD_SEGMENTS or "/" in seg or "\\" in seg:
+            raise ValueError(f"invalid path segment: {seg!r}")
+    return segments
+
+
 def _upstream_url(base: str, user_dir: str, report_id: str, subpath: str, query: str) -> str:
-    url = f"{base}/artifact-comments/{user_dir}/{report_id}"
-    if subpath:
-        url = f"{url}/{subpath}"
+    path = "/".join(quote(seg, safe="") for seg in _clean_segments(user_dir, report_id, subpath))
+    url = f"{base}/artifact-comments/{path}"
     if query:
         url = f"{url}?{query}"
     return url
@@ -80,7 +101,10 @@ async def forward_comments_rest(
         return PlainTextResponse("inference endpoint not configured", status_code=503)
     client = get_proxy_client()
     body = await request.body()
-    url = _upstream_url(base, user_dir, report_id, subpath, request.url.query)
+    try:
+        url = _upstream_url(base, user_dir, report_id, subpath, request.url.query)
+    except ValueError:
+        return PlainTextResponse("invalid path", status_code=400)
     try:
         r = await client.request(
             request.method, url, headers=_forward_headers(api_key), content=body
@@ -104,7 +128,10 @@ async def forward_comments_stream(
     if not base:
         return PlainTextResponse("inference endpoint not configured", status_code=503)
     client = get_proxy_client()
-    url = _upstream_url(base, user_dir, report_id, "stream", request.url.query)
+    try:
+        url = _upstream_url(base, user_dir, report_id, "stream", request.url.query)
+    except ValueError:
+        return PlainTextResponse("invalid path", status_code=400)
     headers = _forward_headers(api_key)
     # NOT a bare "text/event-stream": the auth-gated ingress runs an nginx
     # auth_request subrequest to auth (DRF), forwarding this Accept. DRF only
