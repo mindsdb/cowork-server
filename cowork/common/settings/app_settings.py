@@ -342,7 +342,15 @@ class AppSettings(Settings):
 
     public_base_url: str = Field(
         default="",
-        validation_alias=AliasChoices("COWORK_PUBLIC_BASE_URL", "COWORK_SERVER_ORIGIN"),
+        # Bound to COWORK_PUBLIC_BASE_URL only. It must NOT also accept
+        # COWORK_SERVER_ORIGIN: the desktop app sets COWORK_SERVER_ORIGIN to the
+        # loopback origin (http://127.0.0.1:<port>) purely to build OAuth redirect
+        # URIs (see server_origin above). If that also populated public_base_url,
+        # channels/ingress.py would treat the server as publicly reachable and
+        # stop every polling adapter (Telegram) in favour of a webhook that does
+        # not exist — silently killing desktop channel ingress. Keep the two
+        # decoupled: OAuth origin is server_origin; webhook base is this.
+        validation_alias=AliasChoices("COWORK_PUBLIC_BASE_URL"),
         description=(
             "Public HTTPS base URL of this server (e.g. https://cowork.example.com), "
             "used to build channel webhook URLs for setWebhook-style registration. "
