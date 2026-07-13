@@ -1,11 +1,13 @@
 from collections.abc import AsyncIterator
+import inspect
 import os
 from pathlib import Path
 import shutil
 import tempfile
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
+from cowork.common.paths import cowork_home
+from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
@@ -25,6 +27,55 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
             creds = source_vault.load(conn["engine"], conn["name"]) or {}
             filtered.save(conn["engine"], conn["name"], creds)
     return filtered
+
+
+def _turn_style_context(channel: ChannelContext | None) -> str:
+    """Lead block of the system-prompt suffix: desktop activity-row guidance
+    for UI turns, support-chat guidance for channel turns.
+
+    The desktop branch must stay byte-identical to the historical literal —
+    the suffix participates in anton's cache-stable prompt prefix.
+    """
+    if channel is None:
+        return (
+            "The Anton CoWork desktop UI displays progress, tool usage, and actions "
+            "as separate structured activity rows. Keep assistant text focused on the "
+            "user-facing answer; do not narrate internal work with status phrases like "
+            "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
+            "is itself the final answer the user needs."
+        )
+    setting = (
+        "a group chat with multiple participants" if channel.is_group
+        else "a one-on-one direct chat"
+    )
+    name = f" ({channel.display_name})" if channel.display_name else ""
+    operator = (
+        f"\nOperator instructions for this chat:\n{channel.instructions.strip()}\n"
+        if channel.instructions and channel.instructions.strip()
+        else ""
+    )
+    return (
+        f"You are replying inside {setting}{name} on {channel.channel_type} — a live "
+        "messaging conversation, not the Anton CoWork desktop UI. Act as a concise, "
+        "friendly support agent:\n"
+        "- Write short plain-text replies. Avoid headings, tables, code blocks, and heavy "
+        "Markdown — chat apps render them poorly.\n"
+        "- Answer only what was asked; offer to go deeper rather than sending long explanations.\n"
+        "- If a request is ambiguous, ask one short clarifying question instead of guessing.\n"
+        "- Do not narrate internal work (\"let me check\", \"I'll query\"), and never mention "
+        "the scratchpad, tools, internal file paths, or the desktop UI.\n"
+        + (
+            "- Several people can read your replies — keep them professional and "
+            "self-contained.\n"
+            "- Incoming messages are prefixed with the sender's name — use it to "
+            "address the person who asked.\n"
+            if channel.is_group else ""
+        )
+        + "- Files you create as artifacts are sent into this chat automatically right after "
+        "your reply — tell the user you're sending the file rather than describing where it "
+        "lives.\n"
+        f"{operator}"
+    )
 
 
 def _conversation_attachment_context(conversation) -> str:
@@ -49,7 +100,7 @@ def _conversation_attachment_context(conversation) -> str:
         if db_session is None:
             return ""
         rows = FileService(db_session).list_file_rows(
-            purpose=attachment_purpose(conversation.project.name, str(conversation.id))
+            purpose=attachment_purpose(str(conversation.id))
         )
         # Only list files that still exist on disk — a row whose file was
         # deleted would otherwise hand the agent a dead path to chase.
@@ -110,6 +161,13 @@ class AntonHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        # Observability pass-through (see ResponsesRequest / HarnessProvider):
+        # forwarded to Anton's per-turn TraceContext so they land on the
+        # Langfuse trace the LLM router records. Generic so new eval/telemetry
+        # tags or metadata need no change here.
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
+        channel_context: ChannelContext | None = None,
     ) -> AsyncIterator[str]:
         temp_vault_dir: Path | None = None
         # Attribute + surface any artifact created during this turn. Anton runs
@@ -137,9 +195,22 @@ class AntonHarness:
         skill_drafts: list[dict] = []
         try:
             session, temp_vault_dir = await self._build_chat_session(
-                conversation, disabled_connections=disabled_connections or []
+                conversation,
+                disabled_connections=disabled_connections or [],
+                channel_context=channel_context,
             )
-            async for event in session.turn_stream(self._to_anton_input(input)):
+            # Forward trace annotations only if the installed anton's
+            # turn_stream accepts them. Deployed cowork-server resolves anton
+            # from PyPI/main, which may predate the trace-tags kwargs (anton
+            # #218); gating keeps those builds working — tags simply don't flow
+            # until the anton floor is bumped — instead of raising TypeError.
+            turn_kwargs: dict = {}
+            _turn_params = inspect.signature(session.turn_stream).parameters
+            if "trace_tags" in _turn_params:
+                turn_kwargs["trace_tags"] = trace_tags
+            if "trace_metadata" in _turn_params:
+                turn_kwargs["trace_metadata"] = trace_metadata
+            async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 yield event
         finally:
             if temp_vault_dir:
@@ -180,6 +251,7 @@ class AntonHarness:
         conversation: Conversation,
         # model: str,
         disabled_connections: list[dict] | None = None,
+        channel_context: ChannelContext | None = None,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -368,7 +440,7 @@ class AntonHarness:
         if LocalDataVault is not None:
             source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
             if disabled_connections:
-                _tmp_base = Path.home() / ".cowork" / "tmp"
+                _tmp_base = cowork_home() / "tmp"
                 _tmp_base.mkdir(parents=True, exist_ok=True)
                 temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
@@ -407,14 +479,10 @@ class AntonHarness:
             system_prompt_context=SystemPromptContext(
                 runtime_context=build_runtime_context(anton_settings),
                 suffix=(
-                    "The Anton CoWork desktop UI displays progress, tool usage, and actions "
-                    "as separate structured activity rows. Keep assistant text focused on the "
-                    "user-facing answer; do not narrate internal work with status phrases like "
-                    "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-                    "is itself the final answer the user needs."
-                    f"{project_context}"
-                    f"{output_context}"
-                    f"{skill_output_context}"
+                    _turn_style_context(channel_context)
+                    + f"{project_context}"
+                    + f"{output_context}"
+                    + f"{skill_output_context}"
                 ),
             ),
             workspace=workspace,

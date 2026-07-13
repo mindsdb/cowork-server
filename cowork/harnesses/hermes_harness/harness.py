@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from cowork.common.logger import get_logger
-from cowork.harnesses.base import FileInputBlock, TextInputBlock, register
+from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
@@ -114,6 +114,14 @@ class HermesHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        # Accepted for HarnessProvider compatibility; Hermes does not emit
+        # Langfuse traces, so these observability hints are intentionally
+        # ignored. Wire them up here if Hermes gains trace emission.
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
+        # Accepted for HarnessProvider compatibility; Hermes has no
+        # channel-aware prompt, so the origin hint is intentionally ignored.
+        channel_context: ChannelContext | None = None,
     ) -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict | None] = asyncio.Queue()

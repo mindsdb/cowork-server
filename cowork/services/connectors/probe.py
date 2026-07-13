@@ -18,9 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from cowork.common.paths import cowork_home
+
 logger = logging.getLogger(__name__)
 
-_PROBE_TMP_DIR = Path.home() / ".cowork" / "tmp"
+_PROBE_TMP_DIR = cowork_home() / "tmp"
 
 
 @dataclass

@@ -14,7 +14,9 @@ from cowork.api.v1.endpoints.responses import _SSE_HEADERS
 from cowork.server import app
 from cowork.services.settings import _mask_provider_keys
 
-client = TestClient(app)
+# Present as a loopback client so /settings/reveal-key + /raw pass the
+# local-only guard (settings._require_local, ENG-457).
+client = TestClient(app, client=("127.0.0.1", 50000))
 
 
 def test_sse_headers_are_no_store():
@@ -35,9 +37,19 @@ def test_reveal_key_sends_no_store():
 
 
 def test_non_settings_route_is_not_forced_no_store():
-    # The middleware is scoped to /settings; health must not be swept in.
+    # The middleware is scoped to /settings and /connectors/oauth; health
+    # must not be swept in.
     r = client.get("/api/v1/health/")
     assert r.headers.get("cache-control") != "no-store"
+
+
+def test_oauth_credentials_sends_no_store():
+    # GET .../oauth/{engine}/credentials returns a raw client_secret. Even on
+    # a 404 (unknown engine) the middleware must still stamp no-store, since
+    # it applies by path prefix regardless of status code.
+    r = client.get("/api/v1/connectors/oauth/unknown-engine/credentials")
+    assert r.status_code == 404
+    assert r.headers.get("cache-control") == "no-store"
 
 
 def test_mask_provider_keys_helper():

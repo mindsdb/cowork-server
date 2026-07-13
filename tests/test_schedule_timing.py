@@ -29,6 +29,24 @@ def test_daily_advance_handles_dst_spring_forward_week():
     assert after_spring.astimezone(tz).hour == 9
 
 
+def test_weekdays_advance_mid_week_is_next_day():
+    tz = ZoneInfo("America/New_York")
+    monday = datetime(2026, 1, 19, 14, 0, tzinfo=timezone.utc)  # 9:00 EST
+    tuesday = advance_occurrence(Cadence.weekdays, monday, "America/New_York")
+
+    assert tuesday.astimezone(tz).date().isoformat() == "2026-01-20"
+    assert tuesday.astimezone(tz).hour == 9
+
+
+def test_weekdays_advance_skips_weekend():
+    tz = ZoneInfo("America/New_York")
+    friday = datetime(2026, 1, 16, 14, 0, tzinfo=timezone.utc)  # 9:00 EST
+    monday = advance_occurrence(Cadence.weekdays, friday, "America/New_York")
+
+    assert monday.astimezone(tz).date().isoformat() == "2026-01-19"
+    assert monday.astimezone(tz).hour == 9
+
+
 def test_weekly_advance_keeps_local_wall_clock():
     tz = ZoneInfo("America/Los_Angeles")
     first = datetime(2026, 6, 3, 16, 30, tzinfo=timezone.utc)
@@ -70,3 +88,12 @@ def test_count_missed_single_overdue_occurrence():
 
     assert missed == 1
     assert nxt == datetime(2026, 6, 26, 9, 0, tzinfo=timezone.utc)
+
+
+def test_count_missed_occurrences_weekdays_does_not_count_weekend():
+    anchor = datetime(2026, 1, 16, 9, 0, tzinfo=timezone.utc)  # Friday
+    now = datetime(2026, 1, 19, 10, 0, tzinfo=timezone.utc)  # Monday
+    missed, nxt = count_missed_occurrences(Cadence.weekdays, anchor, "UTC", now=now)
+
+    assert missed == 2  # Friday and Monday; the weekend has no occurrence to miss
+    assert nxt == datetime(2026, 1, 20, 9, 0, tzinfo=timezone.utc)  # Tuesday

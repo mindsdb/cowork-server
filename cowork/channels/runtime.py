@@ -18,7 +18,7 @@ from sqlmodel import select
 from anton.core.dispatch import OutboundMessage
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.session import get_open_session
-from cowork.harnesses.base import get_harness
+from cowork.harnesses.base import ChannelContext, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
@@ -249,7 +249,15 @@ class AntonChannelRuntime:
             try:
                 conversation = self._ensure_conversation(session, binding)
                 self._touch_channel_session(session, binding, conversation, event)
-                reply, used_tools = await self._run_anton(session, conversation, event, adapter)
+                channel_context = ChannelContext(
+                    channel_type=channel_type,
+                    is_group=bool(event.message.is_group),
+                    display_name=binding.display_name,
+                    instructions=binding.instructions,
+                )
+                reply, used_tools = await self._run_anton(
+                    session, conversation, event, adapter, channel_context=channel_context
+                )
             finally:
                 if typing is not None:
                     typing.cancel()
@@ -383,7 +391,8 @@ class AntonChannelRuntime:
         return (get_user_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
 
     async def _run_anton(
-        self, session: Session, conversation: Conversation, event: Any, adapter: Any = None
+        self, session: Session, conversation: Conversation, event: Any, adapter: Any = None,
+        *, channel_context: ChannelContext | None = None,
     ) -> tuple[str, bool]:
         """Run one channel turn; returns the reply text and whether tools ran."""
         harness_id = self.resolve_turn_harness(session, conversation)
@@ -395,6 +404,13 @@ class AntonChannelRuntime:
             harness = get_harness(harness_id)
 
         text = self._event_text(event)
+        # In a group, several people share one conversation — prefix each
+        # message with the sender's name so the model (and the stored history)
+        # can tell who said what. Applied after trigger gating, so regex rules
+        # keep matching the raw text.
+        sender_name = getattr(event.message, "sender_name", None)
+        if text and event.message.is_group and sender_name:
+            text = f"{sender_name}: {text}"
         blocks = await self.build_input_blocks(session, adapter, event, text)
 
         _ = conversation.messages
@@ -414,6 +430,7 @@ class AntonChannelRuntime:
         stream = harness.stream_response(
             conversation=conversation,
             input=blocks,
+            channel_context=channel_context,
         )
         async for _chunk in harness.formatter(stream, harness_id, event_sink):
             pass
