@@ -21,7 +21,12 @@ def _delete_settings(session, *keys: str) -> None:
             pass
 
 
-def test_raw_settings_write_syncs_legacy_env_to_db(tmp_path, monkeypatch):
+def test_raw_settings_write_syncs_credentials_but_not_models(tmp_path, monkeypatch):
+    # ENG-739: /settings/raw syncs credentials + provider selection to the DB,
+    # but NOT model keys — a model in .env is CLI-only and must never be pushed
+    # to the DB, or a bulk sync (web token refresh, re-login) would re-pin a
+    # user who fixed a locked-model 403 via the picker. The .env line is still
+    # written to disk for the standalone CLI.
     from cowork.api.v1.endpoints import settings as settings_endpoint
     from cowork.api.v1.endpoints.settings import _RawSettingsBody, write_raw_settings
     from cowork.db.session import get_open_session
@@ -48,12 +53,19 @@ def test_raw_settings_write_syncs_legacy_env_to_db(tmp_path, monkeypatch):
         response = write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session, _local_request())
 
         assert response == {"ok": True}
-        assert settings_endpoint.read_raw_settings(_local_request())["ANTON_MINDS_API_KEY"] == "existing-key"
+        raw = settings_endpoint.read_raw_settings(_local_request())
+        assert raw["ANTON_MINDS_API_KEY"] == "existing-key"
+        # The model line IS preserved in .env (CLI-only surface)…
+        assert raw["ANTON_PLANNING_MODEL"] == "_reason_"
 
-        loaded = SettingService(session).load()
+        # …but is NOT synced to the DB: the row stays unset (resolves to a
+        # default), while credentials + provider are synced as before.
+        service = SettingService(session)
+        assert service._fetch_row("planning_model") is None
+        loaded = service.load()
         assert loaded.minds_api_key.get_secret_value() == "existing-key"
         assert loaded.planning_provider.value == "minds_cloud"
-        assert loaded.planning_model == "_reason_"
+        assert loaded.planning_model != "_reason_"
     finally:
         _delete_settings(session, "minds_api_key", "planning_provider", "planning_model")
         session.close()
