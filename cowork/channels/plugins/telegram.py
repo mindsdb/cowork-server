@@ -3,7 +3,9 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import re
 import secrets
+import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +45,9 @@ _SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"
 # polling). The HTTP client timeout must exceed this so the long poll isn't
 # aborted before Telegram returns.
 POLL_TIMEOUT_S = 25
+# Cooldown between failed getMe identity fetches so a Bot API outage doesn't
+# add a network round-trip to every inbound group batch.
+IDENTITY_RETRY_S = 300
 
 
 def extract_media(msg: dict) -> list[Attachment]:
@@ -99,6 +104,14 @@ class TelegramBridge:
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
+        # Bot identity for group @mention detection. The credential is an
+        # optional manual override; getMe fills whatever is missing lazily
+        # (see _ensure_bot_identity).
+        self._bot_username: str | None = (
+            (credentials.get("bot_username") or "").strip().lstrip("@") or None
+        )
+        self._bot_id: str | None = None
+        self._identity_attempt_at: float | None = None
 
     @property
     def channel_type(self) -> str:
@@ -194,6 +207,70 @@ class TelegramBridge:
         if not hmac.compare_digest(expected.encode("utf-8"), provided.encode("utf-8")):
             raise SignatureError("telegram secret_token mismatch")
 
+    @staticmethod
+    def _is_group_update(update: dict) -> bool:
+        msg = update.get("message")
+        return isinstance(msg, dict) and (msg.get("chat") or {}).get("type") in (
+            "group", "supergroup", "channel",
+        )
+
+    async def _ensure_bot_identity(self) -> None:
+        """Learn the bot's username/id via getMe for group mention detection.
+
+        Best-effort with a retry cooldown: a Bot API failure leaves any
+        credential-provided username in place and never breaks normalization.
+        Called only when a batch contains a group update, so DM-only installs
+        never pay the network call.
+        """
+        if self._bot_id is not None and self._bot_username:
+            return
+        now = time.monotonic()
+        # None = never attempted. A 0.0 sentinel would read as "in cooldown"
+        # whenever machine uptime < IDENTITY_RETRY_S (monotonic counts from
+        # boot), silently disabling getMe on freshly provisioned instances.
+        if self._identity_attempt_at is not None and now - self._identity_attempt_at < IDENTITY_RETRY_S:
+            return
+        self._identity_attempt_at = now
+        bot_token = (self._secrets.get("bot_token") or "").strip()
+        if not bot_token:
+            return
+        try:
+            result = await self._call(bot_token, "getMe", {})
+        except (ConnectionError, RuntimeError):
+            return
+        me = (result.get("result") or {}) if result.get("ok") else {}
+        if me.get("id") is not None:
+            self._bot_id = str(me["id"])
+        if me.get("username"):
+            self._bot_username = str(me["username"]).lstrip("@")
+
+    def _detect_group_mention(self, msg: dict, text: str) -> bool:
+        username = (self._bot_username or "").lower()
+        # Entity offsets count UTF-16 code units (Bot API spec) — slice via
+        # utf-16-le so emoji/non-BMP text before the mention can't shift the
+        # window.
+        u16 = text.encode("utf-16-le")
+        for ent in (msg.get("entities") or msg.get("caption_entities") or []):
+            etype, off, ln = ent.get("type"), ent.get("offset", 0), ent.get("length", 0)
+            if etype == "mention" and username:
+                frag = u16[2 * off : 2 * (off + ln)].decode("utf-16-le", "ignore")
+                if frag.lower() == f"@{username}":
+                    return True
+            elif etype == "text_mention" and self._bot_id:
+                if str((ent.get("user") or {}).get("id")) == self._bot_id:
+                    return True
+        # Replying to one of the bot's messages addresses the bot.
+        reply_from = (msg.get("reply_to_message") or {}).get("from") or {}
+        if self._bot_id and str(reply_from.get("id", "")) == self._bot_id:
+            return True
+        if username and (reply_from.get("username") or "").lower() == username:
+            return True
+        # Boundary check so "@antonbot" doesn't match a mention of
+        # "@antonbotdev" (usernames are [A-Za-z0-9_]).
+        return bool(username) and re.search(
+            rf"@{re.escape(username)}(?![A-Za-z0-9_])", text, re.IGNORECASE
+        ) is not None
+
     async def parse_inbound(
         self, *, body: bytes, headers: Mapping[str, str], route_name: str | None
     ) -> list[InboundEvent]:
@@ -201,6 +278,8 @@ class TelegramBridge:
             update = json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return []
+        if self._is_group_update(update):
+            await self._ensure_bot_identity()
         event = self._normalize_update(update)
         return [event] if event is not None else []
 
@@ -244,8 +323,11 @@ class TelegramBridge:
         except (TypeError, ValueError):
             timestamp = datetime.now(timezone.utc)
 
-        bot_username = self._secrets.get("bot_username", "")
-        is_mention = (not is_group) or bool(bot_username and f"@{bot_username}" in text)
+        is_mention = (not is_group) or self._detect_group_mention(msg, text)
+
+        sender_name = " ".join(
+            part for part in (sender.get("first_name"), sender.get("last_name")) if part
+        ) or sender.get("username") or None
 
         message_id = str(msg.get("message_id", ""))
         event = InboundEvent(
@@ -256,6 +338,7 @@ class TelegramBridge:
                 timestamp=timestamp,
                 kind="chat",
                 sender_id=str(sender.get("id", "")) or None,
+                sender_name=sender_name,
                 is_mention=is_mention,
                 is_group=is_group,
                 attachments=attachments,
@@ -295,6 +378,8 @@ class TelegramBridge:
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise ConnectionError(f"telegram getUpdates transport error: {exc!r}") from exc
         updates = (resp.json().get("result") if resp.status_code == 200 else None) or []
+        if any(self._is_group_update(u) for u in updates):
+            await self._ensure_bot_identity()
         events: list[InboundEvent] = []
         next_offset = offset
         for update in updates:
@@ -428,7 +513,10 @@ plugin = ChannelPlugin(
                 label="Bot username",
                 secret=False,
                 required=False,
-                description="Used to detect @mentions in group chats",
+                description=(
+                    "Optional override for group @mention detection; "
+                    "auto-detected via getMe when left blank"
+                ),
             ),
             CredentialField(
                 name="secret_token",

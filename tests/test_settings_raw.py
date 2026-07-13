@@ -1,5 +1,13 @@
+from types import SimpleNamespace
+
 import pytest
 from fastapi import HTTPException
+
+
+def _local_request():
+    """Loopback stand-in for the Request arg the raw-settings endpoints now
+    take — they 403 non-loopback callers (settings._require_local, ENG-457)."""
+    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _delete_settings(session, *keys: str) -> None:
@@ -37,10 +45,10 @@ def test_raw_settings_write_syncs_legacy_env_to_db(tmp_path, monkeypatch):
     try:
         _delete_settings(session, "minds_api_key", "planning_provider", "planning_model")
 
-        response = write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session)
+        response = write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session, _local_request())
 
         assert response == {"ok": True}
-        assert settings_endpoint.read_raw_settings()["ANTON_MINDS_API_KEY"] == "existing-key"
+        assert settings_endpoint.read_raw_settings(_local_request())["ANTON_MINDS_API_KEY"] == "existing-key"
 
         loaded = SettingService(session).load()
         assert loaded.minds_api_key.get_secret_value() == "existing-key"
@@ -77,6 +85,7 @@ def test_raw_settings_write_rejects_invalid_db_values_before_env_write(tmp_path,
                     )
                 ),
                 session,
+                _local_request(),
             )
 
         assert exc.value.status_code == 400

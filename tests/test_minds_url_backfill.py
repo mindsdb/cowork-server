@@ -8,9 +8,12 @@ and no UI field to fix it. backfill_minds_url heals those rows on boot.
 
 import json
 
+from cowork.common.settings.app_settings import default_minds_api_host
 from cowork.db.session import get_open_session
 from cowork.migrations import backfill_minds_url
 from cowork.services.settings import SettingService
+
+CANONICAL = default_minds_api_host()
 
 
 def _seed(session, key, value):
@@ -37,9 +40,9 @@ def test_backfill_rewrites_providers_json_mindsurl(tmp_path):
 
         pj = json.loads(_value(session, "providers_json"))
         minds = next(p for p in pj if p["type"] == "minds-cloud")
-        assert minds["mindsUrl"] == "https://api.mindshub.ai"
+        assert minds["mindsUrl"] == CANONICAL
         assert "mdb.ai" not in _value(session, "providers_json")
-        assert _value(session, "minds_url") == "https://api.mindshub.ai"
+        assert _value(session, "minds_url") == CANONICAL
     finally:
         SettingService(session).delete_setting("providers_json")
         SettingService(session).delete_setting("minds_url")
@@ -48,7 +51,7 @@ def test_backfill_rewrites_providers_json_mindsurl(tmp_path):
 def test_backfill_is_idempotent_and_noop_when_clean(tmp_path):
     session = get_open_session()
     try:
-        providers = [{"type": "minds-cloud", "apiKey": "***", "mindsUrl": "https://api.mindshub.ai"}]
+        providers = [{"type": "minds-cloud", "apiKey": "***", "mindsUrl": CANONICAL}]
         _seed(session, "providers_json", json.dumps(providers))
 
         # Already canonical → no change reported.
@@ -71,6 +74,6 @@ def test_backfill_handles_trailing_slash_and_http(tmp_path):
     try:
         _seed(session, "minds_url", "http://mdb.ai/")
         assert backfill_minds_url(session) is True
-        assert _value(session, "minds_url") == "https://api.mindshub.ai/"
+        assert _value(session, "minds_url") == CANONICAL + "/"
     finally:
         SettingService(session).delete_setting("minds_url")

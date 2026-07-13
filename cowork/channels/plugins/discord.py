@@ -297,6 +297,7 @@ class DiscordBridge:
                 timestamp=timestamp,
                 kind="chat",
                 sender_id=author_id or None,
+                sender_name=author.get("global_name") or author.get("username") or None,
                 is_mention=is_mention,
                 is_group=is_group,
                 attachments=attachments,

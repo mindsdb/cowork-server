@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse
 from cowork.services.connectors.oauth.config import GOOGLE_SERVICES
-from cowork.services.connectors.oauth.google import google_service
+from cowork.services.connectors.oauth.google import _ENGINE_TO_SERVICE, _SERVICE_CREDENTIAL_ATTRS, google_service
 
 router = APIRouter()
 
@@ -16,6 +16,22 @@ def start_oauth(service: str, body: OAuthStartRequest = Body(default_factory=OAu
     if service not in GOOGLE_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
     return google_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
+
+
+@router.get("/{engine}/credentials")
+def get_oauth_credentials(engine: str):
+    """Return client_id and client_secret for a builtin-OAuth engine.
+    Called by Electron main process only — never exposed to the renderer."""
+    service_id = _ENGINE_TO_SERVICE.get(engine)
+    if service_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth engine: {engine!r}")
+    id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service_id]
+    settings = OAuthSettings()
+    client_id = getattr(settings, id_attr, "")
+    client_secret = getattr(settings, secret_attr, "")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"OAuth credentials not configured for {engine!r}.")
+    return {"client_id": client_id, "client_secret": client_secret}
 
 
 @router.get("/catalogue")
