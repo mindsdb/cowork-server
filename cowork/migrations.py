@@ -34,7 +34,7 @@ from pydantic import ValidationError
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
-from cowork.common.settings.user_settings import UserSettings
+from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
@@ -221,6 +221,56 @@ def backfill_minds_url(session: Session) -> bool:
         )
     return bool(changed)
 
+
+# Model rows carrying this prefix are provably login-written: the desktop SSO
+# flow is the only writer of `latest:`-prefixed model settings (the settings
+# picker and the server defaults only ever write bare aliases). So a
+# `latest:` pin is never a deliberate user pick and is safe to clear.
+_LOGIN_PIN_PREFIX = "latest:"
+
+
+def clear_login_pinned_models(session: Session) -> bool:
+    """Clear login-written ``latest:``-prefixed model pins on minds-cloud.
+
+    The desktop SSO flow historically pinned ``ANTON_PLANNING_MODEL=latest:sonnet``
+    / ``ANTON_CODING_MODEL=latest:haiku`` on every sign-in and synced them into
+    the DB. That made every login an *explicit* model pick, which defeats the
+    enabled-aware default resolution (it only fills an *unset* model). A
+    free-tier user pinned to a locked model then 403s on their first message,
+    with no self-serve recovery (ENG-597 / ENG-739). The DB is authoritative, so
+    dropping the ``.env`` pin desktop-side does not heal users already pinned.
+
+    A ``latest:`` prefix is provably login-written (see ``_LOGIN_PIN_PREFIX``),
+    so clearing it lets the enabled-aware default resolve the right model per
+    tier (paid -> sonnet/haiku, free -> first enabled). Gated on the
+    corresponding provider being minds-cloud so a hand-set BYOK value is never
+    touched. Idempotent and sentinel-free: it only removes rows that still carry
+    a pin, so it is safe on every boot and self-heals a stale re-login.
+
+    Returns True if any pin was cleared.
+    """
+    svc = SettingService(session)
+    minds = Provider.MINDS_CLOUD.value
+    cleared: list[str] = []
+    for model_key, provider_key in (
+        ("planning_model", "planning_provider"),
+        ("coding_model", "coding_provider"),
+    ):
+        model_row = svc._fetch_row(model_key)
+        if model_row is None or not model_row.value.startswith(_LOGIN_PIN_PREFIX):
+            continue
+        provider_row = svc._fetch_row(provider_key)
+        # A `latest:` pin should only ever coexist with minds-cloud; gate on it
+        # anyway so a deliberately hand-set direct-provider value is left alone.
+        if provider_row is not None and provider_row.value != minds:
+            continue
+        session.delete(model_row)
+        cleared.append(model_key)
+    if cleared:
+        session.commit()
+        invalidate_user_settings_cache()
+        logger.info("Cleared login-pinned model(s): %s", ", ".join(cleared))
+    return bool(cleared)
 
 
 # Packaged skills shipped with cowork. Bump BUILTIN_SKILLS_VERSION when the
