@@ -154,3 +154,33 @@ def test_resolve_inference_endpoint_host_matching(
     base, key = _resolve_inference_endpoint(_FakeSettings(openai_base_url))
     assert base == expected_base
     assert key == expected_key
+
+
+# --- path-segment normalization (traversal guard) -------------------------
+
+
+def test_upstream_url_builds_expected_path():
+    url = cp._upstream_url(BASE, "alice", "rep123", "threads/t1/replies", "status=open")
+    assert url == f"{BASE}/artifact-comments/alice/rep123/threads/t1/replies?status=open"
+
+
+@pytest.mark.parametrize(
+    "user_dir,report_id,subpath",
+    [
+        ("..", "rep123", "threads"),          # climb via user_dir
+        ("alice", "..", "threads"),           # climb via report_id
+        ("alice", "rep123", "../../v1/models"),  # climb via subpath
+        ("alice", "rep123", "a/../../b"),     # embedded dot-segment
+        ("alice", "rep123", "."),             # bare dot
+        ("alice", "rep123", "a//b"),          # empty segment
+    ],
+)
+def test_upstream_url_rejects_traversal(user_dir, report_id, subpath):
+    with pytest.raises(ValueError):
+        cp._upstream_url(BASE, user_dir, report_id, subpath, "")
+
+
+def test_upstream_url_percent_encodes_segments():
+    # A '?' inside a segment must not open a query string on the upstream.
+    url = cp._upstream_url(BASE, "alice", "rep123", "th?x", "")
+    assert url == f"{BASE}/artifact-comments/alice/rep123/th%3Fx"
