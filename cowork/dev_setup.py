@@ -49,7 +49,11 @@ def run_dev_setup() -> None:
             session.commit()
 
     # Migrate .env settings to DB (one-time, idempotent).
-    from cowork.migrations import backfill_minds_url, migrate_env_to_db
+    from cowork.migrations import (
+        backfill_minds_url,
+        clear_login_pinned_models,
+        migrate_env_to_db,
+    )
 
     with SQLSession(engine) as session:
         migrate_env_to_db(session)
@@ -58,6 +62,10 @@ def run_dev_setup() -> None:
         # runs every boot (not gated by the env-migration sentinel, since
         # affected users already passed it).
         backfill_minds_url(session)
+        # Heal existing users stuck on a login-written `latest:` model pin so
+        # the enabled-aware default can resolve a model their tier allows.
+        # Idempotent; runs every boot (ENG-739).
+        clear_login_pinned_models(session)
 
     # Migrate harness-local memory into ~/.cowork/memory, then wire runtime symlinks.
     import cowork.harnesses  # noqa: F401 — registers memory adapters
