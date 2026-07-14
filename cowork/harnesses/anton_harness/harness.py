@@ -441,8 +441,16 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            for conn in data_vault.list_connections():
-                data_vault.inject_env(conn["engine"], conn["name"])
+            # restore_namespaced_env (instead of a bare inject_env loop) also
+            # registers each connection's DS_* var names for credential
+            # scrubbing — without it, scrub_credentials treats every field as
+            # unknown and redacts non-secret values like base_url into
+            # [DS_*] markers in user-facing output (ENG-688). It also clears
+            # stale DS_* vars a previous turn injected for now-disabled
+            # connections.
+            from anton.utils.datasources import restore_namespaced_env
+
+            restore_namespaced_env(data_vault)
 
         # TODO: Add guidance for integrations
 
