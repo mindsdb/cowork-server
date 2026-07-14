@@ -114,6 +114,9 @@ class HermesHarness:
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        # Accepted for HarnessProvider compatibility; Hermes has no mid-turn
+        # path picker, so the interactivity hint is intentionally ignored.
+        interactive: bool = False,
         # Accepted for HarnessProvider compatibility; Hermes does not emit
         # Langfuse traces, so these observability hints are intentionally
         # ignored. Wire them up here if Hermes gains trace emission.

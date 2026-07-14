@@ -44,6 +44,7 @@ class HarnessProvider(Protocol):
         input: list[TextInputBlock | FileInputBlock],
         # model: str,
         disabled_connections: list[dict] | None = None,
+        interactive: bool = False,
         # Optional observability pass-through (see ResponsesRequest). Forwarded
         # to the trace the harness emits; harnesses without tracing accept and
         # ignore them. Generic on purpose so callers can add eval/telemetry

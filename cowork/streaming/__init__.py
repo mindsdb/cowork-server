@@ -9,6 +9,7 @@ from cowork.streaming.backend import get_backend, get_streams_dir, new_buffer
 from cowork.streaming.buffer import StreamBuffer
 from cowork.streaming.records import TerminalReason, TurnRecord
 from cowork.streaming.registry import RunHandle, RunRegistry, registry
+from cowork.streaming.selection_gateway import SelectionGateway, selection_gateway
 
 __all__ = [
     "StreamBuffer",
@@ -20,4 +21,6 @@ __all__ = [
     "new_buffer",
     "get_backend",
     "get_streams_dir",
+    "SelectionGateway",
+    "selection_gateway",
 ]
