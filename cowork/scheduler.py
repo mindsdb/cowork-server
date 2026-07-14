@@ -16,6 +16,10 @@ from cowork.streaming.registry import registry
 logger = get_logger(__name__)
 
 _POLL_INTERVAL_SECONDS = 30
+# Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
+# must not keep its ScheduleRun in `running` forever — that would block the
+# schedule from ever firing again. On timeout the run is recorded as failed.
+_MAX_RUN_DURATION_SECONDS = 600
 _scheduler_task: asyncio.Task | None = None
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
@@ -136,9 +140,17 @@ async def execute_schedule(
                 "trigger_type": trigger,
             },
         )
-        stream = await ResponsesHandler(session).handle(request)
-        async for _ in stream:
-            pass
+        async def _drain_run() -> None:
+            stream = await ResponsesHandler(session).handle(request)
+            async for _ in stream:
+                pass
+
+        try:
+            await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
+            ) from exc
 
         # A cancel or a producer failure closes the stream normally from the
         # consumer's side (the producer runs detached and even swallows its
