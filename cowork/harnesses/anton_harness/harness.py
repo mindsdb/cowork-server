@@ -5,6 +5,8 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from sqlmodel import Session
+
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
@@ -13,6 +15,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+from cowork.services.conversations import ConversationService
 
 
 logger = get_logger(__name__)
@@ -193,8 +196,10 @@ class AntonHarness:
         before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
         skill_drafts: list[dict] = []
+        session = None
+        seed_info: dict | None = None
         try:
-            session, temp_vault_dir = await self._build_chat_session(
+            session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
@@ -215,6 +220,15 @@ class AntonHarness:
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            if session is not None and seed_info is not None:
+                # Best-effort — must never mask the turn's real outcome.
+                try:
+                    self._persist_history_compaction(conversation, session, seed_info)
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to persist history compaction for conversation %s",
+                        conversation.id,
+                    )
             # One dir diff → index the new artifacts AND build their cards.
             # Runs on every exit (success, error, cancel) so an artifact is
             # always indexed; cards are yielded just below on normal completion.
@@ -228,6 +242,34 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
+
+    @staticmethod
+    def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
+        """Save anton's compacted summary + cutoff if it compacted this turn.
+
+        `seed_info["ordered_messages"]`/`["tail_start"]` are what this turn's
+        `initial_history` was built from; `["replayed_summary"]` says whether
+        a summary entry was prepended ahead of them — `covered_through` from
+        `session.last_compaction` counts that entry too, so it must be
+        subtracted before mapping onto `ordered_messages`.
+        """
+        compaction = session.last_compaction
+        if compaction is None:
+            return
+        offset = 1 if seed_info["replayed_summary"] else 0
+        covered = compaction["covered_through"] - offset
+        if covered <= 0:
+            return
+        ordered_messages = seed_info["ordered_messages"]
+        idx = seed_info["tail_start"] + covered - 1
+        if not (0 <= idx < len(ordered_messages)):
+            return
+        conv_session = Session.object_session(conversation)
+        if conv_session is None:
+            return
+        ConversationService(conv_session).update_history_compaction(
+            conversation.id, compaction["summary"], ordered_messages[idx].id,
+        )
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -482,10 +524,38 @@ class AntonHarness:
                 om["content"] = f"[{ts}] {om['content']}"
             return om
 
-        initial_history = [
-            _stamped(m) for m in conversation.messages
-            if m.role in {"user", "assistant"}
-        ]
+        # Ordered, not the bare `conversation.messages` relationship (no ordering)
+        # — the cutoff below only means something against a stable order.
+        conv_session = Session.object_session(conversation)
+        ordered_messages = (
+            ConversationService(conv_session).get_ordered_messages(conversation.id)
+            if conv_session is not None
+            else list(conversation.messages)
+        )
+        ordered_messages = [m for m in ordered_messages if m.role in {"user", "assistant"}]
+
+        # Replay [summary] + [messages after cutoff] instead of full history when a saved compaction is still valid;
+        #  otherwise (no summary, or its cutoff message was deleted since) fall back to full history.
+        history_summary = conversation.history_summary
+        cutoff_id = conversation.history_summary_cutoff_id
+        tail_start = 0
+        if history_summary and cutoff_id:
+            for i, m in enumerate(ordered_messages):
+                if m.id == cutoff_id:
+                    tail_start = i + 1
+                    break
+            else:
+                history_summary = None  # cutoff message is gone — stale
+
+        initial_history = [_stamped(m) for m in ordered_messages[tail_start:]]
+        if history_summary:
+            initial_history = [{"role": "user", "content": history_summary}] + initial_history
+
+        seed_info = {
+            "ordered_messages": ordered_messages,
+            "tail_start": tail_start,
+            "replayed_summary": bool(history_summary),
+        }
 
         config = ChatSessionConfig(
             llm_client=llm_client,
@@ -527,7 +597,7 @@ class AntonHarness:
             ],
             cells=cells
         )
-        return ChatSession(config), temp_vault_dir
+        return ChatSession(config), temp_vault_dir, seed_info
 
     @staticmethod
     def _build_llm_client():
