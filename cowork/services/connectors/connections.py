@@ -205,6 +205,39 @@ class ConnectionsService:
             vault.save(engine, name, fields, secure_keys=secure_keys)
             return remaining
 
+    def picked_files_by_project(self, data_vault, project_name: str) -> dict[str, list[dict]]:
+        """Google-Picker-granted files visible to `project_name`, keyed by
+        connection name. Callers (the Anton harness, once per chat turn) use
+        this to tell the agent about files a plain files.list()/files.search()
+        call won't return — the google_drive connector's drive.file scope only
+        covers files the app created plus these specifically granted ones.
+
+        A file is visible if it's untagged (picked with no project context —
+        a connection-wide grant meant to be usable everywhere, same as the
+        connection's other credentials) or explicitly tagged to `project_name`.
+        A file tagged to OTHER projects only is excluded — that's the scoping
+        leak this closes. Only the Project files rail's display (a UI list,
+        not the agent's access) hides untagged files outside every project;
+        the agent must still be able to use them anywhere.
+
+        Takes `data_vault` rather than using `self._vault()` so callers that
+        run under a filtered/temp vault (e.g. disabled connections) get
+        results scoped to that vault too.
+        """
+        picked_by_connection: dict[str, list[dict]] = {}
+        for conn in data_vault.list_connections():
+            engine, name = conn["engine"], conn["name"]
+            if engine != "google_drive":
+                continue
+            fields = data_vault.load(engine, name) or {}
+            scoped = [
+                f for f in self._load_picked_files(fields)
+                if isinstance(f, dict) and (not f.get("projects") or project_name in f["projects"])
+            ]
+            if scoped:
+                picked_by_connection[name] = scoped
+        return picked_by_connection
+
     def delete(self, engine: str, name: str) -> bool:
         deleted = self._vault().delete(engine, name)
         discard_lock(engine, name)
