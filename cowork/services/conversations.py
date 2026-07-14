@@ -45,6 +45,17 @@ class ConversationService:
             raise ValueError("Conversation not found")
         return conversation
 
+    def get_ordered_messages(self, conversation_id: UUID) -> list[Message]:
+        """Messages in `_MESSAGE_ORDER` — use this, not `conversation.messages`
+        (the bare relationship has no ordering)."""
+        return list(
+            self.session.exec(
+                select(Message)
+                .where(Message.conversation_id == conversation_id)
+                .order_by(*_MESSAGE_ORDER)
+            ).all()
+        )
+
     def create_conversation(
         self,
         topic: str,
@@ -92,11 +103,7 @@ class ConversationService:
         conversation = self.session.get(Conversation, conversation_id)
         if conversation is None:
             return False
-        messages = self.session.exec(
-            select(Message)
-            .where(Message.conversation_id == conversation_id)
-            .order_by(*_MESSAGE_ORDER)
-        ).all()
+        messages = self.get_ordered_messages(conversation_id)
         for message in messages:
             for event in self.session.exec(
                 select(MessageEvent).where(MessageEvent.message_id == message.id)
@@ -119,13 +126,7 @@ class ConversationService:
         removed. Returns the number of messages deleted.
         """
         self.get_conversation(conversation_id)  # raises if not found
-        messages = list(
-            self.session.exec(
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(*_MESSAGE_ORDER)
-            ).all()
-        )
+        messages = self.get_ordered_messages(conversation_id)
         # Find the Nth assistant message (0-based).
         assistant_count = -1
         cut_from = None
@@ -159,6 +160,25 @@ class ConversationService:
             TaskObjectService(self.session).delete_for_conversation(conversation_id)
         self.session.commit()
         return len(to_delete)
+
+    def update_history_compaction(
+        self,
+        conversation_id: UUID,
+        summary: str,
+        cutoff_message_id: UUID,
+    ) -> None:
+        """Persist anton's latest compacted history summary + cutoff.
+
+        Best-effort: silently no-ops if the conversation is gone (this runs
+        from a turn's cleanup path, after the turn's real outcome is settled).
+        """
+        conversation = self.session.get(Conversation, conversation_id)
+        if conversation is None:
+            return
+        conversation.history_summary = summary
+        conversation.history_summary_cutoff_id = cutoff_message_id
+        self.session.add(conversation)
+        self.session.commit()
 
     def save_assistant_turn(
         self,
@@ -195,11 +215,7 @@ class ConversationService:
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
-        messages = self.session.exec(
-            select(Message)
-            .where(Message.conversation_id == conversation_id)
-            .order_by(*_MESSAGE_ORDER)
-        ).all()
+        messages = self.get_ordered_messages(conversation_id)
         result = []
         for message in messages:
             events = self.session.exec(
