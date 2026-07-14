@@ -334,6 +334,11 @@ class UserSettings(Settings):
         title="Episodic Memory",
         description="Enable episodic memory for conversations.",
     )
+    history_compaction_enabled: bool = Field(
+        default=True,
+        title="History Compaction",
+        description="Replay anton's compacted summary + recent tail instead of full history each turn.",
+    )
     proactive_dashboards: bool = Field(
         default=False,
         title="Proactive Dashboards",

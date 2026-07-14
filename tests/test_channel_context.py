@@ -67,7 +67,7 @@ def test_stream_response_forwards_channel_context(monkeypatch):
 
     async def _fake_build(self, conversation, disabled_connections, channel_context=None):
         received["channel_context"] = channel_context
-        return _FakeSession(), None
+        return _FakeSession(), None, None
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(
