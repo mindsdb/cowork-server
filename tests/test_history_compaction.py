@@ -21,11 +21,11 @@ from cowork.services.projects import GENERAL_PROJECT_ID
 
 
 def _stamp(m):
-    return {"role": "user", "content": m.id}
+    return {"role": m.role, "content": m.id}
 
 
-def _fake_messages(n: int) -> list[SimpleNamespace]:
-    return [SimpleNamespace(id=uuid4()) for _ in range(n)]
+def _fake_messages(n: int, role: str = "user") -> list[SimpleNamespace]:
+    return [SimpleNamespace(id=uuid4(), role=role) for _ in range(n)]
 
 
 @pytest.fixture
@@ -52,11 +52,16 @@ class TestSeedHistory:
 
         assert initial_history == [_stamp(m) for m in messages]
         assert seed_info["tail_start"] == 0
-        assert seed_info["replayed_summary"] is False
+        assert seed_info["synthetic_prefix_len"] == 0
         assert seed_info["ordered_messages"] == messages
 
     def test_valid_cutoff_replays_summary_plus_tail(self):
-        messages = _fake_messages(5)
+        # alternating roles so the tail (messages[3:]) starts on "assistant" —
+        # no separator needed.
+        messages = [
+            SimpleNamespace(id=uuid4(), role="user" if i % 2 == 0 else "assistant")
+            for i in range(5)
+        ]
         cutoff_id = messages[2].id  # summary covers messages[0:3]
 
         initial_history, seed_info = AntonHarness._seed_history(
@@ -66,7 +71,22 @@ class TestSeedHistory:
         assert initial_history[0] == {"role": "user", "content": "SUMMARY TEXT"}
         assert initial_history[1:] == [_stamp(m) for m in messages[3:]]
         assert seed_info["tail_start"] == 3
-        assert seed_info["replayed_summary"] is True
+        assert seed_info["synthetic_prefix_len"] == 1
+
+    def test_tail_starting_with_user_gets_assistant_separator(self):
+        """Two consecutive `user`-role messages break/degrade most
+        providers — if the tail starts with `user`, insert the same
+        assistant separator anton's own _summarize_history uses."""
+        messages = _fake_messages(3, role="user")  # tail will all be "user"
+        cutoff_id = messages[0].id
+
+        initial_history, seed_info = AntonHarness._seed_history(
+            messages, "SUMMARY TEXT", cutoff_id, _stamp,
+        )
+
+        assert [m["role"] for m in initial_history[:2]] == ["user", "assistant"]
+        assert initial_history[2:] == [_stamp(m) for m in messages[1:]]
+        assert seed_info["synthetic_prefix_len"] == 2
 
     def test_stale_cutoff_falls_back_to_full_history(self):
         """The cutoff message isn't in the current message list (e.g. it was
@@ -80,7 +100,7 @@ class TestSeedHistory:
 
         assert initial_history == [_stamp(m) for m in messages]
         assert seed_info["tail_start"] == 0
-        assert seed_info["replayed_summary"] is False
+        assert seed_info["synthetic_prefix_len"] == 0
 
 
 class TestPersistHistoryCompaction:
@@ -90,7 +110,7 @@ class TestPersistHistoryCompaction:
         fake_anton_session = SimpleNamespace(last_compaction=None)
 
         AntonHarness._persist_history_compaction(
-            conv, fake_anton_session, {"ordered_messages": [], "tail_start": 0, "replayed_summary": False},
+            conv, fake_anton_session, {"ordered_messages": [], "tail_start": 0, "synthetic_prefix_len": 0},
         )
 
         assert svc.get_conversation(conv.id).history_summary is None
@@ -106,12 +126,12 @@ class TestPersistHistoryCompaction:
         session.commit()
         ordered_messages = svc.get_ordered_messages(conv.id)
 
-        # No prior summary was replayed this turn (replayed_summary=False), so
+        # No prior summary was replayed this turn (synthetic_prefix_len=0), so
         # covered_through indexes directly into ordered_messages.
         fake_anton_session = SimpleNamespace(
             last_compaction={"summary": "[COMPACTED] state record", "covered_through": 4}
         )
-        seed_info = {"ordered_messages": ordered_messages, "tail_start": 0, "replayed_summary": False}
+        seed_info = {"ordered_messages": ordered_messages, "tail_start": 0, "synthetic_prefix_len": 0}
 
         AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
 
@@ -134,18 +154,45 @@ class TestPersistHistoryCompaction:
         ordered_messages = svc.get_ordered_messages(conv.id)
 
         # Previous cutoff was after message 1 (tail_start=2); this turn's
-        # initial_history was [summary, m2, m3, m4, m5] and compaction folded
-        # the summary + m2 + m3 in (covered_through=3 counting the synthetic
-        # summary entry), leaving m4, m5 verbatim — new cutoff is m3.
+        # initial_history was [summary, m2, m3, m4, m5] (no separator needed,
+        # synthetic_prefix_len=1) and compaction folded the summary + m2 + m3
+        # in (covered_through=3 counting the synthetic summary entry),
+        # leaving m4, m5 verbatim — new cutoff is m3.
         fake_anton_session = SimpleNamespace(
             last_compaction={"summary": "[COMPACTED] updated state", "covered_through": 3}
         )
-        seed_info = {"ordered_messages": ordered_messages, "tail_start": 2, "replayed_summary": True}
+        seed_info = {"ordered_messages": ordered_messages, "tail_start": 2, "synthetic_prefix_len": 1}
 
         AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
 
         refreshed = svc.get_conversation(conv.id)
         assert refreshed.history_summary == "[COMPACTED] updated state"
+        assert refreshed.history_summary_cutoff_id == ordered_messages[3].id
+
+    def test_persists_cutoff_accounting_for_separator_offset(self, session):
+        """Same as above, but the tail started with `user` this turn, so
+        `_seed_history` also inserted the assistant separator — two
+        synthetic entries to subtract, not one."""
+        svc = ConversationService(session)
+        conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+        db_messages = [
+            Message(conversation_id=conv.id, role="user" if i % 2 == 0 else "assistant", content=f"m{i}")
+            for i in range(6)
+        ]
+        session.add_all(db_messages)
+        session.commit()
+        ordered_messages = svc.get_ordered_messages(conv.id)
+
+        # initial_history was [summary, separator, m2, m3, m4, m5];
+        # covered_through=4 counts summary+separator+m2+m3 -> new cutoff m3.
+        fake_anton_session = SimpleNamespace(
+            last_compaction={"summary": "[COMPACTED] updated state", "covered_through": 4}
+        )
+        seed_info = {"ordered_messages": ordered_messages, "tail_start": 2, "synthetic_prefix_len": 2}
+
+        AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
+
+        refreshed = svc.get_conversation(conv.id)
         assert refreshed.history_summary_cutoff_id == ordered_messages[3].id
 
     def test_no_new_material_covered_does_not_persist(self, session):
@@ -161,7 +208,7 @@ class TestPersistHistoryCompaction:
         fake_anton_session = SimpleNamespace(
             last_compaction={"summary": "irrelevant", "covered_through": 1}
         )
-        seed_info = {"ordered_messages": ordered_messages, "tail_start": 0, "replayed_summary": True}
+        seed_info = {"ordered_messages": ordered_messages, "tail_start": 0, "synthetic_prefix_len": 1}
 
         AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
 

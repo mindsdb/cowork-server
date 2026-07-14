@@ -261,14 +261,29 @@ class AntonHarness:
             else:
                 history_summary = None  # cutoff message is gone — stale
 
-        initial_history = [stamp(m) for m in ordered_messages[tail_start:]]
+        tail = [stamp(m) for m in ordered_messages[tail_start:]]
+        synthetic_prefix_len = 0
         if history_summary:
-            initial_history = [{"role": "user", "content": history_summary}] + initial_history
+            summary_msg = {"role": "user", "content": history_summary}
+            if tail and tail[0].get("role") == "user":
+                # Same fix anton's own _summarize_history applies: two
+                # consecutive user messages breaks/degrades most providers.
+                initial_history = [
+                    summary_msg,
+                    {"role": "assistant", "content": "Understood — using that as reference."},
+                    *tail,
+                ]
+                synthetic_prefix_len = 2
+            else:
+                initial_history = [summary_msg, *tail]
+                synthetic_prefix_len = 1
+        else:
+            initial_history = tail
 
         seed_info = {
             "ordered_messages": ordered_messages,
             "tail_start": tail_start,
-            "replayed_summary": bool(history_summary),
+            "synthetic_prefix_len": synthetic_prefix_len,
         }
         return initial_history, seed_info
 
@@ -277,15 +292,16 @@ class AntonHarness:
         """Save anton's compacted summary + cutoff if it compacted this turn.
 
         `seed_info["ordered_messages"]`/`["tail_start"]` are what this turn's
-        `initial_history` was built from; `["replayed_summary"]` says whether
-        a summary entry was prepended ahead of them — `covered_through` from
-        `session.last_compaction` counts that entry too, so it must be
+        `initial_history` was built from; `["synthetic_prefix_len"]` is how
+        many non-real entries (summary, plus an assistant separator if one
+        was needed) were prepended ahead of them — `covered_through` from
+        `session.last_compaction` counts those too, so they must be
         subtracted before mapping onto `ordered_messages`.
         """
         compaction = session.last_compaction
         if compaction is None:
             return
-        offset = 1 if seed_info["replayed_summary"] else 0
+        offset = seed_info["synthetic_prefix_len"]
         covered = compaction["covered_through"] - offset
         if covered <= 0:
             return
