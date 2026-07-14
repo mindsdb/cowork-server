@@ -85,7 +85,7 @@ from pathlib import Path  # noqa: E402
 
 from cowork.models.conversation import Conversation  # noqa: E402
 from cowork.models.project import Project  # noqa: E402
-from cowork.services.files import FileService, attachment_purpose  # noqa: E402
+from cowork.services.files import FileService, attachment_purpose, unlink_file_dirs  # noqa: E402
 from cowork.services.projects import ProjectService  # noqa: E402
 
 
@@ -174,3 +174,26 @@ def test_delete_project_survives_one_conversation_delete_failure(session, monkey
     assert not Path(good_file.path).exists()
     # … the failed one is skipped (logged), left as it was — not fatal.
     assert session.get(Conversation, bad.id) is not None
+
+
+def test_delete_by_purpose_stages_without_committing(session):
+    """The attachment-row delete must land in the CALLER's transaction, not its
+    own — otherwise a crash between it and the conversation-row delete leaves a
+    'ghost' conversation (row present, contents gone). Proof: after
+    delete_by_purpose, a rollback brings the rows back, and the bytes are still
+    on disk (unlink is the caller's post-commit step)."""
+    svc = ConversationService(session)
+    conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+    _attach(session, conv.id)
+
+    dirs = FileService(session).delete_by_purpose(attachment_purpose(str(conv.id)))
+    session.rollback()
+
+    assert _attachment_rows(session, conv.id), "delete_by_purpose must not commit on its own"
+    assert dirs and all(d.exists() for d in dirs), "bytes must survive until the caller commits"
+
+    # And the helper only removes bytes once called explicitly (post-commit).
+    FileService(session).delete_by_purpose(attachment_purpose(str(conv.id)))
+    session.commit()
+    unlink_file_dirs(dirs)
+    assert not any(d.exists() for d in dirs), "bytes removed after commit + unlink"
