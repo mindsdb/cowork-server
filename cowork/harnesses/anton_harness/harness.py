@@ -297,8 +297,12 @@ class AntonHarness:
         was needed) were prepended ahead of them — `covered_through` from
         `session.last_compaction` counts those too, so they must be
         subtracted before mapping onto `ordered_messages`.
+
+        `getattr` (not `session.last_compaction` directly): an anton build
+        predating this property must no-op here, not raise — cowork-server
+        and anton ship and deploy independently.
         """
-        compaction = session.last_compaction
+        compaction = getattr(session, "last_compaction", None)
         if compaction is None:
             return
         offset = seed_info["synthetic_prefix_len"]

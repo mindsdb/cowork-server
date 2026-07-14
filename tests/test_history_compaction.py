@@ -104,6 +104,22 @@ class TestSeedHistory:
 
 
 class TestPersistHistoryCompaction:
+    def test_noop_on_anton_predating_last_compaction(self, session):
+        """cowork-server and anton deploy independently — an older anton
+        `ChatSession` with no `last_compaction` property must no-op here,
+        not raise."""
+        svc = ConversationService(session)
+        conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+
+        class _OldChatSession:
+            pass  # no `last_compaction` attribute at all
+
+        AntonHarness._persist_history_compaction(
+            conv, _OldChatSession(), {"ordered_messages": [], "tail_start": 0, "synthetic_prefix_len": 0},
+        )
+
+        assert svc.get_conversation(conv.id).history_summary is None
+
     def test_noop_when_session_did_not_compact(self, session):
         svc = ConversationService(session)
         conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
