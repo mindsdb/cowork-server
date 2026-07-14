@@ -220,7 +220,7 @@ class AntonHarness:
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
-            if session is not None and seed_info is not None:
+            if session is not None and seed_info is not None and seed_info["enabled"]:
                 # Best-effort — must never mask the turn's real outcome.
                 try:
                     self._persist_history_compaction(conversation, session, seed_info)
@@ -536,7 +536,8 @@ class AntonHarness:
 
         # Replay [summary] + [messages after cutoff] instead of full history when a saved compaction is still valid;
         #  otherwise (no summary, or its cutoff message was deleted since) fall back to full history.
-        history_summary = conversation.history_summary
+        compaction_enabled = getattr(user, "history_compaction_enabled", True)
+        history_summary = conversation.history_summary if compaction_enabled else None
         cutoff_id = conversation.history_summary_cutoff_id
         tail_start = 0
         if history_summary and cutoff_id:
@@ -552,6 +553,7 @@ class AntonHarness:
             initial_history = [{"role": "user", "content": history_summary}] + initial_history
 
         seed_info = {
+            "enabled": compaction_enabled,
             "ordered_messages": ordered_messages,
             "tail_start": tail_start,
             "replayed_summary": bool(history_summary),
