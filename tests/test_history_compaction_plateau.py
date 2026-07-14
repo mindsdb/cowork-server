@@ -103,7 +103,10 @@ async def _run_conversation(session, *, compaction_enabled: bool) -> list[int]:
         anton_session = ChatSession(ChatSessionConfig(llm_client=_mock_llm(), initial_history=initial_history))
         reply = await anton_session.turn(f"Turn {turn}: remember FACT_{turn} = value{turn}.")
 
-        if compaction_enabled and anton_session.last_compaction is not None:
+        # getattr, not `anton_session.last_compaction` directly — an anton
+        # build predating this property (cowork-server and anton deploy
+        # independently) must no-op here, matching _persist_history_compaction.
+        if compaction_enabled and getattr(anton_session, "last_compaction", None) is not None:
             compactions += 1
             AntonHarness._persist_history_compaction(conv, anton_session, seed_info)
 
@@ -127,7 +130,14 @@ async def _run_conversation(session, *, compaction_enabled: bool) -> list[int]:
     return chars_per_turn, compactions, conv
 
 
+_ANTON_HAS_LAST_COMPACTION = hasattr(ChatSession, "last_compaction")
+
+
 class TestHistoryCompactionPlateau:
+    @pytest.mark.skipif(
+        not _ANTON_HAS_LAST_COMPACTION,
+        reason="requires anton's ChatSession.last_compaction (ENG-664) — pin not bumped yet",
+    )
     async def test_chars_per_turn_level_off_when_enabled(self, session, capsys):
         chars_per_turn, compactions, conv = await _run_conversation(session, compaction_enabled=True)
 
