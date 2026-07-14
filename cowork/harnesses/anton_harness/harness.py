@@ -244,6 +244,35 @@ class AntonHarness:
             yield SkillCreated(draft)
 
     @staticmethod
+    def _seed_history(ordered_messages: list, history_summary: str | None, cutoff_id, stamp) -> tuple[list[dict], dict]:
+        """Build initial_history as [summary] + [messages after cutoff] when
+        the saved compaction is still valid, else full history.
+
+        Returns `(initial_history, seed_info)` — `seed_info` is what
+        `_persist_history_compaction` needs to map this turn's compaction
+        result back onto `ordered_messages`.
+        """
+        tail_start = 0
+        if history_summary and cutoff_id:
+            for i, m in enumerate(ordered_messages):
+                if m.id == cutoff_id:
+                    tail_start = i + 1
+                    break
+            else:
+                history_summary = None  # cutoff message is gone — stale
+
+        initial_history = [stamp(m) for m in ordered_messages[tail_start:]]
+        if history_summary:
+            initial_history = [{"role": "user", "content": history_summary}] + initial_history
+
+        seed_info = {
+            "ordered_messages": ordered_messages,
+            "tail_start": tail_start,
+            "replayed_summary": bool(history_summary),
+        }
+        return initial_history, seed_info
+
+    @staticmethod
     def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
 
@@ -534,30 +563,14 @@ class AntonHarness:
         )
         ordered_messages = [m for m in ordered_messages if m.role in {"user", "assistant"}]
 
-        # Replay [summary] + [messages after cutoff] instead of full history when a saved compaction is still valid;
-        #  otherwise (no summary, or its cutoff message was deleted since) fall back to full history.
         compaction_enabled = getattr(user, "history_compaction_enabled", True)
-        history_summary = conversation.history_summary if compaction_enabled else None
-        cutoff_id = conversation.history_summary_cutoff_id
-        tail_start = 0
-        if history_summary and cutoff_id:
-            for i, m in enumerate(ordered_messages):
-                if m.id == cutoff_id:
-                    tail_start = i + 1
-                    break
-            else:
-                history_summary = None  # cutoff message is gone — stale
-
-        initial_history = [_stamped(m) for m in ordered_messages[tail_start:]]
-        if history_summary:
-            initial_history = [{"role": "user", "content": history_summary}] + initial_history
-
-        seed_info = {
-            "enabled": compaction_enabled,
-            "ordered_messages": ordered_messages,
-            "tail_start": tail_start,
-            "replayed_summary": bool(history_summary),
-        }
+        initial_history, seed_info = self._seed_history(
+            ordered_messages,
+            conversation.history_summary if compaction_enabled else None,
+            conversation.history_summary_cutoff_id,
+            _stamped,
+        )
+        seed_info["enabled"] = compaction_enabled
 
         config = ChatSessionConfig(
             llm_client=llm_client,
