@@ -183,6 +183,36 @@ class ScheduleRunService:
         self.session.refresh(run)
         return run
 
+    def reap_orphaned_runs(
+        self,
+        error: str = "Run orphaned by a server restart before it completed.",
+    ) -> int:
+        """Mark every run still in ``running`` as ``failed``.
+
+        A crash/restart while a run is in flight leaves its ``ScheduleRun`` in
+        ``running`` forever. Because the scheduler's due-check skips schedules
+        with a running run, a single stale row wedges that schedule
+        permanently. Called once on boot to release those runs. Returns the
+        number of runs reaped.
+        """
+        runs = self.session.exec(
+            select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
+        ).all()
+        now = datetime.now(timezone.utc)
+        for run in runs:
+            started_at = (
+                run.started_at
+                if run.started_at.tzinfo
+                else run.started_at.replace(tzinfo=timezone.utc)
+            )
+            run.finished_at = now
+            run.duration_ms = int((now - started_at).total_seconds() * 1000)
+            run.status = RunStatus.failed
+            run.error = error
+            self.session.add(run)
+        self.session.commit()
+        return len(runs)
+
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
         return list(
             self.session.exec(
