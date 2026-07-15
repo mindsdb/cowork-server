@@ -21,7 +21,7 @@ ORG_ID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 IDENTITY = {"X-User-Id": USER_ID, "X-Organization-Id": ORG_ID}
 
 
-def _app(org_mode: bool = True) -> FastAPI:
+def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
     app = FastAPI()
 
     @app.get("/api/v1/health")
@@ -46,7 +46,7 @@ def _app(org_mode: bool = True) -> FastAPI:
     # Mirror create_app's ordering: principal added first (inner), CORS last
     # (outer) so a 401 still flows back out through CORS.
     if org_mode:
-        app.add_middleware(TrustedHeaderMiddleware, exempt_paths={WEBHOOK})
+        app.add_middleware(TrustedHeaderMiddleware, exempt_paths={WEBHOOK}, enforce=enforce)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[ORIGIN],
@@ -57,8 +57,8 @@ def _app(org_mode: bool = True) -> FastAPI:
     return app
 
 
-def _client(org_mode: bool = True) -> TestClient:
-    return TestClient(_app(org_mode))
+def _client(org_mode: bool = True, enforce: bool = True) -> TestClient:
+    return TestClient(_app(org_mode, enforce))
 
 
 def test_missing_identity_is_401():
@@ -158,3 +158,29 @@ def test_local_mode_has_no_principal_and_no_gate():
     res = _client(org_mode=False).get("/api/v1/whoami")
     assert res.status_code == 200
     assert res.json() == {"principal": None}
+
+
+def test_audit_mode_lets_missing_identity_through(caplog):
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        res = _client(enforce=False).get("/api/v1/whoami")
+    assert res.status_code == 200
+    assert res.json() == {"principal": None}
+    assert "no principal on GET /api/v1/whoami" in caplog.text
+
+
+def test_audit_mode_lets_malformed_identity_through(caplog):
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        res = _client(enforce=False).get(
+            "/api/v1/whoami",
+            headers={"X-User-Id": "user-123", "X-Organization-Id": ORG_ID},
+        )
+    assert res.status_code == 200
+    assert res.json() == {"principal": None}
+    assert "no principal on" in caplog.text
+
+
+def test_audit_mode_still_builds_principal_when_identity_present():
+    res = _client(enforce=False).get("/api/v1/whoami", headers=IDENTITY)
+    assert res.status_code == 200
+    assert res.json()["user_id"] == USER_ID
+    assert res.json()["org_id"] == ORG_ID
