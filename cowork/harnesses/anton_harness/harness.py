@@ -101,7 +101,7 @@ def _conversation_attachment_context(conversation) -> str:
         if db_session is None:
             return ""
         rows = FileService(db_session).list_file_rows(
-            purpose=attachment_purpose(conversation.project.name, str(conversation.id))
+            purpose=attachment_purpose(str(conversation.id))
         )
         # Only list files that still exist on disk — a row whose file was
         # deleted would otherwise hand the agent a dead path to chase.
@@ -274,16 +274,11 @@ class AntonHarness:
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
-            # build_cowork_fetch_submission_tool,
-            # build_cowork_update_form_tool,
         )
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
-        # TODO: Determine if these two tools are really needed.
-        # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
-        # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -447,6 +442,18 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
+            # restore_namespaced_env (instead of a bare inject_env loop) also
+            # registers each connection's DS_* var names for credential
+            # scrubbing — without it, scrub_credentials treats every field as
+            # unknown and redacts non-secret values like base_url into
+            # [DS_*] markers in user-facing output (ENG-688). It also clears
+            # stale DS_* vars a previous turn injected for now-disabled
+            # connections.
+            from anton.utils.datasources import restore_namespaced_env
+
+            restore_namespaced_env(data_vault)
+
+        # TODO: Add guidance for integrations
 
         # Google Drive's google_drive connector uses the drive.file OAuth
         # scope, which only covers files the app created itself, plus files
