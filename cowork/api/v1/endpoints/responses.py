@@ -97,9 +97,27 @@ class CancelRequest(BaseModel):
 
 
 @router.post("/cancel")
-async def cancel_response(req: CancelRequest):
+async def cancel_response(req: CancelRequest, session: SessionDep):
     """Halt the in-flight producer (Stop button). Fetch-abort / tab-close
-    does NOT cancel — only this does."""
+    does NOT cancel — only this does.
+
+    Cancelling a turn also marks the conversation's browser session
+    `stopped` (Browser Control M1): the pre-dispatch gate is set within the
+    same request so no further browser action is dispatched, and it survives
+    reconnect. Best-effort — a conversation with no browser session is a
+    no-op and never blocks cancellation.
+    """
+    # Set the browser pre-dispatch gate FIRST — synchronously, before we
+    # await producer cancellation. Awaiting the producer teardown can yield
+    # control back to the event loop, during which a queued/in-flight browser
+    # command could still be pulled and dispatched; setting `stopped` up front
+    # closes that race so no further browser action runs for this turn.
+    try:
+        from cowork.services.browser.control import BrowserControlService
+
+        BrowserControlService(session).stop_by_conversation(req.conversation_id)
+    except Exception:  # pragma: no cover - defensive, never break cancel
+        logger.warning("browser-stop-on-cancel failed", exc_info=True)
     cancelled = await registry.cancel(req.conversation_id)
     return {"cancelled": cancelled, "conversation_id": req.conversation_id}
 
