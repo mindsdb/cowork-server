@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.common.settings.app_settings import ConnectorSettings
@@ -9,13 +11,33 @@ from cowork.services.connectors.identity import (
     connection_display_name,
 )
 from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.vault_lock import discard_lock, lock_for
 
 
 class ConnectionsService:
+
     def _vault(self):
         from pathlib import Path
         from anton.core.datasources.data_vault import LocalDataVault
         return LocalDataVault(Path(ConnectorSettings().vault_dir))
+
+    def _read_record(self, vault, engine: str, name: str) -> dict | None:
+        """Full on-disk record via read_record() when the vault supports
+        it, else a load()+wrap fallback for older vault shims that only
+        expose the fields dict. Shared by every method below — the fallback
+        shape must stay consistent or callers reading `secure_keys` off it
+        would silently regress."""
+        if hasattr(vault, "read_record"):
+            return vault.read_record(engine, name)
+        raw = vault.load(engine, name)
+        return {"engine": engine, "name": name, "fields": raw} if raw is not None else None
+
+    @staticmethod
+    def _load_picked_files(fields: dict) -> list[dict]:
+        try:
+            return json.loads(fields.get("_picked_files") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
 
     def list(self) -> list[ConnectionSummaryResponse]:
         vault = self._vault()
@@ -27,8 +49,8 @@ class ConnectionsService:
             # Load the record's fields to derive a human display name (label or
             # identity) so the card shows e.g. "Support" / "user@gmail.com"
             # instead of the opaque slug.
-            record = vault.read_record(engine, name) if hasattr(vault, "read_record") else None
-            fields = (record or {}).get("fields") if record else (vault.load(engine, name) or {})
+            record = self._read_record(vault, engine, name)
+            fields = (record or {}).get("fields") if record else {}
             result.append(ConnectionSummaryResponse(
                 engine=engine,
                 name=name,
@@ -43,12 +65,7 @@ class ConnectionsService:
 
     def get(self, engine: str, name: str) -> ConnectionDetailResponse | None:
         vault = self._vault()
-        if hasattr(vault, "read_record"):
-            record = vault.read_record(engine, name)
-        else:
-            raw = vault.load(engine, name)
-            record = {"engine": engine, "name": name, "fields": raw} if raw is not None else None
-
+        record = self._read_record(vault, engine, name)
         if record is None:
             return None
 
@@ -90,21 +107,141 @@ class ConnectionsService:
         Returns ``False`` if the entry does not exist.
         """
         vault = self._vault()
-        if hasattr(vault, "read_record"):
-            record = vault.read_record(engine, name)
-        else:
-            raw = vault.load(engine, name)
-            record = {"engine": engine, "name": name, "fields": raw} if raw is not None else None
-        if record is None:
-            return False
-        fields = dict(record.get("fields") or {})
-        secure_keys = record.get("secure_keys")
-        fields.update(updates)
-        vault.save(engine, name, fields, secure_keys=secure_keys)
-        return True
+        with lock_for(engine, name):
+            record = self._read_record(vault, engine, name)
+            if record is None:
+                return False
+            fields = dict(record.get("fields") or {})
+            secure_keys = record.get("secure_keys")
+            fields.update(updates)
+            vault.save(engine, name, fields, secure_keys=secure_keys)
+            return True
+
+    def merge_picked_files(self, engine: str, name: str, files: list[dict]) -> list[dict] | None:
+        """Merge newly Google-Picker-granted files into the connection's
+        persisted `_picked_files` list (deduped by id), and store it back
+        as a JSON string field.
+
+        Each file carries a `projects` list — the project(s) it was
+        explicitly added to (empty when picked from connection-details,
+        which has no project context). On conflict (same file id picked
+        again, possibly for a different project), the two `projects`
+        lists are UNIONed rather than one overwriting the other — a file
+        already showing under Project A shouldn't disappear from it just
+        because it was also just added to Project B. Every other field
+        (name, mimeType, etc.) is refreshed from the newest pick.
+
+        Storing it as a vault field (not a side table) means it flows
+        through the existing `inject_env` namespacing for free, without
+        any extra plumbing. The leading underscore matters: it's the
+        vault's existing convention for internal bookkeeping fields
+        (`_label`, `_connector_id`, `_method`) that the agent-visible
+        "Connected Data Sources" credential listing skips — this field is
+        picker metadata, not a credential, and must not be listed
+        alongside real OAuth tokens where the agent might mistake it for
+        one and try to use it as an auth parameter.
+
+        Returns the merged list, or None if the connection doesn't exist.
+        """
+        vault = self._vault()
+        with lock_for(engine, name):
+            record = self._read_record(vault, engine, name)
+            if record is None:
+                return None
+
+            fields = dict(record.get("fields") or {})
+            secure_keys = record.get("secure_keys")
+            existing = self._load_picked_files(fields)
+
+            by_id = {f["id"]: f for f in existing if isinstance(f, dict) and "id" in f}
+            for f in files:
+                fid = f.get("id")
+                if fid is None:
+                    continue
+                prior = by_id.get(fid)
+                if prior:
+                    prior_projects = prior.get("projects") or []
+                    incoming_projects = f.get("projects") or []
+                    merged_projects = list(dict.fromkeys([*prior_projects, *incoming_projects]))
+                    by_id[fid] = {**prior, **f, "projects": merged_projects}
+                else:
+                    by_id[fid] = f
+            merged = list(by_id.values())
+
+            fields["_picked_files"] = json.dumps(merged)
+            vault.save(engine, name, fields, secure_keys=secure_keys)
+            return merged
+
+    def remove_picked_file(self, engine: str, name: str, file_id: str, project: str) -> list[dict] | None:
+        """Untag one file from `project` — the inverse of merge_picked_files'
+        union. Only removes `project` from that file's `projects` list; the
+        entry itself is never dropped from `_picked_files` here, even if
+        `project` was its only tag (it just becomes untagged, same as a file
+        picked directly from connection-details with no project context —
+        still visible there, invisible under any project's Project files).
+        Only revokes our own bookkeeping of the grant (stops the agent from
+        being told about the file for this project); does not revoke
+        Google's own server-side record of it.
+
+        Returns the resulting list, or None if the connection doesn't exist.
+        """
+        vault = self._vault()
+        with lock_for(engine, name):
+            record = self._read_record(vault, engine, name)
+            if record is None:
+                return None
+
+            fields = dict(record.get("fields") or {})
+            secure_keys = record.get("secure_keys")
+            existing = self._load_picked_files(fields)
+
+            remaining = []
+            for f in existing:
+                if isinstance(f, dict) and f.get("id") == file_id:
+                    f = {**f, "projects": [p for p in (f.get("projects") or []) if p != project]}
+                remaining.append(f)
+
+            fields["_picked_files"] = json.dumps(remaining)
+            vault.save(engine, name, fields, secure_keys=secure_keys)
+            return remaining
+
+    def picked_files_by_project(self, data_vault, project_name: str) -> dict[str, list[dict]]:
+        """Google-Picker-granted files visible to `project_name`, keyed by
+        connection name. Callers (the Anton harness, once per chat turn) use
+        this to tell the agent about files a plain files.list()/files.search()
+        call won't return — the google_drive connector's drive.file scope only
+        covers files the app created plus these specifically granted ones.
+
+        A file is visible if it's untagged (picked with no project context —
+        a connection-wide grant meant to be usable everywhere, same as the
+        connection's other credentials) or explicitly tagged to `project_name`.
+        A file tagged to OTHER projects only is excluded — that's the scoping
+        leak this closes. Only the Project files rail's display (a UI list,
+        not the agent's access) hides untagged files outside every project;
+        the agent must still be able to use them anywhere.
+
+        Takes `data_vault` rather than using `self._vault()` so callers that
+        run under a filtered/temp vault (e.g. disabled connections) get
+        results scoped to that vault too.
+        """
+        picked_by_connection: dict[str, list[dict]] = {}
+        for conn in data_vault.list_connections():
+            engine, name = conn["engine"], conn["name"]
+            if engine != "google_drive":
+                continue
+            fields = data_vault.load(engine, name) or {}
+            scoped = [
+                f for f in self._load_picked_files(fields)
+                if isinstance(f, dict) and (not f.get("projects") or project_name in f["projects"])
+            ]
+            if scoped:
+                picked_by_connection[name] = scoped
+        return picked_by_connection
 
     def delete(self, engine: str, name: str) -> bool:
-        return self._vault().delete(engine, name)
+        deleted = self._vault().delete(engine, name)
+        discard_lock(engine, name)
+        return deleted
 
 
 service = ConnectionsService()
