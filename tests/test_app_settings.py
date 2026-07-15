@@ -59,3 +59,18 @@ def test_app_settings_rejects_invalid_tenancy_mode(monkeypatch):
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+def test_app_settings_identity_enforce_defaults_to_audit(monkeypatch):
+    monkeypatch.delenv("COWORK_IDENTITY_ENFORCE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.identity_enforce == "audit"
+
+
+def test_app_settings_rejects_invalid_identity_enforce(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "strict")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
