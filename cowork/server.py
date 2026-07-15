@@ -14,6 +14,7 @@ from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.router import api_router as v1_router
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -135,6 +136,13 @@ def create_app() -> FastAPI:
     # token; _install_channels fills this set with their paths so the auth
     # layer lets them through.
     channel_webhook_paths: set[str] = set()
+
+    # Org mode: build a per-request Principal from gateway-injected identity
+    # headers. Added first so it sits inner of the bearer/CORS layers.
+    if settings.tenancy_mode == "org":
+        app.add_middleware(TrustedHeaderMiddleware, exempt_paths=channel_webhook_paths)
+        logger.info("auth: org tenancy mode — trusted-header principal middleware enabled")
+
     if settings.require_auth:
         env_path = Path.home() / ".cowork" / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)
