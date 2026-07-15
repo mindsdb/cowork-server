@@ -22,8 +22,15 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _has_table(table_name: str) -> bool:
+    inspector = sa.inspect(op.get_bind())
+    return table_name in inspector.get_table_names()
+
+
 def upgrade() -> None:
     """Upgrade schema."""
+    if _has_table("task_objects"):
+        return
     op.create_table(
         "task_objects",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -54,6 +61,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
+    if not _has_table("task_objects"):
+        return
     op.drop_index("ix_task_objects_ref", table_name="task_objects")
     op.drop_index("ix_task_objects_project_id", table_name="task_objects")
     op.drop_index("ix_task_objects_conversation_id", table_name="task_objects")

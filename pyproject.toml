@@ -25,6 +25,7 @@ dependencies = [
     "pydantic-settings>=2.14.1",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
+    "tzlocal>=5.0",
     "uvicorn>=0.47.0",
     # Document export (md/html → pdf/docx). All pure-Python, no native
     # deps — keeps the desktop install clean across platforms.
