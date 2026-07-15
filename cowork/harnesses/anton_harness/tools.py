@@ -734,3 +734,295 @@ def build_cowork_label_connection_tool():
         prompt=_LABEL_CONNECTION_PROMPT,
     )
 
+
+# Browser Control Tool (Milestone 1 — read-only)
+# A single `browser_control` tool the agent uses to drive an already-approved
+# browser tab through four READ-ONLY primitives: inspect / follow_link /
+# scroll / wait. There is deliberately NO click / type / submit / download /
+# upload anywhere in M1. The handler is total (never raises): every failure
+# path returns a JSON envelope whose `status` is one of the five canonical
+# `BrowserErrorKind`s, and it maps the richer WS4-internal `result_code`s down
+# to that vocabulary. An action is NEVER reported as success unless its
+# transient `observed` blob is populated (the "no false success" rule).
+
+_BROWSER_CONTROL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["inspect", "follow_link", "scroll", "wait"],
+            "description": (
+                "The read-only browser primitive to run. `inspect` reads the "
+                "current tab; `follow_link` navigates to a link that appeared "
+                "in the last `inspect` (same site only); `scroll` reveals more "
+                "of the page; `wait` lets a slow page settle. No clicking, "
+                "typing, form submission, or downloads exist in this tool."
+            ),
+        },
+        "reason": {
+            "type": "string",
+            "description": (
+                "Why a connector/integration cannot do this and the browser is "
+                "needed instead. Required on every call — this is the "
+                "connector-first justification that gets recorded."
+            ),
+        },
+        "progress_message": {
+            "type": "string",
+            "description": (
+                "One short human-readable line shown live to the user while "
+                "this action runs, e.g. 'Reading the account list'."
+            ),
+        },
+        "href": {
+            "type": "string",
+            "description": (
+                "follow_link only — the link to open. Must be a link that "
+                "appeared in the last `inspect` result, on the same site as "
+                "the approved tab."
+            ),
+        },
+        "direction": {
+            "type": "string",
+            "enum": ["up", "down"],
+            "description": "scroll only — which way to scroll (default 'down').",
+        },
+    },
+    "required": ["action", "reason", "progress_message"],
+}
+
+_BROWSER_CONTROL_PROMPT = (
+    "`browser_control` drives an already-approved browser tab, READ-ONLY. "
+    "Prefer a connector first: always try `lookup_connector` and a native "
+    "integration before reaching for the browser — only use `browser_control` "
+    "when no connector can satisfy the task, and always pass `reason` "
+    "explaining why the connector could not do it. Available actions: "
+    "`inspect` (read the current tab), `follow_link` (open a link that "
+    "appeared in the last inspect, same site only — pass `href`), `scroll` "
+    "(reveal more, pass `direction`), `wait` (let a slow page settle). There "
+    "is NO clicking, typing, form submission, or downloading. Every call needs "
+    "a one-line `progress_message` for the user. NEVER claim you saw or did "
+    "something unless the tool returns `status: \"ok\"` with a populated "
+    "`observed` — an unobserved action is not a success. On any error status "
+    "(permission_denied / bridge_disconnected / tab_closed / navigation_failed "
+    "/ unsupported_action) tell the user plainly and do not fabricate results."
+)
+
+
+def _get_bridge_client():
+    """Thin indirection over WS4's `send_browser_command`.
+
+    Isolated so tests can monkeypatch a fake bridge without importing the
+    real broker, and so WS3 could be developed before WS4 landed. Returns the
+    module-level async `send_browser_command(conversation_id, action, ...)`
+    callable.
+    """
+    from cowork.services.browser.client import send_browser_command
+
+    return send_browser_command
+
+
+async def _cowork_browser_control(session: Any, tc_input: dict) -> str:
+    """Tool handler for `browser_control` — total and non-raising.
+
+    Validates inputs (a missing required field returns an actionable JSON
+    error WITHOUT touching the bridge), dispatches through
+    `send_browser_command`, maps the WS4-internal `result_code` to the five
+    canonical `BrowserErrorKind`s, enforces the observed-result guard (an
+    `ok` with no `observed` is downgraded — never surfaced as success), and
+    returns a `json.dumps` envelope. Hard failures are prefixed `ERROR:` so
+    anton's circuit-breaker sees them.
+    """
+    import time as _time
+
+    from cowork.schemas.browser import (
+        LLM_ACTION_TO_TYPE,
+        BrowserActionType,
+        BrowserErrorKind,
+        ResultCode,
+        result_code_to_error_kind,
+    )
+    from .browser_telemetry import (
+        build_browser_span,
+        emit_browser_span,
+        get_browser_ids,
+    )
+
+    _t0 = _time.monotonic()
+
+    def _err(kind: str, message: str, *, hard: bool = False) -> str:
+        body = {"status": kind, "error": message}
+        payload = json.dumps(body)
+        # Hard failures get the ERROR: prefix so the circuit-breaker counts
+        # them; the JSON follows so the LLM can still parse the status.
+        return f"ERROR: {payload}" if hard else payload
+
+    action = tc_input.get("action")
+    reason = tc_input.get("reason")
+    progress_message = tc_input.get("progress_message")
+
+    # ── input validation (bridge NOT touched on any failure here) ────
+    valid_actions = set(LLM_ACTION_TO_TYPE)
+    if not action or not isinstance(action, str):
+        return _err(
+            BrowserErrorKind.unsupported_action.value,
+            "`action` is required and must be one of "
+            "inspect / follow_link / scroll / wait.",
+        )
+    if action not in valid_actions:
+        return _err(
+            BrowserErrorKind.unsupported_action.value,
+            f"unsupported action '{action}'. "
+            "M1 is read-only: only inspect / follow_link / scroll / wait "
+            "are supported (no click / type / submit / download / upload).",
+        )
+    if not reason or not isinstance(reason, str) or not reason.strip():
+        return _err(
+            BrowserErrorKind.unsupported_action.value,
+            "`reason` is required — explain why a connector cannot do this "
+            "and the browser is needed instead.",
+        )
+    if (
+        not progress_message
+        or not isinstance(progress_message, str)
+        or not progress_message.strip()
+    ):
+        return _err(
+            BrowserErrorKind.unsupported_action.value,
+            "`progress_message` is required — one short human-readable line "
+            "describing what this action is doing.",
+        )
+
+    href = tc_input.get("href")
+    direction = tc_input.get("direction")
+    if action == "follow_link" and (not href or not isinstance(href, str)):
+        return _err(
+            BrowserErrorKind.navigation_failed.value,
+            "`follow_link` requires `href` — a link from the last inspect "
+            "result on the same site.",
+        )
+
+    # Resolve the conversation defensively — the anton session stamps the
+    # cowork conversation id onto `_session_id`.
+    conversation_id = getattr(session, "_session_id", None)
+    if not conversation_id:
+        return _err(
+            BrowserErrorKind.bridge_disconnected.value,
+            "no active conversation — the browser bridge is unavailable.",
+            hard=True,
+        )
+
+    # ── dispatch to WS4's bridge ─────────────────────────────────────
+    try:
+        send_browser_command = _get_bridge_client()
+        verdict = await send_browser_command(
+            conversation_id,
+            action,
+            href=href if action == "follow_link" else None,
+            direction=direction if action == "scroll" else None,
+        )
+    except Exception as exc:  # never let the bridge raise into the loop
+        logger.exception("Cowork browser_control dispatch failed")
+        return _err(
+            BrowserErrorKind.bridge_disconnected.value,
+            f"browser bridge error ({exc}).",
+            hard=True,
+        )
+
+    # ── map WS4 result_code → canonical BrowserErrorKind ─────────────
+    result_code = getattr(verdict, "result_code", ResultCode.error)
+    action_type = getattr(verdict, "action_type", None) or LLM_ACTION_TO_TYPE.get(
+        action, BrowserActionType.inspect
+    )
+    kind = result_code_to_error_kind(result_code, action_type)
+
+    # ── observed-result guard (no false success) ─────────────────────
+    # WS4's BridgeClient already downgrades an unobserved `ok` before it
+    # persists/returns, but the guard is repeated here as defence-in-depth
+    # (e.g. a bridge seam that returns `ok` with no observed) so the tool
+    # NEVER surfaces an unobserved action as success.
+    observed = getattr(verdict, "observed", None)
+    effective_kind = kind
+    if kind == BrowserErrorKind.ok and not observed:
+        # An `ok` with nothing observed is not a real success. Downgrade to
+        # navigation_failed for a navigate, else bridge_disconnected.
+        effective_kind = (
+            BrowserErrorKind.navigation_failed
+            if action_type == BrowserActionType.navigate
+            else BrowserErrorKind.bridge_disconnected
+        )
+
+    # ── content-free Langfuse tool span (WS5-T3) ────────────────────
+    # Emitted for every DISPATCHED action (validation failures above never
+    # touch the bridge and so never produce a span). The span carries only
+    # the action class, a host-only domain, timing, the EFFECTIVE result
+    # code (post no-false-success downgrade), and the shared IDs — no page
+    # content. Emitting the effective code keeps the trace from recording a
+    # false `ok` for an unobserved action.
+    try:
+        _ids = get_browser_ids()
+        emit_browser_span(
+            build_browser_span(
+                command_type=action_type.value,
+                result_code=effective_kind.value,
+                duration_ms=int((_time.monotonic() - _t0) * 1000),
+                domain=getattr(verdict, "domain", None),
+                installation_id=_ids.get("installation_id"),
+                session_id=_ids.get("session_id") or str(conversation_id),
+                task_id=_ids.get("task_id"),
+                action_id=getattr(verdict, "action_id", None),
+            )
+        )
+    except Exception:
+        logger.debug("browser_control span emit failed", exc_info=True)
+
+    if effective_kind != BrowserErrorKind.ok:
+        detail = getattr(verdict, "detail", None)
+        # `stopped` / `taken_over` are CONTROL terminal states, not error
+        # kinds. Surface them distinctly (alongside the canonical error
+        # kind) so the UI can render a stopped / taken-over terminal state
+        # rather than a generic permission denial.
+        control_state = getattr(verdict, "control_state", None)
+        if kind == BrowserErrorKind.ok and not observed:
+            detail = (
+                "the action completed but returned no observable result; "
+                "treating it as a failure rather than claiming success."
+            )
+        body = {"status": effective_kind.value, "error": detail or f"browser action {effective_kind.value}."}
+        if control_state is not None:
+            cs = control_state.value if hasattr(control_state, "value") else str(control_state)
+            body["control_state"] = cs
+        return json.dumps(body)
+
+    # Success — surface the TRANSIENT observed blob + citations. This is
+    # never persisted here; WS4 owns the content-free digest.
+    envelope: dict[str, Any] = {
+        "status": BrowserErrorKind.ok.value,
+        "action": action,
+        "observed": observed,
+        "citations": getattr(verdict, "citations", None) or [],
+    }
+    domain = getattr(verdict, "domain", None)
+    if domain:
+        envelope["domain"] = domain
+    return json.dumps(envelope)
+
+
+def build_cowork_browser_tool():
+    from anton.core.tools.tool_defs import ToolDef
+
+    return ToolDef(
+        name="browser_control",
+        description=(
+            "Drive an already-approved browser tab, READ-ONLY, through four "
+            "primitives: inspect (read the tab), follow_link (open a link from "
+            "the last inspect, same site), scroll, and wait. No clicking, "
+            "typing, form submission, or downloads. Use only when no connector "
+            "can satisfy the task; always pass `reason`. Returns a JSON "
+            "envelope with `status` (ok or an error kind) and, on ok, "
+            "`observed` + `citations`."
+        ),
+        input_schema=_BROWSER_CONTROL_SCHEMA,
+        handler=_cowork_browser_control,
+        prompt=_BROWSER_CONTROL_PROMPT,
+    )

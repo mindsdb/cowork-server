@@ -327,6 +327,16 @@ class UserSettings(Settings):
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
     )
+    browser_control_enabled: bool = Field(
+        default=False,
+        title="Browser Control",
+        description=(
+            "Enable the read-only browser-control tool (Milestone 1). When "
+            "off, the agent has no browser tool and stays connector-first; "
+            "when on, the `browser_control` tool is added to the session so "
+            "the agent can inspect/follow_link/scroll/wait on an approved tab."
+        ),
+    )
     ui_update_mode: str = Field(
         default="manual",
         title="UI Update Mode",
