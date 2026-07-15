@@ -9,6 +9,7 @@ from alembic import context
 from cowork.common.settings.app_settings import get_app_settings
 
 # Import models so SQLModel.metadata is fully populated for autogenerate.
+import cowork.models.browser  # noqa: F401
 import cowork.models.conversation  # noqa: F401
 import cowork.models.file  # noqa: F401
 import cowork.models.message  # noqa: F401
