@@ -32,6 +32,17 @@ class Message(BaseSQLModel, table=True):
         default=None,
         description="Harness/agent that generated this message (e.g. 'anton', 'hermes')",
     )
+    seq: int = Field(
+        default=0,
+        sa_column_kwargs={"server_default": "0"},
+        description=(
+            "Intra-turn ordinal. A turn persists several block-messages "
+            "(assistant tool_use, user tool_result, ...) that share one "
+            "created_at; seq keeps them in emission order, since the role "
+            "tiebreak in message ordering would otherwise sort tool_result "
+            "(user) ahead of tool_use (assistant). 0 for single-row turns."
+        ),
+    )
 
     message_events: list["MessageEvent"] = Relationship(
         sa_relationship_kwargs={"order_by": "MessageEvent.sequence_number"}
