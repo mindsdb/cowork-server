@@ -182,6 +182,13 @@ class ProjectService:
             try:
                 conv_svc.delete_conversation(cid)
             except Exception:
+                # Roll back the failed conversation's partial work FIRST.
+                # delete_conversation stages its row deletes (messages, events,
+                # task objects, attachment rows) before its own commit; without
+                # this rollback those pending deletes would be silently flushed
+                # by the next commit in the cascade (or the project commit below)
+                # — wiping the conversation's data while its row survives.
+                self.session.rollback()
                 logger.warning(
                     "delete_project: failed to delete conversation %s; skipping", cid,
                     exc_info=True,

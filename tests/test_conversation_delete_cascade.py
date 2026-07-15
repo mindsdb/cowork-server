@@ -176,6 +176,44 @@ def test_delete_project_survives_one_conversation_delete_failure(session, monkey
     assert session.get(Conversation, bad.id) is not None
 
 
+def test_delete_project_rolls_back_a_partially_staged_failed_conversation(session, monkeypatch):
+    """A conversation whose delete fails mid-flight — after staging its row
+    deletes but before its own commit — must be rolled back. Otherwise the next
+    commit in the cascade (the good conversation's, or the project's) flushes
+    those pending deletes, wiping the failed conversation's data while its row
+    survives (the ghost ea-rus flagged on #187)."""
+    proj = ProjectService(session).create_project("eng701-rollback-test")
+    svc = ConversationService(session)
+    bad = svc.create_conversation("bad", project_id=proj.id)
+    good = svc.create_conversation("good", project_id=proj.id)
+    bad_file = _attach(session, bad.id)
+    good_file = _attach(session, good.id)
+
+    real = FileService.delete_by_purpose
+
+    def stage_then_raise(self, purpose):
+        dirs = real(self, purpose)  # actually stage the attachment-row deletes
+        if purpose == attachment_purpose(str(bad.id)):
+            raise RuntimeError("boom after staging")
+        return dirs
+
+    monkeypatch.setattr(FileService, "delete_by_purpose", stage_then_raise)
+
+    assert ProjectService(session).delete_project(proj.id) is True
+
+    # good was deleted cleanly …
+    assert session.get(Conversation, good.id) is None
+    assert _attachment_rows(session, good.id) == []
+    assert not Path(good_file.path).exists()
+
+    # … and bad's partial delete was rolled back — its row AND its attachment
+    # row survive; a later commit must NOT have flushed the staged deletes.
+    session.expire_all()
+    assert session.get(Conversation, bad.id) is not None, "bad conversation survives"
+    assert _attachment_rows(session, bad.id), "bad's staged attachment delete was rolled back, not flushed"
+    assert Path(bad_file.path).exists()
+
+
 def test_delete_by_purpose_stages_without_committing(session):
     """The attachment-row delete must land in the CALLER's transaction, not its
     own — otherwise a crash between it and the conversation-row delete leaves a
