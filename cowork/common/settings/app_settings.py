@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -321,6 +322,17 @@ class AppSettings(Settings):
         description=(
             "Bearer token clients must send as 'Authorization: Bearer <token>'. "
             "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
+        ),
+    )
+    tenancy_mode: Literal["local", "org"] = Field(
+        default="local",
+        validation_alias=AliasChoices("COWORK_TENANCY_MODE"),
+        description=(
+            "Deployment tenancy mode. 'local' (default): single-user desktop "
+            "sidecar — request auth is the shared bearer token above. 'org': "
+            "multi-tenant cloud deployment behind the auth gateway — requests "
+            "carry trusted identity headers (X-User-Id / X-Organization-Id) "
+            "from which a per-request principal is built."
         ),
     )
     owner: str = Field(
