@@ -209,12 +209,315 @@ def cancel_scratchpad():
     return {"ok": True}
 
 
-# ── Browse ───────────────────────────────────────────────────────────
+# ── Browse (Browser Control M1, read-only) ───────────────────────────
+#
+# The server is the command authority; the Electron main process owns the
+# CDP socket and executes. This router is the HTTP contract between them:
+#   GET  /status                 — availability + control_state
+#   GET  /resume?session_id=     — reconnect/resume snapshot
+#   POST /commands/next          — long-poll for the next queued command
+#   POST /commands/{id}/result   — poster returns a command's result
+#   POST /bridge/hello           — poller announces a (re)connect
+#   POST /bridge/state           — poller pushes a bridge-state change
+#   POST /control/stop           — set the stopped pre-dispatch gate (<1s)
+#   POST /control/takeover       — mark taken_over
+#
+# Every field here is content-free: host-only domain, action type, timing,
+# typed codes only.
+
+from pydantic import BaseModel
+
+from cowork.schemas.browser import (
+    BridgeCommandResult,
+    BridgeState,
+    BrowserActionType,
+    ControlState,
+    ResumeState,
+    host_only,
+)
 
 browse_router = APIRouter()
 
 
+def _get_control_service(session: Session):
+    from cowork.services.browser.control import BrowserControlService
+
+    return BrowserControlService(session)
+
+
+def _bridge_state_payload(sess) -> dict:
+    """The availability + state snapshot the bridge endpoints return.
+
+    Carries `session_id` so the Electron poller can learn it from
+    `/bridge/hello` (its only handshake entry point) and use it for the
+    session-keyed endpoints (`/commands/next`, `/resume`, `/bridge/state`).
+    """
+    return {
+        "session_id": str(sess.id),
+        "available": sess.available,
+        "control_state": sess.control_state,
+        "bridge_state": sess.bridge_state,
+        "requires_reapproval": sess.requires_reapproval,
+    }
+
+
 @browse_router.get("/status")
-def browse_status():
-    return {"available": False}
+def browse_status(session: _SessionDep, conversation_id: str | None = Query(default=None)):
+    """Availability + control_state.
+
+    Without a `conversation_id` this reports the legacy shape
+    (`{"available": False}`) so existing clients keep working. With one, it
+    reports the session's live availability and control_state.
+    """
+    if not conversation_id:
+        return {"available": False}
+    control = _get_control_service(session)
+    sess = control.get_by_conversation(conversation_id)
+    if sess is None:
+        return {"available": False, "control_state": ControlState.active.value}
+    return {
+        "available": sess.available,
+        "control_state": sess.control_state,
+        "bridge_state": sess.bridge_state,
+        "domain": sess.active_domain,
+        "requires_reapproval": sess.requires_reapproval,
+    }
+
+
+@browse_router.get("/resume")
+def browse_resume(session: _SessionDep, session_id: str = Query(...)):
+    """Reconnect/resume snapshot for a session (content-free)."""
+    from cowork.services.browser.actions import BrowserActionStore
+
+    control = _get_control_service(session)
+    sess = control.get_session(session_id)
+    if sess is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown session")
+    store = BrowserActionStore(session)
+    last = store.last_observed(sess.id)
+    return ResumeState(
+        session_id=str(sess.id),
+        available=sess.available,
+        control_state=ControlState(sess.control_state),
+        bridge_state=BridgeState(sess.bridge_state),
+        domain=sess.active_domain,
+        requires_reapproval=sess.requires_reapproval,
+        last_result_code=(last.result_code if last else None),
+        last_action_type=(last.action_type if last else None),
+        action_count=store.action_count(sess.id),
+    ).model_dump()
+
+
+class _CommandsNextRequest(BaseModel):
+    session_id: str
+    wait_s: float = 25.0
+
+
+@browse_router.post("/commands/next")
+async def browse_commands_next(req: _CommandsNextRequest, session: _SessionDep):
+    """Long-poll for the next queued command for a session.
+
+    The Electron poller calls this after `bridge/hello`. Returns the command
+    to execute, or `{"command": None}` when the wait elapses so the poller
+    can re-poll.
+
+    The control gate is enforced HERE too, not just pre-dispatch: if the
+    session is `stopped` / `taken_over`, we never hand the poller a command.
+    Instead we drain any queued/awaiting commands to a terminal result (so
+    their producers stop waiting) and return `{"command": None, "blocked":
+    ...}`. This closes the race where a command was enqueued just before a
+    Stop landed and would otherwise still be pulled and executed.
+    """
+    from cowork.services.browser.bridge import bridge_command_service
+    from cowork.schemas.browser import ResultCode
+
+    control = _get_control_service(session)
+    sess = control.get_session(req.session_id)
+    if sess is not None and sess.control_state != ControlState.active.value:
+        await bridge_command_service.drain_session(
+            req.session_id,
+            ResultCode.error,
+            detail=f"session {sess.control_state}",
+        )
+        return {"command": None, "blocked": sess.control_state}
+
+    cmd = await bridge_command_service.next(req.session_id, wait_s=req.wait_s)
+    return {"command": cmd.model_dump() if cmd else None}
+
+
+@browse_router.post("/commands/{command_id}/result")
+async def browse_commands_result(command_id: str, result: BridgeCommandResult):
+    """The poster returns a command's result; resolves the awaiting future."""
+    from cowork.services.browser.bridge import bridge_command_service
+
+    # Path is authoritative for the command id.
+    payload = result.model_copy(update={"command_id": command_id})
+    resolved = await bridge_command_service.resolve(command_id, payload)
+    return {"resolved": resolved, "command_id": command_id}
+
+
+class _BridgeHelloRequest(BaseModel):
+    session_id: str | None = None
+    conversation_id: str | None = None
+    domain: str | None = None
+    target_changed: bool = False
+
+
+@browse_router.post("/bridge/hello")
+def browse_bridge_hello(req: _BridgeHelloRequest, session: _SessionDep):
+    """The poller announces a (re)connect.
+
+    UPSERT semantics: when a `conversation_id` (and, on first attach, an
+    approved `domain`) is supplied, this creates-or-updates the
+    `BrowserSession` and the approved-tab grant so a session exists before
+    any command is dispatched — closing the gap where nothing created a
+    session/grant in production. Without a `conversation_id`, it falls back
+    to the legacy `session_id` lookup (404 if unknown).
+
+    A `target_changed` hello (Chrome restarted, target ids changed) marks
+    the session `lost` and requires re-approval while preserving history; a
+    stopped session stays stopped.
+
+    Hello NEVER clears a pending `requires_reapproval`: the poller re-hellos
+    automatically (with a domain) after a Chrome restart, and letting that
+    call `approve()` would silently self-approve server-side without any
+    user action. Only the explicit, user-driven `/browse/control/approve`
+    endpoint clears the flag / refreshes grants once it is set.
+    """
+    control = _get_control_service(session)
+
+    # Upsert path: a conversation-scoped hello creates/updates the session
+    # (and grants the approved host) rather than 404-ing on first connect.
+    if req.conversation_id:
+        from cowork.services.browser.approval import BrowserApprovalService
+
+        approval = BrowserApprovalService(session)
+        existing = control.get_by_conversation(req.conversation_id)
+        if existing is not None and existing.requires_reapproval:
+            # Pending re-approval: no grant refresh, no flag clear — the
+            # poller just learns the session state (requires_reapproval=true).
+            sess = existing
+        elif req.domain:
+            sess = approval.approve(req.conversation_id, req.domain)
+        else:
+            sess = approval.get_or_create_session(req.conversation_id)
+        if sess is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="unknown conversation",
+            )
+        sess = control.on_bridge_state(
+            sess.id, BridgeState.connected, target_changed=req.target_changed
+        )
+        return _bridge_state_payload(sess)
+
+    if not req.session_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="session_id or conversation_id is required",
+        )
+    sess = control.on_bridge_state(
+        req.session_id, BridgeState.connected, target_changed=req.target_changed
+    )
+    if sess is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown session")
+    return _bridge_state_payload(sess)
+
+
+class _ApproveRequest(BaseModel):
+    conversation_id: str
+    domain: str
+
+
+@browse_router.post("/control/approve")
+def browse_control_approve(req: _ApproveRequest, session: _SessionDep):
+    """Approve a tab: upsert the conversation's session + grant its host.
+
+    This is the production entry point a tab approval in the desktop UI
+    calls. It makes the subsequent agent-tool `send()` session lookup +
+    permission check succeed for the approved host-only domain.
+    """
+    from cowork.services.browser.approval import BrowserApprovalService
+
+    sess = BrowserApprovalService(session).approve(
+        req.conversation_id, req.domain
+    )
+    if sess is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="unknown conversation"
+        )
+    return {
+        "session_id": str(sess.id),
+        "active_domain": sess.active_domain,
+        "control_state": sess.control_state,
+        "available": sess.available,
+    }
+
+
+class _BridgeStateRequest(BaseModel):
+    session_id: str
+    bridge_state: BridgeState
+    target_changed: bool = False
+
+
+@browse_router.post("/bridge/state")
+def browse_bridge_state(req: _BridgeStateRequest, session: _SessionDep):
+    """The poller pushes a bridge-state change (connected/lost/…)."""
+    control = _get_control_service(session)
+    sess = control.on_bridge_state(
+        req.session_id, req.bridge_state, target_changed=req.target_changed
+    )
+    if sess is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown session")
+    return _bridge_state_payload(sess)
+
+
+class _ControlRequest(BaseModel):
+    conversation_id: str
+
+
+async def _drain_gated_session(sess) -> None:
+    """Drain any queued/in-flight commands for a gated session.
+
+    Called right after `stop`/`takeover` so an already-in-flight command's
+    awaiting producer resolves to a terminal (non-ok) result immediately
+    instead of hanging until timeout, and any queued command is dropped so a
+    poller can't pull it after the gate landed.
+    """
+    if sess is None:
+        return
+    from cowork.services.browser.bridge import bridge_command_service
+    from cowork.schemas.browser import ResultCode
+
+    await bridge_command_service.drain_session(
+        str(sess.id), ResultCode.error, detail=f"session {sess.control_state}"
+    )
+
+
+@browse_router.post("/control/stop")
+async def browse_control_stop(req: _ControlRequest, session: _SessionDep):
+    """Set the stopped pre-dispatch gate synchronously (<1s, persisted).
+
+    Returns 200 even when no session exists yet so the Stop button never
+    errors; the gate is set the moment a session is created too, via the
+    persisted control_state. Any queued/in-flight command is drained so it
+    never resolves as a success after the Stop.
+    """
+    control = _get_control_service(session)
+    sess = control.stop_by_conversation(req.conversation_id)
+    await _drain_gated_session(sess)
+    if sess is None:
+        return {"stopped": True, "control_state": ControlState.stopped.value, "session": None}
+    return {"stopped": True, "control_state": sess.control_state, "session": str(sess.id)}
+
+
+@browse_router.post("/control/takeover")
+async def browse_control_takeover(req: _ControlRequest, session: _SessionDep):
+    """Mark the conversation's browser session taken_over."""
+    control = _get_control_service(session)
+    sess = control.takeover_by_conversation(req.conversation_id)
+    await _drain_gated_session(sess)
+    if sess is None:
+        return {"taken_over": True, "control_state": ControlState.taken_over.value, "session": None}
+    return {"taken_over": True, "control_state": sess.control_state, "session": str(sess.id)}
 
