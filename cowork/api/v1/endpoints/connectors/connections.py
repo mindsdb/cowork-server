@@ -6,7 +6,12 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from cowork.common.settings.app_settings import ConnectorSettings
-from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse, DirectSaveRequest
+from cowork.schemas.connectors import (
+    ConnectionDetailResponse,
+    ConnectionSummaryResponse,
+    DirectSaveRequest,
+    PatchPickedFilesBody,
+)
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.oauth.google import google_service
 from cowork.services.connectors.persist import persist_connection
@@ -94,3 +99,29 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody):
     if not service.patch_token(engine, name, updates):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True}
+
+
+@router.patch("/{engine}/{name}/picked-files")
+def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody):
+    """Merge Google-Picker-granted files into the connection's persisted
+    `_picked_files` list. Called by Electron Main right after the user
+    picks files — drive.file scope only covers files the app created, so
+    this is the record of what else the user has explicitly granted."""
+    files = [f.model_dump(by_alias=True, exclude_none=True) for f in body.files]
+    merged = service.merge_picked_files(engine, name, files)
+    if merged is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
+    return {"ok": True, "files": merged}
+
+
+@router.delete("/{engine}/{name}/picked-files/{file_id}")
+def delete_picked_file(engine: str, name: str, file_id: str, project: str):
+    """Untag one file from `project` — the "un-pick" counterpart to
+    patch_picked_files, used by the Project files rail's delete action on
+    a Drive reference row. Only removes the file from `project`'s rail;
+    if the file is tagged to other projects too, it stays visible there
+    (see remove_picked_file's docstring)."""
+    remaining = service.remove_picked_file(engine, name, file_id, project)
+    if remaining is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
+    return {"ok": True, "files": remaining}
