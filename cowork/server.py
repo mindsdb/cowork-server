@@ -37,6 +37,22 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
+    # Release scheduled runs left in `running` by a previous process (crash/
+    # restart). Otherwise the due-check treats the stale row as an in-flight
+    # run and never fires that schedule again.
+    try:
+        from cowork.db.session import get_open_session
+        from cowork.services.schedules import ScheduleRunService
+
+        recovery_session = get_open_session()
+        try:
+            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
+            if reaped:
+                logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
+        finally:
+            recovery_session.close()
+    except Exception:
+        logger.exception("scheduled-run boot recovery failed (non-fatal)")
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.ingress import sync_channel_ingress
