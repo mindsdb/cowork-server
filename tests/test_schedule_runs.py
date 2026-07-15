@@ -7,6 +7,7 @@ from sqlmodel import Session, SQLModel
 
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
+from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.schedules import ScheduleRunService
 
@@ -488,3 +489,52 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s = get_open_session()
         ScheduleService(s).delete_schedule(schedule_id)
         s.close()
+
+
+# --- ENG-769: reap orphaned `running` runs left by a crash/restart.
+
+def test_reap_orphaned_runs_marks_running_as_failed():
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+    run = run_service.create_run(schedule.id, is_manual=False)
+
+    # The stale `running` row would otherwise wedge the schedule forever.
+    assert run_service.has_running_run(schedule.id) is True
+
+    reaped = run_service.reap_orphaned_runs()
+
+    assert reaped == 1
+    assert run_service.has_running_run(schedule.id) is False
+
+    session.refresh(run)
+    assert run.status == RunStatus.failed
+    assert run.error is not None
+    assert run.finished_at is not None
+    assert run.duration_ms is not None
+
+
+def test_reap_orphaned_runs_reaps_manual_runs_too():
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+    manual = run_service.create_run(schedule.id, is_manual=True)
+
+    assert run_service.reap_orphaned_runs() == 1
+
+    session.refresh(manual)
+    assert manual.status == RunStatus.failed
+
+
+def test_reap_orphaned_runs_leaves_finished_runs_untouched():
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(session)
+    run = run_service.create_run(schedule.id, is_manual=False)
+    run_service.finish_run(run.id)
+
+    assert run_service.reap_orphaned_runs() == 0
+
+    session.refresh(run)
+    assert run.status == RunStatus.success
+    assert run.error is None
