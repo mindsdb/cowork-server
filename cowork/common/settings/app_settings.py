@@ -335,6 +335,16 @@ class AppSettings(Settings):
             "from which a per-request principal is built."
         ),
     )
+    identity_enforce: Literal["audit", "enforce"] = Field(
+        default="audit",
+        validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
+        description=(
+            "Org-mode identity enforcement. 'audit' (default): requests without "
+            "identity headers are logged and allowed through. 'enforce': they "
+            "are rejected with 401. Flip to 'enforce' once the audit log shows "
+            "all legitimate identity-less callers are handled."
+        ),
+    )
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(
