@@ -194,6 +194,20 @@ class AntonHarness:
         before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
         skill_drafts: list[dict] = []
+        # Shared cross-workstream IDs for the browser tool's content-free
+        # spans (WS5-T3): installation_id / task_id ride in on trace_metadata;
+        # session_id defaults to the conversation id. Installed for the turn
+        # and reset in the finally so nothing leaks across turns.
+        from .browser_telemetry import reset_browser_ids, set_browser_ids
+
+        _browser_ids = {"session_id": str(conversation.id)}
+        if trace_metadata:
+            for _k in ("installation_id", "task_id"):
+                _v = trace_metadata.get(_k)
+                if _v:
+                    _browser_ids[_k] = str(_v)
+        _browser_ids_token = set_browser_ids(_browser_ids)
+
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation,
@@ -214,6 +228,7 @@ class AntonHarness:
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 yield event
         finally:
+            reset_browser_ids(_browser_ids_token)
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
             # One dir diff → index the new artifacts AND build their cards.
@@ -538,6 +553,24 @@ class AntonHarness:
             if m.role in {"user", "assistant"}
         ]
 
+        # Session-time tool set. The browser-control tool is gated on a
+        # DB-backed user flag (connector-first: when browser access is
+        # disabled the tool is simply absent, modelling anton's web_tools
+        # native-vs-fallback gate).
+        base_tools = [
+            CONNECT_DATASOURCE_TOOL,
+            PUBLISH_TOOL,
+            LOOKUP_CONNECTOR_TOOL,
+            REQUEST_CREDENTIALS_TOOL,
+            LABEL_CONNECTION_TOOL,
+            # FETCH_SUBMISSION_TOOL,
+            # UPDATE_FORM_TOOL,
+        ]
+        tools = self._select_session_tools(
+            base_tools,
+            browser_enabled=bool(getattr(user, "browser_control_enabled", False)),
+        )
+
         config = ChatSessionConfig(
             llm_client=llm_client,
             settings=anton_settings,
@@ -568,18 +601,26 @@ class AntonHarness:
             # (anton 2a). The live current time is rendered separately in the
             # volatile tail, so resuming days later still reports the real "now".
             started_at=conversation.created_at,
-            tools=[
-                CONNECT_DATASOURCE_TOOL,
-                PUBLISH_TOOL,
-                LOOKUP_CONNECTOR_TOOL,
-                REQUEST_CREDENTIALS_TOOL,
-                LABEL_CONNECTION_TOOL,
-                # FETCH_SUBMISSION_TOOL,
-                # UPDATE_FORM_TOOL,
-            ],
+            tools=tools,
             cells=cells
         )
         return ChatSession(config), temp_vault_dir
+
+    @staticmethod
+    def _select_session_tools(base_tools: list, *, browser_enabled: bool) -> list:
+        """Assemble the per-session tool list.
+
+        The read-only browser-control tool is appended ONLY when browser
+        access is enabled for the session (connector-first: absent when
+        disabled). Extracted so the gate is unit-testable without building a
+        full ChatSession.
+        """
+        from .tools import build_cowork_browser_tool
+
+        tools = list(base_tools)
+        if browser_enabled:
+            tools.append(build_cowork_browser_tool())
+        return tools
 
     @staticmethod
     def _build_llm_client():
