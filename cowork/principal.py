@@ -10,9 +10,11 @@ identity headers:
     X-User-Roles       comma-separated role names  (optional)
 
 TrustedHeaderMiddleware turns those headers into a Principal on
-``request.state.principal`` and rejects requests that lack the required
-pair — identity is never derived from anything a client can set directly,
-only from what the gateway injected after verification.
+``request.state.principal``. Requests without a valid pair are rejected
+with 401 (COWORK_IDENTITY_ENFORCE=enforce) or logged and let through
+(audit, the rollout default). Identity is never derived from anything a
+client can set directly, only from what the gateway injected after
+verification.
 
 In local mode (the desktop sidecar, the default) the middleware is not
 registered and ``request.state.principal`` is absent; ``get_principal``
@@ -57,12 +59,19 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
     """Build a Principal from gateway-injected identity headers.
 
     Registered in create_app() only when COWORK_TENANCY_MODE=org.
-    Requests without valid identity headers are rejected with 401.
+    With enforce=True requests without valid identity are rejected with 401;
+    with enforce=False (audit rollout) they are logged and allowed through.
     """
 
-    def __init__(self, app: ASGIApp, exempt_paths: Collection[str] = ()) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        exempt_paths: Collection[str] = (),
+        enforce: bool = True,
+    ) -> None:
         super().__init__(app)
         self._exempt_paths = exempt_paths
+        self._enforce = enforce
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         # CORS preflight never carries identity headers.
@@ -77,7 +86,14 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
             user_id = str(UUID(request.headers.get(HEADER_USER_ID, "").strip()))
             org_id = str(UUID(request.headers.get(HEADER_ORG_ID, "").strip()))
         except ValueError:
-            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            if self._enforce:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            logger.warning(
+                "identity: no principal on %s %s (audit mode)",
+                request.method,
+                request.url.path,
+            )
+            return await call_next(request)
 
         roles = frozenset(
             role.strip()

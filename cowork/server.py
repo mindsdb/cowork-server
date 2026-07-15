@@ -140,8 +140,16 @@ def create_app() -> FastAPI:
     # Org mode: build a per-request Principal from gateway-injected identity
     # headers. Added first so it sits inner of the bearer/CORS layers.
     if settings.tenancy_mode == "org":
-        app.add_middleware(TrustedHeaderMiddleware, exempt_paths=channel_webhook_paths)
-        logger.info("auth: org tenancy mode — trusted-header principal middleware enabled")
+        enforce = settings.identity_enforce == "enforce"
+        app.add_middleware(
+            TrustedHeaderMiddleware,
+            exempt_paths=channel_webhook_paths,
+            enforce=enforce,
+        )
+        logger.info(
+            "auth: org tenancy mode — principal middleware enabled (%s)",
+            settings.identity_enforce,
+        )
 
     if settings.require_auth:
         env_path = Path.home() / ".cowork" / ".env"
