@@ -237,3 +237,18 @@ def test_delete_first_turn_clears_all(session, conversation):
     svc.delete_turn(conversation.id, 0)
 
     assert svc.get_ordered_messages(conversation.id) == []
+
+
+def test_hermes_history_excludes_tool_rows(session, conversation):
+    """Hermes builds OpenAI-format history and can't consume anton's Anthropic
+    tool blocks, so tool rows are filtered out (mirrors HermesHarness)."""
+    _persist_named_turn(session, conversation, "q1", "a1")
+    ordered = ConversationService(session).get_ordered_messages(conversation.id)
+    history = [
+        m.to_openai_message().model_dump()
+        for m in ordered
+        if m.role in {"user", "assistant"} and not _is_tool_row(m.content)
+    ]
+    # Only the plain user question and assistant answer survive — no list
+    # content (which is where the tool blocks would have leaked).
+    assert [type(h["content"]).__name__ for h in history] == ["str", "str"]

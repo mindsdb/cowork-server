@@ -150,7 +150,7 @@ class HermesHarness:
         # Canonical order (created_at, seq, ...) — the bare relationship is
         # unordered and would scramble a turn's tool_use/tool_result block-rows.
         from sqlalchemy.orm import object_session
-        from cowork.services.conversations import ConversationService
+        from cowork.services.conversations import ConversationService, _is_tool_row
 
         _db_session = object_session(conversation)
         _ordered = (
@@ -158,10 +158,13 @@ class HermesHarness:
             if _db_session is not None
             else list(conversation.messages)
         )
+        # Drop tool rows: they hold anton's Anthropic-format tool_use/tool_result
+        # blocks, which are invalid in hermes' OpenAI history. hermes emits none
+        # of its own, so this only skips foreign rows from an anton→hermes switch.
         history = [
             msg.to_openai_message().model_dump()
             for msg in _ordered
-            if msg.role in {"user", "assistant"}
+            if msg.role in {"user", "assistant"} and not _is_tool_row(msg.content)
         ]
 
         # Resolve project-derived values while the DB session is alive —
