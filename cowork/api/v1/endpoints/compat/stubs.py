@@ -342,7 +342,33 @@ async def browse_commands_next(req: _CommandsNextRequest, session: _SessionDep):
         return {"command": None, "blocked": sess.control_state}
 
     cmd = await bridge_command_service.next(req.session_id, wait_s=req.wait_s)
-    return {"command": cmd.model_dump() if cmd else None}
+    if cmd is None:
+        return {"command": None}
+
+    # Re-check the gate AFTER the wakeup: a Stop can land while we were
+    # awaiting `next()` (its drain sees an empty queue), then a producer
+    # that had already passed its own pre-dispatch check enqueues and wakes
+    # this await. Without this re-read, that command would be handed to the
+    # extension after the Stop. Expire the ORM cache first — the Stop was
+    # committed by a different request/DB session.
+    session.expire_all()
+    sess = control.get_session(req.session_id)
+    if sess is not None and sess.control_state != ControlState.active.value:
+        # Resolve the pulled command terminally so its producer stops
+        # waiting, then drain anything else that raced in.
+        await bridge_command_service.fail(
+            cmd.command_id,
+            ResultCode.error,
+            detail=f"session {sess.control_state}",
+        )
+        await bridge_command_service.drain_session(
+            req.session_id,
+            ResultCode.error,
+            detail=f"session {sess.control_state}",
+        )
+        return {"command": None, "blocked": sess.control_state}
+
+    return {"command": cmd.model_dump()}
 
 
 @browse_router.post("/commands/{command_id}/result")

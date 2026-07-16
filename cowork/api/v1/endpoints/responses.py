@@ -51,6 +51,23 @@ async def options_handler():
 
 @router.post("/")
 async def responses(responses_request: ResponsesRequest, session: SessionDep):
+    # A fresh user turn resumes a `stopped` browser gate (Browser Control
+    # M1). Stop gates the turn it cancelled — it survives reconnect and is
+    # never auto-cleared — but starting a NEW turn is the explicit user
+    # signal to proceed again, so `stopped` resets to `active` here, BEFORE
+    # the producer starts (a `taken_over` gate is preserved). Best-effort:
+    # a missing/new conversation has no session to resume and never blocks
+    # the turn.
+    if responses_request.conversation:
+        try:
+            from cowork.services.browser.control import BrowserControlService
+
+            BrowserControlService(session).resume_on_new_turn(
+                responses_request.conversation
+            )
+        except Exception:  # pragma: no cover - defensive, never block a turn
+            # e.g. a non-UUID client-allocated conversation id.
+            logger.debug("browser-resume-on-new-turn skipped", exc_info=True)
     handler = ResponsesHandler(session)
     result = await handler.handle(responses_request)
     if responses_request.stream:

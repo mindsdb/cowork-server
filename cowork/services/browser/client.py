@@ -93,8 +93,17 @@ class BridgeClient:
                 detail="no browser session for conversation",
             )
 
+        # A navigate (follow_link) targets the href's registrable host — the
+        # permission check must run against IT, not fall back to the
+        # session's approved active_domain. Without this, `follow_link` with
+        # a cross-host href would ride the same-host grant.
+        domain = (
+            host_only(href)
+            if action_type == BrowserActionType.navigate and href
+            else None
+        )
         return await self._run(
-            sess.id, action_type, href=href, direction=direction
+            sess.id, action_type, domain=domain, href=href, direction=direction
         )
 
     # ── public verbs (the send_browser_command surface) ───────────
