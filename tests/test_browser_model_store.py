@@ -338,3 +338,125 @@ def test_browser_migration_downgrade_guards_missing_tables(tmp_path, monkeypatch
     with engine.begin() as conn:
         cfg.attributes["connection"] = conn
         command.downgrade(cfg, "f7d2b9e4a1c6")  # must not raise
+
+
+# ── review fixes: host-only domain, terminal immutability, cascade ────
+def test_append_pending_normalizes_full_url_domain_to_host(session):
+    # Defense in depth: a caller passing a full URL must never leak
+    # path/query into the host-only `browser_actions.domain` column.
+    bs = _make_session_row(session)
+    store = BrowserActionStore(session)
+    action = store.append_pending(
+        session_id=bs.id,
+        command_id="cmd-url",
+        idempotency_key="k-url",
+        action_type=BrowserActionType.navigate,
+        domain="https://Example.com/path?token=secret#frag",
+    )
+    assert action.domain == "example.com"
+
+
+def test_late_ok_result_does_not_overwrite_terminal_failure(session):
+    # mark_failed(target_lost) is terminal; a delayed `ok` for the same
+    # command_id must not flip the row back to `observed`.
+    bs = _make_session_row(session)
+    store = BrowserActionStore(session)
+    store.append_pending(
+        session_id=bs.id,
+        command_id="cmd-late",
+        idempotency_key="k-late",
+        action_type=BrowserActionType.inspect,
+        domain="example.com",
+    )
+    store.mark_in_flight("cmd-late")
+    store.mark_failed("cmd-late", result_code=ResultCode.target_lost)
+    late = store.record_observed(
+        "cmd-late",
+        result_code=ResultCode.ok,
+        transient={"http_status": 200, "settled": True},
+    )
+    assert late.status == "failed"
+    assert late.result_code == "target_lost"
+    assert late.observed_result is None
+
+
+def test_duplicate_result_does_not_overwrite_terminal_observed(session):
+    bs = _make_session_row(session)
+    store = BrowserActionStore(session)
+    store.append_pending(
+        session_id=bs.id,
+        command_id="cmd-dup",
+        idempotency_key="k-dup",
+        action_type=BrowserActionType.inspect,
+        domain="example.com",
+    )
+    store.mark_in_flight("cmd-dup")
+    store.record_observed(
+        "cmd-dup", result_code=ResultCode.ok, transient={"http_status": 200}
+    )
+    dup = store.record_observed("cmd-dup", result_code=ResultCode.error)
+    assert dup.status == "observed"
+    assert dup.result_code == "ok"
+    assert dup.observed_result == {"http_status": 200}
+
+
+def test_delete_conversation_cleans_browser_rows(session):
+    from sqlmodel import select
+
+    from cowork.models.browser import BrowserAction
+    from cowork.services.conversations import ConversationService
+
+    bs = _make_session_row(session, domain="example.com")
+    conv_id = bs.conversation_id
+    session.add(
+        BrowserTabGrant(
+            session_id=bs.id, domain="example.com",
+            action_class=BrowserActionClass.navigate.value,
+            decision=PermissionDecision.granted.value,
+            granted_at=datetime.now(timezone.utc),
+        )
+    )
+    session.commit()
+    store = BrowserActionStore(session)
+    store.append_pending(
+        session_id=bs.id,
+        command_id="cmd-del",
+        idempotency_key="k-del",
+        action_type=BrowserActionType.inspect,
+        domain="example.com",
+    )
+
+    assert ConversationService(session).delete_conversation(conv_id)
+
+    assert session.exec(
+        select(BrowserSession).where(BrowserSession.conversation_id == conv_id)
+    ).first() is None
+    assert session.exec(
+        select(BrowserTabGrant).where(BrowserTabGrant.session_id == bs.id)
+    ).first() is None
+    assert session.exec(
+        select(BrowserAction).where(BrowserAction.session_id == bs.id)
+    ).first() is None
+
+
+def test_browser_fks_carry_on_delete_cascade(tmp_path, monkeypatch):
+    # The migration must emit ON DELETE CASCADE so FK-enforcing engines
+    # (Postgres) don't reject deleting a conversation with a browser session.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "c.db"
+    uri = f"sqlite:///{db_path}"
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with sqlite3.connect(db_path) as c:
+        def fk_actions(table):
+            # pragma foreign_key_list: (id, seq, table, from, to, on_update, on_delete, match)
+            return {
+                (row[2], row[3]): row[6]
+                for row in c.execute(f"PRAGMA foreign_key_list({table})")
+            }
+
+        assert fk_actions("browser_sessions")[("conversations", "conversation_id")] == "CASCADE"
+        assert fk_actions("browser_tab_grants")[("browser_sessions", "session_id")] == "CASCADE"
+        assert fk_actions("browser_actions")[("browser_sessions", "session_id")] == "CASCADE"

@@ -60,7 +60,9 @@ def upgrade() -> None:
                 server_default=sa.func.now(),
                 nullable=True,
             ),
-            sa.ForeignKeyConstraint(["conversation_id"], ["conversations.id"]),
+            sa.ForeignKeyConstraint(
+                ["conversation_id"], ["conversations.id"], ondelete="CASCADE"
+            ),
             sa.ForeignKeyConstraint(["project_id"], ["projects.id"]),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint(
@@ -100,7 +102,9 @@ def upgrade() -> None:
                 server_default=sa.func.now(),
                 nullable=True,
             ),
-            sa.ForeignKeyConstraint(["session_id"], ["browser_sessions.id"]),
+            sa.ForeignKeyConstraint(
+                ["session_id"], ["browser_sessions.id"], ondelete="CASCADE"
+            ),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint(
                 "session_id",
@@ -147,7 +151,9 @@ def upgrade() -> None:
                 server_default=sa.func.now(),
                 nullable=True,
             ),
-            sa.ForeignKeyConstraint(["session_id"], ["browser_sessions.id"]),
+            sa.ForeignKeyConstraint(
+                ["session_id"], ["browser_sessions.id"], ondelete="CASCADE"
+            ),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint(
                 "session_id", "sequence", name="uq_browser_actions_sequence"
