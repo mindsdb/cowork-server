@@ -200,3 +200,4 @@ In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KE
 ## License
 
 See [LICENSE](LICENSE).
+ 
