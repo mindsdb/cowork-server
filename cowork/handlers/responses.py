@@ -13,7 +13,6 @@ from sqlmodel import Session
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.models.message import Message as DBMessage
 from cowork.streaming import new_buffer, registry
 from cowork.schemas.responses import (
     Content,
@@ -143,14 +142,9 @@ class ResponsesHandler:
         # Non-streaming (legacy/rare): persist the user message inline (via FK,
         # not the relationship, so the cached history above stays clean) and
         # run synchronously within the request.
-        user_message = DBMessage(
-            conversation_id=conversation.id,
-            role=Role.user,
-            content=original_content,
+        user_message = ConversationService(self.session).save_user_message(
+            conversation.id, original_content,
         )
-        self.session.add(user_message)
-        self.session.commit()
-        self.session.refresh(user_message)
 
         stream = self.harness.stream_response(
             conversation=conversation,
@@ -204,8 +198,7 @@ class ResponsesHandler:
                 return
             persisted = True
             try:
-                own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
-                own.commit()
+                ConversationService(own).save_user_message(conv_id, original_content)
                 ConversationService(own).save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                     tool_rows=turn_rows,

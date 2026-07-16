@@ -416,8 +416,7 @@ class AntonChannelRuntime:
         _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
-        session.add(DBMessage(conversation_id=conversation.id, role="user", content=content))
-        session.commit()
+        ConversationService(session).save_user_message(conversation.id, content)
 
         collected: list[str] = []
         events: list[dict] = []

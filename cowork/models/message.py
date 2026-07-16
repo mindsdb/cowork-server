@@ -36,11 +36,11 @@ class Message(BaseSQLModel, table=True):
         default=0,
         sa_column_kwargs={"server_default": "0"},
         description=(
-            "Intra-turn ordinal. A turn persists several block-messages "
-            "(assistant tool_use, user tool_result, ...) that share one "
-            "created_at; seq keeps them in emission order, since the role "
-            "tiebreak in message ordering would otherwise sort tool_result "
-            "(user) ahead of tool_use (assistant). 0 for single-row turns."
+            "Per-conversation monotonic ordinal. Several block-messages "
+            "(assistant tool_use, user tool_result, ...) can share one "
+            "created_at (second precision); seq orders every message in the "
+            "conversation deterministically, without depending on that "
+            "resolution. Assigned as max(seq)+1 on insert; 0 for legacy rows."
         ),
     )
 
