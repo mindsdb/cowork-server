@@ -151,6 +151,13 @@ class BrowserApprovalService:
         # the gate is active) brings the session online.
         sess.requires_reapproval = False
         sess.bridge_state = BridgeState.connected.value
+        # An explicit re-approval is the documented way to end a `taken_over`
+        # gate (see BrowserControlService.resume_on_new_turn()'s docstring:
+        # "only an explicit re-approval ends a takeover"). A `stopped` gate
+        # is a different signal (it survives reconnect/approval and is only
+        # cleared by a fresh user turn) and must NOT be cleared here.
+        if sess.control_state == ControlState.taken_over.value:
+            sess.control_state = ControlState.active.value
         if sess.control_state == ControlState.active.value:
             sess.available = True
         return self._save(sess)

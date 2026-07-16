@@ -236,6 +236,38 @@ def test_takeover_by_conversation_creates_session(session):
     assert sess.control_state == ControlState.taken_over.value
 
 
+def test_explicit_reapproval_ends_a_takeover(session):
+    # Per BrowserControlService.resume_on_new_turn()'s docstring, a
+    # `taken_over` gate is NOT cleared by a new turn -- "only an explicit
+    # re-approval ends a takeover". Verify approve() actually does this
+    # (unlike `stopped`, which approve() must NOT clear -- see
+    # test_stop_by_conversation_creates_session_and_gate_persists above).
+    conv = Conversation(topic="reapprove-after-takeover", project_id=GENERAL_PROJECT_ID)
+    session.add(conv)
+    session.commit()
+    session.refresh(conv)
+
+    control = BrowserControlService(session)
+    control.takeover_by_conversation(conv.id)
+    sess = control.get_by_conversation(conv.id)
+    assert sess.control_state == ControlState.taken_over.value
+    assert sess.available is False
+
+    from cowork.services.browser.approval import BrowserApprovalService
+    approved = BrowserApprovalService(session).approve(conv.id, "example.com")
+    assert approved.control_state == ControlState.active.value
+    assert approved.available is True
+
+    # And a stopped gate remains unaffected by this change: approve() must
+    # still leave `stopped` alone (regression guard for the fix above).
+    control.stop(sess.id)
+    session.refresh(sess)
+    assert sess.control_state == ControlState.stopped.value
+    approved_again = BrowserApprovalService(session).approve(conv.id, "example.com")
+    assert approved_again.control_state == ControlState.stopped.value
+    assert approved_again.available is False
+
+
 def test_stop_by_conversation_nonexistent_conversation_noop(session):
     from uuid import uuid4
     assert BrowserControlService(session).stop_by_conversation(uuid4()) is None
