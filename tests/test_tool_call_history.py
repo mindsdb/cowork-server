@@ -4,8 +4,6 @@ A turn's tool_use / tool_result blocks are persisted as their own `messages`
 rows (ordered by `seq`), hidden from the UI, and replayed verbatim into the
 next turn's LLM history so the agent remembers what it did.
 """
-from datetime import datetime
-
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -181,16 +179,12 @@ def test_is_tool_row_discriminates():
     assert not _is_tool_row([])
 
 
-# --- delete_turn skips hidden tool rows -------------------------------------
+# --- monotonic seq + delete_turn across turns -------------------------------
 
-def _persist_turn_at(session, conv, user_text, answer, when):
-    """Persist one tool-using turn, then stamp its rows with `when` so turns
-    order deterministically (server_default now() is second-precision and
-    would collide within a test run)."""
+def _persist_named_turn(session, conv, user_text, answer):
+    """One tool-using turn via the real service path (monotonic seq)."""
     svc = ConversationService(session)
-    before = {m.id for m in svc.get_ordered_messages(conv.id)}
-    session.add(Message(conversation_id=conv.id, role="user", content=user_text))
-    session.commit()
+    svc.save_user_message(conv.id, user_text)
     tool_rows = [
         {"role": "assistant", "content": [
             {"type": "tool_use", "id": "t", "name": "x", "input": {}}]},
@@ -198,11 +192,6 @@ def _persist_turn_at(session, conv, user_text, answer, when):
             {"type": "tool_result", "tool_use_id": "t", "content": "B"}]},
     ]
     svc.save_assistant_turn(conv.id, answer, [], harness="anton", tool_rows=tool_rows)
-    for m in svc.get_ordered_messages(conv.id):
-        if m.id not in before:
-            m.created_at = when
-            session.add(m)
-    session.commit()
 
 
 def _visible(session, conv):
@@ -212,11 +201,22 @@ def _visible(session, conv):
     ]
 
 
+def test_turns_stay_ordered_within_same_second(session, conversation):
+    """Every row here shares one created_at (server now() is second-precision);
+    monotonic seq alone must keep the turns from interleaving."""
+    _persist_named_turn(session, conversation, "q1", "a1")
+    _persist_named_turn(session, conversation, "q2", "a2")
+    assert _visible(session, conversation) == [
+        ("user", "q1"), ("assistant", "a1"),
+        ("user", "q2"), ("assistant", "a2"),
+    ]
+
+
 def test_delete_second_turn_keeps_first(session, conversation):
     """Deleting the 2nd visible turn must NOT destroy the 1st turn's answer:
     hidden tool_use rows (role=assistant) must not inflate the turn count."""
-    _persist_turn_at(session, conversation, "q1", "a1", datetime(2026, 7, 16, 10, 0))
-    _persist_turn_at(session, conversation, "q2", "a2", datetime(2026, 7, 16, 10, 5))
+    _persist_named_turn(session, conversation, "q1", "a1")
+    _persist_named_turn(session, conversation, "q2", "a2")
     svc = ConversationService(session)
 
     deleted = svc.delete_turn(conversation.id, 1)  # UI's 2nd assistant turn
@@ -230,8 +230,8 @@ def test_delete_second_turn_keeps_first(session, conversation):
 
 
 def test_delete_first_turn_clears_all(session, conversation):
-    _persist_turn_at(session, conversation, "q1", "a1", datetime(2026, 7, 16, 10, 0))
-    _persist_turn_at(session, conversation, "q2", "a2", datetime(2026, 7, 16, 10, 5))
+    _persist_named_turn(session, conversation, "q1", "a1")
+    _persist_named_turn(session, conversation, "q2", "a2")
     svc = ConversationService(session)
 
     svc.delete_turn(conversation.id, 0)

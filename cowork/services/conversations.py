@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import case
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
@@ -13,10 +13,11 @@ from cowork.schemas.responses import Role
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.task_objects import TaskObjectService
 
-# Streaming turns persist user + assistant in one persist() call; on SQLite
-# both rows often share the same created_at (second precision). `seq` orders
-# the block-rows of one turn (see save_assistant_turn); the role tiebreak keeps
-# legacy single-row turns (seq 0) user-before-assistant; id is the final tiebreak.
+# created_at is only second-precision, so rows of turns in the same second
+# would otherwise interleave. `seq` is a per-conversation monotonic ordinal
+# (see _next_seq) that resolves those ties deterministically. The role tiebreak
+# only matters for legacy rows (all seq 0), keeping user before assistant; id is
+# the final tiebreak.
 _MESSAGE_ORDER = (
     Message.created_at,
     Message.seq,
@@ -42,6 +43,37 @@ def _is_tool_row(content) -> bool:
 class ConversationService:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    def _next_seq(self, conversation_id: UUID) -> int:
+        """Next per-conversation ordinal: max(seq) + 1, or 0 when empty.
+
+        Keeps `seq` monotonic across the whole conversation so message order
+        never depends on created_at's second-level resolution.
+
+        ponytail: one extra aggregate per persist, and max+1 races only if a
+        single conversation runs two concurrent turns — which it can't today
+        (turns are serialized). The id tiebreak in _MESSAGE_ORDER still bounds
+        the fallout if that ever changes.
+        """
+        current_max = self.session.exec(
+            select(func.max(Message.seq)).where(
+                Message.conversation_id == conversation_id
+            )
+        ).one()
+        return 0 if current_max is None else current_max + 1
+
+    def save_user_message(self, conversation_id: UUID, content) -> Message:
+        """Persist a user message with the next monotonic `seq` (see _next_seq)."""
+        message = Message(
+            conversation_id=conversation_id,
+            role="user",
+            content=content,
+            seq=self._next_seq(conversation_id),
+        )
+        self.session.add(message)
+        self.session.commit()
+        self.session.refresh(message)
+        return message
 
     def list_conversations(
         self,
@@ -238,8 +270,9 @@ class ConversationService:
             for row in (tool_rows or [])
         ]
         ordered_rows.append(assistant_msg)
-        for position, message in enumerate(ordered_rows):
-            message.seq = position
+        base_seq = self._next_seq(conversation_id)
+        for offset, message in enumerate(ordered_rows):
+            message.seq = base_seq + offset
             self.session.add(message)
         self.session.commit()
         self.session.refresh(assistant_msg)
