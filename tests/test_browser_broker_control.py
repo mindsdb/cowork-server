@@ -958,3 +958,99 @@ def test_permission_check_suffix_grant_covers_only_exact_host(session):
     assert not svc.check(
         bs.id, "foo.github.io", BrowserActionClass.navigate
     ).granted
+
+
+# ── idempotent stop tokens (/control/stop stop_id) ───────────────────
+def _resume(conv_id: str) -> str:
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as s:
+        sess = BrowserControlService(s).resume_on_new_turn(conv_id)
+        return sess.control_state
+
+
+def test_control_stop_new_stop_id_stops(session):
+    conv_id = _create_conv()
+    r = client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-1"},
+    )
+    assert r.status_code == 200
+    assert r.json()["stopped"] is True
+    assert r.json()["control_state"] == "stopped"
+
+
+def test_control_stop_same_stop_id_after_resume_is_pure_ack(session):
+    # stop → fresh user turn resumes → the poller's ack (same stop_id) must
+    # NOT re-stop the freshly-resumed session.
+    conv_id = _create_conv()
+    client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-ack"},
+    )
+    assert _resume(conv_id) == "active"
+    r = client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-ack"},
+    )
+    assert r.status_code == 200
+    assert r.json()["stopped"] is False
+    assert r.json()["control_state"] == "active"
+    r2 = client.get("/api/v1/browse/status", params={"conversation_id": conv_id})
+    assert r2.json()["control_state"] == "active"
+
+
+def test_control_stop_fresh_stop_id_after_resume_stops_again(session):
+    # A genuinely NEW user stop (different stop_id) after a resume must
+    # apply — only the SAME token is an ack.
+    conv_id = _create_conv()
+    client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-a"},
+    )
+    assert _resume(conv_id) == "active"
+    r = client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-b"},
+    )
+    assert r.json()["stopped"] is True
+    assert r.json()["control_state"] == "stopped"
+
+
+def test_control_stop_without_stop_id_keeps_legacy_behavior(session):
+    # Legacy/curl callers without a stop_id always stop, even repeatedly
+    # and even right after a resume.
+    conv_id = _create_conv()
+    client.post("/api/v1/browse/control/stop", json={"conversation_id": conv_id})
+    assert _resume(conv_id) == "active"
+    r = client.post("/api/v1/browse/control/stop", json={"conversation_id": conv_id})
+    assert r.json()["stopped"] is True
+    assert r.json()["control_state"] == "stopped"
+
+
+def test_control_stop_pure_ack_does_not_drain(monkeypatch):
+    # A pure ack must not drain the broker queue; a genuinely new stop does.
+    import cowork.api.v1.endpoints.compat.stubs as stubs
+
+    calls = []
+
+    async def _fake_drain(sess):
+        calls.append(sess)
+
+    monkeypatch.setattr(stubs, "_drain_gated_session", _fake_drain)
+    conv_id = _create_conv()
+    client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-drain"},
+    )
+    assert len(calls) == 1
+    _resume(conv_id)
+    client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-drain"},
+    )
+    assert len(calls) == 1  # ack did NOT drain
+    client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "stop-drain-2"},
+    )
+    assert len(calls) == 2  # new stop drains again

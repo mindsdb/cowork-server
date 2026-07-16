@@ -502,6 +502,13 @@ class _ControlRequest(BaseModel):
     conversation_id: str
 
 
+class _StopRequest(_ControlRequest):
+    # Client-generated stop token (UUID string). The renderer sends it with
+    # the user's stop; the Electron poller re-sends the SAME id as its
+    # acknowledgement, which must be idempotent (see browse_control_stop).
+    stop_id: str | None = None
+
+
 async def _drain_gated_session(sess) -> None:
     """Drain any queued/in-flight commands for a gated session.
 
@@ -521,7 +528,7 @@ async def _drain_gated_session(sess) -> None:
 
 
 @browse_router.post("/control/stop")
-async def browse_control_stop(req: _ControlRequest, session: _SessionDep):
+async def browse_control_stop(req: _StopRequest, session: _SessionDep):
     """Set the stopped pre-dispatch gate synchronously (<1s, persisted).
 
     Returns 200 even when no session exists yet so the Stop button never
@@ -534,13 +541,20 @@ async def browse_control_stop(req: _ControlRequest, session: _SessionDep):
     No re-approval is required after a Stop — Electron's local
     `stopRequested` latch merely closes the hand-out→execute race and
     self-clears.
+
+    Idempotent by `stop_id`: the poller acknowledges the gate by re-POSTing
+    the renderer's `stop_id`. An already-applied `stop_id` is a pure ack —
+    it neither changes control_state (the session may have been resumed by
+    a fresh user turn in between; the ack must NOT re-stop it) nor drains.
+    Absent/new stop_ids keep the full stop behavior (legacy callers too).
     """
     control = _get_control_service(session)
-    sess = control.stop_by_conversation(req.conversation_id)
-    await _drain_gated_session(sess)
+    sess, applied = control.apply_stop(req.conversation_id, stop_id=req.stop_id)
+    if applied:
+        await _drain_gated_session(sess)
     if sess is None:
         return {"stopped": True, "control_state": ControlState.stopped.value, "session": None}
-    return {"stopped": True, "control_state": sess.control_state, "session": str(sess.id)}
+    return {"stopped": applied, "control_state": sess.control_state, "session": str(sess.id)}
 
 
 @browse_router.post("/control/takeover")

@@ -15,6 +15,15 @@ already handed to the wire just before the Stop landed); that latch
 self-clears and is NOT a "requires re-approval" gate. Re-approval is
 required only after take-over / lost (`requires_reapproval`), never after a
 plain Stop.
+
+Stop ack tokens: the renderer sends a client-generated `stop_id` with the
+user's stop, and the Electron poller re-sends the SAME `stop_id` when it
+acknowledges the gate by POSTing /browse/control/stop itself. A `stop_id`
+the session has already applied is a PURE acknowledgement — it must not
+change `control_state` (the session may legitimately be `active` again
+after `resume_on_new_turn`) and must not drain. Only a NEW `stop_id` (or a
+legacy call without one) applies the stop. Tokens live in-memory only (see
+`_last_stop_ids`).
 - `takeover()` sets `taken_over` and flips `available=False` so the poller
   pauses issuing browser actions.
 - `is_blocked()` reports whether the gate currently forbids dispatch.
@@ -32,6 +41,13 @@ from sqlmodel import Session, select
 
 from cowork.models.browser import BrowserSession
 from cowork.schemas.browser import BridgeState, ControlState, coerce_enum, coerce_uuid
+
+# Last applied stop token per conversation (str(conversation_id) → stop_id).
+# In-memory ONLY, like the broker's command queue: the server is a single
+# process, so no DB column is needed. A restart forgets the tokens — worst
+# case the poller's ack after a restart is treated as a new stop and
+# re-stops once (the next user turn resumes it); it can never miss a stop.
+_last_stop_ids: dict[str, str] = {}
 
 
 class BrowserControlService:
@@ -93,6 +109,33 @@ class BrowserControlService:
             self._get_or_create_by_conversation(conversation_id),
             ControlState.stopped,
         )
+
+    def apply_stop(
+        self, conversation_id: UUID | str, *, stop_id: str | None = None
+    ) -> tuple[BrowserSession | None, bool]:
+        """Apply a stop idempotently by its client-generated `stop_id`.
+
+        Returns `(session, applied)`. When `stop_id` matches the LAST stop
+        already applied for this conversation, the call is a PURE
+        acknowledgement (the Electron poller re-sends the renderer's
+        `stop_id` to confirm the gate): `applied` is False and
+        `control_state` is left untouched — the session may legitimately be
+        `active` again after `resume_on_new_turn`, and the ack must not
+        re-stop it. A NEW `stop_id`, or none at all (legacy/curl callers),
+        applies the stop exactly like `stop_by_conversation` and records
+        the token. Tokens are in-memory per-process (`_last_stop_ids`); a
+        restart forgets them, worst case one redundant re-stop.
+        """
+        key = str(coerce_uuid(conversation_id))
+        if stop_id is not None and _last_stop_ids.get(key) == stop_id:
+            return self.get_by_conversation(conversation_id), False
+        sess = self._set_gate(
+            self._get_or_create_by_conversation(conversation_id),
+            ControlState.stopped,
+        )
+        if stop_id is not None and sess is not None:
+            _last_stop_ids[key] = stop_id
+        return sess, True
 
     def resume_on_new_turn(self, conversation_id: UUID | str) -> BrowserSession | None:
         """Clear a `stopped` gate when a FRESH USER TURN starts.
