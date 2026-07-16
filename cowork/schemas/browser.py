@@ -261,10 +261,22 @@ def build_observed_digest(transient: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def host_only(value: str) -> str:
-    """Reduce any URL/host string to its bare registrable host.
+    """Reduce any URL/host string to its bare hostname.
 
     Strips scheme, path, query, fragment, port, and userinfo, leaving only
     the hostname — the only URL-derived value we ever persist or trace.
+
+    This is the FULL hostname, NOT a PSL registrable domain:
+    `sub.example.co.uk` stays `sub.example.co.uk`. The approved grant
+    domain is the PSL-registrable-or-exact host Electron computes with its
+    PSL library; grant MATCHING against it is suffix-based via
+    `host_matches_grant`, never equality on this function's output.
+
+    `host_only` is strictly a normalizer and is idempotent —
+    `host_only(host_only(x)) == host_only(x)` — because digest validation
+    and telemetry use `host_only(v) != v` as an "already normalized" check.
+    IPv6 literals are handled bracket-aware: `[::1]:8080` → `::1`, and a
+    bare `::1` passes through unchanged.
     """
     if not value:
         return ""
@@ -279,10 +291,37 @@ def host_only(value: str) -> str:
     # Drop userinfo.
     if "@" in v:
         v = v.rsplit("@", 1)[1]
-    # Drop port.
-    if ":" in v:
+    # Drop port — bracket-aware so IPv6 literals survive.
+    if v.startswith("["):
+        # `[::1]:8080` / `[::1]` — the host is the bracket literal; strip
+        # the brackets (anything after `]` is the port).
+        end = v.find("]")
+        v = v[1:end] if end != -1 else v[1:]
+    elif v.count(":") == 1:
+        # Exactly one colon and no brackets → `host:port`. Two or more
+        # colons is a bare IPv6 literal (e.g. an already-normalized `::1`)
+        # — leave it intact so the function stays idempotent.
         v = v.split(":", 1)[0]
     return v.lower()
+
+
+def host_matches_grant(host_or_url: str, grant: str) -> bool:
+    """True iff `host_or_url`'s hostname is covered by the grant domain.
+
+    Both sides are normalized via `host_only`. The grant is the
+    PSL-registrable-or-exact host Electron computed when the tab was
+    approved (`example.co.uk`, `foo.github.io`, `::1`, `localhost`, …), so
+    a suffix match here accepts exactly the set Electron accepts: the grant
+    host itself or any subdomain of it (`shop.example.com` under an
+    `example.com` grant), while refusing lookalike suffixes
+    (`notexample.com`, `bank.co.uk.evil.com`). An empty host or empty
+    grant NEVER matches — an empty grant must not match everything.
+    """
+    host = host_only(host_or_url)
+    grant_host = host_only(grant)
+    if not host or not grant_host:
+        return False
+    return host == grant_host or host.endswith("." + grant_host)
 
 
 # ── DTOs ─────────────────────────────────────────────────────────────
