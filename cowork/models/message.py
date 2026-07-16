@@ -52,6 +52,13 @@ class Message(BaseSQLModel, table=True):
         """Convert to the OpenAI-compatible message format used in the API."""
         content = self.content
         if isinstance(content, list):
+            # Tool block-rows (tool_use / tool_result) must reach the model
+            # verbatim so the next turn sees prior tool calls and results.
+            if any(
+                isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+                for block in content
+            ):
+                return OpenAIMessage(role=self.role.value, content=content)
             text_parts = [
                 block.get("text", "")
                 for block in content
