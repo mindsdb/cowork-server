@@ -21,9 +21,11 @@ user's stop, and the Electron poller re-sends the SAME `stop_id` when it
 acknowledges the gate by POSTing /browse/control/stop itself. A `stop_id`
 the session has already applied is a PURE acknowledgement — it must not
 change `control_state` (the session may legitimately be `active` again
-after `resume_on_new_turn`) and must not drain. Only a NEW `stop_id` (or a
-legacy call without one) applies the stop. Tokens live in-memory only (see
-`_last_stop_ids`).
+after `resume_on_new_turn`) and must not drain. Acks are checked against a
+bounded FIFO history of recent stop tokens — not just the last one — so a
+DELAYED ack for an older stop is still recognized. Only a NEW `stop_id` (or
+a legacy call without one) applies the stop. Tokens live in-memory only
+(see `_applied_stop_ids`).
 - `takeover()` sets `taken_over` and flips `available=False` so the poller
   pauses issuing browser actions.
 - `is_blocked()` reports whether the gate currently forbids dispatch.
@@ -35,6 +37,7 @@ legacy call without one) applies the stop. Tokens live in-memory only (see
 """
 from __future__ import annotations
 
+from collections import deque
 from uuid import UUID
 
 from sqlmodel import Session, select
@@ -42,12 +45,20 @@ from sqlmodel import Session, select
 from cowork.models.browser import BrowserSession
 from cowork.schemas.browser import BridgeState, ControlState, coerce_enum, coerce_uuid
 
-# Last applied stop token per conversation (str(conversation_id) → stop_id).
-# In-memory ONLY, like the broker's command queue: the server is a single
-# process, so no DB column is needed. A restart forgets the tokens — worst
-# case the poller's ack after a restart is treated as a new stop and
-# re-stops once (the next user turn resumes it); it can never miss a stop.
-_last_stop_ids: dict[str, str] = {}
+# Recently applied stop tokens per conversation
+# (str(conversation_id) → deque of stop_ids). A SET of recent tokens, not
+# just the last one: a delayed poller ack for an OLDER stop (Stop A t1 →
+# resume → Stop B t2 → resume → late ack t1) must still be recognized as an
+# ack, not treated as a new stop that wrongly re-stops + drains a
+# freshly-resumed session. Bounded FIFO per conversation
+# (_STOP_ID_HISTORY, 16) — far more than any realistic in-flight ack
+# window; the 17th token evicts the 1st, whose ack would then redundantly
+# re-stop once (acceptable, never a missed stop). In-memory ONLY, like the
+# broker's command queue: the server is a single process, so no DB column
+# is needed. A restart forgets the tokens — worst case one redundant
+# re-stop (the next user turn resumes it).
+_STOP_ID_HISTORY = 16
+_applied_stop_ids: dict[str, deque[str]] = {}
 
 
 class BrowserControlService:
@@ -115,26 +126,31 @@ class BrowserControlService:
     ) -> tuple[BrowserSession | None, bool]:
         """Apply a stop idempotently by its client-generated `stop_id`.
 
-        Returns `(session, applied)`. When `stop_id` matches the LAST stop
-        already applied for this conversation, the call is a PURE
+        Returns `(session, applied)`. When `stop_id` is among the RECENTLY
+        applied stops for this conversation (bounded FIFO history, see
+        `_applied_stop_ids` — a set, not just the last token, so a DELAYED
+        poller ack for an older stop is still an ack), the call is a PURE
         acknowledgement (the Electron poller re-sends the renderer's
         `stop_id` to confirm the gate): `applied` is False and
         `control_state` is left untouched — the session may legitimately be
         `active` again after `resume_on_new_turn`, and the ack must not
         re-stop it. A NEW `stop_id`, or none at all (legacy/curl callers),
         applies the stop exactly like `stop_by_conversation` and records
-        the token. Tokens are in-memory per-process (`_last_stop_ids`); a
-        restart forgets them, worst case one redundant re-stop.
+        the token. Tokens are in-memory per-process; a restart forgets
+        them, worst case one redundant re-stop.
         """
         key = str(coerce_uuid(conversation_id))
-        if stop_id is not None and _last_stop_ids.get(key) == stop_id:
+        recent = _applied_stop_ids.get(key)
+        if stop_id is not None and recent is not None and stop_id in recent:
             return self.get_by_conversation(conversation_id), False
         sess = self._set_gate(
             self._get_or_create_by_conversation(conversation_id),
             ControlState.stopped,
         )
         if stop_id is not None and sess is not None:
-            _last_stop_ids[key] = stop_id
+            if recent is None:
+                recent = _applied_stop_ids[key] = deque(maxlen=_STOP_ID_HISTORY)
+            recent.append(stop_id)
         return sess, True
 
     def resume_on_new_turn(self, conversation_id: UUID | str) -> BrowserSession | None:
