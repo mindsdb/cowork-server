@@ -454,7 +454,20 @@ class AntonHarness:
 
         # TODO: Add guidance for integrations
 
-        cells = extract_scratchpad_cells_from_message_events(conversation.messages)
+        # Canonical order (created_at, seq, ...) — the bare `conversation.messages`
+        # relationship is unordered, which scrambles a turn's tool_use/tool_result
+        # block-rows and would break the replayed history.
+        from sqlalchemy.orm import object_session
+        from cowork.services.conversations import ConversationService
+
+        db_session = object_session(conversation)
+        ordered_messages = (
+            ConversationService(db_session).get_ordered_messages(conversation.id)
+            if db_session is not None
+            else list(conversation.messages)
+        )
+
+        cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
         # Per-message timestamps: embed each message's created_at so the agent
@@ -469,7 +482,7 @@ class AntonHarness:
             return om
 
         initial_history = [
-            _stamped(m) for m in conversation.messages
+            _stamped(m) for m in ordered_messages
             if m.role in {"user", "assistant"}
         ]
 
