@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 class GoogleServiceConfig:
     engine: str
     scopes: list[str] = field(default_factory=list)
+    # Whether this service's credentials response should include the Google
+    # Picker API key — a property of the service, not something callers
+    # should re-derive by string-comparing engine names.
+    uses_picker: bool = False
 
 
 GOOGLE_SERVICES: dict[str, GoogleServiceConfig] = {
@@ -18,6 +22,7 @@ GOOGLE_SERVICES: dict[str, GoogleServiceConfig] = {
             "https://www.googleapis.com/auth/userinfo.profile",
             "https://www.googleapis.com/auth/drive.file",
         ],
+        uses_picker=True,
     ),
     "google-calendar": GoogleServiceConfig(
         engine="google_calendar",

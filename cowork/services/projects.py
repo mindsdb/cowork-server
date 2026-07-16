@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -9,6 +10,8 @@ from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.models.project import Project
+
+logger = logging.getLogger(__name__)
 
 
 GENERAL_PROJECT = "general"
@@ -157,6 +160,39 @@ class ProjectService:
             return False
         if project.name == GENERAL_PROJECT:
             raise ValueError("Cannot delete the General project")
+        # Cascade to the project's conversations FIRST (ENG-701). Deleting a
+        # project used to only rmtree its dir + drop the row, orphaning every
+        # conversation in it — and their messages, events, task objects, and
+        # uploaded attachments (whose bytes live OUTSIDE the project dir, so the
+        # rmtree never reached them). There's no DB-level FK cascade. Deleting
+        # each conversation cleans all of that up (incl. attachments), and does
+        # it while the conversation still exists so the cleanup is safe.
+        from cowork.models.conversation import Conversation
+        from cowork.services.conversations import ConversationService
+        conv_svc = ConversationService(self.session)
+        conv_ids = list(
+            self.session.exec(
+                select(Conversation.id).where(Conversation.project_id == project_id)
+            ).all()
+        )
+        for cid in conv_ids:
+            # Fault-isolated: one conversation failing to delete must not abort
+            # the whole project delete and leave it half-cascaded. Log and move
+            # on — a skipped conversation just retains today's orphan behavior.
+            try:
+                conv_svc.delete_conversation(cid)
+            except Exception:
+                # Roll back the failed conversation's partial work FIRST.
+                # delete_conversation stages its row deletes (messages, events,
+                # task objects, attachment rows) before its own commit; without
+                # this rollback those pending deletes would be silently flushed
+                # by the next commit in the cascade (or the project commit below)
+                # — wiping the conversation's data while its row survives.
+                self.session.rollback()
+                logger.warning(
+                    "delete_project: failed to delete conversation %s; skipping", cid,
+                    exc_info=True,
+                )
         path = Path(project.path)
         if path.exists():
             shutil.rmtree(path)

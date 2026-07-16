@@ -18,6 +18,7 @@ from cowork.schemas.connectors import OAuthStartResponse
 from cowork.services.connectors.oauth import pkce as pkce_utils
 from cowork.services.connectors.oauth.config import GOOGLE_SERVICES
 from cowork.services.connectors.oauth.state import OAuthStateStore
+from cowork.services.connectors.vault_lock import lock_for
 
 import logging as _logging
 
@@ -195,21 +196,34 @@ class GoogleOAuthService:
             )
 
             extra = {k: v for k, v in (pending.get("extraFields") or {}).items() if v}
-            LocalDataVault(Path(ConnectorSettings().vault_dir)).save(
-                cfg.engine,
-                connection_name,
-                {
-                    "auth_type": "oauth",
-                    "access_token": access_token,
-                    "refresh_token": str(token_data.get("refresh_token", "")).strip(),
-                    "token_type": str(token_data.get("token_type", "Bearer")).strip(),
-                    "scope": str(token_data.get("scope", "")).strip(),
-                    "expires_at": expires_at,
-                    "account_email": account_email,
-                    "account_name": account_name,
-                    **extra,
-                },
-            )
+            vault = LocalDataVault(Path(ConnectorSettings().vault_dir))
+            new_fields = {
+                "auth_type": "oauth",
+                "access_token": access_token,
+                "refresh_token": str(token_data.get("refresh_token", "")).strip(),
+                "token_type": str(token_data.get("token_type", "Bearer")).strip(),
+                "scope": str(token_data.get("scope", "")).strip(),
+                "expires_at": expires_at,
+                "account_email": account_email,
+                "account_name": account_name,
+                **extra,
+            }
+            # This is a full-record overwrite (reconnecting/re-authorizing an
+            # existing connection, e.g. after token expiry), so anything worth
+            # keeping has to be carried forward explicitly — otherwise files
+            # the user already granted via the Google Picker (or a custom
+            # connection label) are silently revoked with no error shown to
+            # the user. Locked against ConnectionsService's merge_picked_files/
+            # remove_picked_file/patch_token and persist_connection — all of
+            # them read-modify-write the same vault record, and an unlocked
+            # interleaving here would silently revert whichever saves first.
+            with lock_for(cfg.engine, connection_name):
+                existing_fields = (vault.read_record(cfg.engine, connection_name) or {}).get("fields") or {}
+                if existing_fields.get("_picked_files"):
+                    new_fields.setdefault("_picked_files", existing_fields["_picked_files"])
+                if existing_fields.get("_label"):
+                    new_fields.setdefault("_label", existing_fields["_label"])
+                vault.save(cfg.engine, connection_name, new_fields)
         except HTTPException as exc:
             err_msg = str(exc.detail)
             store.clear_pending(service, error=err_msg)

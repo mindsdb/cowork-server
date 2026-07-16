@@ -17,6 +17,7 @@ from cowork.services.connectors.identity import (
     resolve_unique_slug,
     secure_keys_for,
 )
+from cowork.services.connectors.vault_lock import lock_for
 
 
 def _default_vault():
@@ -59,28 +60,41 @@ def persist_connection(
         or derive_connection_name(connector_id, method, cred)
         or f"{connector_id}-{uuid.uuid4().hex[:6]}"
     )
-    # Resolve modify-flow "keep" sentinels against the record being updated, so
-    # an unchanged secret keeps its stored value instead of persisting the
-    # literal sentinel.
-    target = vault.read_record(connector_id, base_slug)
-    cred, is_edit = resolve_keep_sentinels(cred, target)
-    payload = {**cred, "_connector_id": connector_id}
-    if method:
-        payload["_method"] = method
-    secure_keys = secure_keys_for(connector_id, method, payload)
-    if is_edit:
-        slug = base_slug  # an edit targets the named connection — update in place
-    else:
-        slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
-    # Carry an existing label forward when this save didn't set one (a full save
-    # overwrites the record), so editing other fields doesn't drop the label.
-    if not label:
+    # Locked for the same reason ConnectionsService's merge_picked_files/
+    # remove_picked_file/patch_token are: this is a read-modify-write against
+    # the vault record at (connector_id, base_slug) (the edit case — a brand
+    # new connection can't race anything since nothing else references it
+    # yet), and an unlocked interleaving with one of those would silently
+    # revert whichever side saves first.
+    with lock_for(connector_id, base_slug):
+        # Resolve modify-flow "keep" sentinels against the record being
+        # updated, so an unchanged secret keeps its stored value instead of
+        # persisting the literal sentinel.
+        target = vault.read_record(connector_id, base_slug)
+        cred, is_edit = resolve_keep_sentinels(cred, target)
+        payload = {**cred, "_connector_id": connector_id}
+        if method:
+            payload["_method"] = method
+        secure_keys = secure_keys_for(connector_id, method, payload)
+        if is_edit:
+            slug = base_slug  # an edit targets the named connection — update in place
+        else:
+            slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
+        # Carry an existing label forward when this save didn't set one (a full save
+        # overwrites the record), so editing other fields doesn't drop the label.
+        # Same reasoning applies to _picked_files (Google Picker grants) below — a
+        # full save here must not silently revoke files the user already granted
+        # access to.
         existing = target if slug == base_slug else vault.read_record(connector_id, slug)
-        label = str((existing or {}).get("fields", {}).get("_label", "")).strip()
-    if label:
-        payload["_label"] = label
-    vault.save(connector_id, slug, payload, secure_keys=secure_keys)
-    return slug
+        if not label:
+            label = str((existing or {}).get("fields", {}).get("_label", "")).strip()
+        if label:
+            payload["_label"] = label
+        existing_picked_files = (existing or {}).get("fields", {}).get("_picked_files")
+        if existing_picked_files:
+            payload.setdefault("_picked_files", existing_picked_files)
+        vault.save(connector_id, slug, payload, secure_keys=secure_keys)
+        return slug
 
 
 def set_connection_label(engine: str, name: str, label: str, *, vault=None) -> bool:
@@ -91,10 +105,11 @@ def set_connection_label(engine: str, name: str, label: str, *, vault=None) -> b
     """
     if vault is None:
         vault = _default_vault()
-    record = vault.read_record(engine, name)
-    if record is None:
-        return False
-    fields = dict(record.get("fields") or {})
-    fields["_label"] = str(label or "").strip()
-    vault.save(engine, name, fields, secure_keys=record.get("secure_keys"))
-    return True
+    with lock_for(engine, name):
+        record = vault.read_record(engine, name)
+        if record is None:
+            return False
+        fields = dict(record.get("fields") or {})
+        fields["_label"] = str(label or "").strip()
+        vault.save(engine, name, fields, secure_keys=record.get("secure_keys"))
+        return True

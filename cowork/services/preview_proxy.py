@@ -27,6 +27,7 @@ from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
 from cowork.common.http_client import get_proxy_client
 from cowork.services.artifacts import get_preview_mount
+from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,15 @@ async def proxy_artifact_request(
             b'name="api-base" content=""',
             f'name="api-base" content="{proxy_prefix}"'.encode(),
         )
+        # Inject the on-artifact comment marker layer when the renderer opts in
+        # (same activation flag as the static serve path). Fullstack previews
+        # flow through this proxy rather than serve_artifact_file, so this is the
+        # equivalent injection point for them.
+        if ACTIVATION_PARAM in request.query_params:
+            try:
+                patched = inject_layer(patched.decode("utf-8")).encode("utf-8")
+            except UnicodeDecodeError:
+                pass
         resp_headers = dict(_strip_hop_headers(upstream.headers, drop_cors=True))
         resp_headers.update(cors)
         # Drop Content-Length — the patched body may be larger than the
