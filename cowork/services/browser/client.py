@@ -93,10 +93,14 @@ class BridgeClient:
                 detail="no browser session for conversation",
             )
 
-        # A navigate (follow_link) targets the href's registrable host — the
-        # permission check must run against IT, not fall back to the
-        # session's approved active_domain. Without this, `follow_link` with
-        # a cross-host href would ride the same-host grant.
+        # A navigate (follow_link) targets the href's host — the permission
+        # check must run against IT, not fall back to the session's approved
+        # active_domain. Without this, `follow_link` with a cross-site href
+        # would ride the same-site grant. The grant match itself is
+        # registrable-host equality (host_matches_grant, inside the
+        # permission service): active_domain is Electron's
+        # PSL-registrable-or-exact host, so a same-site SUBDOMAIN href
+        # stays allowed, matching exactly what Electron itself accepts.
         domain = (
             host_only(href)
             if action_type == BrowserActionType.navigate and href
@@ -115,8 +119,10 @@ class BridgeClient:
     async def navigate(
         self, session_id: UUID | str, *, href: str, domain: str | None = None
     ) -> BrowserToolVerdict:
-        # The registrable host of the target is what the grant is checked
-        # against; only the host is ever used server-side.
+        # The target's bare host is what the grant is checked against
+        # (registrable-host equality with Electron's PSL-derived grant,
+        # inside the permission service); only the host is ever used
+        # server-side.
         target_domain = domain or host_only(href)
         return await self._run(
             session_id, BrowserActionType.navigate, domain=target_domain, href=href
@@ -188,10 +194,13 @@ class BridgeClient:
             )
 
         # Resolve the effective target host: an explicit domain, else the
-        # session's approved active domain.
+        # session's approved active domain. `target_host` is the bare
+        # hostname (host_only) — it is what gets persisted/traced; grant
+        # matching against it is registrable-host equality inside the
+        # permission service.
         target_host = host_only(domain) if domain else (sess.active_domain or "")
 
-        # 2. Permission check (cross-domain policy).
+        # 2. Permission check (cross-domain policy, registrable-host match).
         verdict = self._permissions.check(sid, target_host, action_class)
         if not verdict.granted:
             return BrowserToolVerdict(

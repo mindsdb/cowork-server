@@ -5,6 +5,16 @@ Owns `control_state` on `BrowserSession`:
 - `stop()` sets `stopped` synchronously (the pre-dispatch gate) and persists
   it — it survives reconnect and is NEVER auto-cleared. Only a fresh user
   turn clears it, via `resume_on_new_turn()` (called from the API layer).
+
+Shared Stop lifecycle (single definition across server + Electron):
+the SERVER is the single source of truth for the Stop gate. Stop gates the
+session server-side, and a FRESH USER TURN resumes it via
+`resume_on_new_turn()` — nothing else clears it. Electron keeps a local
+`stopRequested` latch ONLY to close the hand-out→execute race (a command
+already handed to the wire just before the Stop landed); that latch
+self-clears and is NOT a "requires re-approval" gate. Re-approval is
+required only after take-over / lost (`requires_reapproval`), never after a
+plain Stop.
 - `takeover()` sets `taken_over` and flips `available=False` so the poller
   pauses issuing browser actions.
 - `is_blocked()` reports whether the gate currently forbids dispatch.
@@ -87,10 +97,14 @@ class BrowserControlService:
     def resume_on_new_turn(self, conversation_id: UUID | str) -> BrowserSession | None:
         """Clear a `stopped` gate when a FRESH USER TURN starts.
 
-        Stop gates the turn it cancelled — it survives reconnect and is
-        never auto-cleared — but a new user turn is the explicit signal to
-        proceed again, so it resets `stopped` → `active` (the API layer
-        calls this from POST /responses). A `taken_over` gate is NOT
+        This is the ONLY resume path in the shared server/Electron Stop
+        lifecycle: the server owns the gate, and a new user turn is the
+        explicit signal to proceed again, so it resets `stopped` → `active`
+        (the API layer calls this from POST /responses). Stop gates the
+        turn it cancelled — it survives reconnect and is never
+        auto-cleared. No re-approval is needed after a plain Stop
+        (Electron's local `stopRequested` latch only closes the
+        hand-out→execute race and self-clears). A `taken_over` gate is NOT
         cleared here: the user is actively driving the browser, and only an
         explicit re-approval ends a takeover. Availability is restored only
         when the bridge is connected and no re-approval is pending.

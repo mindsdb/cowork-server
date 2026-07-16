@@ -21,6 +21,7 @@ from cowork.schemas.browser import (
     PermissionDecision,
     coerce_enum,
     coerce_uuid,
+    host_matches_grant,
     host_only,
 )
 
@@ -66,11 +67,16 @@ class BrowserPermissionService:
     ) -> PermissionResult:
         """Resolve granted/denied/expired/revoked for a session+domain+class.
 
-        The `domain` is reduced to its bare host before matching — a grant
-        covers a registrable host, never a full URL. A navigate that would
-        leave the approved host is `denied` (cross-domain policy). A `read`
-        action is allowed under either a `read` or a `navigate` grant on the
-        same host (navigate implies the tab is inspectable).
+        The `domain` is reduced to its bare host before matching. A grant
+        covers Electron's PSL-registrable-or-exact host, so matching goes
+        through `host_matches_grant` (the candidate's PSL registrable host
+        must EQUAL the grant) — `shop.example.com` is covered by an
+        `example.com` grant, exactly the set Electron accepts, while a
+        grant that is itself a suffix (`github.io`) covers only that exact
+        host. A navigate that would leave the granted site is `denied`
+        (cross-domain policy). A `read` action is allowed under either a
+        `read` or a `navigate` grant on the same site (navigate implies
+        the tab is inspectable).
         """
         sid = coerce_uuid(session_id)
         host = host_only(domain)
@@ -86,12 +92,15 @@ class BrowserPermissionService:
                 )
             )
 
-        grants = self._session.exec(
-            select(BrowserTabGrant).where(
-                BrowserTabGrant.session_id == sid,
-                BrowserTabGrant.domain == host,
-            )
+        # Grant matching is registrable-host equality (subdomains of a
+        # granted registrable host are covered), so select the session's
+        # grant rows and match in Python via host_matches_grant — SQL
+        # equality on `domain` would re-introduce the exact-host
+        # divergence from Electron.
+        all_grants = self._session.exec(
+            select(BrowserTabGrant).where(BrowserTabGrant.session_id == sid)
         ).all()
+        grants = [g for g in all_grants if host_matches_grant(host, g.domain)]
 
         if not grants:
             return self._policy.evaluate(

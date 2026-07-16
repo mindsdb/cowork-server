@@ -885,3 +885,76 @@ def test_responses_post_resumes_stopped_browser_session(monkeypatch):
 
     r = client.get("/api/v1/browse/status", params={"conversation_id": conv_id})
     assert r.json()["control_state"] == "active"
+
+
+# ── registrable-host grant matching (server/Electron same-host contract) ──
+def test_permission_check_subdomain_covered_by_grant(session):
+    # The grant domain is Electron's PSL-registrable host; a same-site
+    # SUBDOMAIN target must be granted (its registrable host equals the
+    # grant), while a lookalike suffix host must not.
+    bs = _make_session(session, domain="example.com")
+    from cowork.services.browser.permissions import BrowserPermissionService
+
+    svc = BrowserPermissionService(session)
+    assert svc.check(bs.id, "shop.example.com", BrowserActionClass.read).granted
+    assert svc.check(bs.id, "shop.example.com", BrowserActionClass.navigate).granted
+    assert not svc.check(bs.id, "notexample.com", BrowserActionClass.read).granted
+    assert not svc.check(
+        bs.id, "example.com.evil.com", BrowserActionClass.navigate
+    ).granted
+
+
+def test_send_follow_link_subdomain_reaches_broker(session):
+    # A same-site subdomain href rides the registrable-host grant — it must
+    # reach the broker (timeout with no poller), NOT be refused as an
+    # unapproved tab. This is the divergence Finding 2 fixed: Electron
+    # would allow it, so the server must too.
+    bs = _make_session(session, domain="example.com")
+    broker = BridgeCommandService(default_timeout_s=0.1)
+    bc = BridgeClient(session, broker=broker)
+    verdict = asyncio.run(
+        bc.send(bs.conversation_id, "follow_link", href="https://shop.example.com/a")
+    )
+    assert verdict.result_code == ResultCode.timeout
+
+
+def test_send_follow_link_lookalike_suffix_refused(session):
+    # bank.co.uk.evil.com must NOT ride a bank.co.uk grant.
+    bs = _make_session(session, domain="bank.co.uk")
+    broker = BridgeCommandService(default_timeout_s=0.1)
+    bc = BridgeClient(session, broker=broker)
+    verdict = asyncio.run(
+        bc.send(
+            bs.conversation_id, "follow_link", href="https://bank.co.uk.evil.com/x"
+        )
+    )
+    assert verdict.result_code == ResultCode.unapproved_tab
+    assert broker.pending_count(str(bs.id)) == 0
+
+
+def test_send_ipv6_href_matches_ipv6_grant(session):
+    # host_only must not mangle the IPv6 literal; [::1]:8080 rides a ::1
+    # grant.
+    bs = _make_session(session, domain="::1")
+    broker = BridgeCommandService(default_timeout_s=0.1)
+    bc = BridgeClient(session, broker=broker)
+    verdict = asyncio.run(
+        bc.send(bs.conversation_id, "follow_link", href="http://[::1]:8080/x")
+    )
+    assert verdict.result_code == ResultCode.timeout
+
+
+def test_permission_check_suffix_grant_covers_only_exact_host(session):
+    # A grant that is itself a public/private suffix (approved tab was
+    # literally at that host; Electron fell back to the exact host) covers
+    # ONLY that exact host — foo.github.io's registrable host is
+    # foo.github.io, not github.io, so Electron refuses it and so must we.
+    bs = _make_session(session, domain="github.io")
+    from cowork.services.browser.permissions import BrowserPermissionService
+
+    svc = BrowserPermissionService(session)
+    assert svc.check(bs.id, "github.io", BrowserActionClass.read).granted
+    assert not svc.check(bs.id, "foo.github.io", BrowserActionClass.read).granted
+    assert not svc.check(
+        bs.id, "foo.github.io", BrowserActionClass.navigate
+    ).granted
