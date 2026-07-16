@@ -37,6 +37,7 @@ from cowork.handlers.turn_errors import (
     response_failed_payload,
     response_failed_sse,
 )
+from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
@@ -49,13 +50,17 @@ logger = logging.getLogger(__name__)
 
 
 class ResponsesHandler:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
+        self.principal = principal
         self.harness = get_harness(get_user_settings().harness)
         self.last_conversation_id: str | None = None
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+
+        # Identity into the run's trace metadata; server-derived keys win.
+        trace_metadata = identity_trace_metadata(self.principal, request.trace_metadata)
 
         conversation_service = ConversationService(self.session)
         project_id = self._resolve_project_id(request)
@@ -135,7 +140,7 @@ class ResponsesHandler:
                     harness_id=getattr(self.harness, "id", None),
                     buffer=buffer,
                     trace_tags=request.trace_tags,
-                    trace_metadata=request.trace_metadata,
+                    trace_metadata=trace_metadata,
                 ),
             )
             return sse_from_buffer(buffer, 0)
@@ -157,7 +162,7 @@ class ResponsesHandler:
             input=harness_input,
             disabled_connections=disabled,
             trace_tags=request.trace_tags,
-            trace_metadata=request.trace_metadata,
+            trace_metadata=trace_metadata,
         )
         return await self._collect(stream, conversation.id, request.model, str(user_message.id))
 
