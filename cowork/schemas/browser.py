@@ -10,6 +10,7 @@ page text, full URLs, paths/queries, titles, hrefs, cookies, or form values.
 from __future__ import annotations
 
 from enum import Enum
+from functools import lru_cache
 from typing import Any, TypeVar
 from uuid import UUID
 
@@ -269,8 +270,9 @@ def host_only(value: str) -> str:
     This is the FULL hostname, NOT a PSL registrable domain:
     `sub.example.co.uk` stays `sub.example.co.uk`. The approved grant
     domain is the PSL-registrable-or-exact host Electron computes with its
-    PSL library; grant MATCHING against it is suffix-based via
-    `host_matches_grant`, never equality on this function's output.
+    PSL library; grant MATCHING against it goes through
+    `host_matches_grant` (registrable-host equality via
+    `registrable_host`), never equality on this function's output.
 
     `host_only` is strictly a normalizer and is idempotent —
     `host_only(host_only(x)) == host_only(x)` — because digest validation
@@ -305,23 +307,66 @@ def host_only(value: str) -> str:
     return v.lower()
 
 
-def host_matches_grant(host_or_url: str, grant: str) -> bool:
-    """True iff `host_or_url`'s hostname is covered by the grant domain.
+@lru_cache(maxsize=1)
+def _psl_extract():
+    """The process-wide PSL extractor, configured strictly OFFLINE.
 
-    Both sides are normalized via `host_only`. The grant is the
-    PSL-registrable-or-exact host Electron computed when the tab was
-    approved (`example.co.uk`, `foo.github.io`, `::1`, `localhost`, …), so
-    a suffix match here accepts exactly the set Electron accepts: the grant
-    host itself or any subdomain of it (`shop.example.com` under an
-    `example.com` grant), while refusing lookalike suffixes
-    (`notexample.com`, `bank.co.uk.evil.com`). An empty host or empty
-    grant NEVER matches — an empty grant must not match everything.
+    `suffix_list_urls=()` + `cache_dir=None` pin tldextract to its bundled
+    Public Suffix List snapshot — no network fetch and no cache write at
+    import or runtime (tests and airgapped installs must never hit the
+    network). `include_psl_private_domains=True` mirrors Electron's tldts
+    `allowPrivateDomains: true`, so `foo.github.io` is registrable on both
+    sides.
     """
-    host = host_only(host_or_url)
+    import tldextract
+
+    return tldextract.TLDExtract(
+        suffix_list_urls=(),
+        cache_dir=None,
+        include_psl_private_domains=True,
+    )
+
+
+def registrable_host(value: str) -> str:
+    """The PSL registrable host of a URL/host — Electron's grant function.
+
+    Mirrors the TS side exactly (tldts `getDomain` with
+    `allowPrivateDomains: true`, falling back to the exact host): normalize
+    to the bare hostname via `host_only`, then reduce to the PSL
+    registrable domain (`sub.example.co.uk` → `example.co.uk`,
+    `foo.github.io` → `foo.github.io`). When the PSL yields nothing —
+    `localhost`, IP literals, IPv6, or a host that IS a public/private
+    suffix (`github.io`, `co.uk`) — the bare host is returned unchanged.
+
+    This is a MATCHING-only helper: persisted/traced values always stay
+    `host_only` output.
+    """
+    host = host_only(value)
+    if not host:
+        return ""
+    reg = _psl_extract()(host).top_domain_under_public_suffix
+    return reg or host
+
+
+def host_matches_grant(host_or_url: str, grant: str) -> bool:
+    """True iff `host_or_url`'s registrable host equals the grant domain.
+
+    The grant is the PSL-registrable-or-exact host Electron computed when
+    the tab was approved (`example.co.uk`, `foo.github.io`, `::1`,
+    `localhost`, …). Reducing the candidate through the SAME PSL function
+    (`registrable_host`) and comparing for equality accepts exactly the set
+    Electron accepts: `shop.example.com` under an `example.com` grant, but
+    NOT `foo.github.io` under a `github.io` grant (a grant that is itself a
+    public/private suffix only ever matches that exact host — Electron's
+    getDomain returns null there and it refuses subdomains too). An empty
+    host or empty grant NEVER matches — an empty grant must not match
+    everything.
+    """
+    host = registrable_host(host_or_url)
     grant_host = host_only(grant)
     if not host or not grant_host:
         return False
-    return host == grant_host or host.endswith("." + grant_host)
+    return host == grant_host
 
 
 # ── DTOs ─────────────────────────────────────────────────────────────
