@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -228,6 +229,10 @@ class OAuthSettings(Settings):
     google_analytics_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_ID"))
     google_analytics_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_SECRET"))
 
+    # Browser-side key for the Google Picker widget (drive.file scope only
+    # grants access to files the user explicitly picks via this UI).
+    google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
+
     server_origin: str = Field(
         default="http://127.0.0.1:26866",
         validation_alias=AliasChoices("COWORK_SERVER_ORIGIN"),
@@ -321,6 +326,27 @@ class AppSettings(Settings):
         description=(
             "Bearer token clients must send as 'Authorization: Bearer <token>'. "
             "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
+        ),
+    )
+    tenancy_mode: Literal["local", "org"] = Field(
+        default="local",
+        validation_alias=AliasChoices("COWORK_TENANCY_MODE"),
+        description=(
+            "Deployment tenancy mode. 'local' (default): single-user desktop "
+            "sidecar — request auth is the shared bearer token above. 'org': "
+            "multi-tenant cloud deployment behind the auth gateway — requests "
+            "carry trusted identity headers (X-User-Id / X-Organization-Id) "
+            "from which a per-request principal is built."
+        ),
+    )
+    identity_enforce: Literal["audit", "enforce"] = Field(
+        default="audit",
+        validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
+        description=(
+            "Org-mode identity enforcement. 'audit' (default): requests without "
+            "identity headers are logged and allowed through. 'enforce': they "
+            "are rejected with 401. Flip to 'enforce' once the audit log shows "
+            "all legitimate identity-less callers are handled."
         ),
     )
     owner: str = Field(

@@ -36,3 +36,41 @@ def test_app_settings_ignores_generic_server_host(monkeypatch):
     settings = AppSettings(_env_file=None)
 
     assert settings.host == "127.0.0.1"
+
+
+def test_app_settings_tenancy_mode_defaults_to_local(monkeypatch):
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.tenancy_mode == "local"
+
+
+def test_app_settings_reads_tenancy_mode_org(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.tenancy_mode == "org"
+
+
+def test_app_settings_rejects_invalid_tenancy_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "multi")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_app_settings_identity_enforce_defaults_to_audit(monkeypatch):
+    monkeypatch.delenv("COWORK_IDENTITY_ENFORCE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.identity_enforce == "audit"
+
+
+def test_app_settings_rejects_invalid_identity_enforce(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "strict")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
