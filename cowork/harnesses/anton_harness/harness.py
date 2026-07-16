@@ -8,7 +8,7 @@ import tempfile
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
@@ -17,6 +17,55 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+_REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"
+
+
+def _sanitize_tool_result(block: dict) -> dict:
+    """Replace image parts inside a tool_result with a text marker.
+
+    Base64 image payloads would bloat the JSON column and add nothing to the
+    replayed history. The marker states the removal happened at replay time
+    (not that the tool returned it) so the model doesn't misread it.
+    """
+    content = block.get("content")
+    if not isinstance(content, list):
+        return block
+    scrubbed = [
+        {"type": "text", "text": _REPLAY_IMAGE_PLACEHOLDER}
+        if isinstance(part, dict) and part.get("type") == "image"
+        else part
+        for part in content
+    ]
+    return {**block, "content": scrubbed}
+
+
+def _split_turn_into_rows(history_slice: list) -> list[dict]:
+    """Extract the tool block-rows of one turn from anton's raw history slice.
+
+    Keeps only `tool_use` (assistant) / `tool_result` (user) blocks as
+    `{role, content}` rows. Text blocks are dropped — the assistant's visible
+    text is persisted once in the display row — so a pure-text message yields
+    no row. Images inside tool_result are replaced with a replay marker.
+    """
+    rows: list[dict] = []
+    for msg in history_slice:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        keep_type = "tool_use" if role == "assistant" else "tool_result"
+        blocks = [
+            _sanitize_tool_result(b) if keep_type == "tool_result" else b
+            for b in content
+            if isinstance(b, dict) and b.get("type") == keep_type
+        ]
+        if blocks:
+            rows.append({"role": role, "content": blocks})
+    return rows
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -193,12 +242,18 @@ class AntonHarness:
         before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
         skill_drafts: list[dict] = []
+        turn_rows: list[dict] | None = None
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
+            # Length of the seeded history — everything anton appends past this
+            # index is this turn's block-messages (tool_use / tool_result / text).
+            # Guarded: an anton build (or test double) without `.history` simply
+            # skips capture and falls back to text-only replay.
+            seed_len = len(session.history) if hasattr(session, "history") else None
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Deployed cowork-server resolves anton
             # from PyPI/main, which may predate the trace-tags kwargs (anton
@@ -212,6 +267,18 @@ class AntonHarness:
                 turn_kwargs["trace_metadata"] = trace_metadata
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 yield event
+            # Turn completed cleanly: capture its tool block-rows for
+            # persistence. Skipped on cancel/error (the block below never runs),
+            # so a partial turn falls back to text-only replay and anton's own
+            # dangling-tool_use sealing keeps its in-memory history valid.
+            if seed_len is not None:
+                turn_slice = session.history[seed_len:]
+                while turn_slice and (
+                    not isinstance(turn_slice[0], dict)
+                    or turn_slice[0].get("role") != "assistant"
+                ):
+                    turn_slice = turn_slice[1:]
+                turn_rows = _split_turn_into_rows(turn_slice) or None
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
@@ -228,6 +295,8 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
+        if turn_rows:
+            yield TurnHistory(turn_rows)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:

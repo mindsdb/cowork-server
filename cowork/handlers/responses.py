@@ -185,9 +185,15 @@ class ResponsesHandler:
         own = get_open_session()
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        turn_rows: list[dict] = []
         persisted = False
 
         def event_sink(event_type: str, data: dict) -> None:
+            # Tool block-rows are for LLM-history persistence, not UI replay —
+            # keep them out of the events log the client rebuilds from.
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
@@ -202,6 +208,7 @@ class ResponsesHandler:
                 own.commit()
                 ConversationService(own).save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
+                    tool_rows=turn_rows,
                 )
             except Exception:
                 logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
@@ -297,8 +304,12 @@ class ResponsesHandler:
     ) -> Response:
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        turn_rows: list[dict] = []
 
         def event_sink(event_type: str, data: dict) -> None:
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
@@ -320,7 +331,7 @@ class ResponsesHandler:
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
 
         assistant_text = "".join(collected_text)
-        self._save_assistant_turn(conversation_id, assistant_text, collected_events)
+        self._save_assistant_turn(conversation_id, assistant_text, collected_events, turn_rows)
 
         return Response(
             status=ResponseStatus.completed,
@@ -333,10 +344,11 @@ class ResponsesHandler:
         conversation_id: UUID,
         text: str,
         events: list[dict],
+        tool_rows: list[dict] | None = None,
     ) -> None:
         harness_id = getattr(self.harness, 'id', None)
         ConversationService(self.session).save_assistant_turn(
-            conversation_id, text, events, harness=harness_id,
+            conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
