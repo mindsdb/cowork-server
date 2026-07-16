@@ -147,9 +147,20 @@ class HermesHarness:
         def thinking_callback(text: str) -> None:
             _put({"type": "thought.progress", "subtype": "thinking", "content": text})
 
+        # Canonical order (created_at, seq, ...) — the bare relationship is
+        # unordered and would scramble a turn's tool_use/tool_result block-rows.
+        from sqlalchemy.orm import object_session
+        from cowork.services.conversations import ConversationService
+
+        _db_session = object_session(conversation)
+        _ordered = (
+            ConversationService(_db_session).get_ordered_messages(conversation.id)
+            if _db_session is not None
+            else list(conversation.messages)
+        )
         history = [
             msg.to_openai_message().model_dump()
-            for msg in conversation.messages
+            for msg in _ordered
             if msg.role in {"user", "assistant"}
         ]
 
