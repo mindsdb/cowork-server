@@ -14,13 +14,29 @@ from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.task_objects import TaskObjectService
 
 # Streaming turns persist user + assistant in one persist() call; on SQLite
-# both rows often share the same created_at (second precision). Tie-break
-# user before assistant, then id.
+# both rows often share the same created_at (second precision). `seq` orders
+# the block-rows of one turn (see save_assistant_turn); the role tiebreak keeps
+# legacy single-row turns (seq 0) user-before-assistant; id is the final tiebreak.
 _MESSAGE_ORDER = (
     Message.created_at,
+    Message.seq,
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
+
+
+def _is_tool_row(content) -> bool:
+    """True for a history-only tool block-row (all blocks are tool_use /
+    tool_result). These carry prior tool calls for LLM-history replay and are
+    hidden from the UI, which renders tool activity from message events."""
+    return (
+        isinstance(content, list)
+        and len(content) > 0
+        and all(
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            for block in content
+        )
+    )
 
 
 class ConversationService:
@@ -166,13 +182,23 @@ class ConversationService:
         text: str,
         events: list[dict],
         harness: str | None = None,
+        tool_rows: list[dict] | None = None,
     ) -> None:
-        """Persist an assistant message and its streaming events."""
+        """Persist an assistant turn.
+
+        `tool_rows` are the turn's tool block-messages ({role, content} with
+        `tool_use` / `tool_result` blocks). They are written as their own rows
+        AHEAD of the visible assistant message so the next turn's history
+        replays a valid tool_use → tool_result → text sequence. All rows share
+        one commit (hence one `created_at`); `seq` fixes their order, since the
+        role tiebreak in _MESSAGE_ORDER would otherwise sort tool_result (user)
+        ahead of tool_use (assistant). Hidden from the UI by `get_messages`.
+        """
         # Persist when there's body text OR any events — an artifact-only turn
         # (the agent writes a file and says little/nothing) carries no text but
         # emits a `response.artifact_created` event, and that event must survive
         # reload so the inline card replays identically.
-        if not text and not events:
+        if not text and not events and not tool_rows:
             return
         assistant_msg = Message(
             conversation_id=conversation_id,
@@ -180,18 +206,40 @@ class ConversationService:
             content=text,
             harness=harness,
         )
-        self.session.add(assistant_msg)
+        ordered_rows = [
+            Message(
+                conversation_id=conversation_id,
+                role=row["role"],
+                content=row["content"],
+                harness=harness,
+            )
+            for row in (tool_rows or [])
+        ]
+        ordered_rows.append(assistant_msg)
+        for position, message in enumerate(ordered_rows):
+            message.seq = position
+            self.session.add(message)
         self.session.commit()
         self.session.refresh(assistant_msg)
 
-        for seq, event_data in enumerate(events):
+        for event_seq, event_data in enumerate(events):
             self.session.add(MessageEvent(
                 message_id=assistant_msg.id,
-                sequence_number=seq,
+                sequence_number=event_seq,
                 event_data=event_data,
             ))
         if events:
             self.session.commit()
+
+    def get_ordered_messages(self, conversation_id: UUID) -> list[Message]:
+        """All messages of a conversation in canonical order (see
+        _MESSAGE_ORDER). Includes history-only tool rows — harnesses replay
+        them into the LLM context; use get_messages for the UI-facing view."""
+        return list(self.session.exec(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(*_MESSAGE_ORDER)
+        ).all())
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
@@ -202,6 +250,8 @@ class ConversationService:
         ).all()
         result = []
         for message in messages:
+            if _is_tool_row(message.content):
+                continue  # history-only tool row — not shown in the chat
             events = self.session.exec(
                 select(MessageEvent)
                 .where(MessageEvent.message_id == message.id)
