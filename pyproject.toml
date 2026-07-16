@@ -33,6 +33,7 @@ dependencies = [
     "xhtml2pdf>=0.2.16",
     "python-docx>=1.1.2",
     "htmldocx>=0.0.6",
+    "tldextract>=5.3",
 ]
 
 [project.urls]

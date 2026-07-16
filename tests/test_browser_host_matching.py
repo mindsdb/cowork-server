@@ -2,16 +2,17 @@
 
 The grant domain is the PSL-registrable-or-exact host Electron computes
 (tldts `getDomain`, allowPrivateDomains: true) and reports in bridge hello;
-the server matches candidate hosts against it with a suffix match
-(`host_matches_grant`). This table is mirrored VERBATIM in the TypeScript
-repo — both sides must accept/refuse exactly the same set. Do not change
-the expected values here without changing them there.
+the server reduces candidate hosts through the SAME PSL function
+(`registrable_host`, tldextract with private domains, offline) and matches
+by equality (`host_matches_grant`). This table is mirrored VERBATIM in the
+TypeScript repo — both sides must accept/refuse exactly the same set. Do
+not change the expected values here without changing them there.
 """
 from __future__ import annotations
 
 import pytest
 
-from cowork.schemas.browser import host_matches_grant, host_only
+from cowork.schemas.browser import host_matches_grant, host_only, registrable_host
 
 # (url, grant, expected_match) — mirrored verbatim in the TypeScript repo.
 CONFORMANCE_TABLE = [
@@ -28,6 +29,12 @@ CONFORMANCE_TABLE = [
     ("https://user:pass@sub.example.com/", "example.com", True),
     ("HTTPS://WWW.EXAMPLE.COM", "example.com", True),
     ("https://notexample.com", "example.com", False),
+    # A grant that is ITSELF a public/private suffix (only arises when the
+    # approved tab is literally at that host — getDomain returns null and
+    # Electron falls back to the exact host) matches only that exact host:
+    # foo.github.io's registrable host is foo.github.io ≠ github.io.
+    ("https://foo.github.io/docs", "github.io", False),
+    ("https://bank.co.uk/login", "co.uk", False),
 ]
 
 
@@ -70,6 +77,34 @@ def test_host_only_is_idempotent(value):
     once = host_only(value)
     assert host_only(once) == once
     assert host_only(host_only(once)) == once
+
+
+# ── registrable_host vs host_only ─────────────────────────────────────
+@pytest.mark.parametrize(
+    "value,registrable,bare",
+    [
+        # registrable_host reduces to the PSL registrable domain; host_only
+        # keeps the full hostname — persisted values always use host_only,
+        # matching only ever uses registrable_host.
+        ("shop.example.com", "example.com", "shop.example.com"),
+        ("sub.example.co.uk", "example.co.uk", "sub.example.co.uk"),
+        ("https://foo.github.io/docs", "foo.github.io", "foo.github.io"),
+        # PSL yields nothing → fall back to the bare host (exactly like
+        # Electron's getDomain-null fallback).
+        ("localhost", "localhost", "localhost"),
+        ("192.168.0.1", "192.168.0.1", "192.168.0.1"),
+        ("http://[::1]:8080/x", "::1", "::1"),
+        ("github.io", "github.io", "github.io"),
+        ("co.uk", "co.uk", "co.uk"),
+    ],
+)
+def test_registrable_host_vs_host_only(value, registrable, bare):
+    assert registrable_host(value) == registrable
+    assert host_only(value) == bare
+
+
+def test_registrable_host_empty():
+    assert registrable_host("") == ""
 
 
 def test_host_matches_grant_empty_never_matches():
