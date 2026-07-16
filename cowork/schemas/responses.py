@@ -44,7 +44,9 @@ class Content(BaseModel):
 
 class Message(BaseModel):
     role: Role
-    content: dict | BaseModel | str | list[Content] | None = None
+    # `list[dict]` carries raw tool_use / tool_result blocks verbatim into
+    # LLM history (their id/name/input would be lost if coerced into Content).
+    content: dict | BaseModel | str | list[Content] | list[dict] | None = None
     tool_calls: list[dict] | None = None
     tool_call_id: str | None = None
     name: str | None = None
