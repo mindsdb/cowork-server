@@ -528,6 +528,12 @@ async def browse_control_stop(req: _ControlRequest, session: _SessionDep):
     errors; the gate is set the moment a session is created too, via the
     persisted control_state. Any queued/in-flight command is drained so it
     never resolves as a success after the Stop.
+
+    The server is the single source of truth for this gate: it is cleared
+    ONLY by a fresh user turn (`resume_on_new_turn`, from POST /responses).
+    No re-approval is required after a Stop — Electron's local
+    `stopRequested` latch merely closes the hand-out→execute race and
+    self-clears.
     """
     control = _get_control_service(session)
     sess = control.stop_by_conversation(req.conversation_id)
