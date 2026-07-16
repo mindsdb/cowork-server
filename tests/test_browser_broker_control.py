@@ -1054,3 +1054,72 @@ def test_control_stop_pure_ack_does_not_drain(monkeypatch):
         json={"conversation_id": conv_id, "stop_id": "stop-drain-2"},
     )
     assert len(calls) == 2  # new stop drains again
+
+
+def test_control_stop_delayed_ack_for_older_token_is_pure_ack(monkeypatch):
+    # Stop A (t1) → resume → Stop B (t2) → resume → DELAYED ack for t1: t1
+    # is still in the recent-token history, so it must be a pure ack — no
+    # re-stop, no drain.
+    import cowork.api.v1.endpoints.compat.stubs as stubs
+
+    calls = []
+
+    async def _fake_drain(sess):
+        calls.append(sess)
+
+    monkeypatch.setattr(stubs, "_drain_gated_session", _fake_drain)
+    conv_id = _create_conv()
+    client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "t1"},
+    )
+    assert _resume(conv_id) == "active"
+    client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "t2"},
+    )
+    assert _resume(conv_id) == "active"
+    assert len(calls) == 2  # both real stops drained
+    r = client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "t1"},
+    )
+    assert r.json()["stopped"] is False
+    assert r.json()["control_state"] == "active"
+    assert len(calls) == 2  # delayed ack did NOT drain
+
+
+def test_control_stop_token_history_is_bounded(session):
+    # The per-conversation history is capped (_STOP_ID_HISTORY = 16, FIFO):
+    # after 17 distinct stops the 1st token is evicted, so its late ack
+    # redundantly re-stops (acceptable); a still-remembered token stays a
+    # pure ack. Distinct new tokens always stop.
+    from cowork.services.browser.control import _STOP_ID_HISTORY, _applied_stop_ids
+
+    conv_id = _create_conv()
+    n = _STOP_ID_HISTORY + 1  # 17
+    for i in range(n):
+        r = client.post(
+            "/api/v1/browse/control/stop",
+            json={"conversation_id": conv_id, "stop_id": f"tok-{i}"},
+        )
+        assert r.json()["stopped"] is True  # distinct new tokens still stop
+        assert _resume(conv_id) == "active"
+    recent = _applied_stop_ids[conv_id]
+    assert len(recent) == _STOP_ID_HISTORY
+    assert "tok-0" not in recent  # 17th evicted the 1st
+    assert f"tok-{n - 1}" in recent
+    # Evicted token: treated as a new stop (redundant re-stop, acceptable).
+    r = client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": "tok-0"},
+    )
+    assert r.json()["stopped"] is True
+    assert _resume(conv_id) == "active"
+    # Remembered token: still a pure ack.
+    r = client.post(
+        "/api/v1/browse/control/stop",
+        json={"conversation_id": conv_id, "stop_id": f"tok-{n - 1}"},
+    )
+    assert r.json()["stopped"] is False
+    assert r.json()["control_state"] == "active"
