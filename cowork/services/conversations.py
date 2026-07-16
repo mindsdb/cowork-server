@@ -145,9 +145,11 @@ class ConversationService:
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
         """Delete a turn and everything after it.
 
-        turn_index is 0-based counting only assistant messages. The turn's
-        preceding user message (if any) and all subsequent messages are
-        removed. Returns the number of messages deleted.
+        turn_index is 0-based counting only VISIBLE assistant messages —
+        hidden tool rows (tool_use / tool_result) are skipped so the index
+        matches the UI's, which never shows them. The turn's opening user
+        message and all subsequent messages (including this turn's tool rows)
+        are removed. Returns the number of messages deleted.
         """
         self.get_conversation(conversation_id)  # raises if not found
         messages = list(
@@ -157,19 +159,24 @@ class ConversationService:
                 .order_by(*_MESSAGE_ORDER)
             ).all()
         )
-        # Find the Nth assistant message (0-based).
+        # Find the Nth visible assistant message (0-based).
         assistant_count = -1
         cut_from = None
         for i, m in enumerate(messages):
-            if m.role.value == "assistant":
+            if m.role.value == "assistant" and not _is_tool_row(m.content):
                 assistant_count += 1
                 if assistant_count == turn_index:
-                    # Include the preceding user message in the cut if it
-                    # exists and is immediately before this assistant msg.
-                    if i > 0 and messages[i - 1].role.value == "user":
-                        cut_from = i - 1
-                    else:
-                        cut_from = i
+                    # Walk back over this turn's hidden tool rows (the
+                    # tool_result row is role=user, so a plain i-1 check would
+                    # stop on it and orphan the real user input + tool_use).
+                    cut_from = i
+                    j = i - 1
+                    while j >= 0 and _is_tool_row(messages[j].content):
+                        cut_from = j
+                        j -= 1
+                    # Include the user message that opened the turn.
+                    if j >= 0 and messages[j].role.value == "user":
+                        cut_from = j
                     break
         if cut_from is None:
             raise ValueError(f"Turn {turn_index} not found")

@@ -4,6 +4,8 @@ A turn's tool_use / tool_result blocks are persisted as their own `messages`
 rows (ordered by `seq`), hidden from the UI, and replayed verbatim into the
 next turn's LLM history so the agent remembers what it did.
 """
+from datetime import datetime
+
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -177,3 +179,61 @@ def test_is_tool_row_discriminates():
     assert not _is_tool_row("plain text")
     assert not _is_tool_row([{"type": "input_text", "text": "hi"}])
     assert not _is_tool_row([])
+
+
+# --- delete_turn skips hidden tool rows -------------------------------------
+
+def _persist_turn_at(session, conv, user_text, answer, when):
+    """Persist one tool-using turn, then stamp its rows with `when` so turns
+    order deterministically (server_default now() is second-precision and
+    would collide within a test run)."""
+    svc = ConversationService(session)
+    before = {m.id for m in svc.get_ordered_messages(conv.id)}
+    session.add(Message(conversation_id=conv.id, role="user", content=user_text))
+    session.commit()
+    tool_rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t", "name": "x", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": "B"}]},
+    ]
+    svc.save_assistant_turn(conv.id, answer, [], harness="anton", tool_rows=tool_rows)
+    for m in svc.get_ordered_messages(conv.id):
+        if m.id not in before:
+            m.created_at = when
+            session.add(m)
+    session.commit()
+
+
+def _visible(session, conv):
+    return [
+        (m["role"].value if hasattr(m["role"], "value") else m["role"], m["content"])
+        for m in ConversationService(session).get_messages(conv.id)
+    ]
+
+
+def test_delete_second_turn_keeps_first(session, conversation):
+    """Deleting the 2nd visible turn must NOT destroy the 1st turn's answer:
+    hidden tool_use rows (role=assistant) must not inflate the turn count."""
+    _persist_turn_at(session, conversation, "q1", "a1", datetime(2026, 7, 16, 10, 0))
+    _persist_turn_at(session, conversation, "q2", "a2", datetime(2026, 7, 16, 10, 5))
+    svc = ConversationService(session)
+
+    deleted = svc.delete_turn(conversation.id, 1)  # UI's 2nd assistant turn
+
+    assert _visible(session, conversation) == [("user", "q1"), ("assistant", "a1")]
+    # Turn 2's four rows (user + tool_use + tool_result + answer) are gone.
+    assert deleted == 4
+    # Turn 1's tool rows survive for LLM replay.
+    all_rows = svc.get_ordered_messages(conversation.id)
+    assert sum(1 for m in all_rows if _is_tool_row(m.content)) == 2
+
+
+def test_delete_first_turn_clears_all(session, conversation):
+    _persist_turn_at(session, conversation, "q1", "a1", datetime(2026, 7, 16, 10, 0))
+    _persist_turn_at(session, conversation, "q2", "a2", datetime(2026, 7, 16, 10, 5))
+    svc = ConversationService(session)
+
+    svc.delete_turn(conversation.id, 0)
+
+    assert svc.get_ordered_messages(conversation.id) == []
