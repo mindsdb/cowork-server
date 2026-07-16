@@ -21,6 +21,7 @@ from cowork.schemas.browser import (
     assert_content_free_digest,
     build_observed_digest,
     coerce_enum,
+    host_only,
 )
 
 
@@ -79,7 +80,10 @@ class BrowserActionStore:
             idempotency_key=idempotency_key,
             action_type=at.value,
             action_class=ACTION_TYPE_TO_CLASS[at].value,
-            domain=domain,
+            # Defense in depth: `browser_actions.domain` is host-only by
+            # contract. Normalize HERE too so a caller passing a full URL
+            # (path/query/fragment) can never leak it into the database.
+            domain=host_only(domain) if domain else None,
             status=ActionStatus.pending.value,
         )
         return self._save(action)
@@ -111,6 +115,17 @@ class BrowserActionStore:
         action = self._by_command(command_id)
         if action is None:
             return None
+
+        # Terminal rows are immutable: once a row is `observed` or `failed`,
+        # a late/duplicate result for the same command_id must not rewrite
+        # it. E.g. `mark_failed(target_lost)` followed by a delayed `ok`
+        # would otherwise flip the row back to `observed` and lose the
+        # failure. First terminal result wins.
+        if action.status in (
+            ActionStatus.observed.value,
+            ActionStatus.failed.value,
+        ):
+            return action
 
         rc = coerce_enum(ResultCode, result_code)
 

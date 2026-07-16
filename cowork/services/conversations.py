@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import case
 from sqlmodel import Session, select
 
+from cowork.models.browser import BrowserAction, BrowserSession, BrowserTabGrant
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
@@ -121,6 +122,25 @@ class ConversationService:
         attachment_dirs = FileService(self.session).delete_by_purpose(
             attachment_purpose(str(conversation_id))
         )
+        # Browser Control rows (session + grants + actions). The FKs carry
+        # ON DELETE CASCADE for engines that enforce them (Postgres), but we
+        # delete explicitly too — matching the service-side cleanup above —
+        # so SQLite (which may not enforce FKs) never orphans the rows.
+        browser_sessions = self.session.exec(
+            select(BrowserSession).where(
+                BrowserSession.conversation_id == conversation_id
+            )
+        ).all()
+        for bs in browser_sessions:
+            for grant in self.session.exec(
+                select(BrowserTabGrant).where(BrowserTabGrant.session_id == bs.id)
+            ).all():
+                self.session.delete(grant)
+            for action in self.session.exec(
+                select(BrowserAction).where(BrowserAction.session_id == bs.id)
+            ).all():
+                self.session.delete(action)
+            self.session.delete(bs)
         self.session.delete(conversation)
         self.session.commit()
         unlink_file_dirs(attachment_dirs)

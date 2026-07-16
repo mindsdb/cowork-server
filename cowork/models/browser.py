@@ -43,6 +43,7 @@ class BrowserSession(BaseSQLModel, table=True):
 
     conversation_id: UUID = Field(
         foreign_key="conversations.id",
+        ondelete="CASCADE",
         index=True,
         description="Conversation (task) this browser session belongs to.",
     )
@@ -97,6 +98,7 @@ class BrowserTabGrant(BaseSQLModel, table=True):
 
     session_id: UUID = Field(
         foreign_key="browser_sessions.id",
+        ondelete="CASCADE",
         index=True,
         description="Session this grant belongs to.",
     )
@@ -149,6 +151,7 @@ class BrowserAction(BaseSQLModel, table=True):
 
     session_id: UUID = Field(
         foreign_key="browser_sessions.id",
+        ondelete="CASCADE",
         index=True,
         description="Session this action belongs to.",
     )
