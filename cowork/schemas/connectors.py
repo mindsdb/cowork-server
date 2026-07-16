@@ -33,6 +33,13 @@ class OAuthConfig(BaseModel):
     # Only meaningful when supports_revoke is True — where to POST the
     # token being revoked (RFC 7009-style: token in the form-encoded body).
     revoke_url: str | None = None
+    # Some providers (Linear, confirmed 2026-07-16) require an EXACT
+    # redirect_uri match, including port — unlike Google, which accepts
+    # any 127.0.0.1 port. Set this to a fixed port pre-registered on the
+    # provider's OAuth app; the desktop loopback server binds to it
+    # directly instead of a random free port. Omit for providers that
+    # accept any loopback port (the default, matches Google's behavior).
+    redirect_port: int | None = None
     # Only set on the `browser_oauth_builtin` method — the service-id slug
     # (e.g. "google-drive") used in the /connectors/oauth/{service}/... web
     # fallback routes. The engine name and this slug have already diverged
