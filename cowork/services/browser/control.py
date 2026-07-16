@@ -4,7 +4,7 @@ Owns `control_state` on `BrowserSession`:
 
 - `stop()` sets `stopped` synchronously (the pre-dispatch gate) and persists
   it — it survives reconnect and is NEVER auto-cleared. Only a fresh user
-  turn clears it (done at the API layer, not here).
+  turn clears it, via `resume_on_new_turn()` (called from the API layer).
 - `takeover()` sets `taken_over` and flips `available=False` so the poller
   pauses issuing browser actions.
 - `is_blocked()` reports whether the gate currently forbids dispatch.
@@ -83,6 +83,27 @@ class BrowserControlService:
             self._get_or_create_by_conversation(conversation_id),
             ControlState.stopped,
         )
+
+    def resume_on_new_turn(self, conversation_id: UUID | str) -> BrowserSession | None:
+        """Clear a `stopped` gate when a FRESH USER TURN starts.
+
+        Stop gates the turn it cancelled — it survives reconnect and is
+        never auto-cleared — but a new user turn is the explicit signal to
+        proceed again, so it resets `stopped` → `active` (the API layer
+        calls this from POST /responses). A `taken_over` gate is NOT
+        cleared here: the user is actively driving the browser, and only an
+        explicit re-approval ends a takeover. Availability is restored only
+        when the bridge is connected and no re-approval is pending.
+        """
+        sess = self.get_by_conversation(conversation_id)
+        if sess is None or sess.control_state != ControlState.stopped.value:
+            return sess
+        sess.control_state = ControlState.active.value
+        sess.available = (
+            sess.bridge_state == BridgeState.connected.value
+            and not sess.requires_reapproval
+        )
+        return self._save(sess)
 
     def takeover(self, session_id: UUID | str) -> BrowserSession | None:
         """Mark `taken_over` and pause the bridge from issuing actions."""

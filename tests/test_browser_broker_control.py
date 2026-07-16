@@ -715,3 +715,141 @@ def test_hello_never_self_approves_pending_reapproval():
         bc = BridgeClient(s, broker=BridgeCommandService(default_timeout_s=0.1))
         verdict = asyncio.run(bc.send(conv_id, "inspect"))
     assert verdict.result_code == ResultCode.timeout
+
+
+# ── review fixes: href-host permission, post-wakeup gate, fresh turn ──
+def test_send_follow_link_cross_host_refused(session):
+    # send() must check the permission against the href's registrable host,
+    # not fall back to the session's approved active_domain: with an
+    # approved example.com tab, follow_link to evil.com must be refused.
+    bs = _make_session(session, domain="example.com")
+    broker = BridgeCommandService(default_timeout_s=0.1)
+    bc = BridgeClient(session, broker=broker)
+    verdict = asyncio.run(
+        bc.send(bs.conversation_id, "follow_link", href="https://evil.com/x")
+    )
+    assert verdict.result_code == ResultCode.unapproved_tab
+    assert verdict.domain == "evil.com"
+    # Nothing was enqueued for the poller.
+    assert broker.pending_count(str(bs.id)) == 0
+
+
+def test_send_follow_link_same_host_reaches_broker(session):
+    # Same-host follow_link still passes the grant (reaches the broker and
+    # times out with no poller — not a permission failure).
+    bs = _make_session(session, domain="example.com")
+    broker = BridgeCommandService(default_timeout_s=0.1)
+    bc = BridgeClient(session, broker=broker)
+    verdict = asyncio.run(
+        bc.send(bs.conversation_id, "follow_link", href="https://example.com/a/b")
+    )
+    assert verdict.result_code == ResultCode.timeout
+
+
+def test_commands_next_rechecks_gate_after_wakeup(session):
+    # A Stop that lands while /commands/next is awaiting (draining an empty
+    # queue), followed by an enqueue from a producer that had already passed
+    # its pre-dispatch check, must NOT hand the command to the extension:
+    # the endpoint re-reads the session after the wakeup and blocks.
+    from cowork.api.v1.endpoints.compat.stubs import (
+        _CommandsNextRequest,
+        browse_commands_next,
+    )
+    from cowork.schemas.browser import BridgeCommand
+    from cowork.services.browser.bridge import bridge_command_service
+
+    bs = _make_session(session, domain="example.com")
+    sid = str(bs.id)
+
+    async def go():
+        poll = asyncio.create_task(
+            browse_commands_next(
+                _CommandsNextRequest(session_id=sid, wait_s=2.0), session
+            )
+        )
+        await asyncio.sleep(0.05)  # poller is now awaiting next()
+
+        # Stop lands in a DIFFERENT db session (as a real request would) and
+        # drains the (empty) queue.
+        engine = get_engine(get_app_settings().database.uri)
+        with Session(engine) as other:
+            BrowserControlService(other).stop(sid)
+        await bridge_command_service.drain_session(sid, ResultCode.error)
+
+        # A producer that had already passed its pre-dispatch check enqueues,
+        # waking the long-poll.
+        cmd = BridgeCommand(
+            command_id=bridge_command_service.new_command_id(),
+            action_type=BrowserActionType.inspect,
+            session_id=sid,
+        )
+        future = await bridge_command_service.enqueue(cmd)
+        body = await poll
+        return body, future
+
+    body, future = asyncio.run(go())
+    assert body["command"] is None
+    assert body.get("blocked") == "stopped"
+    # The pulled command's producer was resolved terminally (never ok).
+    assert future.done()
+    assert future.result().result_code != ResultCode.ok
+
+
+def test_resume_on_new_turn_clears_stopped_gate(session):
+    bs = _make_session(session, domain="example.com")
+    control = BrowserControlService(session)
+    control.on_bridge_state(bs.id, BridgeState.connected)
+    control.stop(bs.id)
+    assert control.is_blocked(bs.id)
+
+    sess = control.resume_on_new_turn(bs.conversation_id)
+    assert sess.control_state == ControlState.active.value
+    assert sess.available is True
+    assert not control.is_blocked(bs.id)
+
+    # A stopped-but-disconnected session resumes the gate without becoming
+    # available.
+    control.on_bridge_state(bs.id, BridgeState.disconnected)
+    control.stop(bs.id)
+    sess = control.resume_on_new_turn(bs.conversation_id)
+    assert sess.control_state == ControlState.active.value
+    assert sess.available is False
+
+
+def test_resume_on_new_turn_preserves_takeover(session):
+    # Only Stop is turn-scoped; a takeover is user-driven and must survive a
+    # fresh turn until an explicit re-approval ends it.
+    bs = _make_session(session, domain="example.com")
+    control = BrowserControlService(session)
+    control.takeover(bs.id)
+    sess = control.resume_on_new_turn(bs.conversation_id)
+    assert sess.control_state == ControlState.taken_over.value
+
+
+def test_responses_post_resumes_stopped_browser_session(monkeypatch):
+    # POST /responses (a fresh user turn) resets a stopped gate to active
+    # before the turn runs — without it, a cancelled browser-enabled turn
+    # would block every later browser action for the conversation forever.
+    import cowork.api.v1.endpoints.responses as responses_ep
+
+    conv_id = _create_conv()
+    client.post("/api/v1/responses/cancel", json={"conversation_id": conv_id})
+    r = client.get("/api/v1/browse/status", params={"conversation_id": conv_id})
+    assert r.json()["control_state"] == "stopped"
+
+    class _StubHandler:
+        def __init__(self, session):
+            pass
+
+        async def handle(self, request):
+            return {"ok": True}
+
+    monkeypatch.setattr(responses_ep, "ResponsesHandler", _StubHandler)
+    r = client.post(
+        "/api/v1/responses/",
+        json={"conversation": conv_id, "input": "hi", "stream": False},
+    )
+    assert r.status_code == 200
+
+    r = client.get("/api/v1/browse/status", params={"conversation_id": conv_id})
+    assert r.json()["control_state"] == "active"
