@@ -41,6 +41,17 @@ from cowork.services.browser.permissions import BrowserPermissionService
 
 logger = logging.getLogger(__name__)
 
+# No-session verdict detail. Truthful and actionable: the ONLY way a browser
+# session comes to exist is the in-app connect flow — there is no extension.
+# Without this the LLM invents a nonexistent "Chrome extension" setup flow
+# when no tab is connected (observed incident).
+NO_SESSION_DETAIL = (
+    "No browser tab is connected. Ask the user to connect one in the "
+    "desktop app: Connect Apps and Data → Connect → Browser Control → "
+    "pick a Chrome tab and approve it. There is no browser extension to "
+    "install."
+)
+
 # One asyncio.Lock per server session id enforces single-in-flight.
 _session_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -90,7 +101,7 @@ class BridgeClient:
             return BrowserToolVerdict(
                 result_code=ResultCode.error,
                 action_type=action_type,
-                detail="no browser session for conversation",
+                detail=NO_SESSION_DETAIL,
             )
 
         # A navigate (follow_link) targets the href's host — the permission
@@ -163,7 +174,7 @@ class BridgeClient:
             return BrowserToolVerdict(
                 result_code=ResultCode.error,
                 action_type=action_type,
-                detail="no browser session",
+                detail=NO_SESSION_DETAIL,
             )
 
         # 1. Control gate (pre-dispatch): stopped / taken_over never dispatch.
