@@ -13,7 +13,7 @@ from cowork.schemas.connectors import (
     PatchPickedFilesBody,
 )
 from cowork.services.connectors.connections import service
-from cowork.services.connectors.oauth.google import google_service
+from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry
 
@@ -56,7 +56,7 @@ def save_connection_direct(body: DirectSaveRequest):
 @router.delete("/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_connection(engine: str, name: str):
     try:
-        google_service.revoke(engine, name, ConnectorSettings())
+        oauth_service.revoke(engine, name, ConnectorSettings())
     except Exception:
         _log.exception("Failed to revoke token for %s/%s", engine, name)
     if not service.delete(engine, name):
