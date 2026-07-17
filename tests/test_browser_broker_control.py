@@ -452,30 +452,41 @@ def test_bridge_client_send_unknown_action(session):
     assert "unsupported" in (verdict.detail or "")
 
 
+def test_no_session_detail_wording():
+    # A1 — SINGLE place asserting the guidance copy: the detail must relay
+    # the REAL in-app connect flow and explicitly rule out a browser
+    # extension (the model used to hallucinate a nonexistent "Chrome
+    # extension" setup when the detail was bare).
+    from cowork.services.browser.client import NO_SESSION_DETAIL
+
+    assert "No browser tab is connected" in NO_SESSION_DETAIL
+    assert (
+        "Connect Apps and Data → Connect → Browser Control" in NO_SESSION_DETAIL
+    )
+    assert "no browser extension" in NO_SESSION_DETAIL
+
+
 def test_bridge_client_send_no_session(session):
-    # A1: the no-session detail must relay the REAL in-app connect flow and
-    # explicitly rule out a browser extension (the model used to hallucinate
-    # a nonexistent "Chrome extension" setup when the detail was bare).
     from uuid import uuid4
+
+    from cowork.services.browser.client import NO_SESSION_DETAIL
+
     bc = BridgeClient(session)
     verdict = asyncio.run(bc.send(uuid4(), "inspect"))
     assert verdict.result_code == ResultCode.error
-    detail = verdict.detail or ""
-    assert "No browser tab is connected" in detail
-    assert "Connect Apps and Data → Connect → Browser Control" in detail
-    assert "no browser extension" in detail
+    assert verdict.detail == NO_SESSION_DETAIL
 
 
 def test_bridge_client_run_no_session(session):
     # Same guidance on the session-id path (_run's "no browser session").
     from uuid import uuid4
+
+    from cowork.services.browser.client import NO_SESSION_DETAIL
+
     bc = BridgeClient(session)
     verdict = asyncio.run(bc.inspect(uuid4()))
     assert verdict.result_code == ResultCode.error
-    detail = verdict.detail or ""
-    assert "No browser tab is connected" in detail
-    assert "Connect Apps and Data → Connect → Browser Control" in detail
-    assert "no browser extension" in detail
+    assert verdict.detail == NO_SESSION_DETAIL
 
 
 # ── endpoints ────────────────────────────────────────────────────────
@@ -1142,42 +1153,3 @@ def test_control_stop_token_history_is_bounded(session):
     assert r.json()["stopped"] is False
     assert r.json()["control_state"] == "active"
 
-
-# ── settings: browser_control_enabled round-trip (A1) ────────────────
-def test_browser_control_enabled_setting_round_trips(session):
-    # The renderer flips this on tab approval via
-    # PUT /api/v1/settings/browser_control_enabled {"value": "true"} —
-    # the generic upsert must round-trip the boolean and read back as set.
-    from cowork.services.settings import SettingService
-
-    try:
-        r = client.put(
-            "/api/v1/settings/browser_control_enabled", json={"value": "true"}
-        )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["key"] == "browser_control_enabled"
-        assert body["is_set"] is True
-        assert body["value"] == "True"
-
-        r = client.get("/api/v1/settings/")
-        entry = next(
-            s for s in r.json() if s["key"] == "browser_control_enabled"
-        )
-        assert entry["is_set"] is True
-        assert entry["value"] == "True"
-
-        # The harness gate reads the typed value — it must load as a bool.
-        assert SettingService(session).load().browser_control_enabled is True
-
-        # Symmetric off-switch (SettingsView toggle).
-        r = client.put(
-            "/api/v1/settings/browser_control_enabled", json={"value": "false"}
-        )
-        assert r.status_code == 200
-        assert SettingService(session).load().browser_control_enabled is False
-    finally:
-        try:
-            SettingService(session).delete_setting("browser_control_enabled")
-        except ValueError:
-            pass

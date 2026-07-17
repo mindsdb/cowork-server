@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from cowork.services.browser import BROWSER_CONNECT_FLOW_STEPS
+
 logger = logging.getLogger(__name__)
 
 
@@ -807,8 +809,8 @@ _BROWSER_CONTROL_PROMPT = (
     "(permission_denied / bridge_disconnected / tab_closed / navigation_failed "
     "/ unsupported_action) tell the user plainly and do not fabricate results. "
     "Setup: the ONLY way to connect a tab is the in-app Browser Control "
-    "connect flow in the desktop app — Connect Apps and Data → Connect → "
-    "Browser Control → approve one Chrome tab. There is NO Chrome extension "
+    f"connect flow in the desktop app — {BROWSER_CONNECT_FLOW_STEPS}. "
+    "There is NO Chrome extension "
     "and NO toolbar icon; when no tab is connected, relay exactly these "
     "in-app steps to the user — never invent any other setup procedure."
 )

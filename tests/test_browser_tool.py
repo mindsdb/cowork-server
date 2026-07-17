@@ -81,14 +81,14 @@ class TestToolDef:
         assert "READ-ONLY" in td.prompt
 
     def test_prompt_states_only_setup_path_no_extension(self):
-        # A1: the description must pin the ONLY setup path (the in-app
-        # Browser Control connect flow) and explicitly rule out a Chrome
+        # A1: the description must pin the ONLY setup path (the shared
+        # in-app connect-flow steps) and explicitly rule out a Chrome
         # extension / toolbar icon, so the model relays the real steps
         # instead of hallucinating a nonexistent extension flow.
+        from cowork.services.browser import BROWSER_CONNECT_FLOW_STEPS
+
         td = tools_mod.build_cowork_browser_tool()
-        assert (
-            "Connect Apps and Data → Connect → Browser Control" in td.prompt
-        )
+        assert BROWSER_CONNECT_FLOW_STEPS in td.prompt
         assert "NO Chrome extension" in td.prompt
         assert "NO toolbar icon" in td.prompt
 
@@ -315,11 +315,11 @@ class TestDispatch:
         env = json.loads(out)
         assert env["control_state"] == "taken_over"
 
-    def test_no_session_envelope_carries_connect_flow_guidance(self, monkeypatch):
-        # A1: with no browser tab connected, the tool envelope must carry the
-        # truthful in-app connect steps and the "no browser extension" phrase
-        # (previously the bare "no browser session" detail led the model to
-        # invent a Chrome-extension setup flow).
+    def test_no_session_verdict_maps_to_bridge_disconnected(self, monkeypatch):
+        # A1: a no-session verdict (ResultCode.error carrying
+        # NO_SESSION_DETAIL) surfaces as bridge_disconnected with the detail
+        # passed through untouched. Wording is asserted once on the constant
+        # (test_browser_broker_control.test_no_session_detail_wording).
         from cowork.services.browser.client import NO_SESSION_DETAIL
 
         verdict = BrowserToolVerdict(
@@ -331,9 +331,7 @@ class TestDispatch:
         out = _handle({"action": "inspect", "reason": "r", "progress_message": "p"})
         env = json.loads(out)
         assert env["status"] == BrowserErrorKind.bridge_disconnected.value
-        assert "No browser tab is connected" in env["error"]
-        assert "Connect Apps and Data → Connect → Browser Control" in env["error"]
-        assert "no browser extension" in env["error"]
+        assert env["error"] == NO_SESSION_DETAIL
 
     def test_error_without_control_state_omits_field(self, monkeypatch):
         verdict = BrowserToolVerdict(
