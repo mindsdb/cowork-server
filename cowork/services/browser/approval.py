@@ -147,15 +147,15 @@ class BrowserApprovalService:
             return None
         now = datetime.now(timezone.utc)
         for grant in self._session.exec(
-            select(BrowserTabGrant).where(BrowserTabGrant.session_id == sid)
+            select(BrowserTabGrant).where(
+                BrowserTabGrant.session_id == sid,
+                BrowserTabGrant.domain != host,
+                BrowserTabGrant.decision == PermissionDecision.granted.value,
+            )
         ).all():
-            if (
-                grant.domain != host
-                and grant.decision == PermissionDecision.granted.value
-            ):
-                grant.decision = PermissionDecision.revoked.value
-                grant.expires_at = now
-                self._session.add(grant)
+            grant.decision = PermissionDecision.revoked.value
+            grant.expires_at = now
+            self._session.add(grant)
         new_grant = self.grant_domain(sid, host)
         sess = self._session.get(BrowserSession, sid)
         if sess is not None and sess.active_domain != host:

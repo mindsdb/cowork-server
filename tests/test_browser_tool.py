@@ -22,6 +22,7 @@ from cowork.schemas.browser import (
     BrowserToolVerdict,
     ResultCode,
 )
+from cowork.services.browser.client import OPEN_URL_NOT_ANCHORED_DETAIL
 
 
 # ── fakes ────────────────────────────────────────────────────────────
@@ -351,10 +352,7 @@ class TestDispatch:
         verdict = BrowserToolVerdict(
             result_code=ResultCode.permission_denied,
             action_type=BrowserActionType.open_url,
-            detail=(
-                "open_url is only allowed for sites the user explicitly "
-                "asked for. Ask the user to name the exact site or URL."
-            ),
+            detail=OPEN_URL_NOT_ANCHORED_DETAIL,
         )
         _install_fake_bridge(monkeypatch, verdict=verdict)
         out = _handle(

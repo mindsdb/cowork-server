@@ -17,9 +17,10 @@ from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
-from cowork.models.browser import BrowserSession, BrowserTabGrant
+from cowork.models.browser import BrowserAction, BrowserSession, BrowserTabGrant
 from cowork.models.conversation import Conversation
 from cowork.schemas.browser import (
+    BridgeCommandResult,
     BrowserActionClass,
     BrowserActionType,
     PermissionDecision,
@@ -29,6 +30,7 @@ from cowork.services.browser.bridge import BridgeCommandService
 from cowork.services.browser.client import (
     OPEN_URL_NOT_ANCHORED_DETAIL,
     BridgeClient,
+    _session_locks,
     url_user_anchored,
 )
 from cowork.services.projects import GENERAL_PROJECT_ID
@@ -83,15 +85,27 @@ class TestUrlUserAnchored:
         assert url_user_anchored("https://BBC.co.uk", ["open BBC.CO.UK please"])
 
     def test_www_and_path_reduce_to_registrable_host(self):
-        # www.bbc.co.uk/news → registrable host bbc.co.uk, which the user's
-        # words contain even when they typed the full URL.
+        # Both sides are reduced through registrable_host, so www/path/
+        # subdomain variants on either side anchor the same site.
         assert url_user_anchored(
             "https://www.bbc.co.uk/news/live", ["please open https://bbc.co.uk"]
         )
-        # And the reverse: user typed www., target is the bare host — the
-        # needle bbc.co.uk is a substring of www.bbc.co.uk.
         assert url_user_anchored(
             "https://bbc.co.uk", ["go to www.bbc.co.uk for me"]
+        )
+        # Subdomain target: news.bbc.co.uk reduces to bbc.co.uk — the user
+        # naming the site covers its subdomains (same registrable site).
+        assert url_user_anchored(
+            "https://news.bbc.co.uk/today", ["go to bbc.co.uk"]
+        )
+
+    def test_bare_host_mid_sentence_with_punctuation(self):
+        assert url_user_anchored("https://example.com", ["try example.com, please"])
+        assert url_user_anchored("http://example.com/x", ["(see example.com!)"])
+
+    def test_full_url_in_user_text(self):
+        assert url_user_anchored(
+            "https://bbc.co.uk", ["open https://www.bbc.co.uk/news"]
         )
 
     def test_host_absent(self):
@@ -99,17 +113,28 @@ class TestUrlUserAnchored:
             "https://evil.com/x", ["go to bbc.co.uk", "what's the weather?"]
         )
 
+    def test_superstring_host_does_not_anchor(self):
+        # HIGH 2 regression: raw substring matching allowed these.
+        # "abbc.co.uk" must NOT anchor bbc.co.uk (different registrable host).
+        assert not url_user_anchored("https://bbc.co.uk", ["go to abbc.co.uk"])
+        # "bbc.co.uk.evil.com" must NOT anchor bbc.co.uk — it anchors
+        # evil.com (its own registrable host) instead.
+        assert not url_user_anchored(
+            "https://bbc.co.uk", ["go to bbc.co.uk.evil.com"]
+        )
+        assert url_user_anchored(
+            "https://evil.com", ["go to bbc.co.uk.evil.com"]
+        )
+
+    def test_ip_prefix_does_not_anchor(self):
+        # "127.0.0.10" must NOT anchor 127.0.0.1 (boundary-anchored tokens).
+        assert not url_user_anchored("http://127.0.0.1:8080", ["ping 127.0.0.10"])
+        assert url_user_anchored("http://127.0.0.1:8080", ["ping 127.0.0.1"])
+
     def test_empty_inputs_never_match(self):
         assert not url_user_anchored("", ["bbc.co.uk"])
         assert not url_user_anchored("https://bbc.co.uk", [])
         assert not url_user_anchored("https://bbc.co.uk", ["", None])  # type: ignore[list-item]
-
-    def test_subdomain_target_anchored_by_registrable_host(self):
-        # news.bbc.co.uk reduces to bbc.co.uk — the user naming the site
-        # covers its subdomains (same registrable site).
-        assert url_user_anchored(
-            "https://news.bbc.co.uk/today", ["go to bbc.co.uk"]
-        )
 
 
 # ── tools.py user-text extraction ────────────────────────────────────
@@ -192,25 +217,6 @@ def test_open_url_not_anchored_denied_no_grant_no_command(session):
     assert bs.active_domain == "example.com"
 
 
-def test_open_url_anchored_only_in_assistant_text_denied(session):
-    # The guard input is the USER texts — the caller must not pass assistant
-    # text, and when it doesn't, an assistant-only mention denies.
-    bs = _make_session(session, domain="example.com")
-    broker = BridgeCommandService(default_timeout_s=0.1)
-    bc = BridgeClient(session, broker=broker)
-    verdict = asyncio.run(
-        bc.send(
-            bs.conversation_id,
-            "open_url",
-            href="https://evil.com",
-            user_texts=["hi"],
-        )
-    )
-    assert verdict.result_code == ResultCode.permission_denied
-    assert broker.pending_count(str(bs.id)) == 0
-    assert [g.domain for g in _grants(session, bs)] == ["example.com"]
-
-
 def test_open_url_missing_href_is_error_without_dispatch(session):
     bs = _make_session(session, domain="example.com")
     broker = BridgeCommandService(default_timeout_s=0.1)
@@ -223,57 +229,127 @@ def test_open_url_missing_href_is_error_without_dispatch(session):
     assert [g.domain for g in _grants(session, bs)] == ["example.com"]
 
 
+# ── helpers ──────────────────────────────────────────────────────────
+async def _open_url_ok(bc, broker, bs, *, href, user_texts):
+    """Run an open_url with a fake poller that pulls the command and posts
+    an ok observed result — the full happy path. Returns (cmd, verdict)."""
+    task = asyncio.create_task(
+        bc.send(bs.conversation_id, "open_url", href=href, user_texts=user_texts)
+    )
+    cmd = await broker.next(str(bs.id), wait_s=2.0)
+    assert cmd is not None
+    await broker.resolve(
+        cmd.command_id,
+        BridgeCommandResult(
+            command_id=cmd.command_id,
+            result_code=ResultCode.ok,
+            observed={"http_status": 200, "settled": True},
+        ),
+    )
+    return cmd, await task
+
+
 # ── BridgeClient.open_url: success (grant + retarget + enqueue) ──────
 def test_open_url_anchored_grants_retargets_and_enqueues(session):
     bs = _make_session(session, domain="example.com")
-    broker = BridgeCommandService(default_timeout_s=0.5)
+    broker = BridgeCommandService(default_timeout_s=2.0)
     bc = BridgeClient(session, broker=broker)
 
-    async def go():
-        # No poller: capture the enqueued command via broker.next, then let
-        # the producer time out (dispatch reached the bridge — that's what
-        # this test asserts; the result path is covered elsewhere).
-        task = asyncio.create_task(
-            bc.send(
-                bs.conversation_id,
-                "open_url",
-                href="https://www.bbc.co.uk/news",
-                user_texts=["please go to bbc.co.uk"],
-            )
+    cmd, verdict = asyncio.run(
+        _open_url_ok(
+            bc,
+            broker,
+            bs,
+            href="https://www.bbc.co.uk/news",
+            user_texts=["please go to bbc.co.uk"],
         )
-        cmd = await broker.next(str(bs.id), wait_s=2.0)
-        verdict = await task
-        return cmd, verdict
-
-    cmd, verdict = asyncio.run(go())
+    )
     # The command reached the bridge with the open_url action + full href.
-    assert cmd is not None
     assert cmd.action_type == BrowserActionType.open_url
     assert cmd.href == "https://www.bbc.co.uk/news"
     assert cmd.domain == "www.bbc.co.uk"
-    # (no poller posted a result, so the producer timed out — NOT a
-    # permission failure: the grant existed at dispatch time)
-    assert verdict.result_code == ResultCode.timeout
+    assert verdict.result_code == ResultCode.ok
     assert verdict.action_type == BrowserActionType.open_url
 
     # Grant created for the new host — stored as the PSL-registrable host
     # (the same function Electron's tab approval uses, so `www.` reduces to
     # the registrable site); the prior grant revoked (single active
-    # domain); active_domain moved.
+    # domain); active_domain moved; no reapproval needed after a completed
+    # command (both sides saw the retarget).
     grants = {g.domain: g for g in _grants(session, bs)}
     assert grants["bbc.co.uk"].decision == PermissionDecision.granted.value
     assert grants["example.com"].decision == PermissionDecision.revoked.value
     assert grants["example.com"].expires_at is not None
     session.refresh(bs)
     assert bs.active_domain == "bbc.co.uk"
+    assert bs.requires_reapproval is False
 
     # The persisted action row records action_type open_url.
-    from cowork.models.browser import BrowserAction
-
     rows = session.exec(
         select(BrowserAction).where(BrowserAction.session_id == bs.id)
     ).all()
     assert [r.action_type for r in rows] == [BrowserActionType.open_url.value]
+
+
+# ── HIGH 1 regressions: retarget is atomic with the command handoff ──
+def test_open_url_busy_session_does_not_mutate_grants(session):
+    # Another action in flight (the per-session lock is held) → open_url
+    # refuses busy BEFORE the retarget: grants and active_domain unchanged,
+    # nothing enqueued. Server policy state cannot diverge from Electron
+    # on a refused call.
+    bs = _make_session(session, domain="example.com")
+    broker = BridgeCommandService(default_timeout_s=0.5)
+    bc = BridgeClient(session, broker=broker)
+
+    async def go():
+        lock = _session_locks[str(bs.id)]
+        async with lock:  # simulate an in-flight command
+            return await bc.send(
+                bs.conversation_id,
+                "open_url",
+                href="https://bbc.co.uk",
+                user_texts=["go to bbc.co.uk"],
+            )
+
+    verdict = asyncio.run(go())
+    assert verdict.result_code == ResultCode.permission_denied
+    assert "in flight" in (verdict.detail or "")
+    assert broker.pending_count(str(bs.id)) == 0
+    grants = {g.domain: g for g in _grants(session, bs)}
+    assert set(grants) == {"example.com"}
+    assert grants["example.com"].decision == PermissionDecision.granted.value
+    session.refresh(bs)
+    assert bs.active_domain == "example.com"
+    assert bs.requires_reapproval is False
+
+
+def test_open_url_timeout_forces_reapproval(session):
+    # The command timed out before any poller pulled it: the server has
+    # retargeted but Electron never saw the command — the documented
+    # recovery is forcing `requires_reapproval`, so NOTHING dispatches
+    # until a fresh tab approval re-syncs both sides.
+    bs = _make_session(session, domain="example.com")
+    broker = BridgeCommandService(default_timeout_s=0.1)
+    bc = BridgeClient(session, broker=broker)
+    verdict = asyncio.run(
+        bc.send(
+            bs.conversation_id,
+            "open_url",
+            href="https://bbc.co.uk",
+            user_texts=["go to bbc.co.uk"],
+        )
+    )
+    assert verdict.result_code == ResultCode.timeout
+    session.refresh(bs)
+    assert bs.requires_reapproval is True
+    # No divergent policy window: every subsequent action is refused until
+    # a fresh approval, including same-site-on-new-domain follow_link.
+    blocked = asyncio.run(
+        bc.send(bs.conversation_id, "follow_link", href="https://bbc.co.uk/x")
+    )
+    assert blocked.result_code == ResultCode.unapproved_tab
+    assert "re-approval" in (blocked.detail or "")
+    assert broker.pending_count(str(bs.id)) == 0
 
 
 def test_open_url_blocked_session_creates_no_grant(session):
@@ -301,20 +377,13 @@ def test_open_url_blocked_session_creates_no_grant(session):
 # ── scenario 5 regression: follow_link cross-domain stays blocked ────
 def test_follow_link_cross_domain_still_denied_after_open_url_retarget(session):
     bs = _make_session(session, domain="example.com")
-    broker = BridgeCommandService(default_timeout_s=0.5)
+    broker = BridgeCommandService(default_timeout_s=2.0)
     bc = BridgeClient(session, broker=broker)
 
     async def go():
-        task = asyncio.create_task(
-            bc.send(
-                bs.conversation_id,
-                "open_url",
-                href="https://bbc.co.uk",
-                user_texts=["go to bbc.co.uk"],
-            )
+        await _open_url_ok(
+            bc, broker, bs, href="https://bbc.co.uk", user_texts=["go to bbc.co.uk"]
         )
-        await broker.next(str(bs.id), wait_s=2.0)  # drain the open_url cmd
-        await task  # times out (no poller result) — retarget already done
         # Now: follow_link back to the OLD domain must be denied (its grant
         # was revoked by the retarget)...
         old = await bc.send(
@@ -333,23 +402,17 @@ def test_follow_link_cross_domain_still_denied_after_open_url_retarget(session):
 
 
 def test_follow_link_same_site_as_new_domain_allowed_after_retarget(session):
-    # After the user-directed retarget, same-site follow_link on the NEW
-    # domain passes the grant (reaches the broker; times out with no poller).
+    # After a COMPLETED user-directed retarget, same-site follow_link on
+    # the NEW domain passes the grant (reaches the broker; times out with
+    # no poller for the second command).
     bs = _make_session(session, domain="example.com")
     broker = BridgeCommandService(default_timeout_s=0.5)
     bc = BridgeClient(session, broker=broker)
 
     async def go():
-        task = asyncio.create_task(
-            bc.send(
-                bs.conversation_id,
-                "open_url",
-                href="https://bbc.co.uk",
-                user_texts=["go to bbc.co.uk"],
-            )
+        await _open_url_ok(
+            bc, broker, bs, href="https://bbc.co.uk", user_texts=["go to bbc.co.uk"]
         )
-        await broker.next(str(bs.id), wait_s=2.0)
-        await task
         return await bc.send(
             bs.conversation_id, "follow_link", href="https://bbc.co.uk/news"
         )
