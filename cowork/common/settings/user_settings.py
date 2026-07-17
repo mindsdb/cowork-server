@@ -294,6 +294,31 @@ class UserSettings(Settings):
         title="Show Counters",
         description="Show counters in the UI.",
     )
+    nav_title: str = Field(
+        default="",
+        title="Nav Title",
+        description="Sidebar title text. Empty uses the default, MindsHub.",
+    )
+    nav_title_color: str = Field(
+        default="",
+        title="Nav Title Color",
+        description="Sidebar title color (hex). Empty follows the theme's default text color.",
+    )
+    nav_logo: str = Field(
+        default="",
+        title="Nav Logo",
+        description="Sidebar logo image as a data URI. Empty shows no logo.",
+    )
+    show_theme_toggle: bool = Field(
+        default=True,
+        title="Show Theme Toggle",
+        description="Show the floating light/dark theme toggle button.",
+    )
+    show_8bit_toggle: bool = Field(
+        default=True,
+        title="Show 8-Bit Toggle",
+        description="Show the floating 8-bit style toggle button.",
+    )
     accent_variant: str = Field(
         default="aqua",
         title="Accent Variant",
