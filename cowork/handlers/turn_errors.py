@@ -17,6 +17,7 @@ internals must never leak into the chat, so unmapped failures surface as
 from __future__ import annotations
 
 import json
+import re
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
 IMAGE_FORMAT_USER_MESSAGE = (
@@ -119,14 +120,26 @@ def is_token_limit_error(exc: Exception) -> bool:
     # 429 token-allowance exhausted (the original case).
     if "429" in s and "limit exceeded for tokens" in s:
         return True
-    # Spent credit balance — a 402, or any "insufficient/no credits|quota"
-    # phrasing. Scoped to credit/quota/token context so unrelated 402s or
-    # "insufficient permissions" don't get mislabelled.
-    if "402" in s and ("credit" in s or "quota" in s or "token" in s):
+    # Spent credit balance — a 402 paired with credit/quota keywords.
+    # "402 + token" alone is intentionally excluded: a JWT-expiry or session
+    # error may produce "402 … token … expired" which is not a quota failure.
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    is_402 = status == 402 or re.search(r"\b402\b", s) is not None
+    if is_402 and (
+        "credit" in s or "quota" in s or re.search(r"token\s+(limit|quota|allowance)", s)
+    ):
         return True
     if "insufficient" in s and ("credit" in s or "quota" in s):
         return True
-    if "out of credit" in s or "no credit" in s or "out of quota" in s:
+    # "out of credit/credits" — fine as-is.
+    if "out of credit" in s or "out of quota" in s:
+        return True
+    # "no credits" (plural) is unambiguous quota exhaustion.
+    # "no credit" (singular) is excluded to avoid matching "no credit card on
+    # file" — a payment-method setup message that must not show the quota card.
+    if "no credits" in s:
         return True
     return False
 

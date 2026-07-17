@@ -209,6 +209,43 @@ def test_token_limit_requires_both_signals():
     assert te.is_token_limit_error(Exception("Monthly limit exceeded for tokens")) is False
 
 
+def test_token_limit_detects_credit_exhaustion_phrasings():
+    # Gateway-level 402 credit exhaustion and equivalent wordings are all
+    # mapped to the same token_limit code as a 429 quota failure.
+    assert te.is_token_limit_error(Exception("402 insufficient credits")) is True
+    assert te.is_token_limit_error(Exception("402: quota exceeded")) is True
+    assert te.is_token_limit_error(Exception("insufficient credits to complete request")) is True
+    assert te.is_token_limit_error(Exception("insufficient quota remaining")) is True
+    assert te.is_token_limit_error(Exception("out of credits")) is True
+    assert te.is_token_limit_error(Exception("no credits remaining")) is True
+    assert te.is_token_limit_error(Exception("402 token limit reached")) is True
+
+
+def test_token_limit_no_false_positives_on_unrelated_402():
+    # A 402 without a credit/quota/token-limit keyword is NOT a quota failure
+    # (e.g. "402 Payment Required — account suspended" from a billing backend).
+    assert te.is_token_limit_error(Exception("402 payment required — account suspended")) is False
+
+
+def test_token_limit_no_false_positive_on_credit_card_message():
+    # "no credit card on file" contains "no credit" but is a payment-method
+    # setup message, not a quota exhaustion. Must not show the quota card.
+    assert te.is_token_limit_error(Exception("no credit card on file")) is False
+
+
+def test_token_limit_no_false_positive_on_jwt_402():
+    # A 402 that mentions "token" in the context of an expired JWT/session
+    # must not be mislabelled as a credit exhaustion.
+    assert te.is_token_limit_error(Exception("402 Your JWT token is expired")) is False
+    assert te.is_token_limit_error(Exception("402 authentication token invalid")) is False
+
+
+def test_token_limit_no_false_positive_on_insufficient_permissions():
+    # "insufficient permissions" shares the "insufficient" prefix but is an
+    # authorisation failure, not a quota failure.
+    assert te.is_token_limit_error(Exception("insufficient permissions to access resource")) is False
+
+
 def test_maps_token_limit_to_curated_copy():
     result = te.friendly_turn_error(Exception(_TOKEN_LIMIT_MESSAGE))
     assert result is not None
