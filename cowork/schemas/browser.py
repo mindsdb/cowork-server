@@ -38,6 +38,11 @@ class BrowserActionType(str, Enum):
     navigate = "navigate"
     scroll = "scroll"
     wait = "wait"
+    # A USER-directed navigation to an explicitly requested URL/site. The
+    # user's own instruction is the consent: dispatching one creates a grant
+    # for the new host (M1 "implicit grant"). Agent-initiated cross-domain
+    # hops stay on `navigate` (follow_link) and remain same-site only.
+    open_url = "open_url"
 
 
 class BrowserActionClass(str, Enum):
@@ -59,6 +64,7 @@ LLM_ACTION_TO_TYPE: dict[str, BrowserActionType] = {
     "follow_link": BrowserActionType.navigate,
     "scroll": BrowserActionType.scroll,
     "wait": BrowserActionType.wait,
+    "open_url": BrowserActionType.open_url,
 }
 
 # Stored `action_type` → the capability class a grant is checked against.
@@ -67,6 +73,7 @@ ACTION_TYPE_TO_CLASS: dict[BrowserActionType, BrowserActionClass] = {
     BrowserActionType.navigate: BrowserActionClass.navigate,
     BrowserActionType.scroll: BrowserActionClass.read,
     BrowserActionType.wait: BrowserActionClass.read,
+    BrowserActionType.open_url: BrowserActionClass.navigate,
 }
 
 
@@ -112,7 +119,7 @@ def result_code_to_error_kind(
         target_lost      → tab_closed
         unapproved_tab   → permission_denied
         permission_denied→ permission_denied
-        error            → navigation_failed (for `navigate`) else bridge_disconnected
+        error            → navigation_failed (for `navigate`/`open_url`) else bridge_disconnected
 
     `timeout`, `target_lost`, and `unapproved_tab` are NEVER surfaced raw.
     """
@@ -127,7 +134,7 @@ def result_code_to_error_kind(
         return BrowserErrorKind.permission_denied
     # code == ResultCode.error
     at = coerce_enum(BrowserActionType, action_type) if action_type is not None else None
-    if at == BrowserActionType.navigate:
+    if at in (BrowserActionType.navigate, BrowserActionType.open_url):
         return BrowserErrorKind.navigation_failed
     return BrowserErrorKind.bridge_disconnected
 

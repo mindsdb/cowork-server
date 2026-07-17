@@ -169,7 +169,7 @@ class BrowserAction(BaseSQLModel, table=True):
     )
     action_type: str = Field(
         max_length=16,
-        description="Stored action: inspect | navigate | scroll | wait.",
+        description="Stored action: inspect | navigate | scroll | wait | open_url.",
     )
     action_class: str = Field(
         max_length=16,

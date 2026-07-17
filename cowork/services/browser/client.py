@@ -33,6 +33,7 @@ from cowork.schemas.browser import (
     coerce_enum,
     coerce_uuid,
     host_only,
+    registrable_host,
 )
 from cowork.services.browser import BROWSER_CONNECT_FLOW_STEPS
 from cowork.services.browser.actions import BrowserActionStore
@@ -51,6 +52,37 @@ NO_SESSION_DETAIL = (
     f"desktop app: {BROWSER_CONNECT_FLOW_STEPS}. There is no browser "
     "extension to install."
 )
+
+# open_url denial detail — the user-anchor guard failed. Deterministic and
+# server-side: the model cannot bypass it by claiming the user asked.
+OPEN_URL_NOT_ANCHORED_DETAIL = (
+    "open_url is only allowed for sites the user explicitly asked for. "
+    "Ask the user to name the exact site or URL."
+)
+
+
+def url_user_anchored(host_or_url: str, user_texts: list[str]) -> bool:
+    """True iff the target's registrable host appears in a USER message.
+
+    The deterministic server-side guard behind `open_url` (M1
+    \"user-directed URL = implicit grant\"): a cross-domain open is allowed
+    ONLY when the user's own words name the site. The check is a
+    case-insensitive substring match of the target's PSL registrable host
+    (`registrable_host`, so `www.bbc.co.uk` and `https://bbc.co.uk/news`
+    both reduce to `bbc.co.uk`) against the raw text of the conversation's
+    USER messages — assistant/tool text must never satisfy it (the caller
+    passes user-authored texts only). An empty host or no user text never
+    matches.
+    """
+    host = registrable_host(host_or_url)
+    if not host:
+        return False
+    needle = host.lower()
+    for text in user_texts:
+        if isinstance(text, str) and needle in text.lower():
+            return True
+    return False
+
 
 # One asyncio.Lock per server session id enforces single-in-flight.
 _session_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -79,14 +111,25 @@ class BridgeClient:
         *,
         href: str | None = None,
         direction: str | None = None,
+        user_texts: list[str] | None = None,
     ) -> BrowserToolVerdict:
         """Dispatch a browser command for a conversation by LLM verb.
 
         `action` is the LLM-facing verb (`inspect | follow_link | scroll |
-        wait`). Resolves the conversation's `BrowserSession`, translates the
-        verb to a stored `action_type`, and runs it. An unknown verb or a
-        conversation with no browser session returns a typed verdict (never
-        raises) so the agent tool can map it to a canonical error kind.
+        wait | open_url`). Resolves the conversation's `BrowserSession`,
+        translates the verb to a stored `action_type`, and runs it. An
+        unknown verb or a conversation with no browser session returns a
+        typed verdict (never raises) so the agent tool can map it to a
+        canonical error kind.
+
+        `open_url` (user-directed URL = implicit grant) additionally needs
+        `user_texts` — the raw texts of the conversation's USER messages —
+        for the deterministic user-anchor guard (`url_user_anchored`): the
+        target's registrable host must appear in the user's own words, else
+        the call is denied and NO grant is created. On success the session
+        is retargeted (new host granted, prior grants revoked,
+        `active_domain` moved) BEFORE dispatch, so the normal `_run`
+        permission check passes against the new grant.
         """
         action_type = LLM_ACTION_TO_TYPE.get(action)
         if action_type is None:
@@ -104,6 +147,9 @@ class BridgeClient:
                 detail=NO_SESSION_DETAIL,
             )
 
+        if action_type == BrowserActionType.open_url:
+            return await self._open_url(sess, href, user_texts or [])
+
         # A navigate (follow_link) targets the href's host — the permission
         # check must run against IT, not fall back to the session's approved
         # active_domain. Without this, `follow_link` with a cross-site href
@@ -119,6 +165,58 @@ class BridgeClient:
         )
         return await self._run(
             sess.id, action_type, domain=domain, href=href, direction=direction
+        )
+
+    async def _open_url(self, sess, href: str | None, user_texts: list[str]):
+        """User-directed `open_url`: anchor guard → retarget → dispatch.
+
+        Order matters:
+          1. USER-ANCHOR GUARD (deterministic, server-side): the target's
+             registrable host must appear in a USER message. Failure →
+             `permission_denied`, nothing dispatched, NO grant created.
+          2. Control gates: a stopped/taken-over or reapproval-pending
+             session refuses via `_run`'s normal gates WITHOUT retargeting —
+             a blocked session must not accumulate new grants.
+          3. Retarget: grant the new host, revoke prior grants for other
+             hosts, move `active_domain` (single-active-domain invariant).
+          4. Dispatch through `_run`, whose permission check now passes
+             against the fresh grant and which persists the action row with
+             action_type `open_url`.
+        """
+        target_host = host_only(href) if href else ""
+        if not href or not target_host:
+            return BrowserToolVerdict(
+                result_code=ResultCode.error,
+                action_type=BrowserActionType.open_url,
+                detail="open_url requires a full http(s) `url`",
+            )
+        if not url_user_anchored(href, user_texts):
+            return BrowserToolVerdict(
+                result_code=ResultCode.permission_denied,
+                action_type=BrowserActionType.open_url,
+                domain=target_host,
+                detail=OPEN_URL_NOT_ANCHORED_DETAIL,
+            )
+
+        # Control/reapproval gates BEFORE any grant mutation: let `_run`
+        # produce its normal gate verdicts without creating a grant.
+        if not self._control.is_blocked(sess.id) and not sess.requires_reapproval:
+            from cowork.services.browser.approval import BrowserApprovalService
+
+            # The grant domain is the PSL-registrable-or-exact host — the
+            # SAME function Electron uses for its grants — so the permission
+            # check's registrable-host equality covers subdomains exactly
+            # like a tab approval would (`www.bbc.co.uk` → grant
+            # `bbc.co.uk`).
+            BrowserApprovalService(self._db).retarget_domain(
+                sess.id, registrable_host(target_host)
+            )
+
+        return await self._run(
+            sess.id,
+            BrowserActionType.open_url,
+            domain=target_host,
+            href=href,
         )
 
     # ── public verbs (the send_browser_command surface) ───────────
@@ -319,19 +417,26 @@ async def send_browser_command(
     *,
     href: str | None = None,
     direction: str | None = None,
+    user_texts: list[str] | None = None,
 ) -> BrowserToolVerdict:
     """Module-level `send_browser_command` surface for the agent tool.
 
     Opens (and always closes) its own short-lived DB session so a single
     browser action is fully self-contained. This is the seam WS3's browser
     tool reaches through its thin `_get_bridge_client()` indirection.
+    `user_texts` (the conversation's USER-message texts) is required for
+    `open_url`'s user-anchor guard and ignored by every other verb.
     """
     from cowork.db.session import get_open_session
 
     db = get_open_session()
     try:
         return await BridgeClient(db).send(
-            conversation_id, action, href=href, direction=direction
+            conversation_id,
+            action,
+            href=href,
+            direction=direction,
+            user_texts=user_texts,
         )
     finally:
         db.close()
