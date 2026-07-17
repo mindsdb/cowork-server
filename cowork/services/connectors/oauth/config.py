@@ -1,75 +1,29 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
-class GoogleServiceConfig:
+class OAuthServiceConfig:
     engine: str
-    scopes: list[str] = field(default_factory=list)
     # Whether this service's credentials response should include the Google
     # Picker API key — a property of the service, not something callers
     # should re-derive by string-comparing engine names.
     uses_picker: bool = False
 
 
-GOOGLE_SERVICES: dict[str, GoogleServiceConfig] = {
-    "google-drive": GoogleServiceConfig(
-        engine="google_drive",
-        scopes=[
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "https://www.googleapis.com/auth/userinfo.profile",
-            "https://www.googleapis.com/auth/drive.file",
-        ],
-        uses_picker=True,
-    ),
-    "google-calendar": GoogleServiceConfig(
-        engine="google_calendar",
-        scopes=[
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "https://www.googleapis.com/auth/userinfo.profile",
-            # Sensitive
-            "https://www.googleapis.com/auth/calendar",
-            "https://www.googleapis.com/auth/calendar.readonly",
-            "https://www.googleapis.com/auth/calendar.events",
-            "https://www.googleapis.com/auth/calendar.events.readonly",
-        ],
-    ),
-    "gmail": GoogleServiceConfig(
-        engine="gmail",
-        scopes=[
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "https://www.googleapis.com/auth/userinfo.profile",
-            # Non-sensitive
-            "https://www.googleapis.com/auth/gmail.labels",
-            # Sensitive
-            "https://www.googleapis.com/auth/gmail.send",
-            # Restricted
-            "https://www.googleapis.com/auth/gmail.modify",
-            "https://www.googleapis.com/auth/gmail.readonly",
-            "https://www.googleapis.com/auth/gmail.compose",
-            "https://www.googleapis.com/auth/gmail.metadata",
-        ],
-    ),
-    "google-ads": GoogleServiceConfig(
-        engine="google_ads",
-        scopes=[
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "https://www.googleapis.com/auth/userinfo.profile",
-            "https://www.googleapis.com/auth/adwords",
-        ],
-    ),
-    "google-analytics": GoogleServiceConfig(
-        engine="google_analytics_4",
-        scopes=[
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "https://www.googleapis.com/auth/userinfo.profile",
-            "https://www.googleapis.com/auth/analytics.readonly",
-        ],
-    ),
+# Provider-agnostic registry: service id (the slug used in OAuth routes,
+# e.g. "google-drive") -> engine + any provider-specific extras. Scopes,
+# endpoints, and capability flags live in each connector's spec JSON (the
+# `browser_oauth_builtin` method's `oauth` block) — the canonical
+# description of a connector's OAuth shape — not here, to avoid a second
+# copy that can silently drift out of sync with it. See
+# OAuthService._oauth_config_for().
+OAUTH_SERVICES: dict[str, OAuthServiceConfig] = {
+    "google-drive": OAuthServiceConfig(engine="google_drive", uses_picker=True),
+    "google-calendar": OAuthServiceConfig(engine="google_calendar"),
+    "gmail": OAuthServiceConfig(engine="gmail"),
+    "google-ads": OAuthServiceConfig(engine="google_ads"),
+    "google-analytics": OAuthServiceConfig(engine="google_analytics_4"),
+    "linear": OAuthServiceConfig(engine="linear"),
 }
