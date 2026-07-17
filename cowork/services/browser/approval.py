@@ -126,6 +126,43 @@ class BrowserApprovalService:
         self._session.refresh(grant)
         return grant
 
+    def retarget_domain(
+        self, session_id: UUID | str, domain: str
+    ) -> BrowserTabGrant | None:
+        """User-directed `open_url` retarget: grant `domain`, drop the rest.
+
+        M1's single-active-domain invariant: at most ONE host is granted at
+        a time. A user-directed open of a new site therefore (1) REVOKES
+        every still-granted grant for any OTHER host on the session
+        (`PermissionDecision.revoked` + `expires_at=now` — otherwise a
+        later `follow_link` could silently ride back to the old domain),
+        (2) grants the new host, and (3) moves the session's
+        `active_domain` to it. Re-approving the old domain later re-enables
+        it (grant_domain refreshes a revoked row). Returns the new grant,
+        or `None` for an empty host (nothing revoked in that case).
+        """
+        sid = coerce_uuid(session_id)
+        host = host_only(domain)
+        if not host:
+            return None
+        now = datetime.now(timezone.utc)
+        for grant in self._session.exec(
+            select(BrowserTabGrant).where(BrowserTabGrant.session_id == sid)
+        ).all():
+            if (
+                grant.domain != host
+                and grant.decision == PermissionDecision.granted.value
+            ):
+                grant.decision = PermissionDecision.revoked.value
+                grant.expires_at = now
+                self._session.add(grant)
+        new_grant = self.grant_domain(sid, host)
+        sess = self._session.get(BrowserSession, sid)
+        if sess is not None and sess.active_domain != host:
+            sess.active_domain = host
+            self._save(sess)
+        return new_grant
+
     def approve(
         self,
         conversation_id: UUID | str,

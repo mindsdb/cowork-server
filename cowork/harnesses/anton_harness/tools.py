@@ -752,13 +752,15 @@ _BROWSER_CONTROL_SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["inspect", "follow_link", "scroll", "wait"],
+            "enum": ["inspect", "follow_link", "scroll", "wait", "open_url"],
             "description": (
                 "The read-only browser primitive to run. `inspect` reads the "
                 "current tab; `follow_link` navigates to a link that appeared "
                 "in the last `inspect` (same site only); `scroll` reveals more "
-                "of the page; `wait` lets a slow page settle. No clicking, "
-                "typing, form submission, or downloads exist in this tool."
+                "of the page; `wait` lets a slow page settle; `open_url` opens "
+                "a URL the user explicitly asked for — creates a new site "
+                "approval from the user's instruction. No clicking, typing, "
+                "form submission, or downloads exist in this tool."
             ),
         },
         "reason": {
@@ -789,6 +791,14 @@ _BROWSER_CONTROL_SCHEMA: dict[str, Any] = {
             "enum": ["up", "down"],
             "description": "scroll only — which way to scroll (default 'down').",
         },
+        "url": {
+            "type": "string",
+            "description": (
+                "open_url only — the full http(s) URL the USER explicitly "
+                "asked to open. Only allowed when the user's own message "
+                "directed you to this site; never on your own initiative."
+            ),
+        },
     },
     "required": ["action", "reason", "progress_message"],
 }
@@ -801,7 +811,13 @@ _BROWSER_CONTROL_PROMPT = (
     "explaining why the connector could not do it. Available actions: "
     "`inspect` (read the current tab), `follow_link` (open a link that "
     "appeared in the last inspect, same site only — pass `href`), `scroll` "
-    "(reveal more, pass `direction`), `wait` (let a slow page settle). There "
+    "(reveal more, pass `direction`), `wait` (let a slow page settle), and "
+    "`open_url` (pass `url`). `open_url` may be used ONLY when the user's "
+    "message explicitly asks to open/go to a specific URL or site — the "
+    "user's instruction IS the approval and creates a new site grant; NEVER "
+    "use it on your own initiative, and if the user hasn't named the site, "
+    "ask them instead of guessing. `follow_link` remains same-site only. "
+    "There "
     "is NO clicking, typing, form submission, or downloading. Every call needs "
     "a one-line `progress_message` for the user. NEVER claim you saw or did "
     "something unless the tool returns `status: \"ok\"` with a populated "
@@ -814,6 +830,53 @@ _BROWSER_CONTROL_PROMPT = (
     "and NO toolbar icon; when no tab is connected, relay exactly these "
     "in-app steps to the user — never invent any other setup procedure."
 )
+
+
+def _is_http_url(value: str) -> bool:
+    """True iff `value` parses as an http(s) URL with a host."""
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(value.strip())
+        return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _extract_user_texts(session: Any) -> list[str]:
+    """Extract the raw texts of USER messages from an anton session.
+
+    Feeds the server-side user-anchor guard behind `open_url`: the target
+    host must appear in the user's OWN words, so only `role == "user"`
+    entries are collected — assistant/tool text never anchors a URL.
+    `session._history` is a list of `{role, content}` dicts where `content`
+    is either a plain string or a list of blocks carrying `text` fields.
+    `tool_result` blocks ALSO ride under the user role in Anthropic-style
+    history but are NOT the user's words (page text from a previous inspect
+    could smuggle arbitrary hosts), so any block whose `type` is not `text`
+    is skipped. Everything is best-effort: a malformed entry is skipped,
+    never raised on.
+    """
+    texts: list[str] = []
+    history = getattr(session, "_history", None)
+    if not isinstance(history, list):
+        return texts
+    for msg in history:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type", "text")
+                    text = block.get("text")
+                    if btype == "text" and isinstance(text, str):
+                        texts.append(text)
+                elif isinstance(block, str):
+                    texts.append(block)
+    return texts
 
 
 def _get_bridge_client():
@@ -874,14 +937,15 @@ async def _cowork_browser_control(session: Any, tc_input: dict) -> str:
         return _err(
             BrowserErrorKind.unsupported_action.value,
             "`action` is required and must be one of "
-            "inspect / follow_link / scroll / wait.",
+            "inspect / follow_link / scroll / wait / open_url.",
         )
     if action not in valid_actions:
         return _err(
             BrowserErrorKind.unsupported_action.value,
             f"unsupported action '{action}'. "
-            "M1 is read-only: only inspect / follow_link / scroll / wait "
-            "are supported (no click / type / submit / download / upload).",
+            "M1 is read-only: only inspect / follow_link / scroll / wait / "
+            "open_url are supported (no click / type / submit / download / "
+            "upload).",
         )
     if not reason or not isinstance(reason, str) or not reason.strip():
         return _err(
@@ -908,6 +972,16 @@ async def _cowork_browser_control(session: Any, tc_input: dict) -> str:
             "`follow_link` requires `href` — a link from the last inspect "
             "result on the same site.",
         )
+    url = tc_input.get("url")
+    if action == "open_url":
+        # `url` is required and must parse as an http(s) URL — anything else
+        # is refused before the bridge is touched.
+        if not url or not isinstance(url, str) or not _is_http_url(url):
+            return _err(
+                BrowserErrorKind.navigation_failed.value,
+                "`open_url` requires `url` — the full http(s) URL the user "
+                "explicitly asked to open.",
+            )
 
     # Resolve the conversation defensively — the anton session stamps the
     # cowork conversation id onto `_session_id`.
@@ -922,12 +996,24 @@ async def _cowork_browser_control(session: Any, tc_input: dict) -> str:
     # ── dispatch to WS4's bridge ─────────────────────────────────────
     try:
         send_browser_command = _get_bridge_client()
-        verdict = await send_browser_command(
-            conversation_id,
-            action,
-            href=href if action == "follow_link" else None,
-            direction=direction if action == "scroll" else None,
-        )
+        if action == "open_url":
+            # open_url carries the target as `href` and needs the USER
+            # message texts for the server-side user-anchor guard (the
+            # deterministic check the model cannot bypass).
+            verdict = await send_browser_command(
+                conversation_id,
+                action,
+                href=url,
+                direction=None,
+                user_texts=_extract_user_texts(session),
+            )
+        else:
+            verdict = await send_browser_command(
+                conversation_id,
+                action,
+                href=href if action == "follow_link" else None,
+                direction=direction if action == "scroll" else None,
+            )
     except Exception as exc:  # never let the bridge raise into the loop
         logger.exception("Cowork browser_control dispatch failed")
         return _err(
@@ -952,10 +1038,11 @@ async def _cowork_browser_control(session: Any, tc_input: dict) -> str:
     effective_kind = kind
     if kind == BrowserErrorKind.ok and not observed:
         # An `ok` with nothing observed is not a real success. Downgrade to
-        # navigation_failed for a navigate, else bridge_disconnected.
+        # navigation_failed for a navigate/open_url, else bridge_disconnected.
         effective_kind = (
             BrowserErrorKind.navigation_failed
-            if action_type == BrowserActionType.navigate
+            if action_type
+            in (BrowserActionType.navigate, BrowserActionType.open_url)
             else BrowserErrorKind.bridge_disconnected
         )
 
@@ -1021,10 +1108,12 @@ def build_cowork_browser_tool():
     return ToolDef(
         name="browser_control",
         description=(
-            "Drive an already-approved browser tab, READ-ONLY, through four "
+            "Drive an already-approved browser tab, READ-ONLY, through five "
             "primitives: inspect (read the tab), follow_link (open a link from "
-            "the last inspect, same site), scroll, and wait. No clicking, "
-            "typing, form submission, or downloads. Use only when no connector "
+            "the last inspect, same site), scroll, wait, and open_url (opens a "
+            "URL the user explicitly asked for — creates a new site approval "
+            "from the user's instruction). No clicking, typing, form "
+            "submission, or downloads. Use only when no connector "
             "can satisfy the task; always pass `reason`. Returns a JSON "
             "envelope with `status` (ok or an error kind) and, on ok, "
             "`observed` + `citations`."

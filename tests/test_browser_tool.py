@@ -35,7 +35,9 @@ def _run(coro):
 
 
 def _install_fake_bridge(monkeypatch, verdict=None, *, capture=None, raises=None):
-    async def _fake_send(conversation_id, action, *, href=None, direction=None):
+    async def _fake_send(
+        conversation_id, action, *, href=None, direction=None, user_texts=None
+    ):
         if capture is not None:
             capture.append(
                 {
@@ -43,6 +45,7 @@ def _install_fake_bridge(monkeypatch, verdict=None, *, capture=None, raises=None
                     "action": action,
                     "href": href,
                     "direction": direction,
+                    "user_texts": user_texts,
                 }
             )
         if raises is not None:
@@ -71,7 +74,7 @@ class TestToolDef:
     def test_action_enum_is_read_only(self):
         td = tools_mod.build_cowork_browser_tool()
         enum = td.input_schema["properties"]["action"]["enum"]
-        assert enum == ["inspect", "follow_link", "scroll", "wait"]
+        assert enum == ["inspect", "follow_link", "scroll", "wait", "open_url"]
         for banned in ("click", "type", "submit", "download", "upload"):
             assert banned not in enum
 
@@ -79,6 +82,21 @@ class TestToolDef:
         td = tools_mod.build_cowork_browser_tool()
         assert "lookup_connector" in td.prompt
         assert "READ-ONLY" in td.prompt
+
+    def test_open_url_schema_and_prompt_user_directed_rule(self):
+        # open_url is in the enum, the `url` field exists and pins the
+        # user-directed rule, and the prompt states the user's instruction
+        # IS the approval (never on the agent's own initiative).
+        td = tools_mod.build_cowork_browser_tool()
+        props = td.input_schema["properties"]
+        assert "open_url" in props["action"]["enum"]
+        assert "url" in props
+        assert "explicitly asked" in props["url"]["description"]
+        assert "never on your own initiative" in props["url"]["description"]
+        assert "open_url" in td.prompt
+        assert "explicitly asks" in td.prompt
+        assert "ask them instead of guessing" in td.prompt
+        assert "same-site only" in td.prompt
 
     def test_prompt_states_only_setup_path_no_extension(self):
         # A1: the description must pin the ONLY setup path (the shared
@@ -168,6 +186,32 @@ class TestValidation:
         )
         env = json.loads(out)
         assert env["status"] == BrowserErrorKind.navigation_failed.value
+        assert cap == []
+
+    def test_open_url_requires_url(self, monkeypatch):
+        cap = []
+        _install_fake_bridge(monkeypatch, capture=cap)
+        out = _handle(
+            {"action": "open_url", "reason": "r", "progress_message": "p"}
+        )
+        env = json.loads(out)
+        assert env["status"] == BrowserErrorKind.navigation_failed.value
+        assert cap == []
+
+    def test_open_url_rejects_non_http_url(self, monkeypatch):
+        cap = []
+        _install_fake_bridge(monkeypatch, capture=cap)
+        for bad in ("ftp://example.com", "javascript:alert(1)", "not a url"):
+            out = _handle(
+                {
+                    "action": "open_url",
+                    "url": bad,
+                    "reason": "r",
+                    "progress_message": "p",
+                }
+            )
+            env = json.loads(out)
+            assert env["status"] == BrowserErrorKind.navigation_failed.value
         assert cap == []
 
     def test_no_conversation(self, monkeypatch):
@@ -273,6 +317,57 @@ class TestDispatch:
         )
         assert cap[0]["direction"] == "down"
         assert cap[0]["href"] is None
+
+    def test_open_url_passes_url_as_href_with_user_texts(self, monkeypatch):
+        cap = []
+        verdict = BrowserToolVerdict(
+            result_code=ResultCode.ok,
+            action_type=BrowserActionType.open_url,
+            observed={"final_domain": "bbc.co.uk"},
+        )
+        _install_fake_bridge(monkeypatch, verdict=verdict, capture=cap)
+        session = _FakeSession()
+        session._history = [
+            {"role": "user", "content": "go to bbc.co.uk please"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        out = _handle(
+            {
+                "action": "open_url",
+                "url": "https://bbc.co.uk/news",
+                "reason": "r",
+                "progress_message": "p",
+            },
+            session=session,
+        )
+        env = json.loads(out)
+        assert env["status"] == "ok"
+        assert cap[0]["action"] == "open_url"
+        assert cap[0]["href"] == "https://bbc.co.uk/news"
+        assert cap[0]["direction"] is None
+        assert cap[0]["user_texts"] == ["go to bbc.co.uk please"]
+
+    def test_open_url_denied_maps_to_permission_denied(self, monkeypatch):
+        verdict = BrowserToolVerdict(
+            result_code=ResultCode.permission_denied,
+            action_type=BrowserActionType.open_url,
+            detail=(
+                "open_url is only allowed for sites the user explicitly "
+                "asked for. Ask the user to name the exact site or URL."
+            ),
+        )
+        _install_fake_bridge(monkeypatch, verdict=verdict)
+        out = _handle(
+            {
+                "action": "open_url",
+                "url": "https://evil.com",
+                "reason": "r",
+                "progress_message": "p",
+            }
+        )
+        env = json.loads(out)
+        assert env["status"] == BrowserErrorKind.permission_denied.value
+        assert "explicitly asked" in env["error"]
 
     def test_bridge_raises_is_caught(self, monkeypatch):
         _install_fake_bridge(monkeypatch, raises=RuntimeError("boom"))
