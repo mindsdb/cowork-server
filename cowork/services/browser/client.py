@@ -34,6 +34,7 @@ from cowork.schemas.browser import (
     coerce_uuid,
     host_only,
 )
+from cowork.services.browser import BROWSER_CONNECT_FLOW_STEPS
 from cowork.services.browser.actions import BrowserActionStore
 from cowork.services.browser.bridge import BridgeCommandService, bridge_command_service
 from cowork.services.browser.control import BrowserControlService
@@ -47,9 +48,8 @@ logger = logging.getLogger(__name__)
 # when no tab is connected (observed incident).
 NO_SESSION_DETAIL = (
     "No browser tab is connected. Ask the user to connect one in the "
-    "desktop app: Connect Apps and Data → Connect → Browser Control → "
-    "pick a Chrome tab and approve it. There is no browser extension to "
-    "install."
+    f"desktop app: {BROWSER_CONNECT_FLOW_STEPS}. There is no browser "
+    "extension to install."
 )
 
 # One asyncio.Lock per server session id enforces single-in-flight.
