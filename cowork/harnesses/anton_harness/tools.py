@@ -805,7 +805,12 @@ _BROWSER_CONTROL_PROMPT = (
     "something unless the tool returns `status: \"ok\"` with a populated "
     "`observed` — an unobserved action is not a success. On any error status "
     "(permission_denied / bridge_disconnected / tab_closed / navigation_failed "
-    "/ unsupported_action) tell the user plainly and do not fabricate results."
+    "/ unsupported_action) tell the user plainly and do not fabricate results. "
+    "Setup: the ONLY way to connect a tab is the in-app Browser Control "
+    "connect flow in the desktop app — Connect Apps and Data → Connect → "
+    "Browser Control → approve one Chrome tab. There is NO Chrome extension "
+    "and NO toolbar icon; when no tab is connected, relay exactly these "
+    "in-app steps to the user — never invent any other setup procedure."
 )
 
 

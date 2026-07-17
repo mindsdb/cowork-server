@@ -80,6 +80,18 @@ class TestToolDef:
         assert "lookup_connector" in td.prompt
         assert "READ-ONLY" in td.prompt
 
+    def test_prompt_states_only_setup_path_no_extension(self):
+        # A1: the description must pin the ONLY setup path (the in-app
+        # Browser Control connect flow) and explicitly rule out a Chrome
+        # extension / toolbar icon, so the model relays the real steps
+        # instead of hallucinating a nonexistent extension flow.
+        td = tools_mod.build_cowork_browser_tool()
+        assert (
+            "Connect Apps and Data → Connect → Browser Control" in td.prompt
+        )
+        assert "NO Chrome extension" in td.prompt
+        assert "NO toolbar icon" in td.prompt
+
 
 # ── session tool gate (WS3-T2) ─────────────────────────────────────────
 class TestSessionToolGate:
@@ -302,6 +314,26 @@ class TestDispatch:
         out = _handle({"action": "inspect", "reason": "r", "progress_message": "p"})
         env = json.loads(out)
         assert env["control_state"] == "taken_over"
+
+    def test_no_session_envelope_carries_connect_flow_guidance(self, monkeypatch):
+        # A1: with no browser tab connected, the tool envelope must carry the
+        # truthful in-app connect steps and the "no browser extension" phrase
+        # (previously the bare "no browser session" detail led the model to
+        # invent a Chrome-extension setup flow).
+        from cowork.services.browser.client import NO_SESSION_DETAIL
+
+        verdict = BrowserToolVerdict(
+            result_code=ResultCode.error,
+            action_type=BrowserActionType.inspect,
+            detail=NO_SESSION_DETAIL,
+        )
+        _install_fake_bridge(monkeypatch, verdict=verdict)
+        out = _handle({"action": "inspect", "reason": "r", "progress_message": "p"})
+        env = json.loads(out)
+        assert env["status"] == BrowserErrorKind.bridge_disconnected.value
+        assert "No browser tab is connected" in env["error"]
+        assert "Connect Apps and Data → Connect → Browser Control" in env["error"]
+        assert "no browser extension" in env["error"]
 
     def test_error_without_control_state_omits_field(self, monkeypatch):
         verdict = BrowserToolVerdict(
