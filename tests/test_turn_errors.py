@@ -295,16 +295,16 @@ def test_response_failed_payload_carries_auth_fields():
     assert "reconnectable" not in te.response_failed_payload("boom", "anton_error")
 
 
-# ── Model-403 (model_access_denied / model_disabled) → plan card ──────
+# ── Model-403 (model_access_denied / model_disabled) → credits card ───
 #
-# The gateway rejecting the requested MODEL (tier gate or admin kill switch)
-# used to surface as the generic "Server returned 403 — temporarily
-# unavailable" prose. anton now raises ModelUnavailableError carrying the
-# gateway's structured code + the model alias; these tests pin the mapping.
-# Detection is typed-or-duck-typed on the code/model attributes — the venv's
-# anton may predate the class (version skew), which is exactly what the duck
-# path covers. NO string matching: a message merely mentioning "model_disabled"
-# must never trigger the plan card.
+# The gateway rejecting the requested MODEL (now a wallet/credits lock or an
+# admin kill switch — no tier gating) used to surface as the generic "Server
+# returned 403 — temporarily unavailable" prose. anton now raises
+# ModelUnavailableError carrying the gateway's structured code + the model
+# alias; these tests pin the mapping. Detection is typed-or-duck-typed on the
+# code/model attributes — the venv's anton may predate the class (version
+# skew), which is exactly what the duck path covers. NO string matching: a
+# message merely mentioning "model_disabled" must never trigger the card.
 
 
 class _FakeModelErr(ConnectionError):
@@ -395,3 +395,139 @@ def test_collect_raises_400_with_plan_message_for_model_403():
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
     assert err.value.status_code == 400
     assert err.value.detail == _PLAN_MSG
+
+
+# ── Wallet-model gateway mapping (402/429/404/503 + X-MindsHub-Reason) ─
+#
+# The inference gateway now denies calls with a precise HTTP status plus an
+# X-MindsHub-Reason header (wallet_empty / included_allowance_exhausted /
+# policy_unavailable / unknown_model). anton wraps the provider SDK's
+# APIStatusError (which carries the status + response headers) in a
+# ConnectionError via `raise ... from`, so the structured detail lives on the
+# chained cause. These tests pin that we prefer the header, fall back to the
+# status when it's absent, and never mislabel a transient 503 as out-of-credits.
+
+
+class _FakeHeaders(dict):
+    """Case-insensitive .get(), like httpx.Headers."""
+
+    def get(self, key, default=None):
+        for k, v in self.items():
+            if k.lower() == key.lower():
+                return v
+        return default
+
+
+class _FakeResponse:
+    def __init__(self, headers):
+        self.headers = _FakeHeaders(headers or {})
+
+
+class _FakeAPIStatusError(Exception):
+    """Stand-in for openai.APIStatusError — carries status_code + response."""
+
+    def __init__(self, status_code, headers=None, message="upstream error"):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response = _FakeResponse(headers)
+
+
+def _gateway_failure(status_code, reason=None, message="Server returned an upstream error"):
+    """The exception anton surfaces: a ConnectionError wrapping the SDK's
+    APIStatusError (chained via `raise ... from`), carrying the HTTP status and
+    the gateway's X-MindsHub-Reason header."""
+    headers = {"X-MindsHub-Reason": reason} if reason else {}
+    wrapped = ConnectionError(message)
+    wrapped.__cause__ = _FakeAPIStatusError(status_code, headers)
+    return wrapped
+
+
+def test_http_status_and_reason_walks_cause_chain():
+    status, reason = te._http_status_and_reason(_gateway_failure(402, reason="wallet_empty"))
+    assert status == 402
+    assert reason == "wallet_empty"
+
+
+def test_plain_exception_has_no_http_context():
+    assert te._http_status_and_reason(Exception("boom")) == (None, None)
+
+
+def test_reason_header_wallet_empty_maps_to_out_of_credits():
+    code, message = te.friendly_turn_error(_gateway_failure(402, reason="wallet_empty"))
+    assert code == te.TOKEN_LIMIT_CODE
+    assert message == te.TOKEN_LIMIT_USER_MESSAGE
+
+
+def test_reason_header_allowance_exhausted_maps_to_out_of_credits():
+    code, message = te.friendly_turn_error(
+        _gateway_failure(429, reason="included_allowance_exhausted")
+    )
+    assert code == te.TOKEN_LIMIT_CODE
+    assert message == te.TOKEN_LIMIT_USER_MESSAGE
+
+
+def test_reason_header_policy_unavailable_is_transient_not_out_of_credits():
+    code, message = te.friendly_turn_error(_gateway_failure(503, reason="policy_unavailable"))
+    assert code == te.POLICY_UNAVAILABLE_CODE
+    assert code != te.TOKEN_LIMIT_CODE
+    assert message == te.POLICY_UNAVAILABLE_USER_MESSAGE
+
+
+def test_reason_header_unknown_model_steers_to_settings_not_credits():
+    code, message = te.friendly_turn_error(_gateway_failure(404, reason="unknown_model"))
+    assert code == te.UNKNOWN_MODEL_CODE
+    assert message == te.UNKNOWN_MODEL_USER_MESSAGE
+
+
+def test_bare_402_status_maps_to_out_of_credits_without_header():
+    # Older gateway with no reason header: the 402 status alone is enough.
+    code, _ = te.friendly_turn_error(_gateway_failure(402))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_bare_429_status_maps_to_out_of_credits_without_header():
+    code, _ = te.friendly_turn_error(_gateway_failure(429))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_bare_503_status_maps_to_transient_without_header():
+    code, message = te.friendly_turn_error(_gateway_failure(503))
+    assert code == te.POLICY_UNAVAILABLE_CODE
+    assert message == te.POLICY_UNAVAILABLE_USER_MESSAGE
+
+
+def test_reason_header_wins_over_status():
+    # A 503 carrying an out-of-credits reason maps to out-of-credits — the
+    # header is preferred over the status code.
+    code, _ = te.friendly_turn_error(_gateway_failure(503, reason="wallet_empty"))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_401_status_not_captured_by_wallet_branches():
+    # A gateway 401 (bad credential) still falls to the auth mapping — the new
+    # status-based branches only fire for 402/429/503.
+    exc = _gateway_failure(
+        401, message="Invalid API key — check your OpenAI API key configuration."
+    )
+    code, _ = te.friendly_turn_error(exc)
+    assert code == te.AUTH_ERROR_CODE
+
+
+def test_out_of_credits_copy_is_credits_oriented_not_plan():
+    # Copy must speak wallet/credits, never plans/tiers/upgrades.
+    lowered = te.TOKEN_LIMIT_USER_MESSAGE.lower()
+    assert "credit" in lowered
+    assert "plan" not in lowered and "upgrade" not in lowered and "tier" not in lowered
+
+
+async def test_stream_emits_transient_failed_event_for_policy_unavailable():
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(_gateway_failure(503, reason="policy_unavailable"))
+    )
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.POLICY_UNAVAILABLE_CODE
+    assert payload["error"] == te.POLICY_UNAVAILABLE_USER_MESSAGE
+    # Flows through the generic path — no auth/model extras leak in.
+    assert "reconnectable" not in payload and "model" not in payload
