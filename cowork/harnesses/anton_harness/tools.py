@@ -25,6 +25,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 import uuid
 
 from cowork.services.browser import BROWSER_CONNECT_FLOW_STEPS
@@ -817,8 +818,7 @@ _BROWSER_CONTROL_PROMPT = (
     "user's instruction IS the approval and creates a new site grant; NEVER "
     "use it on your own initiative, and if the user hasn't named the site, "
     "ask them instead of guessing. `follow_link` remains same-site only. "
-    "There "
-    "is NO clicking, typing, form submission, or downloading. Every call needs "
+    "There is NO clicking, typing, form submission, or downloading. Every call needs "
     "a one-line `progress_message` for the user. NEVER claim you saw or did "
     "something unless the tool returns `status: \"ok\"` with a populated "
     "`observed` — an unobserved action is not a success. On any error status "
@@ -835,12 +835,12 @@ _BROWSER_CONTROL_PROMPT = (
 def _is_http_url(value: str) -> bool:
     """True iff `value` parses as an http(s) URL with a host."""
     try:
-        from urllib.parse import urlparse
-
         parsed = urlparse(value.strip())
-        return parsed.scheme in ("http", "https") and bool(parsed.hostname)
-    except (ValueError, AttributeError):
+    except ValueError:
+        # urlparse genuinely raises on malformed input (e.g. an unclosed
+        # IPv6 bracket, "http://[") — that's an invalid URL, not an error.
         return False
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
 
 
 def _extract_user_texts(session: Any) -> list[str]:
@@ -994,26 +994,20 @@ async def _cowork_browser_control(session: Any, tc_input: dict) -> str:
         )
 
     # ── dispatch to WS4's bridge ─────────────────────────────────────
+    # open_url carries the target as `href` and needs the USER message
+    # texts for the server-side user-anchor guard (the deterministic check
+    # the model cannot bypass).
     try:
         send_browser_command = _get_bridge_client()
-        if action == "open_url":
-            # open_url carries the target as `href` and needs the USER
-            # message texts for the server-side user-anchor guard (the
-            # deterministic check the model cannot bypass).
-            verdict = await send_browser_command(
-                conversation_id,
-                action,
-                href=url,
-                direction=None,
-                user_texts=_extract_user_texts(session),
-            )
-        else:
-            verdict = await send_browser_command(
-                conversation_id,
-                action,
-                href=href if action == "follow_link" else None,
-                direction=direction if action == "scroll" else None,
-            )
+        verdict = await send_browser_command(
+            conversation_id,
+            action,
+            href=url
+            if action == "open_url"
+            else (href if action == "follow_link" else None),
+            direction=direction if action == "scroll" else None,
+            user_texts=_extract_user_texts(session) if action == "open_url" else None,
+        )
     except Exception as exc:  # never let the bridge raise into the loop
         logger.exception("Cowork browser_control dispatch failed")
         return _err(
