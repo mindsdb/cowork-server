@@ -126,6 +126,27 @@ class TestUrlUserAnchored:
             "https://evil.com", ["go to bbc.co.uk.evil.com"]
         )
 
+    def test_userinfo_host_does_not_anchor(self):
+        # Host embedded in URL userinfo is NOT the destination: the URL
+        # token anchors example.com only; bbc.co.uk must not leak through
+        # the bare-host pass (URL spans are masked before it runs).
+        text = "open http://bbc.co.uk@example.com/path"
+        assert url_user_anchored("https://example.com", [text])
+        assert not url_user_anchored("https://bbc.co.uk", [text])
+
+    def test_masking_keeps_unrelated_bare_hosts(self):
+        # Masking URL spans must not eat bare hosts elsewhere in the text.
+        text = "open http://user@example.com/path and also bbc.co.uk"
+        assert url_user_anchored("https://bbc.co.uk", [text])
+        assert url_user_anchored("https://example.com", [text])
+
+    def test_ipv6_anchors_only_via_full_url(self):
+        # Accepted M1 limitation: bare/bracketed IPv6 does not anchor;
+        # a full http(s) URL does (host_only is bracket-aware).
+        assert url_user_anchored("http://[::1]:8080", ["open http://[::1]:8080"])
+        assert not url_user_anchored("http://[::1]:8080", ["go to [::1]:8080"])
+        assert not url_user_anchored("http://[::1]:8080", ["go to ::1"])
+
     def test_ip_prefix_does_not_anchor(self):
         # "127.0.0.10" must NOT anchor 127.0.0.1 (boundary-anchored tokens).
         assert not url_user_anchored("http://127.0.0.1:8080", ["ping 127.0.0.10"])

@@ -70,7 +70,9 @@ _URL_TOKEN_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 # ([A-Za-z0-9.-] before, [A-Za-z0-9-] after), so `abbc.co.uk` never yields
 # `bbc.co.uk` and `127.0.0.10` never yields `127.0.0.1`. Greedy labels mean
 # `bbc.co.uk.evil.com` is extracted WHOLE (its registrable host is
-# `evil.com`, not `bbc.co.uk`).
+# `evil.com`, not `bbc.co.uk`). Bare / bracketed IPv6 (`::1`, `[::1]:8080`)
+# is NOT matched — IPv6 consent requires the user to paste a full http(s)
+# URL (e.g. `http://[::1]:8080`), which the URL-token pass handles.
 _HOST_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9.-])"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+"
@@ -109,7 +111,13 @@ def url_user_anchored(host_or_url: str, user_texts: list[str]) -> bool:
         for token in _URL_TOKEN_RE.findall(text):
             if registrable_host(token) == target:
                 return True
-        for token in _HOST_TOKEN_RE.findall(text):
+        # Mask URL-token spans before the bare-host pass so hosts embedded
+        # inside a URL (e.g. userinfo in `http://bbc.co.uk@example.com/`)
+        # cannot anchor as standalone consent — only the URL's parsed
+        # destination host counts. Bare hosts elsewhere in the same text
+        # still anchor.
+        remainder = _URL_TOKEN_RE.sub(" ", text)
+        for token in _HOST_TOKEN_RE.findall(remainder):
             if registrable_host(token) == target:
                 return True
     return False
