@@ -295,13 +295,13 @@ def test_response_failed_payload_carries_auth_fields():
     assert "reconnectable" not in te.response_failed_payload("boom", "anton_error")
 
 
-# ── Model-403 (model_access_denied / model_disabled) → credits card ───
+# ── Model-403 (model_access_denied / model_disabled), legacy back-compat ─
 #
-# The gateway rejecting the requested MODEL (now a wallet/credits lock or an
-# admin kill switch — no tier gating) used to surface as the generic "Server
-# returned 403 — temporarily unavailable" prose. anton now raises
-# ModelUnavailableError carrying the gateway's structured code + the model
-# alias; these tests pin the mapping. Detection is typed-or-duck-typed on the
+# Only pre-wallet gateway/anton versions emit these structured codes (a
+# plan/tier exclusion or an admin kill switch); the current gateway denies a
+# wallet-locked model as 402 wallet_empty instead. The branch is kept so a
+# version-skewed deployment still gets curated copy rather than the generic
+# "Server returned 403" prose. Detection is typed-or-duck-typed on the
 # code/model attributes — the venv's anton may predate the class (version
 # skew), which is exactly what the duck path covers. NO string matching: a
 # message merely mentioning "model_disabled" must never trigger the card.
@@ -402,10 +402,12 @@ def test_collect_raises_400_with_plan_message_for_model_403():
 # The inference gateway now denies calls with a precise HTTP status plus an
 # X-MindsHub-Reason header (wallet_empty / included_allowance_exhausted /
 # policy_unavailable / unknown_model). anton wraps the provider SDK's
-# APIStatusError (which carries the status + response headers) in a
-# ConnectionError via `raise ... from`, so the structured detail lives on the
-# chained cause. These tests pin that we prefer the header, fall back to the
-# status when it's absent, and never mislabel a transient 503 as out-of-credits.
+# APIStatusError (which carries the status + response headers + request URL)
+# in a ConnectionError via `raise ... from`, so the structured detail lives on
+# the chained cause. These tests pin that we prefer the header, fall back to
+# the bare status ONLY when the failing request went to the MindsHub gateway
+# (a BYOK provider's own 402/429/503 must stay generic), and never mislabel a
+# transient 503 as out-of-credits.
 
 
 class _FakeHeaders(dict):
@@ -419,37 +421,68 @@ class _FakeHeaders(dict):
 
 
 class _FakeResponse:
-    def __init__(self, headers):
+    def __init__(self, headers, url=None):
         self.headers = _FakeHeaders(headers or {})
+        if url is not None:
+            self.url = url
 
 
 class _FakeAPIStatusError(Exception):
     """Stand-in for openai.APIStatusError — carries status_code + response."""
 
-    def __init__(self, status_code, headers=None, message="upstream error"):
+    def __init__(self, status_code, headers=None, message="upstream error", url=None):
         super().__init__(message)
         self.status_code = status_code
-        self.response = _FakeResponse(headers)
+        self.response = _FakeResponse(headers, url=url)
 
 
-def _gateway_failure(status_code, reason=None, message="Server returned an upstream error"):
+def _minds_gateway_url() -> str:
+    """A request URL on the host this install treats as the MindsHub gateway."""
+    return f"https://{te._configured_minds_host()}/v1/chat/completions"
+
+
+def _failure(status_code, reason=None, message="Server returned an upstream error", url=None):
     """The exception anton surfaces: a ConnectionError wrapping the SDK's
-    APIStatusError (chained via `raise ... from`), carrying the HTTP status and
-    the gateway's X-MindsHub-Reason header."""
+    APIStatusError (chained via `raise ... from`), carrying the HTTP status,
+    any X-MindsHub-Reason header, and the request URL."""
     headers = {"X-MindsHub-Reason": reason} if reason else {}
     wrapped = ConnectionError(message)
-    wrapped.__cause__ = _FakeAPIStatusError(status_code, headers)
+    wrapped.__cause__ = _FakeAPIStatusError(status_code, headers, url=url)
     return wrapped
 
 
-def test_http_status_and_reason_walks_cause_chain():
-    status, reason = te._http_status_and_reason(_gateway_failure(402, reason="wallet_empty"))
+def _gateway_failure(status_code, reason=None, message="Server returned an upstream error"):
+    """A failure whose request went to the configured MindsHub gateway."""
+    return _failure(status_code, reason=reason, message=message, url=_minds_gateway_url())
+
+
+def _byok_failure(status_code, message="Server returned an upstream error"):
+    """A failure from the user's own provider (BYOK), not the gateway."""
+    return _failure(status_code, message=message, url="https://api.openai.com/v1/chat/completions")
+
+
+def test_http_error_context_walks_cause_chain():
+    status, reason, host = te._http_error_context(_gateway_failure(402, reason="wallet_empty"))
     assert status == 402
     assert reason == "wallet_empty"
+    assert host == te._configured_minds_host()
 
 
 def test_plain_exception_has_no_http_context():
-    assert te._http_status_and_reason(Exception("boom")) == (None, None)
+    assert te._http_error_context(Exception("boom")) == (None, None, None)
+
+
+def test_status_and_host_come_from_the_reason_bearing_exception():
+    # A chain where an earlier exception carries a different status: the
+    # status/host reported must belong to the SAME exception as the header,
+    # never a mix of chain entries.
+    outer = ConnectionError("wrapper")
+    outer.__cause__ = mid = _FakeAPIStatusError(500, url="https://api.openai.com/v1/x")
+    mid.__cause__ = _FakeAPIStatusError(
+        402, {"X-MindsHub-Reason": "wallet_empty"}, url=_minds_gateway_url()
+    )
+    status, reason, host = te._http_error_context(outer)
+    assert (status, reason, host) == (402, "wallet_empty", te._configured_minds_host())
 
 
 def test_reason_header_wallet_empty_maps_to_out_of_credits():
@@ -480,7 +513,8 @@ def test_reason_header_unknown_model_steers_to_settings_not_credits():
 
 
 def test_bare_402_status_maps_to_out_of_credits_without_header():
-    # Older gateway with no reason header: the 402 status alone is enough.
+    # Older gateway with no reason header: the 402 status from the gateway's
+    # host is enough.
     code, _ = te.friendly_turn_error(_gateway_failure(402))
     assert code == te.TOKEN_LIMIT_CODE
 
@@ -494,6 +528,60 @@ def test_bare_503_status_maps_to_transient_without_header():
     code, message = te.friendly_turn_error(_gateway_failure(503))
     assert code == te.POLICY_UNAVAILABLE_CODE
     assert message == te.POLICY_UNAVAILABLE_USER_MESSAGE
+
+
+def test_byok_402_stays_generic():
+    # A BYOK provider's own 402 is not a gateway billing decision — it must
+    # NOT surface the "add credits" card (the user has no wallet to top up
+    # for that key).
+    assert te.friendly_turn_error(_byok_failure(402)) is None
+
+
+def test_byok_429_stays_generic():
+    # An OpenAI/Anthropic rate limit on the user's own key must not be
+    # presented as out-of-credits.
+    assert te.friendly_turn_error(_byok_failure(429)) is None
+
+
+def test_byok_503_stays_generic():
+    # A BYOK provider outage is not "Billing is temporarily unavailable".
+    assert te.friendly_turn_error(_byok_failure(503)) is None
+
+
+def test_bare_status_with_unknown_origin_stays_generic():
+    # No request URL on the failure → origin can't be proven → the bare-status
+    # billing fallbacks must not fire.
+    assert te.friendly_turn_error(_failure(402)) is None
+    assert te.friendly_turn_error(_failure(503)) is None
+
+
+def test_reason_header_maps_even_without_request_url():
+    # Only the gateway sets X-MindsHub-Reason, so the header path stays
+    # unconditional on origin — it maps even when the response carries no URL.
+    code, _ = te.friendly_turn_error(_failure(402, reason="wallet_empty"))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_raising_url_property_never_escapes_the_error_handler():
+    # httpx.Response.url is a property that RAISES (RuntimeError) when the
+    # response has no request attached; friendly_turn_error runs inside except
+    # handlers and must never raise, so origin extraction has to swallow it.
+    import httpx
+
+    wrapped = ConnectionError("Server returned an upstream error")
+    err = _FakeAPIStatusError(402)
+    err.response = httpx.Response(402)  # no request → .url raises
+    wrapped.__cause__ = err
+    assert te._response_url_host(err.response) is None
+    # Origin unprovable → the bare-status billing fallback stays generic.
+    assert te.friendly_turn_error(wrapped) is None
+
+
+def test_bare_404_stays_generic_even_from_the_gateway():
+    # Deliberate asymmetry vs 402/429/503: a header-less 404 is any missing
+    # route/resource, not necessarily an unknown model, so it is never mapped
+    # to unknown_model on status alone.
+    assert te.friendly_turn_error(_gateway_failure(404)) is None
 
 
 def test_reason_header_wins_over_status():
