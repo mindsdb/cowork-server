@@ -23,6 +23,9 @@ internals must never leak into the chat, so unmapped failures surface as
 from __future__ import annotations
 
 import json
+from urllib.parse import urlparse
+
+from cowork.common.settings.app_settings import default_minds_url
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
 IMAGE_FORMAT_USER_MESSAGE = (
@@ -81,22 +84,23 @@ AUTH_ERROR_USER_MESSAGE = (
 AUTH_ERROR_CODE = "provider_auth"
 
 # Wire-level codes for the model-403 case — the gateway rejected the requested
-# MODEL (the credential itself is fine). These are now rare: the wallet billing
-# model has no tier/plan gating, so a locked model is one the org's wallet can't
-# currently pay for (unlock it by adding credits) rather than one a plan
-# excludes. access_denied is still fixed by adding credits; disabled may be an
-# admin kill switch (credits won't help). They mirror the gateway's own
-# ``error.code`` values so nothing is lost in translation, and the renderer keys
-# its card (Add-credits vs Switch-model affordances) on them.
+# MODEL (the credential itself is fine). Only older pre-wallet gateway/anton
+# versions emit these: access_denied meant a plan/tier exclusion and disabled an
+# admin kill switch. The current gateway never sends them — it denies a model
+# the wallet can't pay for as a 402 ``wallet_empty`` (mapped to ``token_limit``
+# above) — so this branch exists purely as back-compat for version-skewed
+# deployments. The codes mirror the gateway's own ``error.code`` values so
+# nothing is lost in translation, and the renderer keys its card on them.
 MODEL_ACCESS_DENIED_CODE = "model_access_denied"
 MODEL_DISABLED_CODE = "model_disabled"
 _MODEL_UNAVAILABLE_CODES = frozenset({MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE})
 
 # Fallback copy if the exception somehow carries no usable message — anton
 # normally supplies curated, user-facing copy which we pass through verbatim.
+# Deliberately neutral: this legacy denial isn't necessarily fixable with
+# credits, so the copy steers to picking another model rather than to billing.
 MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
-    "This model needs credits. Add credits to unlock it, or switch to another "
-    "model in Settings."
+    "That model isn't available right now. Switch to another model in Settings."
 )
 
 # The X-MindsHub-Reason header values the inference gateway sets to name the
@@ -167,9 +171,10 @@ def is_token_limit_error(exc: Exception) -> bool:
 
 
 def model_unavailable_info(exc: Exception) -> tuple[str, str] | None:
-    """``(code, model)`` when the turn died on the gateway's structured
+    """``(code, model)`` when the turn died on the legacy gateway's structured
     model-403 — anton's ``ModelUnavailableError`` carrying
     ``code ∈ {model_access_denied, model_disabled}`` and the model alias.
+    Only pre-wallet gateway/anton versions raise it; kept as back-compat.
 
     Prefers the typed check; falls back to duck-typing on the ``code``/
     ``model`` attributes so a version-skewed anton (type not importable /
@@ -221,50 +226,131 @@ def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
 _UNSET: object = object()
 
 
-def _http_status_and_reason(exc: BaseException) -> tuple[int | None, str | None]:
-    """Extract the upstream HTTP status and the gateway's ``X-MindsHub-Reason``
-    header from a turn failure.
+def _response_url_host(resp: object) -> str | None:
+    """Hostname the request that produced ``resp`` was sent to, lowercased.
+
+    httpx carries the URL on the response itself (``resp.url``) and on its
+    ``request``; the SDKs' status errors expose that response. Returns ``None``
+    when no URL is available (a synthetic error, or headers attached directly
+    to the exception with no response object).
+    """
+    # Everything is guarded: this runs inside turn-failure handling, which
+    # must never raise. Notably httpx.Response.url is a property that RAISES
+    # (RuntimeError) when the response has no request attached — getattr does
+    # not swallow that.
+    try:
+        url = getattr(resp, "url", None)
+        if url is None:
+            url = getattr(getattr(resp, "request", None), "url", None)
+        if url is None:
+            return None
+        # httpx.URL exposes .host directly; anything else is parsed as a string.
+        host = getattr(url, "host", None)
+        if not host:
+            host = urlparse(str(url)).hostname
+    except Exception:
+        return None
+    return str(host).lower() if host else None
+
+
+def _http_error_context(
+    exc: BaseException,
+) -> tuple[int | None, str | None, str | None]:
+    """Extract ``(status, reason, host)`` from a turn failure — the upstream
+    HTTP status, the gateway's ``X-MindsHub-Reason`` header, and the hostname
+    the failing request was sent to.
 
     anton wraps the provider SDK's ``APIStatusError`` in a ``ConnectionError`` /
     ``TokenLimitExceeded`` (``raise ... from exc``), so the structured status and
     the response headers live on the chained cause, not the exception we're
     handed. We walk the ``__cause__`` / ``__context__`` chain looking for a
-    ``status_code`` and a response carrying ``X-MindsHub-Reason``
-    (wallet_empty / included_allowance_exhausted / policy_unavailable /
-    unknown_model), which names the billing decision exactly and lets us skip
-    brittle status/message matching. Returns ``(None, None)`` for a plain
-    exception with no HTTP context.
+    response carrying ``X-MindsHub-Reason`` (wallet_empty /
+    included_allowance_exhausted / policy_unavailable / unknown_model), which
+    names the billing decision exactly and lets us skip brittle status/message
+    matching. When the header is found, the status and host are taken from that
+    SAME exception so the trio always describes one response; otherwise they
+    come from the first exception in the chain with a ``status_code``. The host
+    lets callers tell a gateway billing status from a BYOK provider's own
+    402/429/503. Returns ``(None, None, None)`` for a plain exception with no
+    HTTP context.
     """
     status: int | None = None
-    reason: str | None = None
+    host: str | None = None
     seen: set[int] = set()
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-        if status is None:
-            code = getattr(cur, "status_code", None)
-            if isinstance(code, int):
-                status = code
-        if reason is None:
-            # httpx.Headers (case-insensitive) on the SDK error's `.response`,
-            # or a headers mapping some clients attach directly to the error.
-            resp = getattr(cur, "response", None)
-            headers = getattr(resp, "headers", None)
-            if headers is None:
-                headers = getattr(cur, "headers", None)
-            if headers is not None:
-                try:
-                    val = headers.get("x-mindshub-reason") or headers.get(
-                        "X-MindsHub-Reason"
-                    )
-                except Exception:
-                    val = None
-                if val:
-                    reason = str(val).strip().lower()
-        if status is not None and reason is not None:
-            break
+        code = getattr(cur, "status_code", None)
+        # httpx.Headers (case-insensitive) on the SDK error's `.response`,
+        # or a headers mapping some clients attach directly to the error.
+        resp = getattr(cur, "response", None)
+        headers = getattr(resp, "headers", None)
+        if headers is None:
+            headers = getattr(cur, "headers", None)
+        reason = None
+        if headers is not None:
+            try:
+                reason = headers.get("x-mindshub-reason") or headers.get(
+                    "X-MindsHub-Reason"
+                )
+            except Exception:
+                reason = None
+        if reason:
+            # The header names the billing decision; report the status and
+            # origin of the exception that carries it, never a mix of chain
+            # entries.
+            if not isinstance(code, int):
+                code = getattr(resp, "status_code", None)
+            return (
+                code if isinstance(code, int) else None,
+                str(reason).strip().lower(),
+                _response_url_host(resp),
+            )
+        if status is None and isinstance(code, int):
+            status = code
+            host = _response_url_host(resp)
         cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
-    return status, reason
+    return status, None, host
+
+
+def _configured_minds_host() -> str | None:
+    """Hostname of the MindsHub API URL this install is configured to call.
+
+    Read from user settings (``minds_url``); when settings can't be loaded
+    (e.g. no DB in a bare context) falls back to the environment-aware default
+    URL, which is what the settings field itself defaults to.
+    """
+    url: str | None
+    try:
+        from cowork.common.settings.user_settings import get_user_settings
+
+        url = get_user_settings().minds_url
+    except Exception:
+        url = None
+    if not url:
+        url = default_minds_url()
+    if "://" not in url:
+        url = f"https://{url}"
+    try:
+        host = urlparse(url).hostname
+    except Exception:
+        return None
+    return host.lower() if host else None
+
+
+def _from_minds_gateway(host: str | None) -> bool:
+    """Whether the failing request went to the configured MindsHub gateway.
+
+    Gates the bare-status billing fallbacks: only the gateway's 402/429/503
+    are billing decisions. The same statuses from a BYOK provider mean
+    something else entirely (an OpenAI rate limit, an Anthropic overload) and
+    must not surface billing copy. An unknown origin (no URL on the failure)
+    is treated as not-the-gateway, so ambiguous failures stay generic.
+    """
+    if not host:
+        return False
+    expected = _configured_minds_host()
+    return expected is not None and host == expected
 
 
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
@@ -295,32 +381,39 @@ def friendly_turn_error(
     (the streaming handler needs the rejected model for the card) pass it in so
     it isn't computed twice; omit it and it's resolved on demand.
     """
-    status, reason = _http_status_and_reason(exc)
+    status, reason, host = _http_error_context(exc)
 
     # The gateway's explicit reason header wins — it names the billing decision
     # exactly, so we never have to guess from a status code or message text.
+    # Unconditional on origin: only the gateway sets X-MindsHub-Reason.
     if reason is not None:
         mapped = _map_gateway_reason(reason)
         if mapped is not None:
             return mapped
 
-    # Out-of-credits first: a 402/429 must not be misread as auth or a model
-    # gate. Covers anton's typed TokenLimitExceeded, the credit/quota message
-    # heuristics, and a bare 402/429 status when the reason header is absent
-    # (older gateway).
-    if is_token_limit_error(exc) or status in (402, 429):
+    # Out-of-credits first: a credit/quota failure must not be misread as auth
+    # or a model gate. Covers anton's typed TokenLimitExceeded and the stable
+    # message heuristics.
+    if is_token_limit_error(exc):
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
 
-    # Billing/auth policy service unreachable (503): transient and retryable —
-    # never the out-of-credits card.
-    if status == 503:
-        return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
+    # Bare-status fallback for a gateway that omits the reason header (older
+    # versions). Gated on the failing request having gone to the configured
+    # MindsHub gateway: a BYOK provider's own 402/429/503 (an OpenAI rate
+    # limit, an Anthropic overload) is not a billing decision, so it falls
+    # through — usually to the generic redacted message. 402/429 both mean
+    # out-of-credits; 503 is a transient policy outage, retryable and never
+    # the out-of-credits card.
+    if status in (402, 429, 503) and _from_minds_gateway(host):
+        if status == 503:
+            return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
+        return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
 
     if model_info is _UNSET:
         model_info = model_unavailable_info(exc)
     if model_info is not None:
-        # anton's ModelUnavailableError message is already curated user copy
-        # (credits guidance / hedged kill-switch wording) — pass it through.
+        # Legacy pre-wallet gateway/anton denial — its ModelUnavailableError
+        # message is already curated user copy, so pass it through verbatim.
         return model_info[0], str(exc) or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if is_auth_error(exc):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
