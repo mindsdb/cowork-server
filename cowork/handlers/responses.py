@@ -61,6 +61,8 @@ class ResponsesHandler:
         project_id = self._resolve_project_id(request)
 
         harness_input = self._build_harness_input(request)
+        if request.surface == "browser" and getattr(self.harness, "id", None) == "anton":
+            harness_input = await self._with_browser_context(harness_input)
         original_content = self._extract_original_content(request)
 
         if request.conversation:
@@ -338,6 +340,29 @@ class ResponsesHandler:
         ConversationService(self.session).save_assistant_turn(
             conversation_id, text, events, harness=harness_id,
         )
+
+    async def _with_browser_context(self, harness_input: list[dict]) -> list[dict]:
+        """Prepend a live <browser-context> block to a Browser Agent dock turn.
+
+        Only the LLM input is wrapped — persistence uses original_content, so
+        the transcript and the cache-stable prompt prefix stay clean, and the
+        context (which shifts as the user browses) is rebuilt fresh per turn.
+        A bridge failure never blocks the turn: it proceeds without context.
+        """
+        from cowork.harnesses.anton_harness.browser_tools import build_browser_turn_context
+
+        try:
+            context = await build_browser_turn_context()
+        except Exception:
+            logger.exception("[responses] browser context build failed")
+            return harness_input
+        if not context:
+            return harness_input
+        for block in harness_input:
+            if block.get("type") == "text":
+                block["text"] = f"<browser-context>\n{context}\n</browser-context>\n\n{block['text']}"
+                break
+        return harness_input
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
         blocks: list[dict] = []
