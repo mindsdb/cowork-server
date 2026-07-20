@@ -62,9 +62,13 @@ def create_conversation(body: ConversationCreateRequest, scoped: ScopedSessionDe
         if project is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
         project_id = project.id
-    conversation = svc.create_conversation(
-        topic=body.topic or body.title or "Untitled task", project_id=project_id
-    )
+    try:
+        conversation = svc.create_conversation(
+            topic=body.topic or body.title or "Untitled task", project_id=project_id
+        )
+    except ValueError as e:
+        # e.g. a project_id that isn't visible in this scope
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return _serialize_conversation(conversation)
 
 
