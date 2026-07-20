@@ -18,6 +18,7 @@ from starlette.responses import JSONResponse
 from cowork.common.logger import setup_logging
 from cowork.db.session import get_session
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
+from cowork.principal import Principal, get_principal
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import registry
 
@@ -50,8 +51,12 @@ async def options_handler():
 
 
 @router.post("/")
-async def responses(responses_request: ResponsesRequest, session: SessionDep):
-    handler = ResponsesHandler(session)
+async def responses(
+    responses_request: ResponsesRequest,
+    session: SessionDep,
+    principal: Principal | None = Depends(get_principal),
+):
+    handler = ResponsesHandler(session, principal=principal)
     result = await handler.handle(responses_request)
     if responses_request.stream:
         # `result` is sse_from_buffer(buffer, 0); the producer is already
