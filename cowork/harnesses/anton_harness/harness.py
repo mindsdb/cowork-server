@@ -13,6 +13,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
@@ -273,16 +274,11 @@ class AntonHarness:
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
-            # build_cowork_fetch_submission_tool,
-            # build_cowork_update_form_tool,
         )
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
-        # TODO: Determine if these two tools are really needed.
-        # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
-        # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -446,10 +442,82 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            for conn in data_vault.list_connections():
-                data_vault.inject_env(conn["engine"], conn["name"])
+            # restore_namespaced_env (instead of a bare inject_env loop) also
+            # registers each connection's DS_* var names for credential
+            # scrubbing — without it, scrub_credentials treats every field as
+            # unknown and redacts non-secret values like base_url into
+            # [DS_*] markers in user-facing output (ENG-688). It also clears
+            # stale DS_* vars a previous turn injected for now-disabled
+            # connections.
+            from anton.utils.datasources import restore_namespaced_env
+
+            restore_namespaced_env(data_vault)
 
         # TODO: Add guidance for integrations
+
+        # Google Drive's google_drive connector uses the drive.file OAuth
+        # scope, which only covers files the app created itself, plus files
+        # the user explicitly granted access to via the Google Picker
+        # (persisted as a `_picked_files` vault field — see
+        # cowork/services/connectors/connections.py). A plain
+        # files.list()/files.search() call does NOT return the latter, so
+        # without calling them out by name here the agent has no way to
+        # know they're reachable at all — inject_env() below only puts the
+        # raw JSON in an env var, which isn't enough on its own for the
+        # agent to notice or act on.
+        #
+        # Parsing `_picked_files` and applying the project-scoping rule is
+        # connector logic, not agent logic, so it lives in
+        # ConnectionsService.picked_files_by_project(); this loop only
+        # injects env vars and turns the result into agent-facing prompt text.
+        integration_guidance = ""
+        picked_by_connection: dict[str, list[dict]] = {}
+        if data_vault is not None:
+            for conn in data_vault.list_connections():
+                data_vault.inject_env(conn["engine"], conn["name"])
+            picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
+
+            if picked_by_connection:
+                def _describe(f: dict, conn_name: str) -> str:
+                    line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
+                    resource_key = f.get("resourceKey") or f.get("resource_key")
+                    if resource_key:
+                        line += f", resourceKey: {resource_key}"
+                    return line + ")"
+
+                picked_lines = [
+                    _describe(f, conn_name)
+                    for conn_name, files in picked_by_connection.items()
+                    for f in files
+                ]
+                integration_guidance = (
+                    "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
+                    "access to via the Google Picker, which a plain files.list()/files.search() call "
+                    "will NOT return (the google_drive connector's scope only covers files this app "
+                    "created itself, plus these specifically granted ones):\n"
+                    + "\n".join(picked_lines)
+                    + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
+                    "include every file above IN ADDITION to whatever files.list()/files.search() "
+                    "returns — do not report only the API call's results. To read one of these "
+                    "files' content, call files.get(fileId=...) directly with its id above; do not "
+                    "expect it to appear in a files.list() response first. If a file above has a "
+                    "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
+                    "even though access was actually granted — either add header "
+                    "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
+                    "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
+                    "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
+                    "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
+                    "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
+                    "include both params on any Drive API call touching these files; they're no-ops "
+                    "for regular files, so there's no downside to always sending them. CRITICAL: when "
+                    "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
+                    "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
+                    "by this connector's restricted OAuth grant and will return files across the user's "
+                    "entire Google account that this app was never actually given access to. Omit "
+                    "corpora entirely (or use corpora='user') — combined with "
+                    "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
+                    "surfaces every file this app can legitimately see, Shared Drive items included."
+                )
 
         cells = extract_scratchpad_cells_from_message_events(conversation.messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
@@ -478,11 +546,12 @@ class AntonHarness:
             # episodic=episodic,
             system_prompt_context=SystemPromptContext(
                 runtime_context=build_runtime_context(anton_settings),
-                suffix=(
+                suffix=(                  
                     _turn_style_context(channel_context)
                     + f"{project_context}"
                     + f"{output_context}"
                     + f"{skill_output_context}"
+                    + f"{integration_guidance}"
                 ),
             ),
             workspace=workspace,

@@ -14,6 +14,7 @@ from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.router import api_router as v1_router
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -37,6 +38,22 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
+    # Release scheduled runs left in `running` by a previous process (crash/
+    # restart). Otherwise the due-check treats the stale row as an in-flight
+    # run and never fires that schedule again.
+    try:
+        from cowork.db.session import get_open_session
+        from cowork.services.schedules import ScheduleRunService
+
+        recovery_session = get_open_session()
+        try:
+            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
+            if reaped:
+                logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
+        finally:
+            recovery_session.close()
+    except Exception:
+        logger.exception("scheduled-run boot recovery failed (non-fatal)")
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.ingress import sync_channel_ingress
@@ -119,6 +136,21 @@ def create_app() -> FastAPI:
     # token; _install_channels fills this set with their paths so the auth
     # layer lets them through.
     channel_webhook_paths: set[str] = set()
+
+    # Org mode: build a per-request Principal from gateway-injected identity
+    # headers. Added first so it sits inner of the bearer/CORS layers.
+    if settings.tenancy_mode == "org":
+        enforce = settings.identity_enforce == "enforce"
+        app.add_middleware(
+            TrustedHeaderMiddleware,
+            exempt_paths=channel_webhook_paths,
+            enforce=enforce,
+        )
+        logger.info(
+            "auth: org tenancy mode — principal middleware enabled (%s)",
+            settings.identity_enforce,
+        )
+
     if settings.require_auth:
         env_path = Path.home() / ".cowork" / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)

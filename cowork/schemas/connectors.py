@@ -1,6 +1,16 @@
+import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Method ids are free-form per-connector strings (e.g. "personal-api-key",
+# "service-account", "browser_oauth_builtin") — over a hundred distinct
+# values across existing specs, not a fixed vocabulary, so this only
+# catches the typo class of bug (stray case/whitespace/punctuation) rather
+# than restricting to a known set. Existing ids mix hyphens and
+# underscores (browser_oauth_builtin is the one underscore holdout among
+# otherwise-hyphenated ids), so both are allowed.
+_METHOD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 class ConnectorField(BaseModel):
@@ -20,6 +30,29 @@ class OAuthConfig(BaseModel):
     token_url: str
     scopes: list[str] = []
     extra_auth_params: dict[str, str] = {}
+    # Only meaningful when supports_revoke is True — where to POST the
+    # token being revoked (RFC 7009-style: token in the form-encoded body).
+    revoke_url: str | None = None
+    # Some providers (Linear, confirmed 2026-07-16) require an EXACT
+    # redirect_uri match, including port — unlike Google, which accepts
+    # any 127.0.0.1 port. Set this to a fixed port pre-registered on the
+    # provider's OAuth app; the desktop loopback server binds to it
+    # directly instead of a random free port. Omit for providers that
+    # accept any loopback port (the default, matches Google's behavior).
+    redirect_port: int | None = None
+    # Only set on the `browser_oauth_builtin` method — the service-id slug
+    # (e.g. "google-drive") used in the /connectors/oauth/{service}/... web
+    # fallback routes. The engine name and this slug have already diverged
+    # historically (e.g. engine google_analytics_4 -> service
+    # google-analytics), so it can't be derived by string transform;
+    # renderer code reads this instead of a hardcoded engine->service map.
+    service_id: str | None = None
+    # Capability flags — does this provider issue refresh tokens / support
+    # revoking a grant. Default True matches Google's (and most providers')
+    # behavior; a connector without one or the other declares it explicitly.
+    # False means "skip this behavior silently," never a faked success.
+    supports_refresh: bool = True
+    supports_revoke: bool = True
 
 
 class ConnectorMethod(BaseModel):
@@ -33,6 +66,15 @@ class ConnectorMethod(BaseModel):
     how_to: str | None = None
     help_url: str | None = None
     fields: list[ConnectorField] = []
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id_format(cls, v: str) -> str:
+        if not _METHOD_ID_PATTERN.match(v):
+            raise ValueError(
+                f"method id {v!r} must be lowercase alphanumeric with hyphens/underscores only"
+            )
+        return v
 
 
 class ConnectorForm(BaseModel):
@@ -153,6 +195,36 @@ class DirectSaveRequest(BaseModel):
     method: str | None = None
     name: str = ""
     values: dict[str, Any] = Field(default_factory=dict)
+
+
+class PickedFile(BaseModel):
+    """A Drive file the user explicitly granted access to via the Google
+    Picker — drive.file scope only covers files the app created itself,
+    so this is how existing files become accessible."""
+
+    id: str
+    name: str
+    mime_type: str | None = Field(default=None, alias="mimeType")
+    icon_url: str | None = Field(default=None, alias="iconUrl")
+    url: str | None = None
+    # Required by Drive API alongside `id` for many files not owned by the
+    # connecting account (link-shared docs especially) — without it,
+    # files.get()/files.export() return 404 notFound even with a valid,
+    # correctly-granted token.
+    resource_key: str | None = Field(default=None, alias="resourceKey")
+    # Project names this file has been explicitly added to (via the chat
+    # composer or a project's Project files rail) — empty when the file
+    # was only ever picked from the connection-details "Pick files"
+    # button, which has no project context. Drives per-project scoping
+    # of the Project files display; the underlying Drive grant itself
+    # remains connection-wide regardless of this list.
+    projects: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PatchPickedFilesBody(BaseModel):
+    files: list[PickedFile] = Field(default_factory=list)
 
 
 class OAuthStartRequest(BaseModel):

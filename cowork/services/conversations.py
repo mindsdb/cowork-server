@@ -107,8 +107,23 @@ class ConversationService:
         # outlive the conversation as orphans pointing at artifacts no
         # task owns anymore.
         TaskObjectService(self.session).delete_for_conversation(conversation_id)
+        # Drop the conversation's uploaded attachments (rows + bytes) — they're
+        # keyed by conversation id and would otherwise orphan in the file store
+        # forever, invisible in any UI (ENG-701). Stage the row deletes into
+        # THIS transaction (single commit below, so a crash can't leave a
+        # half-deleted "ghost" conversation), then unlink the bytes only after
+        # the commit succeeds.
+        from cowork.services.files import (
+            FileService,
+            attachment_purpose,
+            unlink_file_dirs,
+        )
+        attachment_dirs = FileService(self.session).delete_by_purpose(
+            attachment_purpose(str(conversation_id))
+        )
         self.session.delete(conversation)
         self.session.commit()
+        unlink_file_dirs(attachment_dirs)
         return True
 
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
