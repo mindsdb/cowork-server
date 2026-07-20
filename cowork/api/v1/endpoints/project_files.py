@@ -10,21 +10,22 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlmodel import Session
 
-from cowork.db.session import get_session
+from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.services.projects import ProjectService
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-SessionDep = Annotated[Session, Depends(get_session)]
+# Every endpoint here uses the session solely to resolve the project via
+# ProjectService, so the whole module runs on the scoped session.
+SessionDep = ScopedSessionDep
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
@@ -41,7 +42,7 @@ class _PreviewMountRequest(BaseModel):
     path: str
 
 
-def _project_dir(name: str, session: Session) -> Path:
+def _project_dir(name: str, session: ScopedSession) -> Path:
     """Resolve a project name to its on-disk directory or 404."""
     try:
         project = ProjectService(session).get_project_by_name(name)

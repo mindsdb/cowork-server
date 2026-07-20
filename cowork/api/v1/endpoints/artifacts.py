@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 from cowork.services.artifacts import (
@@ -211,7 +212,7 @@ async def open_artifact(req: _PathBody):
     return {"status": "ok", "path": str(artifact)}
 
 
-def _resolve_reveal_path(path: str, session: Session) -> Path:
+def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     try:
         return resolve_artifact_path(path)
     except FileNotFoundError:
@@ -235,7 +236,7 @@ def _resolve_reveal_path(path: str, session: Session) -> Path:
 
 
 @router.post("/reveal")
-async def reveal_artifact(req: _PathBody, session: SessionDep):
+async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
         reveal_in_file_manager(target)
