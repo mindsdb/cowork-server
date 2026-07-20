@@ -352,11 +352,6 @@ class UserSettings(Settings):
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
     )
-    ui_update_mode: str = Field(
-        default="manual",
-        title="UI Update Mode",
-        description="How UI updates are applied (manual or auto).",
-    )
     publish_url: str = Field(
         default="",
         title="Publish URL",
