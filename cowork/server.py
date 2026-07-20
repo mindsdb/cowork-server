@@ -13,7 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.router import api_router as v1_router
+from starlette.responses import JSONResponse
+
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.db.scoped import MissingTenantScopeError
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import get_app_settings
@@ -121,6 +124,12 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    # Org-scoped data touched without an org in scope (e.g. audit mode with no
+    # identity) is an auth problem, not a server error — answer 401, not 500.
+    @app.exception_handler(MissingTenantScopeError)
+    async def _missing_tenant_scope(request, exc):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     # Optional bearer-token auth.  Off by default; enabled when
     # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
