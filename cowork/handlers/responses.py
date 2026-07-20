@@ -54,6 +54,7 @@ class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
         self.principal = principal
+        self.scoped = ScopedSession(session, scope_from_principal(principal))
         self.harness = get_harness(get_user_settings().harness)
         self.last_conversation_id: str | None = None
 
@@ -63,7 +64,7 @@ class ResponsesHandler:
         # Identity into the run's trace metadata; server-derived keys win.
         trace_metadata = identity_trace_metadata(self.principal, request.trace_metadata)
 
-        conversation_service = ConversationService(self.session)
+        conversation_service = ConversationService(self.scoped)
         project_id = self._resolve_project_id(request)
 
         harness_input = self._build_harness_input(request)
@@ -188,7 +189,9 @@ class ResponsesHandler:
         user message; on terminal we persist user + assistant together.
         Never reaches the HTTP response — readers tail the buffer.
         """
-        own = get_open_session()
+        # Fresh session (outlives the request), scoped from the immutable
+        # principal captured at handler construction — never request state.
+        own = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
         persisted = False
@@ -204,6 +207,9 @@ class ResponsesHandler:
                 return
             persisted = True
             try:
+                # Re-anchor before ANY write: the conversation may be gone
+                # (deleted mid-turn) or out of scope on this fresh session.
+                ConversationService(own).get_conversation(conv_id)
                 own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
                 own.commit()
                 ConversationService(own).save_assistant_turn(
@@ -404,9 +410,7 @@ class ResponsesHandler:
             )
 
     def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
-        service = ProjectService(
-            ScopedSession(self.session, scope_from_principal(self.principal))
-        )
+        service = ProjectService(self.scoped)
         if request.project_id is not None:
             return request.project_id
         if request.project:
