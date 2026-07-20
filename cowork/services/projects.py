@@ -65,6 +65,8 @@ class ProjectService:
         # projects root, regardless of what sanitization produced. Validate
         # the name before building the path, then re-check the result.
         root = self._root_dir().resolve()
+        if not name or _NAME_DISALLOWED.search(name):
+            raise ValueError("Invalid project name")
         candidate = Path(name)
         if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
             raise ValueError("Invalid project name")
