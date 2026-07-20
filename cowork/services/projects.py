@@ -62,9 +62,13 @@ class ProjectService:
 
     def _project_path(self, name: str) -> Path:
         # Containment guard: a project dir is always a direct child of the
-        # projects root, regardless of what sanitization produced.
+        # projects root, regardless of what sanitization produced. Validate
+        # the name before building the path, then re-check the result.
         root = self._root_dir().resolve()
-        path = (root / name).resolve()
+        candidate = Path(name)
+        if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
+            raise ValueError("Invalid project name")
+        path = (root / candidate.name).resolve()
         if path.parent != root or path == root:
             raise ValueError("Invalid project name")
         return path
