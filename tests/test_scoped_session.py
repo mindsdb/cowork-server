@@ -248,6 +248,35 @@ def test_local_scope_commit_is_unrestricted(session):
 
 # ── fail-closed ─────────────────────────────────────────────────────────────
 
+def test_flush_stamps_unswept_writes(session):
+    # A service not yet swept writes through the raw request session; the
+    # scope's flush hook adopts the row instead of crashing the request.
+    ScopedSession(session, _org_scope())
+    session.add(ScopedNote(title="from-unswept-service"))
+    session.add(ChildNote(title="authored"))
+    session.commit()
+    row = session.exec(select(ScopedNote).where(ScopedNote.title == "from-unswept-service")).one()
+    assert row.org_id == ORG_A
+    child = session.exec(select(ChildNote).where(ChildNote.title == "authored")).one()
+    assert child.created_by == "user-1"
+
+
+def test_flush_allows_deleting_null_org_rows(session):
+    # Pre-sweep rows cleaned up by their own tenant (cascade case).
+    ScopedSession(session, _org_scope())
+    row = session.exec(select(ScopedNote).where(ScopedNote.title == "legacy")).one()
+    session.delete(row)
+    session.commit()
+
+
+def test_flush_still_rejects_cross_org_deletes(session):
+    ScopedSession(session, _org_scope())
+    row = session.exec(select(ScopedNote).where(ScopedNote.title == "b1")).one()
+    session.delete(row)
+    with pytest.raises(TenantMismatchError):
+        session.commit()
+
+
 def test_org_mode_without_org_fails_closed(session):
     scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=None))
     with pytest.raises(MissingTenantScopeError):

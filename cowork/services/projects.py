@@ -6,9 +6,11 @@ import shutil
 from pathlib import Path
 from uuid import UUID
 
-from sqlmodel import Session, select
+import sqlalchemy as sa
+from sqlmodel import select
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.project import Project
 
 logger = logging.getLogger(__name__)
@@ -29,14 +31,49 @@ _NAME_FALLBACK = "untitled-project"
 
 
 class ProjectService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
+
+    def ensure_general_for_scope(self) -> Project | None:
+        """Bootstrap compat: claim the seeded GENERAL project for this org.
+
+        The init migration seeds GENERAL with org_id NULL; an org deployment
+        must adopt it before scoped queries can see it. Narrow by design:
+        only this fixed row, only in org mode, only while org_id is NULL —
+        the claim is a conditional UPDATE so concurrent first requests can't
+        race, and created_by stays NULL (system-created). If another org
+        already claimed it (e.g. a cloned database), returns None → 404;
+        re-provision explicitly rather than silently reassigning.
+        """
+        scope = self.session.scope
+        if not scope.org_mode or scope.org_id is None:
+            return self.session.get(Project, GENERAL_PROJECT_ID)
+        raw = unsafe_unscoped_session(self.session)  # bootstrap op, not query path
+        raw.execute(
+            sa.update(Project)
+            .where(Project.id == GENERAL_PROJECT_ID, Project.org_id.is_(None))  # type: ignore[arg-type]
+            .values(org_id=scope.org_id)
+        )
+        raw.commit()
+        return self.session.get(Project, GENERAL_PROJECT_ID)
 
     def _root_dir(self) -> Path:
         return Path(get_app_settings().project.root_dir)
 
     def _project_path(self, name: str) -> Path:
-        return self._root_dir() / name
+        # Containment guard: a project dir is always a direct child of the
+        # projects root, regardless of what sanitization produced. Validate
+        # the name before building the path, then re-check the result.
+        root = self._root_dir().resolve()
+        if not name or _NAME_DISALLOWED.search(name):
+            raise ValueError("Invalid project name")
+        candidate = Path(name)
+        if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
+            raise ValueError("Invalid project name")
+        path = (root / candidate.name).resolve()
+        if path.parent != root or path == root:
+            raise ValueError("Invalid project name")
+        return path
 
     # TODO: Move this. This should only be done when using Anton.
     def _scaffold(self, target: Path) -> None:
@@ -46,7 +83,7 @@ class ProjectService:
 
     def _unique_name(self, base: str, *, exclude: str | None = None) -> str:
         existing = {
-            p.name for p in self.session.exec(select(Project)).all()
+            p.name for p in self.session.exec(self.session.select(Project)).all()
             if p.name != exclude
         }
         if base not in existing:
@@ -72,7 +109,7 @@ class ProjectService:
         return cleaned
 
     def list_projects(self) -> list[Project]:
-        return list(self.session.exec(select(Project)).all())
+        return list(self.session.exec(self.session.select(Project)).all())
 
     def get_project(self, project_id: UUID) -> Project:
         project = self.session.get(Project, project_id)
@@ -81,13 +118,17 @@ class ProjectService:
         return project
 
     def get_project_by_name(self, name: str) -> Project:
-        project = self.session.exec(select(Project).where(Project.name == name)).first()
+        project = self.session.exec(
+            self.session.select(Project).where(Project.name == name)
+        ).first()
         if project is None:
             raise ValueError("Project not found")
         return project
 
     def get_project_by_name_or_none(self, name: str) -> Project | None:
-        return self.session.exec(select(Project).where(Project.name == name)).first()
+        return self.session.exec(
+            self.session.select(Project).where(Project.name == name)
+        ).first()
 
     def create_project(self, name: str) -> Project:
         sanitized = self._sanitize_name(name)
@@ -143,7 +184,7 @@ class ProjectService:
 
         if is_active is not None:
             if is_active:
-                for other in self.session.exec(select(Project)).all():
+                for other in self.session.exec(self.session.select(Project)).all():
                     if other.id != project_id and other.is_active:
                         other.is_active = False
                         self.session.add(other)
@@ -169,9 +210,12 @@ class ProjectService:
         # it while the conversation still exists so the cleanup is safe.
         from cowork.models.conversation import Conversation
         from cowork.services.conversations import ConversationService
-        conv_svc = ConversationService(self.session)
+        # Raw session until the conversations sweep: the project was already
+        # loaded through the scope, so its conversations are in-tenant.
+        raw = unsafe_unscoped_session(self.session)
+        conv_svc = ConversationService(raw)
         conv_ids = list(
-            self.session.exec(
+            raw.exec(
                 select(Conversation.id).where(Conversation.project_id == project_id)
             ).all()
         )
@@ -208,7 +252,9 @@ class ProjectService:
         return True
 
     def get_active_project(self) -> Project:
-        project = self.session.exec(select(Project).where(Project.is_active)).first()
+        project = self.session.exec(
+            self.session.select(Project).where(Project.is_active)
+        ).first()
         if project is None:
             raise ValueError("No active project")
         return project

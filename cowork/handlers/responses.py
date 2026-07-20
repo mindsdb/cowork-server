@@ -37,6 +37,7 @@ from cowork.handlers.turn_errors import (
     response_failed_payload,
     response_failed_sse,
 )
+from cowork.db.scoped import ScopedSession, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -403,13 +404,19 @@ class ResponsesHandler:
             )
 
     def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
+        service = ProjectService(
+            ScopedSession(self.session, scope_from_principal(self.principal))
+        )
         if request.project_id is not None:
             return request.project_id
         if request.project:
             try:
-                return ProjectService(self.session).get_project_by_name(request.project).id
+                return service.get_project_by_name(request.project).id
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=f"Project not found: {request.project}") from exc
+        # Bootstrap site: a turn can be the org's first request — adopt the
+        # seeded GENERAL project before defaulting to it.
+        service.ensure_general_for_scope()
         return GENERAL_PROJECT_ID
 
     @staticmethod
