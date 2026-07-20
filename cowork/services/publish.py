@@ -132,16 +132,24 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     Publishing follows the env the provider points at: a custom OpenAI-compatible
     MindsHub endpoint (dev/staging) wins over the default minds_url (prod) and
     authenticates with that provider's own key — so pointing the provider at
-    dev/staging publishes there too. An explicit `publish_url` setting still
-    overrides the derived host. api key is "" when the chosen provider has none.
+    dev/staging publishes there too. api key is "" when the chosen provider has none.
+
+    Resolution order for the publish base URL (first non-empty wins):
+      1. ``ANTON_PUBLISH_URL`` env var — an operator/dev override that trumps
+         the stored setting (the DB row would otherwise shadow env; see
+         SettingService, which passes DB rows as init kwargs);
+      2. the ``publish_url`` setting;
+      3. the host derived from the active provider endpoint.
     """
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
-    if oai_host.startswith("api.") and oai_host.endswith(".mindshub.ai"):
+    if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
         endpoint = settings.openai_base_url
         api_key = _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
-    return settings.publish_url or publish_url_for_endpoint(endpoint), api_key
+    env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
+    publish_url = env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    return publish_url, api_key
 
 
 def list_publishable() -> dict:
@@ -431,6 +439,9 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
+            # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
+            # so the comments panel can key threads after an app restart.
+            "artifact_key": result.get("artifact_key", ""),
             "last_md5": result.get("md5", ""),
             # Snapshot of the artifact's content mtime at publish time — the
             # cheap gate for the `modified` badge (see card_for_folder). Uses
@@ -455,6 +466,8 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         "accessProtected": bool(owner_side.get("requires_password")),
         "accessEmails": owner_side.get("emails", []),
         "orgAllowed": bool(owner_side.get("org_allowed")),
+        # Composite comments scope for the panel (Plan 5).
+        "artifactKey": result.get("artifact_key", ""),
         "result": {k: v for k, v in result.items() if k != "file_payload"},
     }
 

@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -228,6 +229,13 @@ class OAuthSettings(Settings):
     google_analytics_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_ID"))
     google_analytics_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_SECRET"))
 
+    linear_client_id: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_ID"))
+    linear_client_secret: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_SECRET"))
+
+    # Browser-side key for the Google Picker widget (drive.file scope only
+    # grants access to files the user explicitly picks via this UI).
+    google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
+
     server_origin: str = Field(
         default="http://127.0.0.1:26866",
         validation_alias=AliasChoices("COWORK_SERVER_ORIGIN"),
@@ -323,6 +331,27 @@ class AppSettings(Settings):
             "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
         ),
     )
+    tenancy_mode: Literal["local", "org"] = Field(
+        default="local",
+        validation_alias=AliasChoices("COWORK_TENANCY_MODE"),
+        description=(
+            "Deployment tenancy mode. 'local' (default): single-user desktop "
+            "sidecar — request auth is the shared bearer token above. 'org': "
+            "multi-tenant cloud deployment behind the auth gateway — requests "
+            "carry trusted identity headers (X-User-Id / X-Organization-Id) "
+            "from which a per-request principal is built."
+        ),
+    )
+    identity_enforce: Literal["audit", "enforce"] = Field(
+        default="audit",
+        validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
+        description=(
+            "Org-mode identity enforcement. 'audit' (default): requests without "
+            "identity headers are logged and allowed through. 'enforce': they "
+            "are rejected with 401. Flip to 'enforce' once the audit log shows "
+            "all legitimate identity-less callers are handled."
+        ),
+    )
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(
@@ -342,15 +371,7 @@ class AppSettings(Settings):
 
     public_base_url: str = Field(
         default="",
-        # Bound to COWORK_PUBLIC_BASE_URL only. It must NOT also accept
-        # COWORK_SERVER_ORIGIN: the desktop app sets COWORK_SERVER_ORIGIN to the
-        # loopback origin (http://127.0.0.1:<port>) purely to build OAuth redirect
-        # URIs (see server_origin above). If that also populated public_base_url,
-        # channels/ingress.py would treat the server as publicly reachable and
-        # stop every polling adapter (Telegram) in favour of a webhook that does
-        # not exist — silently killing desktop channel ingress. Keep the two
-        # decoupled: OAuth origin is server_origin; webhook base is this.
-        validation_alias=AliasChoices("COWORK_PUBLIC_BASE_URL"),
+        validation_alias=AliasChoices("COWORK_PUBLIC_BASE_URL", "COWORK_SERVER_ORIGIN"),
         description=(
             "Public HTTPS base URL of this server (e.g. https://cowork.example.com), "
             "used to build channel webhook URLs for setWebhook-style registration. "
