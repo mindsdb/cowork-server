@@ -17,15 +17,16 @@ Local mode (the desktop sidecar) never filters — today's behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Request
+from fastapi import Depends, Request
 from sqlalchemy import event
 from sqlalchemy.sql import Select
 from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.principal import get_principal
+from cowork.db.session import get_session
+from cowork.principal import Principal, get_principal
 
 
 class MissingTenantScopeError(RuntimeError):
@@ -48,16 +49,21 @@ class TenantScope:
 LOCAL_SCOPE = TenantScope()
 
 
-def get_tenant_scope(request: Request) -> TenantScope:
-    """FastAPI dependency: the request's tenant scope."""
+def scope_from_principal(principal: Principal | None) -> TenantScope:
+    """The single way a TenantScope is built — request DI and background
+    holders of a principal (e.g. ResponsesHandler) both go through here."""
     if get_app_settings().tenancy_mode != "org":
         return LOCAL_SCOPE
-    principal = get_principal(request)
     return TenantScope(
         org_mode=True,
         org_id=principal.org_id if principal else None,
         user_id=principal.user_id if principal else None,
     )
+
+
+def get_tenant_scope(request: Request) -> TenantScope:
+    """FastAPI dependency: the request's tenant scope."""
+    return scope_from_principal(get_principal(request))
 
 
 def _is_org_scoped(model: type) -> bool:
@@ -92,19 +98,48 @@ class ScopedSession:
         self._session = session
         self.scope = scope
         if scope.org_mode:
-            # Validate every flush (incl. autoflush and commit) so a loaded
-            # row mutated to another org can never persist.
-            event.listen(session, "before_flush", self._before_flush)
+            # One scope per raw session: re-wrapping with the same scope is a
+            # no-op (request DI + handler paths share the request session);
+            # a different scope is a bug — two tenants on one session.
+            existing = session.info.get("tenant_scope")
+            if existing is None:
+                session.info["tenant_scope"] = scope
+                # Validate every flush (incl. autoflush and commit) so a loaded
+                # row mutated to another org can never persist.
+                event.listen(session, "before_flush", self._before_flush)
+            elif existing != scope:
+                raise RuntimeError(
+                    "session is already tenant-scoped to a different org"
+                )
 
     def _before_flush(self, session: Any, flush_context: Any, instances: Any) -> None:
-        for row in [*session.new, *session.dirty, *session.deleted]:
+        # Stamp-or-reject: NULL-org writes (services not yet swept to the
+        # scoped API) are adopted into the scope; a non-NULL mismatch is
+        # always a bug. Deletes of NULL-org rows are allowed — pre-sweep
+        # rows being cleaned up by their own tenant (e.g. cascades).
+        for row in [*session.new, *session.dirty]:
             if _is_org_scoped(type(row)):
                 self._require_org(type(row))
-                if row.org_id != self.scope.org_id:
+                if row.org_id is None:
+                    row.org_id = self.scope.org_id
+                elif row.org_id != self.scope.org_id:
                     raise TenantMismatchError(
                         f"pending write on {type(row).__name__} with "
                         f"org_id={row.org_id!r} conflicts with scope "
                         f"org_id={self.scope.org_id!r}"
+                    )
+        for row in session.new:
+            if (
+                self.scope.user_id
+                and getattr(row, "created_by", "missing") is None
+            ):
+                row.created_by = self.scope.user_id
+        for row in session.deleted:
+            if _is_org_scoped(type(row)):
+                self._require_org(type(row))
+                if row.org_id is not None and row.org_id != self.scope.org_id:
+                    raise TenantMismatchError(
+                        f"cannot delete {type(row).__name__} belonging to another org"
                     )
 
     def _require_org(self, model: type) -> None:
@@ -174,6 +209,9 @@ class ScopedSession:
     def flush(self) -> None:
         self._session.flush()
 
+    def rollback(self) -> None:
+        self._session.rollback()
+
 
 def unsafe_unscoped_session(scoped: ScopedSession) -> Session:
     """Deliberate escape hatch to the raw session (system jobs, migrations).
@@ -181,3 +219,14 @@ def unsafe_unscoped_session(scoped: ScopedSession) -> Session:
     Named to be greppable; never use it in service/request code.
     """
     return scoped._session
+
+
+def get_scoped_session(
+    session: Session = Depends(get_session),
+    scope: TenantScope = Depends(get_tenant_scope),
+) -> ScopedSession:
+    """FastAPI dependency: the request's tenant-scoped session."""
+    return ScopedSession(session, scope)
+
+
+ScopedSessionDep = Annotated[ScopedSession, Depends(get_scoped_session)]
