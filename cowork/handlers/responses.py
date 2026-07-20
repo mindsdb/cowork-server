@@ -155,9 +155,9 @@ class ResponsesHandler:
             role=Role.user,
             content=original_content,
         )
-        self.session.add(user_message)
-        self.session.commit()
-        self.session.refresh(user_message)
+        self.scoped.add(user_message)
+        self.scoped.commit()
+        self.scoped.refresh(user_message)
 
         stream = self.harness.stream_response(
             conversation=conversation,
@@ -191,7 +191,7 @@ class ResponsesHandler:
         """
         # Fresh session (outlives the request), scoped from the immutable
         # principal captured at handler construction — never request state.
-        own = ScopedSession(get_open_session(), scope_from_principal(self.principal))
+        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
         persisted = False
@@ -209,17 +209,17 @@ class ResponsesHandler:
             try:
                 # Re-anchor before ANY write: the conversation may be gone
                 # (deleted mid-turn) or out of scope on this fresh session.
-                ConversationService(own).get_conversation(conv_id)
-                own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
-                own.commit()
-                ConversationService(own).save_assistant_turn(
+                ConversationService(producer_session).get_conversation(conv_id)
+                producer_session.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
+                producer_session.commit()
+                ConversationService(producer_session).save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                 )
             except Exception:
                 logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
 
         try:
-            conv = ConversationService(own).get_conversation(conv_id)
+            conv = ConversationService(producer_session).get_conversation(conv_id)
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,
@@ -281,7 +281,7 @@ class ResponsesHandler:
             persist()
             await buffer.close("error")
         finally:
-            own.close()
+            producer_session.close()
 
     @staticmethod
     def _inject_created(sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
@@ -347,7 +347,7 @@ class ResponsesHandler:
         events: list[dict],
     ) -> None:
         harness_id = getattr(self.harness, 'id', None)
-        ConversationService(self.session).save_assistant_turn(
+        ConversationService(self.scoped).save_assistant_turn(
             conversation_id, text, events, harness=harness_id,
         )
 

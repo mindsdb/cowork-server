@@ -55,9 +55,15 @@ class ConversationService:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
         against it before the first stream creates the conversation."""
+        # Anchor the parent: the target project must be visible in scope —
+        # otherwise org A could link a conversation to org B's project and
+        # leak its name/path through serialization.
+        target_project_id = project_id or GENERAL_PROJECT_ID
+        if self.session.get(Project, target_project_id) is None:
+            raise ValueError("Project not found")
         conversation = Conversation(
             topic=topic,
-            project_id=project_id or GENERAL_PROJECT_ID,
+            project_id=target_project_id,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
