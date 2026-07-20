@@ -38,6 +38,20 @@ class PlainNote(SQLModel, table=True):
     title: str = ""
 
 
+class AuthoredNote(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: str | None = Field(default=None, index=True)
+    created_by: str | None = Field(default=None)
+    title: str = ""
+
+
+class ChildNote(SQLModel, table=True):
+    # created_by without org_id — the messages shape (tenancy via parent).
+    id: int | None = Field(default=None, primary_key=True)
+    created_by: str | None = Field(default=None)
+    title: str = ""
+
+
 @pytest.fixture()
 def session():
     engine = create_engine(
@@ -45,6 +59,8 @@ def session():
     )
     ScopedNote.__table__.create(engine)
     PlainNote.__table__.create(engine)
+    AuthoredNote.__table__.create(engine)
+    ChildNote.__table__.create(engine)
     with Session(engine) as s:
         s.add(ScopedNote(org_id=ORG_A, title="a1"))
         s.add(ScopedNote(org_id=ORG_A, title="a2"))
@@ -149,6 +165,32 @@ def test_add_rejects_conflicting_org_id(session):
     scoped = ScopedSession(session, _org_scope())
     with pytest.raises(TenantMismatchError):
         scoped.add(ScopedNote(org_id=ORG_B, title="smuggled"))
+
+
+def test_add_stamps_created_by(session):
+    scoped = ScopedSession(session, _org_scope())
+    note = scoped.add(AuthoredNote(title="mine"))
+    assert note.created_by == "user-1"
+    assert note.org_id == ORG_A
+
+
+def test_add_stamps_created_by_on_child_models(session):
+    # messages shape: created_by but no org_id — still attributed.
+    scoped = ScopedSession(session, _org_scope())
+    note = scoped.add(ChildNote(title="reply"))
+    assert note.created_by == "user-1"
+
+
+def test_add_does_not_overwrite_created_by(session):
+    scoped = ScopedSession(session, _org_scope())
+    note = scoped.add(AuthoredNote(title="theirs", created_by="someone-else"))
+    assert note.created_by == "someone-else"
+
+
+def test_add_in_local_scope_does_not_stamp_created_by(session):
+    scoped = ScopedSession(session, LOCAL_SCOPE)
+    note = scoped.add(AuthoredNote(title="desktop"))
+    assert note.created_by is None
 
 
 def test_add_in_local_scope_does_not_stamp(session):
