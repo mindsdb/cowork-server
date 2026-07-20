@@ -16,6 +16,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
 from cowork.services import task_objects as t
 from cowork.services.artifacts import card_for_folder
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.services.conversations import ConversationService
 
 
@@ -70,7 +71,7 @@ def test_finalize_surfaces_only_new_artifacts(session, tmp_path):
 
     _make_artifact(base, "new", files={"r.md": "new"}, meta={"slug": "new", "name": "New", "type": "document"})
 
-    conv = ConversationService(session).create_conversation(topic="t")
+    conv = ConversationService(ScopedSession(session, LOCAL_SCOPE)).create_conversation(topic="t")
     cards = t.finalize_turn_artifacts(conv.id, conv.project_id, base, before)
     assert [c["slug"] for c in cards] == ["new"]
 
@@ -84,7 +85,7 @@ def test_finalize_surfaces_only_new_artifacts(session, tmp_path):
 def test_artifact_only_turn_is_persisted(session):
     """A turn with no body text but a card event must persist, so the inline
     card replays on reload."""
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation(topic="t")
     event = {"type": "response.artifact_created", "sequence_number": 1,
              "artifact": {"slug": "x", "title": "X", "type": "document", "path": "/p/x/x.md", "ext": ".md"}}
@@ -98,7 +99,7 @@ def test_artifact_only_turn_is_persisted(session):
 
 
 def test_empty_turn_with_no_events_is_not_persisted(session):
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation(topic="t")
     svc.save_assistant_turn(conv.id, "", [], harness="anton")
     assert [m for m in svc.get_messages(conv.id) if m["role"] == "assistant"] == []

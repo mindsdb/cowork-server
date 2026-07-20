@@ -73,6 +73,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
     """A ResponsesHandler whose formatter yields one frame then raises —
     built without __init__ so no DB/harness setup is needed."""
     handler = object.__new__(ResponsesHandler)
+    handler.principal = None  # __init__ bypassed; local-mode producer scope
 
     async def _formatter(stream, model, event_sink):
         yield "event: response.created\ndata: {}\n\n"
