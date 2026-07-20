@@ -18,13 +18,14 @@ from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
+from cowork.db.scoped import ScopedSession
 from cowork.services.conversations import ConversationService
 
 logger = logging.getLogger(__name__)
 
 
 class ProbeHandler:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     async def run(

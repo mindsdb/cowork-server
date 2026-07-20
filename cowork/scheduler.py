@@ -115,8 +115,12 @@ async def execute_schedule(
 
         if conversation_id is None:
             # Conversation not pre-created by the caller (e.g. cron tick).
+            from cowork.db.scoped import ScopedSession, scope_for_background_context
             from cowork.services.conversations import ConversationService
-            conversation = ConversationService(session).create_conversation(
+            # Local mode: today's behavior. Org mode: fails loudly until the
+            # service-principal ticket lands — never a silent unscoped write.
+            scoped = ScopedSession(session, scope_for_background_context())
+            conversation = ConversationService(scoped).create_conversation(
                 topic=schedule.title,
                 project_id=schedule.project_id,
             )
