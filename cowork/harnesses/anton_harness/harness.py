@@ -255,6 +255,7 @@ class AntonHarness:
             # Guarded: an anton build (or test double) without `.history` simply
             # skips capture and falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
+            compacted = False  # set if anton summarizes history mid-turn
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Deployed cowork-server resolves anton
             # from PyPI/main, which may predate the trace-tags kwargs (anton
@@ -267,12 +268,21 @@ class AntonHarness:
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
+                # Under context pressure anton summarizes history mid-turn,
+                # reassigning session.history and invalidating seed_len.
+                if type(event).__name__ == "StreamContextCompacted":
+                    compacted = True
                 yield event
             # Turn completed cleanly: capture its tool block-rows for
             # persistence. Skipped on cancel/error (the block below never runs),
             # so a partial turn falls back to text-only replay and anton's own
             # dangling-tool_use sealing keeps its in-memory history valid.
-            if seed_len is not None:
+            #
+            # Also skipped after a mid-turn compaction: seed_len no longer marks
+            # this turn's start, so slicing could drop rows or surface an orphan
+            # tool_result (its tool_use summarized away) → invalid replay. Text-
+            # only replay stays valid, so degrade to it.
+            if seed_len is not None and not compacted:
                 turn_slice = session.history[seed_len:]
                 while turn_slice and (
                     not isinstance(turn_slice[0], dict)
