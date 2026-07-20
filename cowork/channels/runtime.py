@@ -420,8 +420,14 @@ class AntonChannelRuntime:
 
         collected: list[str] = []
         events: list[dict] = []
+        turn_rows: list[dict] = []
 
         def event_sink(event_type: str, data: dict) -> None:
+            # Tool block-rows are for LLM-history persistence, not UI replay —
+            # keep them out of the events log (mirrors handlers/responses.py).
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             events.append(data)
             if event_type == "response.output_text.delta":
                 collected.append(data.get("delta", ""))
@@ -436,7 +442,7 @@ class AntonChannelRuntime:
 
         reply = "".join(collected)
         ConversationService(session).save_assistant_turn(
-            conversation.id, reply, events, harness=harness_id,
+            conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
         )
         return reply, turn_used_tools(events)
 
