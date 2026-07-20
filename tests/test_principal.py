@@ -184,6 +184,30 @@ def test_audit_mode_lets_malformed_identity_through(caplog):
     assert "no principal on" in caplog.text
 
 
+def test_missing_tenant_scope_maps_to_401(monkeypatch):
+    # Org-scoped data touched with no org in scope (audit mode, no identity)
+    # must answer 401 via the create_app exception handler, not a 500.
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import MissingTenantScopeError
+    from cowork.server import create_app
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    try:
+        app = create_app()
+
+        @app.get("/api/v1/_boom")
+        def boom():
+            raise MissingTenantScopeError("no org in scope")
+
+        res = TestClient(app).get("/api/v1/_boom")
+        assert res.status_code == 401
+        assert res.json() == {"detail": "Unauthorized"}
+    finally:
+        get_app_settings.cache_clear()
+
+
 def test_audit_mode_still_builds_principal_when_identity_present():
     res = _client(enforce=False).get("/api/v1/whoami", headers=IDENTITY)
     assert res.status_code == 200
