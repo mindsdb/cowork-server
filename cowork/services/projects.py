@@ -61,7 +61,13 @@ class ProjectService:
         return Path(get_app_settings().project.root_dir)
 
     def _project_path(self, name: str) -> Path:
-        return self._root_dir() / name
+        # Containment guard: a project dir is always a direct child of the
+        # projects root, regardless of what sanitization produced.
+        root = self._root_dir().resolve()
+        path = (root / name).resolve()
+        if path.parent != root or path == root:
+            raise ValueError("Invalid project name")
+        return path
 
     # TODO: Move this. This should only be done when using Anton.
     def _scaffold(self, target: Path) -> None:
