@@ -83,6 +83,23 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
     "o4-mini": {"efforts": ["low", "medium", "high"], "default": "medium"},
 }
 
+# The lables are used to display the model names in the UI.
+# The lables defined here are for the BYOK providers.
+# MindsHub inference model labels (e.g. "sonnet") are resolved at runtime from the `/v1/models` endpoint.
+MODEL_LABELS: dict[str, str] = {
+    "claude-opus-4-8": "Claude Opus 4.8",
+    "claude-opus-4-7": "Claude Opus 4.7",
+    "claude-opus-4-6": "Claude Opus 4.6",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "gpt-5.5": "GPT 5.5",
+    "gpt-5.5-mini": "GPT 5.5 Mini",
+    "o3": "o3",
+    "o4-mini": "o4-mini",
+    "gemini-2.5-pro": "Gemini 2.5 Pro",
+    "gemini-2.5-flash": "Gemini 2.5 Flash",
+    "gemini-3-flash-preview": "Gemini 3 Flash Preview",
+}
 
 # ── Environment-aware MindsHub URLs ─────────────────────────────────
 # The URL pattern is:
