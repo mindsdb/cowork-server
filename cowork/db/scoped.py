@@ -145,6 +145,14 @@ class ScopedSession:
                     f"{type(row).__name__}.org_id={row.org_id!r} conflicts with scope "
                     f"org_id={self.scope.org_id!r}"
                 )
+        # Attribution: stamp the author on any model carrying created_by
+        # (covers child rows like messages that have no org_id of their own).
+        if (
+            self.scope.org_mode
+            and self.scope.user_id
+            and getattr(row, "created_by", "missing") is None
+        ):
+            row.created_by = self.scope.user_id
         self._session.add(row)
         return row
 
