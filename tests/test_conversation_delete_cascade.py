@@ -86,6 +86,7 @@ from pathlib import Path  # noqa: E402
 from cowork.models.conversation import Conversation  # noqa: E402
 from cowork.models.project import Project  # noqa: E402
 from cowork.services.files import FileService, attachment_purpose, unlink_file_dirs  # noqa: E402
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession  # noqa: E402
 from cowork.services.projects import ProjectService  # noqa: E402
 
 
@@ -132,14 +133,14 @@ def test_delete_conversation_leaves_other_conversations_and_purposes(session):
 
 
 def test_delete_project_cascades_conversations_and_attachments(session):
-    proj = ProjectService(session).create_project("eng701-cascade-test")
+    proj = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project("eng701-cascade-test")
     svc = ConversationService(session)
     conv = svc.create_conversation("topic", project_id=proj.id)
     f = _attach(session, conv.id)
     path = Path(f.path)
     assert path.exists()
 
-    assert ProjectService(session).delete_project(proj.id) is True
+    assert ProjectService(ScopedSession(session, LOCAL_SCOPE)).delete_project(proj.id) is True
     # The conversation itself is gone (no more orphaned rows) …
     assert session.get(Conversation, conv.id) is None
     # … along with its attachment rows + bytes.
@@ -150,7 +151,7 @@ def test_delete_project_cascades_conversations_and_attachments(session):
 def test_delete_project_survives_one_conversation_delete_failure(session, monkeypatch):
     """Fault isolation: if one conversation fails to delete, the project delete
     must still complete and clean up the rest — not abort half-cascaded."""
-    proj = ProjectService(session).create_project("eng701-fault-test")
+    proj = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project("eng701-fault-test")
     svc = ConversationService(session)
     bad = svc.create_conversation("bad", project_id=proj.id)
     good = svc.create_conversation("good", project_id=proj.id)
@@ -166,7 +167,7 @@ def test_delete_project_survives_one_conversation_delete_failure(session, monkey
 
     monkeypatch.setattr(ConversationService, "delete_conversation", flaky)
 
-    assert ProjectService(session).delete_project(proj.id) is True
+    assert ProjectService(ScopedSession(session, LOCAL_SCOPE)).delete_project(proj.id) is True
     assert session.get(Project, proj.id) is None, "project deleted despite one failure"
     # The good conversation + its attachment were still cleaned …
     assert session.get(Conversation, good.id) is None
@@ -182,7 +183,7 @@ def test_delete_project_rolls_back_a_partially_staged_failed_conversation(sessio
     commit in the cascade (the good conversation's, or the project's) flushes
     those pending deletes, wiping the failed conversation's data while its row
     survives (the ghost ea-rus flagged on #187)."""
-    proj = ProjectService(session).create_project("eng701-rollback-test")
+    proj = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project("eng701-rollback-test")
     svc = ConversationService(session)
     bad = svc.create_conversation("bad", project_id=proj.id)
     good = svc.create_conversation("good", project_id=proj.id)
@@ -199,7 +200,7 @@ def test_delete_project_rolls_back_a_partially_staged_failed_conversation(sessio
 
     monkeypatch.setattr(FileService, "delete_by_purpose", stage_then_raise)
 
-    assert ProjectService(session).delete_project(proj.id) is True
+    assert ProjectService(ScopedSession(session, LOCAL_SCOPE)).delete_project(proj.id) is True
 
     # good was deleted cleanly …
     assert session.get(Conversation, good.id) is None

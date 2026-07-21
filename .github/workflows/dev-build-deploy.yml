@@ -2,8 +2,7 @@ name: Dev - Build and Deploy on PR
 
 on:
   pull_request:
-    # types: [opened, reopened, synchronize, labeled]
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, labeled]
 
 permissions:
   contents: read
@@ -24,54 +23,44 @@ jobs:
     # Runs unit tests
     uses: ./.github/workflows/tests-unit.yml
 
-  # TODO: Uncomment this when we have a way to deploy to dev environments
-  # Looks for labels like "deploy-to-<env>" attached to a PR, so we can deploy to those envs
-  # get-deploy-labels:
-  #   runs-on: ubuntu-latest
-  #   outputs:
-  #     deploy-envs: ${{ steps.get-labels.outputs.deploy-envs }}
-  #   steps:
-  #     - name: Pull MindsDB Github Actions
-  #       uses: actions/checkout@v4
-  #       with:
-  #         repository: mindsdb/github-actions
-  #         path: github-actions
-  #     - id: get-labels
-  #       uses: ./github-actions/get-deploy-labels
-
-  # filter-deploy-envs:
-  #   needs: [get-deploy-labels]
-  #   runs-on: ubuntu-latest
-  #   outputs:
-  #     deploy-envs: ${{ steps.filter.outputs.deploy-envs }}
-  #   steps:
-  #     - name: Drop prod + staging from PR-label matrix
-  #       id: filter
-  #       env:
-  #         RAW_ENVS: ${{ needs.get-deploy-labels.outputs.deploy-envs }}
-  #       run: |
-  #         set -euo pipefail
-  #         # prod ships from release.published; staging ships from push:main.
-  #         # Labels for those envs should be no-ops on PRs to avoid clobbering shared infra.
-  #         FILTERED="$(printf '%s' "$RAW_ENVS" | jq -c '[ .[] | select(. != "prod" and . != "staging") ]')"
-  #         echo "deploy-envs=${FILTERED}" >> "$GITHUB_OUTPUT"
 
   build:
-    runs-on: ubuntu-latest
-    needs: [run-unit-tests]
+    runs-on: mdb-dev
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    env:
+      AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+      - uses: mindsdb/github-actions/setup-env@main
+      - id: build
+        uses: mindsdb/github-actions/build-push-ecr@main
         with:
-          python-version: "3.12"
+          module-name: ${{ env.CI_REPOSITORY_SLUG }}
+          build-for-environment: development
 
-      - name: Install dependencies
-        run: uv sync --group dev
 
-      - name: Build package
-        run: uv build
+  scan:
+    runs-on: mdb-dev
+    needs: [build]
+    name: Scan Minds Image
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mindsdb/github-actions/snyk-docker-scan@main
+        with:
+          image: ${{ needs.build.outputs.image }}
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Verify package imports
-        run: uv run python -c "from cowork.server import app"
+
+  deploy-pr-env:
+    runs-on: mdb-dev
+    needs: [build]
+    if: contains(github.event.pull_request.labels.*.name, 'deploy')
+    environment:
+      name: pr-cowork-server-${{ github.event.pull_request.number }}
+      url: https://pr-cowork-server-${{ github.event.pull_request.number }}.dev.mindshub.ai
+    steps:
+      - uses: mindsdb/github-actions/argocd-pr-env-deploy@main
+        with:
+          argocd-token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          gh-token:     ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}

@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.models.project import Project
 from cowork.schemas.conversations import (
@@ -35,6 +36,7 @@ def _serialize_conversation(c):
 @router.get("/")
 def list_conversations(
     session: SessionDep,
+    scoped: ScopedSessionDep,
     project_id: UUID | None = None,
     project: str | None = None,
     limit: int = 50,
@@ -43,7 +45,7 @@ def list_conversations(
     resolved_project_id = project_id
     if not all_projects and resolved_project_id is None and project:
         from cowork.services.projects import ProjectService
-        proj = ProjectService(session).get_project_by_name_or_none(project)
+        proj = ProjectService(scoped).get_project_by_name_or_none(project)
         if proj is not None:
             resolved_project_id = proj.id
     convs = ConversationService(session).list_conversations(

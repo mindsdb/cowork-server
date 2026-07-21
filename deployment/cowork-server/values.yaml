@@ -1,0 +1,150 @@
+# Per-PR ephemeral envs only: when `ephemeral: true`, this chart renders an
+# extra Secret manifest (cowork-db) via templates/ephemeral-secrets.yaml so
+# per-PR namespaces work without ESO. dev/staging/prod leave this off and
+# source `cowork-db` externally.
+ephemeral: false
+
+# Default values for deployment, this is necessary because we're using a unified helm subchart
+deployment:
+  # This is the name of the deployment, this is used in a _lot_ of places in the helm charts so lets just specify it
+  name: cowork-server
+
+  replicaCount: 2
+
+  image:
+    # The build-push-ecr action derives the ECR repo name from the GitHub repo
+    # slug, so this must track the GitHub repo name (cowork-server).
+    repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
+    command: ["python", "-m", "uvicorn", "cowork.server:app"]
+    # Async FastAPI: the event loop handles concurrency per worker. Scale via
+    # replicas (and HPA) rather than worker count. --forwarded-allow-ips '*'
+    # trusts the in-cluster ingress for X-Forwarded-* headers.
+    args: ["--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*"]
+
+  # Alembic locks via the alembic_version table, so concurrent replicas don't
+  # race; on already-migrated databases this is a no-op. The deployment
+  # subchart applies `tpl` to top-level string fields on each initContainer,
+  # so the image string can reference the same chart helpers as the main
+  # container — no need to duplicate the repository/tag here.
+  initContainers:
+    - name: db-migrate
+      image: '{{ template "get-repository" . }}:{{ template "get-release-tag" . }}'
+      command: ["python", "-m", "alembic", "upgrade", "head"]
+      env:
+        - name: DATABASE_URI
+          valueFrom:
+            secretKeyRef:
+              name: cowork-db
+              key: database_uri
+
+  # Liveness restarts the pod if it fails. Kept tolerant (failureThreshold * periodSeconds = 60s)
+  # so a transient stall doesn't take the pod down. cowork-server exposes a single
+  # health endpoint (no separate live/ready); both probes point at it.
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+    path: /api/v1/health/
+
+  # Readiness gates traffic. Polls quickly so the pod returns to service fast after a hiccup.
+  # failureThreshold * periodSeconds = 15s before the pod is pulled from endpoints.
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 15
+    periodSeconds: 5
+    timeoutSeconds: 4
+    failureThreshold: 3
+    path: /api/v1/health/
+
+  # deployment container resource requests/limits
+  # Limits are HARD limits; Requests are "soft" and drive HPA aggressiveness when enabled.
+  resources:
+    limits:
+      cpu: 1
+      memory: 256Mi
+    requests:
+      cpu: 1
+      memory: 256Mi
+
+  autoscaling:
+    enabled: false
+
+  ingress:
+    enabled: true
+    name: cowork-server
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-connect-timeout: "1200"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "1200"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "1200"
+      nginx.ingress.kubernetes.io/proxy-body-size: 500m
+      nginx.ingress.kubernetes.io/enable-cors: "true"
+      nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+      nginx.ingress.kubernetes.io/cors-allow-methods: "GET,OPTIONS,PUT,POST,PATCH,DELETE"
+      nginx.ingress.kubernetes.io/cors-allow-origin: "http://localhost:3000"
+      nginx.ingress.kubernetes.io/cors-allow-headers: >-
+        DNT,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,
+        Authorization,X-CSRF-Token,Accept,Origin,Access-Control-Allow-Origin,X-File-Name,Set-Cookie,X-User-Id,X-User-Email,
+        X-Organization-Id,X-User-Roles,X-Forwarded-User
+      nginx.ingress.kubernetes.io/cors-max-age: "3600"
+      nginx.ingress.kubernetes.io/use-regex: "true"
+      nginx.ingress.kubernetes.io/auth-url: "auth-url" # Modify per environment
+      nginx.ingress.kubernetes.io/auth-method: "GET"
+      # cowork-server's TrustedHeaderMiddleware (org tenancy mode) reads the
+      # identity headers the auth service returns here.
+      nginx.ingress.kubernetes.io/auth-response-headers: >-
+        X-Organization-Id,X-User-Id,X-User-Email,X-User-Roles,X-Forwarded-User
+      nginx.ingress.kubernetes.io/auth-request-headers: "Authorization,Cookie"
+
+  service:
+    targetPort: 9010
+
+  globalEnvs:
+
+    # ====================================
+    # SERVER SETTINGS
+    # ====================================
+
+    # cowork-server defaults to 127.0.0.1:26866 (desktop sidecar). In-cluster
+    # it must bind all interfaces on the service target port.
+    - name: COWORK_SERVER_HOST
+      value: "0.0.0.0"
+    - name: COWORK_LISTEN_PORT
+      value: "9010"
+
+    # Multi-tenant cloud deployment: requests carry trusted identity headers
+    # (X-User-Id / X-Organization-Id) injected by the ingress auth subrequest,
+    # from which a per-request principal is built.
+    - name: COWORK_TENANCY_MODE
+      value: "org"
+
+    # DB settings for sqlalchemy. cowork-server defaults to SQLite; cloud points
+    # at Postgres via this secret (see also the db-migrate initContainer).
+    - name: DATABASE_URI
+      valueFrom:
+        secretKeyRef:
+          name: cowork-db
+          key: database_uri
+
+    # ====================================
+    # PROVIDER API KEYS
+    # ====================================
+
+    - name: ANTHROPIC__API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: ANTHROPIC_API_KEY
+
+    - name: OPENAI__API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: OPENAI_API_KEY
+
+    - name: GEMINI__API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: GEMINI_API_KEY
