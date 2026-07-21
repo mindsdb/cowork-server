@@ -146,7 +146,10 @@ async def execute_schedule(
             },
         )
         async def _drain_run() -> None:
-            stream = await ResponsesHandler(session).handle(request)
+            # ResponsesHandler takes a RAW session (it wraps its own scope from
+            # the principal); hand it the underlying session, not our scoped one.
+            from cowork.db.scoped import unsafe_unscoped_session
+            stream = await ResponsesHandler(unsafe_unscoped_session(session)).handle(request)
             async for _ in stream:
                 pass
 
