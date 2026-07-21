@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
@@ -272,9 +272,19 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        validation_alias=AliasChoices("COWORK_LISTEN_PORT"),
+        # Legacy COWORK_SERVER_PORT must stay: shipped desktop builds hand the
+        # derived per-user port under that name (ENG-439). K8s auto-injects it
+        # as a tcp:// URI on `cowork-server` pods — discarded below.
+        validation_alias=AliasChoices("COWORK_LISTEN_PORT", "COWORK_SERVER_PORT"),
         description="The port to run the server on",
     )
+
+    @field_validator("port", mode="before")
+    @classmethod
+    def _discard_k8s_injected_port(cls, v: object) -> object:
+        if isinstance(v, str) and v.startswith("tcp://"):
+            return 26866
+        return v
     host: str = Field(
         default="127.0.0.1",
         validation_alias=AliasChoices("COWORK_SERVER_HOST"),
