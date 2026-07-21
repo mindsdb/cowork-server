@@ -11,6 +11,7 @@ from cowork.harnesses.anton_harness.harness import (
     _sanitize_tool_result,
     _split_turn_into_rows,
 )
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.project import Project
@@ -26,8 +27,10 @@ def engine(tmp_path):
 
 @pytest.fixture
 def session(engine):
-    with Session(engine) as session:
-        yield session
+    # ConversationService expects a ScopedSession (get_messages/delete_turn use
+    # its .select). LOCAL_SCOPE adds no org filter, matching desktop/local mode.
+    with Session(engine) as raw:
+        yield ScopedSession(raw, LOCAL_SCOPE)
 
 
 @pytest.fixture

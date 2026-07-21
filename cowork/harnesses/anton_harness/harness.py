@@ -604,6 +604,7 @@ class AntonHarness:
         # attached — callers always pass an attached instance; fail fast rather
         # than silently fall back to a scrambled, replay-breaking history.
         from sqlalchemy.orm import object_session
+        from cowork.db.scoped import adopt_scoped_session
         from cowork.services.conversations import ConversationService
 
         db_session = object_session(conversation)
@@ -612,7 +613,9 @@ class AntonHarness:
                 f"Conversation {conversation.id} is detached from its Session; "
                 "cannot resolve ordered history for replay."
             )
-        ordered_messages = ConversationService(db_session).get_ordered_messages(conversation.id)
+        ordered_messages = ConversationService(
+            adopt_scoped_session(db_session)
+        ).get_ordered_messages(conversation.id)
 
         cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
