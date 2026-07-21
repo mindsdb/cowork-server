@@ -1,7 +1,7 @@
 """add message seq
 
 Revision ID: a1c3e5f7b9d2
-Revises: f7d2b9e4a1c6
+Revises: a3f9c2e8b1d4
 Create Date: 2026-07-15 12:00:00.000000
 
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a1c3e5f7b9d2"
-down_revision: Union[str, Sequence[str], None] = "f7d2b9e4a1c6"
+down_revision: Union[str, Sequence[str], None] = "a3f9c2e8b1d4"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
