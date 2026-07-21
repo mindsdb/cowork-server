@@ -1,0 +1,28 @@
+deployment:
+  ingress:
+    enabled: true
+    name: cowork-server
+    annotations:
+      nginx.ingress.kubernetes.io/enable-cors: "true"
+      nginx.ingress.kubernetes.io/cors-allow-origin: "https://console.dev.mindshub.ai, https://dev.mdb.ai, https://hub.dev.mindsdb.com"
+      nginx.ingress.kubernetes.io/auth-url: "http://auth.dev.svc.cluster.local:80/v1/authenticate/"
+    hosts:
+      - host: cowork.dev.mindshub.ai
+        enableMultiPath: true
+        paths:
+          - path: /
+            serviceName: cowork-server
+            servicePort: 80
+
+  extraEnvs:
+
+    - name: ENV
+      value: "dev"
+
+    - name: LOG_LEVEL
+      value: "INFO"
+
+    # Org-mode identity enforcement. 'audit': requests without identity headers
+    # are logged and allowed through (safe while the auth wiring is validated).
+    - name: COWORK_IDENTITY_ENFORCE
+      value: "enforce"

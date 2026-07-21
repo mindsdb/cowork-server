@@ -272,7 +272,7 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        validation_alias=AliasChoices("COWORK_SERVER_PORT"),
+        validation_alias=AliasChoices("COWORK_LISTEN_PORT"),
         description="The port to run the server on",
     )
     host: str = Field(
@@ -299,7 +299,7 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_ALLOWED_ORIGINS"),
         description=(
             "CORS allowed origins (JSON array). "
-            "Defaults to localhost on COWORK_SERVER_PORT and COWORK_RENDERER_PORT."
+            "Defaults to localhost on COWORK_LISTEN_PORT and COWORK_RENDERER_PORT."
         ),
     )
 
