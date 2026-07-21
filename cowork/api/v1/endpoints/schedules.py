@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.schemas.schedules import (
     ScheduleCreateRequest,
@@ -93,7 +94,7 @@ def resume_schedule(schedule_id: UUID, session: SessionDep):
 
 
 @router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED)
-def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: BackgroundTasks):
+def run_schedule_now(schedule_id: UUID, session: SessionDep, scoped: ScopedSessionDep, background_tasks: BackgroundTasks):
     try:
         schedule = ScheduleService(session).get_schedule(schedule_id)
     except ValueError as e:
@@ -102,7 +103,7 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: B
     from cowork.scheduler import execute_schedule
     from cowork.services.conversations import ConversationService
 
-    conversation = ConversationService(session).create_conversation(
+    conversation = ConversationService(scoped).create_conversation(
         topic=schedule.title,
         project_id=schedule.project_id,
     )

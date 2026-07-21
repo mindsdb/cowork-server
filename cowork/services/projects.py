@@ -213,15 +213,13 @@ class ProjectService:
         # it while the conversation still exists so the cleanup is safe.
         from cowork.models.conversation import Conversation
         from cowork.services.conversations import ConversationService
-        # Raw session until the conversations sweep: the project was already
-        # loaded through the scope, so its conversations are in-tenant.
-        raw = unsafe_unscoped_session(self.session)
-        conv_svc = ConversationService(raw)
-        conv_ids = list(
-            raw.exec(
-                select(Conversation.id).where(Conversation.project_id == project_id)
+        conv_svc = ConversationService(self.session)
+        conv_ids = [
+            c.id
+            for c in self.session.exec(
+                self.session.select(Conversation).where(Conversation.project_id == project_id)
             ).all()
-        )
+        ]
         for cid in conv_ids:
             # Fault-isolated: one conversation failing to delete must not abort
             # the whole project delete and leave it half-cascaded. Log and move

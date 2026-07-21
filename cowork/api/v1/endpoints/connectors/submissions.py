@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.handlers.probe import ProbeHandler
 from cowork.schemas.connectors import ConnectorField, SubmitFormRequest
@@ -65,7 +66,7 @@ def _missing_required(fields: list, values: dict, skipped: list[str]) -> list[st
 
 
 @router.post("/")
-async def submit_form(req: SubmitFormRequest, session: SessionDep) -> StreamingResponse:
+async def submit_form(req: SubmitFormRequest, session: SessionDep, scoped: ScopedSessionDep) -> StreamingResponse:
     try:
         connector_id = req.resolve_connector_id()
     except ValueError as e:
@@ -119,7 +120,7 @@ async def submit_form(req: SubmitFormRequest, session: SessionDep) -> StreamingR
         form_spec=req.form_spec,
     )
 
-    handler = ProbeHandler(session)
+    handler = ProbeHandler(scoped)
     return StreamingResponse(
         handler.run(submission_id, connector_id, method, req.name, req.conversation_id),
         media_type="text/event-stream",
