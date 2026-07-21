@@ -1,17 +1,17 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse as FileContentResponse
-from sqlmodel import Session
 
-from cowork.db.session import get_session
+from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.files import FileListResponse, FileResponse
 from cowork.services.files import FileService
 
 
 router = APIRouter()
-SessionDep = Annotated[Session, Depends(get_session)]
+# Every endpoint here uses the session solely for FileService — scoped module-wide.
+SessionDep = ScopedSessionDep
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=FileResponse)
