@@ -9,6 +9,7 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlmodel import select
 
+from cowork.common.paths import safe_join
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.project import Project
@@ -70,7 +71,9 @@ class ProjectService:
         candidate = Path(name)
         if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
             raise ValueError("Invalid project name")
-        path = (root / candidate.name).resolve()
+        # safe_join rejects anything that escapes root; the parent re-check keeps
+        # a project dir a *direct* child of the projects root.
+        path = safe_join(root, candidate.name)
         if path.parent != root or path == root:
             raise ValueError("Invalid project name")
         return path

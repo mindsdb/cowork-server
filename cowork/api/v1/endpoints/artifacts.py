@@ -7,6 +7,7 @@ agent-produced artifacts.
 from __future__ import annotations
 
 import mimetypes
+import os
 import subprocess
 from pathlib import Path
 from typing import Annotated
@@ -221,17 +222,16 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
     try:
-        requested = Path(path).expanduser().resolve()
+        requested = os.path.realpath(Path(path).expanduser())
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
     for project in ProjectService(session).list_projects():
-        project_dir = Path(project.path).resolve()
-        try:
-            requested.relative_to(project_dir)
-        except ValueError:
-            continue
-        if requested.exists():
-            return requested
+        project_dir = os.path.realpath(project.path)
+        # Trailing separator so `<dir>` doesn't match sibling `<dir>-other`.
+        if requested == project_dir or requested.startswith(project_dir + os.sep):
+            resolved = Path(requested)
+            if resolved.exists():
+                return resolved
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
 
 
