@@ -1,4 +1,3 @@
-import os
 from logging.config import fileConfig
 from pathlib import Path
 
@@ -39,9 +38,7 @@ target_metadata = SQLModel.metadata
 
 
 def _database_url() -> str:
-    # DATABASE_URI from env first so migrations don't validate the whole
-    # AppSettings model when only the DB URL is needed.
-    database_uri = os.environ.get("DATABASE_URI") or get_app_settings().database.uri
+    database_uri = get_app_settings().database.uri
     return database_uri or config.get_main_option("sqlalchemy.url", database_uri)
 
 
