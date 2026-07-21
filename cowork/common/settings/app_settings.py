@@ -272,9 +272,9 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        # COWORK_LISTEN_PORT first so K8s' auto-injected COWORK_SERVER_PORT
-        # (URI, not int) doesn't clobber this on a `cowork-server` Service.
-        validation_alias=AliasChoices("COWORK_LISTEN_PORT", "COWORK_SERVER_PORT"),
+        # Not COWORK_SERVER_PORT: K8s auto-injects that as a URI string on any
+        # pod colocated with a `cowork-server` Service, breaking int parsing.
+        validation_alias=AliasChoices("COWORK_LISTEN_PORT"),
         description="The port to run the server on",
     )
     host: str = Field(
