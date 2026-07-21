@@ -36,6 +36,9 @@ class HarnessProvider(Protocol):
     id: str
     label: str
     formatter: AsyncIterator[str]
+    # Whether this harness is offered in org (multi-tenant) deployments.
+    # Defaults True for implementers that don't set it (see _harness_options).
+    supports_org_mode: bool
 
     async def stream_response(
         self,
