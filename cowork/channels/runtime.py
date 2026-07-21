@@ -17,6 +17,7 @@ from sqlmodel import select
 
 from anton.core.dispatch import OutboundMessage
 from cowork.channels.registry import PluginRegistry, get_registry
+from cowork.db.scoped import ScopedSession, scope_for_background_context
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import ChannelContext, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
@@ -337,12 +338,15 @@ class AntonChannelRuntime:
         return True
 
     def _ensure_conversation(self, session: Session, binding: ChannelBinding) -> Conversation:
+        # Local mode: today's behavior. Org mode: fails loudly until the
+        # service-principal ticket lands — never a silent unscoped write.
+        scoped = ScopedSession(session, scope_for_background_context())
         if binding.anton_conversation_id is not None:
-            existing = session.get(Conversation, binding.anton_conversation_id)
+            existing = scoped.get(Conversation, binding.anton_conversation_id)
             if existing is not None:
                 return existing
         topic = f"{binding.channel_type}: {binding.display_name or binding.external_group_id}"[:80]
-        conversation = ConversationService(session).create_conversation(
+        conversation = ConversationService(scoped).create_conversation(
             topic=topic,
             project_id=binding.anton_project_id or self._default_project_id,
         )
@@ -441,7 +445,7 @@ class AntonChannelRuntime:
             pass
 
         reply = "".join(collected)
-        ConversationService(session).save_assistant_turn(
+        ConversationService(ScopedSession(session, scope_for_background_context())).save_assistant_turn(
             conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
         )
         return reply, turn_used_tools(events)

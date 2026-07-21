@@ -35,7 +35,6 @@ def _serialize_conversation(c):
 
 @router.get("/")
 def list_conversations(
-    session: SessionDep,
     scoped: ScopedSessionDep,
     project_id: UUID | None = None,
     project: str | None = None,
@@ -48,38 +47,42 @@ def list_conversations(
         proj = ProjectService(scoped).get_project_by_name_or_none(project)
         if proj is not None:
             resolved_project_id = proj.id
-    convs = ConversationService(session).list_conversations(
+    convs = ConversationService(scoped).list_conversations(
         project_id=resolved_project_id, limit=limit, all_projects=all_projects,
     )
     return {"conversations": [_serialize_conversation(c) for c in convs]}
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-def create_conversation(body: ConversationCreateRequest, session: SessionDep):
-    svc = ConversationService(session)
+def create_conversation(body: ConversationCreateRequest, scoped: ScopedSessionDep):
+    svc = ConversationService(scoped)
     project_id = body.project_id
     if project_id is None and body.project:
         project = svc.project_by_name(body.project)
         if project is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
         project_id = project.id
-    conversation = svc.create_conversation(
-        topic=body.topic or body.title or "Untitled task", project_id=project_id
-    )
+    try:
+        conversation = svc.create_conversation(
+            topic=body.topic or body.title or "Untitled task", project_id=project_id
+        )
+    except ValueError as e:
+        # e.g. a project_id that isn't visible in this scope
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return _serialize_conversation(conversation)
 
 
 @router.get("/{conversation_id}")
-def get_conversation(conversation_id: UUID, session: SessionDep):
+def get_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
     try:
-        return _serialize_conversation(ConversationService(session).get_conversation(conversation_id))
+        return _serialize_conversation(ConversationService(scoped).get_conversation(conversation_id))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 @router.patch("/{conversation_id}")
-def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, session: SessionDep):
-    svc = ConversationService(session)
+def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, scoped: ScopedSessionDep):
+    svc = ConversationService(scoped)
     project_id = body.project_id
     if project_id is None and body.project:
         project = svc.project_by_name(body.project)
@@ -96,7 +99,7 @@ def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, 
 
 
 @router.post("/{conversation_id}/move")
-def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, session: SessionDep):
+def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, session: SessionDep, scoped: ScopedSessionDep):
     """Move a task to another project. With `move_objects` (default), the
     artifacts the task created are relocated into the destination project;
     otherwise only the task's project pointer changes. Attachment files
@@ -104,7 +107,7 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
     conversation id, not project (ENG-338). The destination project must
     already exist (the client creates a new one first, then moves to its
     id)."""
-    svc = ConversationService(session)
+    svc = ConversationService(scoped)
     try:
         conversation = svc.get_conversation(conversation_id)
     except ValueError as e:
@@ -112,7 +115,7 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
 
     dest = None
     if body.project_id is not None:
-        dest = session.get(Project, body.project_id)
+        dest = scoped.get(Project, body.project_id)
     elif body.project:
         dest = svc.project_by_name(body.project)
     if dest is None:
@@ -127,28 +130,28 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
 
 
 @router.get("/{conversation_id}/items")
-def get_messages(conversation_id: UUID, session: SessionDep):
+def get_messages(conversation_id: UUID, scoped: ScopedSessionDep):
     try:
-        return ConversationService(session).get_messages(conversation_id)
+        return ConversationService(scoped).get_messages(conversation_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 @router.delete("/{conversation_id}")
-def delete_conversation(conversation_id: UUID, session: SessionDep):
-    found = ConversationService(session).delete_conversation(conversation_id)
+def delete_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
+    found = ConversationService(scoped).delete_conversation(conversation_id)
     if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     return {"ok": True}
 
 
 @router.delete("/{conversation_id}/turns/{turn_index}")
-def delete_conversation_turn(conversation_id: UUID, turn_index: int, session: SessionDep):
+def delete_conversation_turn(conversation_id: UUID, turn_index: int, scoped: ScopedSessionDep):
     """Delete a turn (user+assistant exchange) and everything after it.
 
     turn_index is the 0-based index counting only assistant messages.
     """
-    svc = ConversationService(session)
+    svc = ConversationService(scoped)
     try:
         deleted = svc.delete_turn(conversation_id, turn_index)
     except ValueError as e:

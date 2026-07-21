@@ -45,7 +45,7 @@ async def search_cowork(
     results: list[dict] = []
 
     # Conversations (tasks)
-    for conv in ConversationService(session).list_conversations(limit=500, all_projects=True):
+    for conv in ConversationService(scoped).list_conversations(limit=500, all_projects=True):
         project_label = ""
         if conv.project:
             project_label = conv.project.name
