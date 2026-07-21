@@ -239,6 +239,19 @@ def unsafe_unscoped_session(scoped: ScopedSession) -> Session:
     return scoped._session
 
 
+def adopt_scoped_session(session: Session) -> ScopedSession:
+    """Wrap an existing raw Session in a ScopedSession, reusing the scope it was
+    opened under. Org mode stamps that scope into `session.info` (see
+    ScopedSession.__init__); local mode has none, so fall back to LOCAL_SCOPE.
+
+    Lets code holding only `object_session(row)` (e.g. harnesses replaying
+    conversation history) reach the scoped query API without re-deriving the
+    principal. Re-wrapping with the same scope is a no-op.
+    """
+    scope = session.info.get("tenant_scope") or LOCAL_SCOPE
+    return ScopedSession(session, scope)
+
+
 def get_scoped_session(
     session: Session = Depends(get_session),
     scope: TenantScope = Depends(get_tenant_scope),

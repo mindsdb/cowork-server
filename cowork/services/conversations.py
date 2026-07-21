@@ -3,7 +3,6 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import case
-from sqlmodel import select
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
@@ -14,19 +13,70 @@ from cowork.schemas.responses import Role
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.task_objects import TaskObjectService
 
-# Streaming turns persist user + assistant in one persist() call; on SQLite
-# both rows often share the same created_at (second precision). Tie-break
-# user before assistant, then id.
+# created_at is only second-precision, so rows of turns in the same second
+# would otherwise interleave. `seq` is a per-conversation monotonic ordinal
+# (see _next_seq) that resolves those ties deterministically. The role tiebreak
+# only matters for legacy rows (all seq 0), keeping user before assistant; id is
+# the final tiebreak.
 _MESSAGE_ORDER = (
     Message.created_at,
+    Message.seq,
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
 
 
+def _is_tool_row(content) -> bool:
+    """True for a history-only tool block-row (all blocks are tool_use /
+    tool_result). These carry prior tool calls for LLM-history replay and are
+    hidden from the UI, which renders tool activity from message events."""
+    return (
+        isinstance(content, list)
+        and len(content) > 0
+        and all(
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            for block in content
+        )
+    )
+
+
 class ConversationService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
+
+    def _next_seq(self, conversation_id: UUID) -> int:
+        """Next per-conversation ordinal: max(seq) + 1, or 0 when empty.
+
+        Keeps `seq` monotonic across the whole conversation so message order
+        never depends on created_at's second-level resolution.
+
+        ponytail: one extra query per persist, and max+1 races only if a single
+        conversation runs two concurrent turns — which it can't today (turns are
+        serialized). The id tiebreak in _MESSAGE_ORDER still bounds the fallout
+        if that ever changes.
+        """
+        # ORDER BY seq DESC LIMIT 1 (not func.max): expressible through the
+        # scoped .select() API, so no escape hatch to the raw session.
+        last = self.session.exec(
+            self.session.select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.seq.desc())
+            .limit(1)
+        ).first()
+        return 0 if last is None else last.seq + 1
+
+    def save_user_message(self, conversation_id: UUID, content) -> Message:
+        """Persist a user message with the next monotonic `seq` (see _next_seq)."""
+        message = Message(
+            conversation_id=conversation_id,
+            role="user",
+            content=content,
+            seq=self._next_seq(conversation_id),
+        )
+        self.session.add(message)
+        self.session.commit()
+        self.session.refresh(message)
+        return message
 
     def list_conversations(
         self,
@@ -143,9 +193,11 @@ class ConversationService:
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
         """Delete a turn and everything after it.
 
-        turn_index is 0-based counting only assistant messages. The turn's
-        preceding user message (if any) and all subsequent messages are
-        removed. Returns the number of messages deleted.
+        turn_index is 0-based counting only VISIBLE assistant messages —
+        hidden tool rows (tool_use / tool_result) are skipped so the index
+        matches the UI's, which never shows them. The turn's opening user
+        message and all subsequent messages (including this turn's tool rows)
+        are removed. Returns the number of messages deleted.
         """
         self.get_conversation(conversation_id)  # raises if not found
         messages = list(
@@ -155,19 +207,24 @@ class ConversationService:
                 .order_by(*_MESSAGE_ORDER)
             ).all()
         )
-        # Find the Nth assistant message (0-based).
+        # Find the Nth visible assistant message (0-based).
         assistant_count = -1
         cut_from = None
         for i, m in enumerate(messages):
-            if m.role.value == "assistant":
+            if m.role.value == "assistant" and not _is_tool_row(m.content):
                 assistant_count += 1
                 if assistant_count == turn_index:
-                    # Include the preceding user message in the cut if it
-                    # exists and is immediately before this assistant msg.
-                    if i > 0 and messages[i - 1].role.value == "user":
-                        cut_from = i - 1
-                    else:
-                        cut_from = i
+                    # Walk back over this turn's hidden tool rows (the
+                    # tool_result row is role=user, so a plain i-1 check would
+                    # stop on it and orphan the real user input + tool_use).
+                    cut_from = i
+                    j = i - 1
+                    while j >= 0 and _is_tool_row(messages[j].content):
+                        cut_from = j
+                        j -= 1
+                    # Include the user message that opened the turn.
+                    if j >= 0 and messages[j].role.value == "user":
+                        cut_from = j
                     break
         if cut_from is None:
             raise ValueError(f"Turn {turn_index} not found")
@@ -195,13 +252,23 @@ class ConversationService:
         text: str,
         events: list[dict],
         harness: str | None = None,
+        tool_rows: list[dict] | None = None,
     ) -> None:
-        """Persist an assistant message and its streaming events."""
+        """Persist an assistant turn.
+
+        `tool_rows` are the turn's tool block-messages ({role, content} with
+        `tool_use` / `tool_result` blocks). They are written as their own rows
+        AHEAD of the visible assistant message so the next turn's history
+        replays a valid tool_use → tool_result → text sequence. All rows share
+        one commit (hence one `created_at`); `seq` fixes their order, since the
+        role tiebreak in _MESSAGE_ORDER would otherwise sort tool_result (user)
+        ahead of tool_use (assistant). Hidden from the UI by `get_messages`.
+        """
         # Persist when there's body text OR any events — an artifact-only turn
         # (the agent writes a file and says little/nothing) carries no text but
         # emits a `response.artifact_created` event, and that event must survive
         # reload so the inline card replays identically.
-        if not text and not events:
+        if not text and not events and not tool_rows:
             return
         # Anchor the write to a parent loaded through THIS session's scope —
         # detached writers (producer) call this on a fresh session, and the
@@ -213,18 +280,41 @@ class ConversationService:
             content=text,
             harness=harness,
         )
-        self.session.add(assistant_msg)
+        ordered_rows = [
+            Message(
+                conversation_id=conversation_id,
+                role=row["role"],
+                content=row["content"],
+                harness=harness,
+            )
+            for row in (tool_rows or [])
+        ]
+        ordered_rows.append(assistant_msg)
+        base_seq = self._next_seq(conversation_id)
+        for offset, message in enumerate(ordered_rows):
+            message.seq = base_seq + offset
+            self.session.add(message)
         self.session.commit()
         self.session.refresh(assistant_msg)
 
-        for seq, event_data in enumerate(events):
+        for event_seq, event_data in enumerate(events):
             self.session.add(MessageEvent(
                 message_id=assistant_msg.id,
-                sequence_number=seq,
+                sequence_number=event_seq,
                 event_data=event_data,
             ))
         if events:
             self.session.commit()
+
+    def get_ordered_messages(self, conversation_id: UUID) -> list[Message]:
+        """All messages of a conversation in canonical order (see
+        _MESSAGE_ORDER). Includes history-only tool rows — harnesses replay
+        them into the LLM context; use get_messages for the UI-facing view."""
+        return list(self.session.exec(
+            self.session.select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(*_MESSAGE_ORDER)
+        ).all())
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
@@ -235,6 +325,8 @@ class ConversationService:
         ).all()
         result = []
         for message in messages:
+            if _is_tool_row(message.content):
+                continue  # history-only tool row — not shown in the chat
             events = self.session.exec(
                 self.session.select(MessageEvent)
                 .where(MessageEvent.message_id == message.id)

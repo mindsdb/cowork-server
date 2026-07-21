@@ -13,7 +13,6 @@ from sqlmodel import Session
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.models.message import Message as DBMessage
 from cowork.streaming import new_buffer, registry
 from cowork.schemas.responses import (
     Content,
@@ -147,18 +146,10 @@ class ResponsesHandler:
             )
             return sse_from_buffer(buffer, 0)
 
-        # Non-streaming (legacy/rare): persist the user message inline (via FK,
-        # not the relationship, so the cached history above stays clean) and
-        # run synchronously within the request.
-        user_message = DBMessage(
-            conversation_id=conversation.id,
-            role=Role.user,
-            content=original_content,
-        )
-        self.scoped.add(user_message)
-        self.scoped.commit()
-        self.scoped.refresh(user_message)
-
+        # Non-streaming (legacy/rare): run synchronously within the request.
+        # The user message is persisted by _collect after the turn (deferred),
+        # so the harness reads history WITHOUT the current turn — otherwise the
+        # fresh-query history would replay it AND resend it as the live input.
         stream = self.harness.stream_response(
             conversation=conversation,
             input=harness_input,
@@ -166,7 +157,7 @@ class ResponsesHandler:
             trace_tags=request.trace_tags,
             trace_metadata=trace_metadata,
         )
-        return await self._collect(stream, conversation.id, request.model, str(user_message.id))
+        return await self._collect(stream, conversation.id, request.model, original_content)
 
     async def _produce(
         self,
@@ -194,9 +185,15 @@ class ResponsesHandler:
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        turn_rows: list[dict] = []
         persisted = False
 
         def event_sink(event_type: str, data: dict) -> None:
+            # Tool block-rows are for LLM-history persistence, not UI replay —
+            # keep them out of the events log the client rebuilds from.
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
@@ -210,10 +207,11 @@ class ResponsesHandler:
                 # Re-anchor before ANY write: the conversation may be gone
                 # (deleted mid-turn) or out of scope on this fresh session.
                 ConversationService(producer_session).get_conversation(conv_id)
-                producer_session.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
+                ConversationService(producer_session).save_user_message(conv_id, original_content)
                 producer_session.commit()
                 ConversationService(producer_session).save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
+                    tool_rows=turn_rows,
                 )
             except Exception:
                 logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
@@ -305,12 +303,16 @@ class ResponsesHandler:
         stream,
         conversation_id: UUID,
         model: str,
-        output_item_id: str,
+        original_content,
     ) -> Response:
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        turn_rows: list[dict] = []
 
         def event_sink(event_type: str, data: dict) -> None:
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
@@ -332,12 +334,17 @@ class ResponsesHandler:
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
 
         assistant_text = "".join(collected_text)
-        self._save_assistant_turn(conversation_id, assistant_text, collected_events)
+        # Persist the user message now — after the harness has read history for
+        # this turn — so it isn't replayed into the turn as duplicate context.
+        user_message = ConversationService(self.scoped).save_user_message(
+            conversation_id, original_content,
+        )
+        self._save_assistant_turn(conversation_id, assistant_text, collected_events, turn_rows)
 
         return Response(
             status=ResponseStatus.completed,
             model=model,
-            output=[self._build_output(output_item_id, assistant_text)],
+            output=[self._build_output(str(user_message.id), assistant_text)],
         )
 
     def _save_assistant_turn(
@@ -345,10 +352,11 @@ class ResponsesHandler:
         conversation_id: UUID,
         text: str,
         events: list[dict],
+        tool_rows: list[dict] | None = None,
     ) -> None:
         harness_id = getattr(self.harness, 'id', None)
         ConversationService(self.scoped).save_assistant_turn(
-            conversation_id, text, events, harness=harness_id,
+            conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:

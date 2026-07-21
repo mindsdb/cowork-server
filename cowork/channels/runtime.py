@@ -420,13 +420,18 @@ class AntonChannelRuntime:
         _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
-        session.add(DBMessage(conversation_id=conversation.id, role="user", content=content))
-        session.commit()
+        scoped = ScopedSession(session, scope_for_background_context())
 
         collected: list[str] = []
         events: list[dict] = []
+        turn_rows: list[dict] = []
 
         def event_sink(event_type: str, data: dict) -> None:
+            # Tool block-rows are for LLM-history persistence, not UI replay —
+            # keep them out of the events log (mirrors handlers/responses.py).
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             events.append(data)
             if event_type == "response.output_text.delta":
                 collected.append(data.get("delta", ""))
@@ -436,12 +441,20 @@ class AntonChannelRuntime:
             input=blocks,
             channel_context=channel_context,
         )
-        async for _chunk in harness.formatter(stream, harness_id, event_sink):
-            pass
+        try:
+            async for _chunk in harness.formatter(stream, harness_id, event_sink):
+                pass
+        finally:
+            # Persist the user message only after the harness has read this
+            # turn's history (it reads via a fresh query). Persisting earlier
+            # would replay the message into this turn AND resend it as the live
+            # input. In `finally` so a crashed turn still records the inbound
+            # message, matching the pre-history-replay behaviour.
+            ConversationService(scoped).save_user_message(conversation.id, content)
 
         reply = "".join(collected)
-        ConversationService(ScopedSession(session, scope_for_background_context())).save_assistant_turn(
-            conversation.id, reply, events, harness=harness_id,
+        ConversationService(scoped).save_assistant_turn(
+            conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
         )
         return reply, turn_used_tools(events)
 
