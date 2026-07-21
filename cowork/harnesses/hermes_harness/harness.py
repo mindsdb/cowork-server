@@ -147,17 +147,21 @@ class HermesHarness:
         def thinking_callback(text: str) -> None:
             _put({"type": "thought.progress", "subtype": "thinking", "content": text})
 
-        # Canonical order (created_at, seq, ...) — the bare relationship is
+        # Canonical order (created_at, seq, ...); the bare relationship is
         # unordered and would scramble a turn's tool_use/tool_result block-rows.
+        # Ordering needs the DB session, so the conversation must be attached —
+        # callers always pass an attached instance; fail fast rather than
+        # silently fall back to a scrambled, replay-breaking history.
         from sqlalchemy.orm import object_session
         from cowork.services.conversations import ConversationService, _is_tool_row
 
         _db_session = object_session(conversation)
-        _ordered = (
-            ConversationService(_db_session).get_ordered_messages(conversation.id)
-            if _db_session is not None
-            else list(conversation.messages)
-        )
+        if _db_session is None:
+            raise RuntimeError(
+                f"Conversation {conversation.id} is detached from its Session; "
+                "cannot resolve ordered history for replay."
+            )
+        _ordered = ConversationService(_db_session).get_ordered_messages(conversation.id)
         # Drop tool rows: they hold anton's Anthropic-format tool_use/tool_result
         # blocks, which are invalid in hermes' OpenAI history. hermes emits none
         # of its own, so this only skips foreign rows from an anton→hermes switch.
