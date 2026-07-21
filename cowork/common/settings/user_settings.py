@@ -93,20 +93,20 @@ def _enabled_aware_default(
     defaults: dict[str, str],
     enabled_map: dict[str, bool],
 ) -> str | None:
-    """The provider's canonical default model, adjusted for tier availability.
+    """The provider's canonical default model, adjusted for availability.
 
-    MindsHub gates models per plan tier (a free-tier key gets sonnet/haiku as
-    ``enabled: false`` from ``/v1/models``), so blindly handing out the
-    canonical default would 403 every turn for a free account. When the cached
-    availability map (``minds_model_enabled``) marks the default as disabled,
-    fall back to the first enabled model in the map — the map preserves the
-    gateway's ``/v1/models`` ordering, which lists the tier's baseline model
-    first. Applies only to minds-cloud: direct (BYOK) providers have no tier
-    gating and no map entries.
+    MindsHub marks a model the org's wallet can't currently pay for (or whose
+    free allowance is exhausted) as ``enabled: false`` from ``/v1/models``, so
+    blindly handing out the canonical default could be denied every turn. When
+    the cached availability map (``minds_model_enabled``) marks the default as
+    disabled, fall back to the first enabled model in the map — the map
+    preserves the gateway's ``/v1/models`` ordering, which lists the
+    free/baseline model first. Applies only to minds-cloud: direct (BYOK)
+    providers have no such availability map.
 
     Deliberately conservative: an absent/empty map, a default missing from the
     map, or a map with nothing enabled all leave the canonical default
-    untouched — degraded metadata must never change behavior for paid users.
+    untouched — degraded metadata must never change behavior.
     """
     default = defaults.get(provider_value)
     if provider_value != Provider.MINDS_CLOUD.value or not enabled_map:
@@ -133,7 +133,7 @@ def _resolved_model(
 
       - provider NOT switched → keep the user's chosen model.
       - provider switched → use the resolved provider's canonical default
-        (tier-adjusted via _enabled_aware_default, so switching a free-tier
+        (availability-adjusted via _enabled_aware_default, so switching an
         account onto minds-cloud never lands on a locked model).
         NEVER fall back to the original provider's model — that would hand e.g.
         a Claude id to an openai-compatible / MindsHub endpoint (misrouting).
@@ -393,8 +393,8 @@ class UserSettings(Settings):
         description=(
             "JSON-encoded map of MindsHub model id → enabled flag, cached from "
             "/v1/models whenever recommended-models fetches it live. Lets model "
-            "defaults avoid tier-locked models without a network call in the "
-            "turn path."
+            "defaults avoid locked models (wallet can't pay / free allowance "
+            "spent) without a network call in the turn path."
         ),
     )
 
@@ -416,8 +416,9 @@ class UserSettings(Settings):
 
         Sourced from the ``minds_model_enabled`` setting, which the
         recommended-models endpoint refreshes from ``/v1/models`` on every
-        settings load — so it tracks plan changes (e.g. an upgrade re-enables
-        sonnet on the next fetch) without any network call here.
+        settings load — so it tracks availability changes (e.g. adding credits
+        re-enables a locked model on the next fetch) without any network call
+        here.
 
         Parsed once per instance and memoized: this is called from
         ``apply_model_defaults`` and both ``resolved_*_model`` properties.
@@ -442,12 +443,13 @@ class UserSettings(Settings):
 
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
-        # Defaults are tier-aware for minds-cloud: a free-tier account (sonnet /
-        # haiku locked) falls back to the first enabled model instead of a
-        # guaranteed-403 default. Only applies while the user hasn't picked a
-        # model (None) — an explicit choice is never rewritten, and since
-        # nothing persists the value assigned here, an upgrade flips the
-        # default back to the canonical model on the next settings load.
+        # Defaults are availability-aware for minds-cloud: when the canonical
+        # default is locked (wallet can't pay / free allowance spent) it falls
+        # back to the first enabled model instead of a guaranteed-denied
+        # default. Only applies while the user hasn't picked a model (None) — an
+        # explicit choice is never rewritten, and since nothing persists the
+        # value assigned here, adding credits flips the default back to the
+        # canonical model on the next settings load.
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
