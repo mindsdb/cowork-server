@@ -43,8 +43,6 @@ def oauth_start(service: str, body: dict[str, Any] | None = None):
 # These endpoints exist as a compat bridge for the current client.
 
 attachments_router = APIRouter()
-# Attachment stubs use the session only for File/Project services — scoped module-wide.
-_SessionDep = ScopedSessionDep
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:
@@ -77,11 +75,11 @@ def _to_attachment(file) -> dict:
 def list_attachments(
     project_name: str,
     session_id: str,
-    session: _SessionDep,
+    scoped: ScopedSessionDep,
     ids: list[str] | None = Query(default=None),
 ):
     from cowork.services.files import FileService
-    rows = FileService(session).list_file_rows(purpose=_attachment_purpose(project_name, session_id))
+    rows = FileService(scoped).list_file_rows(purpose=_attachment_purpose(project_name, session_id))
     if ids:
         wanted = {str(i) for i in ids}
         rows = [r for r in rows if str(r.id) in wanted]
@@ -92,7 +90,7 @@ def list_attachments(
 async def upload_attachment(
     project_name: str,
     session_id: str,
-    session: _SessionDep,
+    scoped: ScopedSessionDep,
     files: list[UploadFile] = File(...),
 ):
     from cowork.services.files import FileService
@@ -105,7 +103,7 @@ async def upload_attachment(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="session_id must not contain ':'",
         )
-    svc = FileService(session)
+    svc = FileService(scoped)
     purpose = _attachment_purpose(project_name, session_id)
     results = []
     for f in files:
@@ -131,24 +129,24 @@ async def upload_attachment(
 
 
 @attachments_router.delete("/{attachment_id}")
-def delete_attachment(attachment_id: UUID, session: _SessionDep):
+def delete_attachment(attachment_id: UUID, scoped: ScopedSessionDep):
     from cowork.services.files import FileService
-    FileService(session).delete_file(attachment_id)
+    FileService(scoped).delete_file(attachment_id)
     return {"ok": True}
 
 
 @attachments_router.delete("/{project_name}/{session_id}/{attachment_id}")
-def delete_attachment_scoped(project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep):
+def delete_attachment_scoped(project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep):
     from cowork.services.files import FileService
-    FileService(session).delete_file(attachment_id)
+    FileService(scoped).delete_file(attachment_id)
     return {"ok": True}
 
 
 @attachments_router.get("/{project_name}/{session_id}/{attachment_id}/raw")
-def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep):
+def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep):
     from cowork.services.files import FileService
     try:
-        content_type, filename, path = FileService(session).get_file_content(attachment_id)
+        content_type, filename, path = FileService(scoped).get_file_content(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     # Inline, not attachment: the rail's row click opens this URL in a
@@ -179,14 +177,14 @@ def _unique_project_target(project_dir: Path, filename: str) -> Path:
 
 @attachments_router.post("/{project_name}/{session_id}/{attachment_id}/move-to-project")
 def move_attachment_to_project(
-    project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep
+    project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep
 ):
     from cowork.services.files import FileService
     from cowork.services.projects import ProjectService
 
     try:
-        project = ProjectService(session).get_project_by_name(project_name)
-        content_type, filename, source = FileService(session).get_file_content(attachment_id)
+        project = ProjectService(scoped).get_project_by_name(project_name)
+        content_type, filename, source = FileService(scoped).get_file_content(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -194,7 +192,7 @@ def move_attachment_to_project(
     project_dir.mkdir(parents=True, exist_ok=True)
     target = _unique_project_target(project_dir, filename)
     shutil.copy2(source, target)
-    FileService(session).delete_file(attachment_id)
+    FileService(scoped).delete_file(attachment_id)
     return {
         "ok": True,
         "project_path": target.name,
