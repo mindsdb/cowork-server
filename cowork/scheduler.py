@@ -102,7 +102,8 @@ async def execute_schedule(
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
-    session = get_open_session()
+    from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+    session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
     run_service = ScheduleRunService(session)
     schedule_service = ScheduleService(session)
 
@@ -273,7 +274,8 @@ async def _scheduler_loop() -> None:
     logger.info("Scheduler loop started")
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        session = get_open_session()
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+        session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
             _handle_missed_runs(session)
             due = _due_schedules(session, datetime.now(timezone.utc))

@@ -48,6 +48,9 @@ class TenantScope:
 
 LOCAL_SCOPE = TenantScope()
 
+# Alias for background executors (scheduler loop): "don't filter by org".
+SYSTEM_SCOPE = LOCAL_SCOPE
+
 
 def scope_from_principal(principal: Principal | None) -> TenantScope:
     """The single way a TenantScope is built — request DI and background

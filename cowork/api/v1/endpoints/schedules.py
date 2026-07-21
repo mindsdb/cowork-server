@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from sqlmodel import Session
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
 from cowork.db.scoped import ScopedSessionDep
-from cowork.db.session import get_session
 from cowork.schemas.schedules import (
     ScheduleCreateRequest,
     ScheduleResponse,
@@ -18,10 +15,11 @@ from cowork.services.schedules import ScheduleRunService, ScheduleService
 
 router = APIRouter()
 
-SessionDep = Annotated[Session, Depends(get_session)]
+# Every endpoint uses the session only via the two schedule services — scoped module-wide.
+SessionDep = ScopedSessionDep
 
 
-def _serialize(schedule, session: Session) -> dict:
+def _serialize(schedule, session) -> dict:
     """ScheduleResponse plus the live `running` flag (any in-flight run)."""
     data = ScheduleResponse.serialize(schedule)
     data["running"] = ScheduleRunService(session).has_active_run(schedule.id)
@@ -94,7 +92,7 @@ def resume_schedule(schedule_id: UUID, session: SessionDep):
 
 
 @router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED)
-def run_schedule_now(schedule_id: UUID, session: SessionDep, scoped: ScopedSessionDep, background_tasks: BackgroundTasks):
+def run_schedule_now(schedule_id: UUID, session: SessionDep, background_tasks: BackgroundTasks):
     try:
         schedule = ScheduleService(session).get_schedule(schedule_id)
     except ValueError as e:
@@ -103,7 +101,7 @@ def run_schedule_now(schedule_id: UUID, session: SessionDep, scoped: ScopedSessi
     from cowork.scheduler import execute_schedule
     from cowork.services.conversations import ConversationService
 
-    conversation = ConversationService(scoped).create_conversation(
+    conversation = ConversationService(session).create_conversation(
         topic=schedule.title,
         project_id=schedule.project_id,
     )
