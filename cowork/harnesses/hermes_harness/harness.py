@@ -153,6 +153,7 @@ class HermesHarness:
         # callers always pass an attached instance; fail fast rather than
         # silently fall back to a scrambled, replay-breaking history.
         from sqlalchemy.orm import object_session
+        from cowork.db.scoped import adopt_scoped_session
         from cowork.services.conversations import ConversationService, _is_tool_row
 
         _db_session = object_session(conversation)
@@ -161,7 +162,9 @@ class HermesHarness:
                 f"Conversation {conversation.id} is detached from its Session; "
                 "cannot resolve ordered history for replay."
             )
-        _ordered = ConversationService(_db_session).get_ordered_messages(conversation.id)
+        _ordered = ConversationService(
+            adopt_scoped_session(_db_session)
+        ).get_ordered_messages(conversation.id)
         # Drop tool rows: they hold anton's Anthropic-format tool_use/tool_result
         # blocks, which are invalid in hermes' OpenAI history. hermes emits none
         # of its own, so this only skips foreign rows from an anton→hermes switch.

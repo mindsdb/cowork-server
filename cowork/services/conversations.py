@@ -3,7 +3,6 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import case
-from sqlmodel import func, select
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
@@ -51,21 +50,20 @@ class ConversationService:
         Keeps `seq` monotonic across the whole conversation so message order
         never depends on created_at's second-level resolution.
 
-        ponytail: one extra aggregate per persist, and max+1 races only if a
-        single conversation runs two concurrent turns — which it can't today
-        (turns are serialized). The id tiebreak in _MESSAGE_ORDER still bounds
-        the fallout if that ever changes.
+        ponytail: one extra query per persist, and max+1 races only if a single
+        conversation runs two concurrent turns — which it can't today (turns are
+        serialized). The id tiebreak in _MESSAGE_ORDER still bounds the fallout
+        if that ever changes.
         """
-        # Run the aggregate on the raw session: ScopedSession.exec only accepts
-        # statements from its own .select(model) (no func.max form). Safe here —
-        # the query is pinned to one conversation_id, so no cross-tenant reach.
-        raw = unsafe_unscoped_session(self.session) if isinstance(self.session, ScopedSession) else self.session
-        current_max = raw.exec(
-            select(func.max(Message.seq)).where(
-                Message.conversation_id == conversation_id
-            )
-        ).one()
-        return 0 if current_max is None else current_max + 1
+        # ORDER BY seq DESC LIMIT 1 (not func.max): expressible through the
+        # scoped .select() API, so no escape hatch to the raw session.
+        last = self.session.exec(
+            self.session.select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.seq.desc())
+            .limit(1)
+        ).first()
+        return 0 if last is None else last.seq + 1
 
     def save_user_message(self, conversation_id: UUID, content) -> Message:
         """Persist a user message with the next monotonic `seq` (see _next_seq)."""
@@ -313,7 +311,7 @@ class ConversationService:
         _MESSAGE_ORDER). Includes history-only tool rows — harnesses replay
         them into the LLM context; use get_messages for the UI-facing view."""
         return list(self.session.exec(
-            select(Message)
+            self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
             .order_by(*_MESSAGE_ORDER)
         ).all())

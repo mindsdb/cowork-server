@@ -22,6 +22,7 @@ from cowork.harnesses.base import ChannelContext
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.models.message import Message
 from cowork.server import create_app
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.services.conversations import ConversationService, _is_tool_row
 
 REPLY = "hello from anton"
@@ -224,7 +225,7 @@ def test_channel_turn_persists_tool_rows_and_hides_history_event(monkeypatch):
     s = get_open_session()
     binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "88")).one()
     cid = binding.anton_conversation_id
-    svc = ConversationService(s)
+    svc = ConversationService(ScopedSession(s, LOCAL_SCOPE))
     # (a) tool rows persisted for LLM replay.
     assert sum(1 for m in svc.get_ordered_messages(cid) if _is_tool_row(m.content)) == 2
     # (b) the turn_history blob is not stored as a MessageEvent / shown to UI,

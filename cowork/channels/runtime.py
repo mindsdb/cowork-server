@@ -420,7 +420,8 @@ class AntonChannelRuntime:
         _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
-        ConversationService(session).save_user_message(conversation.id, content)
+        scoped = ScopedSession(session, scope_for_background_context())
+        ConversationService(scoped).save_user_message(conversation.id, content)
 
         collected: list[str] = []
         events: list[dict] = []
@@ -445,7 +446,7 @@ class AntonChannelRuntime:
             pass
 
         reply = "".join(collected)
-        ConversationService(ScopedSession(session, scope_for_background_context())).save_assistant_turn(
+        ConversationService(scoped).save_assistant_turn(
             conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
         )
         return reply, turn_used_tools(events)
