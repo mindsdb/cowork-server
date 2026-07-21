@@ -283,10 +283,27 @@ class ResponsesHandler:
                 # card can nudge toward MindsHub's cross-provider failover. Never
                 # break the handler — fall back to the bare message on any error.
                 overloaded_info = provider_overloaded_info(exc)
-                extra = {"model": overloaded_info[1] if overloaded_info else ""}
+                failed_model = overloaded_info[1] if overloaded_info else ""
+                extra = {"model": failed_model}
                 try:
                     from cowork.common.settings.user_settings import Provider
-                    provider = get_user_settings().resolved_planning_provider
+                    s = get_user_settings()
+                    # The nudge keys on WHICH provider overloaded. anton passes the
+                    # actual failing model (planning OR coding); map it back to its
+                    # provider so a coding-model incident on a DIFFERENT provider
+                    # than planning isn't mislabeled — e.g. planning=MindsHub +
+                    # coding=BYOK overloads must NOT read as reconnectable=True and
+                    # suppress the failover nudge (Sam's review). Falls back to
+                    # planning when the model is unknown or both roles share a
+                    # provider (then the two agree anyway).
+                    if (
+                        failed_model
+                        and failed_model == s.resolved_coding_model
+                        and failed_model != s.resolved_planning_model
+                    ):
+                        provider = s.resolved_coding_provider
+                    else:
+                        provider = s.resolved_planning_provider
                     extra["provider_label"] = provider.label
                     extra["reconnectable"] = provider == Provider.MINDS_CLOUD
                 except Exception:

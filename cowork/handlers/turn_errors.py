@@ -427,6 +427,13 @@ def friendly_turn_error(
         if mapped is not None:
             return mapped
 
+    # Precedence per ENG-673: token_limit / the billing-status fallback /
+    # provider_auth / the ENG-598 model gate all WIN over provider_overloaded
+    # (ranked below, after auth). These exception types are disjoint in practice
+    # (a ProviderOverloadedError is never a 401 / quota / model-403), so the
+    # order is behavior-preserving — made explicit so the stated contract and the
+    # code can't silently drift apart (Sam's review).
+    #
     # Out-of-credits first: a credit/quota failure must not be misread as auth
     # or a model gate. Covers anton's typed TokenLimitExceeded and the stable
     # message heuristics.
@@ -444,12 +451,6 @@ def friendly_turn_error(
         if status == 503:
             return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
-
-    # A transient-incident timeout (ENG-673) — anton's message is already curated
-    # ("<provider> is experiencing an incident…"); pass it through.
-    overloaded = provider_overloaded_info(exc)
-    if overloaded is not None:
-        return overloaded[0], str(exc) or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
     if model_info is _UNSET:
         model_info = model_unavailable_info(exc)
     if model_info is not None:
@@ -458,6 +459,12 @@ def friendly_turn_error(
         return model_info[0], str(exc) or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if is_auth_error(exc):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
+    # A transient-incident timeout (ENG-673) — anton's message is already curated
+    # ("<provider> is experiencing an incident…"); pass it through. Ranked after
+    # auth/quota/model-gate per the precedence note above.
+    overloaded = provider_overloaded_info(exc)
+    if overloaded is not None:
+        return overloaded[0], str(exc) or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
     if is_image_format_error(exc):
         return "image_format", IMAGE_FORMAT_USER_MESSAGE
     return None
