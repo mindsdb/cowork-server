@@ -39,6 +39,17 @@ class ArtifactCreated:
 
 
 @dataclass
+class TurnHistory:
+    """Synthetic post-turn event carrying the turn's tool block-rows
+    (assistant `tool_use` / user `tool_result`) so the responses route can
+    persist them into the `messages` table. Recorded via `event_sink` only —
+    never emitted as SSE: the client rebuilds all tool activity from the
+    existing thought events, so these rows are for LLM-history replay only."""
+
+    rows: list
+
+
+@dataclass
 class SkillCreated:
     """Synthetic post-turn event: a skill the agent built for the user appeared
     in the drafts dir during the turn (detected by the harness via a dir diff,
@@ -294,6 +305,19 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "artifact": event.artifact,
             })
+
+        elif isinstance(event, TurnHistory):
+            # Recorded for LLM-history replay only — not surfaced to the client
+            # (tool activity is rendered from the thought events above), so it
+            # goes straight to the sink without an SSE frame or sequence number.
+            if event_sink is not None:
+                try:
+                    event_sink("response.turn_history", {
+                        "type": "response.turn_history",
+                        "rows": event.rows,
+                    })
+                except Exception:
+                    pass
 
         elif isinstance(event, SkillCreated):
             seq += 1
