@@ -174,7 +174,7 @@ Environment variables fall into two namespaces:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COWORK_SERVER_PORT` | `26866` | Server port |
+| `COWORK_LISTEN_PORT` | `26866` | Server port |
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root |
