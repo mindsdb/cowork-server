@@ -598,18 +598,21 @@ class AntonHarness:
                     "surfaces every file this app can legitimately see, Shared Drive items included."
                 )
 
-        # Canonical order (created_at, seq, ...) — the bare `conversation.messages`
-        # relationship is unordered, which scrambles a turn's tool_use/tool_result
-        # block-rows and would break the replayed history.
+        # Canonical order (created_at, seq, ...); the bare `conversation.messages`
+        # relationship is unordered and would scramble a turn's tool_use/tool_result
+        # block-rows. Ordering needs the DB session, so the conversation must be
+        # attached — callers always pass an attached instance; fail fast rather
+        # than silently fall back to a scrambled, replay-breaking history.
         from sqlalchemy.orm import object_session
         from cowork.services.conversations import ConversationService
 
         db_session = object_session(conversation)
-        ordered_messages = (
-            ConversationService(db_session).get_ordered_messages(conversation.id)
-            if db_session is not None
-            else list(conversation.messages)
-        )
+        if db_session is None:
+            raise RuntimeError(
+                f"Conversation {conversation.id} is detached from its Session; "
+                "cannot resolve ordered history for replay."
+            )
+        ordered_messages = ConversationService(db_session).get_ordered_messages(conversation.id)
 
         cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
