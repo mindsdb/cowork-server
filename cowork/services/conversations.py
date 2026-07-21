@@ -56,7 +56,11 @@ class ConversationService:
         (turns are serialized). The id tiebreak in _MESSAGE_ORDER still bounds
         the fallout if that ever changes.
         """
-        current_max = self.session.exec(
+        # Run the aggregate on the raw session: ScopedSession.exec only accepts
+        # statements from its own .select(model) (no func.max form). Safe here —
+        # the query is pinned to one conversation_id, so no cross-tenant reach.
+        raw = unsafe_unscoped_session(self.session) if isinstance(self.session, ScopedSession) else self.session
+        current_max = raw.exec(
             select(func.max(Message.seq)).where(
                 Message.conversation_id == conversation_id
             )
