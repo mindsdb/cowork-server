@@ -177,7 +177,13 @@ class _DynamicOptions:
 
 def _harness_options() -> list[str]:
     from cowork.harnesses.base import _registry
-    return list(_registry.keys())
+    org_mode = get_app_settings().tenancy_mode == "org"
+    return [
+        hid for hid, cls in _registry.items()
+        # Org mode hides harnesses that don't support multi-tenancy (Anton-only
+        # for now); getattr default keeps every other harness available.
+        if not org_mode or getattr(cls, "supports_org_mode", True)
+    ]
 
 
 class UserSettings(Settings):
