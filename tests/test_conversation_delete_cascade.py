@@ -36,7 +36,7 @@ def _rows_for(session, conversation_id) -> list[TaskObject]:
 def test_delete_conversation_drops_task_objects(session):
     svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
-    TaskObjectService(session).index_artifact(conv.id, GENERAL_PROJECT_ID, "my-artifact")
+    TaskObjectService(ScopedSession(session, LOCAL_SCOPE)).index_artifact(conv.id, GENERAL_PROJECT_ID, "my-artifact")
     assert _rows_for(session, conv.id), "precondition: artifact indexed"
 
     assert svc.delete_conversation(conv.id) is True
@@ -54,7 +54,7 @@ def test_clear_all_history_drops_task_objects(session):
     session.add(Message(conversation_id=conv.id, role="user", content='"make a plan"'))
     session.commit()
     svc.save_assistant_turn(conv.id, "done", events=[])
-    TaskObjectService(session).index_artifact(conv.id, GENERAL_PROJECT_ID, "my-artifact")
+    TaskObjectService(ScopedSession(session, LOCAL_SCOPE)).index_artifact(conv.id, GENERAL_PROJECT_ID, "my-artifact")
     assert _rows_for(session, conv.id), "precondition: artifact indexed"
 
     svc.delete_turn(conv.id, 0)  # clear from the first turn = clear all history
@@ -74,7 +74,7 @@ def test_partial_turn_delete_keeps_task_objects(session):
     session.add(Message(conversation_id=conv.id, role="user", content='"second"'))
     session.commit()
     svc.save_assistant_turn(conv.id, "a2", events=[])
-    TaskObjectService(session).index_artifact(conv.id, GENERAL_PROJECT_ID, "my-artifact")
+    TaskObjectService(ScopedSession(session, LOCAL_SCOPE)).index_artifact(conv.id, GENERAL_PROJECT_ID, "my-artifact")
 
     svc.delete_turn(conv.id, 1)  # drop only the second turn
     assert _rows_for(session, conv.id), "partial delete must keep the index"
@@ -91,14 +91,14 @@ from cowork.services.projects import ProjectService  # noqa: E402
 
 
 def _attach(session, conversation_id, name="doc.txt"):
-    return FileService(session).create_file_from_bytes(
+    return FileService(ScopedSession(session, LOCAL_SCOPE)).create_file_from_bytes(
         filename=name, content_type="text/plain", data=b"hello",
         purpose=attachment_purpose(str(conversation_id)),
     )
 
 
 def _attachment_rows(session, conversation_id):
-    return FileService(session).list_file_rows(attachment_purpose(str(conversation_id)))
+    return FileService(ScopedSession(session, LOCAL_SCOPE)).list_file_rows(attachment_purpose(str(conversation_id)))
 
 
 def test_delete_conversation_removes_attachment_rows_and_bytes(session):
@@ -120,7 +120,7 @@ def test_delete_conversation_leaves_other_conversations_and_purposes(session):
     keep_file = _attach(session, keep.id)
     _attach(session, doomed.id)
     # A non-attachment purpose must never be touched.
-    other = FileService(session).create_file_from_bytes(
+    other = FileService(ScopedSession(session, LOCAL_SCOPE)).create_file_from_bytes(
         filename="c.bin", content_type="application/octet-stream",
         data=b"x", purpose="channel:some-channel",
     )
@@ -128,7 +128,7 @@ def test_delete_conversation_leaves_other_conversations_and_purposes(session):
     svc.delete_conversation(doomed.id)
 
     assert _attachment_rows(session, keep.id) and Path(keep_file.path).exists()
-    assert FileService(session).list_file_rows("channel:some-channel"), "non-attachment untouched"
+    assert FileService(ScopedSession(session, LOCAL_SCOPE)).list_file_rows("channel:some-channel"), "non-attachment untouched"
     assert Path(other.path).exists()
 
 
@@ -225,14 +225,14 @@ def test_delete_by_purpose_stages_without_committing(session):
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
     _attach(session, conv.id)
 
-    dirs = FileService(session).delete_by_purpose(attachment_purpose(str(conv.id)))
+    dirs = FileService(ScopedSession(session, LOCAL_SCOPE)).delete_by_purpose(attachment_purpose(str(conv.id)))
     session.rollback()
 
     assert _attachment_rows(session, conv.id), "delete_by_purpose must not commit on its own"
     assert dirs and all(d.exists() for d in dirs), "bytes must survive until the caller commits"
 
     # And the helper only removes bytes once called explicitly (post-commit).
-    FileService(session).delete_by_purpose(attachment_purpose(str(conv.id)))
+    FileService(ScopedSession(session, LOCAL_SCOPE)).delete_by_purpose(attachment_purpose(str(conv.id)))
     session.commit()
     unlink_file_dirs(dirs)
     assert not any(d.exists() for d in dirs), "bytes removed after commit + unlink"
