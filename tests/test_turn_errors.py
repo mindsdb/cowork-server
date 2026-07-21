@@ -620,3 +620,122 @@ async def test_stream_emits_transient_failed_event_for_policy_unavailable():
     assert payload["error"] == te.POLICY_UNAVAILABLE_USER_MESSAGE
     # Flows through the generic path — no auth/model extras leak in.
     assert "reconnectable" not in payload and "model" not in payload
+
+
+# ── provider_overloaded (ENG-673) ────────────────────────────────────
+# A transient provider incident that outlasted anton's retry budget surfaces as
+# anton's ProviderOverloadedError (code=provider_overloaded + model). Same
+# typed-or-duck-typed detection as the model-403 case; NO string matching.
+
+
+class _FakeOverloadedErr(ConnectionError):
+    """Duck-typed stand-in for anton's ProviderOverloadedError."""
+
+    def __init__(self, message, code="provider_overloaded", model="", provider=""):
+        super().__init__(message)
+        self.code = code
+        self.model = model
+        self.provider = provider
+
+
+_OVERLOAD_MSG = "Anthropic is experiencing an incident and didn't recover in time."
+
+
+def test_provider_overloaded_detected_via_duck_typing():
+    info = te.provider_overloaded_info(_FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet"))
+    assert info == ("provider_overloaded", "sonnet")
+
+
+def test_provider_overloaded_requires_the_structured_code():
+    assert te.provider_overloaded_info(_FakeOverloadedErr("x", code="other")) is None
+    # A message merely mentioning the words must not trigger the card.
+    assert te.provider_overloaded_info(ConnectionError("provider_overloaded happened")) is None
+    assert te.provider_overloaded_info(ConnectionError("Server returned 500")) is None
+
+
+def test_provider_overloaded_maps_code_and_passes_message_through():
+    code, message = te.friendly_turn_error(_FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet"))
+    assert code == te.PROVIDER_OVERLOADED_CODE == "provider_overloaded"
+    assert message == _OVERLOAD_MSG
+
+
+def test_provider_overloaded_empty_message_gets_fallback_copy():
+    code, message = te.friendly_turn_error(_FakeOverloadedErr(""))
+    assert code == te.PROVIDER_OVERLOADED_CODE
+    assert message == te.PROVIDER_OVERLOADED_FALLBACK_MESSAGE
+
+
+def test_token_limit_wins_over_provider_overloaded():
+    # A quota failure carrying an overload-ish code must stay token_limit.
+    exc = _FakeOverloadedErr(_TOKEN_LIMIT_MESSAGE)
+    code, _ = te.friendly_turn_error(exc)
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_response_failed_payload_carries_overload_fields():
+    p = te.response_failed_payload(
+        _OVERLOAD_MSG, te.PROVIDER_OVERLOADED_CODE,
+        model="sonnet", provider_label="Anthropic", reconnectable=False,
+    )
+    assert p["model"] == "sonnet"
+    assert p["provider_label"] == "Anthropic"
+    assert p["reconnectable"] is False
+
+
+async def test_stream_emits_provider_overloaded_with_model():
+    exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet")
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == "provider_overloaded"
+    assert payload["error"] == _OVERLOAD_MSG
+    assert payload["model"] == "sonnet"
+
+
+async def test_overloaded_reconnectable_keys_on_the_failing_model_not_planning():
+    # ENG-673 (Sam's review): planning=MindsHub, coding=BYOK. When the CODING
+    # model overloads, the card must reflect the BYOK provider that actually
+    # failed — reconnectable=False so the MindsHub failover nudge is shown — NOT
+    # reconnectable=True (which planning=MindsHub would wrongly imply, suppressing
+    # the nudge that would help).
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _FakeSettings:
+        resolved_planning_model = "latest:sonnet"
+        resolved_coding_model = "latest:haiku"
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+
+    exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:haiku")  # the coding model
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == "provider_overloaded"
+    assert payload["model"] == "latest:haiku"
+    assert payload["reconnectable"] is False
+    assert payload["provider_label"] == Provider.ANTHROPIC.label
+
+
+async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
+    # The mirror case: the failing (planning) model is on MindsHub Cloud → already
+    # routed through failover, so no pitch — reconnectable=True (Retry-only).
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _FakeSettings:
+        resolved_planning_model = "latest:sonnet"
+        resolved_coding_model = "latest:haiku"
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.MINDS_CLOUD
+
+    exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:sonnet")  # the planning model
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["reconnectable"] is True

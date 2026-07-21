@@ -30,9 +30,11 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_ACCESS_DENIED_CODE,
     MODEL_DISABLED_CODE,
+    PROVIDER_OVERLOADED_CODE,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
+    provider_overloaded_info,
     response_failed_payload,
     response_failed_sse,
 )
@@ -273,6 +275,39 @@ class ResponsesHandler:
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
+            elif code == PROVIDER_OVERLOADED_CODE:
+                # Transient-incident timeout (ENG-673): give the card the failing
+                # model AND the active provider, and flag whether the user is
+                # already routed through MindsHub. reconnectable=True → on managed
+                # (all upstreams down; just Retry); False → BYOK/direct, so the
+                # card can nudge toward MindsHub's cross-provider failover. Never
+                # break the handler — fall back to the bare message on any error.
+                overloaded_info = provider_overloaded_info(exc)
+                failed_model = overloaded_info[1] if overloaded_info else ""
+                extra = {"model": failed_model}
+                try:
+                    from cowork.common.settings.user_settings import Provider
+                    s = get_user_settings()
+                    # The nudge keys on WHICH provider overloaded. anton passes the
+                    # actual failing model (planning OR coding); map it back to its
+                    # provider so a coding-model incident on a DIFFERENT provider
+                    # than planning isn't mislabeled — e.g. planning=MindsHub +
+                    # coding=BYOK overloads must NOT read as reconnectable=True and
+                    # suppress the failover nudge (Sam's review). Falls back to
+                    # planning when the model is unknown or both roles share a
+                    # provider (then the two agree anyway).
+                    if (
+                        failed_model
+                        and failed_model == s.resolved_coding_model
+                        and failed_model != s.resolved_planning_model
+                    ):
+                        provider = s.resolved_coding_provider
+                    else:
+                        provider = s.resolved_planning_provider
+                    extra["provider_label"] = provider.label
+                    extra["reconnectable"] = provider == Provider.MINDS_CLOUD
+                except Exception:
+                    logger.exception("[responses] could not resolve provider for overload error")
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)
