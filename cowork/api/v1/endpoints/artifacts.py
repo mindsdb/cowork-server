@@ -225,16 +225,23 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
 
     try:
-        requested = os.path.realpath(Path(path))
+        rel = Path(path)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
+
+    # Fallback resolution only accepts project-relative paths.
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
     for project in ProjectService(session).list_projects():
-        project_dir = os.path.realpath(project.path)
-        # Trailing separator so `<dir>` doesn't match sibling `<dir>-other`.
-        if requested == project_dir or requested.startswith(project_dir + os.sep):
-            resolved = Path(requested)
-            if resolved.exists():
-                return resolved
+        project_root = Path(project.path).resolve()
+        try:
+            resolved = (project_root / rel).resolve()
+            resolved.relative_to(project_root)
+        except Exception:
+            continue
+        if resolved.exists():
+            return resolved
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
 
 
