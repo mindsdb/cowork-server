@@ -106,10 +106,8 @@ deployment:
     # SERVER SETTINGS
     # ====================================
 
-    # cowork-server defaults to 127.0.0.1:26866 (desktop sidecar). In-cluster it
-    # must bind all interfaces on the service target port. COWORK_LISTEN_PORT
-    # (not COWORK_SERVER_PORT) avoids K8s' legacy service-link env-var
-    # collision with the `cowork-server` Service.
+    # cowork-server defaults to 127.0.0.1:26866 (desktop sidecar). In-cluster
+    # it must bind all interfaces on the service target port.
     - name: COWORK_SERVER_HOST
       value: "0.0.0.0"
     - name: COWORK_LISTEN_PORT

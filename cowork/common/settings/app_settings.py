@@ -272,8 +272,6 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        # Not COWORK_SERVER_PORT: K8s auto-injects that as a URI string on any
-        # pod colocated with a `cowork-server` Service, breaking int parsing.
         validation_alias=AliasChoices("COWORK_LISTEN_PORT"),
         description="The port to run the server on",
     )
@@ -301,7 +299,7 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_ALLOWED_ORIGINS"),
         description=(
             "CORS allowed origins (JSON array). "
-            "Defaults to localhost on COWORK_SERVER_PORT and COWORK_RENDERER_PORT."
+            "Defaults to localhost on COWORK_LISTEN_PORT and COWORK_RENDERER_PORT."
         ),
     )
 
