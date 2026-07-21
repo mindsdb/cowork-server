@@ -272,7 +272,9 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        validation_alias=AliasChoices("COWORK_SERVER_PORT"),
+        # COWORK_LISTEN_PORT first so K8s' auto-injected COWORK_SERVER_PORT
+        # (URI, not int) doesn't clobber this on a `cowork-server` Service.
+        validation_alias=AliasChoices("COWORK_LISTEN_PORT", "COWORK_SERVER_PORT"),
         description="The port to run the server on",
     )
     host: str = Field(
