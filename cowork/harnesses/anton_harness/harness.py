@@ -95,12 +95,32 @@ def _conversation_attachment_context(conversation) -> str:
     """
     try:
         from sqlalchemy.orm import object_session
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
         from cowork.services.files import FileService, attachment_purpose
 
         db_session = object_session(conversation)
         if db_session is None:
             return ""
-        rows = FileService(db_session).list_file_rows(
+        # Re-wrap with the ORIGINAL scope the conversation was loaded under —
+        # never derived from the row itself. No recorded scope in org mode is
+        # an invariant violation: log it and list nothing.
+        scope = scope_of_session(db_session)
+        if scope is None:
+            if get_app_settings().tenancy_mode == "org":
+                logger.warning(
+                    "attachments: session carries no tenant scope in org mode — "
+                    "listing skipped (conversation %s)", conversation.id,
+                )
+                return ""
+            scope = LOCAL_SCOPE
+        if scope.org_mode and conversation.org_id != scope.org_id:
+            logger.warning(
+                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
+                conversation.id, conversation.org_id, scope.org_id,
+            )
+            return ""
+        rows = FileService(ScopedSession(db_session, scope)).list_file_rows(
             purpose=attachment_purpose(str(conversation.id))
         )
         # Only list files that still exist on disk — a row whose file was
@@ -139,7 +159,12 @@ def _conversation_attachment_context(conversation) -> str:
         # the user no files were uploaded (the Cyberdeck bug this helper
         # exists to fix). Log it so the failure is diagnosable; the agent
         # still degrades gracefully to "".
-        conv_id = getattr(conversation, "id", "<unknown>")
+        try:
+            # A broken session state can make even attribute access raise —
+            # the log line must never re-crash the handler it protects.
+            conv_id = getattr(conversation, "id", "<unknown>")
+        except Exception:
+            conv_id = "<unknown>"
         logger.warning(
             "Failed to build conversation attachment context for conversation %s; "
             "the agent will not see attached files this turn",
@@ -185,6 +210,10 @@ class AntonHarness:
         project_path = Path(conversation.project.path)
         artifacts_base = project_path / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Capture ids while the conversation is unambiguously attached — the
+        # end-of-turn finally must not depend on the session still being live.
+        conv_id = conversation.id
+        conv_project_id = conversation.project_id
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -219,9 +248,7 @@ class AntonHarness:
             # One dir diff → index the new artifacts AND build their cards.
             # Runs on every exit (success, error, cancel) so an artifact is
             # always indexed; cards are yielded just below on normal completion.
-            cards = finalize_turn_artifacts(
-                conversation.id, conversation.project_id, artifacts_base, before_slugs,
-            )
+            cards = finalize_turn_artifacts(conversation, conv_id, conv_project_id, artifacts_base, before_slugs)
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,
             )

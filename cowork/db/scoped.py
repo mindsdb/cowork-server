@@ -81,6 +81,17 @@ def scope_for_background_context() -> TenantScope:
     )
 
 
+def scope_of_session(session: Session) -> TenantScope | None:
+    """The TenantScope a raw session was wrapped with, if any.
+
+    Recovers the ORIGINAL scope (stored at wrap time) so downstream code that
+    only holds a raw session — e.g. via object_session(row) — can re-wrap with
+    the same authorization context instead of deriving one from row data.
+    Local-mode wraps store nothing; returns None.
+    """
+    return session.info.get("tenant_scope")
+
+
 def _is_org_scoped(model: type) -> bool:
     return hasattr(model, "org_id")
 

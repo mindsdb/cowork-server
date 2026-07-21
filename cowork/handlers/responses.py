@@ -356,7 +356,7 @@ class ResponsesHandler:
 
         # Resolve attachment_ids to image/file blocks
         if request.attachment_ids:
-            file_svc = FileService(self.session)
+            file_svc = FileService(self.scoped)
             for aid in request.attachment_ids:
                 try:
                     content_type, filename, filepath = file_svc.get_file_content(UUID(aid))
@@ -382,7 +382,7 @@ class ResponsesHandler:
                                     blocks.append({"type": "text", "text": item.text})
                                 elif item.type == ContentType.file and item.file_id:
                                     try:
-                                        content_type, filename, filepath = FileService(self.session).get_file_content(UUID(item.file_id))
+                                        content_type, filename, filepath = FileService(self.scoped).get_file_content(UUID(item.file_id))
                                     except ValueError:
                                         raise HTTPException(status_code=404, detail=f"File {item.file_id!r} not found")
                                     if content_type and content_type.startswith("image/"):
@@ -399,7 +399,7 @@ class ResponsesHandler:
         rail (which queries by the live conversation id) still finds them."""
         from cowork.services.files import attachment_purpose
 
-        moved = FileService(self.session).relink_purpose(
+        moved = FileService(self.scoped).relink_purpose(
             attachment_purpose(client_session_id),
             attachment_purpose(str(conversation.id)),
         )
