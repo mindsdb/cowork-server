@@ -1,0 +1,18 @@
+# Keep the build context (and image) lean. hatch-vcs still needs git metadata,
+# so .git is intentionally NOT ignored.
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+htmlcov
+.coverage
+tests
+docs
+deployment
+node_modules
+*.egg-info
+dist
+build
+.env

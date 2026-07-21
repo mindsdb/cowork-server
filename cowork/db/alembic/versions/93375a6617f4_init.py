@@ -44,7 +44,7 @@ def upgrade() -> None:
             "INSERT INTO projects (id, name, path, is_active, created_at, modified_at) "
             "VALUES (:id, :name, :path, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
         ).bindparams(
-            id=GENERAL_PROJECT_ID.hex,
+            sa.bindparam("id", GENERAL_PROJECT_ID, type_=sa.Uuid()),
             name=GENERAL_PROJECT,
             path=str(_general_dir),
             is_active=True,
@@ -193,5 +193,9 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_messages_conversation_id"), table_name="messages")
     op.drop_table("messages")
     op.drop_table("conversations")
-    op.execute(sa.text("DELETE FROM projects WHERE id = :id").bindparams(id=str(GENERAL_PROJECT_ID)))
+    op.execute(
+        sa.text("DELETE FROM projects WHERE id = :id").bindparams(
+            sa.bindparam("id", GENERAL_PROJECT_ID, type_=sa.Uuid())
+        )
+    )
     op.drop_table("projects")

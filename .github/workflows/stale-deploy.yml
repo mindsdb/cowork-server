@@ -1,0 +1,18 @@
+# Scheduled wrapper: every day at 12:00 UTC, strip the `deploy` label from any
+# cowork-server PR that's been idle for 3+ days. The label drives the per-PR
+# ArgoCD env ApplicationSet, removing it triggers env teardown.
+name: Stale deploy-label cleanup
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  prune:
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+    uses: mindsdb/github-actions/.github/workflows/stale-deploy-label.yml@main
+    with:
+      target-repo: mindsdb/cowork-server
