@@ -34,7 +34,7 @@ def _rows_for(session, conversation_id) -> list[TaskObject]:
 
 
 def test_delete_conversation_drops_task_objects(session):
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
     TaskObjectService(session).index_artifact(conv.id, GENERAL_PROJECT_ID, "my-artifact")
     assert _rows_for(session, conv.id), "precondition: artifact indexed"
@@ -46,7 +46,7 @@ def test_delete_conversation_drops_task_objects(session):
 def test_clear_all_history_drops_task_objects(session):
     """Truncating from turn 0 (the UI's 'delete chat history') leaves the
     conversation but removes everything — its object index goes too."""
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
     # One full turn: user message + assistant turn (mirrors a real exchange).
     from cowork.models.message import Message
@@ -64,7 +64,7 @@ def test_clear_all_history_drops_task_objects(session):
 def test_partial_turn_delete_keeps_task_objects(session):
     """Deleting a later turn (not turn 0) is a partial truncation — the
     surviving turns may still reference the artifact, so leave the index."""
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
     from cowork.models.message import Message
 
@@ -102,7 +102,7 @@ def _attachment_rows(session, conversation_id):
 
 
 def test_delete_conversation_removes_attachment_rows_and_bytes(session):
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
     f = _attach(session, conv.id)
     path = Path(f.path)
@@ -114,7 +114,7 @@ def test_delete_conversation_removes_attachment_rows_and_bytes(session):
 
 
 def test_delete_conversation_leaves_other_conversations_and_purposes(session):
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     keep = svc.create_conversation("keep", project_id=GENERAL_PROJECT_ID)
     doomed = svc.create_conversation("doomed", project_id=GENERAL_PROJECT_ID)
     keep_file = _attach(session, keep.id)
@@ -134,7 +134,7 @@ def test_delete_conversation_leaves_other_conversations_and_purposes(session):
 
 def test_delete_project_cascades_conversations_and_attachments(session):
     proj = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project("eng701-cascade-test")
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=proj.id)
     f = _attach(session, conv.id)
     path = Path(f.path)
@@ -152,7 +152,7 @@ def test_delete_project_survives_one_conversation_delete_failure(session, monkey
     """Fault isolation: if one conversation fails to delete, the project delete
     must still complete and clean up the rest — not abort half-cascaded."""
     proj = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project("eng701-fault-test")
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     bad = svc.create_conversation("bad", project_id=proj.id)
     good = svc.create_conversation("good", project_id=proj.id)
     _attach(session, bad.id)
@@ -184,7 +184,7 @@ def test_delete_project_rolls_back_a_partially_staged_failed_conversation(sessio
     those pending deletes, wiping the failed conversation's data while its row
     survives (the ghost ea-rus flagged on #187)."""
     proj = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project("eng701-rollback-test")
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     bad = svc.create_conversation("bad", project_id=proj.id)
     good = svc.create_conversation("good", project_id=proj.id)
     bad_file = _attach(session, bad.id)
@@ -221,7 +221,7 @@ def test_delete_by_purpose_stages_without_committing(session):
     'ghost' conversation (row present, contents gone). Proof: after
     delete_by_purpose, a rollback brings the rows back, and the bytes are still
     on disk (unlink is the caller's post-commit step)."""
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
     _attach(session, conv.id)
 
