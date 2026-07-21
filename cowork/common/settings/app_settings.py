@@ -272,9 +272,9 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        # Legacy COWORK_SERVER_PORT must stay: shipped desktop builds hand the
-        # derived per-user port under that name (ENG-439). K8s auto-injects it
-        # as a tcp:// URI on `cowork-server` pods — discarded below.
+        # One name per context: the desktop app hands the sidecar its port as
+        # COWORK_SERVER_PORT (ENG-439); k8s/cloud sets COWORK_LISTEN_PORT,
+        # which wins because k8s auto-injects the former as a tcp:// URI.
         validation_alias=AliasChoices("COWORK_LISTEN_PORT", "COWORK_SERVER_PORT"),
         description="The port to run the server on",
     )
