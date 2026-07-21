@@ -146,13 +146,10 @@ class ResponsesHandler:
             )
             return sse_from_buffer(buffer, 0)
 
-        # Non-streaming (legacy/rare): persist the user message inline (via FK,
-        # not the relationship, so the cached history above stays clean) and
-        # run synchronously within the request.
-        user_message = ConversationService(self.scoped).save_user_message(
-            conversation.id, original_content,
-        )
-
+        # Non-streaming (legacy/rare): run synchronously within the request.
+        # The user message is persisted by _collect after the turn (deferred),
+        # so the harness reads history WITHOUT the current turn — otherwise the
+        # fresh-query history would replay it AND resend it as the live input.
         stream = self.harness.stream_response(
             conversation=conversation,
             input=harness_input,
@@ -160,7 +157,7 @@ class ResponsesHandler:
             trace_tags=request.trace_tags,
             trace_metadata=trace_metadata,
         )
-        return await self._collect(stream, conversation.id, request.model, str(user_message.id))
+        return await self._collect(stream, conversation.id, request.model, original_content)
 
     async def _produce(
         self,
@@ -306,7 +303,7 @@ class ResponsesHandler:
         stream,
         conversation_id: UUID,
         model: str,
-        output_item_id: str,
+        original_content,
     ) -> Response:
         collected_text: list[str] = []
         collected_events: list[dict] = []
@@ -337,12 +334,17 @@ class ResponsesHandler:
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
 
         assistant_text = "".join(collected_text)
+        # Persist the user message now — after the harness has read history for
+        # this turn — so it isn't replayed into the turn as duplicate context.
+        user_message = ConversationService(self.scoped).save_user_message(
+            conversation_id, original_content,
+        )
         self._save_assistant_turn(conversation_id, assistant_text, collected_events, turn_rows)
 
         return Response(
             status=ResponseStatus.completed,
             model=model,
-            output=[self._build_output(output_item_id, assistant_text)],
+            output=[self._build_output(str(user_message.id), assistant_text)],
         )
 
     def _save_assistant_turn(

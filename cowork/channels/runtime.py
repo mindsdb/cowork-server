@@ -421,7 +421,6 @@ class AntonChannelRuntime:
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
         scoped = ScopedSession(session, scope_for_background_context())
-        ConversationService(scoped).save_user_message(conversation.id, content)
 
         collected: list[str] = []
         events: list[dict] = []
@@ -442,8 +441,16 @@ class AntonChannelRuntime:
             input=blocks,
             channel_context=channel_context,
         )
-        async for _chunk in harness.formatter(stream, harness_id, event_sink):
-            pass
+        try:
+            async for _chunk in harness.formatter(stream, harness_id, event_sink):
+                pass
+        finally:
+            # Persist the user message only after the harness has read this
+            # turn's history (it reads via a fresh query). Persisting earlier
+            # would replay the message into this turn AND resend it as the live
+            # input. In `finally` so a crashed turn still records the inbound
+            # message, matching the pre-history-replay behaviour.
+            ConversationService(scoped).save_user_message(conversation.id, content)
 
         reply = "".join(collected)
         ConversationService(scoped).save_assistant_turn(
