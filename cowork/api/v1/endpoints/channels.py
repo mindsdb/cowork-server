@@ -67,10 +67,16 @@ def list_installations(session: SessionDep) -> list[ChannelInstallationResponse]
 
 def _harness_options() -> list[str]:
     # Registered harness ids, resolved at request time (after plugins/harnesses
-    # have loaded — they aren't available when app_settings parses env).
+    # have loaded — they aren't available when app_settings parses env). Org
+    # mode hides harnesses that don't support multi-tenancy (see user_settings).
+    from cowork.common.settings.app_settings import get_app_settings
     from cowork.harnesses.base import _registry
 
-    return list(_registry.keys())
+    org_mode = get_app_settings().tenancy_mode == "org"
+    return [
+        hid for hid, cls in _registry.items()
+        if not org_mode or getattr(cls, "supports_org_mode", True)
+    ]
 
 
 @router.get("/agent", response_model=ChannelAgentResponse)

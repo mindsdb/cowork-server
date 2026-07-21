@@ -11,15 +11,13 @@ import mimetypes
 import os
 import shutil
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlmodel import Session
 
-from cowork.db.scoped import ScopedSessionDep
-from cowork.db.session import get_session
+from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +43,8 @@ def oauth_start(service: str, body: dict[str, Any] | None = None):
 # These endpoints exist as a compat bridge for the current client.
 
 attachments_router = APIRouter()
-_SessionDep = Annotated[Session, Depends(get_session)]
+# Attachment stubs use the session only for File/Project services — scoped module-wide.
+_SessionDep = ScopedSessionDep
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:
@@ -113,6 +112,8 @@ async def upload_attachment(
         try:
             created = await svc.create_file(upload=f, purpose=purpose)
             results.append(_to_attachment(svc.get_file_row(UUID(created.id))))
+        except MissingTenantScopeError:
+            raise  # auth problem — the app-level handler answers 401
         except Exception as exc:
             # Previously any failure here surfaced as an opaque 500 with no
             # server log (e.g. an over-long `purpose` failing model
@@ -178,13 +179,13 @@ def _unique_project_target(project_dir: Path, filename: str) -> Path:
 
 @attachments_router.post("/{project_name}/{session_id}/{attachment_id}/move-to-project")
 def move_attachment_to_project(
-    project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep, scoped: ScopedSessionDep
+    project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep
 ):
     from cowork.services.files import FileService
     from cowork.services.projects import ProjectService
 
     try:
-        project = ProjectService(scoped).get_project_by_name(project_name)
+        project = ProjectService(session).get_project_by_name(project_name)
         content_type, filename, source = FileService(session).get_file_content(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
