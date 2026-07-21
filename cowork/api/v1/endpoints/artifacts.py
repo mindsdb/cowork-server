@@ -221,8 +221,11 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
+    if not path or not path.strip() or "\x00" in path or path.lstrip().startswith("~"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
     try:
-        requested = os.path.realpath(Path(path).expanduser())
+        requested = os.path.realpath(Path(path))
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
     for project in ProjectService(session).list_projects():
