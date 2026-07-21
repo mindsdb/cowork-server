@@ -691,3 +691,51 @@ async def test_stream_emits_provider_overloaded_with_model():
     assert payload["code"] == "provider_overloaded"
     assert payload["error"] == _OVERLOAD_MSG
     assert payload["model"] == "sonnet"
+
+
+async def test_overloaded_reconnectable_keys_on_the_failing_model_not_planning():
+    # ENG-673 (Sam's review): planning=MindsHub, coding=BYOK. When the CODING
+    # model overloads, the card must reflect the BYOK provider that actually
+    # failed — reconnectable=False so the MindsHub failover nudge is shown — NOT
+    # reconnectable=True (which planning=MindsHub would wrongly imply, suppressing
+    # the nudge that would help).
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _FakeSettings:
+        resolved_planning_model = "latest:sonnet"
+        resolved_coding_model = "latest:haiku"
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+
+    exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:haiku")  # the coding model
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == "provider_overloaded"
+    assert payload["model"] == "latest:haiku"
+    assert payload["reconnectable"] is False
+    assert payload["provider_label"] == Provider.ANTHROPIC.label
+
+
+async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
+    # The mirror case: the failing (planning) model is on MindsHub Cloud → already
+    # routed through failover, so no pitch — reconnectable=True (Retry-only).
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _FakeSettings:
+        resolved_planning_model = "latest:sonnet"
+        resolved_coding_model = "latest:haiku"
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.MINDS_CLOUD
+
+    exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:sonnet")  # the planning model
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["reconnectable"] is True
