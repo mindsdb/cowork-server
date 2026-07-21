@@ -3,8 +3,9 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import case
-from sqlmodel import Session, select
+from sqlmodel import select
 
+from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
@@ -24,7 +25,7 @@ _MESSAGE_ORDER = (
 
 
 class ConversationService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     def list_conversations(
@@ -33,7 +34,7 @@ class ConversationService:
         limit: int = 50,
         all_projects: bool = False,
     ) -> list[Conversation]:
-        stmt = select(Conversation)
+        stmt = self.session.select(Conversation)
         if not all_projects:
             stmt = stmt.where(Conversation.project_id == (project_id or GENERAL_PROJECT_ID))
         stmt = stmt.order_by(Conversation.created_at.desc()).limit(limit)  # type: ignore[union-attr]
@@ -54,9 +55,15 @@ class ConversationService:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
         against it before the first stream creates the conversation."""
+        # Anchor the parent: the target project must be visible in scope —
+        # otherwise org A could link a conversation to org B's project and
+        # leak its name/path through serialization.
+        target_project_id = project_id or GENERAL_PROJECT_ID
+        if self.session.get(Project, target_project_id) is None:
+            raise ValueError("Project not found")
         conversation = Conversation(
             topic=topic,
-            project_id=project_id or GENERAL_PROJECT_ID,
+            project_id=target_project_id,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
@@ -68,7 +75,9 @@ class ConversationService:
     def project_by_name(self, name: str | None) -> Project | None:
         if not name:
             return None
-        return self.session.exec(select(Project).where(Project.name == name)).first()
+        return self.session.exec(
+            self.session.select(Project).where(Project.name == name)
+        ).first()
 
     def update_conversation(
         self,
@@ -82,6 +91,9 @@ class ConversationService:
         if topic is not None:
             conversation.topic = topic
         if project_id is not None:
+            # Anchor the move target: the project must be visible in scope.
+            if self.session.get(Project, project_id) is None:
+                raise ValueError("Project not found")
             conversation.project_id = project_id
         self.session.add(conversation)
         self.session.commit()
@@ -93,20 +105,22 @@ class ConversationService:
         if conversation is None:
             return False
         messages = self.session.exec(
-            select(Message)
+            self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
             .order_by(*_MESSAGE_ORDER)
         ).all()
         for message in messages:
             for event in self.session.exec(
-                select(MessageEvent).where(MessageEvent.message_id == message.id)
+                self.session.select(MessageEvent).where(MessageEvent.message_id == message.id)
             ).all():
                 self.session.delete(event)
             self.session.delete(message)
         # Drop the conversation's object index too — otherwise the rows
         # outlive the conversation as orphans pointing at artifacts no
         # task owns anymore.
-        TaskObjectService(self.session).delete_for_conversation(conversation_id)
+        # Raw session until the files/task_objects sweep; the parent
+        # conversation was already loaded through the scope above.
+        TaskObjectService(unsafe_unscoped_session(self.session)).delete_for_conversation(conversation_id)
         # Drop the conversation's uploaded attachments (rows + bytes) — they're
         # keyed by conversation id and would otherwise orphan in the file store
         # forever, invisible in any UI (ENG-701). Stage the row deletes into
@@ -118,7 +132,7 @@ class ConversationService:
             attachment_purpose,
             unlink_file_dirs,
         )
-        attachment_dirs = FileService(self.session).delete_by_purpose(
+        attachment_dirs = FileService(unsafe_unscoped_session(self.session)).delete_by_purpose(
             attachment_purpose(str(conversation_id))
         )
         self.session.delete(conversation)
@@ -136,7 +150,7 @@ class ConversationService:
         self.get_conversation(conversation_id)  # raises if not found
         messages = list(
             self.session.exec(
-                select(Message)
+                self.session.select(Message)
                 .where(Message.conversation_id == conversation_id)
                 .order_by(*_MESSAGE_ORDER)
             ).all()
@@ -160,7 +174,7 @@ class ConversationService:
         to_delete = messages[cut_from:]
         for msg in to_delete:
             for event in self.session.exec(
-                select(MessageEvent).where(MessageEvent.message_id == msg.id)
+                self.session.select(MessageEvent).where(MessageEvent.message_id == msg.id)
             ).all():
                 self.session.delete(event)
             self.session.delete(msg)
@@ -171,7 +185,7 @@ class ConversationService:
         # truncation leaves the index alone (rows aren't turn-scoped, and
         # surviving turns may still reference the artifact).
         if cut_from == 0:
-            TaskObjectService(self.session).delete_for_conversation(conversation_id)
+            TaskObjectService(unsafe_unscoped_session(self.session)).delete_for_conversation(conversation_id)
         self.session.commit()
         return len(to_delete)
 
@@ -189,6 +203,10 @@ class ConversationService:
         # reload so the inline card replays identically.
         if not text and not events:
             return
+        # Anchor the write to a parent loaded through THIS session's scope —
+        # detached writers (producer) call this on a fresh session, and the
+        # conversation may be gone or out-of-scope by now.
+        self.get_conversation(conversation_id)
         assistant_msg = Message(
             conversation_id=conversation_id,
             role="assistant",
@@ -211,14 +229,14 @@ class ConversationService:
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
         messages = self.session.exec(
-            select(Message)
+            self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
             .order_by(*_MESSAGE_ORDER)
         ).all()
         result = []
         for message in messages:
             events = self.session.exec(
-                select(MessageEvent)
+                self.session.select(MessageEvent)
                 .where(MessageEvent.message_id == message.id)
                 .order_by(MessageEvent.sequence_number)
             ).all()

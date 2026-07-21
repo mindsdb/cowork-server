@@ -66,6 +66,21 @@ def get_tenant_scope(request: Request) -> TenantScope:
     return scope_from_principal(get_principal(request))
 
 
+def scope_for_background_context() -> TenantScope:
+    """Scope for code with no request principal (scheduler, channels).
+
+    Local mode → LOCAL_SCOPE (today's behavior). Org mode → fail closed:
+    background work needs a service principal (deferred to the service-identity
+    ticket), and org mode must never silently write unscoped rows that users
+    can't see. Fail loud instead of creating invisible data.
+    """
+    if get_app_settings().tenancy_mode != "org":
+        return LOCAL_SCOPE
+    raise MissingTenantScopeError(
+        "background conversation creation requires a service principal (not yet implemented in org mode)"
+    )
+
+
 def _is_org_scoped(model: type) -> bool:
     return hasattr(model, "org_id")
 
@@ -211,6 +226,9 @@ class ScopedSession:
 
     def rollback(self) -> None:
         self._session.rollback()
+
+    def close(self) -> None:
+        self._session.close()
 
 
 def unsafe_unscoped_session(scoped: ScopedSession) -> Session:
