@@ -23,10 +23,6 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
-    # Postgres driver for cloud deploys. Desktop installs default to SQLite;
-    # the cloud Helm chart points DATABASE_URI at Postgres, and SQLAlchemy
-    # needs a driver present or postgresql:// fails at connect. psycopg v3
-    # ships binary wheels, so no build toolchain in the image.
     "psycopg[binary]>=3.2",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
