@@ -161,7 +161,7 @@ def test_collect_raises_400_with_curated_message_for_image_error():
         Exception("'image_url' does not match the expected tags: 'image'")
     )
     with pytest.raises(HTTPException) as err:
-        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
     assert "PNG or JPEG" in err.value.detail
 
@@ -169,7 +169,7 @@ def test_collect_raises_400_with_curated_message_for_image_error():
 def test_collect_raises_500_generic_for_unmapped_error():
     handler = _handler_with_raising_formatter(Exception("kaboom: secret-token-xyz"))
     with pytest.raises(HTTPException) as err:
-        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 500
     assert err.value.detail == te.GENERIC_TURN_ERROR_MESSAGE
     assert "secret-token" not in err.value.detail
@@ -240,7 +240,7 @@ async def test_stream_emits_friendly_failed_event_for_token_limit():
 def test_collect_raises_400_with_curated_message_for_token_limit():
     handler = _handler_with_raising_formatter(Exception(_TOKEN_LIMIT_MESSAGE))
     with pytest.raises(HTTPException) as err:
-        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
     assert err.value.detail == te.TOKEN_LIMIT_USER_MESSAGE
 
@@ -393,7 +393,7 @@ def test_collect_raises_400_with_plan_message_for_model_403():
         _FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet")
     )
     with pytest.raises(HTTPException) as err:
-        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", output_item_id="msg-1"))
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
     assert err.value.detail == _PLAN_MSG
 
