@@ -33,12 +33,27 @@ from cowork.services.channel_lifecycle import (
     ChannelLifecycleService,
     LifecycleNotImplementedError,
 )
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
 from cowork.harnesses.base import available_harness_ids
 
 router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
+
+
+def _require_local_channels() -> None:
+    """Channel credentials, adapters, and the harness setting are
+    deployment-global (settings-backed, one installation per channel type).
+    Until installations are org-owned, org mode must not expose them — any
+    tenant could read/delete another's credentials or drive the shared
+    adapter. The runtime side already fails closed; this closes the config
+    side."""
+    if get_app_settings().tenancy_mode == "org":
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="channels are not available in org deployments yet",
+        )
 
 
 def _live_adapters(request: Request):
@@ -86,6 +101,7 @@ def set_channel_agent(
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 
+    _require_local_channels()
     options = available_harness_ids()
     harness = (body.harness or "").strip()
     if harness not in options:
@@ -107,6 +123,7 @@ def set_channel_agent(
 
 @router.get("/{channel_type}/config", response_model=ChannelConfigResponse)
 def get_config(channel_type: str, scoped: ScopedSessionDep) -> ChannelConfigResponse:
+    _require_local_channels()
     try:
         return ChannelConfigService(scoped).get_config(channel_type)
     except UnknownChannelError:
@@ -120,6 +137,7 @@ async def set_config(
     request: Request,
     scoped: ScopedSessionDep,
 ) -> ChannelConfigResponse:
+    _require_local_channels()
     try:
         result = ChannelConfigService(scoped).set_config(channel_type, body.values)
     except UnknownChannelError:
@@ -136,6 +154,7 @@ async def set_config(
 
 @router.delete("/{channel_type}/config", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_config(channel_type: str, request: Request, scoped: ScopedSessionDep) -> None:
+    _require_local_channels()
     try:
         deleted = ChannelConfigService(scoped).delete_config(channel_type)
     except UnknownChannelError:
@@ -155,6 +174,7 @@ async def delete_config(channel_type: str, request: Request, scoped: ScopedSessi
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
 async def reload_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
+    _require_local_channels()
     try:
         ChannelConfigService(scoped).get_config(channel_type)
     except UnknownChannelError:
@@ -199,6 +219,7 @@ def delete_binding(binding_id: UUID, scoped: ScopedSessionDep) -> None:
 
 
 def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecycleService:
+    _require_local_channels()
     adapters = _live_adapters(request)
     if adapters is None:
         raise HTTPException(
