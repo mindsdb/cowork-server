@@ -273,7 +273,7 @@ class AppSettings(Settings):
     port: int = Field(
         default=26866,
         # One name per context: the desktop app hands the sidecar its port as
-        # COWORK_SERVER_PORT (ENG-439); k8s/cloud sets COWORK_LISTEN_PORT,
+        # COWORK_SERVER_PORT; k8s/cloud sets COWORK_LISTEN_PORT,
         # which wins because k8s auto-injects the former as a tcp:// URI.
         validation_alias=AliasChoices("COWORK_LISTEN_PORT", "COWORK_SERVER_PORT"),
         description="The port to run the server on",
