@@ -69,6 +69,7 @@ async def _reconcile_ingress(request: Request, channel_type: str) -> None:
 
 @router.get("/status", response_model=ChannelStatusResponse)
 def channel_status(scoped: ScopedSessionDep) -> ChannelStatusResponse:
+    _require_local_channels()  # `configured` reflects the global credentials
     return ChannelConfigService(scoped).status()
 
 
@@ -89,6 +90,7 @@ def get_channel_agent() -> ChannelAgentResponse:
     to whatever first served them)."""
     from cowork.common.settings.user_settings import get_user_settings
 
+    _require_local_channels()  # the harness setting is deployment-global
     current = (get_user_settings().channels_harness or "").strip() or "anton"
     return ChannelAgentResponse(harness=current, options=available_harness_ids())
 
