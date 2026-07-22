@@ -474,23 +474,23 @@ def build_llm_client():
             return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
-    # Routing & summarization role (anton's "thalamus"): the cheap front-model
-    # that gates turns and runs history summarization. Only pass it when the
-    # installed anton's LLMClient accepts the kwargs — older builds predate
-    # ENG-648 and would TypeError, taking the whole agent down. When absent,
-    # anton falls back to the coding role internally, so behavior is preserved.
+    # Routing & summarization role: the cheap front-model that runs history
+    # summarization (and later gates turns). Only pass it when the installed
+    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
+    # would TypeError, taking the whole agent down. When absent, anton falls
+    # back to the coding role internally, so behavior is preserved.
     import inspect as _inspect
 
-    thalamus_kw: dict = {}
+    router_kw: dict = {}
     try:
         _params = _inspect.signature(LLMClient.__init__).parameters
-        if "thalamus_provider" in _params:
-            thalamus_kw = {
-                "thalamus_provider": _make_provider(settings.resolved_router_provider, None),
-                "thalamus_model": settings.resolved_router_model,
+        if "router_provider" in _params:
+            router_kw = {
+                "router_provider": _make_provider(settings.resolved_router_provider, None),
+                "router_model": settings.resolved_router_model,
             }
     except (ValueError, TypeError):
-        thalamus_kw = {}
+        router_kw = {}
 
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at
@@ -505,7 +505,7 @@ def build_llm_client():
             settings.resolved_coding_provider, settings.coding_reasoning_effort
         ),
         coding_model=settings.resolved_coding_model,
-        **thalamus_kw,
+        **router_kw,
     )
 
 

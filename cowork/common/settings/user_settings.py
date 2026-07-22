@@ -257,11 +257,11 @@ class UserSettings(Settings):
             "model's default. Only meaningful for models that advertise effort levels."
         ),
     )
-    # Router role = anton's "thalamus": the cheap front-model that gates each
-    # turn (respond-vs-delegate) and runs history summarization. Selectable so
-    # a user can point routing + summarization at a cheap model independently
-    # of the coding (scratchpad) model. Falls back to the coding role in anton
-    # when unset, so leaving these at defaults is behavior-preserving.
+    # Router role: the cheap front-model that runs history summarization (and
+    # later gates each turn, respond-vs-delegate). Selectable so a user can
+    # point routing + summarization at a cheap model independently of the
+    # coding (scratchpad) model. Falls back to the coding role in anton when
+    # unset, so leaving these at defaults is behavior-preserving.
     router_provider: Provider = Field(
         default=Provider.ANTHROPIC,
         title="Routing & Summarization Provider",
