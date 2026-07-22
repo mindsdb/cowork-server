@@ -29,31 +29,33 @@ def test_app_settings_rejects_invalid_cowork_listen_port(monkeypatch):
         AppSettings(_env_file=None)
 
 
-def test_app_settings_reads_legacy_cowork_server_port(monkeypatch):
-    # The desktop app spawns the sidecar with COWORK_SERVER_PORT; shipped
-    # Electron builds cannot be hot-updated, so the legacy name must work.
+def test_app_settings_reads_desktop_cowork_server_port(monkeypatch):
+    # The desktop app hands the derived per-user port to the sidecar as
+    # COWORK_SERVER_PORT (ENG-439). Regression: dropping this alias made the
+    # server bind :26866 while the app health-polled the derived port.
     monkeypatch.delenv("COWORK_LISTEN_PORT", raising=False)
-    monkeypatch.setenv("COWORK_SERVER_PORT", "9999")
+    monkeypatch.setenv("COWORK_SERVER_PORT", "27735")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.port == 27735
+
+
+def test_app_settings_listen_port_wins_over_server_port(monkeypatch):
+    monkeypatch.setenv("COWORK_LISTEN_PORT", "9999")
+    monkeypatch.setenv("COWORK_SERVER_PORT", "27735")
 
     settings = AppSettings(_env_file=None)
 
     assert settings.port == 9999
 
 
-def test_app_settings_listen_port_wins_over_legacy_alias(monkeypatch):
-    monkeypatch.setenv("COWORK_LISTEN_PORT", "8888")
-    monkeypatch.setenv("COWORK_SERVER_PORT", "9999")
-
-    settings = AppSettings(_env_file=None)
-
-    assert settings.port == 8888
-
-
-def test_app_settings_ignores_k8s_service_link_port(monkeypatch):
-    # K8s injects COWORK_SERVER_PORT=tcp://<ip>:<port> on pods colocated
-    # with a `cowork-server` Service; it must not break startup.
+def test_app_settings_ignores_k8s_injected_server_port_uri(monkeypatch):
+    # K8s auto-injects COWORK_SERVER_PORT=tcp://<ip>:<port> on any pod
+    # colocated with a `cowork-server` Service — must fall back to the
+    # default, not fail int parsing.
     monkeypatch.delenv("COWORK_LISTEN_PORT", raising=False)
-    monkeypatch.setenv("COWORK_SERVER_PORT", "tcp://10.3.0.12:26866")
+    monkeypatch.setenv("COWORK_SERVER_PORT", "tcp://10.0.0.5:26866")
 
     settings = AppSettings(_env_file=None)
 
@@ -70,6 +72,8 @@ def test_app_settings_listen_port_wins_over_service_link_uri(monkeypatch):
 
 
 def test_app_settings_rejects_invalid_legacy_server_port(monkeypatch):
+    # Only the K8s tcp:// URI shape is discarded; other malformed values on
+    # the legacy alias must still fail loudly.
     monkeypatch.delenv("COWORK_LISTEN_PORT", raising=False)
     monkeypatch.setenv("COWORK_SERVER_PORT", "invalid")
 
