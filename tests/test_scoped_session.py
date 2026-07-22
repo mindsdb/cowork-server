@@ -52,6 +52,16 @@ class ChildNote(SQLModel, table=True):
     title: str = ""
 
 
+class DeferredNote(SQLModel, table=True):
+    # org_id present but scoping deferred — the settings shape (inert scope
+    # columns until the settings split). Deferral is granted by the closed
+    # allowlist in cowork/db/scoped.py, not by anything on the model; the
+    # deferred-model tests patch that allowlist to include this table.
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: str | None = Field(default=None, index=True)
+    title: str = ""
+
+
 @pytest.fixture()
 def session():
     engine = create_engine(
@@ -61,6 +71,7 @@ def session():
     PlainNote.__table__.create(engine)
     AuthoredNote.__table__.create(engine)
     ChildNote.__table__.create(engine)
+    DeferredNote.__table__.create(engine)
     with Session(engine) as s:
         s.add(ScopedNote(org_id=ORG_A, title="a1"))
         s.add(ScopedNote(org_id=ORG_A, title="a2"))
@@ -294,11 +305,75 @@ def test_org_mode_without_org_still_allows_unscoped_models(session):
     assert [n.title for n in scoped.exec(scoped.select(PlainNote)).all()] == ["plain"]
 
 
+# ── deferred models (the settings shape) ────────────────────────────────────
+
+@pytest.fixture()
+def _defer_note(monkeypatch):
+    """Grant DeferredNote a slot on the closed allowlist for one test."""
+    import cowork.db.scoped as scoped_mod
+
+    monkeypatch.setattr(
+        scoped_mod,
+        "_TENANCY_DEFERRED_TABLES",
+        scoped_mod._TENANCY_DEFERRED_TABLES | {DeferredNote.__tablename__},
+    )
+
+
+def test_deferral_is_allowlist_gated_not_model_gated(session):
+    # Without an allowlist entry, an org_id-bearing model is scoped no matter
+    # what the model itself declares — there is no model-side opt-out.
+    scoped = ScopedSession(session, _org_scope())
+    note = scoped.add(DeferredNote(title="scoped-by-default"))
+    assert note.org_id == ORG_A
+
+
+def test_deferred_model_select_is_unfiltered_in_org_mode(session, _defer_note):
+    # Rows written before the settings split (NULL org, e.g. env-seeded)
+    # must stay visible to org-mode reads.
+    session.add(DeferredNote(org_id=None, title="env-seeded"))
+    session.add(DeferredNote(org_id=ORG_B, title="other-org"))
+    session.commit()
+    scoped = ScopedSession(session, _org_scope())
+    titles = {n.title for n in scoped.exec(scoped.select(DeferredNote)).all()}
+    assert titles == {"env-seeded", "other-org"}
+
+
+def test_deferred_model_add_is_not_stamped(session, _defer_note):
+    scoped = ScopedSession(session, _org_scope())
+    note = scoped.add(DeferredNote(title="unstamped"))
+    scoped.commit()
+    assert note.org_id is None
+
+
+def test_deferred_model_flush_is_not_stamped(session, _defer_note):
+    # The unswept-service flush hook must leave deferred rows alone too.
+    ScopedSession(session, _org_scope())
+    session.add(DeferredNote(title="from-raw-session"))
+    session.commit()
+    row = session.exec(select(DeferredNote).where(DeferredNote.title == "from-raw-session")).one()
+    assert row.org_id is None
+
+
+def test_deferred_model_ignores_missing_org(session, _defer_note):
+    # Fail-closed does not apply: deferred models behave like unscoped ones.
+    scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=None))
+    scoped.add(DeferredNote(title="no-org-in-scope"))
+    scoped.commit()
+    assert scoped.exec(scoped.select(DeferredNote)).all()
+
+
 # ── escape hatch ────────────────────────────────────────────────────────────
 
 def test_unsafe_escape_hatch_is_the_raw_session(session):
     scoped = ScopedSession(session, _org_scope())
     assert unsafe_unscoped_session(scoped) is session
+
+
+def test_wrapping_a_scoped_session_is_rejected(session):
+    # A wrapper-of-wrapper breaks exec() silently later — fail at construction.
+    scoped = ScopedSession(session, _org_scope())
+    with pytest.raises(TypeError, match="cannot wrap"):
+        ScopedSession(scoped, _org_scope())
 
 
 # ── get_tenant_scope dependency ─────────────────────────────────────────────
