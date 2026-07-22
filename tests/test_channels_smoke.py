@@ -715,13 +715,14 @@ def test_channel_agent_endpoint_validates_and_persists():
     from cowork.services.settings import SettingService
 
     session = get_open_session()
+    scoped = ScopedSession(session, LOCAL_SCOPE)
     try:
         # Unknown harness is rejected, not persisted.
         with pytest.raises(HTTPException) as exc:
-            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session)
+            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session, scoped)
         assert exc.value.status_code == 400
 
-        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session)
+        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session, scoped)
         assert resp.harness == "hermes"
         assert "anton" in resp.options and "hermes" in resp.options
         assert get_channel_agent().harness == "hermes"
@@ -760,7 +761,7 @@ def test_channel_agent_switch_resets_bound_conversations():
         session.refresh(binding)
         bid = binding.id
 
-        reset = ChannelBindingService(session).reset_conversations(channel_type="telegram")
+        reset = ChannelBindingService(ScopedSession(session, LOCAL_SCOPE)).reset_conversations(channel_type="telegram")
         assert reset >= 1
         session.expire_all()
         assert session.get(ChannelBinding, bid).anton_conversation_id is None
@@ -867,7 +868,7 @@ def test_binding_project_change_detaches_conversation():
         session.add(ChannelSession(binding_id=bid, external_session_key="__default__"))
         session.commit()
 
-        svc = ChannelBindingService(session)
+        svc = ChannelBindingService(ScopedSession(session, LOCAL_SCOPE))
 
         # Same project: conversation stays pinned.
         svc.update(bid, BindingUpdateRequest(anton_project_id=GENERAL_PROJECT_ID))

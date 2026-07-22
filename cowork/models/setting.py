@@ -6,6 +6,9 @@ from cowork.models.base import BaseSQLModel
 class Setting(BaseSQLModel, table=True):
     __tablename__ = "settings"
 
+    # Scope columns are inert until the settings split — see
+    # _TENANCY_DEFERRED_TABLES in cowork/db/scoped.py.
+
     key: str = Field(max_length=128, unique=True, index=True)
     value: str
     # No indexes yet — the only live query path is by `key`.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Index, UniqueConstraint
+from sqlalchemy import Index, text
 from sqlmodel import Field
 
 from .base import BaseSQLModel
@@ -17,6 +17,15 @@ class Pin(BaseSQLModel, table=True):
     org_id: str | None = Field(default=None, max_length=36, description="Org of the pinned item; NULL on local/desktop rows")
 
     __table_args__ = (
-        UniqueConstraint("item_type", "item_id"),
+        # One pin per (item, user, org); COALESCE keeps NULL desktop rows on
+        # the old one-pin-per-item rule. Full rationale: migration d2e8f1a4c7b9.
+        Index(
+            "uq_pins_item_user",
+            "item_type",
+            "item_id",
+            text("coalesce(user_id, '')"),
+            text("coalesce(org_id, '')"),
+            unique=True,
+        ),
         Index("ix_pins_user_id_org_id", "user_id", "org_id"),
     )
