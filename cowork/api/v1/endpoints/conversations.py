@@ -20,12 +20,16 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-def _serialize_conversation(c):
+def _serialize_conversation(c, updated_at=None):
+    # `updated_at` is the conversation's last-activity time, derived from its
+    # messages (ENG-961) — the stored `modified_at` only moves on rename/move,
+    # so it can't be trusted as "recent". Callers pass the derived value;
+    # falling back to `created_at` keeps a message-less conversation stable.
     return ConversationListItem.serialize({
         "id": c.id,
         "title": c.topic,
         "preview": c.topic,
-        "updated_at": c.modified_at or c.created_at,
+        "updated_at": updated_at or c.created_at,
         "created_at": c.created_at,
         "project": c.project.name if c.project else None,
         "project_path": c.project.path if c.project else None,
@@ -47,10 +51,10 @@ def list_conversations(
         proj = ProjectService(scoped).get_project_by_name_or_none(project)
         if proj is not None:
             resolved_project_id = proj.id
-    convs = ConversationService(scoped).list_conversations(
+    convs = ConversationService(scoped).list_conversations_with_activity(
         project_id=resolved_project_id, limit=limit, all_projects=all_projects,
     )
-    return {"conversations": [_serialize_conversation(c) for c in convs]}
+    return {"conversations": [_serialize_conversation(c, updated_at=activity) for c, activity in convs]}
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -74,10 +78,12 @@ def create_conversation(body: ConversationCreateRequest, scoped: ScopedSessionDe
 
 @router.get("/{conversation_id}")
 def get_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
+    svc = ConversationService(scoped)
     try:
-        return _serialize_conversation(ConversationService(scoped).get_conversation(conversation_id))
+        conversation = svc.get_conversation(conversation_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
 
 
 @router.patch("/{conversation_id}")
@@ -93,7 +99,7 @@ def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, 
         conversation = svc.update_conversation(
             conversation_id, topic=body.topic or body.title, project_id=project_id
         )
-        return _serialize_conversation(conversation)
+        return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -126,7 +132,7 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
         TaskObjectService(session).relocate_to_project(conversation, source, dest)
 
     conversation = svc.update_conversation(conversation_id, project_id=dest.id)
-    return _serialize_conversation(conversation)
+    return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
 
 
 @router.get("/{conversation_id}/items")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import case
+from sqlalchemy import case, func
+from sqlalchemy import select as sa_select
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
@@ -78,17 +80,69 @@ class ConversationService:
         self.session.refresh(message)
         return message
 
+    def last_message_at(self, conversation_id: UUID) -> datetime | None:
+        """Timestamp of the most recent message, or None for an empty
+        conversation. This is the real "last activity" — the stored
+        `conversation.modified_at` only moves on rename/move, never on a turn
+        (ENG-961), so it must be derived from the messages themselves. The
+        `messages(conversation_id, created_at)` index makes this an index seek.
+        """
+        last = self.session.exec(
+            self.session.select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        ).first()
+        return last.created_at if last is not None else None
+
     def list_conversations(
         self,
         project_id: UUID | None = None,
         limit: int = 50,
         all_projects: bool = False,
     ) -> list[Conversation]:
+        """Conversations most-recently-*active* first. Ordering by derived
+        activity (not `created_at`) is what keeps the `limit` window holding
+        recently-*used* tasks rather than recently-*created* ones (ENG-961).
+
+        The order key is a correlated MAX(message.created_at) subquery rather
+        than a join+group_by so the statement stays a single-entity select —
+        the scoped session's org filter still applies and `exec()` returns
+        clean Conversation rows. Empty conversations coalesce to their own
+        `created_at` so a NULL max can't sort them to the end.
+        """
+        last_activity = func.coalesce(
+            sa_select(func.max(Message.created_at))
+            .where(Message.conversation_id == Conversation.id)
+            .correlate(Conversation)
+            .scalar_subquery(),
+            Conversation.created_at,
+        )
         stmt = self.session.select(Conversation)
         if not all_projects:
             stmt = stmt.where(Conversation.project_id == (project_id or GENERAL_PROJECT_ID))
-        stmt = stmt.order_by(Conversation.created_at.desc()).limit(limit)  # type: ignore[union-attr]
+        # created_at then id break ties deterministically so equal-activity rows
+        # (e.g. two empty conversations) keep a stable order across polls.
+        stmt = stmt.order_by(
+            last_activity.desc(), Conversation.created_at.desc(), Conversation.id
+        ).limit(limit)
         return list(self.session.exec(stmt).all())
+
+    def list_conversations_with_activity(
+        self,
+        project_id: UUID | None = None,
+        limit: int = 50,
+        all_projects: bool = False,
+    ) -> list[tuple[Conversation, datetime]]:
+        """`list_conversations` paired with each row's last-activity timestamp
+        for serialization. The value reuses `last_message_at` (an index seek on
+        the ENG-961 composite index); callers that don't need the value (e.g.
+        search indexing) use `list_conversations` and skip the per-row lookup.
+        """
+        convs = self.list_conversations(
+            project_id=project_id, limit=limit, all_projects=all_projects
+        )
+        return [(conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs]
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self.session.get(Conversation, conversation_id)
