@@ -30,8 +30,8 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 
 # Per-provider default model tuple served to the picker as `recommendedPair`.
 # Order: (planning, coding, router). The 3rd slot is the "routing and
-# summarization" role (anton's thalamus): MindsHub defaults to the cheap
-# `kimi`; direct providers use their smallest model. The frontend falls back
+# summarization" role: MindsHub defaults to the cheap `kimi`; direct
+# providers use their smallest model. The frontend falls back
 # to the coding slot when the 3rd is absent, so an older client still works.
 RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
     "minds-cloud": ("sonnet", "haiku", "kimi"),
@@ -62,8 +62,8 @@ CODING_MODEL_DEFAULTS: dict[str, str] = {
     "gemini": "gemini-2.5-flash",
     "minds_cloud": "haiku",
 }
-# Router role = anton's "thalamus": the cheap front-model that gates each turn
-# (respond-vs-delegate) AND runs history summarization. Defaults: MindsHub →
+# Router role: the cheap front-model that runs history summarization (and later
+# gates each turn, respond-vs-delegate). Defaults: MindsHub →
 # `kimi` (Kimi K2 — fast and cheap; the deprecated `latest:` prefix still
 # resolves but the bare alias is preferred), direct providers → their smallest
 # model (same as the coding tier). Keyed by Provider.value (snake_case).
