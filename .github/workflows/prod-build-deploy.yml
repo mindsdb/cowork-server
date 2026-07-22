@@ -25,7 +25,7 @@ jobs:
     uses: ./.github/workflows/tests-unit.yml
 
   build:
-    runs-on: mdb-prod
+    runs-on: mdb-dev
     outputs:
       image: ${{ steps.build.outputs.image }}
     env:
@@ -40,7 +40,7 @@ jobs:
           build-for-environment: production
 
   scan:
-    runs-on: mdb-prod
+    runs-on: mdb-dev
     needs: [ build ]
     name: Scan Minds Image
     steps:
