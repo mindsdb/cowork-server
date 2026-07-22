@@ -32,6 +32,19 @@ class Message(BaseSQLModel, table=True):
         default=None,
         description="Harness/agent that generated this message (e.g. 'anton', 'hermes')",
     )
+    # Authorship only — tenancy is scoped via the conversation (roots-only rule).
+    created_by: str | None = Field(default=None, max_length=36, description="User who authored the message; NULL on local/desktop rows")
+    seq: int = Field(
+        default=0,
+        sa_column_kwargs={"server_default": "0"},
+        description=(
+            "Per-conversation monotonic ordinal. Several block-messages "
+            "(assistant tool_use, user tool_result, ...) can share one "
+            "created_at (second precision); seq orders every message in the "
+            "conversation deterministically, without depending on that "
+            "resolution. Assigned as max(seq)+1 on insert; 0 for legacy rows."
+        ),
+    )
 
     message_events: list["MessageEvent"] = Relationship(
         sa_relationship_kwargs={"order_by": "MessageEvent.sequence_number"}
@@ -41,6 +54,13 @@ class Message(BaseSQLModel, table=True):
         """Convert to the OpenAI-compatible message format used in the API."""
         content = self.content
         if isinstance(content, list):
+            # Tool block-rows (tool_use / tool_result) must reach the model
+            # verbatim so the next turn sees prior tool calls and results.
+            if any(
+                isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+                for block in content
+            ):
+                return OpenAIMessage(role=self.role.value, content=content)
             text_parts = [
                 block.get("text", "")
                 for block in content

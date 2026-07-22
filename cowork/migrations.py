@@ -58,13 +58,17 @@ _ENV_TO_SETTING: dict[str, str] = {
     "ANTON_OPENAI_API_KEY_CUSTOM": "openai_compatible_api_key",
     "ANTON_GEMINI_API_KEY": "gemini_api_key",
     "ANTON_MINDS_API_KEY": "minds_api_key",
-    # Provider / model
+    # Provider selection. NOTE: ANTON_PLANNING_MODEL / ANTON_CODING_MODEL are
+    # deliberately NOT mapped (ENG-739). This table drives both the first-boot
+    # .env→DB seed (migrate_env_to_db) and the POST /settings/raw merge sync,
+    # the latter running on every desktop/web credential push and web token
+    # refresh. Syncing a model from .env would re-pin a user who recovered a
+    # locked-model 403 via the Settings picker (their .env may still hold a
+    # legacy `latest:` line). Models are product state that enters the DB only
+    # via explicit writes (picker / onboarding); .env model lines are CLI-only.
     "ANTON_PLANNING_PROVIDER": "planning_provider",
-    "ANTON_PLANNING_MODEL": "planning_model",
     "ANTON_CODING_PROVIDER": "coding_provider",
-    "ANTON_CODING_MODEL": "coding_model",
     "ANTON_ROUTER_PROVIDER": "router_provider",
-    "ANTON_ROUTER_MODEL": "router_model",
     # URLs
     "ANTON_MINDS_URL": "minds_url",
     "ANTON_OPENAI_BASE_URL": "openai_base_url",

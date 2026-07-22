@@ -20,6 +20,7 @@ class ChannelInstallation(BaseSQLModel, table=True):
         default="disconnected",
         description="Last known adapter state: disconnected | active | error",
     )
+    org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
 
 
 class ChannelBinding(BaseSQLModel, table=True):
@@ -47,6 +48,8 @@ class ChannelBinding(BaseSQLModel, table=True):
     display_name: str | None = Field(default=None, description="Human-facing label for the bound chat")
     trigger_rule: str = Field(default="always", description="always | mention_only | regex")
     trigger_pattern: str | None = Field(default=None, description="Regex source when trigger_rule = regex")
+    org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
+    created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
     instructions: str | None = Field(
         default=None,
         description="Operator instructions (persona, tone, scope) for turns served through this binding",

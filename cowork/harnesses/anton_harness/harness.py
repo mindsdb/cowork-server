@@ -8,15 +8,65 @@ import tempfile
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+_REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"
+
+
+def _sanitize_tool_result(block: dict) -> dict:
+    """Replace image parts inside a tool_result with a text marker.
+
+    Base64 image payloads would bloat the JSON column and add nothing to the
+    replayed history. The marker states the removal happened at replay time
+    (not that the tool returned it) so the model doesn't misread it.
+    """
+    content = block.get("content")
+    if not isinstance(content, list):
+        return block
+    scrubbed = [
+        {"type": "text", "text": _REPLAY_IMAGE_PLACEHOLDER}
+        if isinstance(part, dict) and part.get("type") == "image"
+        else part
+        for part in content
+    ]
+    return {**block, "content": scrubbed}
+
+
+def _split_turn_into_rows(history_slice: list) -> list[dict]:
+    """Extract the tool block-rows of one turn from anton's raw history slice.
+
+    Keeps only `tool_use` (assistant) / `tool_result` (user) blocks as
+    `{role, content}` rows. Text blocks are dropped — the assistant's visible
+    text is persisted once in the display row — so a pure-text message yields
+    no row. Images inside tool_result are replaced with a replay marker.
+    """
+    rows: list[dict] = []
+    for msg in history_slice:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        keep_type = "tool_use" if role == "assistant" else "tool_result"
+        blocks = [
+            _sanitize_tool_result(b) if keep_type == "tool_result" else b
+            for b in content
+            if isinstance(b, dict) and b.get("type") == keep_type
+        ]
+        if blocks:
+            rows.append({"role": role, "content": blocks})
+    return rows
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -193,12 +243,19 @@ class AntonHarness:
         before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
         skill_drafts: list[dict] = []
+        turn_rows: list[dict] | None = None
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
+            # Length of the seeded history — everything anton appends past this
+            # index is this turn's block-messages (tool_use / tool_result / text).
+            # Guarded: an anton build (or test double) without `.history` simply
+            # skips capture and falls back to text-only replay.
+            seed_len = len(session.history) if hasattr(session, "history") else None
+            compacted = False  # set if anton summarizes history mid-turn
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Deployed cowork-server resolves anton
             # from PyPI/main, which may predate the trace-tags kwargs (anton
@@ -211,7 +268,28 @@ class AntonHarness:
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
+                # Under context pressure anton summarizes history mid-turn,
+                # reassigning session.history and invalidating seed_len.
+                if type(event).__name__ == "StreamContextCompacted":
+                    compacted = True
                 yield event
+            # Turn completed cleanly: capture its tool block-rows for
+            # persistence. Skipped on cancel/error (the block below never runs),
+            # so a partial turn falls back to text-only replay and anton's own
+            # dangling-tool_use sealing keeps its in-memory history valid.
+            #
+            # Also skipped after a mid-turn compaction: seed_len no longer marks
+            # this turn's start, so slicing could drop rows or surface an orphan
+            # tool_result (its tool_use summarized away) → invalid replay. Text-
+            # only replay stays valid, so degrade to it.
+            if seed_len is not None and not compacted:
+                turn_slice = session.history[seed_len:]
+                while turn_slice and (
+                    not isinstance(turn_slice[0], dict)
+                    or turn_slice[0].get("role") != "assistant"
+                ):
+                    turn_slice = turn_slice[1:]
+                turn_rows = _split_turn_into_rows(turn_slice) or None
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
@@ -228,6 +306,8 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
+        if turn_rows:
+            yield TurnHistory(turn_rows)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -273,16 +353,11 @@ class AntonHarness:
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
-            # build_cowork_fetch_submission_tool,
-            # build_cowork_update_form_tool,
         )
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
-        # TODO: Determine if these two tools are really needed.
-        # FETCH_SUBMISSION_TOOL = build_cowork_fetch_submission_tool()
-        # UPDATE_FORM_TOOL = build_cowork_update_form_tool()
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -461,12 +536,103 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            for conn in data_vault.list_connections():
-                data_vault.inject_env(conn["engine"], conn["name"])
+            # restore_namespaced_env (instead of a bare inject_env loop) also
+            # registers each connection's DS_* var names for credential
+            # scrubbing — without it, scrub_credentials treats every field as
+            # unknown and redacts non-secret values like base_url into
+            # [DS_*] markers in user-facing output (ENG-688). It also clears
+            # stale DS_* vars a previous turn injected for now-disabled
+            # connections.
+            from anton.utils.datasources import restore_namespaced_env
+
+            restore_namespaced_env(data_vault)
 
         # TODO: Add guidance for integrations
 
-        cells = extract_scratchpad_cells_from_message_events(conversation.messages)
+        # Google Drive's google_drive connector uses the drive.file OAuth
+        # scope, which only covers files the app created itself, plus files
+        # the user explicitly granted access to via the Google Picker
+        # (persisted as a `_picked_files` vault field — see
+        # cowork/services/connectors/connections.py). A plain
+        # files.list()/files.search() call does NOT return the latter, so
+        # without calling them out by name here the agent has no way to
+        # know they're reachable at all — inject_env() below only puts the
+        # raw JSON in an env var, which isn't enough on its own for the
+        # agent to notice or act on.
+        #
+        # Parsing `_picked_files` and applying the project-scoping rule is
+        # connector logic, not agent logic, so it lives in
+        # ConnectionsService.picked_files_by_project(); this loop only
+        # injects env vars and turns the result into agent-facing prompt text.
+        integration_guidance = ""
+        picked_by_connection: dict[str, list[dict]] = {}
+        if data_vault is not None:
+            for conn in data_vault.list_connections():
+                data_vault.inject_env(conn["engine"], conn["name"])
+            picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
+
+            if picked_by_connection:
+                def _describe(f: dict, conn_name: str) -> str:
+                    line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
+                    resource_key = f.get("resourceKey") or f.get("resource_key")
+                    if resource_key:
+                        line += f", resourceKey: {resource_key}"
+                    return line + ")"
+
+                picked_lines = [
+                    _describe(f, conn_name)
+                    for conn_name, files in picked_by_connection.items()
+                    for f in files
+                ]
+                integration_guidance = (
+                    "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
+                    "access to via the Google Picker, which a plain files.list()/files.search() call "
+                    "will NOT return (the google_drive connector's scope only covers files this app "
+                    "created itself, plus these specifically granted ones):\n"
+                    + "\n".join(picked_lines)
+                    + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
+                    "include every file above IN ADDITION to whatever files.list()/files.search() "
+                    "returns — do not report only the API call's results. To read one of these "
+                    "files' content, call files.get(fileId=...) directly with its id above; do not "
+                    "expect it to appear in a files.list() response first. If a file above has a "
+                    "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
+                    "even though access was actually granted — either add header "
+                    "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
+                    "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
+                    "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
+                    "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
+                    "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
+                    "include both params on any Drive API call touching these files; they're no-ops "
+                    "for regular files, so there's no downside to always sending them. CRITICAL: when "
+                    "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
+                    "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
+                    "by this connector's restricted OAuth grant and will return files across the user's "
+                    "entire Google account that this app was never actually given access to. Omit "
+                    "corpora entirely (or use corpora='user') — combined with "
+                    "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
+                    "surfaces every file this app can legitimately see, Shared Drive items included."
+                )
+
+        # Canonical order (created_at, seq, ...); the bare `conversation.messages`
+        # relationship is unordered and would scramble a turn's tool_use/tool_result
+        # block-rows. Ordering needs the DB session, so the conversation must be
+        # attached — callers always pass an attached instance; fail fast rather
+        # than silently fall back to a scrambled, replay-breaking history.
+        from sqlalchemy.orm import object_session
+        from cowork.db.scoped import adopt_scoped_session
+        from cowork.services.conversations import ConversationService
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            raise RuntimeError(
+                f"Conversation {conversation.id} is detached from its Session; "
+                "cannot resolve ordered history for replay."
+            )
+        ordered_messages = ConversationService(
+            adopt_scoped_session(db_session)
+        ).get_ordered_messages(conversation.id)
+
+        cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
         # Per-message timestamps: embed each message's created_at so the agent
@@ -481,7 +647,7 @@ class AntonHarness:
             return om
 
         initial_history = [
-            _stamped(m) for m in conversation.messages
+            _stamped(m) for m in ordered_messages
             if m.role in {"user", "assistant"}
         ]
 
@@ -498,6 +664,7 @@ class AntonHarness:
                     + f"{project_context}"
                     + f"{output_context}"
                     + f"{skill_output_context}"
+                    + f"{integration_guidance}"
                 ),
             ),
             workspace=workspace,

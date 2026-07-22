@@ -1,8 +1,9 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
@@ -244,6 +245,13 @@ class OAuthSettings(Settings):
     google_analytics_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_ID"))
     google_analytics_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_SECRET"))
 
+    linear_client_id: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_ID"))
+    linear_client_secret: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_SECRET"))
+
+    # Browser-side key for the Google Picker widget (drive.file scope only
+    # grants access to files the user explicitly picks via this UI).
+    google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
+
     server_origin: str = Field(
         default="http://127.0.0.1:26866",
         validation_alias=AliasChoices("COWORK_SERVER_ORIGIN"),
@@ -280,9 +288,19 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        validation_alias=AliasChoices("COWORK_SERVER_PORT"),
+        # One name per context: the desktop app hands the sidecar its port as
+        # COWORK_SERVER_PORT; k8s/cloud sets COWORK_LISTEN_PORT,
+        # which wins because k8s auto-injects the former as a tcp:// URI.
+        validation_alias=AliasChoices("COWORK_LISTEN_PORT", "COWORK_SERVER_PORT"),
         description="The port to run the server on",
     )
+
+    @field_validator("port", mode="before")
+    @classmethod
+    def _discard_k8s_injected_port(cls, v: object) -> object:
+        if isinstance(v, str) and v.startswith("tcp://"):
+            return 26866
+        return v
     host: str = Field(
         default="127.0.0.1",
         validation_alias=AliasChoices("COWORK_SERVER_HOST"),
@@ -307,7 +325,7 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_ALLOWED_ORIGINS"),
         description=(
             "CORS allowed origins (JSON array). "
-            "Defaults to localhost on COWORK_SERVER_PORT and COWORK_RENDERER_PORT."
+            "Defaults to localhost on COWORK_LISTEN_PORT and COWORK_RENDERER_PORT."
         ),
     )
 
@@ -337,6 +355,27 @@ class AppSettings(Settings):
         description=(
             "Bearer token clients must send as 'Authorization: Bearer <token>'. "
             "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
+        ),
+    )
+    tenancy_mode: Literal["local", "org"] = Field(
+        default="local",
+        validation_alias=AliasChoices("COWORK_TENANCY_MODE"),
+        description=(
+            "Deployment tenancy mode. 'local' (default): single-user desktop "
+            "sidecar — request auth is the shared bearer token above. 'org': "
+            "multi-tenant cloud deployment behind the auth gateway — requests "
+            "carry trusted identity headers (X-User-Id / X-Organization-Id) "
+            "from which a per-request principal is built."
+        ),
+    )
+    identity_enforce: Literal["audit", "enforce"] = Field(
+        default="audit",
+        validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
+        description=(
+            "Org-mode identity enforcement. 'audit' (default): requests without "
+            "identity headers are logged and allowed through. 'enforce': they "
+            "are rejected with 401. Flip to 'enforce' once the audit log shows "
+            "all legitimate identity-less callers are handled."
         ),
     )
     owner: str = Field(

@@ -233,9 +233,10 @@ async def recommended_models(session: SessionDep):
     # win on any key collision.
     model_efforts: dict[str, dict] = {k: dict(v) for k, v in DIRECT_EFFORT_CATALOG.items()}
 
-    # `modelEnabled` maps a model id → bool. MindsHub lists models the caller's
-    # tier can't use (marked enabled:false) so the picker can show them as locked
-    # upsells; a model absent from this map is treated as available. Additive
+    # `modelEnabled` maps a model id → bool. MindsHub lists models the org's
+    # wallet can't currently pay for / whose free allowance is exhausted (marked
+    # enabled:false) so the picker can show them as locked, with an "add credits"
+    # affordance; a model absent from this map is treated as available. Additive
     # alongside modelEfforts — consumers that ignore it keep working.
     model_enabled: dict[str, bool] = {}
 
@@ -247,9 +248,9 @@ async def recommended_models(session: SessionDep):
         if live:
             recommended["minds-cloud"] = live
             # Cache the availability map so model-default resolution
-            # (UserSettings._minds_enabled_map) can avoid tier-locked models
-            # without a network call in the turn path. A plan upgrade re-enables
-            # the canonical defaults on the next settings load.
+            # (UserSettings._minds_enabled_map) can avoid locked models without
+            # a network call in the turn path. Adding credits re-enables the
+            # canonical defaults on the next settings load.
             #
             # Guard on `live_enabled` (the map we actually write), NOT `live`
             # (the id list): a gateway that returns ids without `enabled` flags
@@ -263,7 +264,7 @@ async def recommended_models(session: SessionDep):
                 # Persist ORDER-PRESERVING JSON — never sort_keys. The
                 # first-enabled default fallback (_enabled_aware_default)
                 # iterates the map in insertion order, relying on /v1/models
-                # listing the tier's baseline model first; an alphabetized map
+                # listing the free/baseline model first; an alphabetized map
                 # could silently promote the wrong model. The compare is
                 # order-sensitive too, so a gateway re-ranking (same set, new
                 # baseline first) also counts as a change and refreshes the map.

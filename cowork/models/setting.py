@@ -8,3 +8,7 @@ class Setting(BaseSQLModel, table=True):
 
     key: str = Field(max_length=128, unique=True, index=True)
     value: str
+    # No indexes yet — the only live query path is by `key`.
+    scope: str | None = Field(default=None, max_length=16, description="'org' | 'user'; NULL = legacy/global row")
+    user_id: str | None = Field(default=None, max_length=36, description="Owning user for user-scoped rows")
+    org_id: str | None = Field(default=None, max_length=36, description="Owning org for org-scoped rows")

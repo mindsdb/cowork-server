@@ -21,6 +21,7 @@ class RunStatus(str, Enum):
     running = "running"
     success = "success"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class ScheduleCreateRequest(CamelRequest):
@@ -59,6 +60,9 @@ class ScheduleResponse(CamelResponse):
     last_result_conversation_id: UUID | None
     last_error: str | None
     missed_runs: int
+    # Not a Schedule column — endpoints fill it from ScheduleRunService so the
+    # UI can show an in-flight run (manual or cron).
+    running: bool = False
     created_at: datetime | None
     modified_at: datetime | None
 

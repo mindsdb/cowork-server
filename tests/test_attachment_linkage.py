@@ -145,6 +145,7 @@ def test_project_rename_keeps_attachments_reachable(session, tmp_path, monkeypat
     """Attach → rename the project → the uploads rail and the agent-context
     lookup (both keyed by conversation id) still find the file."""
     from cowork.api.v1.endpoints.compat.stubs import list_attachments
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.services.projects import ProjectService
 
     # Sanctioned filesystem isolation (same pattern as test_schema_migrations):
@@ -152,7 +153,7 @@ def test_project_rename_keeps_attachments_reachable(session, tmp_path, monkeypat
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
 
-    psvc = ProjectService(session)
+    psvc = ProjectService(ScopedSession(session, LOCAL_SCOPE))
     project = psvc.create_project(name="Campaign-Monitoring-2026")
     conversation = ConversationService(session).create_conversation(
         topic="t", project_id=project.id

@@ -7,16 +7,20 @@ agent-produced artifacts.
 from __future__ import annotations
 
 import mimetypes
+import os
 import subprocess
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
+from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 from cowork.services.artifacts import (
     _project_artifacts_base,
     artifact_status as _artifact_status,
@@ -36,6 +40,29 @@ SessionDep = Annotated[Session, Depends(get_session)]
 
 class _PathBody(BaseModel):
     path: str
+
+
+# ``no-cache`` mirrors the FileResponse headers used elsewhere so a rebuilt
+# artifact is always re-fetched.
+_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
+def _wants_comment_layer(media_type: str, request: Request) -> bool:
+    """The comment marker layer is injected only into the top-level HTML
+    document, and only when the renderer opts in via the activation query flag.
+    Asset requests and flag-less loads stream untouched."""
+    return media_type == "text/html" and ACTIVATION_PARAM in request.query_params
+
+
+def _html_with_layer(target: Path):
+    """Read an HTML file and return an HTMLResponse with the marker layer
+    injected, or None when it can't be read as text (caller falls back to a
+    plain FileResponse)."""
+    try:
+        html = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return HTMLResponse(inject_layer(html), headers=_NO_CACHE)
 
 
 @router.get("/")
@@ -122,7 +149,7 @@ async def preview_mount_endpoint(req: _PathBody, request: Request):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}")
-async def preview_asset(token: str, rel_path: str):
+async def preview_asset(token: str, rel_path: str, request: Request):
     parent = get_preview_mount(token)
     if parent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preview mount has expired or is unknown")
@@ -137,13 +164,17 @@ async def preview_asset(token: str, rel_path: str):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    return FileResponse(target, media_type=media_type, headers={
-        "Cache-Control": "no-cache, must-revalidate",
-    })
+    if _wants_comment_layer(media_type, request):
+        # Offload the (potentially large) synchronous read so it doesn't stall
+        # the event loop / other in-flight SSE streams — this endpoint is async.
+        resp = await run_in_threadpool(_html_with_layer, target)
+        if resp is not None:
+            return resp
+    return FileResponse(target, media_type=media_type, headers=_NO_CACHE)
 
 
 @router.get("/serve/{project_name}/{file_path:path}")
-def serve_artifact_file(project_name: str, file_path: str):
+def serve_artifact_file(project_name: str, file_path: str, request: Request):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
     and new-tab open both work in web deployments."""
@@ -158,9 +189,13 @@ def serve_artifact_file(project_name: str, file_path: str):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    return FileResponse(target, media_type=media_type, headers={
-        "Cache-Control": "no-cache, must-revalidate",
-    })
+    # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
+    # — the blocking read here doesn't touch the event loop.
+    if _wants_comment_layer(media_type, request):
+        resp = _html_with_layer(target)
+        if resp is not None:
+            return resp
+    return FileResponse(target, media_type=media_type, headers=_NO_CACHE)
 
 
 @router.post("/open")
@@ -178,7 +213,7 @@ async def open_artifact(req: _PathBody):
     return {"status": "ok", "path": str(artifact)}
 
 
-def _resolve_reveal_path(path: str, session: Session) -> Path:
+def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     try:
         return resolve_artifact_path(path)
     except FileNotFoundError:
@@ -186,23 +221,42 @@ def _resolve_reveal_path(path: str, session: Session) -> Path:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
+    if not path or "\x00" in path or path.lstrip().startswith("~"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
+    normalized = os.path.normpath(path.strip())
+    if (
+        not normalized
+        or normalized == "."
+        or normalized.startswith("..")
+        or normalized == ".."
+        or os.path.isabs(normalized)
+    ):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
     try:
-        requested = Path(path).expanduser().resolve()
+        rel = Path(normalized)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
+
+    # Fallback resolution only accepts project-relative paths.
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
     for project in ProjectService(session).list_projects():
-        project_dir = Path(project.path).resolve()
+        project_root = Path(project.path).resolve()
         try:
-            requested.relative_to(project_dir)
-        except ValueError:
+            resolved = (project_root / rel).resolve()
+            resolved.relative_to(project_root)
+        except Exception:
             continue
-        if requested.exists():
-            return requested
+        if resolved.exists():
+            return resolved
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
 
 
 @router.post("/reveal")
-async def reveal_artifact(req: _PathBody, session: SessionDep):
+async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
         reveal_in_file_manager(target)
