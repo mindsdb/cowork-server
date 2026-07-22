@@ -24,32 +24,6 @@ jobs:
   run-unit-tests:
     uses: ./.github/workflows/tests-unit.yml
 
-  build:
-    runs-on: mdb-dev
-    outputs:
-      image: ${{ steps.build.outputs.image }}
-    env:
-      AWS_REGION: us-east-1
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mindsdb/github-actions/setup-env@main
-      - id: build
-        uses: mindsdb/github-actions/build-push-ecr@main
-        with:
-          module-name: ${{ env.CI_REPOSITORY_SLUG }}
-          build-for-environment: production
-
-  scan:
-    runs-on: mdb-dev
-    needs: [ build ]
-    name: Scan Minds Image
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mindsdb/github-actions/snyk-docker-scan@main
-        with:
-          image: ${{ needs.build.outputs.image }}
-          snyk-token: ${{ secrets.SNYK_TOKEN }}
-
   # build:
   #   runs-on: mdb-dev
   #   outputs:
