@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from sqlmodel import Session
-
 from cowork.channels.lifecycle import LifecycleContext, LifecycleError, LifecycleResult
 from cowork.channels.plugin import ChannelPlugin
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import ScopedSession
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
 
 _LOCAL_ENVS = {"local", "dev", "development", "test"}
@@ -41,7 +40,7 @@ class LifecycleNotImplementedError(Exception):
 
 
 class ChannelLifecycleService:
-    def __init__(self, session: Session, adapters, registry: PluginRegistry | None = None) -> None:
+    def __init__(self, session: ScopedSession, adapters, registry: PluginRegistry | None = None) -> None:
         self.session = session
         self.adapters = adapters
         self.registry = registry if registry is not None else get_registry()

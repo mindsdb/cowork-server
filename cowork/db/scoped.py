@@ -95,7 +95,16 @@ def scope_of_session(session: Session) -> TenantScope | None:
     return session.info.get("tenant_scope")
 
 
+# Tables whose ownership columns stay inert. Closed list on purpose: deferring
+# a table is a scoped-layer decision, never a model-side flag. settings stays
+# key-based until the settings split — rows are deployment-owned and env-seeded
+# with NULL org, so org-mode reads must not filter and writes must not stamp.
+_TENANCY_DEFERRED_TABLES = frozenset({"settings"})
+
+
 def _is_org_scoped(model: type) -> bool:
+    if getattr(model, "__tablename__", None) in _TENANCY_DEFERRED_TABLES:
+        return False
     return hasattr(model, "org_id")
 
 
@@ -124,6 +133,11 @@ class ScopedSession:
     """Session wrapper that makes org scoping structural, not remembered."""
 
     def __init__(self, session: Session, scope: TenantScope) -> None:
+        if isinstance(session, ScopedSession):
+            # A wrapper-of-wrapper breaks exec() later — fail at construction.
+            raise TypeError(
+                "ScopedSession cannot wrap another ScopedSession; pass the raw Session"
+            )
         self._session = session
         self.scope = scope
         if scope.org_mode:
