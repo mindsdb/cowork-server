@@ -72,3 +72,16 @@ def get_harness(name: str) -> HarnessProvider:
         available = ", ".join(_registry) or "none"
         raise ValueError(f"Unknown harness {name!r}. Available: {available}")
     return cls()
+
+
+def available_harness_ids() -> list[str]:
+    """Registered harness ids offered to users. In org mode, harnesses that
+    don't support multi-tenancy are hidden (Anton-only for now); the getattr
+    default keeps every other harness available."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    org_mode = get_app_settings().tenancy_mode == "org"
+    return [
+        hid for hid, cls in _registry.items()
+        if not org_mode or getattr(cls, "supports_org_mode", True)
+    ]
