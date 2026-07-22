@@ -3,13 +3,33 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from tzlocal import get_localzone
+
 from cowork.common.datetime_utils import ensure_utc
+from cowork.common.logger import get_logger
 from cowork.schemas.schedules import Cadence
+
+logger = get_logger(__name__)
 
 
 def resolve_timezone(name: str | None) -> ZoneInfo:
-    if not name or name == "local":
+    if not name:
         return ZoneInfo("UTC")
+    if name == "local":
+        # cowork-server runs on the user's own machine, so "local" means the
+        # system's zone. Resolve it to a real (DST-aware) IANA zone instead of
+        # silently falling back to UTC, which would fire schedules on the
+        # wrong wall clock.
+        try:
+            local = get_localzone()
+            if isinstance(local, ZoneInfo):
+                return local
+            # Older tzlocal returned a pytz zone; recover its IANA key.
+            key = getattr(local, "key", None) or str(local)
+            return ZoneInfo(key)
+        except Exception:
+            logger.warning("Could not resolve 'local' timezone; falling back to UTC")
+            return ZoneInfo("UTC")
     try:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:

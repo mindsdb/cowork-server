@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from fastapi.responses import FileResponse
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -176,12 +177,14 @@ def _unique_project_target(project_dir: Path, filename: str) -> Path:
 
 
 @attachments_router.post("/{project_name}/{session_id}/{attachment_id}/move-to-project")
-def move_attachment_to_project(project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep):
+def move_attachment_to_project(
+    project_name: str, session_id: str, attachment_id: UUID, session: _SessionDep, scoped: ScopedSessionDep
+):
     from cowork.services.files import FileService
     from cowork.services.projects import ProjectService
 
     try:
-        project = ProjectService(session).get_project_by_name(project_name)
+        project = ProjectService(scoped).get_project_by_name(project_name)
         content_type, filename, source = FileService(session).get_file_content(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc

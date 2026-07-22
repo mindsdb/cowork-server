@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
@@ -33,6 +34,7 @@ def _score(text: str, query: str) -> int:
 @router.get("")
 async def search_cowork(
     session: SessionDep,
+    scoped: ScopedSessionDep,
     q: str = Query(default=""),
     limit: int = Query(default=25),
 ):
@@ -43,7 +45,7 @@ async def search_cowork(
     results: list[dict] = []
 
     # Conversations (tasks)
-    for conv in ConversationService(session).list_conversations(limit=500, all_projects=True):
+    for conv in ConversationService(scoped).list_conversations(limit=500, all_projects=True):
         project_label = ""
         if conv.project:
             project_label = conv.project.name
@@ -60,7 +62,7 @@ async def search_cowork(
             })
 
     # Projects
-    for project in ProjectService(session).list_projects():
+    for project in ProjectService(scoped).list_projects():
         text = " ".join([project.name or "", project.path or ""])
         score = _score(text, query)
         if score:

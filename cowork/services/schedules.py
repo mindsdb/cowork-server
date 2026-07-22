@@ -109,8 +109,9 @@ class ScheduleRunService:
 
     def has_running_run(self, schedule_id: UUID) -> bool:
         """
-        Check if the schedule has a running run.
-        This is used to prevent overlapping scheduled runs. Manual runs are not relevant here.
+        Check if the schedule has a running non-manual (cron) run.
+        The scheduler's due-check gates on has_active_run instead, so a
+        manual run in flight also defers the slot (PR #181 review).
         """
         run = self.session.exec(
             select(ScheduleRun)
@@ -121,11 +122,50 @@ class ScheduleRunService:
         ).first()
         return run is not None
 
+    def has_active_run(self, schedule_id: UUID) -> bool:
+        """Any in-flight run, manual or cron. Drives the UI "running" state
+        (unlike has_running_run, which only guards cron overlap)."""
+        run = self.session.exec(
+            select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .limit(1)
+        ).first()
+        return run is not None
+
+    def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
+        """When the schedule's most recent successful run (manual or cron)
+        finished, or None if it never succeeded. Used by the scheduler's
+        freshness guard to skip a due slot right after e.g. a manual run.
+        """
+        run = self.session.exec(
+            select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status == RunStatus.success)
+            .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+        if run is None or run.finished_at is None:
+            return None
+        finished = run.finished_at
+        return finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
+
+    def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> None:
+        """Attach the run's conversation as soon as it is known — before the
+        turn executes — so the UI can open a run that is still in flight."""
+        run = self.session.get(ScheduleRun, run_id)
+        if run is None:
+            return
+        run.conversation_id = conversation_id
+        self.session.add(run)
+        self.session.commit()
+
     def finish_run(
         self,
         run_id: UUID,
         conversation_id: UUID | None = None,
         error: str | None = None,
+        status: RunStatus | None = None,
     ) -> ScheduleRun:
         run = self.session.get(ScheduleRun, run_id)
         if run is None:
@@ -134,13 +174,44 @@ class ScheduleRunService:
         run.finished_at = now
         started_at = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=timezone.utc)
         run.duration_ms = int((now - started_at).total_seconds() * 1000)
-        run.status = RunStatus.failed if error else RunStatus.success
+        run.status = status or (RunStatus.failed if error else RunStatus.success)
         run.error = error
-        run.conversation_id = conversation_id
+        if conversation_id is not None:
+            run.conversation_id = conversation_id
         self.session.add(run)
         self.session.commit()
         self.session.refresh(run)
         return run
+
+    def reap_orphaned_runs(
+        self,
+        error: str = "Run orphaned by a server restart before it completed.",
+    ) -> int:
+        """Mark every run still in ``running`` as ``failed``.
+
+        A crash/restart while a run is in flight leaves its ``ScheduleRun`` in
+        ``running`` forever. Because the scheduler's due-check skips schedules
+        with a running run, a single stale row wedges that schedule
+        permanently. Called once on boot to release those runs. Returns the
+        number of runs reaped.
+        """
+        runs = self.session.exec(
+            select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
+        ).all()
+        now = datetime.now(timezone.utc)
+        for run in runs:
+            started_at = (
+                run.started_at
+                if run.started_at.tzinfo
+                else run.started_at.replace(tzinfo=timezone.utc)
+            )
+            run.finished_at = now
+            run.duration_ms = int((now - started_at).total_seconds() * 1000)
+            run.status = RunStatus.failed
+            run.error = error
+            self.session.add(run)
+        self.session.commit()
+        return len(runs)
 
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
         return list(

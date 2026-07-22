@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
     artifacts,
+    comments,
     conversations,
     files,
     health,
@@ -71,6 +72,7 @@ api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
+api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(search.router, prefix="/search", tags=["search"])

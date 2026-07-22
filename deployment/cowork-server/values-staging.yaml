@@ -1,0 +1,28 @@
+deployment:
+  ingress:
+    enabled: true
+    name: cowork-server
+    annotations:
+      nginx.ingress.kubernetes.io/enable-cors: "true"
+      nginx.ingress.kubernetes.io/cors-allow-origin: "https://console.staging.mindshub.ai, https://staging.mdb.ai, https://hub.staging.mindsdb.com"
+      nginx.ingress.kubernetes.io/auth-url: "http://auth.staging.svc.cluster.local:80/v1/authenticate/"
+    hosts:
+      - host: cowork.staging.mindshub.ai
+        enableMultiPath: true
+        paths:
+          - path: /
+            serviceName: cowork-server
+            servicePort: 80
+
+  extraEnvs:
+
+    - name: ENV
+      value: "staging"
+
+    - name: LOG_LEVEL
+      value: "WARNING"
+
+    # Org-mode identity enforcement. 'enforce': requests without identity
+    # headers are rejected with 401.
+    - name: COWORK_IDENTITY_ENFORCE
+      value: "enforce"

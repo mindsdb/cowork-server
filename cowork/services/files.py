@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 from uuid import UUID
@@ -10,6 +11,23 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
+
+logger = logging.getLogger(__name__)
+
+
+def unlink_file_dirs(dirs: list[Path]) -> None:
+    """Best-effort removal of the per-file `<root>/<file.id>/` directories whose
+    rows the caller has already committed as deleted. Log-and-continue so a
+    locked file can't abort the caller's own deletion — same policy as
+    move-to-project. Call this AFTER the DB delete is committed, never before:
+    the row is the source of truth, so bytes must outlive an uncommitted delete.
+    """
+    for d in dirs:
+        try:
+            if d.exists():
+                shutil.rmtree(d)
+        except OSError:
+            logger.warning("could not remove file dir %s", d, exc_info=True)
 
 
 def attachment_purpose(session_id: str) -> str:
@@ -132,9 +150,27 @@ class FileService:
         file_dir = Path(file.path).parent
         self.session.delete(file)
         self.session.commit()
-        if file_dir.exists():
-            shutil.rmtree(file_dir)
+        unlink_file_dirs([file_dir])
         return True
+
+    def delete_by_purpose(self, purpose: str) -> list[Path]:
+        """Stage deletion of every file row under `purpose`; return the on-disk
+        dirs to unlink once the caller commits.
+
+        Cleans up a conversation's attachments when the conversation (or its
+        project) is deleted — otherwise the rows + bytes orphan forever
+        (ENG-701). Follows the stage-only convention of
+        `TaskObjectService.delete_for_conversation`: the caller owns the commit,
+        so the attachment-row delete lands in the SAME transaction as the
+        caller's own deletes (a crash mid-way can't leave a half-deleted
+        conversation), then the caller unlinks the returned dirs via
+        `unlink_file_dirs` AFTER committing.
+        """
+        rows = list(self.session.exec(select(File).where(File.purpose == purpose)).all())
+        dirs = [Path(f.path).parent for f in rows if f.path]
+        for f in rows:
+            self.session.delete(f)
+        return dirs
 
     def get_file_content(self, file_id: UUID) -> tuple[str, str, Path]:
         file = self._get_file_model(file_id)
