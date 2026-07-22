@@ -123,7 +123,7 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
 
     source = conversation.project
     if body.move_objects and source is not None and dest.id != source.id:
-        TaskObjectService(session).relocate_to_project(conversation, source, dest)
+        TaskObjectService(scoped).relocate_to_project(conversation, source, dest)
 
     conversation = svc.update_conversation(conversation_id, project_id=dest.id)
     return _serialize_conversation(conversation)

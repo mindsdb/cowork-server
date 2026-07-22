@@ -48,6 +48,9 @@ class TenantScope:
 
 LOCAL_SCOPE = TenantScope()
 
+# Alias for background executors (scheduler loop): "don't filter by org".
+SYSTEM_SCOPE = LOCAL_SCOPE
+
 
 def scope_from_principal(principal: Principal | None) -> TenantScope:
     """The single way a TenantScope is built — request DI and background
@@ -79,6 +82,17 @@ def scope_for_background_context() -> TenantScope:
     raise MissingTenantScopeError(
         "background conversation creation requires a service principal (not yet implemented in org mode)"
     )
+
+
+def scope_of_session(session: Session) -> TenantScope | None:
+    """The TenantScope a raw session was wrapped with, if any.
+
+    Recovers the ORIGINAL scope (stored at wrap time) so downstream code that
+    only holds a raw session — e.g. via object_session(row) — can re-wrap with
+    the same authorization context instead of deriving one from row data.
+    Local-mode wraps store nothing; returns None.
+    """
+    return session.info.get("tenant_scope")
 
 
 def _is_org_scoped(model: type) -> bool:

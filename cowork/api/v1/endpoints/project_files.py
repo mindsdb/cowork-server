@@ -23,9 +23,6 @@ from cowork.services.projects import ProjectService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-# Every endpoint here uses the session solely to resolve the project via
-# ProjectService, so the whole module runs on the scoped session.
-SessionDep = ScopedSessionDep
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
@@ -42,10 +39,10 @@ class _PreviewMountRequest(BaseModel):
     path: str
 
 
-def _project_dir(name: str, session: ScopedSession) -> Path:
+def _project_dir(name: str, scoped: ScopedSession) -> Path:
     """Resolve a project name to its on-disk directory or 404."""
     try:
-        project = ProjectService(session).get_project_by_name(name)
+        project = ProjectService(scoped).get_project_by_name(name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     base = Path(project.path)
@@ -91,8 +88,8 @@ def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:
 
 
 @router.get("/{project_name}/instructions")
-def get_project_instructions(project_name: str, session: SessionDep):
-    base = _project_dir(project_name, session)
+def get_project_instructions(project_name: str, scoped: ScopedSessionDep):
+    base = _project_dir(project_name, scoped)
     p = _anton_md_path(base)
     rel = p.relative_to(base).as_posix()
     if p.is_file():
@@ -105,8 +102,8 @@ def get_project_instructions(project_name: str, session: SessionDep):
 
 
 @router.get("/{project_name}/files")
-def list_project_files(project_name: str, session: SessionDep):
-    base = _project_dir(project_name, session)
+def list_project_files(project_name: str, scoped: ScopedSessionDep):
+    base = _project_dir(project_name, scoped)
     files: list[dict[str, Any]] = []
     for p in sorted(base.rglob("*")):
         if p.is_dir():
@@ -132,8 +129,8 @@ def list_project_files(project_name: str, session: SessionDep):
 
 
 @router.get("/{project_name}/files/{path:path}")
-def read_project_file(project_name: str, path: str, session: SessionDep):
-    base = _project_dir(project_name, session)
+def read_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+    base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     if not target.exists():
         anton_rel = _anton_md_path(base).relative_to(base).as_posix()
@@ -153,8 +150,8 @@ def read_project_file(project_name: str, path: str, session: SessionDep):
 
 
 @router.put("/{project_name}/files/{path:path}")
-def write_project_file(project_name: str, path: str, req: _FileWriteRequest, session: SessionDep):
-    base = _project_dir(project_name, session)
+def write_project_file(project_name: str, path: str, req: _FileWriteRequest, scoped: ScopedSessionDep):
+    base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=400, detail="Path is a directory")
@@ -170,10 +167,10 @@ def write_project_file(project_name: str, path: str, req: _FileWriteRequest, ses
 @router.post("/{project_name}/files/upload")
 async def upload_project_files(
     project_name: str,
-    session: SessionDep,
+    scoped: ScopedSessionDep,
     files: list[UploadFile] = File(...),
 ):
-    base = _project_dir(project_name, session)
+    base = _project_dir(project_name, scoped)
     results: list[dict[str, Any]] = []
     for f in files:
         if not f.filename:
@@ -195,8 +192,8 @@ async def upload_project_files(
 
 
 @router.delete("/{project_name}/files/{path:path}")
-def delete_project_file(project_name: str, path: str, session: SessionDep):
-    base = _project_dir(project_name, session)
+def delete_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+    base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -207,8 +204,8 @@ def delete_project_file(project_name: str, path: str, session: SessionDep):
 
 
 @router.post("/preview-mount-file")
-def preview_mount_file(req: _PreviewMountRequest, session: SessionDep):
-    base = _project_dir(req.name, session)
+def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
+    base = _project_dir(req.name, scoped)
     target = _safe_relpath(req.path, base)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -244,8 +241,8 @@ def preview_asset(token: str, rel_path: str):
 
 
 @router.get("/{project_name}/files-raw/{path:path}")
-def download_project_file(project_name: str, path: str, session: SessionDep):
-    base = _project_dir(project_name, session)
+def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+    base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")

@@ -474,7 +474,9 @@ class AntonChannelRuntime:
                 data = await fetch(attachment)
             if not data:
                 continue
-            stored = FileService(session).create_file_from_bytes(
+            stored = FileService(
+                ScopedSession(session, scope_for_background_context())
+            ).create_file_from_bytes(
                 filename=attachment.filename,
                 content_type=attachment.mime_type,
                 data=data,

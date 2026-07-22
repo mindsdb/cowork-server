@@ -3,19 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlmodel import Session, select
-
+from cowork.db.scoped import ScopedSession
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
 
 
 class ScheduleService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     def list_schedules(self, project_id: UUID | None = None) -> list[Schedule]:
-        query = select(Schedule)
+        query = self.session.select(Schedule)
         if project_id is not None:
             query = query.where(Schedule.project_id == project_id)
         return list(self.session.exec(query).all())
@@ -67,7 +66,7 @@ class ScheduleService:
         if schedule is None:
             return False
         for run in self.session.exec(
-            select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
+            self.session.select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
         ).all():
             self.session.delete(run)
         self.session.delete(schedule)
@@ -92,7 +91,7 @@ class ScheduleService:
 
 
 class ScheduleRunService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     def create_run(self, schedule_id: UUID, is_manual: bool = False) -> ScheduleRun:
@@ -114,7 +113,7 @@ class ScheduleRunService:
         manual run in flight also defers the slot (PR #181 review).
         """
         run = self.session.exec(
-            select(ScheduleRun)
+            self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.running)
             .where(ScheduleRun.is_manual == False)
@@ -125,8 +124,12 @@ class ScheduleRunService:
     def has_active_run(self, schedule_id: UUID) -> bool:
         """Any in-flight run, manual or cron. Drives the UI "running" state
         (unlike has_running_run, which only guards cron overlap)."""
+        # Anchor: ScheduleRun has no org column, so gate on the parent
+        # schedule being visible in scope (request-reachable via _serialize).
+        if self.session.get(Schedule, schedule_id) is None:
+            return False
         run = self.session.exec(
-            select(ScheduleRun)
+            self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.running)
             .limit(1)
@@ -139,7 +142,7 @@ class ScheduleRunService:
         freshness guard to skip a due slot right after e.g. a manual run.
         """
         run = self.session.exec(
-            select(ScheduleRun)
+            self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.success)
             .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
@@ -196,7 +199,7 @@ class ScheduleRunService:
         number of runs reaped.
         """
         runs = self.session.exec(
-            select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
+            self.session.select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
         ).all()
         now = datetime.now(timezone.utc)
         for run in runs:
@@ -214,9 +217,12 @@ class ScheduleRunService:
         return len(runs)
 
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
+        # Anchor on parent visibility (child table, request-reachable).
+        if self.session.get(Schedule, schedule_id) is None:
+            return []
         return list(
             self.session.exec(
-                select(ScheduleRun)
+                self.session.select(ScheduleRun)
                 .where(ScheduleRun.schedule_id == schedule_id)
                 .order_by(ScheduleRun.started_at.desc())  # type: ignore[union-attr]
                 .limit(limit)

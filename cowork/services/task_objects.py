@@ -6,8 +6,8 @@ import shutil
 from pathlib import Path
 from uuid import UUID
 
-from sqlmodel import Session, select
 
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
@@ -48,17 +48,25 @@ class TaskObjectService:
     """Indexes the artifacts/files a task owns and relocates them when the
     task moves to another project."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     # ── indexing ──────────────────────────────────────────────────────
 
     def index_artifact(self, conversation_id: UUID, project_id: UUID, slug: str) -> None:
-        """Upsert an artifact row (idempotent on conversation+ref)."""
+        """Upsert an artifact row (idempotent on conversation+ref).
+
+        Anchors both roots through the scope first — TaskObject has no org
+        column, so parent visibility IS the tenancy check."""
         if not slug:
             return
+        if (
+            self.session.get(Conversation, conversation_id) is None
+            or self.session.get(Project, project_id) is None
+        ):
+            raise ValueError("Conversation or project not found in scope")
         existing = self.session.exec(
-            select(TaskObject).where(
+            self.session.select(TaskObject).where(
                 TaskObject.conversation_id == conversation_id,
                 TaskObject.kind == KIND_ARTIFACT,
                 TaskObject.ref == slug,
@@ -95,7 +103,7 @@ class TaskObjectService:
                     self.index_artifact(conversation.id, project.id, folder.name)
         return list(
             self.session.exec(
-                select(TaskObject).where(
+                self.session.select(TaskObject).where(
                     TaskObject.conversation_id == conversation.id,
                     TaskObject.kind == KIND_ARTIFACT,
                 )
@@ -104,16 +112,18 @@ class TaskObjectService:
 
     # ── deleting ──────────────────────────────────────────────────────
 
-    def delete_for_conversation(self, conversation_id: UUID) -> int:
+    def delete_for_conversation(self, conversation: Conversation) -> int:
         """Drop every object row a conversation owns, so deleting a chat (or
         clearing its history) doesn't leave dangling rows that keep surfacing
-        artifacts the task no longer has. Stages the deletes on the session;
-        the caller commits as part of its own transaction. Returns the count.
+        artifacts the task no longer has. Takes the LOADED conversation (not an
+        id) so the parent was necessarily fetched through the caller's scope.
+        Stages the deletes on the session; the caller commits as part of its
+        own transaction. Returns the count.
 
         Only the index is removed — on-disk artifact folders and attached file
         bytes are left untouched (work products, managed separately)."""
         rows = self.session.exec(
-            select(TaskObject).where(TaskObject.conversation_id == conversation_id)
+            self.session.select(TaskObject).where(TaskObject.conversation_id == conversation.id)
         ).all()
         for row in rows:
             self.session.delete(row)
@@ -203,7 +213,7 @@ def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     }
 
 
-def finalize_turn_artifacts(conversation_id, project_id, artifacts_base, before: set[str]) -> list[dict]:
+def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts_base, before: set[str]) -> list[dict]:
     """End-of-turn artifact handling, from a SINGLE artifacts-dir diff.
 
     For every artifact folder that appeared during the turn this:
@@ -224,13 +234,37 @@ def finalize_turn_artifacts(conversation_id, project_id, artifacts_base, before:
     if not new:
         return []
 
+    # conversation_id/project_id are captured by the caller while the row is
+    # unambiguously attached (not read here, to avoid depending on the session
+    # still being live/unexpired in this end-of-turn path). Scope recovery
+    # DOES need the live session, so it stays here (agent-agnostic boundary):
+    # re-wrap with the ORIGINAL scope the conversation was loaded under, never
+    # one derived from the row. No session (detached/fake) → None → local
+    # behavior in local mode, logged-and-skipped in org mode (fail-safe).
+    from sqlalchemy.orm import object_session
+    try:
+        _sess = object_session(conversation)
+    except Exception:
+        _sess = None
+    scope = scope_of_session(_sess) if _sess is not None else None
+
     try:
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.db.session import get_engine, get_session_factory
 
+        if scope is None:
+            # Never invent a scope: local mode passes through; org mode
+            # without the caller's scope skips indexing (best-effort path).
+            if get_app_settings().tenancy_mode == "org":
+                logger.warning(
+                    "artifact indexing skipped: no tenant scope provided in org mode (conversation %s)",
+                    conversation_id,
+                )
+                raise RuntimeError("no tenant scope for artifact indexing")
+            scope = LOCAL_SCOPE
         factory = get_session_factory(get_engine(get_app_settings().database.uri))
         with factory() as session:
-            svc = TaskObjectService(session)
+            svc = TaskObjectService(ScopedSession(session, scope))
             for slug in new:
                 svc.index_artifact(conversation_id, project_id, slug)
     except Exception:
