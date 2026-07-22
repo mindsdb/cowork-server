@@ -5,9 +5,14 @@ derived from its identity field (gmail → email) instead of a random slug, and
 the record carries an explicit ``secure_keys`` list so the email stays readable
 while the app password is masked.
 """
+from datetime import datetime, timezone
+from pathlib import Path
+
 from anton.core.datasources.data_vault import LocalDataVault
 
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.oauth import google as oauth_google
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL,
     connection_display_name,
@@ -362,4 +367,88 @@ class TestOAuthIdentity:
             {"access_token": "toktoktok", "auth_type": "oauth"},
         )
         assert slug.startswith("google_drive-")  # graceful random fallback
+
+
+class TestOAuthCallbackDedup:
+    """The browser OAuth callback must route through the same identity-derived
+    slug convention persist_connection uses everywhere else. Regression test for
+    the duplicate-Google-Drive-connections bug: reconnecting the same account
+    (e.g. re-running the browser sign-in, or using a different Google OAuth
+    entry point) must update the existing vault record in place, not leave a
+    second "connected" entry behind.
+    """
+
+    def _connect(self, monkeypatch, tmp_path, *, state, access_token, email, scope=""):
+        monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+        settings = OAuthSettings(
+            google_drive_client_id="cid",
+            google_drive_client_secret="csecret",
+            state_path=str(tmp_path / "oauth_state.json"),
+        )
+        svc = oauth_google.OAuthService()
+        store = svc._store(settings)
+        store.set_pending(
+            "google-drive",
+            state=state,
+            verifier="verifier",
+            redirect_uri="http://127.0.0.1/callback",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            client_id="cid",
+            client_secret="csecret",
+        )
+        store.set_outcome(state, {"status": "pending"})
+
+        monkeypatch.setattr(
+            oauth_google.OAuthService,
+            "_exchange_code",
+            lambda self, **kw: {
+                "access_token": access_token, "refresh_token": "reftok",
+                "expires_in": 3600, "scope": scope,
+            },
+        )
+        monkeypatch.setitem(
+            oauth_google._USERINFO_FETCHERS, "google_drive",
+            lambda access_token: {"email": email, "name": "User"},
+        )
+        svc.callback("google-drive", code="authcode", state=state, error="", settings=settings)
+
+    def test_repeat_connection_same_account_dedups(self, monkeypatch, tmp_path):
+        self._connect(monkeypatch, tmp_path, state="state-1", access_token="tok1", email="user@gmail.com")
+        # Simulate reconnecting the same account (browser sign-in run again).
+        self._connect(monkeypatch, tmp_path, state="state-2", access_token="tok2", email="user@gmail.com")
+
+        vault = LocalDataVault(Path(ConnectorSettings().vault_dir))
+        conns = vault.list_connections()
+        assert len(conns) == 1
+        assert conns[0]["name"] == "user-gmail-com"
+        assert vault.load("google_drive", "user-gmail-com")["access_token"] == "tok2"
+
+    def test_different_accounts_do_not_collide(self, monkeypatch, tmp_path):
+        self._connect(monkeypatch, tmp_path, state="state-1", access_token="tok1", email="a@gmail.com")
+        self._connect(monkeypatch, tmp_path, state="state-2", access_token="tok2", email="b@gmail.com")
+
+        vault = LocalDataVault(Path(ConnectorSettings().vault_dir))
+        names = {c["name"] for c in vault.list_connections()}
+        assert names == {"a-gmail-com", "b-gmail-com"}
+
+    def test_reconnect_with_reordered_scope_still_dedups(self, monkeypatch, tmp_path):
+        # Reproduces a live duplicate: Google's token endpoint doesn't
+        # guarantee stable word order in the returned `scope` string, so the
+        # exact same granted scopes came back in a different order on the
+        # second token exchange for the same account.
+        scope_a = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile openid"
+        scope_b = "https://www.googleapis.com/auth/drive.file openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile"
+        self._connect(
+            monkeypatch, tmp_path, state="state-1", access_token="tok1",
+            email="martyna@mindsdb.com", scope=scope_a,
+        )
+        self._connect(
+            monkeypatch, tmp_path, state="state-2", access_token="tok2",
+            email="martyna@mindsdb.com", scope=scope_b,
+        )
+
+        vault = LocalDataVault(Path(ConnectorSettings().vault_dir))
+        conns = vault.list_connections()
+        assert len(conns) == 1
+        assert conns[0]["name"] == "martyna-mindsdb-com"
 
