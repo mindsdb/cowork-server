@@ -10,14 +10,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import UUID
-
-from sqlmodel import select
 
 from anton.core.dispatch import OutboundMessage
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import ScopedSession, scope_for_background_context
+from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, scope_for_background_context
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import ChannelContext, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
@@ -33,9 +31,6 @@ from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.skills import SkillService
-
-if TYPE_CHECKING:
-    from sqlmodel import Session
 
 log = logging.getLogger(__name__)
 
@@ -150,14 +145,16 @@ class LiveAdapterRegistry:
         """Live adapter for a channel, or None if not configured/active."""
         return self._cache.get(channel_type)
 
-    async def refresh(self, channel_type: str, *, session: Session | None = None) -> bool:
+    async def refresh(self, channel_type: str, *, session: ScopedSession | None = None) -> bool:
 
         plugin = self._registry.get(channel_type)
         if plugin is None:
             self._cache.pop(channel_type, None)
             return False
         own_session = session is None
-        s = session or get_open_session()
+        # Boot/background refresh reads deployment-level channel credentials
+        # (settings; scoping deferred) — SYSTEM_SCOPE like the scheduler loop.
+        s = session or ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
             creds = ChannelConfigService(s, registry=self._registry).load_credentials(channel_type)
         finally:
@@ -228,7 +225,11 @@ class AntonChannelRuntime:
     async def _handle_locked(self, channel_type: str, event: Any) -> None:
         session = get_open_session()
         try:
-            binding = self._resolve_or_create_binding(session, channel_type, event)
+            # One scope for the whole turn. Local mode: today's behavior.
+            # Org mode: fails loudly here until the service-principal ticket
+            # lands — never a silent unscoped write from an inbound message.
+            scoped = ScopedSession(session, scope_for_background_context())
+            binding = self._resolve_or_create_binding(scoped, channel_type, event)
             log.info(
                 "channel %s: binding %s → project %s (trigger=%s)",
                 channel_type, binding.id, binding.anton_project_id, binding.trigger_rule,
@@ -237,7 +238,7 @@ class AntonChannelRuntime:
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
             if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
-                await self._start_fresh(session, channel_type, binding, event)
+                await self._start_fresh(scoped, channel_type, binding, event)
                 return
             # Optional hook: adapters with set_typing show a typing indicator
             # for the duration of the turn; others are untouched.
@@ -248,8 +249,8 @@ class AntonChannelRuntime:
             # 1s slack for filesystem timestamp granularity.
             turn_started = time.time() - 1
             try:
-                conversation = self._ensure_conversation(session, binding)
-                self._touch_channel_session(session, binding, conversation, event)
+                conversation = self._ensure_conversation(scoped, binding)
+                self._touch_channel_session(scoped, binding, conversation, event)
                 channel_context = ChannelContext(
                     channel_type=channel_type,
                     is_group=bool(event.message.is_group),
@@ -257,7 +258,7 @@ class AntonChannelRuntime:
                     instructions=binding.instructions,
                 )
                 reply, used_tools = await self._run_anton(
-                    session, conversation, event, adapter, channel_context=channel_context
+                    scoped, conversation, event, adapter, channel_context=channel_context
                 )
             finally:
                 if typing is not None:
@@ -283,10 +284,10 @@ class AntonChannelRuntime:
             session.close()
 
 
-    async def _start_fresh(self, session: Session, channel_type: str, binding: ChannelBinding, event: Any) -> None:
+    async def _start_fresh(self, scoped: ScopedSession, channel_type: str, binding: ChannelBinding, event: Any) -> None:
         """Handle /new: detach the pinned conversation and confirm deterministically instead of running a turn."""
-        ChannelBindingService(session).detach_conversation(binding)
-        project = session.get(Project, binding.anton_project_id or self._default_project_id)
+        ChannelBindingService(scoped).detach_conversation(binding)
+        project = scoped.get(Project, binding.anton_project_id or self._default_project_id)
         name = project.name if project else "general"
         log.info("channel %s: /new detached conversation for binding %s", channel_type, binding.id)
         await self._deliver(
@@ -294,12 +295,12 @@ class AntonChannelRuntime:
             f'Starting fresh — your next message begins a new conversation in the "{name}" project.',
         )
 
-    def _resolve_or_create_binding(self, session: Session, channel_type: str, event: Any) -> ChannelBinding:
+    def _resolve_or_create_binding(self, scoped: ScopedSession, channel_type: str, event: Any) -> ChannelBinding:
         group_id = event.address.platform_id
         thread_id = event.address.thread_id
         thread_key = thread_id or _DEFAULT_THREAD_KEY
-        binding = session.exec(
-            select(ChannelBinding).where(
+        binding = scoped.exec(
+            scoped.select(ChannelBinding).where(
                 ChannelBinding.channel_type == channel_type,
                 ChannelBinding.external_group_id == group_id,
                 ChannelBinding.external_thread_key == thread_key,
@@ -315,9 +316,9 @@ class AntonChannelRuntime:
             anton_project_id=self._default_project_id,
             trigger_rule="mention_only" if event.message.is_group else "always",
         )
-        session.add(binding)
-        session.commit()
-        session.refresh(binding)
+        scoped.add(binding)
+        scoped.commit()
+        scoped.refresh(binding)
         return binding
 
     @staticmethod
@@ -337,10 +338,7 @@ class AntonChannelRuntime:
                 return False
         return True
 
-    def _ensure_conversation(self, session: Session, binding: ChannelBinding) -> Conversation:
-        # Local mode: today's behavior. Org mode: fails loudly until the
-        # service-principal ticket lands — never a silent unscoped write.
-        scoped = ScopedSession(session, scope_for_background_context())
+    def _ensure_conversation(self, scoped: ScopedSession, binding: ChannelBinding) -> Conversation:
         if binding.anton_conversation_id is not None:
             existing = scoped.get(Conversation, binding.anton_conversation_id)
             if existing is not None:
@@ -351,17 +349,19 @@ class AntonChannelRuntime:
             project_id=binding.anton_project_id or self._default_project_id,
         )
         binding.anton_conversation_id = conversation.id
-        session.add(binding)
-        session.commit()
+        scoped.add(binding)
+        scoped.commit()
         return conversation
 
     @staticmethod
     def _touch_channel_session(
-        session: Session, binding: ChannelBinding, conversation: Conversation, event: Any
+        scoped: ScopedSession, binding: ChannelBinding, conversation: Conversation, event: Any
     ) -> None:
+        # ChannelSession is a child (no org_id), anchored by its binding —
+        # already resolved through this turn's scope.
         key = event.address.thread_id or _DEFAULT_THREAD_KEY
-        row = session.exec(
-            select(ChannelSession).where(
+        row = scoped.exec(
+            scoped.select(ChannelSession).where(
                 ChannelSession.binding_id == binding.id,
                 ChannelSession.external_session_key == key,
             )
@@ -376,15 +376,17 @@ class AntonChannelRuntime:
             )
         else:
             row.last_message_at = now
-        session.add(row)
-        session.commit()
+        scoped.add(row)
+        scoped.commit()
 
-    def resolve_turn_harness(self, session: Session, conversation: Conversation) -> str:
+    def resolve_turn_harness(self, scoped: ScopedSession, conversation: Conversation) -> str:
         """Pinned harness for this conversation (whatever first served it), else
         the configured channel agent. This is the persisted ``channels_harness``
         setting (UI-selectable, env-seeded) — never the desktop UI harness."""
-        pinned = session.exec(
-            select(DBMessage.harness).where(
+        # Messages are children (no org_id): anchored on the conversation the
+        # caller already holds through this turn's scope.
+        pinned = scoped.exec(
+            scoped.select(DBMessage.harness).where(
                 DBMessage.conversation_id == conversation.id,
                 DBMessage.role == "assistant",
                 DBMessage.harness != None,  # noqa: E711
@@ -395,11 +397,11 @@ class AntonChannelRuntime:
         return (get_user_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
 
     async def _run_anton(
-        self, session: Session, conversation: Conversation, event: Any, adapter: Any = None,
+        self, scoped: ScopedSession, conversation: Conversation, event: Any, adapter: Any = None,
         *, channel_context: ChannelContext | None = None,
     ) -> tuple[str, bool]:
         """Run one channel turn; returns the reply text and whether tools ran."""
-        harness_id = self.resolve_turn_harness(session, conversation)
+        harness_id = self.resolve_turn_harness(scoped, conversation)
         try:
             harness = get_harness(harness_id)
         except ValueError:
@@ -415,12 +417,11 @@ class AntonChannelRuntime:
         sender_name = getattr(event.message, "sender_name", None)
         if text and event.message.is_group and sender_name:
             text = f"{sender_name}: {text}"
-        blocks = await self.build_input_blocks(session, adapter, event, text)
+        blocks = await self.build_input_blocks(scoped, adapter, event, text)
 
         _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
-        scoped = ScopedSession(session, scope_for_background_context())
 
         collected: list[str] = []
         events: list[dict] = []
@@ -463,7 +464,7 @@ class AntonChannelRuntime:
         content = event.message.content
         return content if isinstance(content, str) else str(content)
 
-    async def build_input_blocks(self, session: Session, adapter: Any, event: Any, text: str) -> list[dict]:
+    async def build_input_blocks(self, scoped: ScopedSession, adapter: Any, event: Any, text: str) -> list[dict]:
         """Harness input from the inbound event: stored media become image/file
         blocks (same shapes the responses handler builds), text rides last."""
         blocks: list[dict] = []
@@ -474,9 +475,7 @@ class AntonChannelRuntime:
                 data = await fetch(attachment)
             if not data:
                 continue
-            stored = FileService(
-                ScopedSession(session, scope_for_background_context())
-            ).create_file_from_bytes(
+            stored = FileService(scoped).create_file_from_bytes(
                 filename=attachment.filename,
                 content_type=attachment.mime_type,
                 data=data,

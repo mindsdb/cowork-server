@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from fastapi import APIRouter, Request, Response
 
 from cowork.channels.plugin import ChannelPlugin
+from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
 from cowork.services.channel_events import ChannelEventService
 
@@ -202,7 +203,10 @@ def intake_events(
     sched = scheduler or _default_scheduler
     session = get_open_session()
     try:
-        channel_log = ChannelEventService(session)
+        # SYSTEM_SCOPE like the scheduler loop: the event log has no org
+        # column and dedupes per installation — channel_type maps to exactly
+        # one installation per database (see services/channel_events.py).
+        channel_log = ChannelEventService(ScopedSession(session, SYSTEM_SCOPE))
         for event in events:
             key = bridge.dedupe_key(event)
             if channel_log.is_duplicate_inbound(channel_type, key):
@@ -223,7 +227,7 @@ async def _process_event(channel_type: str, event: Any, event_id: Any, sink: Inb
     since it runs after the request's session is closed."""
     session = get_open_session()
     try:
-        channel_log = ChannelEventService(session)
+        channel_log = ChannelEventService(ScopedSession(session, SYSTEM_SCOPE))
         try:
             await sink(channel_type, event)
             channel_log.set_status(event_id, "routed")
