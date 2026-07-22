@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel
-from sqlalchemy import JSON
+from sqlalchemy import JSON, Index
 from sqlmodel import Column, Field, Relationship
 
 from cowork.models.base import BaseSQLModel
@@ -15,6 +15,12 @@ if TYPE_CHECKING:
 
 class Message(BaseSQLModel, table=True):
     __tablename__ = "messages"
+    # Composite index for the per-conversation MAX(created_at) that derives a
+    # conversation's last-activity time (ENG-961): with conversation_id as the
+    # leading column the DB can seek to the max instead of scanning the group.
+    __table_args__ = (
+        Index("ix_messages_conversation_created", "conversation_id", "created_at"),
+    )
 
     conversation_id: UUID = Field(
         ...,
