@@ -95,16 +95,10 @@ def scope_of_session(session: Session) -> TenantScope | None:
     return session.info.get("tenant_scope")
 
 
-# Tables whose ownership columns exist but stay inert for now. Deliberately a
-# closed list in this module — deferring a table from tenancy is a scoped-layer
-# decision that must land here, in review, never as a flag on the model.
-#
-# settings: deployment-owned rows (one deployment/database per org in org
-# mode), env-seeded with NULL org at boot; the unique ``key`` and the hot read
-# path stay key-based until the settings split's composite-key schema. Reads
-# must stay unfiltered (seeded rows would vanish) and writes unstamped. Gating
-# WHO may read/write org-mode settings (admin-only writes, secret reveals) is
-# endpoint authorization — week-2 item 7 — not this layer's filtering.
+# Tables whose ownership columns stay inert. Closed list on purpose: deferring
+# a table is a scoped-layer decision, never a model-side flag. settings stays
+# key-based until the settings split — rows are deployment-owned and env-seeded
+# with NULL org, so org-mode reads must not filter and writes must not stamp.
 _TENANCY_DEFERRED_TABLES = frozenset({"settings"})
 
 
@@ -140,8 +134,7 @@ class ScopedSession:
 
     def __init__(self, session: Session, scope: TenantScope) -> None:
         if isinstance(session, ScopedSession):
-            # A wrapper-of-wrapper hands raw statements to the inner exec()
-            # (which only accepts its own select()) — fail at construction.
+            # A wrapper-of-wrapper breaks exec() later — fail at construction.
             raise TypeError(
                 "ScopedSession cannot wrap another ScopedSession; pass the raw Session"
             )

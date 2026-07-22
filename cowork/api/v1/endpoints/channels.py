@@ -82,8 +82,7 @@ def get_channel_agent() -> ChannelAgentResponse:
 def set_channel_agent(
     body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep
 ) -> ChannelAgentResponse:
-    # Two views of the same request session: SettingService stays on the raw
-    # one until the settings split; the binding reset goes through the scope.
+    # Same request session twice: SettingService stays raw until the settings split.
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 

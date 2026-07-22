@@ -203,9 +203,8 @@ def intake_events(
     sched = scheduler or _default_scheduler
     session = get_open_session()
     try:
-        # SYSTEM_SCOPE like the scheduler loop: the event log has no org
-        # column and dedupes per installation — channel_type maps to exactly
-        # one installation per database (see services/channel_events.py).
+        # SYSTEM_SCOPE: the event log dedupes per installation, not per org
+        # (see services/channel_events.py).
         channel_log = ChannelEventService(ScopedSession(session, SYSTEM_SCOPE))
         for event in events:
             key = bridge.dedupe_key(event)
