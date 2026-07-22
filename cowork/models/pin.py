@@ -17,13 +17,8 @@ class Pin(BaseSQLModel, table=True):
     org_id: str | None = Field(default=None, max_length=36, description="Org of the pinned item; NULL on local/desktop rows")
 
     __table_args__ = (
-        # One pin per (item, user, org) so two org members can pin the same
-        # item. org_id belongs in the boundary because neither identifier is
-        # globally unique: a user belongs to many orgs (Keycloak user id +
-        # active-org header), and item_id is client-supplied (project pins
-        # use the name, unique only per org). COALESCE turns the NULLs of
-        # local/desktop rows into real values, keeping the pre-tenancy
-        # "one pin per item" dedupe there.
+        # One pin per (item, user, org); COALESCE keeps NULL desktop rows on
+        # the old one-pin-per-item rule. Full rationale: migration d2e8f1a4c7b9.
         Index(
             "uq_pins_item_user",
             "item_type",

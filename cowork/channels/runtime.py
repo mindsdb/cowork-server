@@ -225,9 +225,8 @@ class AntonChannelRuntime:
     async def _handle_locked(self, channel_type: str, event: Any) -> None:
         session = get_open_session()
         try:
-            # One scope for the whole turn. Local mode: today's behavior.
-            # Org mode: fails loudly here until the service-principal ticket
-            # lands — never a silent unscoped write from an inbound message.
+            # One scope per turn. Org mode fails loudly here until the
+            # service-principal ticket lands — never a silent unscoped write.
             scoped = ScopedSession(session, scope_for_background_context())
             binding = self._resolve_or_create_binding(scoped, channel_type, event)
             log.info(
@@ -357,8 +356,7 @@ class AntonChannelRuntime:
     def _touch_channel_session(
         scoped: ScopedSession, binding: ChannelBinding, conversation: Conversation, event: Any
     ) -> None:
-        # ChannelSession is a child (no org_id), anchored by its binding —
-        # already resolved through this turn's scope.
+        # ChannelSession is a child (no org_id): anchored by its binding.
         key = event.address.thread_id or _DEFAULT_THREAD_KEY
         row = scoped.exec(
             scoped.select(ChannelSession).where(
@@ -383,8 +381,7 @@ class AntonChannelRuntime:
         """Pinned harness for this conversation (whatever first served it), else
         the configured channel agent. This is the persisted ``channels_harness``
         setting (UI-selectable, env-seeded) — never the desktop UI harness."""
-        # Messages are children (no org_id): anchored on the conversation the
-        # caller already holds through this turn's scope.
+        # Messages are children (no org_id): anchored on the caller's conversation.
         pinned = scoped.exec(
             scoped.select(DBMessage.harness).where(
                 DBMessage.conversation_id == conversation.id,
