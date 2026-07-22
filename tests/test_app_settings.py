@@ -31,8 +31,8 @@ def test_app_settings_rejects_invalid_cowork_listen_port(monkeypatch):
 
 def test_app_settings_reads_desktop_cowork_server_port(monkeypatch):
     # The desktop app hands the derived per-user port to the sidecar as
-    # COWORK_SERVER_PORT (ENG-439). Regression: dropping this alias made the
-    # server bind :26866 while the app health-polled the derived port.
+    # COWORK_SERVER_PORT. Regression: dropping this alias made the server
+    # bind :26866 while the app health-polled the derived port.
     monkeypatch.delenv("COWORK_LISTEN_PORT", raising=False)
     monkeypatch.setenv("COWORK_SERVER_PORT", "27735")
 
