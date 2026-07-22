@@ -479,6 +479,24 @@ def build_llm_client():
             return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
+    # Routing & summarization role: the cheap front-model that runs history
+    # summarization (and later gates turns). Only pass it when the installed
+    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
+    # would TypeError, taking the whole agent down. When absent, anton falls
+    # back to the coding role internally, so behavior is preserved.
+    import inspect as _inspect
+
+    router_kw: dict = {}
+    try:
+        _params = _inspect.signature(LLMClient.__init__).parameters
+        if "router_provider" in _params:
+            router_kw = {
+                "router_provider": _make_provider(settings.resolved_router_provider, None),
+                "router_model": settings.resolved_router_model,
+            }
+    except (ValueError, TypeError):
+        router_kw = {}
+
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at
     # a keyless provider — the same resolution config_status reports, so the
@@ -492,6 +510,7 @@ def build_llm_client():
             settings.resolved_coding_provider, settings.coding_reasoning_effort
         ),
         coding_model=settings.resolved_coding_model,
+        **router_kw,
     )
 
 
