@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.schemas.channels import (
     ChannelAgentResponse,
@@ -52,18 +53,18 @@ async def _reconcile_ingress(request: Request, channel_type: str) -> None:
 
 
 @router.get("/status", response_model=ChannelStatusResponse)
-def channel_status(session: SessionDep) -> ChannelStatusResponse:
-    return ChannelConfigService(session).status()
+def channel_status(scoped: ScopedSessionDep) -> ChannelStatusResponse:
+    return ChannelConfigService(scoped).status()
 
 
 @router.get("/plugins", response_model=list[PluginResponse])
-def list_plugins(session: SessionDep) -> list[PluginResponse]:
-    return ChannelConfigService(session).list_plugins()
+def list_plugins(scoped: ScopedSessionDep) -> list[PluginResponse]:
+    return ChannelConfigService(scoped).list_plugins()
 
 
 @router.get("/installations", response_model=list[ChannelInstallationResponse])
-def list_installations(session: SessionDep) -> list[ChannelInstallationResponse]:
-    return ChannelConfigService(session).list_installations()
+def list_installations(scoped: ScopedSessionDep) -> list[ChannelInstallationResponse]:
+    return ChannelConfigService(scoped).list_installations()
 
 
 @router.get("/agent", response_model=ChannelAgentResponse)
@@ -78,7 +79,11 @@ def get_channel_agent() -> ChannelAgentResponse:
 
 
 @router.put("/agent", response_model=ChannelAgentResponse)
-def set_channel_agent(body: ChannelAgentUpdateRequest, session: SessionDep) -> ChannelAgentResponse:
+def set_channel_agent(
+    body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep
+) -> ChannelAgentResponse:
+    # Two views of the same request session: SettingService stays on the raw
+    # one until the settings split; the binding reset goes through the scope.
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 
@@ -97,14 +102,14 @@ def set_channel_agent(body: ChannelAgentUpdateRequest, session: SessionDep) -> C
     # per-conversation, so without this only new chats would switch).
     reset = 0
     if harness != previous:
-        reset = ChannelBindingService(session).reset_conversations()
+        reset = ChannelBindingService(scoped).reset_conversations()
     return ChannelAgentResponse(harness=harness, options=options, reset_conversations=reset)
 
 
 @router.get("/{channel_type}/config", response_model=ChannelConfigResponse)
-def get_config(channel_type: str, session: SessionDep) -> ChannelConfigResponse:
+def get_config(channel_type: str, scoped: ScopedSessionDep) -> ChannelConfigResponse:
     try:
-        return ChannelConfigService(session).get_config(channel_type)
+        return ChannelConfigService(scoped).get_config(channel_type)
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
 
@@ -114,10 +119,10 @@ async def set_config(
     channel_type: str,
     body: ChannelConfigUpdateRequest,
     request: Request,
-    session: SessionDep,
+    scoped: ScopedSessionDep,
 ) -> ChannelConfigResponse:
     try:
-        result = ChannelConfigService(session).set_config(channel_type, body.values)
+        result = ChannelConfigService(scoped).set_config(channel_type, body.values)
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
     except ValueError as e:
@@ -125,15 +130,15 @@ async def set_config(
 
     adapters = _live_adapters(request)
     if adapters is not None:
-        await adapters.refresh(channel_type, session=session)
+        await adapters.refresh(channel_type, session=scoped)
     await _reconcile_ingress(request, channel_type)
     return result
 
 
 @router.delete("/{channel_type}/config", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_config(channel_type: str, request: Request, session: SessionDep) -> None:
+async def delete_config(channel_type: str, request: Request, scoped: ScopedSessionDep) -> None:
     try:
-        deleted = ChannelConfigService(session).delete_config(channel_type)
+        deleted = ChannelConfigService(scoped).delete_config(channel_type)
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
     if not deleted:
@@ -149,29 +154,29 @@ async def delete_config(channel_type: str, request: Request, session: SessionDep
 
 
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
-async def reload_channel(channel_type: str, request: Request, session: SessionDep) -> ChannelReloadResponse:
+async def reload_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
     try:
-        ChannelConfigService(session).get_config(channel_type)
+        ChannelConfigService(scoped).get_config(channel_type)
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
     adapters = _live_adapters(request)
     active = False
     if adapters is not None:
-        active = await adapters.refresh(channel_type, session=session)
+        active = await adapters.refresh(channel_type, session=scoped)
     await _reconcile_ingress(request, channel_type)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
 
 
 @router.get("/bindings", response_model=list[BindingResponse])
-def list_bindings(session: SessionDep, channel_type: str | None = None) -> list[BindingResponse]:
-    return ChannelBindingService(session).list(channel_type=channel_type)
+def list_bindings(scoped: ScopedSessionDep, channel_type: str | None = None) -> list[BindingResponse]:
+    return ChannelBindingService(scoped).list(channel_type=channel_type)
 
 
 @router.post("/bindings", response_model=BindingResponse, status_code=status.HTTP_201_CREATED)
-def create_binding(body: BindingCreateRequest, session: SessionDep) -> BindingResponse:
+def create_binding(body: BindingCreateRequest, scoped: ScopedSessionDep) -> BindingResponse:
     try:
-        return ChannelBindingService(session).create(body)
+        return ChannelBindingService(scoped).create(body)
     except BindingConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -179,9 +184,9 @@ def create_binding(body: BindingCreateRequest, session: SessionDep) -> BindingRe
 
 
 @router.patch("/bindings/{binding_id}", response_model=BindingResponse)
-def update_binding(binding_id: UUID, body: BindingUpdateRequest, session: SessionDep) -> BindingResponse:
+def update_binding(binding_id: UUID, body: BindingUpdateRequest, scoped: ScopedSessionDep) -> BindingResponse:
     try:
-        return ChannelBindingService(session).update(binding_id, body)
+        return ChannelBindingService(scoped).update(binding_id, body)
     except BindingNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")
     except ValueError as e:
@@ -189,24 +194,24 @@ def update_binding(binding_id: UUID, body: BindingUpdateRequest, session: Sessio
 
 
 @router.delete("/bindings/{binding_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_binding(binding_id: UUID, session: SessionDep) -> None:
-    if not ChannelBindingService(session).delete(binding_id):
+def delete_binding(binding_id: UUID, scoped: ScopedSessionDep) -> None:
+    if not ChannelBindingService(scoped).delete(binding_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")
 
 
-def _lifecycle_service(request: Request, session: Session) -> ChannelLifecycleService:
+def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecycleService:
     adapters = _live_adapters(request)
     if adapters is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="channels runtime not initialized",
         )
-    return ChannelLifecycleService(session, adapters)
+    return ChannelLifecycleService(scoped, adapters)
 
 
 @router.post("/{channel_type}/setup", response_model=ChannelLifecycleResponse)
-async def setup_channel(channel_type: str, request: Request, session: SessionDep) -> ChannelLifecycleResponse:
-    svc = _lifecycle_service(request, session)
+async def setup_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelLifecycleResponse:
+    svc = _lifecycle_service(request, scoped)
     try:
         result = await svc.setup(channel_type)
     except UnknownChannelError:
@@ -223,8 +228,8 @@ async def setup_channel(channel_type: str, request: Request, session: SessionDep
 
 
 @router.post("/{channel_type}/teardown", response_model=ChannelLifecycleResponse)
-async def teardown_channel(channel_type: str, request: Request, session: SessionDep) -> ChannelLifecycleResponse:
-    svc = _lifecycle_service(request, session)
+async def teardown_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelLifecycleResponse:
+    svc = _lifecycle_service(request, scoped)
     try:
         result = await svc.teardown(channel_type)
     except UnknownChannelError:
