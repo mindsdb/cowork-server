@@ -133,6 +133,8 @@ class ResponsesHandler:
                 conversation_id=str(conversation.id),
                 turn_id=turn_id,
                 buffer=buffer,
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
                 producer_coro=self._produce(
                     conv_id=conversation.id,
                     harness_input=harness_input,

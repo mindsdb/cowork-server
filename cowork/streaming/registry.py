@@ -39,6 +39,17 @@ class RunHandle:
     buffer: StreamBuffer
     task: asyncio.Task
     created_at_monotonic: float = field(default_factory=lambda: 0.0)
+    # Owning org, captured from the trusted scope that started the turn (None
+    # in local mode). The tail/cancel/in-flight endpoints check it so one org
+    # can't tail or cancel another org's in-flight turn; a conversation_id is
+    # not an authorization token.
+    org_id: str | None = None
+    # Author of the turn, for attribution/audit only — NOT an authorization
+    # gate. Conversations are org-shared (they carry org_id + created_by, never
+    # a personal user_id), so any member may tail a teammate's live turn, just
+    # as they can already read its persisted transcript. Recorded here so the
+    # boundary can be tightened to per-user later without a schema change.
+    user_id: str | None = None
 
     @property
     def is_running(self) -> bool:
@@ -73,6 +84,8 @@ class RunRegistry:
         turn_id: int,
         buffer: StreamBuffer,
         producer_coro,
+        org_id: str | None = None,
+        user_id: str | None = None,
     ) -> RunHandle:
         """Spawn the producer as a detached task and register it. A
         duplicate start for an already-in-flight conversation returns the
@@ -93,6 +106,8 @@ class RunRegistry:
                 buffer=buffer,
                 task=task,
                 created_at_monotonic=loop.time(),
+                org_id=org_id,
+                user_id=user_id,
             )
             self._by_cid[conversation_id] = handle
             return handle
