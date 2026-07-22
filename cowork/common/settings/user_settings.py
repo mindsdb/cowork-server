@@ -559,6 +559,7 @@ class UserSettings(Settings):
             self.router_provider,
             self.router_model,
             ROUTER_MODEL_DEFAULTS,
+            self._minds_enabled_map(),
         )
 
     @property
