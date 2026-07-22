@@ -221,11 +221,21 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-    if not path or not path.strip() or "\x00" in path or path.lstrip().startswith("~"):
+    if not path or "\x00" in path or path.lstrip().startswith("~"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
+    normalized = os.path.normpath(path.strip())
+    if (
+        not normalized
+        or normalized == "."
+        or normalized.startswith("..")
+        or normalized == ".."
+        or os.path.isabs(normalized)
+    ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
 
     try:
-        rel = Path(path)
+        rel = Path(normalized)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
 
