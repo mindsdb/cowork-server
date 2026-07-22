@@ -104,6 +104,8 @@ def _build_datasource_context(vault, disabled_keys: set[tuple[str, str]]) -> str
 @register
 class HermesHarness:
     id: str = "hermes"
+    # Multi-tenancy is Anton-only for now; hidden from harness options in org mode.
+    supports_org_mode: bool = False
     label: str = "Hermes"
     formatter = staticmethod(format_hermes_stream)
 
@@ -178,8 +180,6 @@ class HermesHarness:
         # _run executes on an executor thread where lazy relationship
         # loads would fail.
         project_path = str(conversation.project.path)
-        conversation_id = conversation.id
-        project_id = conversation.project_id
         conversation_topic = conversation.topic
         prompt = self._to_prompt_string(input)
 
@@ -195,6 +195,10 @@ class HermesHarness:
         )
         artifacts_base = Path(project_path) / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Capture ids while the conversation is unambiguously attached — the
+        # end-of-turn finally must not depend on the session still being live.
+        conv_id = conversation.id
+        conv_project_id = conversation.project_id
         # Skill drafts surface as cards (never auto-saved). Snapshot the drafts
         # dir AND the live skills dir so a stray auto-save is caught + relocated.
         skill_drafts_base = Path(project_path) / ".anton" / "skill_drafts"
@@ -239,9 +243,7 @@ class HermesHarness:
             # yielded just below before the terminal result on normal
             # completion (mapped to response.artifact_created by the formatter,
             # same event the Anton harness produces).
-            cards = finalize_turn_artifacts(
-                conversation_id, project_id, artifacts_base, before_slugs,
-            )
+            cards = finalize_turn_artifacts(conversation, conv_id, conv_project_id, artifacts_base, before_slugs)
             # Sibling diff for skills the agent built this turn — relocates any
             # stray auto-save and returns self-contained draft payloads.
             skill_drafts = finalize_turn_skill_drafts(

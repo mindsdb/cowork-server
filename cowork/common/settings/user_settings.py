@@ -176,8 +176,8 @@ class _DynamicOptions:
 
 
 def _harness_options() -> list[str]:
-    from cowork.harnesses.base import _registry
-    return list(_registry.keys())
+    from cowork.harnesses.base import available_harness_ids
+    return available_harness_ids()
 
 
 class UserSettings(Settings):

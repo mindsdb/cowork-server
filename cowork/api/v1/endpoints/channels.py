@@ -33,6 +33,7 @@ from cowork.services.channel_lifecycle import (
     LifecycleNotImplementedError,
 )
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
+from cowork.harnesses.base import available_harness_ids
 
 router = APIRouter()
 
@@ -65,14 +66,6 @@ def list_installations(session: SessionDep) -> list[ChannelInstallationResponse]
     return ChannelConfigService(session).list_installations()
 
 
-def _harness_options() -> list[str]:
-    # Registered harness ids, resolved at request time (after plugins/harnesses
-    # have loaded — they aren't available when app_settings parses env).
-    from cowork.harnesses.base import _registry
-
-    return list(_registry.keys())
-
-
 @router.get("/agent", response_model=ChannelAgentResponse)
 def get_channel_agent() -> ChannelAgentResponse:
     """The harness that serves channel conversations. Distinct from the desktop
@@ -81,7 +74,7 @@ def get_channel_agent() -> ChannelAgentResponse:
     from cowork.common.settings.user_settings import get_user_settings
 
     current = (get_user_settings().channels_harness or "").strip() or "anton"
-    return ChannelAgentResponse(harness=current, options=_harness_options())
+    return ChannelAgentResponse(harness=current, options=available_harness_ids())
 
 
 @router.put("/agent", response_model=ChannelAgentResponse)
@@ -89,7 +82,7 @@ def set_channel_agent(body: ChannelAgentUpdateRequest, session: SessionDep) -> C
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 
-    options = _harness_options()
+    options = available_harness_ids()
     harness = (body.harness or "").strip()
     if harness not in options:
         raise HTTPException(

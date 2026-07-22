@@ -4,7 +4,7 @@ from uuid import UUID
 
 from sqlalchemy import case
 
-from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
+from cowork.db.scoped import ScopedSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
@@ -168,9 +168,7 @@ class ConversationService:
         # Drop the conversation's object index too — otherwise the rows
         # outlive the conversation as orphans pointing at artifacts no
         # task owns anymore.
-        # Raw session until the files/task_objects sweep; the parent
-        # conversation was already loaded through the scope above.
-        TaskObjectService(unsafe_unscoped_session(self.session)).delete_for_conversation(conversation_id)
+        TaskObjectService(self.session).delete_for_conversation(conversation)
         # Drop the conversation's uploaded attachments (rows + bytes) — they're
         # keyed by conversation id and would otherwise orphan in the file store
         # forever, invisible in any UI (ENG-701). Stage the row deletes into
@@ -182,7 +180,7 @@ class ConversationService:
             attachment_purpose,
             unlink_file_dirs,
         )
-        attachment_dirs = FileService(unsafe_unscoped_session(self.session)).delete_by_purpose(
+        attachment_dirs = FileService(self.session).delete_by_purpose(
             attachment_purpose(str(conversation_id))
         )
         self.session.delete(conversation)
@@ -199,7 +197,7 @@ class ConversationService:
         message and all subsequent messages (including this turn's tool rows)
         are removed. Returns the number of messages deleted.
         """
-        self.get_conversation(conversation_id)  # raises if not found
+        conversation = self.get_conversation(conversation_id)  # raises if not found
         messages = list(
             self.session.exec(
                 self.session.select(Message)
@@ -242,7 +240,7 @@ class ConversationService:
         # truncation leaves the index alone (rows aren't turn-scoped, and
         # surviving turns may still reference the artifact).
         if cut_from == 0:
-            TaskObjectService(unsafe_unscoped_session(self.session)).delete_for_conversation(conversation_id)
+            TaskObjectService(self.session).delete_for_conversation(conversation)
         self.session.commit()
         return len(to_delete)
 

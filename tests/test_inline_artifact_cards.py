@@ -72,12 +72,12 @@ def test_finalize_surfaces_only_new_artifacts(session, tmp_path):
     _make_artifact(base, "new", files={"r.md": "new"}, meta={"slug": "new", "name": "New", "type": "document"})
 
     conv = ConversationService(ScopedSession(session, LOCAL_SCOPE)).create_conversation(topic="t")
-    cards = t.finalize_turn_artifacts(conv.id, conv.project_id, base, before)
+    cards = t.finalize_turn_artifacts(conv, conv.id, conv.project_id, base, before)
     assert [c["slug"] for c in cards] == ["new"]
 
     # Nothing new on a second pass.
     after = t.snapshot_artifact_slugs(base)
-    assert t.finalize_turn_artifacts(conv.id, conv.project_id, base, after) == []
+    assert t.finalize_turn_artifacts(conv, conv.id, conv.project_id, base, after) == []
 
 
 # ── persistence: the reload guarantee ──────────────────────────────────────
