@@ -273,6 +273,7 @@ class AntonHarness:
             build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
+    build_cowork_request_approval_tool,
             build_cowork_request_credentials_tool,
         )
         from .browser_tools import build_browser_tools
@@ -280,6 +281,7 @@ class AntonHarness:
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
+        REQUEST_APPROVAL_TOOL = build_cowork_request_approval_tool()
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -575,6 +577,8 @@ class AntonHarness:
                 LOOKUP_CONNECTOR_TOOL,
                 REQUEST_CREDENTIALS_TOOL,
                 LABEL_CONNECTION_TOOL,
+                # Approve-before-act: parks consequential actions for human review.
+                REQUEST_APPROVAL_TOOL,
                 # Desktop browser bridge tools — discovery is deferred to call
                 # time, so these register even when the desktop app is down
                 # and fail gracefully with a friendly string.
