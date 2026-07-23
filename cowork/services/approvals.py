@@ -166,6 +166,22 @@ class ApprovalService:
             self._settle(approval, "skipped", receipt=None)
             return approval, True
 
+        if resolution == "always":
+            # "Always" is earned, not offered: the same scope must have been
+            # approved UNMODIFIED 3+ times before the grant exists. Then it
+            # executes exactly like an approval this time.
+            from cowork.services.rules import RuleService, scope_of
+
+            origin = str(descriptor.args.get("origin") or "") if isinstance(descriptor, ActionDescriptorV1) else ""
+            if not isinstance(descriptor, ActionDescriptorV1) or not origin:
+                raise ValueError("'always' needs an action with a scoped origin")
+            action_kind = scope_of(origin=origin, tool=descriptor.tool, label=descriptor.summary)[1]
+            rules = RuleService(self.session)
+            if not rules.eligible_for_always(origin=origin, action_kind=action_kind):
+                raise ValueError("'always' needs 3 identical unmodified approvals of this action first")
+            rules.grant(origin=origin, action_kind=action_kind, source_approval_id=approval.id)
+            resolution = "approved"
+
         # approved / edited — execute deterministically, exactly as approved.
         if isinstance(descriptor, AuthDescriptorV1):
             # Auth cards park no execution: approving hands the tab to the

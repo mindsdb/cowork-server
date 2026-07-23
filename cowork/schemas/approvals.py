@@ -74,7 +74,7 @@ class ApprovalCreateRequest(CamelRequest):
 
 
 class ApprovalResolveRequest(CamelRequest):
-    resolution: Literal["approved", "edited", "skipped"]
+    resolution: Literal["approved", "edited", "skipped", "always"]
     edited_draft: str | None = None
 
 
