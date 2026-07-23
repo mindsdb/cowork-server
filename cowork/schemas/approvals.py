@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, TypeAdapter
+from pydantic.alias_generators import to_camel
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
@@ -28,7 +29,13 @@ class ApprovalStatus(str, Enum):
 # Versioned action descriptors — discriminated union on `kind`, version: 1.
 # Later phases add kinds (auth is here; schedule, rule linkage next); never
 # bolt fields onto an existing v1 schema without bumping `version`.
-class ActionDescriptorV1(BaseModel):
+# Storage is snake_case (model_dump); the API serves camelCase (by_alias)
+# like every other response in the house.
+class _DescriptorBase(BaseModel):
+    model_config = {"alias_generator": to_camel, "populate_by_name": True}
+
+
+class ActionDescriptorV1(_DescriptorBase):
     """An executable action: the harness runs tool+args verbatim on approve."""
 
     version: Literal[1] = 1
@@ -38,7 +45,7 @@ class ActionDescriptorV1(BaseModel):
     summary: str = Field(default="", description="One-line human description of the action")
 
 
-class AuthDescriptorV1(BaseModel):
+class AuthDescriptorV1(_DescriptorBase):
     """An auth wall the agent can't cross — the card hands the tab to the human."""
 
     version: Literal[1] = 1
@@ -88,4 +95,11 @@ class ApprovalResponse(CamelResponse):
     def serialize(cls, obj):
         # JSON-safe dump (UUID/datetime → strings): approval payloads are
         # also persisted into message_events JSON columns, not just served.
-        return cls.model_validate(obj, from_attributes=True).model_dump(by_alias=True, mode="json")
+        data = cls.model_validate(obj, from_attributes=True).model_dump(by_alias=True, mode="json")
+        # The stored descriptor is snake_case; responses are camelCase house-wide.
+        # (by_alias dumped the key as actionDescriptor already)
+        if isinstance(data.get("actionDescriptor"), dict):
+            data["actionDescriptor"] = _DESCRIPTOR_ADAPTER.validate_python(
+                data["actionDescriptor"]
+            ).model_dump(by_alias=True, mode="json")
+        return data
