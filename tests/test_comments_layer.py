@@ -50,8 +50,8 @@ def test_layer_supports_edit_delete_protocol():
 
 
 def test_layer_reports_anchor_states():
-    # Классификация видимости якоря и её отправка наружу (для пометки "hidden"
-    # в инбоксе). anchored не репортится; scroll-путь исключён.
+    # Classify anchor visibility and report it outward (to mark items "hidden"
+    # in the inbox). anchored is not reported; the scroll path is excluded.
     for token in [
         "isShown",
         "'anchor-states'",
@@ -64,12 +64,12 @@ def test_layer_reports_anchor_states():
 
 
 def test_layer_hidden_popover_and_hover():
-    # Скрытый якорь (резолвится, но не показан) открывает центрированный попап
-    # с отдельным hidden-нотисом; hover не рисует нулевой бокс.
+    # A hidden anchor (resolves but is not shown) opens a centered popover
+    # with a separate hidden notice; hover does not draw a zero-size box.
     assert "isShown(m.target)" in LAYER_JS
-    assert "to see it in place" in LAYER_JS                 # hidden-нотис (contiguous chunk)
-    assert "el && isShown(el)" in LAYER_JS                 # focus не скроллит к скрытому
-    assert "!hel || !isShown(hel)" in LAYER_JS             # hl-on гасит скрытый
+    assert "to see it in place" in LAYER_JS                 # hidden notice (contiguous chunk)
+    assert "el && isShown(el)" in LAYER_JS                 # focus does not scroll to a hidden one
+    assert "!hel || !isShown(hel)" in LAYER_JS             # hl-on suppresses a hidden one
 
 
 def test_orphan_notice_skipped_for_general_comments():
