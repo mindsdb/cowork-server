@@ -856,3 +856,14 @@ class TestTabsAppAnnotation:
         result = await browser_tools._browser_tabs(None, {})
         assert "Open tabs:" in result
         assert "[app:" not in result
+
+
+class TestMatchAppRobustness:
+    def test_null_fields_never_raise(self):
+        apps = [
+            {"id": None, "name": None, "origin": None},
+            {"id": "app-x", "name": "X", "origin": "https://x.com"},
+        ]
+        assert browser_tools._match_app(apps, "anything") == apps[1] or browser_tools._match_app(apps, "anything") is None
+        assert browser_tools._match_app(apps, "x") == apps[1]
+        assert browser_tools._match_app(apps, "") is None

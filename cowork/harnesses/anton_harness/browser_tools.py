@@ -527,6 +527,11 @@ async def _browser_close_tab(session: Any, tc_input: dict) -> str:
     )
 
 
+def _app_field(app: dict, key: str) -> str:
+    """Registry fields can be null on corrupt/partial entries — never .lower() None."""
+    return str(app.get(key) or "").lower()
+
+
 def _match_app(apps: list[dict], query: str) -> dict | None:
     """Resolve a user/agent-supplied app name or id: exact (case-insensitive),
     then prefix, then substring across name and origin."""
@@ -534,13 +539,13 @@ def _match_app(apps: list[dict], query: str) -> dict | None:
     if not q:
         return None
     for app in apps:
-        if app.get("id", "").lower() == q or app.get("name", "").lower() == q:
+        if _app_field(app, "id") == q or _app_field(app, "name") == q:
             return app
     for app in apps:
-        if app.get("name", "").lower().startswith(q) or q in app.get("origin", "").lower():
+        if _app_field(app, "name").startswith(q) or q in _app_field(app, "origin"):
             return app
     for app in apps:
-        if q in app.get("name", "").lower():
+        if q in _app_field(app, "name"):
             return app
     return None
 
