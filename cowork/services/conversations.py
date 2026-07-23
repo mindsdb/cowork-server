@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+import shutil
 from datetime import datetime
+from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import case, func
@@ -40,6 +43,38 @@ def _is_tool_row(content) -> bool:
             for block in content
         )
     )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _skill_created_slug(event_data) -> str | None:
+    """The draft slug of a persisted `response.skill_created` event, else None."""
+    if not isinstance(event_data, dict) or event_data.get("type") != "response.skill_created":
+        return None
+    skill = event_data.get("skill")
+    slug = skill.get("slug") if isinstance(skill, dict) else None
+    return slug if isinstance(slug, str) and slug else None
+
+
+def _sweep_skill_drafts(session, project_id, slugs: set[str]) -> None:
+    """Remove the on-disk skill drafts for `slugs` in a project's drafts dir.
+
+    Called when a turn holding a skill card is deleted: the card's event is gone,
+    so the draft would otherwise be orphaned. Best-effort — a missing project or
+    folder is a no-op. Confined to direct children of the drafts dir.
+    """
+    project = session.get(Project, project_id)
+    if project is None or not project.path:
+        return
+    drafts_root = Path(project.path) / ".anton" / "skill_drafts"
+    for slug in slugs:
+        folder = drafts_root / slug
+        try:
+            if folder.parent == drafts_root and folder.is_dir():
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            logger.warning("Could not sweep skill draft %r on turn delete", slug, exc_info=True)
 
 
 class ConversationService:
@@ -281,10 +316,14 @@ class ConversationService:
         if cut_from is None:
             raise ValueError(f"Turn {turn_index} not found")
         to_delete = messages[cut_from:]
+        swept_slugs: set[str] = set()
         for msg in to_delete:
             for event in self.session.exec(
                 self.session.select(MessageEvent).where(MessageEvent.message_id == msg.id)
             ).all():
+                slug = _skill_created_slug(event.event_data)
+                if slug:
+                    swept_slugs.add(slug)
                 self.session.delete(event)
             self.session.delete(msg)
         # Clearing the whole history (truncate from turn 0) is the UI's
@@ -296,6 +335,10 @@ class ConversationService:
         if cut_from == 0:
             TaskObjectService(self.session).delete_for_conversation(conversation)
         self.session.commit()
+        # After the rows are gone, reap the on-disk drafts whose only card lived
+        # in a deleted turn (their `skill_created` events were just removed).
+        if swept_slugs:
+            _sweep_skill_drafts(self.session, conversation.project_id, swept_slugs)
         return len(to_delete)
 
     def save_assistant_turn(
