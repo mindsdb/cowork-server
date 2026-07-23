@@ -137,11 +137,19 @@ async def execute_schedule(
         # seam) so incident forensics don't have to reconstruct which schedule/
         # trigger produced a turn from timestamps.
         trigger = "manual" if is_manual else "cron"
+        # Scheduled × browser: when the desktop bridge is up, scheduled turns
+        # get the same live browser context as a dock turn; when it's down
+        # they degrade like any other turn (tools return the standard
+        # unavailable string if called).
+        from cowork.harnesses.anton_harness.browser_tools import bridge_available
+
+        surface = "browser" if await bridge_available() else None
         request = ResponsesRequest(
             input=schedule.prompt,
             model=schedule.model,
             stream=True,
             conversation=str(conversation_id),
+            surface=surface,
             trace_tags=["scheduled_task", f"trigger:{trigger}"],
             trace_metadata={
                 "schedule_id": str(schedule_id),

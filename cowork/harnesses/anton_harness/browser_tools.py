@@ -407,6 +407,16 @@ _CONTEXT_GUIDANCE = (
 )
 
 
+async def bridge_available() -> bool:
+    """Cheap liveness probe for the desktop browser bridge. Scheduled runs
+    key off this: surface:'browser' only when the browser is actually there."""
+    try:
+        await _bridge_call("GET", "/state", timeout=_FAST_TIMEOUT)
+        return True
+    except Exception:
+        return False
+
+
 async def build_browser_turn_context() -> str:
     """Copilot guidance + live tab state for a Browser Agent dock turn.
 
@@ -432,7 +442,8 @@ async def build_browser_turn_context() -> str:
             title = _clean(tab.get("title"), 60) or "New tab"
             url = (tab.get("url") or "").strip() or "(blank)"
             marker = "[active] " if tab.get("id") == active_id else ""
-            lines.append(f"{i}. {marker}{title} — {url}")
+            needs_auth = " — NEEDS SIGN-IN (ask the user, don't attempt)" if tab.get("needsAuth") else ""
+            lines.append(f"{i}. {marker}{title} — {url}{needs_auth}")
         if len(tabs) > _CONTEXT_MAX_TABS:
             lines.append(f"… and {len(tabs) - _CONTEXT_MAX_TABS} more (browser_tabs for the full list).")
         state_block = "Currently open tabs (live):\n" + "\n".join(lines)
