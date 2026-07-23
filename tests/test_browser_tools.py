@@ -488,8 +488,11 @@ class TestMutations:
             session=None, tc_input={"index": 0, "tab_id": "t1"}
         )
         assert result.startswith("Clicked element [0].")
-        assert calls[0]["json"] == {"tabId": "t1", "index": 0}
-        assert calls[0]["timeout"] == 30.0
+        # The supervised-mode gate pre-fetches a snapshot for classification —
+        # the action call is no longer calls[0]; select it by path.
+        click_call = next(c for c in calls if c["path"] == "/click")
+        assert click_call["json"] == {"tabId": "t1", "index": 0}
+        assert click_call["timeout"] == 30.0
 
     @pytest.mark.asyncio
     async def test_click_passes_snapshot_v_as_v(self, monkeypatch):
@@ -498,7 +501,8 @@ class TestMutations:
             session=None, tc_input={"index": 0, "tab_id": "t1", "snapshot_v": 3}
         )
         assert result.startswith("Clicked element [0].")
-        assert calls[0]["json"] == {"tabId": "t1", "index": 0, "v": 3}
+        click_call = next(c for c in calls if c["path"] == "/click")
+        assert click_call["json"] == {"tabId": "t1", "index": 0, "v": 3}
 
     @pytest.mark.asyncio
     async def test_click_missing_index_is_arg_error(self, monkeypatch):
@@ -698,10 +702,11 @@ class TestTrustedInputTools:
     async def test_click_at_payload_and_ok_text(self, monkeypatch):
         captured = _patch_bridge(monkeypatch, lambda *a: ({"ok": True}, 200))
         result = await browser_tools._browser_click_at(None, {"x": 120, "y": 340, "tab_id": "t1"})
-        assert captured[0]["path"] == "/click-at"
-        assert captured[0]["json"] == {"tabId": "t1", "x": 120, "y": 340}
+        # The gate probes /inspect-point first; select the action call by path.
+        at_call = next(c for c in captured if c["path"] == "/click-at")
+        assert at_call["json"] == {"tabId": "t1", "x": 120, "y": 340}
         assert "trusted click" in result
-        assert captured[0]["timeout"] == browser_tools._SLOW_TIMEOUT
+        assert at_call["timeout"] == browser_tools._SLOW_TIMEOUT
 
     @pytest.mark.asyncio
     async def test_click_at_validates_coordinates(self):

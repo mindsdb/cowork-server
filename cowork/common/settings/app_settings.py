@@ -205,6 +205,19 @@ class SkillSettings(Settings):
     )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
 
 
+class BrowserSettings(Settings):
+    gate_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_BROWSER_GATE", "BROWSER_GATE_ENABLED"),
+        description=(
+            "Supervised mode: consequential browser actions (send/submit/delete/pay) "
+            "park for human approval instead of executing. A gate regression must "
+            "never brick the browser agent for everyone, so this can be disabled "
+            "without a deploy."
+        ),
+    )
+
+
 class ConnectorSettings(Settings):
     vault_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "data-vault"),
@@ -404,6 +417,7 @@ class AppSettings(Settings):
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
+    browser: BrowserSettings = Field(default_factory=BrowserSettings)  # COWORK_BROWSER_GATE / BROWSER_GATE_ENABLED
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
 
 

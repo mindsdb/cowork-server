@@ -397,6 +397,171 @@ def _snapshot_v_arg(tc_input: dict) -> int | None:
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
+# ---------------------------------------------------------------------------
+# Supervised mode (approve-before-act gate)
+# ---------------------------------------------------------------------------
+# Consequential controls (classified by the bridge and annotated [!] in
+# snapshots) may not be clicked/submitted directly: the action parks as an
+# Approval for the human to approve, edit, or skip, and only a valid one-shot
+# token from that approval lets it through. Disable with
+# COWORK_BROWSER_GATE=0 — a gate regression must never brick the browser
+# agent for everyone.
+
+
+def _gate_enabled() -> bool:
+    try:
+        from cowork.common.settings.app_settings import get_app_settings
+
+        return bool(get_app_settings().browser.gate_enabled)
+    except Exception:
+        return True  # fail closed
+
+
+# Enter variants that send a compose — EXCEPT shift (newline) and alt.
+_SEND_KEYS = {"enter", "return"}
+_SEND_MODS = {frozenset(), frozenset({"control"}), frozenset({"ctrl"}),
+              frozenset({"meta"}), frozenset({"cmd"}), frozenset({"command"})}
+# Bridge paths the gate's executors replay (args are the POST body verbatim).
+_GATE_PATHS = {"browser_click": "/click", "browser_click_at": "/click-at", "browser_press_key": "/press"}
+
+
+def _is_consequential_el(el: dict) -> bool:
+    if el.get("consequential") is True:
+        return True
+    text = el.get("text")
+    return isinstance(text, str) and text.lstrip().startswith("[!]")
+
+
+async def _gate_label_click(tab_id: str | None, index: int) -> str | None:
+    """Consequential label for a snapshot element, or None when safe/unknown.
+    Never gate what we can't see — a failed lookup defers to the action's own
+    error handling rather than parking blind."""
+    try:
+        data = await _bridge_call("GET", "/snapshot", params={"tabId": tab_id}, timeout=_FAST_TIMEOUT)
+    except Exception:
+        return None
+    for el in (data or {}).get("elements") or []:
+        if isinstance(el, dict) and el.get("index") == index:
+            if _is_consequential_el(el):
+                return _clean(el.get("text"), 80) or "this action"
+            return None
+    return None
+
+
+async def _gate_label_probe(path: str, body: dict) -> str | None:
+    """Consequential label from an inspect endpoint (/inspect-point|active)."""
+    try:
+        data = await _bridge_call("POST", path, body=body, timeout=_FAST_TIMEOUT)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+    if _is_consequential_el(data):
+        return _clean(data.get("text"), 80) or "this action"
+    return None
+
+
+async def _gate(session: Any, tc_input: dict, *, tool: str, args: dict, label: str | None) -> str | None:
+    """Supervised-mode gate. None = proceed; a string = return it to the model."""
+    if not _gate_enabled() or label is None:
+        return None
+    raw = str(tc_input.get("approval_token") or "").strip()
+    if raw:
+        from cowork.db.session import get_open_session
+        from cowork.services.approvals import ApprovalService
+
+        db = get_open_session()
+        try:
+            ApprovalService(db).consume_token(raw, tool=tool, args=args)
+        except ValueError as e:
+            return (
+                f"{tool}: approval token rejected ({e}). The approved action could not be "
+                "verified — re-propose it with request_approval."
+            )
+        finally:
+            db.close()
+        return None
+
+    # Park, never execute.
+    from uuid import UUID
+
+    from cowork.db.session import get_open_session
+    from cowork.schemas.approvals import ActionDescriptorV1
+    from cowork.services.approvals import ApprovalService
+
+    conv = getattr(session, "_session_id", None)
+    if not conv:
+        return (
+            f"{tool}: '{label}' is irreversible and needs human approval, but the proposal "
+            "couldn't be queued (no conversation context). Paused — tell the user."
+        )
+    db = get_open_session()
+    try:
+        approval = ApprovalService(db).create(
+            conversation_id=UUID(str(conv)),
+            descriptor=ActionDescriptorV1(tool=tool, args=args, summary=label),
+            draft=args.get("text") if isinstance(args.get("text"), str) else "",
+        )
+        approval_id = approval.id
+    finally:
+        db.close()
+    return (
+        f'PAUSED for approval: "{label}" is a consequential action — I\'ve parked it for the '
+        f"user (approval id {approval_id}). END YOUR TURN: tell them it's waiting for review. "
+        "Do not retry the action yourself."
+    )
+
+
+def _run_sync(coro: Any) -> Any:
+    """Run an async bridge call from sync executor code. asyncio.run() alone
+    would explode whenever the caller already has a loop (tests, async
+    endpoints), so the coroutine gets its own thread + loop regardless."""
+    import asyncio
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["value"] = asyncio.run(coro)
+        except Exception as exc:  # surfaced by the caller, never swallowed
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _make_gate_executor(tool: str):
+    """Executor for resolved approvals: spends the one-shot token (payload-bound)
+    then replays the exact approved bridge call."""
+
+    def _exec(db_session: Any, args: dict, raw_token: str) -> dict:
+        from cowork.services.approvals import ApprovalService
+
+        try:
+            ApprovalService(db_session).consume_token(raw_token, tool=tool, args=args)
+        except ValueError as e:
+            return {"executed": False, "error": str(e)}
+        try:
+            result = _run_sync(_bridge_call("POST", _GATE_PATHS[tool], body=args, timeout=_SLOW_TIMEOUT))
+        except Exception as e:
+            return {"executed": False, "error": f"browser action failed: {e}"}
+        return {"executed": True, "result": result}
+
+    return _exec
+
+
+def _register_gate_executors() -> None:
+    from cowork.services.approvals import register_executor
+
+    for tool in _GATE_PATHS:
+        register_executor(tool, _make_gate_executor(tool))
+
+
 async def _browser_navigate(session: Any, tc_input: dict) -> str:
     url = str(tc_input.get("url", "")).strip()
     if not url:
@@ -444,9 +609,20 @@ async def _browser_click(session: Any, tc_input: dict) -> str:
     index = _index_arg("browser_click", tc_input)
     if isinstance(index, str):
         return index
+    tab_id = _tab_id(tc_input)
+    args: dict[str, Any] = {"index": index}
+    if tab_id:
+        args["tabId"] = tab_id
+    v = _snapshot_v_arg(tc_input)
+    if v is not None:
+        args["v"] = v
+    label = await _gate_label_click(tab_id, index)
+    paused = await _gate(session, tc_input, tool="browser_click", args=args, label=label)
+    if paused is not None:
+        return paused
     return await _call_and_format(
         "browser_click", "POST", "/click",
-        body={"tabId": _tab_id(tc_input), "index": index, "v": _snapshot_v_arg(tc_input)},
+        body=args,
         timeout=_SLOW_TIMEOUT,
         ok=lambda data: (
             f"Clicked element [{index}]. If the page changed, take a fresh "
@@ -594,9 +770,17 @@ async def _browser_click_at(session: Any, tc_input: dict) -> str:
             "browser_click_at: `x` and `y` (viewport CSS pixel coordinates, as seen "
             "in the latest browser_screenshot) are required."
         )
+    args = {"x": x, "y": y}
+    tab_id = _tab_id(tc_input)
+    if tab_id:
+        args["tabId"] = tab_id
+    label = await _gate_label_probe("/inspect-point", {"x": x, "y": y, **({"tabId": tab_id} if tab_id else {})})
+    paused = await _gate(session, tc_input, tool="browser_click_at", args=args, label=label)
+    if paused is not None:
+        return paused
     return await _call_and_format(
         "browser_click_at", "POST", "/click-at",
-        body={"tabId": _tab_id(tc_input), "x": x, "y": y},
+        body=args,
         timeout=_SLOW_TIMEOUT,
         ok=lambda data: (
             f"Clicked at ({x}, {y}) — a real trusted click, like a mouse. If the "
@@ -618,9 +802,23 @@ async def _browser_press_key(session: Any, tc_input: dict) -> str:
         if isinstance(modifiers, list)
         else None
     )
+    tab_id = _tab_id(tc_input)
+    args: dict[str, Any] = {"key": key}
+    if tab_id:
+        args["tabId"] = tab_id
+    if mods:
+        args["modifiers"] = mods
+    label = None
+    if key.lower() in _SEND_KEYS and frozenset(mods or []) in _SEND_MODS:
+        label = await _gate_label_probe(
+            "/inspect-active", {"tabId": tab_id} if tab_id else {}
+        )
+    paused = await _gate(session, tc_input, tool="browser_press_key", args=args, label=label)
+    if paused is not None:
+        return paused
     return await _call_and_format(
         "browser_press_key", "POST", "/press",
-        body={"tabId": _tab_id(tc_input), "key": key, "modifiers": mods},
+        body=args,
         timeout=_SLOW_TIMEOUT,
         ok=lambda data: (
             f"Pressed {key}"
@@ -723,6 +921,8 @@ def build_browser_tools():
     tools simply return a friendly "unavailable" string when the desktop
     app isn't running."""
     from anton.core.tools.tool_defs import ToolDef
+
+    _register_gate_executors()
 
     return [
         ToolDef(
