@@ -55,6 +55,15 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
     session.add(schedule)
 
 
+def _sweep_expired_approvals(session) -> None:
+    """Expire pending approvals past their TTL — parked proposals are not forever."""
+    from cowork.services.approvals import ApprovalService
+
+    expired = ApprovalService(session).sweep_expired()
+    if expired:
+        logger.info(f"Swept {expired} expired approval(s)")
+
+
 def _handle_missed_runs(session) -> None:
     now = datetime.now(timezone.utc)
     schedules = ScheduleService(session).list_schedules()
@@ -272,6 +281,7 @@ async def _scheduler_loop() -> None:
         session = get_open_session()
         try:
             _handle_missed_runs(session)
+            _sweep_expired_approvals(session)
             due = _due_schedules(session, datetime.now(timezone.utc))
         except Exception:
             logger.exception("Scheduler loop error during poll")
