@@ -81,3 +81,9 @@ class ApprovalResponse(CamelResponse):
     expires_at: datetime
     resolved_at: datetime | None
     created_at: datetime
+
+    @classmethod
+    def serialize(cls, obj):
+        # JSON-safe dump (UUID/datetime → strings): approval payloads are
+        # also persisted into message_events JSON columns, not just served.
+        return cls.model_validate(obj, from_attributes=True).model_dump(by_alias=True, mode="json")

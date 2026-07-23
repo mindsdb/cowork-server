@@ -54,6 +54,20 @@ async def lifespan(app: FastAPI):
             recovery_session.close()
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
+    # Expire approvals that outlived their TTL while we were down — a parked
+    # proposal from three days ago must not greet the user as actionable.
+    try:
+        from cowork.services.approvals import ApprovalService
+
+        sweep_session = get_open_session()
+        try:
+            expired = ApprovalService(sweep_session).sweep_expired()
+            if expired:
+                logger.info(f"Swept {expired} expired approval(s) on boot")
+        finally:
+            sweep_session.close()
+    except Exception:
+        logger.exception("approval boot sweep failed (non-fatal)")
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.ingress import sync_channel_ingress
