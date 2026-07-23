@@ -1,12 +1,14 @@
 name: Auto-release and publish to PyPI
 
-# Thin caller: the shared release/publish machinery lives in
-# publish-pypi.yml (one CalVer computation, tag/release, build, publish);
-# this file only decides WHEN it runs and that the stream is stable.
+# Stable release stream: on every push to main, cut a CalVer release and
+# publish it to PyPI. The publish job MUST live in this top-level workflow
+# (not a reusable one) — PyPI Trusted Publishing does not support reusable
+# workflows, and matches the OIDC claim on THIS filename. Register
+# publish.yml as a trusted publisher (environment `pypi`) at
+# https://pypi.org/manage/project/cowork-server/settings/publishing/
 
 permissions:
   contents: write
-  id-token: write
 
 on:
   push:
@@ -17,11 +19,88 @@ concurrency:
   group: auto-release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CALVER_MAJOR: 0
+
 jobs:
-  release-publish:
-    # workflow_dispatch can be pointed at any ref; only main commits may
-    # cut a stable release.
+  unit-tests:
+    uses: ./.github/workflows/tests-unit.yml
+
+  release:
+    needs: unit-tests
+    # workflow_dispatch can be pointed at any ref; only main cuts a stable release.
     if: github.ref == 'refs/heads/main'
-    uses: ./.github/workflows/publish-pypi.yml
-    with:
-      prerelease: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need tags for sequence calculation
+
+      - name: Compute CalVer version
+        id: version
+        run: |
+          set -euo pipefail
+
+          MAJOR=${{ env.CALVER_MAJOR }}
+          YY=$(date -u +%y)
+          M=$(date -u +%-m)
+          DD=$(date -u +%-d)
+
+          # Next free NUMERIC sequence for today. rc-suffixed tags fail this
+          # numeric check, so the stable and rc streams never fight over a
+          # sequence number.
+          PREFIX="v${MAJOR}.${YY}.${M}.${DD}."
+          SEQ=0
+          for tag in $(git tag -l "${PREFIX}*"); do
+            N="${tag##*.}"
+            if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$SEQ" ]; then
+              SEQ="$N"
+            fi
+          done
+          SEQ=$((SEQ + 1))
+
+          VERSION="${MAJOR}.${YY}.${M}.${DD}.${SEQ}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${VERSION}"
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            --title "${{ steps.version.outputs.tag }}"
+
+  publish:
+    name: Build and publish to PyPI
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write  # required for trusted publisher (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          fetch-depth: 0  # hatch-vcs needs tags to derive version
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build package
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Trusted publisher (OIDC) — publish.yml must be registered at the
+        # PyPI project's publishing settings (environment: pypi).

@@ -104,7 +104,6 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 # The URL pattern is:
 #   prod:    api.mindshub.ai    / view.mindshub.ai
 #   staging: api.staging.mindshub.ai / view.staging.mindshub.ai
-#   dev:     api.dev.mindshub.ai    / view.dev.mindshub.ai
 #   local:   same as dev (local dev typically targets the dev env)
 
 
