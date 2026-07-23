@@ -411,11 +411,14 @@ class TestTabs:
         }
         _patch_bridge(monkeypatch, lambda m, p, params, body: (state, 200))
         result = await browser_tools._browser_tabs(session=None, tc_input={})
-        assert result.splitlines() == [
+        # Untrusted-content wrapper frames the listing (titles are page-controlled).
+        assert result.startswith('<untrusted-page-content source="open tabs">')
+        for line in (
             "Open tabs:",
             "1. Pricing — https://x.com/pricing (tabId: a)",
             "2. [active] New tab — (blank) (loading…) (tabId: b)",
-        ]
+        ):
+            assert line in result
 
 
 class TestRead:
@@ -521,8 +524,9 @@ class TestMutations:
         result = await browser_tools._browser_type(
             session=None, tc_input={"index": 4, "text": "hello", "submit": True}
         )
-        assert "Typed into element [4] and submitted (Enter)." in result
-        assert calls[0]["json"] == {"index": 4, "text": "hello", "submit": True}
+        # Supervised mode: type+submit IS the send — it parks, never posts.
+        assert "irreversible and needs human approval" in result
+        assert not any(c["path"] == "/type" for c in calls)
 
     @pytest.mark.asyncio
     async def test_type_passes_snapshot_v_as_v(self, monkeypatch):

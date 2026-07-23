@@ -325,12 +325,17 @@ def _tripwire_scan(body: str) -> str | None:
 
 
 def _wrap_untrusted(body: str, url: str) -> str:
-    """Frame page-derived text as data, with a tripwire line when it bites."""
+    """Frame page-derived text as data, with a tripwire line when it bites.
+    The page must not be able to forge the frame itself: neutralize any
+    literal closing delimiter in the body and quotes in the source URL, or
+    injected text would escape the wrapper and read as trusted."""
     note = _tripwire_scan(body)
-    parts = [f'<untrusted-page-content source="{url}">', _UNTRUSTED_PREAMBLE]
+    safe_url = url.replace('"', "")
+    safe_body = body.replace("</untrusted-page-content", "<\\/untrusted-page-content")
+    parts = [f'<untrusted-page-content source="{safe_url}">', _UNTRUSTED_PREAMBLE]
     if note:
         parts.append(note)
-    parts += ["", body, "</untrusted-page-content>"]
+    parts += ["", safe_body, "</untrusted-page-content>"]
     return "\n".join(parts)
 
 
@@ -479,11 +484,21 @@ def _gate_enabled() -> bool:
 
 
 # Enter variants that send a compose — EXCEPT shift (newline) and alt.
-_SEND_KEYS = {"enter", "return"}
-_SEND_MODS = {frozenset(), frozenset({"control"}), frozenset({"ctrl"}),
-              frozenset({"meta"}), frozenset({"cmd"}), frozenset({"command"})}
+# Post-normalization names only (cmd/ctrl/alt/shift — see _MODIFIER_NAMES):
+# bare Enter plus the ctrl/cmd send chords; shift never sends (newline).
+_SEND_KEYS = {"enter", "return", "numpadenter"}
+_SEND_MODS = {frozenset(), frozenset({"ctrl"}), frozenset({"cmd"})}
 # Bridge paths the gate's executors replay (args are the POST body verbatim).
-_GATE_PATHS = {"browser_click": "/click", "browser_click_at": "/click-at", "browser_press_key": "/press"}
+# Paths approval executors can replay. The gate polices click/click_at/
+# press_key; type+submit is gated unconditionally; paste/type are here so
+# request_approval proposals for them can execute at all.
+_GATE_PATHS = {
+    "browser_click": "/click",
+    "browser_click_at": "/click-at",
+    "browser_press_key": "/press",
+    "browser_type": "/type",
+    "browser_paste": "/paste",
+}
 
 
 def _is_consequential_el(el: dict) -> bool:
@@ -493,20 +508,23 @@ def _is_consequential_el(el: dict) -> bool:
     return isinstance(text, str) and text.lstrip().startswith("[!]")
 
 
-async def _gate_label_click(tab_id: str | None, index: int) -> str | None:
-    """Consequential label for a snapshot element, or None when safe/unknown.
-    Never gate what we can't see — a failed lookup defers to the action's own
-    error handling rather than parking blind."""
+async def _gate_label_click(tab_id: str | None, index: int) -> tuple[str | None, int | None]:
+    """(Consequential label, snapshot v) for a snapshot element — the v binds
+    the parked approval to the exact page state it was classified from, so a
+    later replay hits the bridge's staleness check if the page has moved on.
+    (None, None) when safe/unknown: never gate what we can't see."""
     try:
         data = await _bridge_call("GET", "/snapshot", params={"tabId": tab_id}, timeout=_FAST_TIMEOUT)
     except Exception:
-        return None
+        return None, None
+    v = (data or {}).get("v")
+    v = v if isinstance(v, int) and not isinstance(v, bool) else None
     for el in (data or {}).get("elements") or []:
         if isinstance(el, dict) and el.get("index") == index:
             if _is_consequential_el(el):
-                return _clean(el.get("text"), 80) or "this action"
-            return None
-    return None
+                return (_clean(el.get("text"), 80) or "this action"), v
+            return None, v
+    return None, v
 
 
 async def _gate_label_probe(path: str, body: dict) -> str | None:
@@ -539,6 +557,9 @@ async def _gate(session: Any, tc_input: dict, *, tool: str, args: dict, label: s
                 f"{tool}: approval token rejected ({e}). The approved action could not be "
                 "verified — re-propose it with request_approval."
             )
+        except Exception as e:
+            # House rule: never raise into the agent loop.
+            return f"{tool}: couldn't verify the approval ({e}). Tell the user, don't retry in a loop."
         finally:
             db.close()
         return None
@@ -564,6 +585,9 @@ async def _gate(session: Any, tc_input: dict, *, tool: str, args: dict, label: s
             draft=args.get("text") if isinstance(args.get("text"), str) else "",
         )
         approval_id = approval.id
+    except Exception as e:
+        # House rule: never raise into the agent loop — fail the action, not the turn.
+        return f"{tool}: couldn't queue the approval ({e}). Paused — tell the user, don't retry."
     finally:
         db.close()
     return (
@@ -627,6 +651,15 @@ async def _browser_navigate(session: Any, tc_input: dict) -> str:
     url = str(tc_input.get("url", "")).strip()
     if not url:
         return "browser_navigate: `url` is required."
+    # Defense in depth (the bridge enforces this too): never forward schemes
+    # that execute or spoof in the logged-in origin. Plain text stays — the
+    # bridge turns it into a search.
+    lowered = url.lower()
+    if lowered.startswith(("javascript:", "data:", "file:", "vbscript:")):
+        return (
+            "browser_navigate: only http(s) URLs (or a search phrase) are allowed — "
+            f"refusing {url.split(':', 1)[0]}: navigation."
+        )
     if tc_input.get("new_tab") and tc_input.get("background"):
         return await _call_and_format(
             "browser_navigate", "POST", "/tabs",
@@ -648,7 +681,11 @@ async def _browser_navigate(session: Any, tc_input: dict) -> str:
 
 
 async def _browser_tabs(session: Any, tc_input: dict) -> str:
-    return await _call_and_format("browser_tabs", "GET", "/state", ok=_fmt_tabs)
+    # Titles/URLs are page-controlled too — the listing gets the same frame.
+    return await _call_and_format(
+        "browser_tabs", "GET", "/state",
+        ok=lambda data: _wrap_untrusted(_fmt_tabs(data), "open tabs"),
+    )
 
 
 async def _browser_read(session: Any, tc_input: dict) -> str:
@@ -681,7 +718,9 @@ async def _browser_click(session: Any, tc_input: dict) -> str:
     v = _snapshot_v_arg(tc_input)
     if v is not None:
         args["v"] = v
-    label = await _gate_label_click(tab_id, index)
+    label, snap_v = await _gate_label_click(tab_id, index)
+    if label is not None and "v" not in args and snap_v is not None:
+        args["v"] = snap_v  # bind the parked approval to the classified page state
     paused = await _gate(session, tc_input, tool="browser_click", args=args, label=label)
     if paused is not None:
         return paused
@@ -705,6 +744,24 @@ async def _browser_type(session: Any, tc_input: dict) -> str:
         return "browser_type: `text` is required."
     text = str(text)
     submit = bool(tc_input.get("submit"))
+    if submit:
+        # Typing AND pressing Enter IS the send — no target classification can
+        # make it safe, so it always parks. (The single biggest gate bypass
+        # found in adversarial review.)
+        args: dict[str, Any] = {"index": index, "text": text, "submit": True}
+        tab_id = _tab_id(tc_input)
+        if tab_id:
+            args["tabId"] = tab_id
+        v = _snapshot_v_arg(tc_input)
+        if v is not None:
+            args["v"] = v
+        paused = await _gate(
+            session, tc_input,
+            tool="browser_type", args=args,
+            label="type + submit (Enter) the composed text",
+        )
+        if paused is not None:
+            return paused
     return await _call_and_format(
         "browser_type", "POST", "/type",
         body={

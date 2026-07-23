@@ -39,6 +39,10 @@ def db_session(monkeypatch):
         "get_open_session",
         lambda: Session(engine),
     )
+    # create() validates executability — the test tool must have an executor.
+    from cowork.services.approvals import register_executor
+
+    register_executor("t", lambda s, a, tok: {"ok": True})
     yield session, conv
     session.close()
 

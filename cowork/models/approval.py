@@ -32,7 +32,7 @@ class Approval(BaseSQLModel, table=True):
     status: str = Field(
         default="pending",
         index=True,
-        description="pending | approved | edited | skipped | expired",
+        description="pending | resolving | approved | edited | skipped | expired | failed (re-resolvable)",
     )
     action_descriptor: dict[str, Any] | BaseModel | str | list[Any] = Field(
         default_factory=dict,

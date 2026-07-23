@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import pytest
+
 import cowork.harnesses.anton_harness.browser_tools as bt
+
+
+@pytest.fixture(autouse=True)
+def _reset_tripwire():
+    bt.TRIPWIRE_HITS.clear()
+    yield
+    bt.TRIPWIRE_HITS.clear()
+
 
 
 def test_wrap_untrusted_frames_content_as_data():

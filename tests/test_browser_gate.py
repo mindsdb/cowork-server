@@ -48,6 +48,7 @@ def _env(monkeypatch):
     from cowork.db import session as db_session_module
 
     monkeypatch.setattr(db_session_module, "get_open_session", lambda: Session(engine))
+    bt._register_gate_executors()
     yield session, conv
     session.close()
 

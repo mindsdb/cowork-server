@@ -149,17 +149,6 @@ def test_auth_cards_park_without_execution(session, conversation):
     assert EXECUTOR_CALLS == []
 
 
-def test_missing_executor_is_a_receipt_not_a_crash(session, conversation):
-    service = ApprovalService(session)
-    approval = service.create(
-        conversation_id=conversation.id,
-        descriptor=_descriptor(tool="no_such_tool"),
-    )
-    resolved, _ = service.resolve(approval.id, resolution="approved")
-    assert resolved.receipt["executed"] is False
-    assert "no executor registered" in resolved.receipt["error"]
-
-
 def test_expired_pending_cannot_resolve_and_sweep_marks_expired(session, conversation):
     service = ApprovalService(session)
     approval = service.create(

@@ -761,7 +761,7 @@ _REQUEST_APPROVAL_SCHEMA = {
             "properties": {
                 "tool": {
                     "type": "string",
-                    "description": "Tool to execute on approve (e.g. browser_click, browser_paste).",
+                    "description": "Tool to execute on approve (e.g. browser_click, browser_type).",
                 },
                 "args": {
                     "type": "object",
@@ -844,6 +844,9 @@ async def _cowork_request_approval(session: Any, tc_input: dict) -> str:
             ttl_seconds=ttl if isinstance(ttl, int) and ttl > 0 else DEFAULT_TTL_SECONDS,
         )
         approval_id = approval.id  # capture before close — the row detaches
+    except Exception as e:
+        # House rule: handlers return strings, never raise into the agent loop.
+        return f"request_approval: couldn't queue the proposal ({e}). Tell the user, don't retry."
     finally:
         db.close()
 
