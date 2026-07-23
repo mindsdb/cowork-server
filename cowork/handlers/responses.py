@@ -61,6 +61,10 @@ class ResponsesHandler:
         project_id = self._resolve_project_id(request)
 
         harness_input = self._build_harness_input(request)
+        # Topic text comes from the UNWRAPPED input: the browser-context
+        # injection below is for the model only and must not leak into
+        # conversation titles/previews/search.
+        topic_text = self._prompt_text(harness_input)
         if request.surface == "browser" and getattr(self.harness, "id", None) == "anton":
             harness_input = await self._with_browser_context(harness_input)
         original_content = self._extract_original_content(request)
@@ -79,7 +83,7 @@ class ResponsesHandler:
                     # the first stream. Adopt it, otherwise those uploads strand
                     # under an id no conversation ever gets (ENG-264).
                     conversation = conversation_service.create_conversation(
-                        topic=self._prompt_text(harness_input)[:80],
+                        topic=topic_text[:80],
                         project_id=project_id,
                         conversation_id=conv_id,
                     )
@@ -89,13 +93,13 @@ class ResponsesHandler:
                 # row id, so create a fresh conversation and re-link any
                 # attachments uploaded against the client's id (ENG-264).
                 conversation = conversation_service.create_conversation(
-                    topic=self._prompt_text(harness_input)[:80],
+                    topic=topic_text[:80],
                     project_id=project_id,
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
             conversation = conversation_service.create_conversation(
-                topic=self._prompt_text(harness_input)[:80],
+                topic=topic_text[:80],
                 project_id=project_id,
             )
 
