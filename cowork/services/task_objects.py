@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -293,24 +294,46 @@ def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts
 # under the already-off-limits `.anton/` dir, so a draft is invisible to BOTH
 # the artifacts scan and skill-discovery) and surface each as a self-contained
 # `response.skill_created` event. Mirrors the artifact snapshot/diff above, but
-# is deliberately NOT indexed as a TaskObject — a draft is transient until Save.
+# is deliberately NOT indexed as a TaskObject — a draft persists on disk until
+# the user Saves or dismisses it.
 
 # A skill folder is a draft iff it holds the canonical SKILL.md filename.
 _DRAFT_FILE_MAX = 200_000  # per sibling file; skills are small text — cap defensively
 
 
-def snapshot_skill_drafts(drafts_base) -> set[str]:
-    """The set of skill-draft folder names under `.anton/skill_drafts`."""
+def _draft_content_hash(skill_md_path: Path) -> str:
+    """SHA-256 of a draft's SKILL.md bytes ('' if unreadable).
+
+    ponytail: hashes SKILL.md only, not sibling files — a sibling-only edit
+    won't re-emit a card. Skills are refined by rewriting SKILL.md, so this
+    covers the real case; upgrade to a whole-folder hash if sibling-only edits
+    must surface.
+    """
+    try:
+        return hashlib.sha256(skill_md_path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def snapshot_skill_drafts(drafts_base) -> dict[str, str]:
+    """Map each skill-draft folder name under `.anton/skill_drafts` to a content
+    hash of its SKILL.md.
+
+    Keying on content (not just the folder name) lets the turn-end diff re-emit
+    a card when a draft is refined in place across turns, not only when a new
+    folder first appears.
+    """
     from anton.core.tools.skill_format import SKILL_FILE
 
     base = Path(drafts_base)
     if not base.is_dir():
-        return set()
-    return {
-        child.name
-        for child in base.iterdir()
-        if child.is_dir() and (child / SKILL_FILE).is_file()
-    }
+        return {}
+    snapshot: dict[str, str] = {}
+    for child in base.iterdir():
+        skill_md = child / SKILL_FILE
+        if child.is_dir() and skill_md.is_file():
+            snapshot[child.name] = _draft_content_hash(skill_md)
+    return snapshot
 
 
 def snapshot_stray_skills(project_skills_dir) -> set[str]:
@@ -399,17 +422,20 @@ def _skill_draft_payload(folder: Path) -> dict | None:
     }
 
 
-def finalize_turn_skill_drafts(project_path, before_drafts: set[str], before_strays: set[str]) -> list[dict]:
-    """End-of-turn skill-draft handling from a single dir diff.
+def finalize_turn_skill_drafts(project_path, before_drafts: dict[str, str], before_strays: set[str]) -> list[dict]:
+    """End-of-turn skill-draft handling from a content diff of the drafts dir.
 
     1. Relocate any NEW stray (non-symlink) skill folder the agent wrote into
        `<project>/skills` over into the drafts dir — kills the auto-save leak
        even if the prompt/tool routing failed. Moving it in makes it show up in
        the drafts diff below, so it travels the same card path.
-    2. Diff the drafts dir and return a self-contained payload per new draft.
+    2. Diff the drafts dir by SKILL.md content and return a self-contained
+       payload for every draft that is NEW or CHANGED since the turn started.
 
-    Returns `[]` when nothing new. Best-effort: every step is guarded so a draft
-    can never break a turn.
+    Draft folders PERSIST — they are not swept here, so an unsaved skill stays on
+    disk and later refinements re-emit an updated card (cleanup happens on
+    Save/Dismiss, not per turn). Returns `[]` when nothing new or changed.
+    Best-effort: every step is guarded so a draft can never break a turn.
     """
     base = Path(project_path)
     drafts_base = base / ".anton" / "skill_drafts"
@@ -428,18 +454,16 @@ def finalize_turn_skill_drafts(project_path, before_drafts: set[str], before_str
     except Exception:
         logger.warning("Stray-skill relocation failed", exc_info=True)
 
-    # 2. Diff drafts, build payloads, then remove each folder — the payload is
-    # self-contained so staging files are not needed after this point.
+    # 2. Diff drafts by content: emit a payload for every draft whose SKILL.md is
+    # new or changed since the turn started. Folders are KEPT on disk so a draft
+    # survives across turns and later refinements re-emit an updated card.
+    before = dict(before_drafts or {})
     after = snapshot_skill_drafts(drafts_base)
-    new = sorted(after - set(before_drafts or ()))
     payloads: list[dict] = []
-    for slug in new:
-        folder = drafts_base / slug
-        payload = _skill_draft_payload(folder)
+    for slug in sorted(after):
+        if after[slug] == before.get(slug):
+            continue  # unchanged since turn start → no card
+        payload = _skill_draft_payload(drafts_base / slug)
         if payload is not None:
             payloads.append(payload)
-        try:
-            shutil.rmtree(folder)
-        except OSError:
-            logger.warning("Could not remove skill draft folder %r", slug, exc_info=True)
     return payloads
