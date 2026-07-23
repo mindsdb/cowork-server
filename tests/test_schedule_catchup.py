@@ -72,11 +72,17 @@ def test_late_fire_is_marked_catch_up(monkeypatch):
 
     asyncio.run(execute_schedule(schedule_id, is_manual=False))
 
+    # Resolve the run's conversation deterministically — the suite shares a
+    # database, so "latest by created_at" can pick another test's row.
     from cowork.models.conversation import Conversation
+    from cowork.models.schedule import ScheduleRun
     from sqlmodel import select
 
     check = get_open_session()
-    conv = check.exec(select(Conversation).order_by(Conversation.created_at.desc())).first()  # type: ignore[attr-defined]
+    run = check.exec(
+        select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
+    ).first()
+    conv = check.get(Conversation, run.conversation_id)
     assert conv.topic.startswith("Morning digest (catch-up — was due ")
     check.close()
 
