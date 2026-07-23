@@ -1,0 +1,141 @@
+name: Release and publish to PyPI (shared)
+
+# Shared release machinery for both publish paths:
+#   publish.yml         (push to main)    → stable CalVer release
+#   publish-staging.yml (push to staging) → rc pre-release
+# The two differ only in the `prerelease` input. PyPI trusted publishing
+# matches on the CALLER workflow filename, so both callers must be
+# registered at https://pypi.org/manage/project/cowork-server/settings/publishing/
+
+on:
+  workflow_call:
+    inputs:
+      prerelease:
+        description: "true = rc pre-release (staging stream); false = stable release"
+        required: true
+        type: boolean
+
+env:
+  CALVER_MAJOR: 0
+
+jobs:
+  unit-tests:
+    uses: ./.github/workflows/tests-unit.yml
+
+  release:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need tags for sequence calculation
+
+      - name: Compute CalVer version
+        id: version
+        run: |
+          set -euo pipefail
+
+          MAJOR=${{ env.CALVER_MAJOR }}
+          YY=$(date -u +%y)
+          M=$(date -u +%-m)
+          DD=$(date -u +%-d)
+
+          # Next free NUMERIC sequence for today. rc-suffixed tags fail the
+          # numeric check, so the stable and rc streams never fight over a
+          # sequence number, and an rc always PEP 440-precedes the stable of
+          # the same base (X.SEQrcN < X.SEQ).
+          PREFIX="v${MAJOR}.${YY}.${M}.${DD}."
+          SEQ=0
+          for tag in $(git tag -l "${PREFIX}*"); do
+            N="${tag##*.}"
+            if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$SEQ" ]; then
+              SEQ="$N"
+            fi
+          done
+          SEQ=$((SEQ + 1))
+
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            # rc counter within the base sequence.
+            RC=0
+            for tag in $(git tag -l "${PREFIX}${SEQ}rc*"); do
+              N="${tag##*rc}"
+              if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$RC" ]; then
+                RC="$N"
+              fi
+            done
+            RC=$((RC + 1))
+            VERSION="${MAJOR}.${YY}.${M}.${DD}.${SEQ}rc${RC}"
+          else
+            VERSION="${MAJOR}.${YY}.${M}.${DD}.${SEQ}"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${VERSION}"
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            --title "${{ steps.version.outputs.tag }}" \
+            ${{ inputs.prerelease && '--prerelease' || '' }}
+
+  publish:
+    name: Build and publish to PyPI
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write  # required for trusted publisher (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          fetch-depth: 0  # hatch-vcs needs tags to derive version
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      # Exact cowork-server/anton pairing for the rc stream: pin anton-agent
+      # to its latest staging rc so this wheel records the anton that was
+      # current when it published. The desktop passes the pin as a DIRECT
+      # `--with anton-agent==<rc>` requirement at install time (uv honors
+      # pre-release markers only in direct requirements) — no resolution-wide
+      # prerelease flag is ever used.
+      - name: Pin anton-agent to its latest staging rc
+        if: inputs.prerelease
+        run: |
+          set -euo pipefail
+          LATEST=$(curl -fsSL --retry 3 https://pypi.org/pypi/anton-agent/json | jq -r '[.releases | to_entries[] | select(.key | test("^[0-9]+(\\.[0-9]+)*(rc[0-9]+)?$")) | select((.value | length) > 0) | select(any(.value[]; .yanked != true)) | {v: .key, t: ([.value[].upload_time_iso_8601] | max)}] | sort_by(.t) | last | .v')
+          if [[ "$LATEST" == *rc* ]]; then
+            sed -i 's/"anton-agent>=[^"]*"/"anton-agent=='"$LATEST"'"/' pyproject.toml
+            grep -q '"anton-agent=='"$LATEST"'"' pyproject.toml
+            echo "Pinned anton-agent==$LATEST"
+          else
+            echo "Latest anton-agent is a stable release ($LATEST); keeping the loose constraint"
+          fi
+
+      - name: Build package
+        env:
+          # The anton pin dirties the checkout, which would make hatch-vcs
+          # append a +dirty local segment PyPI rejects. Force the version to
+          # exactly what the tag encodes (a no-op on the clean stable path).
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.release.outputs.version }}
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Trusted publisher (OIDC) — the CALLER workflow filename must be
+        # registered at the PyPI project's publishing settings.

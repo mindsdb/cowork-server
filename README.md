@@ -90,7 +90,7 @@ Data lives in two places: a **SQLite database** for structured records and the *
 
 - **Location**: `~/.cowork/cowork.db` (override with `DATABASE_URI`)
 - **ORM**: [SQLModel](https://sqlmodel.tiangolo.com/) (SQLAlchemy + Pydantic)
-- **Migrations**: Alembic (`cowork/db/alembic/versions/`)
+- **Migrations**: Alembic (`cowork/db/alembic/versions/`). Startup runs `alembic upgrade head` (singular), so the graph must have exactly ONE head: if two branches each added a migration on the same parent, every fresh boot aborts with "Multiple head revisions". After merging or rebasing, check `alembic heads`; if it prints two revisions, add a no-op merge revision whose `down_revision` is the tuple of both heads (see `f4e2c1a9d3b7` for the pattern).
 
 Key tables:
 

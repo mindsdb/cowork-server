@@ -1,7 +1,12 @@
 name: Auto-release and publish to PyPI
 
+# Thin caller: the shared release/publish machinery lives in
+# publish-pypi.yml (one CalVer computation, tag/release, build, publish);
+# this file only decides WHEN it runs and that the stream is stable.
+
 permissions:
   contents: write
+  id-token: write
 
 on:
   push:
@@ -12,82 +17,11 @@ concurrency:
   group: auto-release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  CALVER_MAJOR: 0
-
 jobs:
-  unit-tests:
-    uses: ./.github/workflows/tests-unit.yml
-
-  auto-release:
-    needs: unit-tests
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # need tags for sequence calculation
-
-      - name: Compute CalVer version
-        id: version
-        run: |
-          set -euo pipefail
-
-          MAJOR=${{ env.CALVER_MAJOR }}
-          YY=$(date -u +%y)    # e.g. 26
-          M=$(date -u +%-m)    # e.g. 6 (no zero-pad)
-          DD=$(date -u +%-d)   # e.g. 23 (no zero-pad)
-
-          # Find the highest sequence for today's date
-          PREFIX="v${MAJOR}.${YY}.${M}.${DD}."
-          SEQ=0
-          for tag in $(git tag -l "${PREFIX}*" | sort -t. -k5 -n); do
-            N="${tag##*.}"
-            if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$SEQ" ]; then
-              SEQ="$N"
-            fi
-          done
-          SEQ=$((SEQ + 1))
-
-          VERSION="${MAJOR}.${YY}.${M}.${DD}.${SEQ}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Computed version: ${VERSION}"
-
-      - name: Create tag and GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --generate-notes \
-            --title "${{ steps.version.outputs.tag }}"
-
-  publish:
-    name: Build and publish to PyPI
-    needs: auto-release
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      contents: read   # required to checkout private repo
-      id-token: write  # required for trusted publisher (OIDC)
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.auto-release.outputs.tag }}
-          fetch-depth: 0  # hatch-vcs needs tags to derive version
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
-
-      - name: Build package
-        run: uv build
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        # Uses trusted publisher (OIDC) — no API token needed.
-        # Configure at: https://pypi.org/manage/project/cowork-server/settings/publishing/
+  release-publish:
+    # workflow_dispatch can be pointed at any ref; only main commits may
+    # cut a stable release.
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/publish-pypi.yml
+    with:
+      prerelease: false
