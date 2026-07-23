@@ -298,7 +298,8 @@ class TestCandidateFallthrough:
         calls = _patch_client(monkeypatch, responder)
         result = await browser_tools._browser_read(session=None, tc_input={})
         assert "T\nu\n\nok" in result
-        assert len(calls) == 2
+        # /state auth-wall probe (stale→fresh fallthrough) + the /read itself.
+        assert len(calls) == 3
 
     @pytest.mark.asyncio
     async def test_all_candidates_dead_returns_unavailable(self, monkeypatch, tmp_path):
@@ -318,7 +319,8 @@ class TestCandidateFallthrough:
         calls = _patch_client(monkeypatch, lambda *a: ({"error": "no such tab"}, 404))
         result = await browser_tools._browser_snapshot(session=None, tc_input={"tab_id": "nope"})
         assert result == "Browser error: no such tab"
-        assert len(calls) == 1  # real error from a live bridge — no retry
+        # /state probe 404s too (a real error never falls through), then /snapshot.
+        assert len(calls) == 2
 
     @pytest.mark.asyncio
     async def test_dead_pid_file_candidate_never_called(self, monkeypatch, tmp_path):
@@ -437,7 +439,8 @@ class TestRead:
         assert result.startswith('<untrusted-page-content source="https://x.com">')
         assert "Hello\nhttps://x.com\n\nbody text" in result
         assert result.endswith("</untrusted-page-content>")
-        assert calls[0]["params"] == {"tabId": "t9", "maxChars": 500}
+        read_call = next(c for c in calls if c["path"] == "/read")
+        assert read_call["params"] == {"tabId": "t9", "maxChars": 500}
 
     @pytest.mark.asyncio
     async def test_long_text_truncated_politely(self, monkeypatch):
@@ -535,7 +538,8 @@ class TestMutations:
             session=None, tc_input={"index": 4, "text": "hello", "snapshot_v": 2}
         )
         assert "Typed into element [4]." in result
-        assert calls[0]["json"]["v"] == 2
+        type_call = next(c for c in calls if c["path"] == "/type")
+        assert type_call["json"]["v"] == 2
 
     @pytest.mark.asyncio
     async def test_scroll_validates_direction(self, monkeypatch):
@@ -729,8 +733,8 @@ class TestTrustedInputTools:
             None, {"key": "a", "modifiers": ["cmd", "hyper"], "tab_id": "t1"}
         )
         # unknown modifiers are filtered out, cmd passes through
-        assert captured[0]["path"] == "/press"
-        assert captured[0]["json"] == {"tabId": "t1", "key": "a", "modifiers": ["cmd"]}
+        press_call = next(c for c in captured if c["path"] == "/press")
+        assert press_call["json"] == {"tabId": "t1", "key": "a", "modifiers": ["cmd"]}
         assert "Pressed a with cmd" in result
 
     @pytest.mark.asyncio
