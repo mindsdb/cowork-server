@@ -734,3 +734,135 @@ def build_cowork_label_connection_tool():
         prompt=_LABEL_CONNECTION_PROMPT,
     )
 
+
+
+# ---------------------------------------------------------------------------
+# request_approval — park a consequential action for human review
+# ---------------------------------------------------------------------------
+
+_REQUEST_APPROVAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "Card headline the user reviews (e.g. 'Send reply to Abi Tedder').",
+        },
+        "summary": {
+            "type": "string",
+            "description": "One-line description of the action being approved.",
+        },
+        "draft": {
+            "type": "string",
+            "description": "The full user-inspectable content (e.g. the email body). The user can edit it before approving — put it in action.args.text too so an edited approval substitutes it.",
+        },
+        "action": {
+            "type": "object",
+            "description": "EXACTLY what executes on approval — dispatched verbatim, never re-interpreted.",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "Tool to execute on approve (e.g. browser_click, browser_paste).",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Exact arguments for that tool. Editable draft content belongs in args.text.",
+                },
+            },
+            "required": ["tool", "args"],
+        },
+        "ttl_seconds": {
+            "type": "integer",
+            "description": "How long the proposal stays actionable in seconds (default 259200 = 72h).",
+        },
+    },
+    "required": ["title", "summary", "action"],
+}
+
+_REQUEST_APPROVAL_DESCRIPTION = (
+    "Park a consequential action (send, submit, delete, pay, post — anything irreversible or "
+    "visible to others) for human review instead of executing it. Provide the exact action you "
+    "would take (tool + args); the system executes verbatim what the user approves — no "
+    "reinterpretation. Returns after creating the review card; end your turn and tell the user "
+    "what awaits their review."
+)
+
+_REQUEST_APPROVAL_PROMPT = (
+    "CONSEQUENTIAL ACTIONS (hard rule):\n"
+    "- Any action that is irreversible or visible to others — send, submit, delete, pay, purchase,\n"
+    "  post, publish, share — must be PARKED for review with the `request_approval` tool instead of\n"
+    "  being executed directly. Never click a send/submit/delete/pay control yourself, even when\n"
+    "  the user asked for the outcome: park it and let them press the button.\n"
+    "- request_approval takes the exact action (tool + args) you WOULD have taken; the human\n"
+    "  approves, edits, or skips it, and the system executes precisely what they approved.\n"
+    "- After calling request_approval, END YOUR TURN: tell the user in one sentence what is\n"
+    "  waiting for their review. Do not keep working toward the same outcome — the proposal IS\n"
+    "  the outcome.\n"
+    "- Reading, drafting, navigating, and organizing are always safe — never park those.\n"
+    "- When a proposal you parked is resolved, the resolution appears in the conversation. Treat\n"
+    "  it as final; do not re-propose the same action unless the user asks.\n"
+)
+
+
+async def _cowork_request_approval(session: Any, tc_input: dict) -> str:
+    """Tool handler for `request_approval`: create the Approval row and end the turn."""
+    from uuid import UUID
+
+    from cowork.db.session import get_open_session
+    from cowork.schemas.approvals import ActionDescriptorV1
+    from cowork.services.approvals import DEFAULT_TTL_SECONDS, ApprovalService
+
+    title = str(tc_input.get("title") or "").strip()
+    summary = str(tc_input.get("summary") or "").strip()
+    draft = str(tc_input.get("draft") or "")
+    action = tc_input.get("action")
+    ttl = tc_input.get("ttl_seconds")
+
+    if not title:
+        return "request_approval: `title` is required."
+    if not summary:
+        return "request_approval: `summary` is required."
+    if not isinstance(action, dict) or not str(action.get("tool") or "").strip():
+        return "request_approval: `action.tool` is required — the exact tool to execute on approval."
+    args = action.get("args")
+    if not isinstance(args, dict):
+        return "request_approval: `action.args` must be an object of exact tool arguments."
+
+    conversation_id = getattr(session, "_session_id", None)
+    if not conversation_id:
+        return (
+            "request_approval: no conversation context — the proposal couldn't be queued. "
+            "Tell the user the action needs their review and ask them to confirm before you proceed."
+        )
+
+    descriptor = ActionDescriptorV1(tool=str(action["tool"]).strip(), args=args, summary=summary)
+    db = get_open_session()
+    try:
+        approval = ApprovalService(db).create(
+            conversation_id=UUID(str(conversation_id)),
+            descriptor=descriptor,
+            draft=draft,
+            ttl_seconds=ttl if isinstance(ttl, int) and ttl > 0 else DEFAULT_TTL_SECONDS,
+        )
+        approval_id = approval.id  # capture before close — the row detaches
+    finally:
+        db.close()
+
+    return (
+        f'Proposal parked for human review: "{title}" (id {approval_id}).\n'
+        "END YOUR TURN NOW. Tell the user in one sentence what is waiting for their review, "
+        "then stop — do not call more tools toward this outcome. The system executes exactly "
+        "what they approve (with their edits if they edit); you will see the resolution in "
+        "the conversation when it happens."
+    )
+
+
+def build_cowork_request_approval_tool():
+    from anton.core.tools.tool_defs import ToolDef
+
+    return ToolDef(
+        name="request_approval",
+        description=_REQUEST_APPROVAL_DESCRIPTION,
+        input_schema=_REQUEST_APPROVAL_SCHEMA,
+        handler=_cowork_request_approval,
+        prompt=_REQUEST_APPROVAL_PROMPT,
+    )
