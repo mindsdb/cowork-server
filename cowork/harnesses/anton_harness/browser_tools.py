@@ -651,6 +651,63 @@ def _make_gate_executor(tool: str):
     return _exec
 
 
+async def _check_auth_wall(session: Any, tc_input: dict, *, tool: str) -> str | None:
+    """Sign-in wall for the target tab, or None. A needsAuth tab produces ONE
+    live auth approval per conversation+tab (deduped) and a paused string —
+    the agent must never attempt logins, CAPTCHAs, or account creation."""
+    try:
+        state = await _bridge_call("GET", "/state", timeout=_FAST_TIMEOUT)
+    except Exception:
+        return None
+    tabs = state.get("tabs") or []
+    tab_id = _tab_id(tc_input) or state.get("activeTabId")
+    tab = next((t for t in tabs if isinstance(t, dict) and t.get("id") == tab_id), None)
+    if not tab or not tab.get("needsAuth"):
+        return None
+
+    app = _clean(tab.get("title"), 60) or (tab.get("url") or "this app")
+    conv = getattr(session, "_session_id", None)
+    if not conv:
+        return f"{tool}: {app} needs a sign-in — tell the user; don't attempt it yourself."
+
+    from uuid import UUID
+
+    from cowork.db.session import get_open_session
+    from cowork.schemas.approvals import AuthDescriptorV1
+    from cowork.services.approvals import ApprovalService
+
+    db = get_open_session()
+    try:
+        service = ApprovalService(db)
+        pending = service.list(status="pending", conversation_id=UUID(str(conv)))
+        existing = next(
+            (a for a in pending
+             if a.kind == "auth" and (a.action_descriptor or {}).get("tab_id") == tab_id),
+            None,
+        )
+        if existing is not None:
+            approval_id = existing.id
+        else:
+            approval = service.create(
+                conversation_id=UUID(str(conv)),
+                descriptor=AuthDescriptorV1(
+                    app_name=app,
+                    tab_id=tab_id,
+                    reason=f"{tool} hit a sign-in wall",
+                ),
+            )
+            approval_id = approval.id
+    except Exception as e:
+        return f"{tool}: {app} needs a sign-in (couldn't queue the auth card: {e}) — tell the user."
+    finally:
+        db.close()
+    return (
+        f"PAUSED — sign-in needed: {app} is asking for credentials. I've handed it to the "
+        f"user (approval id {approval_id}). Do NOT attempt to log in, solve CAPTCHAs, or "
+        "create accounts — tell the user it's waiting for them, then stop."
+    )
+
+
 def _register_gate_executors() -> None:
     from cowork.services.approvals import register_executor
 
@@ -700,6 +757,9 @@ async def _browser_tabs(session: Any, tc_input: dict) -> str:
 
 
 async def _browser_read(session: Any, tc_input: dict) -> str:
+    wall = await _check_auth_wall(session, tc_input, tool="browser_read")
+    if wall:
+        return wall
     max_chars = tc_input.get("max_chars")
     params = {"tabId": _tab_id(tc_input)}
     if isinstance(max_chars, int) and not isinstance(max_chars, bool) and max_chars > 0:
@@ -711,6 +771,9 @@ async def _browser_read(session: Any, tc_input: dict) -> str:
 
 
 async def _browser_snapshot(session: Any, tc_input: dict) -> str:
+    wall = await _check_auth_wall(session, tc_input, tool="browser_snapshot")
+    if wall:
+        return wall
     return await _call_and_format(
         "browser_snapshot", "GET", "/snapshot",
         params={"tabId": _tab_id(tc_input)},
@@ -722,6 +785,9 @@ async def _browser_click(session: Any, tc_input: dict) -> str:
     index = _index_arg("browser_click", tc_input)
     if isinstance(index, str):
         return index
+    wall = await _check_auth_wall(session, tc_input, tool="browser_click")
+    if wall:
+        return wall
     tab_id = _tab_id(tc_input)
     args: dict[str, Any] = {"index": index}
     if tab_id:
@@ -750,6 +816,9 @@ async def _browser_type(session: Any, tc_input: dict) -> str:
     index = _index_arg("browser_type", tc_input)
     if isinstance(index, str):
         return index
+    wall = await _check_auth_wall(session, tc_input, tool="browser_type")
+    if wall:
+        return wall
     text = tc_input.get("text")
     if text is None:
         return "browser_type: `text` is required."
@@ -798,6 +867,9 @@ async def _browser_scroll(session: Any, tc_input: dict) -> str:
     body: dict[str, Any] = {"tabId": _tab_id(tc_input), "direction": direction}
     if isinstance(amount, int) and not isinstance(amount, bool) and amount > 0:
         body["amount"] = amount
+    wall = await _check_auth_wall(session, tc_input, tool="browser_scroll")
+    if wall:
+        return wall
     return await _call_and_format(
         "browser_scroll", "POST", "/scroll", body=body,
         ok=lambda data: (
@@ -821,6 +893,9 @@ async def _browser_back(session: Any, tc_input: dict) -> str:
 
 
 async def _browser_screenshot(session: Any, tc_input: dict) -> str:
+    wall = await _check_auth_wall(session, tc_input, tool="browser_screenshot")
+    if wall:
+        return wall
     return await _call_and_format(
         "browser_screenshot", "POST", "/screenshot",
         body={"tabId": _tab_id(tc_input)}, ok=_fmt_screenshot,
@@ -903,6 +978,9 @@ async def _browser_click_at(session: Any, tc_input: dict) -> str:
             "browser_click_at: `x` and `y` (viewport CSS pixel coordinates, as seen "
             "in the latest browser_screenshot) are required."
         )
+    wall = await _check_auth_wall(session, tc_input, tool="browser_click_at")
+    if wall:
+        return wall
     args = {"x": x, "y": y}
     tab_id = _tab_id(tc_input)
     if tab_id:
@@ -935,6 +1013,9 @@ async def _browser_press_key(session: Any, tc_input: dict) -> str:
         if isinstance(modifiers, list)
         else None
     )
+    wall = await _check_auth_wall(session, tc_input, tool="browser_press_key")
+    if wall:
+        return wall
     tab_id = _tab_id(tc_input)
     args: dict[str, Any] = {"key": key}
     if tab_id:
