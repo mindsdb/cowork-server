@@ -105,6 +105,7 @@ class TestBuilderShape:
         "browser_back",
         "browser_screenshot",
         "browser_close_tab",
+        "browser_open_app",
         "browser_click_at",
         "browser_press_key",
         "browser_insert_text",
@@ -131,7 +132,10 @@ class TestBuilderShape:
     def test_snake_case_args_and_enum(self):
         assert "new_tab" in _tool("browser_navigate").input_schema["properties"]
         assert "max_chars" in _tool("browser_read").input_schema["properties"]
-        for name in self.EXPECTED[2:]:  # everything but navigate/tabs takes tab_id
+        for name in self.EXPECTED[2:]:  # everything but navigate/tabs/open_app takes tab_id
+            if name == "browser_open_app":
+                assert "name" in _tool(name).input_schema["properties"]
+                continue
             assert "tab_id" in _tool(name).input_schema["properties"], name
         assert _tool("browser_scroll").input_schema["properties"]["direction"]["enum"] == [
             "up", "down", "top", "bottom",
@@ -759,3 +763,107 @@ class TestTrustedInputTools:
         ]:
             result = await handler(None, tc_input)
             assert "desktop browser is unavailable" in result, handler.__name__
+
+
+# ---------------------------------------------------------------------------
+# browser_open_app + app annotations on browser_tabs
+# ---------------------------------------------------------------------------
+
+_APPS = [
+    {"id": "app-mail.google.com", "name": "Gmail", "origin": "https://mail.google.com", "createdAt": 1},
+    {"id": "app-linear.app", "name": "Linear", "origin": "https://linear.app", "createdAt": 2},
+]
+
+
+def _patch_apps_and_state(monkeypatch, tabs=None, open_result=None, apps_payload=None):
+    """GET /apps returns the registry; everything else routes by path."""
+
+    def responder(method, path, params, json_body):
+        if path == "/apps":
+            return (apps_payload if apps_payload is not None else _APPS, 200)
+        if path == "/apps/open":
+            return (open_result or {"tabId": "t-1", "created": False}, 200)
+        if path == "/state":
+            return ({"tabs": tabs or [], "activeTabId": None, "viewVisible": True}, 200)
+        return ({"ok": True}, 200)
+
+    return _patch_bridge(monkeypatch, responder)
+
+
+class TestOpenApp:
+    @pytest.mark.asyncio
+    async def test_resolves_name_and_opens(self, monkeypatch):
+        captured = _patch_apps_and_state(monkeypatch)
+        result = await browser_tools._browser_open_app(None, {"name": "gmail"})
+        posts = [c for c in captured if c["path"] == "/apps/open"]
+        assert posts and posts[0]["json"] == {"appId": "app-mail.google.com"}
+        assert "Gmail" in result
+        assert "existing tab" in result
+
+    @pytest.mark.asyncio
+    async def test_created_variant_reports_fresh_pinned_tab(self, monkeypatch):
+        _patch_apps_and_state(monkeypatch, open_result={"tabId": "t-9", "created": True})
+        result = await browser_tools._browser_open_app(None, {"name": "Linear"})
+        assert "fresh pinned tab" in result
+
+    @pytest.mark.asyncio
+    async def test_prefix_and_substring_matching(self, monkeypatch):
+        _patch_apps_and_state(monkeypatch)
+        for query in ("gma", "mail.google"):
+            result = await browser_tools._browser_open_app(None, {"name": query})
+            assert "Gmail" in result, query
+
+    @pytest.mark.asyncio
+    async def test_no_match_lists_known_apps(self, monkeypatch):
+        _patch_apps_and_state(monkeypatch)
+        result = await browser_tools._browser_open_app(None, {"name": "figma"})
+        assert "No app matches 'figma'" in result
+        assert "Gmail" in result and "Linear" in result
+
+    @pytest.mark.asyncio
+    async def test_name_required(self):
+        assert "`name` is required" in await browser_tools._browser_open_app(None, {})
+
+    @pytest.mark.asyncio
+    async def test_apps_list_failure_returns_unavailable(self, monkeypatch):
+        _patch_bridge(monkeypatch, lambda *a: httpx.ConnectError("down"))
+        result = await browser_tools._browser_open_app(None, {"name": "gmail"})
+        assert "desktop browser is unavailable" in result
+
+
+class TestTabsAppAnnotation:
+    @pytest.mark.asyncio
+    async def test_matching_tabs_get_app_labels(self, monkeypatch):
+        tabs = [
+            {"id": "t1", "title": "Inbox", "url": "https://mail.google.com/mail/u/0/#inbox", "isLoading": False},
+            {"id": "t2", "title": "News", "url": "https://www.bbc.co.uk/sport", "isLoading": False},
+        ]
+        async def fake_bridge_call(*a, **k):
+            return {"tabs": tabs, "activeTabId": None, "apps": _APPS}
+
+        monkeypatch.setattr(browser_tools, "_bridge_call", fake_bridge_call)
+        result = await browser_tools._browser_tabs(None, {})
+        assert "[app: Gmail]" in result
+        assert "bbc.co.uk/sport (tabId: t2)" in result
+        assert result.count("[app:") == 1
+
+    @pytest.mark.asyncio
+    async def test_tabs_without_apps_field_still_list(self, monkeypatch):
+        async def fake_bridge_call(*a, **k):
+            return {"tabs": [{"id": "t1", "title": "N", "url": "https://x.com", "isLoading": False}], "activeTabId": None}
+
+        monkeypatch.setattr(browser_tools, "_bridge_call", fake_bridge_call)
+        result = await browser_tools._browser_tabs(None, {})
+        assert "Open tabs:" in result
+        assert "[app:" not in result
+
+
+class TestMatchAppRobustness:
+    def test_null_fields_never_raise(self):
+        apps = [
+            {"id": None, "name": None, "origin": None},
+            {"id": "app-x", "name": "X", "origin": "https://x.com"},
+        ]
+        assert browser_tools._match_app(apps, "anything") == apps[1] or browser_tools._match_app(apps, "anything") is None
+        assert browser_tools._match_app(apps, "x") == apps[1]
+        assert browser_tools._match_app(apps, "") is None

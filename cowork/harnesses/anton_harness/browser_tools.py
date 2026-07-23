@@ -218,18 +218,32 @@ def _fmt_navigate(data: dict) -> str:
     )
 
 
+def _origin_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+
+        parts = urlparse(url or "")
+        return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+    except Exception:
+        return ""
+
+
 def _fmt_tabs(data: dict) -> str:
     tabs = data.get("tabs") or []
     if not tabs:
         return "No tabs are open in the desktop browser. Use browser_navigate to open one."
     active_id = data.get("activeTabId")
+    # /state carries the apps registry; label tabs that belong to a pinned app
+    # so the agent can address tools by name ("check Gmail") not tabIds.
+    app_names = {a.get("origin", ""): a.get("name", "") for a in data.get("apps") or [] if a.get("origin")}
     lines = []
     for i, tab in enumerate(tabs, 1):
         title = _clean(tab.get("title")) or "New tab"
         url = (tab.get("url") or "").strip() or "(blank)"
         marker = "[active] " if tab.get("id") == active_id else ""
         loading = " (loading…)" if tab.get("isLoading") else ""
-        lines.append(f"{i}. {marker}{title} — {url}{loading} (tabId: {tab.get('id')})")
+        app_label = f"  [app: {app_names[_origin_of(tab.get('url') or '')]}]" if _origin_of(tab.get("url") or "") in app_names else ""
+        lines.append(f"{i}. {marker}{title} — {url}{loading} (tabId: {tab.get('id')}){app_label}")
     return "Open tabs:\n" + "\n".join(lines)
 
 
@@ -513,6 +527,58 @@ async def _browser_close_tab(session: Any, tc_input: dict) -> str:
     )
 
 
+def _app_field(app: dict, key: str) -> str:
+    """Registry fields can be null on corrupt/partial entries — never .lower() None."""
+    return str(app.get(key) or "").lower()
+
+
+def _match_app(apps: list[dict], query: str) -> dict | None:
+    """Resolve a user/agent-supplied app name or id: exact (case-insensitive),
+    then prefix, then substring across name and origin."""
+    q = query.strip().lower()
+    if not q:
+        return None
+    for app in apps:
+        if _app_field(app, "id") == q or _app_field(app, "name") == q:
+            return app
+    for app in apps:
+        if _app_field(app, "name").startswith(q) or q in _app_field(app, "origin"):
+            return app
+    for app in apps:
+        if q in _app_field(app, "name"):
+            return app
+    return None
+
+
+async def _browser_open_app(session: Any, tc_input: dict) -> str:
+    name = str(tc_input.get("name") or "").strip()
+    if not name:
+        return "browser_open_app: `name` is required — the app's name as pinned in the sidebar (e.g. 'Gmail', 'Slack')."
+
+    try:
+        apps_data = await _bridge_call("GET", "/apps", timeout=_FAST_TIMEOUT)
+    except _BridgeUnavailable:
+        return _UNAVAILABLE_MSG
+    except _BridgeHTTPError as exc:
+        return f"Browser error: {exc}"
+    apps = apps_data if isinstance(apps_data, list) else []
+    app = _match_app(apps, name)
+    if not app:
+        known = ", ".join(a.get("name", "?") for a in apps[:8]) or "none yet"
+        return (
+            f"No app matches '{name}'. Pinned apps: {known}. "
+            "Ask the user to pin it (sidebar → Add app), or browser_navigate to its URL instead."
+        )
+    return await _call_and_format(
+        "browser_open_app", "POST", "/apps/open",
+        body={"appId": app["id"]}, timeout=_SLOW_TIMEOUT,
+        ok=lambda data: (
+            f"Opened {app['name']} — {'a fresh pinned tab' if data.get('created') else 'its existing tab is now active'}. "
+            "Follow with browser_read or browser_snapshot to work it."
+        ),
+    )
+
+
 _MODIFIER_NAMES = ("cmd", "ctrl", "alt", "shift")
 
 
@@ -620,6 +686,8 @@ _NAVIGATE_PROMPT = (
     "  the active tab) when it has the result worth showing. Close tabs you opened.\n"
     "- When the user asks you to open/show something, navigate in the active tab (default) or a\n"
     "  foreground new tab (new_tab=true) so they actually see it.\n"
+    "- When the user names one of their tools by name ('check my email', 'open Linear'), use\n"
+    "  browser_open_app — it opens their pinned, already-logged-in app rather than a cold URL.\n"
     "- Never loop a failed action — re-read or re-snapshot once, and if the browser is unavailable, tell the user."
 )
 
@@ -852,6 +920,27 @@ def build_browser_tools():
                 "properties": {"tab_id": _TAB_ID_PROP},
             },
             handler=_browser_close_tab,
+        ),
+        ToolDef(
+            name="browser_open_app",
+            description=(
+                "Open one of the user's pinned web apps by NAME (e.g. 'Gmail', 'Slack', "
+                "'Linear') — activates its existing tab or opens a fresh pinned tab, "
+                "already logged in. Use this first whenever the user names a tool they "
+                "use ('check my email', 'what's in Slack'); follow with browser_read "
+                "or browser_snapshot to work the page."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "App name as pinned in the sidebar (case-insensitive; prefix/substring ok).",
+                    },
+                },
+                "required": ["name"],
+            },
+            handler=_browser_open_app,
         ),
         ToolDef(
             name="browser_click_at",
