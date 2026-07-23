@@ -219,29 +219,14 @@ def _hermes_create_skill_draft(args: dict, **kwargs) -> str:
     ``skill_file``. The folder lives under ``.anton/skill_drafts`` (off-limits to
     discovery, never the live skills store), so the skill is NOT auto-saved; the
     turn-end diff surfaces it as a `response.skill_created` card the user Saves
-    or Downloads explicitly."""
-    from anton.core.tools.skill_format import SKILL_FILE, normalize_name
+    or Downloads explicitly. Editing an existing skill pre-seeds the folder from
+    the saved version (see ``stage_skill_draft``)."""
+    from cowork.services.task_objects import stage_skill_draft
 
     ctx = _artifact_context(kwargs)
     if ctx is None or not ctx.get("skill_drafts_root"):
         return json.dumps({"error": "Skill-draft tools are unavailable: no project context for this run."})
-
-    name = str(args.get("name") or "").strip()
-    if not name:
-        return json.dumps({"error": "`name` is required."})
-    slug = normalize_name(name)
-    if not slug:
-        return json.dumps({"error": "`name` must contain at least one alphanumeric character."})
-
-    folder = Path(ctx["skill_drafts_root"]) / slug
-    folder.mkdir(parents=True, exist_ok=True)
-    return json.dumps(
-        {
-            "slug": slug,
-            "path": str(folder),
-            "skill_file": str(folder / SKILL_FILE),
-        }
-    )
+    return json.dumps(stage_skill_draft(ctx["skill_drafts_root"], args.get("name")))
 
 
 def register_skill_tools() -> None:
@@ -252,35 +237,19 @@ def register_skill_tools() -> None:
     — the user decides via the in-chat card (Save / Download)."""
     from tools.registry import registry
 
+    from cowork.services.task_objects import (
+        CREATE_SKILL_DRAFT_DESCRIPTION,
+        CREATE_SKILL_DRAFT_SCHEMA,
+    )
+
     if registry.get_entry("create_skill_draft") is None:
         registry.register(
             name="create_skill_draft",
             toolset="skills",
             schema={
                 "name": "create_skill_draft",
-                "description": (
-                    "Claim a staging folder for a skill you are building or improving for the "
-                    "user (e.g. when running the skill-creator skill). Call this BEFORE writing "
-                    "the skill; it returns {slug, path, skill_file} — write your SKILL.md to "
-                    "`skill_file` (and any sibling files into `path`). The skill is staged, NOT "
-                    "saved: it surfaces as a card the user explicitly saves or downloads. NEVER "
-                    "write a skill into the project `skills/` directory and NEVER use "
-                    "create_artifact for a skill."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "The skill's name (becomes its slug, e.g. 'competitive-analysis').",
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional one-line trigger description shown on the card.",
-                        },
-                    },
-                    "required": ["name"],
-                },
+                "description": CREATE_SKILL_DRAFT_DESCRIPTION,
+                "parameters": CREATE_SKILL_DRAFT_SCHEMA,
             },
             handler=_hermes_create_skill_draft,
             description="Stage a built skill as a draft for the user to save or download.",
