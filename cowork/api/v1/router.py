@@ -17,6 +17,7 @@ from cowork.api.v1.endpoints import (
     files,
     health,
     memory,
+    metrics,
     pins,
     project_files,
     projects,
@@ -60,6 +61,7 @@ api_router = APIRouter(prefix="/api/v1")
 
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
+api_router.include_router(metrics.router, prefix="/metrics", tags=["metrics"])
 api_router.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
 api_router.include_router(onboarding.router, prefix="/onboarding", tags=["onboarding"])
 api_router.include_router(rules.router, prefix="/rules", tags=["rules"])
