@@ -35,6 +35,10 @@ class Schedule(BaseSQLModel, table=True):
     )
     last_error: str | None = Field(default=None, description="Error message from last failed run")
     missed_runs: int = Field(default=0, description="Count of runs missed while the scheduler was offline")
+    requires_browser: bool = Field(
+        default=False,
+        description="Needs the desktop browser to execute: due slots DEFER (never fire, never consume) while the bridge is down and catch up when it returns — e.g. the morning digest",
+    )
 
 
 class ScheduleRun(BaseSQLModel, table=True):

@@ -33,6 +33,7 @@ class ScheduleCreateRequest(CamelRequest):
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
+    requires_browser: bool = False
 
 
 class ScheduleUpdateRequest(CamelRequest):
@@ -44,6 +45,7 @@ class ScheduleUpdateRequest(CamelRequest):
     timezone: str | None = None
     project_id: UUID | None = None
     enabled: bool | None = None
+    requires_browser: bool | None = None
 
 
 class ScheduleResponse(CamelResponse):
@@ -54,6 +56,7 @@ class ScheduleResponse(CamelResponse):
     timezone: str
     next_run_at: datetime
     enabled: bool
+    requires_browser: bool
     project_id: UUID
     model: str
     last_run_at: datetime | None
