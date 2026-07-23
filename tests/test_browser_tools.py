@@ -297,7 +297,7 @@ class TestCandidateFallthrough:
 
         calls = _patch_client(monkeypatch, responder)
         result = await browser_tools._browser_read(session=None, tc_input={})
-        assert result == "T\nu\n\nok"
+        assert "T\nu\n\nok" in result
         assert len(calls) == 2
 
     @pytest.mark.asyncio
@@ -430,7 +430,10 @@ class TestRead:
         result = await browser_tools._browser_read(
             session=None, tc_input={"tab_id": "t9", "max_chars": 500}
         )
-        assert result == "Hello\nhttps://x.com\n\nbody text"
+        # Untrusted-content wrapper frames the page text as data (P6).
+        assert result.startswith('<untrusted-page-content source="https://x.com">')
+        assert "Hello\nhttps://x.com\n\nbody text" in result
+        assert result.endswith("</untrusted-page-content>")
         assert calls[0]["params"] == {"tabId": "t9", "maxChars": 500}
 
     @pytest.mark.asyncio
@@ -460,8 +463,9 @@ class TestSnapshot:
         }
         _patch_bridge(monkeypatch, lambda m, p, params, body: (payload, 200))
         result = await browser_tools._browser_snapshot(session=None, tc_input={})
+        assert result.startswith('<untrusted-page-content source="https://x.com">')
         lines = result.splitlines()
-        assert lines[0] == "Home"
+        assert "Home" in lines
         assert "[3] link 'Pricing' -> /pricing" in lines
         assert "[7] input(text) 'Search'" in lines
         assert "[12] button 'Sign in'" in lines
