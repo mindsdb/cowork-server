@@ -132,3 +132,35 @@ def test_descriptor_rejects_unknown_version_and_kind():
             kind="action",
             descriptor={"version": 1, "kind": "teleport", "tool": "x"},
         )
+
+
+def test_response_serves_camelcase_descriptor():
+    from cowork.schemas.approvals import ApprovalResponse
+
+    session = _session()
+    conv = _conversation(session)
+    approval = _action_approval(conv.id)
+    session.add(approval)
+    session.commit()
+    session.refresh(approval)
+
+    data = ApprovalResponse.serialize(approval)
+    assert data["actionDescriptor"]["tool"] == "browser_click"
+    assert data["actionDescriptor"]["summary"] == "Send the drafted reply"
+    # args is an opaque payload — passed through untouched
+    assert data["actionDescriptor"]["args"] == {"index": 42, "snapshot_v": 3}
+
+    auth = Approval(
+        conversation_id=conv.id,
+        kind="auth",
+        action_descriptor=AuthDescriptorV1(app_name="Gmail", tab_id="tab-9").model_dump(),
+        expires_at=approval.expires_at,
+    )
+    session.add(auth)
+    session.commit()
+    session.refresh(auth)
+    auth_data = ApprovalResponse.serialize(auth)
+    assert auth_data["actionDescriptor"]["appName"] == "Gmail"
+    assert auth_data["actionDescriptor"]["tabId"] == "tab-9"
+    assert "app_name" not in auth_data["actionDescriptor"]
+    session.close()
