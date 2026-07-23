@@ -283,11 +283,15 @@ class OAuthService:
             )
         except Exception as exc:
             err_msg = str(exc)
+            _log.exception("OAuth callback failed for %s", service)
             store.clear_pending(service, error=err_msg)
             store.set_outcome(state, {"status": "error", "error": err_msg})
+            # The detail goes to the log and the outcome store (both internal);
+            # the browser page stays generic so a raw exception message can't
+            # leak internals to the end user.
             return _callback_page(
                 f"{service_label} connection failed",
-                f"CoWork could not finish the {service_label} sign-in flow: {err_msg}",
+                f"Cowork could not finish the {service_label} sign-in flow. Return to Cowork and try again.",
                 success=False,
             )
 

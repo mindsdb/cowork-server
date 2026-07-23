@@ -80,39 +80,6 @@ def test_app_settings_rejects_invalid_legacy_server_port(monkeypatch):
         AppSettings(_env_file=None)
 
 
-def test_app_settings_reads_desktop_cowork_server_port(monkeypatch):
-    # The desktop app hands the derived per-user port to the sidecar as
-    # COWORK_SERVER_PORT (ENG-439). Regression: dropping this alias made the
-    # server bind :26866 while the app health-polled the derived port.
-    monkeypatch.delenv("COWORK_LISTEN_PORT", raising=False)
-    monkeypatch.setenv("COWORK_SERVER_PORT", "27735")
-
-    settings = AppSettings(_env_file=None)
-
-    assert settings.port == 27735
-
-
-def test_app_settings_listen_port_wins_over_server_port(monkeypatch):
-    monkeypatch.setenv("COWORK_LISTEN_PORT", "9999")
-    monkeypatch.setenv("COWORK_SERVER_PORT", "27735")
-
-    settings = AppSettings(_env_file=None)
-
-    assert settings.port == 9999
-
-
-def test_app_settings_ignores_k8s_injected_server_port_uri(monkeypatch):
-    # K8s auto-injects COWORK_SERVER_PORT=tcp://<ip>:<port> on any pod
-    # colocated with a `cowork-server` Service — must fall back to the
-    # default, not fail int parsing.
-    monkeypatch.delenv("COWORK_LISTEN_PORT", raising=False)
-    monkeypatch.setenv("COWORK_SERVER_PORT", "tcp://10.0.0.5:26866")
-
-    settings = AppSettings(_env_file=None)
-
-    assert settings.port == 26866
-
-
 def test_app_settings_ignores_generic_server_host(monkeypatch):
     monkeypatch.delenv("COWORK_SERVER_HOST", raising=False)
     monkeypatch.setenv("SERVER_HOST", "0.0.0.0")

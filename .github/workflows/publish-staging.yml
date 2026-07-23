@@ -1,0 +1,31 @@
+name: Staging pre-release and publish to PyPI
+
+# Thin caller: the shared release/publish machinery lives in
+# publish-pypi.yml; this stream publishes PEP 440 pre-releases
+# (0.YY.M.DD.SEQrcN) so staging desktop builds install from PyPI exactly
+# like prod (same installer flow, no git/Xcode CLT) while following the rc
+# stream. Resolvers ignore pre-releases unless a specifier names one, and
+# PyPI's `info.version` (which the prod desktop updater reads) excludes
+# them, so prod installs can never pick these up.
+
+permissions:
+  contents: write
+  id-token: write
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+concurrency:
+  group: staging-prerelease-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-publish:
+    # workflow_dispatch can be pointed at any ref; only staging commits may
+    # mint rc tags.
+    if: github.ref == 'refs/heads/staging'
+    uses: ./.github/workflows/publish-pypi.yml
+    with:
+      prerelease: true
