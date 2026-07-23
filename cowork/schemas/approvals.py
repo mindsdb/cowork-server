@@ -17,10 +17,12 @@ class ApprovalKind(str, Enum):
 
 class ApprovalStatus(str, Enum):
     pending = "pending"
+    resolving = "resolving"  # claimed, execution in flight (crash window)
     approved = "approved"
     edited = "edited"
     skipped = "skipped"
     expired = "expired"
+    failed = "failed"  # execution failed — re-resolvable, never terminal
 
 
 # Versioned action descriptors — discriminated union on `kind`, version: 1.

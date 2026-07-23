@@ -68,6 +68,15 @@ async def lifespan(app: FastAPI):
             sweep_session.close()
     except Exception:
         logger.exception("approval boot sweep failed (non-fatal)")
+    # Approval executors must exist before ANY resolve — build_browser_tools
+    # only runs inside an agent session, but a user can approve from the
+    # inbox without starting one.
+    try:
+        from cowork.harnesses.anton_harness.browser_tools import _register_gate_executors
+
+        _register_gate_executors()
+    except Exception:
+        logger.exception("gate executor boot registration failed (non-fatal)")
     start_scheduler()
     await app.state.channel_adapters.refresh_all()
     from cowork.channels.ingress import sync_channel_ingress

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -17,6 +18,8 @@ from cowork.schemas.approvals import (
     parse_descriptor,
 )
 from cowork.services.conversations import ConversationService
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 72 * 3600
 # Execution tokens outlive the resolve click by minutes, not days — a token
@@ -75,15 +78,28 @@ class ApprovalService:
             ttl_seconds=ttl_seconds,
             expires_at=_utcnow() + timedelta(seconds=ttl_seconds),
         )
+        # An action nobody can execute is a trap card (approved but nothing
+        # happens) — reject it at creation instead of discovering it at resolve.
+        if isinstance(descriptor, ActionDescriptorV1) and descriptor.tool not in _EXECUTORS:
+            raise ValueError(f"no executor registered for tool '{descriptor.tool}'")
+        # A draft the user can't actually edit into the action is a lie on the
+        # card — draft-carrying descriptors must take the edit in args.text.
+        if draft and isinstance(descriptor, ActionDescriptorV1) and "text" not in descriptor.args:
+            raise ValueError("draft-carrying descriptors require a `text` arg for edits to substitute into")
         self.session.add(approval)
         self.session.commit()
         self.session.refresh(approval)
         summary = _summary_of(approval)
-        ConversationService(self.session).save_assistant_turn(
-            conversation_id,
-            f"Proposal parked: {summary}",
-            [{"type": EVENT_REQUESTED, "approval": ApprovalResponse.serialize(approval)}],
-        )
+        try:
+            ConversationService(self.session).save_assistant_turn(
+                conversation_id,
+                f"Proposal parked: {summary}",
+                [{"type": EVENT_REQUESTED, "approval": ApprovalResponse.serialize(approval)}],
+            )
+        except Exception:
+            # The transcript is documentation; the approval row is the truth.
+            # A write failure here must never sink the queue.
+            logger.exception("approval transcript write failed (non-fatal)")
         return approval
 
     def list(
@@ -122,13 +138,25 @@ class ApprovalService:
         executed_now=False and NO re-execution — a double-click never
         double-sends.
         """
+        # Atomic claim: exactly one resolver wins, even when two requests race
+        # the threadpool — a double-click never double-sends. 'failed' is
+        # re-claimable: a botched execution may be retried by the user.
+        from sqlalchemy import update
+
+        claimed = self.session.execute(
+            update(Approval)
+            .where(Approval.id == approval_id, Approval.status.in_(["pending", "failed"]))
+            .values(status="resolving")
+        ).rowcount
+        self.session.commit()
+        if claimed != 1:
+            return self.get(approval_id), False
         approval = self.get(approval_id)
-        if approval.status != "pending":
-            return approval, False
+
         if _as_utc(approval.expires_at) <= _utcnow():
             self._settle(approval, "expired", receipt=None)
             return approval, False
-        if resolution == "edited" and not edited_draft:
+        if resolution == "edited" and edited_draft is None:
             raise ValueError("edited resolution requires edited_draft")
 
         descriptor = parse_descriptor(approval.action_descriptor)
@@ -143,26 +171,41 @@ class ApprovalService:
             # Auth cards park no execution: approving hands the tab to the
             # human; the agent re-attempts on its next turn.
             receipt = {"executed": False, "handed_to_user": descriptor.app_name}
-        else:
-            args = dict(descriptor.args)
-            if resolution == "edited":
-                # v1 convention: the descriptor's draft-bearing arg is `text`.
-                args["text"] = edited_draft
-            raw_token = self._issue_token(approval, tool=descriptor.tool, args=args)
-            executor = _EXECUTORS.get(descriptor.tool)
-            if executor is None:
-                receipt = {
-                    "executed": False,
-                    "error": f"no executor registered for tool '{descriptor.tool}'",
-                }
-            else:
-                result = executor(self.session, args, raw_token)
-                result.setdefault("executed", True)
-                receipt = result
+            receipt["resolved_at"] = _utcnow().isoformat()
+            self._settle(approval, resolution, receipt=receipt)
+            return approval, True
 
-        receipt = receipt or {}
+        args = dict(descriptor.args)
+        if resolution == "edited":
+            # v1 convention: the descriptor's draft-bearing arg is `text`. An
+            # edit on anything else would silently not take — refuse it.
+            if "text" not in args:
+                raise ValueError("edited resolution requires a descriptor with a `text` arg")
+            args["text"] = edited_draft
+
+        executor = _EXECUTORS.get(descriptor.tool)
+        if executor is None:
+            # Not terminal: settle 'failed' (re-resolvable) rather than burning
+            # the human's approval on nothing.
+            receipt = {
+                "executed": False,
+                "resolved_at": _utcnow().isoformat(),
+                "error": f"no executor registered for tool '{descriptor.tool}'",
+            }
+            self._settle(approval, "failed", receipt=receipt)
+            return approval, True
+
+        raw_token = self._issue_token(approval, tool=descriptor.tool, args=args)
+        result = executor(self.session, args, raw_token)
+        if not isinstance(result, dict):
+            # A sloppy executor must not crash the resolution — wrap, don't trust.
+            result = {"executed": True, "result": result}
+        result.setdefault("executed", True)
+        receipt = result
         receipt["resolved_at"] = _utcnow().isoformat()
-        self._settle(approval, resolution, receipt=receipt)
+        # executed:false receipts are execution failures, not approvals —
+        # settle 'failed' (re-resolvable); only real execution settles approved.
+        self._settle(approval, resolution if receipt["executed"] else "failed", receipt=receipt)
         return approval, True
 
     # ------------------------------------------------------------------
@@ -189,16 +232,24 @@ class ApprovalService:
         ).first()
         if token is None:
             raise ValueError("invalid approval token")
-        if token.consumed_at is not None:
-            raise ValueError("approval token already consumed")
         if _as_utc(token.expires_at) <= _utcnow():
             raise ValueError("approval token expired")
         payload = token.payload if isinstance(token.payload, dict) else {}
         if payload.get("tool") != tool or payload.get("args") != args:
+            # Mismatch rejects WITHOUT burning — the real token holder may still spend it.
             raise ValueError("approval token payload mismatch")
-        token.consumed_at = _utcnow()
-        self.session.add(token)
+        # Burn atomically: exactly one concurrent spender wins the row.
+        from sqlalchemy import update
+
+        claimed = self.session.execute(
+            update(ApprovalToken)
+            .where(ApprovalToken.id == token.id, ApprovalToken.consumed_at.is_(None))
+            .values(consumed_at=_utcnow())
+        ).rowcount
+        if claimed != 1:
+            raise ValueError("approval token already consumed")
         self.session.commit()
+        self.session.refresh(token)
         return token
 
     # ------------------------------------------------------------------
@@ -232,12 +283,18 @@ class ApprovalService:
             "edited": "Edited & approved",
             "skipped": "Skipped",
             "expired": "Expired",
+            "failed": "Failed",
         }.get(status, status.title())
-        ConversationService(self.session).save_assistant_turn(
-            approval.conversation_id,
-            f"{verb}: {summary}",
-            [{"type": EVENT_RESOLVED, "approval": ApprovalResponse.serialize(approval)}],
-        )
+        try:
+            ConversationService(self.session).save_assistant_turn(
+                approval.conversation_id,
+                f"{verb}: {summary}",
+                [{"type": EVENT_RESOLVED, "approval": ApprovalResponse.serialize(approval)}],
+            )
+        except Exception:
+            # Never 500 a resolution AFTER the action executed — the state is
+            # committed; the transcript line is best-effort documentation.
+            logger.exception("approval transcript write failed (non-fatal)")
 
 
 def _summary_of(approval: Approval) -> str:

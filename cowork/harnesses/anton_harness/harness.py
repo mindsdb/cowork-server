@@ -273,7 +273,7 @@ class AntonHarness:
             build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
-    build_cowork_request_approval_tool,
+            build_cowork_request_approval_tool,
             build_cowork_request_credentials_tool,
         )
         from .browser_tools import build_browser_tools
