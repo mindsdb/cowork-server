@@ -135,6 +135,9 @@ async def _bridge_call(
                 base_url=base_url,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=timeout,
+                # Loopback only — never route through a user's HTTP(S)_PROXY,
+                # which would both break the call and expose the bridge token.
+                trust_env=False,
             ) as client:
                 resp = await client.request(method, path, params=params, json=body)
         except (httpx.HTTPError, OSError) as exc:
