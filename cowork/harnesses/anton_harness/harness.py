@@ -381,6 +381,7 @@ class AntonHarness:
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
         )
+        from .browser_tools import build_browser_tools
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
@@ -714,6 +715,10 @@ class AntonHarness:
                 LOOKUP_CONNECTOR_TOOL,
                 REQUEST_CREDENTIALS_TOOL,
                 LABEL_CONNECTION_TOOL,
+                # Desktop browser bridge tools — discovery is deferred to call
+                # time, so these register even when the desktop app is down
+                # and fail gracefully with a friendly string.
+                *build_browser_tools(),
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
             ],

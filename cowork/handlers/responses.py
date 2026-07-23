@@ -69,6 +69,12 @@ class ResponsesHandler:
         project_id = self._resolve_project_id(request)
 
         harness_input = self._build_harness_input(request)
+        # Topic text comes from the UNWRAPPED input: the browser-context
+        # injection below is for the model only and must not leak into
+        # conversation titles/previews/search.
+        topic_text = self._prompt_text(harness_input)
+        if request.surface == "browser" and getattr(self.harness, "id", None) == "anton":
+            harness_input = await self._with_browser_context(harness_input)
         original_content = self._extract_original_content(request)
 
         if request.conversation:
@@ -85,7 +91,7 @@ class ResponsesHandler:
                     # the first stream. Adopt it, otherwise those uploads strand
                     # under an id no conversation ever gets (ENG-264).
                     conversation = conversation_service.create_conversation(
-                        topic=self._prompt_text(harness_input)[:80],
+                        topic=topic_text[:80],
                         project_id=project_id,
                         conversation_id=conv_id,
                     )
@@ -95,13 +101,13 @@ class ResponsesHandler:
                 # row id, so create a fresh conversation and re-link any
                 # attachments uploaded against the client's id (ENG-264).
                 conversation = conversation_service.create_conversation(
-                    topic=self._prompt_text(harness_input)[:80],
+                    topic=topic_text[:80],
                     project_id=project_id,
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
             conversation = conversation_service.create_conversation(
-                topic=self._prompt_text(harness_input)[:80],
+                topic=topic_text[:80],
                 project_id=project_id,
             )
 
@@ -395,6 +401,29 @@ class ResponsesHandler:
         ConversationService(self.scoped).save_assistant_turn(
             conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
+
+    async def _with_browser_context(self, harness_input: list[dict]) -> list[dict]:
+        """Prepend a live <browser-context> block to a Browser Agent dock turn.
+
+        Only the LLM input is wrapped — persistence uses original_content, so
+        the transcript and the cache-stable prompt prefix stay clean, and the
+        context (which shifts as the user browses) is rebuilt fresh per turn.
+        A bridge failure never blocks the turn: it proceeds without context.
+        """
+        from cowork.harnesses.anton_harness.browser_tools import build_browser_turn_context
+
+        try:
+            context = await build_browser_turn_context()
+        except Exception:
+            logger.exception("[responses] browser context build failed")
+            return harness_input
+        if not context:
+            return harness_input
+        for block in harness_input:
+            if block.get("type") == "text":
+                block["text"] = f"<browser-context>\n{context}\n</browser-context>\n\n{block['text']}"
+                break
+        return harness_input
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
         blocks: list[dict] = []

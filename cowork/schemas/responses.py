@@ -157,6 +157,14 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Connections to exclude from this turn (client sends on every request)",
     )
+    # Which UI surface the turn came from. "browser" = the Browser Agent dock:
+    # the handler injects a live <browser-context> block (copilot guidance +
+    # open-tab state) into the LLM input only — never persisted, rebuilt per
+    # turn. Absent/None = ordinary chat turn, no injection.
+    surface: str | None = Field(
+        default=None,
+        description="UI surface this turn originated from (e.g. 'browser' for the Browser Agent dock)",
+    )
     # Generic observability pass-through. Whatever a caller puts here is
     # forwarded verbatim to the harness → LLM router → Langfuse trace, so new
     # eval / telemetry use-cases can attach data without changing this server or
