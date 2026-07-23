@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from cowork.common.datetime_utils import ensure_utc
@@ -125,8 +125,17 @@ async def execute_schedule(
         if conversation_id is None:
             # Conversation not pre-created by the caller (e.g. cron tick).
             from cowork.services.conversations import ConversationService
+            from cowork.common.datetime_utils import ensure_utc as _ensure_utc
+
+            topic = schedule.title
+            if not is_manual and schedule.next_run_at is not None:
+                slot = _ensure_utc(schedule.next_run_at)
+                if slot < datetime.now(timezone.utc) - timedelta(minutes=5):
+                    # Deferred (app asleep at the slot) — honest catch-up, not
+                    # an on-time run. "Your 9:00 digest, ran when you opened it."
+                    topic = f"{schedule.title} (catch-up — was due {slot:%H:%M})"
             conversation = ConversationService(session).create_conversation(
-                topic=schedule.title,
+                topic=topic,
                 project_id=schedule.project_id,
             )
             conversation_id = conversation.id
@@ -251,16 +260,23 @@ def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: date
     return last is not None and (now - last).total_seconds() < window
 
 
-def _due_schedules(session, now: datetime) -> list[Schedule]:
+def _due_schedules(session, now: datetime, bridge_up: bool = True) -> list[Schedule]:
     """Enabled schedules whose slot is due and should actually execute.
 
     A due slot with a successful run inside the freshness window is skipped
     and advanced to its next occurrence instead of returned.
+
+    A browser-required schedule whose bridge is DOWN is deferred, never
+    fired, never consumed — its slot stays past-due and catches up the poll
+    after the desktop returns (the honest "ran when you opened Cowork").
     """
     run_service = ScheduleRunService(session)
     due: list[Schedule] = []
     skipped = False
     for s in ScheduleService(session).list_schedules():
+        if s.requires_browser and not bridge_up:
+            # Defer, don't consume: the slot waits for the desktop to return.
+            continue
         # Gate on ANY in-flight run, manual included: a manual run still
         # executing when the slot comes due would otherwise run alongside the
         # cron run and publish the same output twice. The slot is deferred,
@@ -290,7 +306,10 @@ async def _scheduler_loop() -> None:
         try:
             _handle_missed_runs(session)
             _sweep_expired_approvals(session)
-            due = _due_schedules(session, datetime.now(timezone.utc))
+            from cowork.harnesses.anton_harness.browser_tools import bridge_available
+
+            bridge_up = await bridge_available()
+            due = _due_schedules(session, datetime.now(timezone.utc), bridge_up=bridge_up)
         except Exception:
             logger.exception("Scheduler loop error during poll")
             due = []

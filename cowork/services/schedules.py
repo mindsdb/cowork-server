@@ -36,6 +36,7 @@ class ScheduleService:
         timezone: str = "UTC",
         project_id: UUID | None = None,
         enabled: bool = True,
+        requires_browser: bool = False,
     ) -> Schedule:
         schedule = Schedule(
             title=title,
@@ -46,6 +47,7 @@ class ScheduleService:
             timezone=timezone,
             project_id=project_id or GENERAL_PROJECT_ID,
             enabled=enabled,
+            requires_browser=requires_browser,
         )
         self.session.add(schedule)
         self.session.commit()
