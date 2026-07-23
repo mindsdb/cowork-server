@@ -14,10 +14,8 @@ def list_skills():
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_skill(body: SkillCreateRequest):
-    service = SkillService()
-    save = service.save_skill if body.upsert else service.create_skill
     try:
-        skill = save(
+        skill = SkillService().create_skill(
             label=body.label,
             name=body.name,
             instructions=body.instructions or "",
