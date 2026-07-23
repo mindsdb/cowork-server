@@ -44,9 +44,12 @@ Use this loop:
 8. Repeat until the skill is strong enough to upload.
 9. To create or edit a skill, FIRST call `create_skill_draft(name)` and write
    SKILL.md to the returned `skill_file`. Editing an existing skill: the same
-   call pre-fills the folder from its saved version, so start from that. Every
-   edit — new skill or iteration — goes to the draft; NEVER write into the
-   project `skills/` directory (the live store).
+   call pre-fills the folder from its saved version, so start from that. If the
+   folder comes back empty but a skill of that name is already available to you
+   (listed in procedural memory), `recall_skill(name)` to load its current
+   content and write that into the draft as your starting point — do not restart
+   from a blank template. Every edit — new skill or iteration — goes to the
+   draft; NEVER write into the project `skills/` directory (the live store).
 
 If the user already has a draft skill, start from the draft and improve it. Do
 not restart from a generic template unless the draft is unusable.
