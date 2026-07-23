@@ -12,7 +12,17 @@ from cowork.services.task_objects import (
     finalize_turn_skill_drafts,
     snapshot_skill_drafts,
     snapshot_stray_skills,
+    stage_skill_draft,
 )
+
+
+def _point_store_at(monkeypatch, root: Path) -> None:
+    """Redirect the skill store root (`get_app_settings().skill.root_dir`)."""
+    import cowork.common.settings.app_settings as app_settings
+
+    skill = type("S", (), {"root_dir": str(root)})()
+    settings = type("Cfg", (), {"skill": skill})()
+    monkeypatch.setattr(app_settings, "get_app_settings", lambda: settings)
 
 SKILL_MD = """---
 name: Competitive Analysis
@@ -69,6 +79,48 @@ def test_preexisting_draft_not_re_emitted(tmp_path: Path):
     before = snapshot_skill_drafts(drafts)  # already contains the draft
     before_strays = snapshot_stray_skills(project / "skills")
     assert finalize_turn_skill_drafts(project, before, before_strays) == []
+
+
+def test_stage_skill_draft_seeds_from_saved_skill(tmp_path: Path, monkeypatch):
+    store = tmp_path / "store"
+    _write_skill(store / "my-skill")
+    (store / "my-skill" / "helper.py").write_text("print(1)\n", encoding="utf-8")
+    _point_store_at(monkeypatch, store)
+
+    drafts = tmp_path / "drafts"
+    result = stage_skill_draft(drafts, "my-skill")
+    assert result["slug"] == "my-skill"
+    seeded = drafts / "my-skill"
+    assert (seeded / "SKILL.md").read_text(encoding="utf-8").startswith("---")  # editing starts from saved
+    assert (seeded / "helper.py").exists()  # siblings seeded too
+
+
+def test_stage_skill_draft_fresh_when_no_saved_skill(tmp_path: Path, monkeypatch):
+    _point_store_at(monkeypatch, tmp_path / "empty-store")
+
+    result = stage_skill_draft(tmp_path / "drafts", "brand-new")
+    assert result["slug"] == "brand-new"
+    assert (tmp_path / "drafts" / "brand-new").is_dir()
+    assert not (tmp_path / "drafts" / "brand-new" / "SKILL.md").exists()  # nothing to seed
+
+
+def test_stage_skill_draft_does_not_clobber_in_progress_draft(tmp_path: Path, monkeypatch):
+    store = tmp_path / "store"
+    _write_skill(store / "dup", body="STORE VERSION\n")
+    _point_store_at(monkeypatch, store)
+
+    drafts = tmp_path / "drafts"
+    (drafts / "dup").mkdir(parents=True)
+    (drafts / "dup" / "SKILL.md").write_text("DRAFT IN PROGRESS\n", encoding="utf-8")
+
+    stage_skill_draft(drafts, "dup")
+    # An in-progress draft wins — the store copy must not overwrite it.
+    assert (drafts / "dup" / "SKILL.md").read_text(encoding="utf-8") == "DRAFT IN PROGRESS\n"
+
+
+def test_stage_skill_draft_rejects_empty_name(tmp_path: Path):
+    assert "error" in stage_skill_draft(tmp_path, "")
+    assert "error" in stage_skill_draft(tmp_path, "   ")
 
 
 def test_refined_draft_is_re_emitted_and_persists(tmp_path: Path):
