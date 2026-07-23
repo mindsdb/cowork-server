@@ -551,10 +551,50 @@ async def _gate_label_probe(path: str, body: dict) -> str | None:
     return None
 
 
+async def _origin_for_tab(tab_id: str | None) -> str | None:
+    """Lowercase host of the target tab's URL, or None. Rule scopes and parked
+    approvals key off this; an unreadable registry just means unscoped."""
+    try:
+        from urllib.parse import urlparse
+
+        state = await _bridge_call("GET", "/state", timeout=_FAST_TIMEOUT)
+        tabs = (state or {}).get("tabs") or []
+        tab = next(
+            (t for t in tabs if isinstance(t, dict) and t.get("id") == (tab_id or (state or {}).get("activeTabId"))),
+            None,
+        )
+        host = urlparse((tab or {}).get("url") or "").hostname
+        return host.lower() if host else None
+    except Exception:
+        return None
+
+
 async def _gate(session: Any, tc_input: dict, *, tool: str, args: dict, label: str | None) -> str | None:
     """Supervised-mode gate. None = proceed; a string = return it to the model."""
     if not _gate_enabled() or label is None:
         return None
+
+    # Standing rules: an exact scope match bypasses the proposal entirely —
+    # deterministic lookup at act time, revocation included (R1).
+    origin = await _origin_for_tab(args.get("tabId"))
+    if origin:
+        from cowork.db.session import get_open_session as _open_session
+        from cowork.services.rules import RuleService, scope_of
+
+        action_kind = scope_of(origin=origin, tool=tool, label=label)[1]
+        db = _open_session()
+        try:
+            rules = RuleService(db)
+            rule = rules.matching(origin=origin, action_kind=action_kind)
+            if rule is not None:
+                rules.record_hit(rule)
+                return None
+        except Exception:
+            pass  # rule lookup failure must never block an action
+        finally:
+            db.close()
+        # Parked approvals carry their scope so evidence can accumulate.
+        args.setdefault("origin", origin)
     raw = str(tc_input.get("approval_token") or "").strip()
     if raw:
         from cowork.db.session import get_open_session
