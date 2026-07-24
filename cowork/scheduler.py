@@ -102,7 +102,8 @@ async def execute_schedule(
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
-    session = get_open_session()
+    from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+    session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
     run_service = ScheduleRunService(session)
     schedule_service = ScheduleService(session)
 
@@ -115,7 +116,10 @@ async def execute_schedule(
 
         if conversation_id is None:
             # Conversation not pre-created by the caller (e.g. cron tick).
+            from cowork.db.scoped import scope_for_background_context
             from cowork.services.conversations import ConversationService
+            # Fail-closed check: org mode raises until service principals land.
+            scope_for_background_context()
             conversation = ConversationService(session).create_conversation(
                 topic=schedule.title,
                 project_id=schedule.project_id,
@@ -141,7 +145,10 @@ async def execute_schedule(
             },
         )
         async def _drain_run() -> None:
-            stream = await ResponsesHandler(session).handle(request)
+            # ResponsesHandler takes a RAW session (it wraps its own scope from
+            # the principal); hand it the underlying session, not our scoped one.
+            from cowork.db.scoped import unsafe_unscoped_session
+            stream = await ResponsesHandler(unsafe_unscoped_session(session)).handle(request)
             async for _ in stream:
                 pass
 
@@ -269,7 +276,8 @@ async def _scheduler_loop() -> None:
     logger.info("Scheduler loop started")
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        session = get_open_session()
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+        session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
             _handle_missed_runs(session)
             due = _due_schedules(session, datetime.now(timezone.utc))

@@ -9,7 +9,8 @@ from cowork.models.project import Project
 from cowork.models.schedule import Schedule
 from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.schedules import ScheduleRunService
+from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
+from cowork.services.schedules import ScheduleRunService, ScheduleService
 
 
 def _session():
@@ -39,13 +40,13 @@ def _schedule(session: Session) -> Schedule:
 def test_has_running_run_false_when_no_runs():
     session = _session()
     schedule = _schedule(session)
-    assert ScheduleRunService(session).has_running_run(schedule.id) is False
+    assert ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).has_running_run(schedule.id) is False
 
 
 def test_has_running_run_true_for_scheduled_run_in_progress():
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
     run = run_service.create_run(schedule.id, is_manual=False)
 
     assert run_service.has_running_run(schedule.id) is True
@@ -57,7 +58,7 @@ def test_has_running_run_true_for_scheduled_run_in_progress():
 def test_has_running_run_ignores_manual_run_in_progress():
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
     run = run_service.create_run(schedule.id, is_manual=True)
 
     assert run_service.has_running_run(schedule.id) is False
@@ -81,7 +82,7 @@ def _finish_at(session: Session, run_id, when: datetime) -> None:
 def test_last_successful_finish_ignores_failures_and_running():
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
     assert run_service.last_successful_finish(schedule.id) is None
 
@@ -101,14 +102,14 @@ def test_due_slot_skipped_and_advanced_after_recent_manual_success():
 
     session = _session()
     schedule = _schedule(session)  # daily, due at 2026-06-25 09:00 UTC
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
     now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
     run = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(run.id)
     _finish_at(session, run.id, now - timedelta(minutes=50))
 
-    assert _due_schedules(session, now) == []
+    assert _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now) == []
     session.refresh(schedule)
     # Slot consumed: advanced past the skipped occurrence to the next day.
     assert schedule.next_run_at.replace(tzinfo=timezone.utc) > now
@@ -119,14 +120,14 @@ def test_due_slot_runs_when_last_success_is_old():
 
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
     now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
     run = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(run.id)
     _finish_at(session, run.id, now - timedelta(hours=2))
 
-    assert [s.id for s in _due_schedules(session, now)] == [schedule.id]
+    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
 
 
 def test_due_slot_deferred_while_manual_run_in_flight():
@@ -138,11 +139,11 @@ def test_due_slot_deferred_while_manual_run_in_flight():
 
     session = _session()
     schedule = _schedule(session)  # daily, due at 2026-06-25 09:00 UTC
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
     run_service.create_run(schedule.id, is_manual=True)  # still running
 
     now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
-    assert _due_schedules(session, now) == []
+    assert _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now) == []
     session.refresh(schedule)
     assert schedule.next_run_at.replace(tzinfo=timezone.utc) == datetime(
         2026, 6, 25, 9, 0, tzinfo=timezone.utc
@@ -154,14 +155,14 @@ def test_due_slot_runs_when_recent_run_failed():
 
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
     now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
     run = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(run.id, error="boom")
     _finish_at(session, run.id, now - timedelta(minutes=10))
 
-    assert [s.id for s in _due_schedules(session, now)] == [schedule.id]
+    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
 
 
 # --- ENG-688: cancelled-run status + the UI-facing "running" flag.
@@ -171,7 +172,7 @@ def test_finish_run_status_override_records_cancelled():
 
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
     run = run_service.create_run(schedule.id, is_manual=False)
     finished = run_service.finish_run(run.id, status=RunStatus.cancelled)
@@ -185,7 +186,7 @@ def test_finish_run_status_override_records_cancelled():
 def test_has_active_run_counts_manual_runs():
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
     assert run_service.has_active_run(schedule.id) is False
     run = run_service.create_run(schedule.id, is_manual=True)
@@ -225,7 +226,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
 
     session = get_open_session()
-    schedule = ScheduleService(session).create_schedule(
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
         title="trace stamp test",
         prompt="do the thing",
         cadence="daily",
@@ -251,7 +252,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
             assert req.trace_metadata["schedule_run_id"]
     finally:
         s = get_open_session()
-        ScheduleService(s).delete_schedule(schedule_id)
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
         s.close()
 
 
@@ -365,7 +366,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     monkeypatch.setattr(scheduler_mod, "_turn_terminal_reason", _terminal)
 
     session = get_open_session()
-    schedule = ScheduleService(session).create_schedule(
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
         title="terminal mapping test",
         prompt="do the thing",
         cadence="daily",
@@ -382,8 +383,8 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     try:
         asyncio.run(execute_schedule(schedule_id, is_manual=is_manual))
         check = get_open_session()
-        fresh = ScheduleService(check).get_schedule(schedule_id)
-        run = ScheduleRunService(check).list_runs(schedule_id)[0]
+        fresh = ScheduleService(ScopedSession(check, SYSTEM_SCOPE)).get_schedule(schedule_id)
+        run = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)[0]
         state = {
             "run_status": run.status,
             "run_error": run.error,
@@ -396,7 +397,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
         return state
     finally:
         s = get_open_session()
-        ScheduleService(s).delete_schedule(schedule_id)
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
         s.close()
 
 
@@ -446,7 +447,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     from cowork.services.schedules import ScheduleService
 
     session = get_open_session()
-    schedule = ScheduleService(session).create_schedule(
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
         title="early link test",
         prompt="do the thing",
         cadence="daily",
@@ -467,7 +468,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
 
         async def handle(self, request):
             check = get_open_session()
-            run = ScheduleRunService(check).list_runs(schedule_id)[0]
+            run = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)[0]
             seen["conversation_id_during_turn"] = (
                 str(run.conversation_id) if run.conversation_id else None
             )
@@ -487,7 +488,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         assert seen["conversation_id_during_turn"] == seen["request_conversation"]
     finally:
         s = get_open_session()
-        ScheduleService(s).delete_schedule(schedule_id)
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
         s.close()
 
 
@@ -496,7 +497,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
 def test_reap_orphaned_runs_marks_running_as_failed():
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
     run = run_service.create_run(schedule.id, is_manual=False)
 
     # The stale `running` row would otherwise wedge the schedule forever.
@@ -517,7 +518,7 @@ def test_reap_orphaned_runs_marks_running_as_failed():
 def test_reap_orphaned_runs_reaps_manual_runs_too():
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
     manual = run_service.create_run(schedule.id, is_manual=True)
 
     assert run_service.reap_orphaned_runs() == 1
@@ -529,7 +530,7 @@ def test_reap_orphaned_runs_reaps_manual_runs_too():
 def test_reap_orphaned_runs_leaves_finished_runs_untouched():
     session = _session()
     schedule = _schedule(session)
-    run_service = ScheduleRunService(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
     run = run_service.create_run(schedule.id, is_manual=False)
     run_service.finish_run(run.id)
 

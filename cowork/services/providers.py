@@ -18,12 +18,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Model used to probe MindsHub connectivity/auth (health test + onboarding
-# validation). MUST be tier-universal: MindsHub gates paid models per plan, so
-# a free-tier key gets a 403 for haiku/sonnet/etc. mindshub_air is the free
-# baseline and is present in EVERY tier's registry, so it resolves for all
-# accounts — the probe then reflects reachability + key validity only, not
-# model availability. Using a paid model here caused ENG-576 (free-tier
-# "MindsHub failed its last test" / "Invalid API key" false-negatives).
+# validation). MUST be universally callable: MindsHub bills per model (a model
+# the org's wallet can't pay for is denied), so probing a paid model would fail
+# for an out-of-credits account even though the key is valid. mindshub_air is
+# the free included model (drawn from the monthly allowance), so it resolves
+# without depending on wallet balance — the probe then reflects reachability +
+# key validity only, not billing availability. Probing a paid model here caused
+# ENG-576 ("MindsHub failed its last test" / "Invalid API key" false-negatives).
 MINDS_PROBE_MODEL = "mindshub_air"
 
 
@@ -130,9 +131,11 @@ async def fetch_minds_models(
     None on any failure so the caller falls back to the static list),
     ``efforts`` maps a model id to ``{"efforts": [...], "default": "..."}`` for
     every model that advertises ``reasoning_efforts``, and ``enabled`` maps a
-    model id to its ``enabled`` flag. MindsHub lists models the caller's tier
-    can't use (marked ``"enabled": false``) so the picker can show them as
-    locked upsells; a model missing from ``enabled`` is treated as available.
+    model id to its ``enabled`` flag. MindsHub marks a model the org's wallet
+    can't currently pay for / whose free allowance is spent as
+    ``"enabled": false`` so the picker can show it as locked with an "add
+    credits" affordance; a model missing from ``enabled`` is treated as
+    available.
     """
     if not minds_url or not api_key:
         return None, {}, {}
@@ -192,8 +195,9 @@ async def fetch_minds_models(
         if not model_id:
             continue
         ids.append(model_id)
-        # A model the caller's tier can't use is listed with enabled=false so the
-        # picker can show it as a locked upsell. Missing → available.
+        # A model the org's wallet can't currently pay for (or whose free
+        # allowance is spent) is listed with enabled=false so the picker can
+        # show it as locked with an "add credits" affordance. Missing → available.
         if "enabled" in row:
             enabled[model_id] = bool(row.get("enabled"))
         levels = row.get("reasoning_efforts")
@@ -278,17 +282,18 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 return "fail", "missing API key"
             base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
             chat_url = minds_chat_base_url(base)
-            # Probe with a TIER-UNIVERSAL model, never the configured/default
-            # one. This is a connectivity + auth check for the provider, not a
-            # model-availability check — and MindsHub tier-gates paid models
-            # (free tier gets a 403 for e.g. haiku/sonnet). The old default was
+            # Probe with a UNIVERSALLY-CALLABLE model, never the configured/
+            # default one. This is a connectivity + auth check for the provider,
+            # not a billing-availability check — and MindsHub bills per model (a
+            # model the wallet can't pay for is denied). The old default was
             # CODING_MODEL_DEFAULTS["minds_cloud"] = "haiku" (paid), so every
-            # free-tier account saw "MindsHub failed its last test" even though
-            # chat worked on mindshub_air (ENG-576). mindshub_air is the free
-            # baseline and is present in EVERY tier's registry, so it resolves
-            # for all accounts — the dot then reflects reachability/key validity
-            # only. (Testing the user's role model was also rejected in the
-            # ENG-577 review for adding false-negatives + token cost.)
+            # out-of-credits account saw "MindsHub failed its last test" even
+            # though chat worked on mindshub_air (ENG-576). mindshub_air is the
+            # free included model (drawn from the monthly allowance), so it
+            # resolves without depending on wallet balance — the dot then
+            # reflects reachability/key validity only. (Testing the user's role
+            # model was also rejected in the ENG-577 review for adding
+            # false-negatives + token cost.)
             return await _chat_probe(
                 f"{chat_url}/chat/completions",
                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -474,6 +479,24 @@ def build_llm_client():
             return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
+    # Routing & summarization role: the cheap front-model that runs history
+    # summarization (and later gates turns). Only pass it when the installed
+    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
+    # would TypeError, taking the whole agent down. When absent, anton falls
+    # back to the coding role internally, so behavior is preserved.
+    import inspect as _inspect
+
+    router_kw: dict = {}
+    try:
+        _params = _inspect.signature(LLMClient.__init__).parameters
+        if "router_provider" in _params:
+            router_kw = {
+                "router_provider": _make_provider(settings.resolved_router_provider, None),
+                "router_model": settings.resolved_router_model,
+            }
+    except (ValueError, TypeError):
+        router_kw = {}
+
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at
     # a keyless provider — the same resolution config_status reports, so the
@@ -487,6 +510,7 @@ def build_llm_client():
             settings.resolved_coding_provider, settings.coding_reasoning_effort
         ),
         coding_model=settings.resolved_coding_model,
+        **router_kw,
     )
 
 

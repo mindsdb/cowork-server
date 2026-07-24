@@ -8,7 +8,7 @@ import tempfile
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
@@ -18,6 +18,55 @@ from cowork.services.connectors.connections import service
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+_REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"
+
+
+def _sanitize_tool_result(block: dict) -> dict:
+    """Replace image parts inside a tool_result with a text marker.
+
+    Base64 image payloads would bloat the JSON column and add nothing to the
+    replayed history. The marker states the removal happened at replay time
+    (not that the tool returned it) so the model doesn't misread it.
+    """
+    content = block.get("content")
+    if not isinstance(content, list):
+        return block
+    scrubbed = [
+        {"type": "text", "text": _REPLAY_IMAGE_PLACEHOLDER}
+        if isinstance(part, dict) and part.get("type") == "image"
+        else part
+        for part in content
+    ]
+    return {**block, "content": scrubbed}
+
+
+def _split_turn_into_rows(history_slice: list) -> list[dict]:
+    """Extract the tool block-rows of one turn from anton's raw history slice.
+
+    Keeps only `tool_use` (assistant) / `tool_result` (user) blocks as
+    `{role, content}` rows. Text blocks are dropped — the assistant's visible
+    text is persisted once in the display row — so a pure-text message yields
+    no row. Images inside tool_result are replaced with a replay marker.
+    """
+    rows: list[dict] = []
+    for msg in history_slice:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        keep_type = "tool_use" if role == "assistant" else "tool_result"
+        blocks = [
+            _sanitize_tool_result(b) if keep_type == "tool_result" else b
+            for b in content
+            if isinstance(b, dict) and b.get("type") == keep_type
+        ]
+        if blocks:
+            rows.append({"role": role, "content": blocks})
+    return rows
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -95,12 +144,32 @@ def _conversation_attachment_context(conversation) -> str:
     """
     try:
         from sqlalchemy.orm import object_session
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
         from cowork.services.files import FileService, attachment_purpose
 
         db_session = object_session(conversation)
         if db_session is None:
             return ""
-        rows = FileService(db_session).list_file_rows(
+        # Re-wrap with the ORIGINAL scope the conversation was loaded under —
+        # never derived from the row itself. No recorded scope in org mode is
+        # an invariant violation: log it and list nothing.
+        scope = scope_of_session(db_session)
+        if scope is None:
+            if get_app_settings().tenancy_mode == "org":
+                logger.warning(
+                    "attachments: session carries no tenant scope in org mode — "
+                    "listing skipped (conversation %s)", conversation.id,
+                )
+                return ""
+            scope = LOCAL_SCOPE
+        if scope.org_mode and conversation.org_id != scope.org_id:
+            logger.warning(
+                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
+                conversation.id, conversation.org_id, scope.org_id,
+            )
+            return ""
+        rows = FileService(ScopedSession(db_session, scope)).list_file_rows(
             purpose=attachment_purpose(str(conversation.id))
         )
         # Only list files that still exist on disk — a row whose file was
@@ -139,7 +208,12 @@ def _conversation_attachment_context(conversation) -> str:
         # the user no files were uploaded (the Cyberdeck bug this helper
         # exists to fix). Log it so the failure is diagnosable; the agent
         # still degrades gracefully to "".
-        conv_id = getattr(conversation, "id", "<unknown>")
+        try:
+            # A broken session state can make even attribute access raise —
+            # the log line must never re-crash the handler it protects.
+            conv_id = getattr(conversation, "id", "<unknown>")
+        except Exception:
+            conv_id = "<unknown>"
         logger.warning(
             "Failed to build conversation attachment context for conversation %s; "
             "the agent will not see attached files this turn",
@@ -185,6 +259,10 @@ class AntonHarness:
         project_path = Path(conversation.project.path)
         artifacts_base = project_path / ".anton" / "artifacts"
         before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Capture ids while the conversation is unambiguously attached — the
+        # end-of-turn finally must not depend on the session still being live.
+        conv_id = conversation.id
+        conv_project_id = conversation.project_id
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -194,12 +272,19 @@ class AntonHarness:
         before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
         skill_drafts: list[dict] = []
+        turn_rows: list[dict] | None = None
         try:
             session, temp_vault_dir = await self._build_chat_session(
                 conversation,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
+            # Length of the seeded history — everything anton appends past this
+            # index is this turn's block-messages (tool_use / tool_result / text).
+            # Guarded: an anton build (or test double) without `.history` simply
+            # skips capture and falls back to text-only replay.
+            seed_len = len(session.history) if hasattr(session, "history") else None
+            compacted = False  # set if anton summarizes history mid-turn
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Deployed cowork-server resolves anton
             # from PyPI/main, which may predate the trace-tags kwargs (anton
@@ -212,16 +297,35 @@ class AntonHarness:
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
+                # Under context pressure anton summarizes history mid-turn,
+                # reassigning session.history and invalidating seed_len.
+                if type(event).__name__ == "StreamContextCompacted":
+                    compacted = True
                 yield event
+            # Turn completed cleanly: capture its tool block-rows for
+            # persistence. Skipped on cancel/error (the block below never runs),
+            # so a partial turn falls back to text-only replay and anton's own
+            # dangling-tool_use sealing keeps its in-memory history valid.
+            #
+            # Also skipped after a mid-turn compaction: seed_len no longer marks
+            # this turn's start, so slicing could drop rows or surface an orphan
+            # tool_result (its tool_use summarized away) → invalid replay. Text-
+            # only replay stays valid, so degrade to it.
+            if seed_len is not None and not compacted:
+                turn_slice = session.history[seed_len:]
+                while turn_slice and (
+                    not isinstance(turn_slice[0], dict)
+                    or turn_slice[0].get("role") != "assistant"
+                ):
+                    turn_slice = turn_slice[1:]
+                turn_rows = _split_turn_into_rows(turn_slice) or None
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
             # One dir diff → index the new artifacts AND build their cards.
             # Runs on every exit (success, error, cancel) so an artifact is
             # always indexed; cards are yielded just below on normal completion.
-            cards = finalize_turn_artifacts(
-                conversation.id, conversation.project_id, artifacts_base, before_slugs,
-            )
+            cards = finalize_turn_artifacts(conversation, conv_id, conv_project_id, artifacts_base, before_slugs)
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,
             )
@@ -229,6 +333,8 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
+        if turn_rows:
+            yield TurnHistory(turn_rows)
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -334,6 +440,21 @@ class AntonHarness:
             db_val = getattr(user, attr, None)
             if db_val:
                 setattr(anton_settings, attr, db_val)
+
+        # Routing & summarization role → anton's router_* fields. The LLM
+        # client is actually built by build_llm_client (which reads the
+        # resolved router model directly), so this only keeps AntonSettings
+        # consistent for any path that reads it. Guarded so an anton build
+        # predating ENG-648 (no router_* fields) doesn't raise.
+        router_provider = getattr(user, "router_provider", None)
+        if router_provider is not None and hasattr(anton_settings, "router_provider"):
+            anton_settings.router_provider = (
+                router_provider.value.replace("_", "-")
+                if hasattr(router_provider, "value") else router_provider
+            )
+        router_model = getattr(user, "router_model", None)
+        if router_model is not None and hasattr(anton_settings, "router_model"):
+            anton_settings.router_model = router_model
 
         workspace = Workspace(base)
         workspace.initialize()
@@ -519,7 +640,26 @@ class AntonHarness:
                     "surfaces every file this app can legitimately see, Shared Drive items included."
                 )
 
-        cells = extract_scratchpad_cells_from_message_events(conversation.messages)
+        # Canonical order (created_at, seq, ...); the bare `conversation.messages`
+        # relationship is unordered and would scramble a turn's tool_use/tool_result
+        # block-rows. Ordering needs the DB session, so the conversation must be
+        # attached — callers always pass an attached instance; fail fast rather
+        # than silently fall back to a scrambled, replay-breaking history.
+        from sqlalchemy.orm import object_session
+        from cowork.db.scoped import adopt_scoped_session
+        from cowork.services.conversations import ConversationService
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            raise RuntimeError(
+                f"Conversation {conversation.id} is detached from its Session; "
+                "cannot resolve ordered history for replay."
+            )
+        ordered_messages = ConversationService(
+            adopt_scoped_session(db_session)
+        ).get_ordered_messages(conversation.id)
+
+        cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
         # Per-message timestamps: embed each message's created_at so the agent
@@ -534,7 +674,7 @@ class AntonHarness:
             return om
 
         initial_history = [
-            _stamped(m) for m in conversation.messages
+            _stamped(m) for m in ordered_messages
             if m.role in {"user", "assistant"}
         ]
 
@@ -546,7 +686,7 @@ class AntonHarness:
             # episodic=episodic,
             system_prompt_context=SystemPromptContext(
                 runtime_context=build_runtime_context(anton_settings),
-                suffix=(                  
+                suffix=(
                     _turn_style_context(channel_context)
                     + f"{project_context}"
                     + f"{output_context}"

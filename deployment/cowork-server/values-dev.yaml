@@ -10,7 +10,9 @@ deployment:
       - host: cowork.dev.mindshub.ai
         enableMultiPath: true
         paths:
-          - path: /
+          # Narrowed from / to /api: the cowork-frontend chart owns / (static
+          # SPA) on this host; cowork-server owns the same-origin API prefix.
+          - path: /api
             serviceName: cowork-server
             servicePort: 80
 

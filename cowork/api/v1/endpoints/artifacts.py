@@ -7,6 +7,7 @@ agent-produced artifacts.
 from __future__ import annotations
 
 import mimetypes
+import os
 import subprocess
 from pathlib import Path
 from typing import Annotated
@@ -17,6 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 from cowork.services.artifacts import (
@@ -211,7 +213,7 @@ async def open_artifact(req: _PathBody):
     return {"status": "ok", "path": str(artifact)}
 
 
-def _resolve_reveal_path(path: str, session: Session) -> Path:
+def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     try:
         return resolve_artifact_path(path)
     except FileNotFoundError:
@@ -219,23 +221,42 @@ def _resolve_reveal_path(path: str, session: Session) -> Path:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
+    if not path or "\x00" in path or path.lstrip().startswith("~"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
+    normalized = os.path.normpath(path.strip())
+    if (
+        not normalized
+        or normalized == "."
+        or normalized.startswith("..")
+        or normalized == ".."
+        or os.path.isabs(normalized)
+    ):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
     try:
-        requested = Path(path).expanduser().resolve()
+        rel = Path(normalized)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path") from exc
+
+    # Fallback resolution only accepts project-relative paths.
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid path")
+
     for project in ProjectService(session).list_projects():
-        project_dir = Path(project.path).resolve()
+        project_root = Path(project.path).resolve()
         try:
-            requested.relative_to(project_dir)
-        except ValueError:
+            resolved = (project_root / rel).resolve()
+            resolved.relative_to(project_root)
+        except Exception:
             continue
-        if requested.exists():
-            return requested
+        if resolved.exists():
+            return resolved
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
 
 
 @router.post("/reveal")
-async def reveal_artifact(req: _PathBody, session: SessionDep):
+async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
         reveal_in_file_manager(target)

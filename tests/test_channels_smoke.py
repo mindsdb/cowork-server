@@ -22,6 +22,8 @@ from cowork.harnesses.base import ChannelContext
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.models.message import Message
 from cowork.server import create_app
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.services.conversations import ConversationService, _is_tool_row
 
 REPLY = "hello from anton"
 LINK_PREFIX = "https://app.example.com/c/"
@@ -30,9 +32,10 @@ LINK_PREFIX = "https://app.example.com/c/"
 class FakeHarness:
     """Stands in for the Anton harness — one assistant delta, no LLM."""
 
-    def __init__(self, tool_event: bool = False, delay: float = 0.0):
+    def __init__(self, tool_event: bool = False, delay: float = 0.0, turn_history: list | None = None):
         self.tool_event = tool_event
         self.delay = delay
+        self.turn_history = turn_history
         self.inputs: list[list[dict]] = []
         self.channel_contexts: list = []
 
@@ -52,6 +55,11 @@ class FakeHarness:
                 "type": "response.in_progress",
                 "thought_role": "thought_scratchpad_start",
                 "tool_use_id": "t1",
+            })
+        if self.turn_history is not None:
+            event_sink("response.turn_history", {
+                "type": "response.turn_history",
+                "rows": self.turn_history,
             })
         event_sink("response.output_text.delta", {"delta": REPLY})
         if False:
@@ -189,6 +197,45 @@ def test_rich_turn_appends_conversation_link(monkeypatch):
         if m.role == "assistant"
     )
     assert assistant.content == REPLY
+    s.close()
+
+
+def test_channel_turn_persists_tool_rows_and_hides_history_event(monkeypatch):
+    """A channel turn must persist the harness's tool rows for LLM replay, and
+    the synthetic turn_history event must NOT leak into stored MessageEvents."""
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "x", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "B"}]},
+    ]
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness(turn_history=rows))
+
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s", "bot_username": "b"})
+    event = asyncio.run(bridge.parse_inbound(
+        body=telegram_update(60, 88, 1, "use a tool"), headers={}, route_name=None,
+    ))[0]
+
+    adapters = LiveAdapterRegistry(registry)
+    adapters._cache["telegram"] = FakeAdapter()
+    asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
+
+    s = get_open_session()
+    binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "88")).one()
+    cid = binding.anton_conversation_id
+    svc = ConversationService(ScopedSession(s, LOCAL_SCOPE))
+    # (a) tool rows persisted for LLM replay.
+    assert sum(1 for m in svc.get_ordered_messages(cid) if _is_tool_row(m.content)) == 2
+    # (b) the turn_history blob is not stored as a MessageEvent / shown to UI,
+    #     and tool rows stay hidden from the chat.
+    ui = svc.get_messages(cid)
+    assert all(
+        e.get("type") != "response.turn_history"
+        for m in ui for e in m.get("events", [])
+    )
+    assert all(not _is_tool_row(m["content"]) for m in ui)
     s.close()
 
 
@@ -668,13 +715,14 @@ def test_channel_agent_endpoint_validates_and_persists():
     from cowork.services.settings import SettingService
 
     session = get_open_session()
+    scoped = ScopedSession(session, LOCAL_SCOPE)
     try:
         # Unknown harness is rejected, not persisted.
         with pytest.raises(HTTPException) as exc:
-            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session)
+            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session, scoped)
         assert exc.value.status_code == 400
 
-        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session)
+        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session, scoped)
         assert resp.harness == "hermes"
         assert "anton" in resp.options and "hermes" in resp.options
         assert get_channel_agent().harness == "hermes"
@@ -713,7 +761,7 @@ def test_channel_agent_switch_resets_bound_conversations():
         session.refresh(binding)
         bid = binding.id
 
-        reset = ChannelBindingService(session).reset_conversations(channel_type="telegram")
+        reset = ChannelBindingService(ScopedSession(session, LOCAL_SCOPE)).reset_conversations(channel_type="telegram")
         assert reset >= 1
         session.expire_all()
         assert session.get(ChannelBinding, bid).anton_conversation_id is None
@@ -820,7 +868,7 @@ def test_binding_project_change_detaches_conversation():
         session.add(ChannelSession(binding_id=bid, external_session_key="__default__"))
         session.commit()
 
-        svc = ChannelBindingService(session)
+        svc = ChannelBindingService(ScopedSession(session, LOCAL_SCOPE))
 
         # Same project: conversation stays pinned.
         svc.update(bid, BindingUpdateRequest(anton_project_id=GENERAL_PROJECT_ID))

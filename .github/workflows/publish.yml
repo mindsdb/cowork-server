@@ -1,5 +1,12 @@
 name: Auto-release and publish to PyPI
 
+# Stable release stream: on every push to main, cut a CalVer release and
+# publish it to PyPI. The publish job MUST live in this top-level workflow
+# (not a reusable one) — PyPI Trusted Publishing does not support reusable
+# workflows, and matches the OIDC claim on THIS filename. Register
+# publish.yml as a trusted publisher (environment `pypi`) at
+# https://pypi.org/manage/project/cowork-server/settings/publishing/
+
 permissions:
   contents: write
 
@@ -19,9 +26,13 @@ jobs:
   unit-tests:
     uses: ./.github/workflows/tests-unit.yml
 
-  auto-release:
+  release:
     needs: unit-tests
+    # workflow_dispatch can be pointed at any ref; only main cuts a stable release.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -35,14 +46,16 @@ jobs:
           set -euo pipefail
 
           MAJOR=${{ env.CALVER_MAJOR }}
-          YY=$(date -u +%y)    # e.g. 26
-          M=$(date -u +%-m)    # e.g. 6 (no zero-pad)
-          DD=$(date -u +%-d)   # e.g. 23 (no zero-pad)
+          YY=$(date -u +%y)
+          M=$(date -u +%-m)
+          DD=$(date -u +%-d)
 
-          # Find the highest sequence for today's date
+          # Next free NUMERIC sequence for today. rc-suffixed tags fail this
+          # numeric check, so the stable and rc streams never fight over a
+          # sequence number.
           PREFIX="v${MAJOR}.${YY}.${M}.${DD}."
           SEQ=0
-          for tag in $(git tag -l "${PREFIX}*" | sort -t. -k5 -n); do
+          for tag in $(git tag -l "${PREFIX}*"); do
             N="${tag##*.}"
             if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$SEQ" ]; then
               SEQ="$N"
@@ -55,7 +68,7 @@ jobs:
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Computed version: ${VERSION}"
 
-      - name: Create tag and GitHub Release
+      - name: Create tag and GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -67,16 +80,16 @@ jobs:
 
   publish:
     name: Build and publish to PyPI
-    needs: auto-release
+    needs: release
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      contents: read   # required to checkout private repo
+      contents: read
       id-token: write  # required for trusted publisher (OIDC)
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.auto-release.outputs.tag }}
+          ref: ${{ needs.release.outputs.tag }}
           fetch-depth: 0  # hatch-vcs needs tags to derive version
 
       - name: Setup uv
@@ -89,5 +102,5 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # Uses trusted publisher (OIDC) — no API token needed.
-        # Configure at: https://pypi.org/manage/project/cowork-server/settings/publishing/
+        # Trusted publisher (OIDC) — publish.yml must be registered at the
+        # PyPI project's publishing settings (environment: pypi).
