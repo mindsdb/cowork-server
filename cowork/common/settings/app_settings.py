@@ -247,6 +247,9 @@ class OAuthSettings(Settings):
     linear_client_id: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_ID"))
     linear_client_secret: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_SECRET"))
 
+    github_client_id: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_ID"))
+    github_client_secret: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_SECRET"))
+
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
     google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))

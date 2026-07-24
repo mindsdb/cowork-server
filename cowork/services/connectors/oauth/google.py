@@ -32,6 +32,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
     "google-ads":       ("google_ads_client_id",        "google_ads_client_secret"),
     "google-analytics": ("google_analytics_client_id",  "google_analytics_client_secret"),
     "linear":           ("linear_client_id",            "linear_client_secret"),
+    "github":           ("github_client_id",            "github_client_secret"),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -58,6 +59,25 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     return {"email": viewer.get("email", ""), "name": viewer.get("name", "")}
 
 
+def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
+    """GitHub's `email` is frequently null — the app only requests `read:user`,
+    not `user:email`, and even with that scope a user can keep their email
+    private. `login` (the username) is always present and always unique, so it's
+    the fallback identity — same intent as email elsewhere, just not a real
+    email address."""
+    result = _json_request(
+        "https://api.github.com/user",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    login = str(result.get("login") or "").strip()
+    email = str(result.get("email") or "").strip()
+    name = str(result.get("name") or "").strip()
+    return {"email": email or login, "name": name or login}
+
+
 # engine → identity-fetch function. The one piece of connector onboarding
 # that can't be pure spec-JSON data — response shape (REST vs GraphQL) is
 # genuinely provider-specific code, not configuration. New OAuth-builtin
@@ -69,6 +89,7 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "google_ads": _fetch_userinfo_google,
     "google_analytics_4": _fetch_userinfo_google,
     "linear": _fetch_userinfo_linear,
+    "github": _fetch_userinfo_github,
 }
 
 
