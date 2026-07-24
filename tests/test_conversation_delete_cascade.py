@@ -291,3 +291,60 @@ def test_delete_turn_without_skill_card_keeps_drafts(session):
     svc.delete_turn(conv.id, 0)
     assert draft.exists(), "a turn without a skill card must not sweep drafts"
     shutil.rmtree(draft, ignore_errors=True)
+
+
+def test_new_skill_card_supersedes_earlier_versions(session):
+    """A later skill_created for the same slug drops the earlier one; a
+    different slug is untouched — history keeps one card per skill (latest)."""
+    from cowork.models.message import Message
+    from cowork.models.message_event import MessageEvent
+
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+
+    def _emit(user, text, slug, instr):
+        session.add(Message(conversation_id=conv.id, role="user", content=f'"{user}"'))
+        session.commit()
+        svc.save_assistant_turn(
+            conv.id, text,
+            events=[{"type": "response.skill_created",
+                     "skill": {"slug": slug, "instructions": instr}}],
+        )
+
+    _emit("build", "v1", "dedup-me", "v1")
+    _emit("also", "other", "other-skill", "keep")
+    _emit("refine", "v2", "dedup-me", "v2")
+
+    msg_ids = [m.id for m in session.exec(
+        select(Message).where(Message.conversation_id == conv.id)).all()]
+    events = session.exec(
+        select(MessageEvent).where(MessageEvent.message_id.in_(msg_ids))).all()
+    dedup = [e for e in events if _skill_created_slug(e.event_data) == "dedup-me"]
+    other = [e for e in events if _skill_created_slug(e.event_data) == "other-skill"]
+
+    assert len(dedup) == 1, "only the latest same-slug card survives"
+    assert dedup[0].event_data["skill"]["instructions"] == "v2"
+    assert len(other) == 1, "a different slug is not superseded"
+
+
+def test_delete_turn_discards_stream_buffers(session):
+    """turn_id == message count, so after truncation the next turn reuses a
+    deleted turn's buffer file (append mode) and replays the old answer. The
+    delete must drop the conversation's stream buffers."""
+    from cowork.models.message import Message
+    from cowork.streaming.backend import get_streams_dir
+    from cowork.streaming.buffer import turn_buffer_path
+
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+    session.add(Message(conversation_id=conv.id, role="user", content='"hi"'))
+    session.commit()
+    svc.save_assistant_turn(conv.id, "answer", events=[])
+
+    buf = turn_buffer_path(get_streams_dir(), str(conv.id), 0)
+    buf.parent.mkdir(parents=True, exist_ok=True)
+    buf.write_text('{"seq": 0}\n', encoding="utf-8")
+    assert buf.exists()
+
+    svc.delete_turn(conv.id, 0)
+    assert not buf.exists(), "stale stream buffers must be discarded on turn delete"

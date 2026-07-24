@@ -12,6 +12,7 @@ so swapping the backend is a one-line settings change with no call-site churn.
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from cowork.common.settings.app_settings import StreamSettings
@@ -19,6 +20,7 @@ from cowork.streaming.buffer import (
     FileStreamBuffer,
     RedisStreamBuffer,
     StreamBuffer,
+    conversation_dir,
     turn_buffer_path,
 )
 
@@ -38,3 +40,14 @@ def new_buffer(conversation_id: str, turn_id: int) -> StreamBuffer:
         # WIP — raises NotImplementedError until the cloud move wires it.
         return RedisStreamBuffer(conversation_id=conversation_id, turn_id=turn_id)
     return FileStreamBuffer(turn_buffer_path(get_streams_dir(), conversation_id, turn_id))
+
+
+def remove_conversation_buffers(conversation_id: str) -> None:
+    """Delete a conversation's on-disk turn buffers.
+
+    ponytail: file backend only — the Redis backend (WIP) stores buffers as keys,
+    not files, so this is a no-op there; add key deletion when Redis ships.
+    """
+    if get_backend() != "file":
+        return
+    shutil.rmtree(conversation_dir(get_streams_dir(), conversation_id), ignore_errors=True)

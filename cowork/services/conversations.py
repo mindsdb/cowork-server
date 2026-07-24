@@ -77,6 +77,22 @@ def _sweep_skill_drafts(session, project_id, slugs: set[str]) -> None:
             logger.warning("Could not sweep skill draft %r on turn delete", slug, exc_info=True)
 
 
+def _discard_conversation_streams(conversation_id) -> None:
+    """Drop a conversation's stale stream buffers + handle after a turn delete.
+
+    A turn's buffer is keyed by `turn_id = len(messages)`; truncating the history
+    makes the next turn reuse a deleted turn's buffer and replay the old answer
+    instead of generating. Streaming owns the buffers — we just ask it to discard.
+    Best-effort: never breaks the delete.
+    """
+    try:
+        from cowork.streaming import discard_conversation
+
+        discard_conversation(conversation_id)
+    except Exception:
+        logger.warning("Could not discard streams for conversation %s", conversation_id, exc_info=True)
+
+
 class ConversationService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
@@ -339,6 +355,9 @@ class ConversationService:
         # in a deleted turn (their `skill_created` events were just removed).
         if swept_slugs:
             _sweep_skill_drafts(self.session, conversation.project_id, swept_slugs)
+        # Drop stale stream buffers so a resend regenerates instead of replaying
+        # a deleted turn (turn_id == message count collides after truncation).
+        _discard_conversation_streams(conversation_id)
         return len(to_delete)
 
     def save_assistant_turn(
@@ -399,6 +418,41 @@ class ConversationService:
                 event_data=event_data,
             ))
         if events:
+            self.session.commit()
+            # A skill card supersedes its earlier versions: when this turn emits a
+            # `skill_created`, drop the same slug's earlier skill_created events so
+            # history holds ONE card per skill (the latest). Keeps the on-disk
+            # single-draft-per-slug model consistent with the transcript, and makes
+            # the "latest card" durable across reload (not just a render-time dedup).
+            new_slugs = {s for s in (_skill_created_slug(e) for e in events) if s}
+            if new_slugs:
+                self._supersede_skill_cards(conversation_id, assistant_msg.id, new_slugs)
+
+    def _supersede_skill_cards(self, conversation_id: UUID, keep_message_id: UUID, slugs: set[str]) -> None:
+        """Delete earlier `skill_created` events (for `slugs`) in this conversation,
+        keeping only the one on `keep_message_id`.
+
+        ponytail: scans the conversation's message events in Python (JSON slug
+        isn't portably queryable in SQL). Bounded — runs only on a skill-emitting
+        turn, which is rare; upgrade to an indexed column if skills get chatty.
+        """
+        msg_ids = [
+            m.id for m in self.session.exec(
+                self.session.select(Message).where(Message.conversation_id == conversation_id)
+            ).all()
+        ]
+        if not msg_ids:
+            return
+        deleted = False
+        for event in self.session.exec(
+            self.session.select(MessageEvent).where(MessageEvent.message_id.in_(msg_ids))
+        ).all():
+            if event.message_id == keep_message_id:
+                continue
+            if _skill_created_slug(event.event_data) in slugs:
+                self.session.delete(event)
+                deleted = True
+        if deleted:
             self.session.commit()
 
     def get_ordered_messages(self, conversation_id: UUID) -> list[Message]:
