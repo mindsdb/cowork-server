@@ -127,23 +127,34 @@ deployment:
           name: cowork-db
           key: database_uri
 
+    # Fernet master key for encrypting sensitive settings at rest. Without it
+    # the server generates a key into an ephemeral per-pod file, so a restart
+    # or a second replica cannot decrypt what an earlier pod wrote. Sourced
+    # from a Secret so the key is stable across restarts and replicas. Must be
+    # a valid urlsafe-base64 Fernet key (add it to mindsdb-secrets).
+    - name: COWORK_MASTER_KEY
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: COWORK_MASTER_KEY
+
     # ====================================
     # PROVIDER API KEYS
     # ====================================
 
-    - name: ANTHROPIC__API_KEY
+    - name: ANTHROPIC_API_KEY
       valueFrom:
         secretKeyRef:
           name: mindsdb-secrets
           key: ANTHROPIC_API_KEY
 
-    - name: OPENAI__API_KEY
+    - name: OPENAI_API_KEY
       valueFrom:
         secretKeyRef:
           name: mindsdb-secrets
           key: OPENAI_API_KEY
 
-    - name: GEMINI__API_KEY
+    - name: GEMINI_API_KEY
       valueFrom:
         secretKeyRef:
           name: mindsdb-secrets
