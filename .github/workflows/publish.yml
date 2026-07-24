@@ -104,3 +104,26 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         # Trusted publisher (OIDC) — publish.yml must be registered at the
         # PyPI project's publishing settings (environment: pypi).
+
+  notify-failure:
+    # Alert the eng channel if ANY job in the release/publish pipeline fails.
+    needs: [unit-tests, release, publish]
+    if: failure()
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "auto-release + PyPI publish"
+      runs-on: ubuntu-latest
+    secrets: inherit
+
+
+  notify-recovery:
+    # Post a green "recovered" message when the pipeline goes green after a
+    # failing run (the reusable no-ops on a normal green run).
+    needs: [unit-tests, release, publish]
+    if: success()
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "auto-release + PyPI publish"
+      status: recovered
+      runs-on: ubuntu-latest
+    secrets: inherit
