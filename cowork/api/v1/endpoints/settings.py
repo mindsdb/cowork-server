@@ -245,9 +245,15 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
     # alongside modelEfforts — consumers that ignore it keep working.
     model_enabled: dict[str, bool] = {}
 
+    # `modelLabels` maps a model id → MindsHub's human-readable display label.
+    # Display-only: the picker uses this to render the option text, but the id
+    # remains the value used for selection/storage/resolution everywhere else.
+    # A model absent from this map falls back to the client's id-derived label.
+    model_labels: dict[str, str] = {}
+
     s = SettingService(session).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts, live_enabled = await fetch_minds_models(
+        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
         if live:
@@ -282,6 +288,7 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
                     SettingService(session).upsert_setting("minds_model_enabled", desired)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_labels.update(live_labels)
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -307,19 +314,21 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled = await fetch_minds_models(
+        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
             oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
         )
         if live:
             recommended["openai-compatible"] = live
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_labels.update(live_labels)
 
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
+        "modelLabels": model_labels,
     }
 
 

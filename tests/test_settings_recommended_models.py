@@ -40,6 +40,7 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
             ["model-a", "model-b"],
             {"model-a": {"efforts": ["low", "high"], "default": "low"}},
             {"model-b": False},
+            {},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -82,7 +83,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
     async def fake_fetch(base_url, api_key, force_refresh=False):
         nonlocal called
         called = True
-        return ["x"], {}, {}
+        return ["x"], {}, {}, {}
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -112,6 +113,7 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
             ["mindshub_air", "opus", "gpt"],
             {},
             {"mindshub_air": True, "opus": False, "gpt": False},
+            {"opus": "Claude Opus"},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -125,6 +127,9 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
 
         assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "opus", "gpt"]
         assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
+        # Display-only label passthrough — a model missing here (mindshub_air,
+        # gpt) is the client's job to derive a fallback, not this endpoint's.
+        assert result["modelLabels"] == {"opus": "Claude Opus"}
     finally:
         _delete_settings(session, "minds_api_key", "minds_url")
         session.close()
@@ -141,7 +146,7 @@ def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
     from cowork.services.settings import SettingService
 
     async def fake_fetch(base_url, api_key, force_refresh=False):
-        return (["mindshub_air", "opus"], {}, {})  # ids present, enabled EMPTY
+        return (["mindshub_air", "opus"], {}, {}, {})  # ids present, enabled EMPTY
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -175,7 +180,7 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
     from cowork.services.settings import SettingService
 
     async def fake_fetch(base_url, api_key, force_refresh=False):
-        return (["mindshub_air", "opus"], {}, {"mindshub_air": True, "opus": False})
+        return (["mindshub_air", "opus"], {}, {"mindshub_air": True, "opus": False}, {})
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -221,6 +226,7 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
             ["zephyr_base", "air-mini", "sonnet"],
             {},
             {"zephyr_base": True, "air-mini": True, "sonnet": False},
+            {},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
