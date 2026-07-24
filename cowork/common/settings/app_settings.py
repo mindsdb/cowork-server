@@ -389,6 +389,19 @@ class AppSettings(Settings):
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
 
+    master_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_MASTER_KEY"),
+        description=(
+            "Fernet master key material (urlsafe-base64) used to encrypt "
+            "sensitive settings at rest. When set, it is used directly and "
+            "master_key_path is ignored. Required for stateless/cloud deploys "
+            "so the key survives pod restarts (a per-pod file key would orphan "
+            "everything encrypted before the restart). Empty (desktop default) "
+            "reads or generates the key at master_key_path."
+        ),
+    )  # COWORK_MASTER_KEY
+
     master_key_path: str = Field(
         default_factory=lambda: str(cowork_home() / ".master_key"),
         description="Path to the Fernet master key file used to encrypt sensitive settings",
