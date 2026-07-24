@@ -369,7 +369,7 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
 
     try:
         from anton.core.datasources.data_vault import LocalDataVault
-        from anton.publisher import publish
+        from anton.publisher import publish, StatePublishBlocked
     except Exception as exc:
         raise RuntimeError("Anton publisher is unavailable") from exc
 
@@ -415,6 +415,10 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             # the published artifact has no DB connection in the cloud.
             vault=LocalDataVault(Path(get_app_settings().connector.vault_dir)),
         )
+    except StatePublishBlocked as exc:
+        # Surface the state-collection block verbatim — NOT the generic
+        # credentials message below.
+        raise RuntimeError(str(exc)) from exc
     except Exception as exc:
         logger.exception("Publishing failed")
         raise RuntimeError("Publishing failed. Check your Minds credentials and try again.") from exc
@@ -541,7 +545,7 @@ def unpublish_artifact(raw_path: str) -> dict:
         raise FileNotFoundError("No published version on file")
 
     try:
-        from anton.publisher import unpublish
+        from anton.publisher import unpublish, _STATE_SNAPSHOT
     except Exception as exc:
         raise RuntimeError("Anton publisher is unavailable") from exc
 
@@ -572,6 +576,12 @@ def unpublish_artifact(raw_path: str) -> dict:
             published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
         except Exception:
             pass
+    # Reset the state-snapshot baseline (data is purged server-side on delete),
+    # so a later publish with a changed collection set is treated as fresh.
+    try:
+        (published_dir / _STATE_SNAPSHOT).unlink()
+    except OSError:
+        pass
     return {"status": "ok"}
 
 
