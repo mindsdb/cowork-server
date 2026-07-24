@@ -105,13 +105,15 @@ def ensure_onboarding_cards(
         pin_cards = [card]
     result["pin_card"] = str(pin_cards[0].id) if pin_cards else None
 
-    # Card 3 — only after card 1 is resolved, and never alongside an existing
-    # digest schedule or a prior card 3 (any status).
+    # Card 3 — the content engine. Established users (apps already pinned, no
+    # digest schedule) skip card 1 entirely and go straight here: one click
+    # and tomorrow morning has its first real work on the board. Without this
+    # branch the cascade was unreachable for exactly the users who'd benefit.
     card1_done = pin_cards and pin_cards[0].status in ("approved", "edited", "skipped")
     digest_cards = _cards(session, DIGEST_CARD_TOOL)
-    if card1_done and not digest_cards and not _digest_schedule_exists(session):
+    if (card1_done or pinned_apps) and not digest_cards and not _digest_schedule_exists(session):
         card3 = service.create(
-            conversation_id=pin_cards[0].conversation_id,
+            conversation_id=pin_cards[0].conversation_id if pin_cards else _onboarding_conversation(session),
             descriptor=ActionDescriptorV1(
                 tool=DIGEST_CARD_TOOL,
                 args={"hour": digest_hour, "timezone": digest_timezone},

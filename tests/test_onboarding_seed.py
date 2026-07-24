@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import create_engine
 from sqlmodel import Session, SQLModel, select
@@ -44,10 +46,14 @@ def test_empty_world_seeds_card1_only(session):
     assert _cards(session, DIGEST_CARD_TOOL) == []
 
 
-def test_established_user_gets_nothing(session):
+def test_established_user_goes_straight_to_card3(session):
+    # Apps pinned, no digest schedule: no beginner card — straight to the
+    # digest proposal, the thing that puts real work on the board.
     result = ensure_onboarding_cards(session, pinned_apps=[{"id": "app-gmail", "name": "Gmail"}])
-    assert result == {"pin_card": None, "digest_card": None}
-    assert session.exec(select(Approval)).all() == []
+    assert result["pin_card"] is None
+    cards3 = _cards(session, DIGEST_CARD_TOOL)
+    assert len(cards3) == 1
+    assert result["digest_card"] == str(cards3[0].id)
 
 
 def test_idempotent_second_call(session):
@@ -72,18 +78,14 @@ def test_card3_follows_card1_resolution(session):
 
 
 def test_card3_not_seeded_when_digest_schedule_exists(session):
-    ensure_onboarding_cards(session, pinned_apps=[])
-    card1 = _cards(session, PIN_CARD_TOOL)[0]
-    card1.status = "skipped"
-    session.add(card1)
-    session.commit()
+    # The schedule already exists BEFORE any seeding — the card would be noise.
     session.add(Schedule(
         title=DIGEST_TITLE, prompt="x", cadence="daily", timezone="UTC",
-        next_run_at=card1.expires_at, enabled=True, project_id=GENERAL_PROJECT_ID, model="default",
+        next_run_at=datetime.now(timezone.utc) + timedelta(hours=1), enabled=True, project_id=GENERAL_PROJECT_ID, model="default",
     ))
     session.commit()
 
-    result = ensure_onboarding_cards(session, pinned_apps=[])
+    result = ensure_onboarding_cards(session, pinned_apps=[{"id": "app-gmail"}])
     assert result["digest_card"] is None
     assert _cards(session, DIGEST_CARD_TOOL) == []
 
