@@ -734,3 +734,44 @@ def build_cowork_label_connection_tool():
         prompt=_LABEL_CONNECTION_PROMPT,
     )
 
+
+##################
+# Skill Draft Tool
+##################
+
+# Anton has no native skill-write tool; before this, the skill-creator flow was
+# prompt-only, so editing an existing skill let the agent hunt down and mutate
+# the live store in place. This tool gives anton the same structured draft-claim
+# hermes has: it stages the skill under `.anton/skill_drafts/` (surfaced as a
+# card, never auto-saved) and, when a skill of that name is already saved,
+# pre-seeds the folder with its stored contents so an edit starts from — and
+# Save upserts back — the saved version.
+
+
+async def _cowork_create_skill_draft(session: Any, tc_input: dict) -> str:
+    """Tool handler for `create_skill_draft` — claim (and seed) a draft folder."""
+    from cowork.services.task_objects import stage_skill_draft
+
+    workspace = getattr(session, "_workspace", None)
+    base = getattr(workspace, "base", None)
+    if base is None:
+        return json.dumps({"error": "Skill-draft tools are unavailable: no workspace for this run."})
+    drafts_root = Path(base) / ".anton" / "skill_drafts"
+    return json.dumps(stage_skill_draft(drafts_root, tc_input.get("name")))
+
+
+def build_cowork_create_skill_draft_tool():
+    from anton.core.tools.tool_defs import ToolDef
+
+    from cowork.services.task_objects import (
+        CREATE_SKILL_DRAFT_DESCRIPTION,
+        CREATE_SKILL_DRAFT_SCHEMA,
+    )
+
+    return ToolDef(
+        name="create_skill_draft",
+        description=CREATE_SKILL_DRAFT_DESCRIPTION,
+        input_schema=CREATE_SKILL_DRAFT_SCHEMA,
+        handler=_cowork_create_skill_draft,
+    )
+
