@@ -135,7 +135,8 @@ async def fetch_minds_models(
     can't currently pay for / whose free allowance is spent as
     ``"enabled": false`` so the picker can show it as locked with an "add
     credits" affordance; a model missing from ``enabled`` is treated as
-    available.
+    available. Rows with ``"embedding": true`` are dropped entirely — they
+    share this listing but aren't chat/completion models.
 
     ``force_refresh`` skips the cache *read* (a fresh result is still cached
     for subsequent calls) — used when the caller knows the cached answer may
@@ -198,6 +199,12 @@ async def fetch_minds_models(
             continue
         model_id = str(row.get("id")).strip()
         if not model_id:
+            continue
+        # Embedding models share this listing but aren't chat/completion
+        # models — chosen for planning/coding roles they'd error every turn.
+        # Filtered here, the single place every row is parsed, so neither the
+        # picker nor default-resolution ever sees them.
+        if row.get("embedding"):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
