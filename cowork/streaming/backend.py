@@ -12,7 +12,7 @@ so swapping the backend is a one-line settings change with no call-site churn.
 """
 from __future__ import annotations
 
-import re
+import os
 import shutil
 from pathlib import Path
 
@@ -51,8 +51,10 @@ def remove_conversation_buffers(conversation_id: str) -> None:
     """
     if get_backend() != "file":
         return
-    # Allowlist to a single safe path segment before it reaches the filesystem —
-    # a conversation id is a UUID; `_safe_segment` alone lets `..` through.
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", conversation_id):
+    # Resolve, then require the target to stay inside the streams dir — `_safe_segment`
+    # alone lets `..` through (`.` is in its allowed set), so contain it here.
+    streams = os.path.realpath(get_streams_dir())
+    target = os.path.realpath(conversation_dir(get_streams_dir(), conversation_id))
+    if not target.startswith(streams + os.sep):
         return
-    shutil.rmtree(conversation_dir(get_streams_dir(), conversation_id), ignore_errors=True)
+    shutil.rmtree(target, ignore_errors=True)
