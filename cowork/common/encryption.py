@@ -6,7 +6,14 @@ from cryptography.fernet import Fernet
 
 def _load_or_create_master_key() -> bytes:
     from cowork.common.settings.app_settings import get_app_settings
-    key_path = Path(get_app_settings().master_key_path)
+    settings = get_app_settings()
+    # A directly-provided key (COWORK_MASTER_KEY) wins over the file. Stateless
+    # / cloud deploys set it from a Secret so the key is stable across pod
+    # restarts and replicas; without it each pod would generate its own file
+    # key and lose access to data encrypted by a previous pod.
+    if settings.master_key:
+        return settings.master_key.strip().encode()
+    key_path = Path(settings.master_key_path)
     if key_path.exists():
         return key_path.read_bytes().strip()
     key = Fernet.generate_key()
