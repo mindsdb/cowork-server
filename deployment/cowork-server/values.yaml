@@ -142,19 +142,19 @@ deployment:
     # PROVIDER API KEYS
     # ====================================
 
-    - name: ANTHROPIC__API_KEY
+    - name: ANTHROPIC_API_KEY
       valueFrom:
         secretKeyRef:
           name: mindsdb-secrets
           key: ANTHROPIC_API_KEY
 
-    - name: OPENAI__API_KEY
+    - name: OPENAI_API_KEY
       valueFrom:
         secretKeyRef:
           name: mindsdb-secrets
           key: OPENAI_API_KEY
 
-    - name: GEMINI__API_KEY
+    - name: GEMINI_API_KEY
       valueFrom:
         secretKeyRef:
           name: mindsdb-secrets
