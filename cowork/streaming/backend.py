@@ -12,6 +12,7 @@ so swapping the backend is a one-line settings change with no call-site churn.
 """
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
@@ -49,5 +50,9 @@ def remove_conversation_buffers(conversation_id: str) -> None:
     not files, so this is a no-op there; add key deletion when Redis ships.
     """
     if get_backend() != "file":
+        return
+    # Allowlist to a single safe path segment before it reaches the filesystem —
+    # a conversation id is a UUID; `_safe_segment` alone lets `..` through.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", conversation_id):
         return
     shutil.rmtree(conversation_dir(get_streams_dir(), conversation_id), ignore_errors=True)
