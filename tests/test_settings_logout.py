@@ -9,10 +9,13 @@ Verifies that:
 from __future__ import annotations
 
 import pytest
+from cryptography.fernet import Fernet
 from sqlmodel import Session
 
+from cowork.common.encryption import encrypt
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
+from cowork.models.setting import Setting
 from cowork.services.settings import SettingService
 from cowork.common.settings.user_settings import UserSettings
 
@@ -148,3 +151,23 @@ def test_clear_credentials_idempotent(session: Session):
         assert len(second) == 0
     finally:
         _cleanup(session)
+
+
+def test_load_skips_secret_encrypted_under_a_lost_master_key(monkeypatch):
+    """An undecryptable secret (master key rotated / regenerated on a pod
+    restart) must read as unset, not raise — one bad row propagating
+    InvalidToken up through get_user_settings() 500'd /health and crashlooped
+    the server. A valid sibling row must still load. `_load` is env-independent
+    here except for the BaseSettings env fallback, so clear the provider env."""
+    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    foreign = Fernet(Fernet.generate_key())  # a key this process doesn't hold
+    bad = Setting(key="anthropic_api_key", value=foreign.encrypt(b"orphan").decode())
+    good = Setting(key="openai_api_key", value=encrypt("sk-openai-valid"))
+
+    settings = SettingService._load([bad, good])  # must not raise
+
+    assert settings.anthropic_api_key is None
+    assert settings.openai_api_key is not None
+    assert settings.openai_api_key.get_secret_value() == "sk-openai-valid"
