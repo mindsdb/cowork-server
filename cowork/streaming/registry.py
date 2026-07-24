@@ -161,6 +161,11 @@ def discard_conversation(conversation_id: str) -> None:
     is reused once the history is truncated, so a stale buffer would be tailed,
     reused, or replayed on the next send. Streaming owns these files; callers just
     ask for the conversation to be discarded.
+
+    Deliberately drops ALL of the conversation's buffers, not only the truncated
+    turns: buffers are just reconnect cache (the DB transcript is the source of
+    truth on reload), and a delete never races an in-flight stream for the same
+    conversation, so a whole-conversation wipe is both safe and simplest.
     """
     from cowork.streaming.backend import remove_conversation_buffers
 
