@@ -125,6 +125,16 @@ class RunRegistry:
     def in_flight(self) -> list[RunHandle]:
         return [h for h in self._by_cid.values() if h.is_running]
 
+    def discard(self, conversation_id: str) -> None:
+        """Drop a conversation's handle (sync, best-effort).
+
+        Called after a turn delete: the buffered turn is stale (turn_id ==
+        message count, so truncation makes the next turn reuse it), and the
+        handle must not be tailed or reused. The dict pop is atomic; the async
+        lock is skipped because a delete never races a start for the same id.
+        """
+        self._by_cid.pop(conversation_id, None)
+
     async def gc_finished(self, max_age_seconds: float = 300.0) -> int:
         """Drop handles whose producer finished > max_age ago. The buffer
         file stays on disk — only the in-memory handle is freed."""
@@ -142,3 +152,18 @@ class RunRegistry:
 
 # Single global instance per server process.
 registry: RunRegistry = RunRegistry()
+
+
+def discard_conversation(conversation_id: str) -> None:
+    """Drop a conversation's in-memory handle AND its on-disk buffers.
+
+    After a turn delete the buffered turns are stale — `turn_id == message count`
+    is reused once the history is truncated, so a stale buffer would be tailed,
+    reused, or replayed on the next send. Streaming owns these files; callers just
+    ask for the conversation to be discarded.
+    """
+    from cowork.streaming.backend import remove_conversation_buffers
+
+    cid = str(conversation_id)
+    registry.discard(cid)
+    remove_conversation_buffers(cid)
