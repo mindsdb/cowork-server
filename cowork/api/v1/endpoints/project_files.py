@@ -9,6 +9,7 @@ import hashlib
 import logging
 import mimetypes
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -212,13 +213,13 @@ def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
     lingering draft is the safe default we're clearing, not a hard error. The
     slug is confined to a direct child of the drafts dir (no traversal).
     """
-    base = _project_dir(project_name, scoped)
-    drafts_root = base / ".anton" / "skill_drafts"
-    target = _safe_relpath(slug, drafts_root)
-    if target.parent != drafts_root.resolve():
+    # Allowlist the slug to a single safe path segment (no separators, no `.`/`..`)
+    # before it touches the filesystem — a plain draft folder name, never a path.
+    if slug in (".", "..") or not re.fullmatch(r"[A-Za-z0-9._-]+", slug):
         raise HTTPException(status_code=400, detail="invalid slug")
-    if target.is_dir():
-        shutil.rmtree(target, ignore_errors=True)
+    folder = _project_dir(project_name, scoped) / ".anton" / "skill_drafts" / slug
+    if folder.is_dir():
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 @router.post("/preview-mount-file")
