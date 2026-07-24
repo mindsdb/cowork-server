@@ -7,6 +7,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.api.v1.endpoints import memory as memory_router
 from cowork.common.settings.app_settings import AppSettings, MemorySettings
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_session
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import ProjectMemoryStore, SharedMemoryStore
@@ -29,8 +30,11 @@ def engine(tmp_path):
 
 @pytest.fixture
 def session(engine):
-    with Session(engine) as session:
-        yield session
+    # MemoryService now takes a ScopedSession. In local mode (LOCAL_SCOPE) it
+    # neither filters nor stamps, so add/commit/refresh and the service behave
+    # exactly as with the raw session — the wrap is transparent here.
+    with Session(engine) as raw:
+        yield ScopedSession(raw, LOCAL_SCOPE)
 
 
 @pytest.fixture
