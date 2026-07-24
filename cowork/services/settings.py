@@ -1,6 +1,8 @@
 import json
+import logging
 from enum import Enum
 
+from cryptography.fernet import InvalidToken
 from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
@@ -11,6 +13,8 @@ from cowork.common.settings.user_settings import (
 )
 from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
+
+logger = logging.getLogger(__name__)
 
 
 def _mask_provider_keys(providers_json: str) -> str:
@@ -55,7 +59,15 @@ class SettingService:
             if row.key not in UserSettings.model_fields:
                 continue
             if UserSettings.field_is_sensitive(row.key):
-                decrypted = decrypt(row.value)
+                try:
+                    decrypted = decrypt(row.value)
+                except InvalidToken:
+                    # Wrong master key → treat as unset, not a load-wide failure.
+                    logger.warning(
+                        "settings: %r could not be decrypted (master key mismatch); treating as unset",
+                        row.key,
+                    )
+                    continue
                 # An empty credential is no credential: a blank sensitive value
                 # (e.g. a key cleared in the UI, which upserts "") reads as unset,
                 # so the provider is honestly not-configured rather than present.
