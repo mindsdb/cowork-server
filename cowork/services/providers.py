@@ -123,7 +123,7 @@ _minds_models_cache: dict[
 
 
 async def fetch_minds_models(
-    minds_url: str, api_key: str
+    minds_url: str, api_key: str, *, force_refresh: bool = False
 ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
@@ -136,6 +136,11 @@ async def fetch_minds_models(
     ``"enabled": false`` so the picker can show it as locked with an "add
     credits" affordance; a model missing from ``enabled`` is treated as
     available.
+
+    ``force_refresh`` skips the cache *read* (a fresh result is still cached
+    for subsequent calls) — used when the caller knows the cached answer may
+    be stale, e.g. the Settings picker re-checking after the user tops up
+    credits in an external tab and refocuses the app.
     """
     if not minds_url or not api_key:
         return None, {}, {}
@@ -143,7 +148,7 @@ async def fetch_minds_models(
 
     now = time.monotonic()
     cached = _minds_models_cache.get(base)
-    if cached:
+    if cached and not force_refresh:
         ts, val = cached
         ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
         if (now - ts) < ttl:
