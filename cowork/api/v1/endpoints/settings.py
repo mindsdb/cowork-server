@@ -215,14 +215,19 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
 
 
 @router.get("/recommended-models")
-async def recommended_models(session: SessionDep):
+async def recommended_models(session: SessionDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
     the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
     when a Minds key + URL are configured. Falls back to the static list
     (the `latest:*` aliases) when the key is absent or the endpoint can't
-    be reached."""
+    be reached.
+
+    `refresh=true` bypasses fetch_minds_models's cache (`force_refresh`) — the
+    Settings UI passes it when re-checking after window refocus, since the
+    cached `enabled` map can otherwise mask a wallet top-up for its 5-minute
+    TTL. The plain mount-time load omits it and stays cache-eligible."""
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
 
@@ -243,7 +248,7 @@ async def recommended_models(session: SessionDep):
     s = SettingService(session).load()
     if s.minds_api_key is not None and s.minds_url:
         live, live_efforts, live_enabled = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value()
+            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
         if live:
             recommended["minds-cloud"] = live
@@ -302,7 +307,9 @@ async def recommended_models(session: SessionDep):
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
+        live, live_efforts, live_enabled = await fetch_minds_models(
+            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
+        )
         if live:
             recommended["openai-compatible"] = live
         model_efforts.update(live_efforts)

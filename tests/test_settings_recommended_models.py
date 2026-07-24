@@ -34,7 +34,7 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
 
     calls: list[tuple[str, str]] = []
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         calls.append((base_url, api_key))
         return (
             ["model-a", "model-b"],
@@ -79,7 +79,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
 
     called = False
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         nonlocal called
         called = True
         return ["x"], {}, {}
@@ -105,7 +105,7 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         # MindsHub lists the whole picker catalog; paid models come back
         # enabled:false for a free caller so the UI can show them as locked.
         return (
@@ -140,7 +140,7 @@ def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         return (["mindshub_air", "opus"], {}, {})  # ids present, enabled EMPTY
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -174,7 +174,7 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         return (["mindshub_air", "opus"], {}, {"mindshub_air": True, "opus": False})
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -214,7 +214,7 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         # Baseline listed FIRST by the gateway, but sorting alphabetically
         # would put 'air-mini' ahead of it.
         return (

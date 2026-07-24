@@ -123,7 +123,7 @@ _minds_models_cache: dict[
 
 
 async def fetch_minds_models(
-    minds_url: str, api_key: str
+    minds_url: str, api_key: str, *, force_refresh: bool = False
 ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
@@ -135,7 +135,13 @@ async def fetch_minds_models(
     can't currently pay for / whose free allowance is spent as
     ``"enabled": false`` so the picker can show it as locked with an "add
     credits" affordance; a model missing from ``enabled`` is treated as
-    available.
+    available. Rows with ``"embedding": true`` are dropped entirely — they
+    share this listing but aren't chat/completion models.
+
+    ``force_refresh`` skips the cache *read* (a fresh result is still cached
+    for subsequent calls) — used when the caller knows the cached answer may
+    be stale, e.g. the Settings picker re-checking after the user tops up
+    credits in an external tab and refocuses the app.
     """
     if not minds_url or not api_key:
         return None, {}, {}
@@ -143,7 +149,7 @@ async def fetch_minds_models(
 
     now = time.monotonic()
     cached = _minds_models_cache.get(base)
-    if cached:
+    if cached and not force_refresh:
         ts, val = cached
         ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
         if (now - ts) < ttl:
@@ -193,6 +199,12 @@ async def fetch_minds_models(
             continue
         model_id = str(row.get("id")).strip()
         if not model_id:
+            continue
+        # Embedding models share this listing but aren't chat/completion
+        # models — chosen for planning/coding roles they'd error every turn.
+        # Filtered here, the single place every row is parsed, so neither the
+        # picker nor default-resolution ever sees them.
+        if row.get("embedding"):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
