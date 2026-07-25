@@ -49,6 +49,24 @@ jobs:
           image: ${{ needs.build.outputs.image }}
           snyk-token: ${{ secrets.SNYK_TOKEN }}
 
+  notify:
+    # Alert the eng channel if any active job in the staging pipeline fails. Add
+    # deploy here if the commented-out deploy graph below is ever re-enabled.
+    # One job covers both outcomes: a `uses:` job cannot branch on status, so
+    # the aggregate result picks the failed or recovered message, and a
+    # cancelled run stays silent.
+    needs: [run-unit-tests, build, scan]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      actions: read  # the prior-run lookup behind the recovery message
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "staging build+deploy"
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+      runs-on: ubuntu-latest
+    secrets: inherit
+
   # deploy:
   #   runs-on: mdb-dev
   #   needs: [build, scan]

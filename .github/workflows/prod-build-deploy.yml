@@ -24,6 +24,25 @@ jobs:
   run-unit-tests:
     uses: ./.github/workflows/tests-unit.yml
 
+  notify:
+    # Alert the eng channel if any job in the main pipeline fails. Depends on every
+    # active job; add build/scan/deploy here if the commented-out deploy graph
+    # below is ever re-enabled.
+    # One job covers both outcomes: a `uses:` job cannot branch on status, so
+    # the aggregate result picks the failed or recovered message, and a
+    # cancelled run stays silent.
+    needs: [run-unit-tests]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      actions: read  # the prior-run lookup behind the recovery message
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "prod build+deploy"
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+      runs-on: ubuntu-latest
+    secrets: inherit
+
   # build:
   #   runs-on: mdb-dev
   #   outputs:
