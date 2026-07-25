@@ -34,12 +34,13 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
 
     calls: list[tuple[str, str]] = []
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         calls.append((base_url, api_key))
         return (
             ["model-a", "model-b"],
             {"model-a": {"efforts": ["low", "high"], "default": "low"}},
             {"model-b": False},
+            {},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -72,6 +73,69 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
         session.close()
 
 
+def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
+    """A colliding model id must not let a BYO base URL restyle a MindsHub model.
+
+    modelEfforts / modelEnabled / modelLabels are keyed by model id alone, with
+    no provider dimension, so both branches write into one namespace. MindsHub
+    is fetched first and owns any id it describes; the custom endpoint fills
+    only the ids MindsHub didn't. Without that, pointing an openai-compatible
+    card at an endpoint that happens to serve `sonnet` would rename MindsHub's
+    sonnet in the picker and could render it locked.
+    """
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False):
+        if "mindshub" in base_url:
+            return (
+                ["sonnet", "haiku"],
+                {"sonnet": {"efforts": ["low", "high"], "default": "high"}},
+                {"sonnet": True, "haiku": True},
+                {"sonnet": "Claude Sonnet 5", "haiku": "Claude Haiku 4.5"},
+            )
+        # Same alias, different everything — and locked.
+        return (
+            ["sonnet", "local-llama"],
+            {"sonnet": {"efforts": ["none"], "default": "none"}},
+            {"sonnet": False, "local-llama": True},
+            {"sonnet": "Some Other Sonnet", "local-llama": "Local Llama"},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session,
+            minds_api_key="mdb_test",
+            minds_url="https://api.mindshub.ai",
+            providers_json=json.dumps(
+                [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+            ),
+            openai_api_key="sk-test",
+        )
+
+        result = asyncio.run(recommended_models(session))
+
+        # MindsHub's description of `sonnet` survives on all three maps.
+        assert result["modelLabels"]["sonnet"] == "Claude Sonnet 5"
+        assert result["modelEnabled"]["sonnet"] is True
+        assert result["modelEfforts"]["sonnet"] == {"efforts": ["low", "high"], "default": "high"}
+        # The custom endpoint still contributes ids MindsHub never mentioned.
+        assert result["modelLabels"]["local-llama"] == "Local Llama"
+        assert result["modelEnabled"]["local-llama"] is True
+        # Both buckets still list their own models; only the id-keyed maps merge.
+        assert result["recommendedModels"]["minds-cloud"] == ["sonnet", "haiku"]
+        assert result["recommendedModels"]["openai-compatible"] == ["sonnet", "local-llama"]
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "providers_json", "openai_api_key", "minds_model_enabled"
+        )
+        session.close()
+
+
 def test_recommended_models_no_openai_compatible_card(monkeypatch):
     from cowork.api.v1.endpoints import settings as settings_endpoint
     from cowork.api.v1.endpoints.settings import recommended_models
@@ -79,10 +143,10 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
 
     called = False
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         nonlocal called
         called = True
-        return ["x"], {}, {}
+        return ["x"], {}, {}, {}
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -105,13 +169,14 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         # MindsHub lists the whole picker catalog; paid models come back
         # enabled:false for a free caller so the UI can show them as locked.
         return (
             ["mindshub_air", "opus", "gpt"],
             {},
             {"mindshub_air": True, "opus": False, "gpt": False},
+            {"opus": "Claude Opus"},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -125,6 +190,9 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
 
         assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "opus", "gpt"]
         assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
+        # Display-only label passthrough — a model missing here (mindshub_air,
+        # gpt) is the client's job to derive a fallback, not this endpoint's.
+        assert result["modelLabels"] == {"opus": "Claude Opus"}
     finally:
         _delete_settings(session, "minds_api_key", "minds_url")
         session.close()
@@ -140,8 +208,8 @@ def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key):
-        return (["mindshub_air", "opus"], {}, {})  # ids present, enabled EMPTY
+    async def fake_fetch(base_url, api_key, force_refresh=False):
+        return (["mindshub_air", "opus"], {}, {}, {})  # ids present, enabled EMPTY
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -174,8 +242,8 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key):
-        return (["mindshub_air", "opus"], {}, {"mindshub_air": True, "opus": False})
+    async def fake_fetch(base_url, api_key, force_refresh=False):
+        return (["mindshub_air", "opus"], {}, {"mindshub_air": True, "opus": False}, {})
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
 
@@ -214,13 +282,14 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key):
+    async def fake_fetch(base_url, api_key, force_refresh=False):
         # Baseline listed FIRST by the gateway, but sorting alphabetically
         # would put 'air-mini' ahead of it.
         return (
             ["zephyr_base", "air-mini", "sonnet"],
             {},
             {"zephyr_base": True, "air-mini": True, "sonnet": False},
+            {},
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
