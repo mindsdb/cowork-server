@@ -73,6 +73,69 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
         session.close()
 
 
+def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
+    """A colliding model id must not let a BYO base URL restyle a MindsHub model.
+
+    modelEfforts / modelEnabled / modelLabels are keyed by model id alone, with
+    no provider dimension, so both branches write into one namespace. MindsHub
+    is fetched first and owns any id it describes; the custom endpoint fills
+    only the ids MindsHub didn't. Without that, pointing an openai-compatible
+    card at an endpoint that happens to serve `sonnet` would rename MindsHub's
+    sonnet in the picker and could render it locked.
+    """
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False):
+        if "mindshub" in base_url:
+            return (
+                ["sonnet", "haiku"],
+                {"sonnet": {"efforts": ["low", "high"], "default": "high"}},
+                {"sonnet": True, "haiku": True},
+                {"sonnet": "Claude Sonnet 5", "haiku": "Claude Haiku 4.5"},
+            )
+        # Same alias, different everything — and locked.
+        return (
+            ["sonnet", "local-llama"],
+            {"sonnet": {"efforts": ["none"], "default": "none"}},
+            {"sonnet": False, "local-llama": True},
+            {"sonnet": "Some Other Sonnet", "local-llama": "Local Llama"},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session,
+            minds_api_key="mdb_test",
+            minds_url="https://api.mindshub.ai",
+            providers_json=json.dumps(
+                [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+            ),
+            openai_api_key="sk-test",
+        )
+
+        result = asyncio.run(recommended_models(session))
+
+        # MindsHub's description of `sonnet` survives on all three maps.
+        assert result["modelLabels"]["sonnet"] == "Claude Sonnet 5"
+        assert result["modelEnabled"]["sonnet"] is True
+        assert result["modelEfforts"]["sonnet"] == {"efforts": ["low", "high"], "default": "high"}
+        # The custom endpoint still contributes ids MindsHub never mentioned.
+        assert result["modelLabels"]["local-llama"] == "Local Llama"
+        assert result["modelEnabled"]["local-llama"] is True
+        # Both buckets still list their own models; only the id-keyed maps merge.
+        assert result["recommendedModels"]["minds-cloud"] == ["sonnet", "haiku"]
+        assert result["recommendedModels"]["openai-compatible"] == ["sonnet", "local-llama"]
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "providers_json", "openai_api_key", "minds_model_enabled"
+        )
+        session.close()
+
+
 def test_recommended_models_no_openai_compatible_card(monkeypatch):
     from cowork.api.v1.endpoints import settings as settings_endpoint
     from cowork.api.v1.endpoints.settings import recommended_models

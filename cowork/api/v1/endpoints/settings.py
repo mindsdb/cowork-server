@@ -214,6 +214,12 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
 
+def _fill_missing(target: dict, extra: dict) -> None:
+    """Add only the keys `target` doesn't already have (first writer wins)."""
+    for key, value in extra.items():
+        target.setdefault(key, value)
+
+
 @router.get("/recommended-models")
 async def recommended_models(session: SessionDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
@@ -321,9 +327,15 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
         )
         if live:
             recommended["openai-compatible"] = live
-        model_efforts.update(live_efforts)
-        model_enabled.update(live_enabled)
-        model_labels.update(live_labels)
+        # These three maps are keyed by model id alone, not by (provider, id),
+        # so a custom endpoint serving an id MindsHub also serves would other-
+        # wise decide that model's label, effort levels and locked state for the
+        # minds-cloud bucket too — letting a BYO base URL rename or lock a
+        # MindsHub model in the picker. MindsHub is fetched first and wins;
+        # the custom endpoint only fills ids MindsHub didn't describe.
+        _fill_missing(model_efforts, live_efforts)
+        _fill_missing(model_enabled, live_enabled)
+        _fill_missing(model_labels, live_labels)
 
     return {
         "recommendedModels": recommended,

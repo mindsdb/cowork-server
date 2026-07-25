@@ -122,6 +122,29 @@ _minds_models_cache: dict[
 ] = {}
 
 
+# Substrings that identify an embeddings model by id, used only for endpoints
+# that don't flag one. OpenAI's /v1/models has no field for it, so a BYO
+# openai-compatible endpoint (or OpenAI itself) lists `text-embedding-3-small`
+# indistinguishably from a chat model. Kept to the "embedding"/"embed" word
+# rather than family names (bge, gte, e5) so a chat model is never dropped by a
+# coincidence; a family-named embeddings model just stays in the list, which is
+# the pre-existing behavior.
+_EMBEDDING_ID_HINTS = ("text-embedding", "embedding-", "-embedding", "-embed-", "embed-")
+
+
+def _is_embedding_row(row: dict, model_id: str) -> bool:
+    """Whether a /v1/models row is an embeddings model rather than a chat one.
+
+    MindsHub marks these explicitly with `"embedding": true`, and that flag is
+    authoritative in both directions — an endpoint that says false is believed.
+    Only when the field is absent entirely does the id get inspected.
+    """
+    if "embedding" in row:
+        return bool(row.get("embedding"))
+    lowered = model_id.lower()
+    return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
+
+
 async def fetch_minds_models(
     minds_url: str, api_key: str, *, force_refresh: bool = False
 ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]]:
@@ -139,8 +162,8 @@ async def fetch_minds_models(
     available. ``labels`` is purely a display aid for the picker — the model
     id remains the value used everywhere else (selection, storage,
     resolution); a model missing from ``labels`` falls back to the client's
-    id-derived label. Rows with ``"embedding": true`` are dropped entirely —
-    they share this listing but aren't chat/completion models.
+    id-derived label. Embeddings models are dropped entirely — they share this
+    listing but aren't chat/completion models (see ``_is_embedding_row``).
 
     ``force_refresh`` skips the cache *read* for a cached success (a fresh
     result is still cached for subsequent calls) — used when the caller knows
@@ -216,7 +239,7 @@ async def fetch_minds_models(
         # models — chosen for planning/coding roles they'd error every turn.
         # Filtered here, the single place every row is parsed, so neither the
         # picker nor default-resolution ever sees them.
-        if row.get("embedding"):
+        if _is_embedding_row(row, model_id):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
