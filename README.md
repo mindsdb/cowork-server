@@ -51,9 +51,24 @@ Set `LOG_LEVEL` (default `INFO`) to control verbosity. Enable file logging with 
 
 ## Releasing
 
-1. Bump `version` in `pyproject.toml`
-2. Create a GitHub release with a matching tag (e.g. `v0.1.5`)
-3. The [`publish.yml`](.github/workflows/publish.yml) workflow builds and publishes to [PyPI](https://pypi.org/project/cowork-server/) via OIDC trusted publishing
+Releases are automatic on merge; there is no version to bump by hand (the
+package version comes from the tag).
+
+- Push to `main`: [`publish.yml`](.github/workflows/publish.yml) runs the unit
+  tests, cuts a CalVer tag and GitHub release (`v0.<yy>.<m>.<d>.<seq>`), then
+  builds and publishes to [PyPI](https://pypi.org/project/cowork-server/) via
+  OIDC trusted publishing.
+- Push to `staging`:
+  [`publish-staging.yml`](.github/workflows/publish-staging.yml) does the same on
+  the rc pre-release stream (`v0.<yy>.<m>.<d>.<seq>rc<n>`, GitHub and PyPI
+  pre-release), pinning the matching `anton-agent` rc into the wheel so the pair
+  installs exactly.
+
+Both take their version, tag, and release from the shared `calver-release.yml`
+reusable in [mindsdb/github-actions](https://github.com/mindsdb/github-actions)
+(`prerelease: true` selects the rc stream). The publish jobs stay in these two
+workflows: PyPI trusted publishing matches the OIDC claim on the workflow
+filename and does not support reusable workflows.
 
 In the packaged Electron app, a background updater checks PyPI on every launch and upgrades automatically (with rollback on failure). See [`server-updater.ts`](https://github.com/mindsdb/cowork/blob/main/src/main/server-updater.ts) in the frontend repo.
 
