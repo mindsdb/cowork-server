@@ -225,9 +225,11 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
     be reached.
 
     `refresh=true` bypasses fetch_minds_models's cache (`force_refresh`) — the
-    Settings UI passes it when re-checking after window refocus, since the
-    cached `enabled` map can otherwise mask a wallet top-up for its 5-minute
-    TTL. The plain mount-time load omits it and stays cache-eligible."""
+    Settings UI passes it when the model dropdown is opened, since the cached
+    `enabled` map can otherwise mask a wallet top-up for its 5-minute TTL. The
+    plain mount-time load omits it and stays cache-eligible. A cached *failure*
+    is honored either way, so an unreachable MindsHub doesn't cost every open
+    the full HTTP timeout."""
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
 

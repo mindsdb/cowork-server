@@ -142,10 +142,15 @@ async def fetch_minds_models(
     id-derived label. Rows with ``"embedding": true`` are dropped entirely —
     they share this listing but aren't chat/completion models.
 
-    ``force_refresh`` skips the cache *read* (a fresh result is still cached
-    for subsequent calls) — used when the caller knows the cached answer may
-    be stale, e.g. the Settings picker re-checking after the user tops up
-    credits in an external tab and refocuses the app.
+    ``force_refresh`` skips the cache *read* for a cached success (a fresh
+    result is still cached for subsequent calls) — used when the caller knows
+    the cached answer may be stale, e.g. the Settings picker re-checking on
+    dropdown open after the user tops up credits in an external tab.
+
+    A cached *failure* is still honored under ``force_refresh``: the negative
+    TTL exists so an unreachable MindsHub isn't re-probed on every call, and
+    the picker opens on demand, so bypassing it would make every open pay the
+    full HTTP timeout for as long as the outage lasts.
     """
     if not minds_url or not api_key:
         return None, {}, {}, {}
@@ -153,10 +158,12 @@ async def fetch_minds_models(
 
     now = time.monotonic()
     cached = _minds_models_cache.get(base)
-    if cached and not force_refresh:
+    if cached:
         ts, val = cached
         ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
-        if (now - ts) < ttl:
+        # force_refresh only overrides the success TTL — see the negative-cache
+        # note above.
+        if (now - ts) < ttl and not (force_refresh and val[0]):
             return val
 
     def _remember(
