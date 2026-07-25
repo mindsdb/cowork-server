@@ -214,15 +214,28 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
 
+def _fill_missing(target: dict, extra: dict) -> None:
+    """Add only the keys `target` doesn't already have (first writer wins)."""
+    for key, value in extra.items():
+        target.setdefault(key, value)
+
+
 @router.get("/recommended-models")
-async def recommended_models(session: SessionDep):
+async def recommended_models(session: SessionDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
     the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
     when a Minds key + URL are configured. Falls back to the static list
     (the `latest:*` aliases) when the key is absent or the endpoint can't
-    be reached."""
+    be reached.
+
+    `refresh=true` bypasses fetch_minds_models's cache (`force_refresh`) — the
+    Settings UI passes it when the model dropdown is opened, since the cached
+    `enabled` map can otherwise mask a wallet top-up for its 5-minute TTL. The
+    plain mount-time load omits it and stays cache-eligible. A cached *failure*
+    is honored either way, so an unreachable MindsHub doesn't cost every open
+    the full HTTP timeout."""
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
 
@@ -240,10 +253,16 @@ async def recommended_models(session: SessionDep):
     # alongside modelEfforts — consumers that ignore it keep working.
     model_enabled: dict[str, bool] = {}
 
+    # `modelLabels` maps a model id → MindsHub's human-readable display label.
+    # Display-only: the picker uses this to render the option text, but the id
+    # remains the value used for selection/storage/resolution everywhere else.
+    # A model absent from this map falls back to the client's id-derived label.
+    model_labels: dict[str, str] = {}
+
     s = SettingService(session).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts, live_enabled = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value()
+        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
         if live:
             recommended["minds-cloud"] = live
@@ -277,6 +296,7 @@ async def recommended_models(session: SessionDep):
                     SettingService(session).upsert_setting("minds_model_enabled", desired)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_labels.update(live_labels)
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -302,17 +322,27 @@ async def recommended_models(session: SessionDep):
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled = await fetch_minds_models(oc_card["baseUrl"].strip(), oc_key)
+        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
+        )
         if live:
             recommended["openai-compatible"] = live
-        model_efforts.update(live_efforts)
-        model_enabled.update(live_enabled)
+        # These three maps are keyed by model id alone, not by (provider, id),
+        # so a custom endpoint serving an id MindsHub also serves would other-
+        # wise decide that model's label, effort levels and locked state for the
+        # minds-cloud bucket too — letting a BYO base URL rename or lock a
+        # MindsHub model in the picker. MindsHub is fetched first and wins;
+        # the custom endpoint only fills ids MindsHub didn't describe.
+        _fill_missing(model_efforts, live_efforts)
+        _fill_missing(model_enabled, live_enabled)
+        _fill_missing(model_labels, live_labels)
 
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
+        "modelLabels": model_labels,
     }
 
 
