@@ -5,7 +5,7 @@ name: Dev - Build and Deploy on PR
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, labeled]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -112,21 +112,19 @@ jobs:
     # mean one does: with no `deploy` label the rollout is skipped and every other
     # job still passes, which posted a comment full of URLs for an env nobody had
     # created.
-    if: ${{ needs.gate.outputs.run == 'true' && needs.build-deploy.outputs.pr-env-deployed == 'true' }}
+    if: ${{ !cancelled() && needs.gate.outputs.run == 'true' }}
     permissions:
       contents: read
       pull-requests: write
     uses: mindsdb/github-actions/.github/workflows/pr-env-comment.yml@main
     with:
       env-name: pr-cowork-server-${{ github.event.pull_request.number }}
+      status: ${{ needs.build-deploy.outputs.pr-env-deployed == 'true' && 'up' || 'absent' }}
       # cowork-server is PUBLIC, so the reusable drops this and the notes anyway.
       # Passed for the day the repo is not, and so the caller reads the same as
       # the others.
       access-doc-url: https://github.com/mindsdb/internal-documentation/blob/main/pr-environments.md
-      links: >-
-        [{"label":"API","url":"https://pr-cowork-server-${{ github.event.pull_request.number }}.dev.mindshub.ai"},
-         {"label":"Health","url":"https://pr-cowork-server-${{ github.event.pull_request.number }}.dev.mindshub.ai/api/v1/health/"},
-         {"label":"Namespace","url":"`pr-cowork-server-${{ github.event.pull_request.number }}`"}]
+      links: '[{"label":"Health","url":"https://cowork-pr-cowork-server-${{ github.event.pull_request.number }}.dev.mindshub.ai/api/v1/health/"}]'
       notes: >-
         The desktop app does not consume this environment: it installs cowork-server
         from PyPI or git per channel, so a PR env is for exercising the HTTP surface
