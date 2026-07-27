@@ -40,6 +40,11 @@ concurrency:
 # one run tree without breaking publishing.
 jobs:
   unit-tests:
+    # Explicit, though `contents: read` is also the repo default. A caller job's
+    # `permissions` is the CAP on the workflow it calls, so leaving it off makes
+    # this file's blast radius a property of Settings -> Actions rather than of
+    # the file, and an org-wide flip to read/write would silently widen it.
+    # tests-unit.yml declares `contents: read` itself, so this matches exactly.
     permissions:
       contents: read
     uses: ./.github/workflows/tests-unit.yml
@@ -77,13 +82,13 @@ jobs:
       contents: read
       id-token: write  # required for trusted publisher (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.release.outputs.tag }}
           fetch-depth: 0  # hatch-vcs needs tags to derive version
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
 
