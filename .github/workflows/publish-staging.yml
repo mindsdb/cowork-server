@@ -12,8 +12,11 @@ name: Staging pre-release and publish to PyPI
 # on THIS filename. Register publish-staging.yml as a trusted publisher
 # (environment `pypi`) at the PyPI project's publishing settings.
 
-permissions:
-  contents: write
+# No workflow-level `permissions:` block. It used to grant `contents: write` to
+# every job in this file, which only `release` needs — the unit tests and the
+# image build got it for nothing, and so would anything added later without
+# thinking. Each job below states its own, so the default (read) applies to the
+# rest.
 
 on:
   push:
