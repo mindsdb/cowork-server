@@ -105,3 +105,28 @@ def test_explicit_database_uri_still_overrides_cowork_home(monkeypatch, tmp_path
     assert AppSettings(_env_file=None).database.uri == "sqlite:////tmp/explicit.db"
 
     get_app_settings.cache_clear()
+
+
+def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):
+    # With COWORK_REQUIRE_AUTH=true the effective token is mirrored to
+    # <cowork_home()>/.env so the desktop app can read it. A hardcoded
+    # ~/.cowork/.env would leave an isolated build (COWORK_HOME set) writing
+    # token state into another install's data home (ENG-868).
+    from cowork.server import create_app
+
+    home = tmp_path / "cowork-preview"
+    # Redirect the OS home too, so a regression writes into tmp_path instead
+    # of the developer's real ~/.cowork/.env.
+    fake_os_home = tmp_path / "os-home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_os_home))
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", "tok-eng-868")
+    get_app_settings.cache_clear()
+    try:
+        create_app()
+        env_file = home / ".env"
+        assert env_file.exists(), "auth token state must live under cowork_home()"
+        assert "COWORK_AUTH_TOKEN=tok-eng-868" in env_file.read_text(encoding="utf-8")
+    finally:
+        get_app_settings.cache_clear()
