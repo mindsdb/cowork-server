@@ -11,7 +11,12 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
-from cowork.principal import Principal, TrustedHeaderMiddleware, get_principal
+from cowork.principal import (
+    Principal,
+    TrustedHeaderMiddleware,
+    get_principal,
+    identity_trace_metadata,
+)
 
 ORIGIN = "http://localhost:1234"
 WEBHOOK = "/api/v1/channels/slack/events"
@@ -179,8 +184,63 @@ def test_audit_mode_lets_malformed_identity_through(caplog):
     assert "no principal on" in caplog.text
 
 
+def test_missing_tenant_scope_maps_to_401(monkeypatch):
+    # Org-scoped data touched with no org in scope (audit mode, no identity)
+    # must answer 401 via the create_app exception handler, not a 500.
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import MissingTenantScopeError
+    from cowork.server import create_app
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    try:
+        app = create_app()
+
+        @app.get("/api/v1/_boom")
+        def boom():
+            raise MissingTenantScopeError("no org in scope")
+
+        res = TestClient(app).get("/api/v1/_boom")
+        assert res.status_code == 401
+        assert res.json() == {"detail": "Unauthorized"}
+    finally:
+        get_app_settings.cache_clear()
+
+
 def test_audit_mode_still_builds_principal_when_identity_present():
     res = _client(enforce=False).get("/api/v1/whoami", headers=IDENTITY)
     assert res.status_code == 200
     assert res.json()["user_id"] == USER_ID
     assert res.json()["org_id"] == ORG_ID
+
+
+def test_identity_trace_metadata_without_principal_is_passthrough():
+    assert identity_trace_metadata(None, None) is None
+    assert identity_trace_metadata(None, {"turn": "3"}) == {"turn": "3"}
+
+
+def test_identity_trace_metadata_adds_identity():
+    principal = Principal(user_id=USER_ID, org_id=ORG_ID)
+    merged = identity_trace_metadata(principal, {"harness": "anton"})
+    assert merged == {
+        "harness": "anton",
+        "user_id": USER_ID,
+        "organization_id": ORG_ID,
+    }
+
+
+def test_identity_trace_metadata_overrides_client_spoofing():
+    principal = Principal(user_id=USER_ID, org_id=ORG_ID)
+    merged = identity_trace_metadata(
+        principal, {"user_id": "attacker", "organization_id": "other-org"}
+    )
+    assert merged["user_id"] == USER_ID
+    assert merged["organization_id"] == ORG_ID
+
+
+def test_identity_trace_metadata_does_not_mutate_base():
+    principal = Principal(user_id=USER_ID, org_id=ORG_ID)
+    base = {"harness": "anton"}
+    identity_trace_metadata(principal, base)
+    assert base == {"harness": "anton"}

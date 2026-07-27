@@ -18,8 +18,8 @@ from cowork.schemas.connectors import OAuthConfig, OAuthStartResponse
 from cowork.services.connectors.oauth import pkce as pkce_utils
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.oauth.state import OAuthStateStore
+from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry as spec_registry
-from cowork.services.connectors.vault_lock import lock_for
 
 import logging as _logging
 
@@ -246,7 +246,6 @@ class OAuthService:
             userinfo = fetch_userinfo(access_token)
             account_email = str(userinfo.get("email", "")).strip()
             account_name = str(userinfo.get("name", "")).strip()
-            connection_name = account_email or cfg.engine
 
             expires_in = int(token_data.get("expires_in", 0) or 0)
             expires_at = (
@@ -255,7 +254,6 @@ class OAuthService:
             )
 
             extra = {k: v for k, v in (pending.get("extraFields") or {}).items() if v}
-            vault = LocalDataVault(Path(ConnectorSettings().vault_dir))
             new_fields = {
                 "auth_type": "oauth",
                 "access_token": access_token,
@@ -267,22 +265,13 @@ class OAuthService:
                 "account_name": account_name,
                 **extra,
             }
-            # This is a full-record overwrite (reconnecting/re-authorizing an
-            # existing connection, e.g. after token expiry), so anything worth
-            # keeping has to be carried forward explicitly — otherwise files
-            # the user already granted via the Google Picker (or a custom
-            # connection label) are silently revoked with no error shown to
-            # the user. Locked against ConnectionsService's merge_picked_files/
-            # remove_picked_file/patch_token and persist_connection — all of
-            # them read-modify-write the same vault record, and an unlocked
-            # interleaving here would silently revert whichever saves first.
-            with lock_for(cfg.engine, connection_name):
-                existing_fields = (vault.read_record(cfg.engine, connection_name) or {}).get("fields") or {}
-                if existing_fields.get("_picked_files"):
-                    new_fields.setdefault("_picked_files", existing_fields["_picked_files"])
-                if existing_fields.get("_label"):
-                    new_fields.setdefault("_label", existing_fields["_label"])
-                vault.save(cfg.engine, connection_name, new_fields)
+            # Routed through the shared persist_connection()/identity.py convention
+            # (same one save_connection_direct uses for the Electron PKCE flow) so
+            # reconnecting the same account resolves to the same slug — an
+            # identity-derived match (is_same_account) updates the existing record
+            # in place, carrying forward Google Picker grants and any label,
+            # instead of leaving a stale duplicate connection behind.
+            connection_name = persist_connection(cfg.engine, "browser_oauth_builtin", "", new_fields)
         except HTTPException as exc:
             err_msg = str(exc.detail)
             store.clear_pending(service, error=err_msg)
@@ -294,11 +283,15 @@ class OAuthService:
             )
         except Exception as exc:
             err_msg = str(exc)
+            _log.exception("OAuth callback failed for %s", service)
             store.clear_pending(service, error=err_msg)
             store.set_outcome(state, {"status": "error", "error": err_msg})
+            # The detail goes to the log and the outcome store (both internal);
+            # the browser page stays generic so a raw exception message can't
+            # leak internals to the end user.
             return _callback_page(
                 f"{service_label} connection failed",
-                f"CoWork could not finish the {service_label} sign-in flow: {err_msg}",
+                f"Cowork could not finish the {service_label} sign-in flow. Return to Cowork and try again.",
                 success=False,
             )
 

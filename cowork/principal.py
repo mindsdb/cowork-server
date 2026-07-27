@@ -112,3 +112,19 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
 def get_principal(request: Request) -> Principal | None:
     """FastAPI dependency: the request's Principal, or None in local mode."""
     return getattr(request.state, "principal", None)
+
+
+def identity_trace_metadata(
+    principal: Principal | None, base: dict[str, str] | None
+) -> dict[str, str] | None:
+    """Merge the principal's identity into trace metadata.
+
+    Server-derived identity always wins over client-supplied keys, so a
+    caller can't spoof attribution. No principal → base returned unchanged.
+    """
+    if principal is None:
+        return base
+    merged = dict(base or {})
+    merged["user_id"] = principal.user_id
+    merged["organization_id"] = principal.org_id
+    return merged

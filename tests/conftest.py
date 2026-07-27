@@ -17,6 +17,9 @@ os.environ["MASTER_KEY_PATH"] = str(TMP / "master.key")
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 os.environ["COWORK_PROJECTS_DIR"] = str(TMP / "projects")
+# File bytes too — without this, any test using FileService writes into the
+# developer's real ~/.cowork/files/ and orphans dirs there.
+os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
 os.environ["ENV"] = "test"
 
 import pytest

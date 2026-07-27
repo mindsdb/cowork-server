@@ -13,7 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.router import api_router as v1_router
+from starlette.responses import JSONResponse
+
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.db.scoped import MissingTenantScopeError
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import get_app_settings
@@ -23,6 +26,24 @@ from cowork.scheduler import start_scheduler
 
 # Set up logging
 logger = setup_logging()
+
+
+async def _start_channels(app: FastAPI) -> None:
+    """Build live adapters from stored credentials and start ingress.
+
+    Org mode: channels are local-mode only — no adapters, no provider
+    connections, no ingress (the config endpoints 501 and webhook routes are
+    not mounted, see _install_channels)."""
+    if get_app_settings().tenancy_mode == "org":
+        return
+    await app.state.channel_adapters.refresh_all()
+    from cowork.channels.ingress import sync_channel_ingress
+    from cowork.channels.registry import get_registry
+
+    for plugin in get_registry().all():
+        await sync_channel_ingress(
+            app.state.channel_ingress, app.state.channel_adapters, plugin.channel_type
+        )
 
 
 @asynccontextmanager
@@ -42,10 +63,11 @@ async def lifespan(app: FastAPI):
     # restart). Otherwise the due-check treats the stale row as an in-flight
     # run and never fires that schedule again.
     try:
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
         from cowork.services.schedules import ScheduleRunService
 
-        recovery_session = get_open_session()
+        recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
             if reaped:
@@ -55,14 +77,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
     start_scheduler()
-    await app.state.channel_adapters.refresh_all()
-    from cowork.channels.ingress import sync_channel_ingress
-    from cowork.channels.registry import get_registry
-
-    for plugin in get_registry().all():
-        await sync_channel_ingress(
-            app.state.channel_ingress, app.state.channel_adapters, plugin.channel_type
-        )
+    await _start_channels(app)
     try:
         yield
     finally:
@@ -121,6 +136,12 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    # Org-scoped data touched without an org in scope (e.g. audit mode with no
+    # identity) is an auth problem, not a server error — answer 401, not 500.
+    @app.exception_handler(MissingTenantScopeError)
+    async def _missing_tenant_scope(request, exc):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     # Optional bearer-token auth.  Off by default; enabled when
     # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
@@ -207,25 +228,32 @@ def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
     from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
     from cowork.channels.webhooks import build_channel_webhook_router
 
-    load_first_party_plugins()
+    # Org mode: channels are local-mode only — mount no auth-exempt webhook
+    # routes and load no plugins. The empty registry/manager keep the
+    # lifespan start/stop paths inert.
+    local_mode = get_app_settings().tenancy_mode != "org"
+    if local_mode:
+        load_first_party_plugins()
     adapters = LiveAdapterRegistry()
     runtime = AntonChannelRuntime(adapters)
-    for plugin in get_registry().all():
-        if not plugin.webhooks:
-            continue
-        app.include_router(
-            build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
-            prefix="/api/v1/channels",
-        )
-        # Mirrors the route path built in webhooks._add_webhook_route:
-        # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
-        webhook_paths.update(
-            f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
-            for webhook in plugin.webhooks
-        )
+    if local_mode:
+        for plugin in get_registry().all():
+            if not plugin.webhooks:
+                continue
+            app.include_router(
+                build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
+                prefix="/api/v1/channels",
+            )
+            # Mirrors the route path built in webhooks._add_webhook_route:
+            # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
+            webhook_paths.update(
+                f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
+                for webhook in plugin.webhooks
+            )
     app.state.channel_adapters = adapters
     app.state.channel_runtime = runtime
     app.state.channel_ingress = IngressManager(sink=runtime.handle)
+    app.state.channel_webhook_paths = webhook_paths
 
 
 # Create the application instance
