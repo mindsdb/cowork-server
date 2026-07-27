@@ -14,8 +14,11 @@ name: Auto-release and publish to PyPI
 # is built for prod, deliberately: the desktop app installs the wheel published
 # below, not a container.
 
-permissions:
-  contents: write
+# No workflow-level `permissions:` block. It used to grant `contents: write` to
+# every job in this file, which only `release` needs — the unit tests and the
+# image build got it for nothing, and so would anything added later without
+# thinking. Each job below states its own, so the default (read) applies to the
+# rest.
 
 on:
   push:
