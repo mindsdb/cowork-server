@@ -18,12 +18,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Model used to probe MindsHub connectivity/auth (health test + onboarding
-# validation). MUST be tier-universal: MindsHub gates paid models per plan, so
-# a free-tier key gets a 403 for haiku/sonnet/etc. mindshub_air is the free
-# baseline and is present in EVERY tier's registry, so it resolves for all
-# accounts — the probe then reflects reachability + key validity only, not
-# model availability. Using a paid model here caused ENG-576 (free-tier
-# "MindsHub failed its last test" / "Invalid API key" false-negatives).
+# validation). MUST be universally callable: MindsHub bills per model (a model
+# the org's wallet can't pay for is denied), so probing a paid model would fail
+# for an out-of-credits account even though the key is valid. mindshub_air is
+# the free included model (drawn from the monthly allowance), so it resolves
+# without depending on wallet balance — the probe then reflects reachability +
+# key validity only, not billing availability. Probing a paid model here caused
+# ENG-576 ("MindsHub failed its last test" / "Invalid API key" false-negatives).
 MINDS_PROBE_MODEL = "mindshub_air"
 
 
@@ -115,27 +116,67 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-# Cache value: (timestamp, (ids, efforts_map, enabled_map)). ids is None on failure.
+# Cache value: (timestamp, (ids, efforts_map, enabled_map, labels_map)). ids is None on failure.
 _minds_models_cache: dict[
-    str, tuple[float, tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]]
+    str, tuple[float, tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]]]
 ] = {}
 
 
+# Substrings that identify an embeddings model by id, used only for endpoints
+# that don't flag one. OpenAI's /v1/models has no field for it, so a BYO
+# openai-compatible endpoint (or OpenAI itself) lists `text-embedding-3-small`
+# indistinguishably from a chat model. Kept to the "embedding"/"embed" word
+# rather than family names (bge, gte, e5) so a chat model is never dropped by a
+# coincidence; a family-named embeddings model just stays in the list, which is
+# the pre-existing behavior.
+_EMBEDDING_ID_HINTS = ("text-embedding", "embedding-", "-embedding", "-embed-", "embed-")
+
+
+def _is_embedding_row(row: dict, model_id: str) -> bool:
+    """Whether a /v1/models row is an embeddings model rather than a chat one.
+
+    MindsHub marks these explicitly with `"embedding": true`, and that flag is
+    authoritative in both directions — an endpoint that says false is believed.
+    Only when the field is absent entirely does the id get inspected.
+    """
+    if "embedding" in row:
+        return bool(row.get("embedding"))
+    lowered = model_id.lower()
+    return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
+
+
 async def fetch_minds_models(
-    minds_url: str, api_key: str
-) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
+    minds_url: str, api_key: str, *, force_refresh: bool = False
+) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]]:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
-    Returns ``(ids, efforts, enabled)`` where ``ids`` is the model-id list (or
-    None on any failure so the caller falls back to the static list),
-    ``efforts`` maps a model id to ``{"efforts": [...], "default": "..."}`` for
-    every model that advertises ``reasoning_efforts``, and ``enabled`` maps a
-    model id to its ``enabled`` flag. MindsHub lists models the caller's tier
-    can't use (marked ``"enabled": false``) so the picker can show them as
-    locked upsells; a model missing from ``enabled`` is treated as available.
+    Returns ``(ids, efforts, enabled, labels)`` where ``ids`` is the model-id
+    list (or None on any failure so the caller falls back to the static
+    list), ``efforts`` maps a model id to ``{"efforts": [...], "default":
+    "..."}`` for every model that advertises ``reasoning_efforts``,
+    ``enabled`` maps a model id to its ``enabled`` flag, and ``labels`` maps a
+    model id to MindsHub's human-readable ``label`` string. MindsHub marks a
+    model the org's wallet can't currently pay for / whose free allowance is
+    spent as ``"enabled": false`` so the picker can show it as locked with an
+    "add credits" affordance; a model missing from ``enabled`` is treated as
+    available. ``labels`` is purely a display aid for the picker — the model
+    id remains the value used everywhere else (selection, storage,
+    resolution); a model missing from ``labels`` falls back to the client's
+    id-derived label. Embeddings models are dropped entirely — they share this
+    listing but aren't chat/completion models (see ``_is_embedding_row``).
+
+    ``force_refresh`` skips the cache *read* for a cached success (a fresh
+    result is still cached for subsequent calls) — used when the caller knows
+    the cached answer may be stale, e.g. the Settings picker re-checking on
+    dropdown open after the user tops up credits in an external tab.
+
+    A cached *failure* is still honored under ``force_refresh``: the negative
+    TTL exists so an unreachable MindsHub isn't re-probed on every call, and
+    the picker opens on demand, so bypassing it would make every open pay the
+    full HTTP timeout for as long as the outage lasts.
     """
     if not minds_url or not api_key:
-        return None, {}, {}
+        return None, {}, {}, {}
     base = minds_chat_base_url(minds_url)
 
     now = time.monotonic()
@@ -143,12 +184,14 @@ async def fetch_minds_models(
     if cached:
         ts, val = cached
         ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
-        if (now - ts) < ttl:
+        # force_refresh only overrides the success TTL — see the negative-cache
+        # note above.
+        if (now - ts) < ttl and not (force_refresh and val[0]):
             return val
 
     def _remember(
-        val: tuple[Optional[list[str]], dict[str, dict], dict[str, bool]],
-    ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool]]:
+        val: tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]],
+    ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]]:
         _minds_models_cache[base] = (time.monotonic(), val)
         return val
 
@@ -168,32 +211,40 @@ async def fetch_minds_models(
             )
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember((None, {}, {}))
+            return _remember((None, {}, {}, {}))
         data = r.json()
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
-        return _remember((None, {}, {}))
+        return _remember((None, {}, {}, {}))
 
     # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
     # Accept a bare list too, defensively. Each row may carry the non-standard
     # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
-    # (str) and `enabled` (bool) — OpenAI clients ignore unknown keys; we
-    # surface them for the picker.
+    # (str), `enabled` (bool), and `label` (str) — OpenAI clients ignore
+    # unknown keys; we surface them for the picker.
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return _remember((None, {}, {}))
+        return _remember((None, {}, {}, {}))
     ids: list[str] = []
     efforts: dict[str, dict] = {}
     enabled: dict[str, bool] = {}
+    labels: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict) or not row.get("id"):
             continue
         model_id = str(row.get("id")).strip()
         if not model_id:
             continue
+        # Embedding models share this listing but aren't chat/completion
+        # models — chosen for planning/coding roles they'd error every turn.
+        # Filtered here, the single place every row is parsed, so neither the
+        # picker nor default-resolution ever sees them.
+        if _is_embedding_row(row, model_id):
+            continue
         ids.append(model_id)
-        # A model the caller's tier can't use is listed with enabled=false so the
-        # picker can show it as a locked upsell. Missing → available.
+        # A model the org's wallet can't currently pay for (or whose free
+        # allowance is spent) is listed with enabled=false so the picker can
+        # show it as locked with an "add credits" affordance. Missing → available.
         if "enabled" in row:
             enabled[model_id] = bool(row.get("enabled"))
         levels = row.get("reasoning_efforts")
@@ -203,7 +254,12 @@ async def fetch_minds_models(
             if default:
                 entry["default"] = str(default)
             efforts[model_id] = entry
-    return _remember(((ids or None), efforts, enabled))
+        # Display-only — the id (model_id) stays the value used for
+        # selection/storage/resolution everywhere else.
+        label = row.get("label")
+        if isinstance(label, str) and label.strip():
+            labels[model_id] = label.strip()
+    return _remember(((ids or None), efforts, enabled, labels))
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -278,17 +334,18 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 return "fail", "missing API key"
             base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
             chat_url = minds_chat_base_url(base)
-            # Probe with a TIER-UNIVERSAL model, never the configured/default
-            # one. This is a connectivity + auth check for the provider, not a
-            # model-availability check — and MindsHub tier-gates paid models
-            # (free tier gets a 403 for e.g. haiku/sonnet). The old default was
+            # Probe with a UNIVERSALLY-CALLABLE model, never the configured/
+            # default one. This is a connectivity + auth check for the provider,
+            # not a billing-availability check — and MindsHub bills per model (a
+            # model the wallet can't pay for is denied). The old default was
             # CODING_MODEL_DEFAULTS["minds_cloud"] = "haiku" (paid), so every
-            # free-tier account saw "MindsHub failed its last test" even though
-            # chat worked on mindshub_air (ENG-576). mindshub_air is the free
-            # baseline and is present in EVERY tier's registry, so it resolves
-            # for all accounts — the dot then reflects reachability/key validity
-            # only. (Testing the user's role model was also rejected in the
-            # ENG-577 review for adding false-negatives + token cost.)
+            # out-of-credits account saw "MindsHub failed its last test" even
+            # though chat worked on mindshub_air (ENG-576). mindshub_air is the
+            # free included model (drawn from the monthly allowance), so it
+            # resolves without depending on wallet balance — the dot then
+            # reflects reachability/key validity only. (Testing the user's role
+            # model was also rejected in the ENG-577 review for adding
+            # false-negatives + token cost.)
             return await _chat_probe(
                 f"{chat_url}/chat/completions",
                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -474,6 +531,24 @@ def build_llm_client():
             return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
+    # Routing & summarization role: the cheap front-model that runs history
+    # summarization (and later gates turns). Only pass it when the installed
+    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
+    # would TypeError, taking the whole agent down. When absent, anton falls
+    # back to the coding role internally, so behavior is preserved.
+    import inspect as _inspect
+
+    router_kw: dict = {}
+    try:
+        _params = _inspect.signature(LLMClient.__init__).parameters
+        if "router_provider" in _params:
+            router_kw = {
+                "router_provider": _make_provider(settings.resolved_router_provider, None),
+                "router_model": settings.resolved_router_model,
+            }
+    except (ValueError, TypeError):
+        router_kw = {}
+
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at
     # a keyless provider — the same resolution config_status reports, so the
@@ -487,6 +562,7 @@ def build_llm_client():
             settings.resolved_coding_provider, settings.coding_reasoning_effort
         ),
         coding_model=settings.resolved_coding_model,
+        **router_kw,
     )
 
 

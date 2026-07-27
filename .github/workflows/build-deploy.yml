@@ -1,0 +1,106 @@
+# The cowork-server image build, defined once.
+#
+# `dev-build-deploy.yml` and `staging-build-deploy.yml` were the same build and
+# scan twice, and `prod-build-deploy.yml` was a third copy of nothing but the unit
+# tests and a notify job that `publish.yml` already ran on the same event.
+#
+# What actually ships this repo is the PyPI wheel, not a container image: the
+# desktop app installs `cowork-server` from PyPI (or git, per channel), so
+# `publish.yml` and `publish-staging.yml` are the real deploy path. The image
+# build exists for the per-PR environments and for the day the commented-out Helm
+# deploy below is switched on.
+#
+# ON PERMISSIONS. A called workflow can never exceed its caller's grant, and that
+# cap is checked when the workflow FILE IS LOADED, not when a job runs. A job here
+# naming a scope any one caller does not grant rejects that caller's whole run as a
+# `startup_failure` with zero jobs — and with no job in the run, no notify job can
+# So the rule for every job in this file: declare only what EVERY caller grants.
+# Nothing here declares a PR scope, which is why the per-PR environment comment is
+# NOT in this file — it lives in the pull-request caller, where the grant belongs.
+# Putting it here would have forced the push callers to grant `pull-requests: write`
+# on the release path just so the file would load.
+#
+# Do not reach for "inherit it instead": a job that declares nothing is invisible to
+# the permission gate, so a caller that forgets the grant fails at RUN time with an
+# opaque HTTP 403 rather than failing the lint. Declaring the scope is what makes
+# the relationship checkable. The shared `workflow-lint.yml` verifies it on every
+# PR.
+
+name: Build and Deploy
+
+on:
+
+  workflow_call:
+    inputs:
+      build-environment:
+        description: "Image flavour and tag prefix (development | staging | production)"
+        type: string
+        required: true
+      build-runner:
+        description: "Runner label for the build and scan"
+        type: string
+        default: mdb-dev
+      pr-environment:
+        description: "Run the per-PR environment rollout and its access comment"
+        type: boolean
+        default: false
+
+    outputs:
+      pr-env-deployed:
+        description: >-
+          "true" only when the per-PR environment actually rolled out. The
+          pipeline succeeding does not mean one exists: without the `deploy`
+          label the rollout is skipped and everything else still passes, so a
+          caller keying off the pipeline result advertises URLs for an
+          environment nobody created.
+        value: ${{ jobs.deploy-pr-env.outputs.deployed }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  build:
+    runs-on: ${{ inputs.build-runner }}
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mindsdb/github-actions/setup-env@main
+      - id: build
+        uses: mindsdb/github-actions/build-push-ecr@main
+        with:
+          module-name: ${{ env.CI_REPOSITORY_SLUG }}
+          build-for-environment: ${{ inputs.build-environment }}
+
+  scan:
+    runs-on: ${{ inputs.build-runner }}
+    needs: [build]
+    name: Scan Minds Image
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mindsdb/github-actions/snyk-docker-scan@main
+        with:
+          image: ${{ needs.build.outputs.image }}
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+
+  deploy-pr-env:
+    runs-on: ${{ inputs.build-runner }}
+    needs: [build]
+    if: inputs.pr-environment && contains(github.event.pull_request.labels.*.name, 'deploy')
+    environment:
+      name: pr-cowork-server-${{ github.event.pull_request.number }}
+      url: https://pr-cowork-server-${{ github.event.pull_request.number }}.dev.mindshub.ai
+    outputs:
+      deployed: ${{ steps.rollout.outputs.deployed }}
+    steps:
+      - uses: mindsdb/github-actions/argocd-pr-env-deploy@main
+        with:
+          argocd-token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          gh-token: ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}
+      - name: Record that the environment is up
+        id: rollout
+        run: echo "deployed=true" >> "$GITHUB_OUTPUT"

@@ -68,6 +68,7 @@ _ENV_TO_SETTING: dict[str, str] = {
     # via explicit writes (picker / onboarding); .env model lines are CLI-only.
     "ANTON_PLANNING_PROVIDER": "planning_provider",
     "ANTON_CODING_PROVIDER": "coding_provider",
+    "ANTON_ROUTER_PROVIDER": "router_provider",
     # URLs
     "ANTON_MINDS_URL": "minds_url",
     "ANTON_OPENAI_BASE_URL": "openai_base_url",

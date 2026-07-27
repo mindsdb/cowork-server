@@ -28,3 +28,19 @@ def cowork_home() -> Path:
     """
     raw = os.environ.get("COWORK_HOME")
     return Path(raw).expanduser() if raw else _DEFAULT_HOME
+
+
+def safe_join(base: Path | str, *parts: str) -> Path:
+    """Join user-controlled *parts* onto *base*, guaranteeing containment.
+
+    Normalizes the result and rejects (``ValueError``) anything that lands
+    outside *base* — a ``..`` segment, an absolute component that resets the
+    join, or a name carrying a path separator. Comparison is on whole path
+    components (``os.path.commonpath``), not a string prefix, so ``base`` and a
+    sibling like ``<base>-other`` are correctly treated as unrelated.
+    """
+    base_norm = os.path.normpath(str(base))
+    target = os.path.normpath(os.path.join(base_norm, *parts))
+    if os.path.commonpath([base_norm, target]) != base_norm:
+        raise ValueError(f"path {target!r} escapes base directory {base_norm!r}")
+    return Path(target)

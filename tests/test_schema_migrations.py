@@ -139,6 +139,29 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
             "channel_installations",
         ):
             connection.execute(text(f"DROP TABLE IF EXISTS {table}"))
+        # It also predates the tenancy columns (a3f9c2e8b1d4); drop them (and
+        # their indexes — SQLite can't drop an indexed column) so that
+        # migration recreates them. uq_pins_item_user (d2e8f1a4c7b9) rides on
+        # pins.user_id and must go for the same reason.
+        for index in (
+            "ix_projects_org_id",
+            "ix_conversations_org_id",
+            "ix_files_org_id",
+            "ix_schedules_org_id",
+            "ix_pins_user_id_org_id",
+            "uq_pins_item_user",
+        ):
+            connection.execute(text(f"DROP INDEX IF EXISTS {index}"))
+        for table, column in (
+            ("projects", "org_id"), ("projects", "created_by"),
+            ("conversations", "org_id"), ("conversations", "created_by"),
+            ("messages", "created_by"),
+            ("files", "org_id"), ("files", "created_by"),
+            ("schedules", "org_id"), ("schedules", "created_by"),
+            ("pins", "user_id"), ("pins", "org_id"),
+            ("settings", "scope"), ("settings", "user_id"), ("settings", "org_id"),
+        ):
+            connection.execute(text(f"ALTER TABLE {table} DROP COLUMN {column}"))
 
     run_schema_migrations(engine, uri)
 

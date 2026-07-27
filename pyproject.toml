@@ -63,6 +63,12 @@ fallback-version = "0.0.0-dev"
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
 
+[tool.uv]
+# hermes-agent pins Pillow==12.2.0 exactly (still true as of its latest
+# upstream commit), which blocks picking up Pillow security fixes. Override
+# it project-wide so the resolver isn't held back by that inner pin.
+override-dependencies = ["pillow>=12.3.0"]
+
 [tool.uv.sources]
 anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48

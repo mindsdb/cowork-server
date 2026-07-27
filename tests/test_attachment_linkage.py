@@ -19,6 +19,7 @@ from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.models.file import File
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService, attachment_purpose
@@ -47,7 +48,7 @@ def _add_file(session: Session, purpose: str) -> File:
 
 def test_create_conversation_adopts_client_allocated_id(session):
     allocated = uuid4()
-    svc = ConversationService(session)
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conversation = svc.create_conversation(topic="t", conversation_id=allocated)
     assert conversation.id == allocated
     # And it is fetchable under that id — the handler's get-or-adopt path.
@@ -55,7 +56,7 @@ def test_create_conversation_adopts_client_allocated_id(session):
 
 
 def test_create_conversation_without_id_still_generates_one(session):
-    conversation = ConversationService(session).create_conversation(topic="t")
+    conversation = ConversationService(ScopedSession(session, LOCAL_SCOPE)).create_conversation(topic="t")
     assert isinstance(conversation.id, UUID)
 
 
@@ -67,14 +68,14 @@ def test_relink_purpose_moves_attachments(session):
     _add_file(session, old)
     _add_file(session, old)
 
-    svc = FileService(session)
+    svc = FileService(ScopedSession(session, LOCAL_SCOPE))
     assert svc.relink_purpose(old, new) == 2
     assert [f.filename for f in svc.list_files(purpose=new)] == ["report.csv", "report.csv"]
     assert svc.list_files(purpose=old) == []
 
 
 def test_relink_purpose_noop_when_nothing_matches(session):
-    svc = FileService(session)
+    svc = FileService(ScopedSession(session, LOCAL_SCOPE))
     assert svc.relink_purpose(
         attachment_purpose("nope"),
         attachment_purpose(str(uuid4())),
@@ -89,7 +90,7 @@ def test_list_attachments_returns_legacy_row_shape(session):
 
     sid = str(uuid4())
     _add_file(session, attachment_purpose(sid))
-    rows = list_attachments("general", sid, session, ids=None)
+    rows = list_attachments("general", sid, ScopedSession(session, LOCAL_SCOPE), ids=None)
     assert len(rows) == 1
     row = rows[0]
     assert row["name"] == "report.csv"
@@ -99,8 +100,8 @@ def test_list_attachments_returns_legacy_row_shape(session):
     assert isinstance(row["created_at"], str) and "T" in row["created_at"]
 
     # The client's ?ids= filter narrows the listing.
-    assert list_attachments("general", sid, session, ids=["nonexistent"]) == []
-    assert len(list_attachments("general", sid, session, ids=[row["id"]])) == 1
+    assert list_attachments("general", sid, ScopedSession(session, LOCAL_SCOPE), ids=["nonexistent"]) == []
+    assert len(list_attachments("general", sid, ScopedSession(session, LOCAL_SCOPE), ids=[row["id"]])) == 1
 
 
 def test_attachment_raw_serves_inline(session, tmp_path):
@@ -145,6 +146,7 @@ def test_project_rename_keeps_attachments_reachable(session, tmp_path, monkeypat
     """Attach → rename the project → the uploads rail and the agent-context
     lookup (both keyed by conversation id) still find the file."""
     from cowork.api.v1.endpoints.compat.stubs import list_attachments
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.services.projects import ProjectService
 
     # Sanctioned filesystem isolation (same pattern as test_schema_migrations):
@@ -152,9 +154,9 @@ def test_project_rename_keeps_attachments_reachable(session, tmp_path, monkeypat
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
 
-    psvc = ProjectService(session)
+    psvc = ProjectService(ScopedSession(session, LOCAL_SCOPE))
     project = psvc.create_project(name="Campaign-Monitoring-2026")
-    conversation = ConversationService(session).create_conversation(
+    conversation = ConversationService(ScopedSession(session, LOCAL_SCOPE)).create_conversation(
         topic="t", project_id=project.id
     )
     _add_file(session, attachment_purpose(str(conversation.id)))
@@ -162,10 +164,10 @@ def test_project_rename_keeps_attachments_reachable(session, tmp_path, monkeypat
     renamed = psvc.update_project(project.id, name="Campaign-Q3")
     assert renamed.name != "Campaign-Monitoring-2026"
 
-    rows = list_attachments(renamed.name, str(conversation.id), session, ids=None)
+    rows = list_attachments(renamed.name, str(conversation.id), ScopedSession(session, LOCAL_SCOPE), ids=None)
     assert [r["name"] for r in rows] == ["report.csv"]
     # Old-name lookups keep working too — the tag never contained the name.
-    rows = list_attachments("Campaign-Monitoring-2026", str(conversation.id), session, ids=None)
+    rows = list_attachments("Campaign-Monitoring-2026", str(conversation.id), ScopedSession(session, LOCAL_SCOPE), ids=None)
     assert [r["name"] for r in rows] == ["report.csv"]
 
 

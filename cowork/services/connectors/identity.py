@@ -149,6 +149,21 @@ def connection_display_name(fields: dict) -> str | None:
 # overrides this list (see the `k in spec_secrets` check below).
 _KNOWN_NONSECRET_FIELDS = frozenset({"token_url", "auth_type", "token_type"})
 
+# Non-secret bookkeeping fields that legitimately change on every reconnect of
+# the *same* account:
+# - `expires_at` is recomputed as `now + expires_in` on every token
+#   exchange/refresh.
+# - `scope` is the space-separated list Google's token endpoint echoes back —
+#   the same granted scopes, but not guaranteed to come back in the same
+#   order on every separate token exchange, so it can differ byte-for-byte
+#   for an identical grant.
+# Comparing either in `is_same_account` would make it report "different
+# account" on every reconnect (or on a reconnect that just happens to get a
+# reordered scope string back) — defeating the dedup entirely and leaving a
+# fresh `-2`, `-3`, ... suffixed connection behind each time (the
+# duplicate-Google-Drive-connections bug).
+_VOLATILE_IDENTITY_FIELDS = frozenset({"expires_at", "scope"})
+
 
 def secure_keys_for(connector_id: str, method: str | None, fields: dict) -> list[str]:
     """The ``secure_keys`` to persist: spec-marked secrets ∪ name-heuristic.
@@ -181,6 +196,7 @@ def _nonsecret_identity(fields: dict, secure_keys: list[str]) -> dict:
         for k, v in (fields or {}).items()
         if not k.startswith("_")
         and k not in secure
+        and k not in _VOLATILE_IDENTITY_FIELDS
         and not is_secret_key(k, secure_keys)
     }
 

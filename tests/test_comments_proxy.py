@@ -10,7 +10,7 @@ import cowork.services.comments_proxy as cp
 from cowork.server import app
 
 client = TestClient(app)
-BASE = "https://api.dev.mindshub.ai/v1"
+BASE = "https://api.staging.mindshub.ai/v1"
 KEY = "mdb_testkey"
 
 # Real resolver, captured before the autouse fixture below monkeypatches it away.
@@ -140,8 +140,7 @@ class _FakeSettings:
         # Prod MindsHub OpenAI-compatible endpoint.
         ("https://api.mindshub.ai/v1", "https://api.mindshub.ai/v1", "mdb_oaikey"),
         # Hyphenated dev/staging subdomain — must still be recognised as MindsHub.
-        ("https://api-gitlab.dev.mindshub.ai/v1", "https://api-gitlab.dev.mindshub.ai/v1", "mdb_oaikey"),
-        ("https://api.dev.mindshub.ai/v1", "https://api.dev.mindshub.ai/v1", "mdb_oaikey"),
+        ("https://api.staging.mindshub.ai/v1", "https://api.staging.mindshub.ai/v1", "mdb_oaikey"),
         # Non-MindsHub / unset custom endpoint → fall back to prod minds_url.
         ("https://api.openai.com/v1", "https://api.mindshub.ai", "mdb_prodkey"),
         ("", "https://api.mindshub.ai", "mdb_prodkey"),

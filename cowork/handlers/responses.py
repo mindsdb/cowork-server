@@ -13,7 +13,6 @@ from sqlmodel import Session
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.models.message import Message as DBMessage
 from cowork.streaming import new_buffer, registry
 from cowork.schemas.responses import (
     Content,
@@ -31,12 +30,16 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_ACCESS_DENIED_CODE,
     MODEL_DISABLED_CODE,
+    PROVIDER_OVERLOADED_CODE,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
+    provider_overloaded_info,
     response_failed_payload,
     response_failed_sse,
 )
+from cowork.db.scoped import ScopedSession, scope_from_principal
+from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
@@ -49,15 +52,20 @@ logger = logging.getLogger(__name__)
 
 
 class ResponsesHandler:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
+        self.principal = principal
+        self.scoped = ScopedSession(session, scope_from_principal(principal))
         self.harness = get_harness(get_user_settings().harness)
         self.last_conversation_id: str | None = None
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
-        conversation_service = ConversationService(self.session)
+        # Identity into the run's trace metadata; server-derived keys win.
+        trace_metadata = identity_trace_metadata(self.principal, request.trace_metadata)
+
+        conversation_service = ConversationService(self.scoped)
         project_id = self._resolve_project_id(request)
 
         harness_input = self._build_harness_input(request)
@@ -125,6 +133,8 @@ class ResponsesHandler:
                 conversation_id=str(conversation.id),
                 turn_id=turn_id,
                 buffer=buffer,
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
                 producer_coro=self._produce(
                     conv_id=conversation.id,
                     harness_input=harness_input,
@@ -135,31 +145,23 @@ class ResponsesHandler:
                     harness_id=getattr(self.harness, "id", None),
                     buffer=buffer,
                     trace_tags=request.trace_tags,
-                    trace_metadata=request.trace_metadata,
+                    trace_metadata=trace_metadata,
                 ),
             )
             return sse_from_buffer(buffer, 0)
 
-        # Non-streaming (legacy/rare): persist the user message inline (via FK,
-        # not the relationship, so the cached history above stays clean) and
-        # run synchronously within the request.
-        user_message = DBMessage(
-            conversation_id=conversation.id,
-            role=Role.user,
-            content=original_content,
-        )
-        self.session.add(user_message)
-        self.session.commit()
-        self.session.refresh(user_message)
-
+        # Non-streaming (legacy/rare): run synchronously within the request.
+        # The user message is persisted by _collect after the turn (deferred),
+        # so the harness reads history WITHOUT the current turn — otherwise the
+        # fresh-query history would replay it AND resend it as the live input.
         stream = self.harness.stream_response(
             conversation=conversation,
             input=harness_input,
             disabled_connections=disabled,
             trace_tags=request.trace_tags,
-            trace_metadata=request.trace_metadata,
+            trace_metadata=trace_metadata,
         )
-        return await self._collect(stream, conversation.id, request.model, str(user_message.id))
+        return await self._collect(stream, conversation.id, request.model, original_content)
 
     async def _produce(
         self,
@@ -182,12 +184,20 @@ class ResponsesHandler:
         user message; on terminal we persist user + assistant together.
         Never reaches the HTTP response — readers tail the buffer.
         """
-        own = get_open_session()
+        # Fresh session (outlives the request), scoped from the immutable
+        # principal captured at handler construction — never request state.
+        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        turn_rows: list[dict] = []
         persisted = False
 
         def event_sink(event_type: str, data: dict) -> None:
+            # Tool block-rows are for LLM-history persistence, not UI replay —
+            # keep them out of the events log the client rebuilds from.
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
@@ -198,16 +208,20 @@ class ResponsesHandler:
                 return
             persisted = True
             try:
-                own.add(DBMessage(conversation_id=conv_id, role=Role.user, content=original_content))
-                own.commit()
-                ConversationService(own).save_assistant_turn(
+                # Re-anchor before ANY write: the conversation may be gone
+                # (deleted mid-turn) or out of scope on this fresh session.
+                ConversationService(producer_session).get_conversation(conv_id)
+                ConversationService(producer_session).save_user_message(conv_id, original_content)
+                producer_session.commit()
+                ConversationService(producer_session).save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
+                    tool_rows=turn_rows,
                 )
             except Exception:
                 logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
 
         try:
-            conv = ConversationService(own).get_conversation(conv_id)
+            conv = ConversationService(producer_session).get_conversation(conv_id)
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,
@@ -263,13 +277,46 @@ class ResponsesHandler:
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
+            elif code == PROVIDER_OVERLOADED_CODE:
+                # Transient-incident timeout (ENG-673): give the card the failing
+                # model AND the active provider, and flag whether the user is
+                # already routed through MindsHub. reconnectable=True → on managed
+                # (all upstreams down; just Retry); False → BYOK/direct, so the
+                # card can nudge toward MindsHub's cross-provider failover. Never
+                # break the handler — fall back to the bare message on any error.
+                overloaded_info = provider_overloaded_info(exc)
+                failed_model = overloaded_info[1] if overloaded_info else ""
+                extra = {"model": failed_model}
+                try:
+                    from cowork.common.settings.user_settings import Provider
+                    s = get_user_settings()
+                    # The nudge keys on WHICH provider overloaded. anton passes the
+                    # actual failing model (planning OR coding); map it back to its
+                    # provider so a coding-model incident on a DIFFERENT provider
+                    # than planning isn't mislabeled — e.g. planning=MindsHub +
+                    # coding=BYOK overloads must NOT read as reconnectable=True and
+                    # suppress the failover nudge (Sam's review). Falls back to
+                    # planning when the model is unknown or both roles share a
+                    # provider (then the two agree anyway).
+                    if (
+                        failed_model
+                        and failed_model == s.resolved_coding_model
+                        and failed_model != s.resolved_planning_model
+                    ):
+                        provider = s.resolved_coding_provider
+                    else:
+                        provider = s.resolved_planning_provider
+                    extra["provider_label"] = provider.label
+                    extra["reconnectable"] = provider == Provider.MINDS_CLOUD
+                except Exception:
+                    logger.exception("[responses] could not resolve provider for overload error")
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)
             persist()
             await buffer.close("error")
         finally:
-            own.close()
+            producer_session.close()
 
     @staticmethod
     def _inject_created(sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
@@ -293,12 +340,16 @@ class ResponsesHandler:
         stream,
         conversation_id: UUID,
         model: str,
-        output_item_id: str,
+        original_content,
     ) -> Response:
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        turn_rows: list[dict] = []
 
         def event_sink(event_type: str, data: dict) -> None:
+            if event_type == "response.turn_history":
+                turn_rows[:] = data.get("rows") or []
+                return
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
@@ -320,12 +371,17 @@ class ResponsesHandler:
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
 
         assistant_text = "".join(collected_text)
-        self._save_assistant_turn(conversation_id, assistant_text, collected_events)
+        # Persist the user message now — after the harness has read history for
+        # this turn — so it isn't replayed into the turn as duplicate context.
+        user_message = ConversationService(self.scoped).save_user_message(
+            conversation_id, original_content,
+        )
+        self._save_assistant_turn(conversation_id, assistant_text, collected_events, turn_rows)
 
         return Response(
             status=ResponseStatus.completed,
             model=model,
-            output=[self._build_output(output_item_id, assistant_text)],
+            output=[self._build_output(str(user_message.id), assistant_text)],
         )
 
     def _save_assistant_turn(
@@ -333,10 +389,11 @@ class ResponsesHandler:
         conversation_id: UUID,
         text: str,
         events: list[dict],
+        tool_rows: list[dict] | None = None,
     ) -> None:
         harness_id = getattr(self.harness, 'id', None)
-        ConversationService(self.session).save_assistant_turn(
-            conversation_id, text, events, harness=harness_id,
+        ConversationService(self.scoped).save_assistant_turn(
+            conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
 
     def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
@@ -344,7 +401,7 @@ class ResponsesHandler:
 
         # Resolve attachment_ids to image/file blocks
         if request.attachment_ids:
-            file_svc = FileService(self.session)
+            file_svc = FileService(self.scoped)
             for aid in request.attachment_ids:
                 try:
                     content_type, filename, filepath = file_svc.get_file_content(UUID(aid))
@@ -370,7 +427,7 @@ class ResponsesHandler:
                                     blocks.append({"type": "text", "text": item.text})
                                 elif item.type == ContentType.file and item.file_id:
                                     try:
-                                        content_type, filename, filepath = FileService(self.session).get_file_content(UUID(item.file_id))
+                                        content_type, filename, filepath = FileService(self.scoped).get_file_content(UUID(item.file_id))
                                     except ValueError:
                                         raise HTTPException(status_code=404, detail=f"File {item.file_id!r} not found")
                                     if content_type and content_type.startswith("image/"):
@@ -387,7 +444,7 @@ class ResponsesHandler:
         rail (which queries by the live conversation id) still finds them."""
         from cowork.services.files import attachment_purpose
 
-        moved = FileService(self.session).relink_purpose(
+        moved = FileService(self.scoped).relink_purpose(
             attachment_purpose(client_session_id),
             attachment_purpose(str(conversation.id)),
         )
@@ -398,13 +455,17 @@ class ResponsesHandler:
             )
 
     def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
+        service = ProjectService(self.scoped)
         if request.project_id is not None:
             return request.project_id
         if request.project:
             try:
-                return ProjectService(self.session).get_project_by_name(request.project).id
+                return service.get_project_by_name(request.project).id
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=f"Project not found: {request.project}") from exc
+        # Bootstrap site: a turn can be the org's first request — adopt the
+        # seeded GENERAL project before defaulting to it.
+        service.ensure_general_for_scope()
         return GENERAL_PROJECT_ID
 
     @staticmethod
