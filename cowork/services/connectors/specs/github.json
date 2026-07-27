@@ -47,7 +47,7 @@
           ],
           "service_id": "github",
           "supports_refresh": false,
-          "supports_revoke": false,
+          "supports_revoke": true,
           "redirect_port": 47290
         }
       },
