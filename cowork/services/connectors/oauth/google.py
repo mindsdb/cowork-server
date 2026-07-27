@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html as html_lib
 import json
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
     "google-ads":       ("google_ads_client_id",        "google_ads_client_secret"),
     "google-analytics": ("google_analytics_client_id",  "google_analytics_client_secret"),
     "linear":           ("linear_client_id",            "linear_client_secret"),
+    "github":           ("github_client_id",            "github_client_secret"),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -58,6 +60,25 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     return {"email": viewer.get("email", ""), "name": viewer.get("name", "")}
 
 
+def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
+    """GitHub's `email` is frequently null — the app only requests `read:user`,
+    not `user:email`, and even with that scope a user can keep their email
+    private. `login` (the username) is always present and always unique, so it's
+    the fallback identity — same intent as email elsewhere, just not a real
+    email address."""
+    result = _json_request(
+        "https://api.github.com/user",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    login = str(result.get("login") or "").strip()
+    email = str(result.get("email") or "").strip()
+    name = str(result.get("name") or "").strip()
+    return {"email": email or login, "name": name or login}
+
+
 # engine → identity-fetch function. The one piece of connector onboarding
 # that can't be pure spec-JSON data — response shape (REST vs GraphQL) is
 # genuinely provider-specific code, not configuration. New OAuth-builtin
@@ -69,6 +90,38 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "google_ads": _fetch_userinfo_google,
     "google_analytics_4": _fetch_userinfo_google,
     "linear": _fetch_userinfo_linear,
+    "github": _fetch_userinfo_github,
+}
+
+
+def _revoke_github(token: str, client_id: str, client_secret: str) -> None:
+    """GitHub classic OAuth Apps don't support the generic RFC-7009 POST
+    revoke_url pattern the other connectors use. Revoking the whole grant
+    (the thing that actually removes the app from the user's Authorized
+    OAuth Apps list, not just invalidating one token) is
+    `DELETE /applications/{client_id}/grant`, authenticated with HTTP Basic
+    auth using the app's client_id:client_secret, and a JSON body naming the
+    token — shaped nothing like the other providers' revoke calls."""
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    request = Request(
+        f"https://api.github.com/applications/{client_id}/grant",
+        data=json.dumps({"access_token": token}).encode("utf-8"),
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        },
+        method="DELETE",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
+# engine → custom revoke function, for providers whose revoke call doesn't
+# fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
+# Checked before the generic path in revoke() below.
+_REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
+    "github": _revoke_github,
 }
 
 
@@ -303,14 +356,14 @@ class OAuthService:
             success=True,
         )
 
-    def revoke(self, engine: str, name: str, connector_settings: ConnectorSettings) -> None:
+    def revoke(self, engine: str, name: str, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings | None = None) -> None:
         if engine not in _ENGINE_TO_SERVICE:
             return
+        custom_revoke = _REVOKE_HANDLERS.get(engine)
         oauth_cfg = self._oauth_config_for(engine)
-        if oauth_cfg is None or not oauth_cfg.supports_revoke or not oauth_cfg.revoke_url:
+        if custom_revoke is None and (oauth_cfg is None or not oauth_cfg.supports_revoke or not oauth_cfg.revoke_url):
             _log.debug("Revoke not supported for %s/%s — skipping, local cleanup only", engine, name)
             return
-        _log.info("Revoking OAuth token for %s/%s", engine, name)
         try:
             fields = LocalDataVault(Path(connector_settings.vault_dir)).load(engine, name) or {}
         except Exception:
@@ -319,6 +372,20 @@ class OAuthService:
             return
         token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
         if not token:
+            return
+        _log.info("Revoking OAuth token for %s/%s", engine, name)
+        if custom_revoke is not None:
+            if oauth_settings is None:
+                _log.warning("Cannot revoke %s/%s — no OAuthSettings provided for credential lookup", engine, name)
+                return
+            try:
+                client_id, client_secret = self._resolve_credentials(_ENGINE_TO_SERVICE[engine], oauth_settings)
+                custom_revoke(token, client_id, client_secret)
+                _log.info("Revoked OAuth grant for %s/%s", engine, name)
+            except HTTPError as exc:
+                _log.warning("Could not revoke OAuth grant for %s/%s: %s %s", engine, name, exc.code, exc.reason)
+            except Exception as exc:
+                _log.warning("Could not revoke OAuth grant for %s/%s: %s", engine, name, exc)
             return
         try:
             request = Request(

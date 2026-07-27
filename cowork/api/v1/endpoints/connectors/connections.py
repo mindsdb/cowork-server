@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from cowork.common.settings.app_settings import ConnectorSettings
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
@@ -56,7 +56,7 @@ def save_connection_direct(body: DirectSaveRequest):
 @router.delete("/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_connection(engine: str, name: str):
     try:
-        oauth_service.revoke(engine, name, ConnectorSettings())
+        oauth_service.revoke(engine, name, ConnectorSettings(), OAuthSettings())
     except Exception:
         _log.exception("Failed to revoke token for %s/%s", engine, name)
     if not service.delete(engine, name):
