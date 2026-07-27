@@ -40,6 +40,8 @@ concurrency:
 # one run tree without breaking publishing.
 jobs:
   unit-tests:
+    permissions:
+      contents: read
     uses: ./.github/workflows/tests-unit.yml
 
   build-deploy:
