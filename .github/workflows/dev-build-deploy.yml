@@ -108,7 +108,11 @@ jobs:
     # The rendering is shared so every repo's comment looks the same; the host
     # pattern stays here, because mindsdb/github-actions is public.
     needs: [gate, build-deploy]
-    if: ${{ needs.gate.outputs.run == 'true' && needs.build-deploy.result == 'success' }}
+    # Only when an environment actually exists. `build-deploy` succeeding does not
+    # mean one does: with no `deploy` label the rollout is skipped and every other
+    # job still passes, which posted a comment full of URLs for an env nobody had
+    # created.
+    if: ${{ needs.gate.outputs.run == 'true' && needs.build-deploy.outputs.pr-env-deployed == 'true' }}
     permissions:
       contents: read
       pull-requests: write

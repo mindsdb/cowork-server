@@ -45,8 +45,17 @@ on:
         type: boolean
         default: false
 
-defaults:
+    outputs:
+      pr-env-deployed:
+        description: >-
+          "true" only when the per-PR environment actually rolled out. The
+          pipeline succeeding does not mean one exists: without the `deploy`
+          label the rollout is skipped and everything else still passes, so a
+          caller keying off the pipeline result advertises URLs for an
+          environment nobody created.
+        value: ${{ jobs.deploy-pr-env.outputs.deployed }}
 
+defaults:
   run:
     shell: bash
 
@@ -85,8 +94,13 @@ jobs:
     environment:
       name: pr-cowork-server-${{ github.event.pull_request.number }}
       url: https://pr-cowork-server-${{ github.event.pull_request.number }}.dev.mindshub.ai
+    outputs:
+      deployed: ${{ steps.rollout.outputs.deployed }}
     steps:
       - uses: mindsdb/github-actions/argocd-pr-env-deploy@main
         with:
           argocd-token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
           gh-token: ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}
+      - name: Record that the environment is up
+        id: rollout
+        run: echo "deployed=true" >> "$GITHUB_OUTPUT"
