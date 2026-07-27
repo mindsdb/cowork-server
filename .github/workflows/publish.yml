@@ -6,6 +6,13 @@ name: Auto-release and publish to PyPI
 # workflows, and matches the OIDC claim on THIS filename. Register
 # publish.yml as a trusted publisher (environment `pypi`) at
 # https://pypi.org/manage/project/cowork-server/settings/publishing/
+#
+# THIS IS THE PROD PIPELINE. `prod-build-deploy.yml` used to run on the same event
+# and contained nothing this file does not: the same unit tests and the same notify
+# job, with its build, scan, and deploy jobs all commented out. It was a second run
+# tree per release that reported on a subset of the first, so it is gone. No image
+# is built for prod, deliberately: the desktop app installs the wheel published
+# below, not a container.
 
 permissions:
   contents: write

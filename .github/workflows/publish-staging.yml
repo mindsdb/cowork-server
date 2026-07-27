@@ -24,9 +24,32 @@ concurrency:
   group: staging-prerelease-${{ github.ref }}
   cancel-in-progress: false
 
+# THIS IS THE STAGING PIPELINE, not a side workflow. It used to be one of two
+# workflows on push to `staging` — this one and `staging-build-deploy.yml` — so
+# every merge produced two disconnected run trees and neither showed the whole
+# story: the one named "Build and Deploy" did not publish, and the one that
+# published did not build.
+#
+# They merged into this file rather than the other way round because of the
+# constraint above: the publish job must live in a top-level workflow whose
+# filename the PyPI trusted-publisher claim matches. So this file keeps the name
+# and calls the image build as a reusable, which is the only arrangement that gives
+# one run tree without breaking publishing.
 jobs:
   unit-tests:
     uses: ./.github/workflows/tests-unit.yml
+
+  build-deploy:
+    # The container image, for the per-PR environments and whatever comes after.
+    # Independent of the release chain on purpose: a scan finding should not hold
+    # up the wheel the desktop installs from, and a failed publish should not hide
+    # a broken image. Both land in this one run tree, and `notify` covers both.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-deploy.yml
+    with:
+      build-environment: staging
+    secrets: inherit
 
   release:
     needs: unit-tests
@@ -96,14 +119,14 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, release, publish]
+    needs: [unit-tests, build-deploy, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
       actions: read  # the prior-run lookup behind the recovery message
     uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
     with:
-      env-name: "staging auto-release + PyPI publish"
+      env-name: "staging build + release + PyPI publish"
       status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
       runs-on: ubuntu-latest
     secrets: inherit
