@@ -155,7 +155,7 @@ deployment:
     # Same Redis the controller consumes. If cowork and Redis are in different
     # namespaces, use the FQDN (redis-master.<namespace>.svc.cluster.local).
     - name: COWORK_TURN_REDIS_URL
-      value: "redis://redis-master:6379/0"
+      value: "redis://redis-master.dev.svc.cluster.local:6379/0"
 
     # ====================================
     # PROVIDER API KEYS
