@@ -10,10 +10,12 @@ from uuid import UUID
 from fastapi import HTTPException
 from sqlmodel import Session
 
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
 from cowork.streaming import new_buffer, registry
+from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -129,24 +131,25 @@ class ResponsesHandler:
             # persisted by the producer at the end (deferred), so the harness
             # reads history WITHOUT the current turn (see _produce).
             buffer = new_buffer(str(conversation.id), turn_id)
+            producer_coro = self._select_producer(
+                conv_id=conversation.id,
+                harness_input=harness_input,
+                original_content=original_content,
+                model=request.model,
+                disabled=disabled,
+                harness_name=get_user_settings().harness,
+                harness_id=getattr(self.harness, "id", None),
+                buffer=buffer,
+                trace_tags=request.trace_tags,
+                trace_metadata=trace_metadata,
+            )
             await registry.start(
                 conversation_id=str(conversation.id),
                 turn_id=turn_id,
                 buffer=buffer,
                 org_id=self.scoped.scope.org_id,
                 user_id=self.scoped.scope.user_id,
-                producer_coro=self._produce(
-                    conv_id=conversation.id,
-                    harness_input=harness_input,
-                    original_content=original_content,
-                    model=request.model,
-                    disabled=disabled,
-                    harness_name=get_user_settings().harness,
-                    harness_id=getattr(self.harness, "id", None),
-                    buffer=buffer,
-                    trace_tags=request.trace_tags,
-                    trace_metadata=trace_metadata,
-                ),
+                producer_coro=producer_coro,
             )
             return sse_from_buffer(buffer, 0)
 
@@ -162,6 +165,49 @@ class ResponsesHandler:
             trace_metadata=trace_metadata,
         )
         return await self._collect(stream, conversation.id, request.model, original_content)
+
+    def _select_producer(
+        self,
+        *,
+        conv_id: UUID,
+        harness_input: list[dict],
+        original_content,
+        model: str,
+        disabled: list[dict] | None,
+        harness_name: str,
+        harness_id: str | None,
+        buffer,
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
+    ):
+        """Choose the streaming producer coroutine.
+
+        `COWORK_TURN_BACKEND=remote` (`TurnQueueSettings().backend`) routes
+        the turn through the Redis-backed remote producer. Otherwise (the
+        default, "inprocess"), this runs in-process: the `self._produce(...)`
+        call below is unchanged from before this branch existed.
+        """
+        if TurnQueueSettings().backend == "remote":
+            return produce_remote_turn(
+                conversation_id=str(conv_id),
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+                input_text=self._prompt_text(harness_input),
+                model=model,
+                buffer=buffer,
+            )
+        return self._produce(
+            conv_id=conv_id,
+            harness_input=harness_input,
+            original_content=original_content,
+            model=model,
+            disabled=disabled,
+            harness_name=harness_name,
+            harness_id=harness_id,
+            buffer=buffer,
+            trace_tags=trace_tags,
+            trace_metadata=trace_metadata,
+        )
 
     async def _produce(
         self,
