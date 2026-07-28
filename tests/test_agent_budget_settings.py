@@ -19,6 +19,8 @@ _ENV_KEYS = (
     "MAX_CONTINUATIONS",
     "ANTON_MAX_TOOL_ROUNDS",
     "ANTON_MAX_CONTINUATIONS",
+    "COWORK_DEFAULT_MAX_TOOL_ROUNDS",
+    "COWORK_DEFAULT_MAX_CONTINUATIONS",
 )
 
 
@@ -26,12 +28,37 @@ _ENV_KEYS = (
 def _clean_budget_env(monkeypatch):
     for key in _ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    _clear_app_settings_cache()
+    yield
+    _clear_app_settings_cache()
+
+
+def _clear_app_settings_cache():
+    from cowork.common.settings.app_settings import get_app_settings
+
+    if hasattr(get_app_settings, "cache_clear"):
+        get_app_settings.cache_clear()
 
 
 def test_defaults_are_50_and_5():
     s = UserSettings()
     assert s.max_tool_rounds == 50
     assert s.max_continuations == 5
+
+
+def test_hosted_deployments_can_lower_defaults_via_env(monkeypatch):
+    # Hosted web builds have no Settings UI (sidebar entries are
+    # desktop-only), and inference cost lands on the operator — the
+    # COWORK_DEFAULT_* env vars are the deployment-level lever for users
+    # who never set the per-user setting.
+    monkeypatch.setenv("COWORK_DEFAULT_MAX_TOOL_ROUNDS", "30")
+    monkeypatch.setenv("COWORK_DEFAULT_MAX_CONTINUATIONS", "2")
+    _clear_app_settings_cache()
+    s = UserSettings()
+    assert s.max_tool_rounds == 30
+    assert s.max_continuations == 2
+    # An explicit per-user value still wins over the deployment default.
+    assert UserSettings.model_validate({"max_tool_rounds": "80"}).max_tool_rounds == 80
 
 
 def test_defaults_exceed_anton_core_defaults():

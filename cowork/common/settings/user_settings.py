@@ -433,8 +433,11 @@ class UserSettings(Settings):
     # Overlaid onto AntonSettings per conversation (anton_harness.harness);
     # anton's own CLI defaults (25/3) are lower — Cowork deliberately runs
     # with more headroom so long tasks finish without a mid-task check-in.
+    # Defaults come from app settings so hosted deployments (operator-paid
+    # inference, no Settings UI on web) can lower them via env without
+    # touching per-user rows.
     max_tool_rounds: int = Field(
-        default=50,
+        default_factory=lambda: get_app_settings().default_max_tool_rounds,
         ge=5,
         le=500,
         title="Max Steps per Task",
@@ -442,19 +445,23 @@ class UserSettings(Settings):
             "How many actions (running code, reading files, searching) the agent "
             "may take on one request before it pauses and checks in with you. "
             "Raise it so big tasks can finish in one go; lower it to keep a "
-            "tighter leash on time and cost. Applies to the Anton agent."
+            "tighter leash on time and cost. Applies to the Anton agent and, for "
+            "Cowork sessions, replaces the ANTON_MAX_TOOL_ROUNDS environment "
+            "variable."
         ),
     )
     max_continuations: int = Field(
-        default=5,
+        default_factory=lambda: get_app_settings().default_max_continuations,
         ge=0,
         le=25,
         title="Max Auto-Continues",
         description=(
             "When the agent stops but its work looks unfinished, Cowork can send "
             "it back to complete the job — this caps how many times. Raise it "
-            "for hands-off thoroughness; set 0 to always stop at the first "
-            "draft. Applies to the Anton agent."
+            "for hands-off thoroughness; set 0 to stop after the first attempt "
+            "(you'll still get a summary of what's missing). Applies to the "
+            "Anton agent and, for Cowork sessions, replaces the "
+            "ANTON_MAX_CONTINUATIONS environment variable."
         ),
     )
     publish_url: str = Field(

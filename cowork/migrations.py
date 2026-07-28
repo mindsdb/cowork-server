@@ -51,6 +51,13 @@ _MIGRATION_SENTINEL = "_env_migrated_v2"
 
 # Complete map of .env keys -> DB setting keys for all fields that
 # overlap between AntonSettings (.env) and UserSettings (DB).
+# Inclusion rule: a key belongs in this table only if (a) every value anton's
+# own settings accept for it is also valid for UserSettings — the sync
+# validates all mapped keys and raises on the first failure, so one
+# CLI-only-valid .env line would fail the whole credential-push / token-refresh
+# path — and (b) re-syncing a stale .env line can never override a choice the
+# user made in the product (the ENG-739 model re-pin bug). When in doubt,
+# leave the key out: .env lines still work for the standalone anton CLI.
 _ENV_TO_SETTING: dict[str, str] = {
     # API keys
     "ANTON_ANTHROPIC_API_KEY": "anthropic_api_key",
