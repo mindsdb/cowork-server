@@ -775,7 +775,7 @@ class AntonHarness:
         # Replay [summary] + [messages after cutoff] instead of full history
         # when a saved compaction is still valid (ENG-664). Disabled → plain
         # full history and `seed_info = None`, which skips persistence too.
-        if getattr(user, "history_compaction_enabled", True):
+        if user.history_compaction_enabled:
             initial_history, seed_info = self._seed_history(
                 replayable,
                 conversation.history_summary,
