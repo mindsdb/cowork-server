@@ -147,8 +147,12 @@ async def format_responses_stream(
     # Round-boundary paragraphing (ENG-887): armed when an LLM round
     # completes, consumed by the next text delta. `text_tail` keeps the
     # last two streamed chars so a round that already ends with a blank
-    # line doesn't get a second one.
+    # line doesn't get a second one; empty until the first visible text,
+    # which also stops a break from landing before anything was said.
+    # `round_had_text` scopes the max_tokens exception below to the round
+    # that actually streamed the truncated text.
     round_break = False
+    round_had_text = False
     text_tail = ""
 
     def _event(event_type: str, data: dict) -> str:
@@ -186,9 +190,11 @@ async def format_responses_stream(
         if isinstance(event, StreamTextDelta):
             text = event.text
             if round_break:
-                if collected_text and not text_tail.endswith("\n\n"):
+                if text_tail and not text_tail.endswith("\n\n"):
                     text = "\n\n" + text
                 round_break = False
+            if event.text:
+                round_had_text = True
             text_tail = (text_tail + text)[-2:]
             collected_text.append(text)
             seq += 1
@@ -350,10 +356,18 @@ async def format_responses_stream(
             # ChatSession._stream_and_handle_tools), so that boundary must
             # stay seamless.
             llm = event.response
-            round_break = not (
+            truncated = (
                 llm.stop_reason in ("max_tokens", "length")
                 and not llm.tool_calls
             )
+            if not truncated:
+                round_break = True
+            elif round_had_text:
+                round_break = False
+            # A truncated round that streamed nothing (all thinking tokens)
+            # leaves any armed break in place — the truncation belongs to
+            # text the user never saw, so it can't glue the visible rounds.
+            round_had_text = False
 
     full_text = "".join(collected_text)
     resp_completed = Response(

@@ -113,6 +113,37 @@ async def test_max_tokens_with_tool_calls_still_breaks():
     assert completed == "Running it now.\n\nDone."
 
 
+async def test_zero_text_truncated_round_keeps_the_armed_break():
+    # A round can burn its whole output budget on thinking tokens: it ends
+    # at max_tokens having streamed nothing visible. Its truncation belongs
+    # to text the user never saw, so the break armed by the previous
+    # narration round must survive it.
+    events = [
+        StreamTextDelta(text="Sentence one."),
+        _round_end(tool_calls=[_TOOL_CALL]),
+        *_tool_round(),
+        _round_end(stop_reason="max_tokens"),
+        StreamTextDelta(text="Sentence two."),
+        _round_end(stop_reason="end_turn"),
+    ]
+    _, completed = await _drain(events)
+    assert completed == "Sentence one.\n\nSentence two."
+
+
+async def test_no_break_before_the_first_visible_text():
+    # anthropic can emit an empty leading text delta; an empty round must
+    # not make the real first text open with a blank line.
+    events = [
+        StreamTextDelta(text=""),
+        _round_end(tool_calls=[_TOOL_CALL]),
+        *_tool_round(),
+        StreamTextDelta(text="Hello."),
+        _round_end(stop_reason="end_turn"),
+    ]
+    _, completed = await _drain(events)
+    assert completed == "Hello."
+
+
 async def test_no_double_blank_line_when_round_already_ends_with_one():
     events = [
         StreamTextDelta(text="First thought.\n"),
