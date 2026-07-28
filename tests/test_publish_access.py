@@ -7,9 +7,10 @@ state read back for pre-filling the publish dialog.
 import json
 from pathlib import Path
 
+from anton.publish_access import normalize_emails as _normalize_emails
+from anton.publish_access import resolve_access as _resolve_access
 from cowork.api.v1.endpoints.publish import _PublishBody
 from cowork.services.artifacts import _published_access_for
-from cowork.services.publish import _normalize_emails, _resolve_access
 
 
 # ---------------------------------------------------------------------------
@@ -165,3 +166,19 @@ def test_published_access_public_default(tmp_path: Path):
     assert out["accessMode"] == "public"
     assert out["accessProtected"] is False
     assert out["accessEmails"] == []
+
+
+# ---------------------------------------------------------------------------
+# Unified .published.json target/key convention (anton == cowork)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_publish_target_matches_anton(tmp_path):
+    from anton.publish_access import resolve_publish_target
+    root = tmp_path / ".anton" / "artifacts"
+    art = root / "sales"
+    art.mkdir(parents=True)
+    (art / "metadata.json").write_text('{"type": "html-report", "primary": "report.html"}')
+    (art / "report.html").write_text("<html></html>")
+    _t, pub_dir, key, is_fs = resolve_publish_target(art, [root])
+    assert (pub_dir, key, is_fs) == (art, "report.html", False)
