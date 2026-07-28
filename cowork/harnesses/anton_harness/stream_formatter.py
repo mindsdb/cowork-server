@@ -144,6 +144,12 @@ async def format_responses_stream(
     seq = 0
     last_progress = 0.0
     collected_text: list[str] = []
+    # Round-boundary paragraphing (ENG-887): armed when an LLM round
+    # completes, consumed by the next text delta. `text_tail` keeps the
+    # last two streamed chars so a round that already ends with a blank
+    # line doesn't get a second one.
+    round_break = False
+    text_tail = ""
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -178,13 +184,19 @@ async def format_responses_stream(
 
     async for event in event_stream:
         if isinstance(event, StreamTextDelta):
-            collected_text.append(event.text)
+            text = event.text
+            if round_break:
+                if collected_text and not text_tail.endswith("\n\n"):
+                    text = "\n\n" + text
+                round_break = False
+            text_tail = (text_tail + text)[-2:]
+            collected_text.append(text)
             seq += 1
             yield _event("response.output_text.delta", {
                 "type": "response.output_text.delta",
                 "sequence_number": seq,
                 "item_id": msg_id,
-                "delta": event.text,
+                "delta": text,
             })
 
         elif isinstance(event, StreamToolUseStart):
@@ -328,7 +340,20 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamComplete):
-            pass
+            # One LLM round is over. anton's agent loop streams the next
+            # round's narration into the same output item, and a round ends
+            # without trailing whitespace — so without a paragraph break the
+            # rounds fuse mid-sentence ("…the Google Sheet.My regex…") in
+            # the live stream, the persisted message, and every replay.
+            # Exception: a round cut off at max_tokens with no tool calls is
+            # resumed mid-sentence by a continuation round (see anton's
+            # ChatSession._stream_and_handle_tools), so that boundary must
+            # stay seamless.
+            llm = event.response
+            round_break = not (
+                llm.stop_reason in ("max_tokens", "length")
+                and not llm.tool_calls
+            )
 
     full_text = "".join(collected_text)
     resp_completed = Response(
