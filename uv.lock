@@ -143,8 +143,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.7.6.2"
-source = { git = "https://github.com/mindsdb/anton.git?branch=main#3184e896b13626685b086edaed3fc38601cef122" }
+version = "2.26.7.3.2.dev49+g96b7dffd3"
+source = { git = "https://github.com/mindsdb/anton.git?branch=feat%2Fwhole-turn-skeleton#96b7dffd363b4f6a7c5d17f95243f79b697249a1" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -452,7 +452,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=main" },
+    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=feat%2Fwhole-turn-skeleton" },
     { name = "cryptography", specifier = ">=48.0.0" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
