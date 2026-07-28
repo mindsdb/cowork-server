@@ -34,11 +34,7 @@ from pydantic import ValidationError
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
-from cowork.common.settings.user_settings import (
-    ENV_ALIAS_TO_SETTING,
-    UserSettings,
-    normalize_provider_value,
-)
+from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
@@ -53,14 +49,39 @@ _ENV_PATH = cowork_home() / ".env"
 # with the old sentinel (which may have found nothing) get a fresh run.
 _MIGRATION_SENTINEL = "_env_migrated_v2"
 
-# Map of .env keys -> DB setting keys for all fields that overlap between
-# AntonSettings (.env) and UserSettings (DB). Derived from the single canonical
-# alias map in user_settings (SETTING_ENV_ALIASES) so this table can no longer
-# drift from the client's copy — see the note there, incl. why the model keys
-# (ANTON_PLANNING_MODEL / ANTON_CODING_MODEL) are deliberately excluded
-# (ENG-739). Drives both the first-boot .env→DB seed (migrate_env_to_db) and the
-# POST /settings/raw merge sync.
-_ENV_TO_SETTING: dict[str, str] = ENV_ALIAS_TO_SETTING
+# Complete map of .env keys -> DB setting keys for all fields that
+# overlap between AntonSettings (.env) and UserSettings (DB).
+_ENV_TO_SETTING: dict[str, str] = {
+    # API keys
+    "ANTON_ANTHROPIC_API_KEY": "anthropic_api_key",
+    "ANTON_OPENAI_API_KEY": "openai_api_key",
+    "ANTON_OPENAI_API_KEY_CUSTOM": "openai_compatible_api_key",
+    "ANTON_GEMINI_API_KEY": "gemini_api_key",
+    "ANTON_MINDS_API_KEY": "minds_api_key",
+    # Provider selection. NOTE: ANTON_PLANNING_MODEL / ANTON_CODING_MODEL are
+    # deliberately NOT mapped (ENG-739). This table drives both the first-boot
+    # .env→DB seed (migrate_env_to_db) and the POST /settings/raw merge sync,
+    # the latter running on every desktop/web credential push and web token
+    # refresh. Syncing a model from .env would re-pin a user who recovered a
+    # locked-model 403 via the Settings picker (their .env may still hold a
+    # legacy `latest:` line). Models are product state that enters the DB only
+    # via explicit writes (picker / onboarding); .env model lines are CLI-only.
+    "ANTON_PLANNING_PROVIDER": "planning_provider",
+    "ANTON_CODING_PROVIDER": "coding_provider",
+    "ANTON_ROUTER_PROVIDER": "router_provider",
+    # URLs
+    "ANTON_MINDS_URL": "minds_url",
+    "ANTON_OPENAI_BASE_URL": "openai_base_url",
+    # Behavioral settings
+    "ANTON_MEMORY_ENABLED": "memory_enabled",
+    "ANTON_MEMORY_MODE": "memory_mode",
+    "ANTON_EPISODIC_MEMORY": "episodic_memory",
+    "ANTON_PROACTIVE_DASHBOARDS": "proactive_dashboards",
+    "ANTON_ACT_FIRST": "act_first",
+    "ANTON_MAX_TOOL_ROUNDS": "max_tool_rounds",
+    "ANTON_MAX_CONTINUATIONS": "max_continuations",
+    "ANTON_PUBLISH_URL": "publish_url",
+}
 
 
 def _parse_env_file() -> dict[str, str]:
@@ -83,13 +104,17 @@ def _parse_env_file() -> dict[str, str]:
 def _normalize_provider_value(val: str, dotenv: dict[str, str]) -> str:
     """Translate .env provider strings to DB enum values.
 
-    Thin adapter over the canonical ``normalize_provider_value`` in
-    user_settings — kept so the .env-shaped call sites here don't each repeat
-    the "does this dotenv carry a Minds key" check.
+    The .env may use hyphens (``openai-compatible``) or underscores
+    (``openai_compatible``).  The DB ``Provider`` enum uses underscores
+    and has a dedicated ``minds_cloud`` value.
     """
-    return normalize_provider_value(
-        val, minds_key_present=bool(dotenv.get("ANTON_MINDS_API_KEY"))
-    )
+    # Canonicalize to underscores first so both forms are handled.
+    canonical = val.replace("-", "_")
+    # Detect MindsHub: if the user has a Minds key and the provider is
+    # "openai_compatible", this is really minds_cloud.
+    if canonical == "openai_compatible" and dotenv.get("ANTON_MINDS_API_KEY"):
+        return "minds_cloud"
+    return canonical
 
 
 def sync_env_vars_to_db(session: Session, dotenv: dict[str, str]) -> list[str]:

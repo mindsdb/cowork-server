@@ -429,6 +429,33 @@ class UserSettings(Settings):
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
     )
+    # ── Advanced agent budgets ──
+    # Overlaid onto AntonSettings per conversation (anton_harness.harness);
+    # anton's own CLI defaults (25/3) are lower — Cowork deliberately runs
+    # with more headroom so long tasks finish without a mid-task check-in.
+    max_tool_rounds: int = Field(
+        default=50,
+        ge=5,
+        le=500,
+        title="Max Steps per Task",
+        description=(
+            "How many actions (running code, reading files, searching) the agent "
+            "may take on one request before it pauses and checks in with you. "
+            "Raise it so big tasks can finish in one go; lower it to keep a "
+            "tighter leash on time and cost."
+        ),
+    )
+    max_continuations: int = Field(
+        default=5,
+        ge=0,
+        le=25,
+        title="Max Auto-Continues",
+        description=(
+            "When the agent stops but its work looks unfinished, Cowork can send "
+            "it back to complete the job — this caps how many times. Raise it "
+            "for hands-off thoroughness; set 0 to always stop at the first draft."
+        ),
+    )
     publish_url: str = Field(
         default="",
         title="Publish URL",
