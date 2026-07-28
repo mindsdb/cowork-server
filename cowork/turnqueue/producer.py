@@ -1,10 +1,10 @@
 """Remote turn producer: enqueue a whole-turn job, tail the reply stream,
-and emit the buffered SSE frames for a completed (or failed) turn.
+and emit SSE frames for the turn.
 
-Buffered scope only: exactly three SSE frames are appended (created, one
-output_text.delta carrying the full final text, completed) - no token
-streaming, no S3, no heartbeat. Wired into the responses handler in a
-later task.
+Emits `response.created`, one `response.output_text.delta` per `turn_delta`
+reply, and closes the buffer only on a terminal reply (`turn_completed` or
+`turn_failed`) with a final `response.completed` frame. No S3, no
+heartbeat. Wired into the responses handler in a later task.
 """
 from __future__ import annotations
 
@@ -57,13 +57,14 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                     continue
                 kind = payload["kind"]
                 data = payload.get("data") or {}
-                if kind == "turn_completed":
+                if kind == "turn_delta":
                     await buffer.append("sse", {"sse": _sse(
                         "response.output_text.delta",
-                        {"type": "response.output_text.delta",
-                         "delta": data.get("final_text", "")})})
-                    await buffer.append("sse", {"sse": _sse(
-                        "response.completed", {"type": "response.completed"})})
+                        {"type": "response.output_text.delta", "delta": data.get("text", "")})})
+                    continue
+                if kind == "turn_completed":
+                    await buffer.append("sse", {"sse": _sse("response.completed",
+                                                            {"type": "response.completed"})})
                     await buffer.close("completed")
                     return
                 if kind == "turn_failed":
