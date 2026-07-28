@@ -29,6 +29,7 @@ deployment:
   initContainers:
     - name: db-migrate
       image: '{{ template "get-repository" . }}:{{ template "get-release-tag" . }}'
+      imagePullPolicy: Always
       command: ["python", "-m", "alembic", "upgrade", "head"]
       env:
         - name: DATABASE_URI
