@@ -33,11 +33,24 @@ async def test_produce_remote_turn_streams_deltas(monkeypatch):
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     buf = RecBuffer()
     await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=buf)
-    assert json.loads(fake.added[0][1]["payload"])["op"] == "anton_turn"
+                                   input_text="hi", model=None, buffer=buf,
+                                   history=[{"role": "user", "content": "prev"}])
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["op"] == "anton_turn"
+    assert job["params"]["history"] == [{"role": "user", "content": "prev"}]
     sse = [r[1]["sse"] for r in buf.records]
     assert "response.created" in sse[0]
     assert "he" in sse[1] and "response.output_text.delta" in sse[1]
     assert "llo" in sse[2]
     assert "response.completed" in sse[3]
     assert buf.closed == "completed"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_turn_history_defaults_empty(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=RecBuffer())
+    assert json.loads(fake.added[0][1]["payload"])["params"]["history"] == []

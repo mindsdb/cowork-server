@@ -25,7 +25,8 @@ def _sse(event: str, payload: dict) -> str:
 
 async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               user_id: str | None, input_text: str,
-                              model: str | None, buffer) -> None:
+                              model: str | None, buffer,
+                              history: list | None = None) -> None:
     settings = TurnQueueSettings()
     r = get_redis()
     corr = _new_correlation_id()
@@ -38,7 +39,8 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         "reply_stream": reply_stream,
         "organization_id": org_id,
         "user_id": user_id,
-        "params": {"input": input_text, "workspace_path": "/workspace", "model": model},
+        "params": {"input": input_text, "workspace_path": "/workspace",
+                   "model": model, "history": history or []},
     }
     await r.xadd(settings.jobs_stream, {"payload": json.dumps(job)})
     await buffer.append("sse", {"sse": _sse("response.created",

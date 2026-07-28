@@ -188,6 +188,14 @@ class ResponsesHandler:
         call below is unchanged from before this branch existed.
         """
         if TurnQueueSettings().backend == "remote":
+            # Prior messages only (current input isn't persisted yet on this path).
+            # mode="json" since this gets json.dumps'd into the Redis job.
+            ordered = ConversationService(self.scoped).get_ordered_messages(conv_id)
+            history = [
+                m.to_openai_message().model_dump(mode="json")
+                for m in ordered
+                if m.role in {"user", "assistant"}
+            ]
             return produce_remote_turn(
                 conversation_id=str(conv_id),
                 org_id=self.scoped.scope.org_id,
@@ -195,6 +203,7 @@ class ResponsesHandler:
                 input_text=self._prompt_text(harness_input),
                 model=model,
                 buffer=buffer,
+                history=history,
             )
         return self._produce(
             conv_id=conv_id,
