@@ -16,6 +16,7 @@ from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
 from cowork.services.projects import GENERAL_PROJECT_ID
+from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
 
 # created_at is only second-precision, so rows of turns in the same second
@@ -288,9 +289,21 @@ class ConversationService:
         attachment_dirs = FileService(self.session).delete_by_purpose(
             attachment_purpose(str(conversation_id))
         )
+        # anton snapshots the scratchpad namespace to
+        # `<project>/.anton/scratchpad-sessions/<conversation_id>/` so variables survive
+        # the pad process being replaced each turn (ENG-1124). Nothing else prunes those
+        # — only a whole-project delete would — so they accumulate one directory per
+        # conversation, and a namespace can hold the injected DS_* credentials (ENG-392),
+        # making a stale snapshot data-at-rest rather than just disk.
+        # Resolve the project path HERE, while the conversation is still attached; the
+        # removal happens after the commit for the same reason as the attachment bytes.
+        session_project_path = (
+            conversation.project.path if conversation.project is not None else None
+        )
         self.session.delete(conversation)
         self.session.commit()
         unlink_file_dirs(attachment_dirs)
+        remove_conversation_sessions(session_project_path, conversation_id)
         return True
 
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
