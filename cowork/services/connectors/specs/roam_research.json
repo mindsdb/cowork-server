@@ -1,0 +1,60 @@
+{
+  "id": "roam_research",
+  "label": "Roam Research",
+  "aliases": [
+    "roam",
+    "roamresearch",
+    "roam research graph"
+  ],
+  "keywords": [
+    "notes",
+    "notetaking",
+    "knowledge graph",
+    "networked thought",
+    "outliner",
+    "wiki",
+    "second brain",
+    "blocks",
+    "pages"
+  ],
+  "description": "Query and write blocks and pages in a Roam Research graph via its official Backend API.",
+  "category": "productivity",
+  "logo": "brain",
+  "logo_color": "#4A66E0",
+  "form": {
+    "form_id": "roam-research-connector",
+    "title": "Connect Roam Research",
+    "subtitle": "Paste a graph API token to give Anton read/write access to one Roam Research graph. Roam has no OAuth — this is the only supported connection method.",
+    "logo": "brain",
+    "logo_color": "#4A66E0",
+    "methods": [
+      {
+        "id": "graph-api-token",
+        "label": "Graph API Token",
+        "description": "Paste an API token generated inside the specific Roam graph you want Anton to access. No OAuth client setup — Roam doesn't offer one.",
+        "recommended": true,
+        "how_to": "## Generate a Roam Research graph API token\n\nRoam's Backend API is authenticated per-graph with a static API token — there's no OAuth flow to connect your account as a whole, so you connect one graph at a time.\n\n### Steps\n\n1. Open the Roam graph you want Anton to access at [roamresearch.com](https://roamresearch.com).\n2. Click **Settings** (bottom of the left sidebar), then open the **Graph** tab.\n3. Scroll to the **API tokens** section and click **+ New API Token**.\n4. Give it a name like `Anton` and confirm.\n5. Copy the token shown — it will not be displayed again.\n6. Paste it into **API Token** below, and enter the exact **Graph name** (the name in your Roam URL, e.g. `roamresearch.com/#/app/<graph-name>`).\n\n### Notes\n\n- The token only works against the ONE graph it was created in — connect each graph separately if you use more than one.\n- Creating API tokens may require a paid Roam plan (Pro or Believer); free graphs may not show the API tokens section.\n- An idle graph can take a few seconds to \"wake up\" on the first request after being closed — a slow first call is normal, not a broken token.\n- Anton uses the same token for both reading and writing blocks/pages; scope what the token can do by how you use it, since Roam does not offer read-only tokens.\n- Rate limited by Roam (exact quota undocumented) — if you see frequent failures, space out requests.",
+        "help_url": "https://github.com/Roam-Research/backend-sdks",
+        "fields": [
+          {
+            "name": "api_token",
+            "label": "API Token",
+            "type": "password",
+            "required": true,
+            "secret": true,
+            "placeholder": "roam-graph-token-...",
+            "description": "Generated in the target graph → Settings → Graph tab → API tokens. Shown only once at creation."
+          },
+          {
+            "name": "graph_name",
+            "label": "Graph name",
+            "type": "text",
+            "required": true,
+            "placeholder": "my-notes",
+            "description": "The graph's name as it appears in its URL: roamresearch.com/#/app/<graph-name>. The token above only works against this one graph."
+          }
+        ]
+      }
+    ]
+  }
+}
