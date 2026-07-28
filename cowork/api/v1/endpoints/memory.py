@@ -1,10 +1,8 @@
-from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlmodel import Session
+from fastapi import APIRouter, HTTPException, Query, status
 
-from cowork.db.session import get_session
+from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.memory import (
     MemoryDeleteRequest,
     MemoryResponse,
@@ -13,25 +11,19 @@ from cowork.schemas.memory import (
 from cowork.services.memory import MemoryService
 
 router = APIRouter()
-SessionDep = Annotated[Session, Depends(get_session)]
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @router.get("/", response_model=list[MemoryResponse])
 async def list_memory(
-    session: SessionDep,
+    scoped: ScopedSessionDep,
     project_id: UUID | None = Query(default=None),
 ):
-    return await MemoryService(session).list_memory(project_id=project_id)
+    return await MemoryService(scoped).list_memory(project_id=project_id)
 
 
 @router.put("/", response_model=MemoryResponse)
-async def update_memory(body: MemoryUpdateRequest, session: SessionDep):
+async def update_memory(body: MemoryUpdateRequest, scoped: ScopedSessionDep):
     try:
-        return await MemoryService(session).update_memory(
+        return await MemoryService(scoped).update_memory(
             scope=body.scope,
             category=body.category,
             content=body.content,
@@ -42,9 +34,9 @@ async def update_memory(body: MemoryUpdateRequest, session: SessionDep):
 
 
 @router.delete("/")
-async def delete_memory(body: MemoryDeleteRequest, session: SessionDep):
+async def delete_memory(body: MemoryDeleteRequest, scoped: ScopedSessionDep):
     try:
-        await MemoryService(session).delete_memory(
+        await MemoryService(scoped).delete_memory(
             scope=body.scope,
             category=body.category,
             project_id=body.project_id,

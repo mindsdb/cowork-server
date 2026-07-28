@@ -1,25 +1,31 @@
 """Channel event log — inbound/outbound audit + inbound de-duplication.
 
+ChannelEvent has no org_id: dedupe by (channel_type, dedupe_key) is safe only
+because channel_type maps to exactly one installation per database (enforced
+by UNIQUE(channel_installations.channel_type); provider event ids are unique
+per chat/account, not globally). If per-org installations ever relax that
+constraint, this table needs an installation anchor in the same migration —
+test_channels_tenancy pins the invariant.
 """
 from __future__ import annotations
 
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
 
+from cowork.db.scoped import ScopedSession
 from cowork.models.channel import ChannelEvent
 
 
 class ChannelEventService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     def is_duplicate_inbound(self, channel_type: str, dedupe_key: str | None) -> bool:
         if not dedupe_key:
             return False
         row = self.session.exec(
-            select(ChannelEvent).where(
+            self.session.select(ChannelEvent).where(
                 ChannelEvent.channel_type == channel_type,
                 ChannelEvent.dedupe_key == dedupe_key,
                 ChannelEvent.direction == "inbound",

@@ -12,4 +12,6 @@ class Project(BaseSQLModel, table=True):
         max_length=1024,
     )
     is_active: bool = Field(default=True, description="Whether the project is active")
+    org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
+    created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 

@@ -6,9 +6,9 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import UploadFile
-from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import ScopedSession
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 
@@ -46,7 +46,7 @@ def attachment_purpose(session_id: str) -> str:
 
 
 class FileService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     def _root_dir(self) -> Path:
@@ -62,7 +62,7 @@ class FileService:
         )
 
     def list_files(self, purpose: str | None = None) -> list[FileResponse]:
-        stmt = select(File)
+        stmt = self.session.select(File)
         if purpose is not None:
             stmt = stmt.where(File.purpose == purpose)
         return [self._to_response(f) for f in self.session.exec(stmt).all()]
@@ -71,7 +71,7 @@ class FileService:
         """Raw File rows for callers that need fields the OpenAI-style
         FileResponse drops (content_type, timestamps) — e.g. the
         attachments compat endpoints."""
-        return list(self.session.exec(select(File).where(File.purpose == purpose)).all())
+        return list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
 
     def get_file_row(self, file_id: UUID) -> File:
         return self._get_file_model(file_id)
@@ -80,7 +80,7 @@ class FileService:
         """Repoint every file stored under `old_purpose`. Used when a
         conversation ends up with a different id than the one the client
         uploaded attachments against. Returns the number relinked."""
-        files = self.session.exec(select(File).where(File.purpose == old_purpose)).all()
+        files = self.session.exec(self.session.select(File).where(File.purpose == old_purpose)).all()
         for file in files:
             file.purpose = new_purpose
             self.session.add(file)
@@ -105,13 +105,19 @@ class FileService:
             purpose=purpose,
             path="",
         )
-
-        file_dir = self._root_dir() / str(file.id)
-        file_dir.mkdir(parents=True)
-        dest = file_dir / filename
-        dest.write_bytes(contents)
-        file.path = str(dest)
+        # Stage the row first: the scope check (and stamping) happens in
+        # add(), so a missing principal fails BEFORE any bytes hit disk.
         self.session.add(file)
+        file_dir = self._root_dir() / str(file.id)
+        try:
+            file_dir.mkdir(parents=True)
+            dest = file_dir / filename
+            dest.write_bytes(contents)
+        except Exception:
+            self.session.rollback()
+            shutil.rmtree(file_dir, ignore_errors=True)
+            raise
+        file.path = str(dest)
         self.session.commit()
         self.session.refresh(file)
         return self._to_response(file)
@@ -127,12 +133,18 @@ class FileService:
             purpose=purpose,
             path="",
         )
-        file_dir = self._root_dir() / str(file.id)
-        file_dir.mkdir(parents=True)
-        dest = file_dir / safe_name
-        dest.write_bytes(data)
-        file.path = str(dest)
+        # Row staged first — scope failure must precede any filesystem write.
         self.session.add(file)
+        file_dir = self._root_dir() / str(file.id)
+        try:
+            file_dir.mkdir(parents=True)
+            dest = file_dir / safe_name
+            dest.write_bytes(data)
+        except Exception:
+            self.session.rollback()
+            shutil.rmtree(file_dir, ignore_errors=True)
+            raise
+        file.path = str(dest)
         self.session.commit()
         self.session.refresh(file)
         return file
@@ -166,7 +178,7 @@ class FileService:
         conversation), then the caller unlinks the returned dirs via
         `unlink_file_dirs` AFTER committing.
         """
-        rows = list(self.session.exec(select(File).where(File.purpose == purpose)).all())
+        rows = list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
         dirs = [Path(f.path).parent for f in rows if f.path]
         for f in rows:
             self.session.delete(f)

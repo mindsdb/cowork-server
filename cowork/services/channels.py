@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from sqlmodel import Session, select
-
 from cowork.channels.plugin import ChannelPlugin
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
+from cowork.db.scoped import ScopedSession
 from cowork.models.channel import ChannelInstallation
 from cowork.models.setting import Setting
 from cowork.schemas.channels import (
@@ -30,7 +29,7 @@ class UnknownChannelError(Exception):
 
 
 class ChannelConfigService:
-    def __init__(self, session: Session, registry: PluginRegistry | None = None) -> None:
+    def __init__(self, session: ScopedSession, registry: PluginRegistry | None = None) -> None:
         self.session = session
         self.registry = registry if registry is not None else get_registry()
 
@@ -39,11 +38,14 @@ class ChannelConfigService:
         return [self._plugin_dto(p) for p in self.registry.all()]
 
     def list_installations(self) -> list[ChannelInstallationResponse]:
-        rows = self.session.exec(select(ChannelInstallation)).all()
+        rows = self.session.exec(self.session.select(ChannelInstallation)).all()
         return [ChannelInstallationResponse.model_validate(r, from_attributes=True) for r in rows]
 
     def status(self) -> ChannelStatusResponse:
-        installs = {r.channel_type: r for r in self.session.exec(select(ChannelInstallation)).all()}
+        installs = {
+            r.channel_type: r
+            for r in self.session.exec(self.session.select(ChannelInstallation)).all()
+        }
         items: list[ChannelStatusItem] = []
         for plugin in self.registry.all():
             row = installs.get(plugin.channel_type)
@@ -162,7 +164,10 @@ class ChannelConfigService:
         )
 
     def _fetch_setting(self, key: str) -> Setting | None:
-        return self.session.exec(select(Setting).where(Setting.key == key)).first()
+        # Setting is tenancy-deferred: key-based in every mode until the split.
+        return self.session.exec(
+            self.session.select(Setting).where(Setting.key == key)
+        ).first()
 
     def _upsert_setting(self, key: str, value: str) -> None:
         row = self._fetch_setting(key)
@@ -174,7 +179,9 @@ class ChannelConfigService:
 
     def _fetch_installation(self, channel_type: str) -> ChannelInstallation | None:
         return self.session.exec(
-            select(ChannelInstallation).where(ChannelInstallation.channel_type == channel_type)
+            self.session.select(ChannelInstallation).where(
+                ChannelInstallation.channel_type == channel_type
+            )
         ).first()
 
     def _ensure_installation(self, plugin: ChannelPlugin) -> None:

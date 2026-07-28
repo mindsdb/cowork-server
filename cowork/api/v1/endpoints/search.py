@@ -1,12 +1,9 @@
 """Search endpoint — local search across cowork resources."""
 from __future__ import annotations
 
-from typing import Annotated
+from fastapi import APIRouter, Query
 
-from fastapi import APIRouter, Depends, Query
-from sqlmodel import Session
-
-from cowork.db.session import get_session
+from cowork.db.scoped import ScopedSessionDep
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
 from cowork.services.pins import PinService
@@ -14,7 +11,6 @@ from cowork.services.projects import ProjectService
 from cowork.services.schedules import ScheduleService
 
 router = APIRouter()
-SessionDep = Annotated[Session, Depends(get_session)]
 
 
 def _score(text: str, query: str) -> int:
@@ -32,7 +28,7 @@ def _score(text: str, query: str) -> int:
 
 @router.get("")
 async def search_cowork(
-    session: SessionDep,
+    scoped: ScopedSessionDep,
     q: str = Query(default=""),
     limit: int = Query(default=25),
 ):
@@ -43,7 +39,7 @@ async def search_cowork(
     results: list[dict] = []
 
     # Conversations (tasks)
-    for conv in ConversationService(session).list_conversations(limit=500, all_projects=True):
+    for conv in ConversationService(scoped).list_conversations(limit=500, all_projects=True):
         project_label = ""
         if conv.project:
             project_label = conv.project.name
@@ -60,7 +56,7 @@ async def search_cowork(
             })
 
     # Projects
-    for project in ProjectService(session).list_projects():
+    for project in ProjectService(scoped).list_projects():
         text = " ".join([project.name or "", project.path or ""])
         score = _score(text, query)
         if score:
@@ -93,7 +89,7 @@ async def search_cowork(
             })
 
     # Schedules
-    for schedule in ScheduleService(session).list_schedules():
+    for schedule in ScheduleService(scoped).list_schedules():
         text = " ".join([schedule.title or "", schedule.prompt or ""])
         score = _score(text, query)
         if score:
@@ -107,7 +103,7 @@ async def search_cowork(
             })
 
     # Pins
-    for idx, pin in enumerate(PinService(session).list_pins()):
+    for idx, pin in enumerate(PinService(scoped).list_pins()):
         text = " ".join([pin.title or "", str(pin.item_id) or "", pin.item_type or ""])
         score = _score(text, query)
         if score:

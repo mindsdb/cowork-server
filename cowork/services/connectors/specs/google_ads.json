@@ -69,7 +69,11 @@
           "extra_auth_params": {
             "access_type": "offline",
             "prompt": "consent"
-          }
+          },
+          "supports_refresh": true,
+          "supports_revoke": true,
+          "revoke_url": "https://oauth2.googleapis.com/revoke",
+          "service_id": "google-ads"
         }
       },
       {
@@ -90,7 +94,10 @@
           "extra_auth_params": {
             "access_type": "offline",
             "prompt": "consent"
-          }
+          },
+          "supports_refresh": true,
+          "supports_revoke": true,
+          "revoke_url": "https://oauth2.googleapis.com/revoke"
         },
         "how_to": "## OAuth 2.0 + Google Ads Developer Token\n\nGoogle Ads requires **two** separate credentials: an OAuth 2.0 client (from Google Cloud Console) and a **developer token** (from Google Ads Manager Center). Both are mandatory.\n\n### Step 1 — Create an OAuth 2.0 client\n\n1. Open [Google Cloud Console](https://console.cloud.google.com/) → pick or create a project.\n2. **APIs & Services → Library** → search for and enable the **Google Ads API**.\n3. **APIs & Services → OAuth consent screen** → configure an internal or external app; add your email as a test user if external.\n4. **APIs & Services → Credentials → Create credentials → OAuth client ID** → choose **Desktop app**.\n5. Copy the **Client ID** and **Client secret** into the fields below.\n\n### Step 2 — Obtain a developer token\n\n1. Sign in to your [Google Ads Manager Account (MCC)](https://ads.google.com/).\n2. Click the **Tools & Settings** wrench → **Setup → API Center**.\n3. If you haven't applied yet, submit an application. Basic access is granted immediately for testing; standard access requires a short review.\n4. Copy the **Developer token** shown on the API Center page and paste it into the field below.\n\n### Step 3 — (Optional) MCC login customer ID\n\nIf you manage multiple accounts under an MCC, paste the **manager account customer ID** (10-digit number, no dashes) into **Login customer ID**. Leave blank if you only have a single account.\n\n### Step 4 — Authorize\n\nClick **Submit**. Anton opens Google's consent screen in your browser. Sign in with the Google account that has access to your ad accounts, grant the requested permissions, and Anton stores the resulting refresh token locally.\n\n### Notes\n\n- The `adwords` scope grants broad access to all accounts reachable by the authorized user.\n- Developer tokens are shown once per API Center session — bookmark the API Center page for quick retrieval.\n- To revoke, visit [Third-party apps with account access](https://myaccount.google.com/permissions) and remove the entry.",
         "help_url": "https://developers.google.com/google-ads/api/docs/oauth/overview",
