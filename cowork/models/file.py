@@ -18,3 +18,5 @@ class File(BaseSQLModel, table=True):
     # thing that 500s an upload again.
     purpose: str = Field(sa_type=Text)
     path: str = Field(max_length=1024)
+    org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
+    created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")

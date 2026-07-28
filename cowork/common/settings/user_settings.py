@@ -7,6 +7,7 @@ from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_valid
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     PLANNING_MODEL_DEFAULTS,
+    ROUTER_MODEL_DEFAULTS,
     Settings,
     default_minds_url,
     get_app_settings,
@@ -93,20 +94,20 @@ def _enabled_aware_default(
     defaults: dict[str, str],
     enabled_map: dict[str, bool],
 ) -> str | None:
-    """The provider's canonical default model, adjusted for tier availability.
+    """The provider's canonical default model, adjusted for availability.
 
-    MindsHub gates models per plan tier (a free-tier key gets sonnet/haiku as
-    ``enabled: false`` from ``/v1/models``), so blindly handing out the
-    canonical default would 403 every turn for a free account. When the cached
-    availability map (``minds_model_enabled``) marks the default as disabled,
-    fall back to the first enabled model in the map — the map preserves the
-    gateway's ``/v1/models`` ordering, which lists the tier's baseline model
-    first. Applies only to minds-cloud: direct (BYOK) providers have no tier
-    gating and no map entries.
+    MindsHub marks a model the org's wallet can't currently pay for (or whose
+    free allowance is exhausted) as ``enabled: false`` from ``/v1/models``, so
+    blindly handing out the canonical default could be denied every turn. When
+    the cached availability map (``minds_model_enabled``) marks the default as
+    disabled, fall back to the first enabled model in the map — the map
+    preserves the gateway's ``/v1/models`` ordering, which lists the
+    free/baseline model first. Applies only to minds-cloud: direct (BYOK)
+    providers have no such availability map.
 
     Deliberately conservative: an absent/empty map, a default missing from the
     map, or a map with nothing enabled all leave the canonical default
-    untouched — degraded metadata must never change behavior for paid users.
+    untouched — degraded metadata must never change behavior.
     """
     default = defaults.get(provider_value)
     if provider_value != Provider.MINDS_CLOUD.value or not enabled_map:
@@ -133,7 +134,7 @@ def _resolved_model(
 
       - provider NOT switched → keep the user's chosen model.
       - provider switched → use the resolved provider's canonical default
-        (tier-adjusted via _enabled_aware_default, so switching a free-tier
+        (availability-adjusted via _enabled_aware_default, so switching an
         account onto minds-cloud never lands on a locked model).
         NEVER fall back to the original provider's model — that would hand e.g.
         a Claude id to an openai-compatible / MindsHub endpoint (misrouting).
@@ -176,8 +177,8 @@ class _DynamicOptions:
 
 
 def _harness_options() -> list[str]:
-    from cowork.harnesses.base import _registry
-    return list(_registry.keys())
+    from cowork.harnesses.base import available_harness_ids
+    return available_harness_ids()
 
 
 class UserSettings(Settings):
@@ -256,6 +257,25 @@ class UserSettings(Settings):
             "model's default. Only meaningful for models that advertise effort levels."
         ),
     )
+    # Router role: the cheap front-model that runs history summarization (and
+    # later gates each turn, respond-vs-delegate). Selectable so a user can
+    # point routing + summarization at a cheap model independently of the
+    # coding (scratchpad) model. Falls back to the coding role in anton when
+    # unset, so leaving these at defaults is behavior-preserving.
+    router_provider: Provider = Field(
+        default=Provider.ANTHROPIC,
+        title="Routing & Summarization Provider",
+        description="The provider for the routing/summarization model.",
+    )
+    router_model: str | None = Field(
+        default=None,
+        title="Routing & Summarization Model",
+        description=(
+            "The cheap model used for respond-vs-delegate routing and history "
+            "summarization. Defaults to the recommended model for the selected "
+            "provider (MindsHub → kimi; other providers → their smallest model)."
+        ),
+    )
     harness: Annotated[str, _DynamicOptions(_harness_options)] = Field(
         default="anton",
         title="Harness",
@@ -294,6 +314,31 @@ class UserSettings(Settings):
         title="Show Counters",
         description="Show counters in the UI.",
     )
+    nav_title: str = Field(
+        default="",
+        title="Nav Title",
+        description="Sidebar title text. Empty uses the default, MindsHub.",
+    )
+    nav_title_color: str = Field(
+        default="",
+        title="Nav Title Color",
+        description="Sidebar title color (hex). Empty follows the theme's default text color.",
+    )
+    nav_logo: str = Field(
+        default="",
+        title="Nav Logo",
+        description="Sidebar logo image as a data URI. Empty shows no logo.",
+    )
+    show_theme_toggle: bool = Field(
+        default=True,
+        title="Show Theme Toggle",
+        description="Show the floating light/dark theme toggle button.",
+    )
+    show_8bit_toggle: bool = Field(
+        default=True,
+        title="Show 8-Bit Toggle",
+        description="Show the floating 8-bit style toggle button.",
+    )
     accent_variant: str = Field(
         default="aqua",
         title="Accent Variant",
@@ -326,11 +371,6 @@ class UserSettings(Settings):
             "Act on reasonable defaults and state assumptions inline instead of "
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
-    )
-    ui_update_mode: str = Field(
-        default="manual",
-        title="UI Update Mode",
-        description="How UI updates are applied (manual or auto).",
     )
     publish_url: str = Field(
         default="",
@@ -373,8 +413,8 @@ class UserSettings(Settings):
         description=(
             "JSON-encoded map of MindsHub model id → enabled flag, cached from "
             "/v1/models whenever recommended-models fetches it live. Lets model "
-            "defaults avoid tier-locked models without a network call in the "
-            "turn path."
+            "defaults avoid locked models (wallet can't pay / free allowance "
+            "spent) without a network call in the turn path."
         ),
     )
 
@@ -396,8 +436,9 @@ class UserSettings(Settings):
 
         Sourced from the ``minds_model_enabled`` setting, which the
         recommended-models endpoint refreshes from ``/v1/models`` on every
-        settings load — so it tracks plan changes (e.g. an upgrade re-enables
-        sonnet on the next fetch) without any network call here.
+        settings load — so it tracks availability changes (e.g. adding credits
+        re-enables a locked model on the next fetch) without any network call
+        here.
 
         Parsed once per instance and memoized: this is called from
         ``apply_model_defaults`` and both ``resolved_*_model`` properties.
@@ -422,12 +463,13 @@ class UserSettings(Settings):
 
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
-        # Defaults are tier-aware for minds-cloud: a free-tier account (sonnet /
-        # haiku locked) falls back to the first enabled model instead of a
-        # guaranteed-403 default. Only applies while the user hasn't picked a
-        # model (None) — an explicit choice is never rewritten, and since
-        # nothing persists the value assigned here, an upgrade flips the
-        # default back to the canonical model on the next settings load.
+        # Defaults are availability-aware for minds-cloud: when the canonical
+        # default is locked (wallet can't pay / free allowance spent) it falls
+        # back to the first enabled model instead of a guaranteed-denied
+        # default. Only applies while the user hasn't picked a model (None) — an
+        # explicit choice is never rewritten, and since nothing persists the
+        # value assigned here, adding credits flips the default back to the
+        # canonical model on the next settings load.
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
@@ -436,6 +478,10 @@ class UserSettings(Settings):
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
                 self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
+            )
+        if self.router_model is None:
+            self.router_model = _enabled_aware_default(
+                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
             )
         return self
 
@@ -499,6 +545,20 @@ class UserSettings(Settings):
             self.coding_provider,
             self.coding_model,
             CODING_MODEL_DEFAULTS,
+            self._minds_enabled_map(),
+        )
+
+    @property
+    def resolved_router_provider(self) -> Provider:
+        return self._resolve_provider(self.router_provider)
+
+    @property
+    def resolved_router_model(self) -> str | None:
+        return _resolved_model(
+            self.resolved_router_provider,
+            self.router_provider,
+            self.router_model,
+            ROUTER_MODEL_DEFAULTS,
             self._minds_enabled_map(),
         )
 

@@ -4,9 +4,9 @@ import re
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
 
 from cowork.channels.registry import PluginRegistry, get_registry
+from cowork.db.scoped import ScopedSession
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -28,12 +28,12 @@ class BindingConflictError(Exception):
 
 
 class ChannelBindingService:
-    def __init__(self, session: Session, registry: PluginRegistry | None = None) -> None:
+    def __init__(self, session: ScopedSession, registry: PluginRegistry | None = None) -> None:
         self.session = session
         self.registry = registry if registry is not None else get_registry()
 
     def list(self, channel_type: str | None = None) -> list[BindingResponse]:
-        stmt = select(ChannelBinding)
+        stmt = self.session.select(ChannelBinding)
         if channel_type:
             stmt = stmt.where(ChannelBinding.channel_type == channel_type)
         return [self._dto(row) for row in self.session.exec(stmt).all()]
@@ -127,7 +127,7 @@ class ChannelBindingService:
         old one. Past conversations are preserved (just no longer the active
         thread). Returns how many bindings had an active conversation.
         """
-        stmt = select(ChannelBinding)
+        stmt = self.session.select(ChannelBinding)
         if channel_type:
             stmt = stmt.where(ChannelBinding.channel_type == channel_type)
         reset = 0
@@ -155,14 +155,15 @@ class ChannelBindingService:
         return True
 
     def _drop_sessions(self, binding_id: UUID) -> None:
+        # ChannelSession is a child (no org_id): anchored by the caller's binding.
         for sess in self.session.exec(
-            select(ChannelSession).where(ChannelSession.binding_id == binding_id)
+            self.session.select(ChannelSession).where(ChannelSession.binding_id == binding_id)
         ).all():
             self.session.delete(sess)
 
     def _find(self, channel_type: str, group_id: str, thread_key: str) -> ChannelBinding | None:
         return self.session.exec(
-            select(ChannelBinding).where(
+            self.session.select(ChannelBinding).where(
                 ChannelBinding.channel_type == channel_type,
                 ChannelBinding.external_group_id == group_id,
                 ChannelBinding.external_thread_key == thread_key,
@@ -184,6 +185,7 @@ class ChannelBindingService:
                 raise ValueError(f"invalid trigger_pattern regex: {exc}")
 
     def _validate_links(self, project_id: UUID | None, conversation_id: UUID | None) -> None:
+        # Scoped get: another org's project/conversation reads as nonexistent.
         if project_id is not None and self.session.get(Project, project_id) is None:
             raise ValueError(f"project not found: {project_id}")
         if conversation_id is not None and self.session.get(Conversation, conversation_id) is None:

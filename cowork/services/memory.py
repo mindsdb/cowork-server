@@ -3,8 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import UUID
 
-from sqlmodel import Session, select
-
+from cowork.db.scoped import ScopedSession
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import PROJECT_SLOTS, ProjectMemoryStore, SharedMemoryStore
 from cowork.models.project import Project
@@ -12,7 +11,7 @@ from cowork.schemas.memory import MemoryResponse, MemoryScope
 
 
 class MemoryService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         self.session = session
         self._global_store = SharedMemoryStore()
 
@@ -66,7 +65,7 @@ class MemoryService:
                 )
             )
 
-        projects = list(self.session.exec(select(Project)).all())
+        projects = list(self.session.exec(self.session.select(Project)).all())
         if project_id is not None:
             projects = [p for p in projects if p.id == project_id]
 

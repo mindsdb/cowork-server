@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
@@ -29,12 +29,17 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
     "openai-compatible": [],
 }
 
-RECOMMENDED_PAIR: dict[str, tuple[str, str]] = {
-    "minds-cloud": ("sonnet", "haiku"),
-    "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
-    "openai": ("gpt-5.5", "gpt-5.5-mini"),
-    "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
-    "openai-compatible": ("", ""),
+# Per-provider default model tuple served to the picker as `recommendedPair`.
+# Order: (planning, coding, router). The 3rd slot is the "routing and
+# summarization" role: MindsHub defaults to the cheap `kimi`; direct
+# providers use their smallest model. The frontend falls back
+# to the coding slot when the 3rd is absent, so an older client still works.
+RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
+    "minds-cloud": ("sonnet", "haiku", "kimi"),
+    "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+    "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
+    "gemini": ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash"),
+    "openai-compatible": ("", "", ""),
 }
 
 # Keyed by the Provider enum *value* (the string) rather than the enum
@@ -57,6 +62,17 @@ CODING_MODEL_DEFAULTS: dict[str, str] = {
     "openai": "gpt-5.5-mini",
     "gemini": "gemini-2.5-flash",
     "minds_cloud": "haiku",
+}
+# Router role: the cheap front-model that runs history summarization (and later
+# gates each turn, respond-vs-delegate). Defaults: MindsHub →
+# `kimi` (Kimi K2 — fast and cheap; the deprecated `latest:` prefix still
+# resolves but the bare alias is preferred), direct providers → their smallest
+# model (same as the coding tier). Keyed by Provider.value (snake_case).
+ROUTER_MODEL_DEFAULTS: dict[str, str] = {
+    "anthropic": "claude-haiku-4-5-20251001",
+    "openai": "gpt-5.5-mini",
+    "gemini": "gemini-2.5-flash",
+    "minds_cloud": "kimi",
 }
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
@@ -88,7 +104,6 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 # The URL pattern is:
 #   prod:    api.mindshub.ai    / view.mindshub.ai
 #   staging: api.staging.mindshub.ai / view.staging.mindshub.ai
-#   dev:     api.dev.mindshub.ai    / view.dev.mindshub.ai
 #   local:   same as dev (local dev typically targets the dev env)
 
 
@@ -229,6 +244,12 @@ class OAuthSettings(Settings):
     google_analytics_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_ID"))
     google_analytics_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_ANALYTICS_CLIENT_SECRET"))
 
+    linear_client_id: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_ID"))
+    linear_client_secret: str = Field(default="", validation_alias=AliasChoices("LINEAR_CLIENT_SECRET"))
+
+    github_client_id: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_ID"))
+    github_client_secret: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_SECRET"))
+
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
     google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
@@ -269,9 +290,19 @@ class AppSettings(Settings):
 
     port: int = Field(
         default=26866,
-        validation_alias=AliasChoices("COWORK_SERVER_PORT"),
+        # One name per context: the desktop app hands the sidecar its port as
+        # COWORK_SERVER_PORT; k8s/cloud sets COWORK_LISTEN_PORT,
+        # which wins because k8s auto-injects the former as a tcp:// URI.
+        validation_alias=AliasChoices("COWORK_LISTEN_PORT", "COWORK_SERVER_PORT"),
         description="The port to run the server on",
     )
+
+    @field_validator("port", mode="before")
+    @classmethod
+    def _discard_k8s_injected_port(cls, v: object) -> object:
+        if isinstance(v, str) and v.startswith("tcp://"):
+            return 26866
+        return v
     host: str = Field(
         default="127.0.0.1",
         validation_alias=AliasChoices("COWORK_SERVER_HOST"),
@@ -296,7 +327,7 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_ALLOWED_ORIGINS"),
         description=(
             "CORS allowed origins (JSON array). "
-            "Defaults to localhost on COWORK_SERVER_PORT and COWORK_RENDERER_PORT."
+            "Defaults to localhost on COWORK_LISTEN_PORT and COWORK_RENDERER_PORT."
         ),
     )
 
@@ -360,6 +391,19 @@ class AppSettings(Settings):
     )  # COWORK_SERVER_OWNER
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
+
+    master_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_MASTER_KEY"),
+        description=(
+            "Fernet master key material (urlsafe-base64) used to encrypt "
+            "sensitive settings at rest. When set, it is used directly and "
+            "master_key_path is ignored. Required for stateless/cloud deploys "
+            "so the key survives pod restarts (a per-pod file key would orphan "
+            "everything encrypted before the restart). Empty (desktop default) "
+            "reads or generates the key at master_key_path."
+        ),
+    )  # COWORK_MASTER_KEY
 
     master_key_path: str = Field(
         default_factory=lambda: str(cowork_home() / ".master_key"),
