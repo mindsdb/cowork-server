@@ -37,9 +37,25 @@ def _published_state(raw_path: str) -> dict:
     return published_state(raw_path)
 
 
-def _publish_artifact(raw_path: str) -> dict:
+def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
     from cowork.services.publish import publish_artifact
-    return publish_artifact(raw_path)
+    return publish_artifact(raw_path, access=access)
+
+
+def _published_owner_state(raw_path: str) -> dict:
+    """Raw owner-side `.published.json` entry (mode/access_password/…) so the
+    tool can preserve prior access on re-publish. Lazily imported to avoid a
+    startup import cycle."""
+    from cowork.services.publish import published_owner_state
+    return published_owner_state(raw_path)
+
+
+def _access_from_state(entry: dict) -> dict:
+    """Rebuild input access from a stored .published.json entry.
+
+    Single source of truth: anton.publish_access.access_from_owner_side."""
+    from anton.publish_access import access_from_owner_side
+    return access_from_owner_side(entry)
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
@@ -78,7 +94,20 @@ COWORK_PUBLISH_PROMPT = (
     "  services (paste sites, gists, CDNs, file hosts) via scratchpad code — unless the user\n"
     "  explicitly names the service and confirms. This rule applies only to sharing generated\n"
     "  output with the public internet; reading public APIs and writing to the user's connected\n"
-    "  datasources (databases, CRMs, etc.) is fine."
+    "  datasources (databases, CRMs, etc.) is fine.\n"
+    "ACCESS MODE:\n"
+    "- Before publishing you MUST know the access mode. If the user stated it\n"
+    "  (e.g. 'publish with password', 'share only with a@x.com', 'make it public'), use it:\n"
+    "  set access_mode (+ password/emails/org_allowed) accordingly.\n"
+    "- If the user did NOT specify an access mode, ASK them in chat which one they want —\n"
+    "  public (anyone with the link), password-protected, or restricted to specific emails /\n"
+    "  the whole organization — and wait for their answer before calling this tool with\n"
+    "  action='publish'. Do NOT silently default to public.\n"
+    "- NEVER invent a password. If the user chooses password, get the value from them in chat\n"
+    "  or point them to the publish panel (Access → Password).\n"
+    "- Exception: when re-publishing an artifact that already has access on record and the user\n"
+    "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
+    "  ask again)."
 )
 
 
@@ -144,11 +173,35 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     if action != "publish":
         return f"publish_or_preview: unknown action '{action}'"
 
+    # Resolve the access spec: explicit tool fields > preserve previous > public.
+    access_mode = tc_input.get("access_mode")
+    if access_mode == "password":
+        pw = (tc_input.get("password") or "").strip()
+        if not pw:
+            return (
+                "A password is required but was not provided. Tell the user to set it "
+                "from the publish panel (Access → Password) — do NOT ask for the "
+                "password in chat and never invent one."
+            )
+        access = {"mode": "password", "password": pw}
+    elif access_mode == "restricted":
+        access = {"mode": "restricted",
+                  "emails": tc_input.get("emails") or [],
+                  "org_allowed": bool(tc_input.get("org_allowed"))}
+    elif access_mode == "public":
+        access = {"mode": "public"}
+    else:
+        # No access fields: preserve the artifact's previous access on re-publish.
+        # NOTE: _published_owner_state (not _published_state) — the latter drops
+        # mode/access_password, which would silently reset to public.
+        prev = _published_owner_state(abs_path)
+        access = _access_from_state(prev) if prev.get("report_id") else {"mode": "public"}
+
     # action == 'publish' — delegate to the service (single source of truth for
     # target resolution, fullstack bundling, vault secrets, access, history,
-    # and report_id reuse). The tool always publishes public.
+    # and report_id reuse).
     try:
-        result = _publish_artifact(abs_path)
+        result = _publish_artifact(abs_path, access=access)
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
