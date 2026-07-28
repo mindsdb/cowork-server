@@ -285,6 +285,23 @@ class StreamSettings(Settings):
     )
 
 
+class TurnQueueSettings(Settings):
+    model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
+
+    backend: str = Field(
+        default="inprocess",
+        description="Turn-queue backend: 'inprocess' (single-instance, default) or 'remote' (Redis-backed, multi-instance).",
+    )
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis connection URL used when backend is 'remote'.",
+    )
+    jobs_stream: str = Field(
+        default="scratchpad:requests",
+        description="Redis stream key turn jobs are queued on when backend is 'remote'.",
+    )
+
+
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 

@@ -24,6 +24,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
     "psycopg[binary]>=3.2",
+    "redis>=5,<6",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "tzlocal>=5.0",
