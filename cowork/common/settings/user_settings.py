@@ -442,7 +442,7 @@ class UserSettings(Settings):
             "How many actions (running code, reading files, searching) the agent "
             "may take on one request before it pauses and checks in with you. "
             "Raise it so big tasks can finish in one go; lower it to keep a "
-            "tighter leash on time and cost."
+            "tighter leash on time and cost. Applies to the Anton agent."
         ),
     )
     max_continuations: int = Field(
@@ -453,7 +453,8 @@ class UserSettings(Settings):
         description=(
             "When the agent stops but its work looks unfinished, Cowork can send "
             "it back to complete the job — this caps how many times. Raise it "
-            "for hands-off thoroughness; set 0 to always stop at the first draft."
+            "for hands-off thoroughness; set 0 to always stop at the first "
+            "draft. Applies to the Anton agent."
         ),
     )
     publish_url: str = Field(

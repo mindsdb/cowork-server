@@ -78,8 +78,15 @@ _ENV_TO_SETTING: dict[str, str] = {
     "ANTON_EPISODIC_MEMORY": "episodic_memory",
     "ANTON_PROACTIVE_DASHBOARDS": "proactive_dashboards",
     "ANTON_ACT_FIRST": "act_first",
-    "ANTON_MAX_TOOL_ROUNDS": "max_tool_rounds",
-    "ANTON_MAX_CONTINUATIONS": "max_continuations",
+    # NOTE: ANTON_MAX_TOOL_ROUNDS / ANTON_MAX_CONTINUATIONS are deliberately
+    # NOT mapped, for the same reason as models (ENG-739) plus a harder
+    # failure mode: anton's own CoreSettings accepts any int, so a stale
+    # anton-CLI line like ANTON_MAX_TOOL_ROUNDS=1000 in the shared
+    # ~/.cowork/.env is valid for the CLI but fails UserSettings' bounds —
+    # and because sync_env_vars_to_db raises on the first invalid key, a
+    # single such line would 400 every credential push / token refresh.
+    # Budgets enter the DB only via explicit writes (Settings UI / API);
+    # .env budget lines remain CLI-only.
     "ANTON_PUBLISH_URL": "publish_url",
 }
 
