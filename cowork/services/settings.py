@@ -125,32 +125,63 @@ class SettingService:
         set_keys = {row.key} if row is not None else set()
         return self._to_response(key, settings, self._is_set(key, settings, set_keys))
 
-    def upsert_setting(self, key: str, value: str) -> SettingResponse:
+    def _encode_for_store(self, key: str, value: str) -> tuple[str, UserSettings]:
+        """Validate ``value`` for ``key``; return (stored-string, model).
+
+        The stored string is Fernet-encrypted for sensitive fields and the enum
+        ``.value`` for enums. Raises ``ValueError`` for an unknown key or a
+        value that fails the field's validation. One place for the encode rules
+        that ``upsert_setting`` and ``save_all`` share.
+        """
         self._validate_key(key)
         try:
             validated = UserSettings.model_validate({key: value})
         except ValidationError as e:
             raise ValueError(str(e))
-
         field_val = getattr(validated, key)
         if UserSettings.field_is_sensitive(key):
             raw = field_val.get_secret_value() if isinstance(field_val, SecretStr) else str(field_val)
-            store_val = encrypt(raw)
-        elif isinstance(field_val, Enum):
-            store_val = field_val.value
-        else:
-            store_val = str(field_val) if field_val is not None else value
+            return encrypt(raw), validated
+        if isinstance(field_val, Enum):
+            return field_val.value, validated
+        return (str(field_val) if field_val is not None else value), validated
 
+    def _write_row(self, key: str, store_val: str) -> None:
         row = self._fetch_row(key)
         if row is None:
             row = Setting(key=key, value=store_val)
         else:
             row.value = store_val
         self.session.add(row)
+
+    def upsert_setting(self, key: str, value: str) -> SettingResponse:
+        store_val, validated = self._encode_for_store(key, value)
+        self._write_row(key, store_val)
         self.session.commit()
         invalidate_user_settings_cache()
-
         return self._to_response(key, validated, True)
+
+    def save_all(self, updates: dict[str, str]) -> list[str]:
+        """Validate and upsert many settings in ONE transaction (all-or-nothing).
+
+        Unlike ``bulk_upsert`` (best-effort, used by the .env sync) this raises
+        on the first invalid key/value and writes NOTHING, so a Settings-form
+        save can't half-apply the way the per-key PUT loop could. ``***`` (the
+        unchanged-secret sentinel) and ``None`` are skipped, matching the
+        client's write-diff. Returns the keys written.
+        """
+        encoded: dict[str, str] = {}
+        for key, value in updates.items():
+            if value is None or value == "***":
+                continue
+            store_val, _ = self._encode_for_store(key, value)  # raises → nothing written
+            encoded[key] = store_val
+        for key, store_val in encoded.items():
+            self._write_row(key, store_val)
+        if encoded:
+            self.session.commit()
+            invalidate_user_settings_cache()
+        return list(encoded.keys())
 
     def bulk_upsert(self, updates: dict[str, str]) -> list[str]:
         """Upsert multiple settings in a single transaction.

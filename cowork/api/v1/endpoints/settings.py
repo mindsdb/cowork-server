@@ -21,7 +21,11 @@ from sqlmodel import Session
 from cowork.common.paths import cowork_home
 from cowork.db.session import get_session
 from cowork.schemas.base import CamelRequest
-from cowork.schemas.settings import SettingResponse, SettingUpsertRequest
+from cowork.schemas.settings import (
+    SettingResponse,
+    SettingsBulkUpsertRequest,
+    SettingUpsertRequest,
+)
 from cowork.services.providers import (
     check_config_status,
     fetch_minds_models,
@@ -48,6 +52,21 @@ SessionDep = Annotated[Session, Depends(get_session)]
 @router.get("/", response_model=list[SettingResponse])
 def list_settings(session: SessionDep) -> list[SettingResponse]:
     return SettingService(session).list_settings()
+
+
+@router.put("/")
+def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep):
+    """Upsert many settings in one transaction (all-or-nothing).
+
+    The Settings form saves through here: either every value validates and is
+    written, or the request 400s and nothing is written. Replaces the per-key
+    PUT loop, which could leave the DB half-written on a partial failure.
+    """
+    try:
+        updated = SettingService(session).save_all(body.values)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"updated": updated}
 
 
 @router.put("/{key}", response_model=SettingResponse)
@@ -164,11 +183,12 @@ class _TestProvidersBody(BaseModel):
 
 @router.post("/test-providers")
 async def test_providers(session: SessionDep, body: _TestProvidersBody | None = None):
-    """Ping the given (or all stored) providers and persist the results.
+    """Ping the given (or all stored) providers and return connectivity results.
 
-    Despite the read-only-sounding name this WRITES: each tested provider's
-    status is merged into the persisted `provider_status` /
-    `provider_status_details` settings so the Settings dots survive a reload.
+    Read-only: a test is a point-in-time check and no longer writes to the DB.
+    Persisting made a "test" a silent write, and a stored green dot could
+    outlive a revoked key or a drained wallet and read as passing when it no
+    longer was (ENG-335). Callers render the returned results directly.
     """
     s = SettingService(session).load()
 
@@ -189,16 +209,6 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
 
     statuses, details = await ping_providers(providers)
-
-    # Persist the results merged into the stored map so the Settings dots
-    # survive a reload. Only the tested providers' entries change; every other
-    # provider keeps its last recorded result.
-    merged_status = {**json.loads(s.provider_status or "{}"), **statuses}
-    merged_details = {**json.loads(s.provider_status_details or "{}"), **details}
-    SettingService(session).bulk_upsert({
-        "provider_status": json.dumps(merged_status),
-        "provider_status_details": json.dumps(merged_details),
-    })
     return {"providerStatus": statuses, "providerStatusDetails": details}
 
 

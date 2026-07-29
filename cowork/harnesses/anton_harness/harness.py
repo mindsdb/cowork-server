@@ -380,11 +380,13 @@ class AntonHarness:
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
+            build_cowork_create_skill_draft_tool,
         )
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
+        CREATE_SKILL_DRAFT_TOOL = build_cowork_create_skill_draft_tool()
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -538,13 +540,20 @@ class AntonHarness:
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
         )
         # A skill is NOT an artifact and is NOT auto-saved. When the agent builds
-        # or improves a skill (e.g. via skill-creator), stage it under the drafts
-        # dir — the turn-end diff surfaces it as a card the user saves/downloads.
+        # or improves a skill (e.g. via skill-creator), it stages a DRAFT via the
+        # create_skill_draft tool — the turn-end diff surfaces it as a card the
+        # user saves/downloads. Editing an existing skill goes through the same
+        # tool (it pre-seeds the draft from the saved version), NEVER by editing
+        # the live `skills/` directory in place.
         skill_output_context = (
-            f"Skills you build or improve for the user (e.g. while running the skill-creator skill) "
-            f"are DRAFTS — write each as its own folder under `{str(skill_drafts_dir)}/<skill-name>/SKILL.md` "
-            "(one folder per skill, plus any sibling files). A skill is NOT an artifact: never call "
-            "`create_artifact` for a skill, and NEVER write a skill into the project `skills/` directory. "
+            "Skills you build or improve for the user (e.g. while running the skill-creator skill) "
+            "are DRAFTS — never auto-saved. Workflow:\n"
+            "  1. Call `create_skill_draft(name)` FIRST to claim a folder; it returns `{slug, path, skill_file}`. "
+            "If a skill of that name is already saved, the folder comes pre-filled with its current contents "
+            "so you edit from the saved version.\n"
+            "  2. Write the SKILL.md to `skill_file` and any sibling files into `path` (one folder per skill).\n"
+            "  3. A skill is NOT an artifact: never call `create_artifact` for a skill, and NEVER write a skill "
+            "into the project `skills/` directory (that is the live store — editing it there bypasses the draft).\n"
             "The staged skill surfaces as a card the user explicitly saves or downloads; it is not saved until they do."
         )
 
@@ -714,6 +723,7 @@ class AntonHarness:
                 LOOKUP_CONNECTOR_TOOL,
                 REQUEST_CREDENTIALS_TOOL,
                 LABEL_CONNECTION_TOOL,
+                CREATE_SKILL_DRAFT_TOOL,
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
             ],
