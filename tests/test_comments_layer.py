@@ -91,11 +91,8 @@ def test_serve_injects_only_with_flag():
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = _make_project(tmp)
         with patch(
-            "cowork.services.artifacts._registered_project_dirs",
-            return_value=[project_dir],
-        ), patch(
-            "cowork.services.artifacts._projects_root",
-            return_value=project_dir.parent,
+            "cowork.api.v1.endpoints.artifacts._project_artifacts_base",
+            return_value=project_dir / ".anton" / "artifacts",
         ):
             # Entry document with the flag → layer injected.
             r = client.get(f"/api/v1/artifacts/serve/proj/index.html?{ACTIVATION_PARAM}=1")
