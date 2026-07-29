@@ -118,3 +118,53 @@ def test_removal_is_confined_to_the_snapshot_root(session, tmp_path):
     # And the root itself is never a valid target.
     assert remove_conversation_sessions(project_dir, ".") is False
     assert sessions_root(project_dir).is_dir()
+
+
+def test_sweep_never_touches_the_unscoped_bucket(session, tmp_path):
+    """anton's `_no-session` bucket is live state, not an orphan.
+
+    cowork-server usually supplies a `session_id`, but not always —
+    `services/connectors/probe.py` builds a `ChatSession` with no conversation for
+    connector probing, and a probe that execs a cell writes there. A rule of "any
+    directory not in the live conversation set" would delete it on every boot.
+    """
+    project = session.get(Project, GENERAL_PROJECT_ID)
+    bucket = sessions_root(project.path) / "_no-session"
+    bucket.mkdir(parents=True, exist_ok=True)
+    (bucket / "probe.pkl").write_bytes(b"live probe state")
+
+    sweep_orphan_sessions(session)
+
+    assert bucket.is_dir(), "the unscoped bucket must survive the sweep"
+
+
+def test_sweep_only_removes_conversation_shaped_directories(session):
+    """Anything that isn't a conversation id is left alone — deletes must be narrow."""
+    project = session.get(Project, GENERAL_PROJECT_ID)
+    root = sessions_root(project.path)
+    root.mkdir(parents=True, exist_ok=True)
+    keep = root / "some-future-sibling"
+    keep.mkdir(exist_ok=True)
+    orphan = root / "00000000-0000-0000-0000-0000deadbeef"
+    orphan.mkdir(exist_ok=True)
+
+    sweep_orphan_sessions(session)
+
+    assert not orphan.exists(), "a real conversation-shaped orphan is still swept"
+    assert keep.is_dir(), "an unrecognised directory must be left alone"
+
+
+def test_uuid_needs_no_sanitising(session):
+    """Pins the cross-repo invariant this module's prune depends on.
+
+    anton sanitises the session id into the directory name (`[A-Za-z0-9._-]`); we build
+    it from a raw `str(conversation_id)`. Those agree only because a UUID contains
+    nothing that sanitisation would touch. If that ever stops holding, the two repos
+    disagree on the path and the prune silently stops matching.
+    """
+    import re
+    from uuid import uuid4
+
+    raw = str(uuid4())
+    sanitised = re.sub(r"[^A-Za-z0-9._-]", "_", raw).strip("._")
+    assert sanitised == raw, "a UUID must survive anton's path sanitiser unchanged"

@@ -24,14 +24,35 @@ rest outliving the conversation that was allowed to see it.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from pathlib import Path
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
-# Must match `_session_snapshot_path` in anton's `core/backends/local.py`.
+# Must match `snapshot_dir` in anton's `core/backends/local.py`.
+#
+# ⚠️ Cross-repo invariant: anton *sanitises* the session id into this directory name
+# (`[A-Za-z0-9._-]`, leading dots stripped); we build it from a raw
+# `str(conversation_id)`. Those agree for UUIDs — which is all cowork-server ever
+# passes as `session_id` — and `test_uuid_needs_no_sanitising` pins that. If a host
+# ever supplies a non-UUID session id the two would diverge, the prune would silently
+# stop matching, and the leak would come back with no error anywhere.
 _SESSIONS_DIRNAME = "scratchpad-sessions"
+
+# anton's bucket for pads created without a conversation scope. cowork-server normally
+# passes one, but not always: `services/connectors/probe.py` builds a `ChatSession`
+# with no conversation for connector probing. Never sweep it — it is not an orphan, it
+# is another component's live state.
+_UNSCOPED_BUCKET = "_no-session"
+
+# Only ever sweep directories that actually look like a conversation id. "Not in the
+# live set" is far too broad a rule for a delete: anything else that ever lands in this
+# folder (a bucket name, a stray file, a future sibling) would be destroyed on boot.
+_CONVERSATION_DIR = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def sessions_root(project_path: str | Path) -> Path:
@@ -128,6 +149,8 @@ def sweep_orphan_sessions(session) -> int:
             continue
         for child in children:
             if not child.is_dir() or child.name in live:
+                continue
+            if child.name == _UNSCOPED_BUCKET or not _CONVERSATION_DIR.match(child.name):
                 continue
             if _remove_contained(child, root):
                 removed += 1
