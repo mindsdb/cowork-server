@@ -9,10 +9,13 @@ heartbeat. Wired into the responses handler in a later task.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 
 from cowork.turnqueue.redis_client import get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings
+
+logger = logging.getLogger(__name__)
 
 
 def _new_correlation_id() -> str:
@@ -70,6 +73,10 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                     await buffer.close("completed")
                     return
                 if kind == "turn_failed":
+                    logger.warning(
+                        "Remote turn failed conversation=%s correlation_id=%s error=%s",
+                        conversation_id, corr, data.get("error"),
+                    )
                     await buffer.append("sse", {"sse": _sse(
                         "response.completed",
                         {"type": "response.completed", "error": data.get("error")})})
