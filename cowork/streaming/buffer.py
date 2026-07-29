@@ -86,8 +86,13 @@ def _safe_segment(name: str) -> str:
     return cleaned[:128]
 
 
+def conversation_dir(streams_dir: Path, conversation_id: str) -> Path:
+    """Directory holding all of a conversation's turn buffers."""
+    return streams_dir / _safe_segment(conversation_id)
+
+
 def turn_buffer_path(streams_dir: Path, conversation_id: str, turn_id: int) -> Path:
-    return streams_dir / _safe_segment(conversation_id) / f"turn_{int(turn_id):06d}.jsonl"
+    return conversation_dir(streams_dir, conversation_id) / f"turn_{int(turn_id):06d}.jsonl"
 
 
 def read_records(path: Path, from_seq: int = 0) -> Iterator[TurnRecord]:
