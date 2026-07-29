@@ -197,6 +197,20 @@ def _harness_options() -> list[str]:
 # planning_model / coding_model are DELIBERATELY absent (ENG-739): a model in
 # .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
 # token-refresh would re-pin a picker choice from a stale ``latest:`` line.
+#
+# max_tool_rounds / max_continuations are DELIBERATELY absent too, for the
+# ENG-739 reason plus a harder failure mode: anton's own CoreSettings accepts
+# any int, so a stale anton-CLI line like ANTON_MAX_TOOL_ROUNDS=1000 in the
+# shared ~/.cowork/.env is valid for the CLI but fails UserSettings' bounds —
+# and because sync_env_vars_to_db validates every mapped key and raises on the
+# first failure, one such line would 400 every credential push / token
+# refresh. Budgets enter the DB only via explicit writes (Settings UI / API).
+#
+# General inclusion rule: a key belongs here only if (a) every value anton's
+# own settings accept for it is also valid for UserSettings, and (b)
+# re-syncing a stale .env line can never override a choice the user made in
+# the product. When in doubt, leave it out — .env lines still work for the
+# standalone anton CLI.
 SETTING_ENV_ALIASES: dict[str, str] = {
     "anthropic_api_key": "ANTON_ANTHROPIC_API_KEY",
     "openai_api_key": "ANTON_OPENAI_API_KEY",
