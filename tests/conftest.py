@@ -20,9 +20,8 @@ os.environ["COWORK_PROJECTS_DIR"] = str(TMP / "projects")
 # File bytes too — without this, any test using FileService writes into the
 # developer's real ~/.cowork/files/ and orphans dirs there.
 os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
-# Home dir too: cowork_home() backs the .env path. A settings write now mirrors
-# the DB out to $COWORK_HOME/.env for the CLI (ENG-1127), so without this a
-# settings-writing test would rewrite the developer's real ~/.cowork/.env.
+# Home dir too: a settings write now mirrors the DB to $COWORK_HOME/.env for the
+# CLI (ENG-1127), so without this a test would rewrite the real ~/.cowork/.env.
 os.environ["COWORK_HOME"] = str(TMP)
 os.environ["ENV"] = "test"
 
