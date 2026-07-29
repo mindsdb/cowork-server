@@ -24,9 +24,12 @@ from cowork.services.providers import GEMINI_BASE_URL
 def build(monkeypatch):
     """Return a `build(settings) -> (client, calls)` helper.
 
-    `calls` maps "openai"/"anthropic" → constructor kwargs in build order.
-    Newer Anton builds may construct an optional router provider first, so
-    assertions use the final planning/coding construction."""
+    `calls` maps "openai"/"anthropic" → list of constructor kwarg dicts, in the
+    order build_llm_client built them. When the installed anton's LLMClient
+    accepts a router role, build_llm_client constructs that one first, so the
+    list may start with a router call before planning/coding — tests index
+    `[-1]` (always the coding call) rather than `[0]` so they don't depend on
+    whether the router role happened to resolve to the same provider."""
     calls: dict[str, list[dict]] = {}
 
     def _capture(kind):
