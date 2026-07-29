@@ -48,9 +48,17 @@ def _svc(engine, scope: TenantScope) -> ScheduleService:
 
 
 def _make(svc: ScheduleService) -> object:
+    # Explicit in-scope project: create_schedule now anchors project_id (same
+    # as conversations), and the NULL-org GENERAL seed isn't visible to an
+    # org scope.
+    project = Project(name=f"p-{uuid4().hex[:6]}", path="/tmp/p")
+    svc.session.add(project)
+    svc.session.commit()
+    svc.session.refresh(project)
     return svc.create_schedule(
         title="daily report", prompt="do it", cadence="daily",
         next_run_at=datetime(2026, 1, 1, tzinfo=timezone.utc), model="sonnet",
+        project_id=project.id,
     )
 
 
@@ -74,6 +82,30 @@ def test_other_org_cannot_see_or_touch(engine):
         b.pause_schedule(sched.id)
     assert b.delete_schedule(sched.id) is False  # nonexistent-shaped
     assert a.get_schedule(sched.id).title == "daily report"  # untouched
+
+
+def test_create_anchors_project_cross_org(engine):
+    # B must not create a schedule under A's project (foreign-parent write).
+    a = _svc(engine, _scope(ORG_A))
+    b = _svc(engine, _scope(ORG_B))
+    a_sched = _make(a)
+    with pytest.raises(ValueError, match="not found"):
+        b.create_schedule(
+            title="t", prompt="p", cadence="daily",
+            next_run_at=datetime(2026, 1, 1, tzinfo=timezone.utc), model="m",
+            project_id=a_sched.project_id,
+        )
+
+
+def test_update_anchors_project_cross_org(engine):
+    # B must not repoint its own schedule onto A's project.
+    a = _svc(engine, _scope(ORG_A))
+    b = _svc(engine, _scope(ORG_B))
+    a_sched = _make(a)
+    b_sched = _make(b)
+    with pytest.raises(ValueError, match="not found"):
+        b.update_schedule(b_sched.id, project_id=a_sched.project_id)
+    assert b.get_schedule(b_sched.id).project_id != a_sched.project_id
 
 
 def test_runs_are_anchored_to_parent_schedule(engine):
