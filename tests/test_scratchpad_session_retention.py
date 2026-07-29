@@ -168,3 +168,40 @@ def test_uuid_needs_no_sanitising(session):
     raw = str(uuid4())
     sanitised = re.sub(r"[^A-Za-z0-9._-]", "_", raw).strip("._")
     assert sanitised == raw, "a UUID must survive anton's path sanitiser unchanged"
+
+
+def test_non_uuid_conversation_id_is_refused_before_any_path_work(session, tmp_path):
+    """The id becomes a path segment we delete recursively, so validate at the boundary.
+
+    CodeQL flagged `py/path-injection` (high) here: the id arrives from an HTTP path
+    parameter. Containment downstream did catch traversal, but late — and the function
+    signature accepts `str`, so a future caller could pass anything. Parsing through
+    `UUID` refuses it before a path is ever built.
+    """
+    from cowork.services.scratchpad_sessions import (
+        conversation_session_dir,
+        remove_conversation_sessions,
+    )
+
+    project_dir = tmp_path / "project"
+    sessions_root(project_dir).mkdir(parents=True)
+
+    for bad in ["../../etc", "..", ".", "", "not-a-uuid", "a/b", None]:
+        assert conversation_session_dir(project_dir, bad) is None, bad
+        assert remove_conversation_sessions(project_dir, bad) is False, bad
+
+    assert sessions_root(project_dir).is_dir(), "nothing under the root was touched"
+
+
+def test_canonical_uuid_is_accepted_in_any_case(session, tmp_path):
+    """A real id still works, and is canonicalised so casing can't fork the directory."""
+    from uuid import uuid4
+
+    from cowork.services.scratchpad_sessions import conversation_session_dir
+
+    u = uuid4()
+    lower = conversation_session_dir(tmp_path, str(u))
+    upper = conversation_session_dir(tmp_path, str(u).upper())
+    assert lower is not None and upper is not None
+    assert lower == upper, "casing must not produce two directories for one conversation"
+    assert lower.name == str(u)
