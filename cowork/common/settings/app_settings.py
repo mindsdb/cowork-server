@@ -444,7 +444,11 @@ class AppSettings(Settings):
     # set the corresponding UserSettings override these; users who don't get
     # these values. Hosted deployments (where inference cost lands on the
     # operator and the Settings UI is unreachable — sidebar entries are
-    # desktop-only) can lower them without touching per-user rows.
+    # desktop-only) can lower them without touching per-user rows; commented
+    # entries live in deployment/cowork-server/values-{prod,staging}.yaml.
+    # NOTE: get_app_settings() is @lru_cache'd, so changing the COWORK_DEFAULT_*
+    # env requires a process restart — "I changed the env and nothing happened"
+    # means the old value is cached for the life of the process.
     default_max_tool_rounds: int = Field(
         default=50,
         ge=5,
