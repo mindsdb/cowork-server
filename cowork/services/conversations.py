@@ -371,6 +371,14 @@ class ConversationService:
         # Drop stale stream buffers so a resend regenerates instead of replaying
         # a deleted turn (turn_id == message count collides after truncation).
         _discard_conversation_streams(conversation_id)
+        # Rewinding history must rewind the scratchpad too. The namespace snapshot is at
+        # the state the *deleted* turns left it in, so without this a resend reloads
+        # variables created by a turn the user just removed — the visible history and the
+        # agent's actual state would disagree. Cheapest correct answer is to drop the
+        # snapshot: the agent then rebuilds from the surviving history, which is exactly
+        # what the user asked for by truncating.
+        project = self.session.get(Project, conversation.project_id)
+        remove_conversation_sessions(project.path if project else None, conversation_id)
         return len(to_delete)
 
     def save_assistant_turn(

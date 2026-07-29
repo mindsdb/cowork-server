@@ -40,10 +40,10 @@ logger = logging.getLogger(__name__)
 # would disagree on the path, and the prune would silently stop matching.
 _SESSIONS_DIRNAME = "scratchpad-sessions"
 
-# anton's bucket for pads created without a conversation scope. cowork-server normally
-# passes one, but not always: `services/connectors/probe.py` builds a `ChatSession`
-# with no conversation for connector probing. Never sweep it — it is not an orphan, it
-# is another component's live state.
+# anton no longer writes an unscoped bucket at all — it refuses to persist without a
+# session id, precisely because `CredentialProbe` runs unscoped and parses `DS_*`
+# credentials (anton#283 review). Kept as a guard anyway: an older anton in the field
+# still creates it, and it is another component's live state, not an orphan.
 _UNSCOPED_BUCKET = "_no-session"
 
 
@@ -148,7 +148,14 @@ def sweep_orphan_sessions(session) -> int:
         # box, so it must see all conversation ids. Scoping it would make every other
         # org's live conversations look orphaned and delete their snapshots.
         projects = session.exec(select(Project)).all()
-        live = {str(cid) for cid in session.exec(select(Conversation.id)).all()}
+        # Liveness is per (project, conversation), not global by conversation id. A
+        # conversation that moved from project A to B keeps a directory under A; treating
+        # it as live everywhere would strand that directory forever, and conversation
+        # delete only ever cleans the current project. Scoping the check lets the sweep
+        # reclaim the one left behind by the move.
+        live_by_project: dict = {}
+        for cid, pid in session.exec(select(Conversation.id, Conversation.project_id)).all():
+            live_by_project.setdefault(str(pid), set()).add(str(cid))
     except Exception:
         logger.exception("scratchpad-session sweep: could not read projects/conversations")
         return 0
@@ -157,6 +164,7 @@ def sweep_orphan_sessions(session) -> int:
         root = sessions_root(project.path) if project.path else None
         if root is None or not root.is_dir():
             continue
+        live = live_by_project.get(str(project.id), set())
         try:
             children = list(root.iterdir())
         except OSError:

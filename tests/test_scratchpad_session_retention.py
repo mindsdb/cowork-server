@@ -205,3 +205,52 @@ def test_canonical_uuid_is_accepted_in_any_case(session, tmp_path):
     assert lower is not None and upper is not None
     assert lower == upper, "casing must not produce two directories for one conversation"
     assert lower.name == str(u)
+
+
+def test_delete_turn_invalidates_the_snapshot(session):
+    """Rewinding history must rewind the scratchpad too.
+
+    Without this, truncating the visible history leaves the snapshot at the state the
+    *deleted* turns produced, so a resend reloads variables created by a turn the user
+    just removed — the history and the agent's state silently disagree.
+    """
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+    svc.save_user_message(conv.id, "do a thing")
+    svc.save_assistant_turn(conv.id, "did the thing", [])
+    folder = _seed_snapshot(session, conv.id)
+    assert folder.is_dir(), "precondition"
+
+    svc.delete_turn(conv.id, 0)
+
+    assert not folder.exists(), "snapshot must not outlive the turns that produced it"
+
+
+def test_sweep_reclaims_a_directory_left_behind_by_a_project_move(session):
+    """Liveness is per (project, conversation), not global by conversation id.
+
+    A conversation moved from project A to B keeps a directory under A. Checking
+    liveness globally marks it live forever, and conversation delete only cleans the
+    current project — so the one under A would be stranded.
+    """
+    from cowork.services.projects import ProjectService
+
+    projects = ProjectService(ScopedSession(session, LOCAL_SCOPE))
+    other = projects.create_project("eng1124-move-test")
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    conv = svc.create_conversation("mover", project_id=GENERAL_PROJECT_ID)
+
+    stale = _seed_snapshot(session, conv.id)          # written while in General
+    conv.project_id = other.id                        # ...then moved
+    session.add(conv)
+    session.commit()
+    fresh = conversation_session_dir(other.path, conv.id)
+    fresh.mkdir(parents=True, exist_ok=True)
+    (fresh / "forecast.pkl").write_bytes(b"current")
+
+    sweep_orphan_sessions(session)
+
+    assert not stale.exists(), "the directory under the old project must be reclaimed"
+    assert fresh.is_dir(), "the directory under the current project must survive"
+
+    svc.delete_conversation(conv.id)
