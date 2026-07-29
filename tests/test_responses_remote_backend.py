@@ -3,8 +3,8 @@ through the Redis-backed remote producer instead of the in-process detached
 run; unset/"inprocess" must stay byte-identical to today.
 
 Built without __init__ (same pattern as tests/test_turn_errors.py) so no
-DB/harness setup is needed - _select_producer only touches self.scoped and
-self._produce.
+DB/harness setup is needed - _select_producer only touches self.scoped,
+self._produce and self._remote_history (stubbed here; it needs a DB session).
 """
 from __future__ import annotations
 
@@ -65,6 +65,8 @@ def test_remote_backend_selected(monkeypatch):
         raise AssertionError("in-process _produce must not run when backend=remote")
 
     handler._produce = _boom
+    prior = [{"role": "user", "content": "earlier"}]
+    handler._remote_history = lambda conv_id: prior
 
     kwargs = _kwargs()
     result = handler._select_producer(**kwargs)
@@ -76,6 +78,7 @@ def test_remote_backend_selected(monkeypatch):
     assert called["input_text"] == "hello there"
     assert called["model"] == "anton"
     assert called["buffer"] is kwargs["buffer"]
+    assert called["history"] == prior
 
 
 @pytest.mark.parametrize("backend_env", [None, "inprocess"])
