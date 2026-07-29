@@ -7,6 +7,13 @@ from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.encryption import decrypt, encrypt
+from cowork.common.paths import cowork_home
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.env_export import (
+    atomic_write_env,
+    build_env_export,
+    merge_env_lines,
+)
 from cowork.common.settings.user_settings import (
     UserSettings,
     invalidate_user_settings_cache,
@@ -154,11 +161,49 @@ class SettingService:
             row.value = store_val
         self.session.add(row)
 
-    def upsert_setting(self, key: str, value: str) -> SettingResponse:
+    def _after_write(self, *, export_env: bool = True) -> None:
+        """Post-commit hook shared by the settings mutators.
+
+        Invalidates the settings cache and, on a single-user desktop install,
+        mirrors the DB out to the CLI's ``.env`` (ENG-1127). ``export_env=False``
+        is for the startup ``.env``→DB migration, which must not rewrite the very
+        file it is seeding from — doing so mid-loop would strip the keys it has
+        not migrated yet.
+        """
+        invalidate_user_settings_cache()
+        if export_env:
+            self._export_env_for_cli()
+
+    def _export_env_for_cli(self) -> None:
+        """Mirror the DB's aliased settings to the CLI's ``.env`` (best-effort).
+
+        The DB is the source of truth (ENG-1127); ``.env`` is a derived export
+        the standalone ``anton`` CLI reads. Only runs for ``local`` (single-user
+        desktop) tenancy — a multi-tenant cloud pod has no per-user ``.env`` or
+        CLI and must not spill decrypted secrets to disk. Re-derives the whole
+        managed set from the DB and merge-writes it, preserving every unmanaged
+        line (auth token, CLI-only model pins, comments). Skips the write when
+        the file is already current. Never raises into the write that triggered
+        it — a stale ``.env`` must not fail a settings save.
+        """
+        try:
+            if get_app_settings().tenancy_mode != "local":
+                return
+            rows = self._fetch_all_rows()
+            managed = build_env_export(self._load(rows), {row.key for row in rows})
+            path = cowork_home() / ".env"
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            content = merge_env_lines(existing, managed)
+            if content != existing:
+                atomic_write_env(path, content)
+        except Exception as exc:  # noqa: BLE001 - export is best-effort
+            logger.warning("settings: .env export for the CLI failed: %s", exc)
+
+    def upsert_setting(self, key: str, value: str, *, export_env: bool = True) -> SettingResponse:
         store_val, validated = self._encode_for_store(key, value)
         self._write_row(key, store_val)
         self.session.commit()
-        invalidate_user_settings_cache()
+        self._after_write(export_env=export_env)
         return self._to_response(key, validated, True)
 
     def save_all(self, updates: dict[str, str]) -> list[str]:
@@ -180,7 +225,7 @@ class SettingService:
             self._write_row(key, store_val)
         if encoded:
             self.session.commit()
-            invalidate_user_settings_cache()
+            self._after_write()
         return list(encoded.keys())
 
     def bulk_upsert(self, updates: dict[str, str]) -> list[str]:
@@ -228,7 +273,7 @@ class SettingService:
             return False
         self.session.delete(row)
         self.session.commit()
-        invalidate_user_settings_cache()
+        self._after_write()
         return True
 
     def clear_credentials(self) -> list[str]:
@@ -261,6 +306,6 @@ class SettingService:
                 deleted.append(key)
         if deleted:
             self.session.commit()
-            invalidate_user_settings_cache()
+            self._after_write()
         return deleted
 
