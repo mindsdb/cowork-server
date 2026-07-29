@@ -59,6 +59,21 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
+    # Reclaim scratchpad namespace snapshots whose conversation is gone (ENG-1124).
+    # `delete_conversation` prunes its own from now on; this catches everything
+    # deleted before that shipped, plus any path that drops a conversation row
+    # without going through ConversationService.
+    try:
+        from cowork.db.session import get_open_session
+        from cowork.services.scratchpad_sessions import sweep_orphan_sessions
+
+        sweep_session = get_open_session()
+        try:
+            sweep_orphan_sessions(sweep_session)
+        finally:
+            sweep_session.close()
+    except Exception:
+        logger.exception("scratchpad-session boot sweep failed (non-fatal)")
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
     # run and never fires that schedule again.
