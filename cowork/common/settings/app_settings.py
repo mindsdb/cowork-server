@@ -35,7 +35,7 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 # providers use their smallest model. The frontend falls back
 # to the coding slot when the 3rd is absent, so an older client still works.
 RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
-    "minds-cloud": ("kimi3", "haiku", "gpt-mini"),
+    "minds-cloud": ("kimi", "haiku", "gpt-mini"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
     "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
     "gemini": ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash"),
@@ -55,7 +55,7 @@ PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
     "gemini": "gemini-2.5-pro",
-    "minds_cloud": "kimi3",
+    "minds_cloud": "kimi",
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
