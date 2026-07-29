@@ -164,11 +164,8 @@ class SettingService:
     def _after_write(self, *, export_env: bool = True) -> None:
         """Post-commit hook shared by the settings mutators.
 
-        Invalidates the settings cache and, on a single-user desktop install,
-        mirrors the DB out to the CLI's ``.env`` (ENG-1127). ``export_env=False``
-        is for the startup ``.env``→DB migration, which must not rewrite the very
-        file it is seeding from — doing so mid-loop would strip the keys it has
-        not migrated yet.
+        Invalidates the cache and (desktop install) mirrors the DB to the CLI's
+        ``.env`` (ENG-1127); ``export_env=False`` skips the mirror for the seeding migration.
         """
         invalidate_user_settings_cache()
         if export_env:
@@ -177,14 +174,8 @@ class SettingService:
     def _export_env_for_cli(self) -> None:
         """Mirror the DB's aliased settings to the CLI's ``.env`` (best-effort).
 
-        The DB is the source of truth (ENG-1127); ``.env`` is a derived export
-        the standalone ``anton`` CLI reads. Only runs for ``local`` (single-user
-        desktop) tenancy — a multi-tenant cloud pod has no per-user ``.env`` or
-        CLI and must not spill decrypted secrets to disk. Re-derives the whole
-        managed set from the DB and merge-writes it, preserving every unmanaged
-        line (auth token, CLI-only model pins, comments). Skips the write when
-        the file is already current. Never raises into the write that triggered
-        it — a stale ``.env`` must not fail a settings save.
+        Local (desktop) tenancy only — a cloud pod must not spill decrypted secrets
+        to disk (ENG-1127). Never raises — a stale ``.env`` must not fail a save.
         """
         try:
             if get_app_settings().tenancy_mode != "local":

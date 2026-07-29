@@ -1,8 +1,7 @@
-"""ENG-1127 Phase A: the server exports the DB's settings back to the CLI's .env.
+"""ENG-1127 Phase A: the server exports the DB's settings to the CLI's .env.
 
-Pure derivation (build_env_export / merge_env_lines) plus the SettingService
-integration: a write mirrors to .env only for local tenancy, preserves unmanaged
-lines (auth token, CLI model pins), and the .env→DB migration never re-exports.
+Pure derivation plus the SettingService integration (local-tenancy-only,
+preserves unmanaged lines, migration never re-exports).
 """
 from types import SimpleNamespace
 
@@ -22,25 +21,22 @@ def test_build_env_export_formats_and_excludes_models():
         anthropic_api_key="sk-secret",
         planning_provider="minds_cloud",
         minds_url="https://mdb.example",
-        planning_model="latest:sonnet",  # not aliased — must NOT be exported
+        planning_model="latest:sonnet",  # not aliased (ENG-739)
     )
     present = {"anthropic_api_key", "planning_provider", "minds_url", "planning_model"}
     out = build_env_export(s, present)
     assert out["ANTON_ANTHROPIC_API_KEY"] == "sk-secret"  # decrypted plaintext
-    assert out["ANTON_PLANNING_PROVIDER"] == "minds-cloud"  # ui_value (dash form)
+    assert out["ANTON_PLANNING_PROVIDER"] == "minds-cloud"  # dash form
     assert out["ANTON_MINDS_URL"] == "https://mdb.example"
-    # Model keys are deliberately not in SETTING_ENV_ALIASES (ENG-739).
     assert not any("MODEL" in k for k in out)
 
 
 def test_build_env_export_only_exports_stored_keys():
-    # minds_url has a non-None default, but with no row present it must not be
-    # exported — .env mirrors stored settings, not resolved defaults.
+    # minds_url has a non-None default but no row → must not be exported
     s = UserSettings(anthropic_api_key="sk-x")
     out = build_env_export(s, present_keys={"anthropic_api_key"})
     assert out == {"ANTON_ANTHROPIC_API_KEY": "sk-x"}
-    assert "ANTON_MINDS_URL" not in out  # defaulted but not stored
-    # Nothing stored at all → empty export.
+    assert "ANTON_MINDS_URL" not in out
     assert build_env_export(UserSettings(), present_keys=set()) == {}
 
 
@@ -67,7 +63,7 @@ def test_merge_preserves_unmanaged_and_replaces_managed():
 
 def test_merge_drops_cleared_managed_key():
     existing = "COWORK_AUTH_TOKEN=tok\nANTON_MINDS_API_KEY=old\n"
-    merged = merge_env_lines(existing, {})  # nothing set → managed keys removed
+    merged = merge_env_lines(existing, {})
     assert "ANTON_MINDS_API_KEY" not in merged
     assert "COWORK_AUTH_TOKEN=tok" in merged
 
@@ -93,7 +89,6 @@ def _cleanup(session, *keys):
 
 def test_save_all_exports_env_and_preserves_unmanaged(local_export):
     env_path = local_export
-    # A pre-existing .env with an auth token and a CLI-only model pin.
     env_path.write_text("COWORK_AUTH_TOKEN=tok-1\nANTON_PLANNING_MODEL=latest:sonnet\n", encoding="utf-8")
     session = get_open_session()
     try:
@@ -102,10 +97,10 @@ def test_save_all_exports_env_and_preserves_unmanaged(local_export):
             {"minds_api_key": "sk-abc", "minds_url": "https://mdb", "planning_provider": "minds_cloud"}
         )
         text = env_path.read_text(encoding="utf-8")
-        assert "ANTON_MINDS_API_KEY=sk-abc" in text           # decrypted secret
+        assert "ANTON_MINDS_API_KEY=sk-abc" in text
         assert "ANTON_MINDS_URL=https://mdb" in text
-        assert "ANTON_PLANNING_PROVIDER=minds-cloud" in text  # dash form
-        # Unmanaged lines the server must not touch.
+        assert "ANTON_PLANNING_PROVIDER=minds-cloud" in text
+        # unmanaged lines the server must not touch
         assert "COWORK_AUTH_TOKEN=tok-1" in text
         assert "ANTON_PLANNING_MODEL=latest:sonnet" in text
         assert oct(env_path.stat().st_mode)[-3:] == "600"
@@ -150,8 +145,7 @@ def test_clear_credentials_wipes_creds_from_env_but_keeps_model(local_export):
 
 
 def test_migration_write_does_not_export(local_export):
-    # migrate_env_to_db seeds the DB *from* .env with export_env=False, so a
-    # per-key seed write must not rewrite (and mid-loop truncate) that .env.
+    # migration seeds the DB from .env (export_env=False), so a seed write must not rewrite it
     env_path = local_export
     session = get_open_session()
     try:

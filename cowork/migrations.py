@@ -142,11 +142,9 @@ def migrate_env_to_db(session: Session) -> bool:
             if setting_key.endswith("_provider"):
                 val = _normalize_provider_value(val, dotenv)
             try:
-                # export_env=False: this loop seeds the DB *from* .env; letting
-                # the per-key write re-export .env mid-loop would strip the keys
-                # not migrated yet (and blow them away on a crash). The DB is
-                # authoritative once seeding completes; the next real write
-                # exports the reconciled file (ENG-1127).
+                # export_env=False: this loop seeds the DB *from* .env; a per-key
+                # re-export mid-loop would strip the keys not migrated yet. The
+                # next real write exports the reconciled file (ENG-1127).
                 svc.upsert_setting(setting_key, val, export_env=False)
                 migrated_keys.append(setting_key)
             except Exception as e:
