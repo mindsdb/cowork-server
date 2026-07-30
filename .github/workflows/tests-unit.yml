@@ -2,6 +2,18 @@ name: Unit Tests
 
 on:
   workflow_call:
+    inputs:
+      anton-ref:
+        description: >-
+          anton git ref to test against, overriding the committed anton-agent
+          pin for the duration of this job only. Staging-line callers pass
+          "staging" so cowork-server's staging code is validated against anton's
+          staging HEAD rather than the committed (main-line) pin — this is what
+          lets a cross-repo change ride staging before it reaches anton/main
+          without hand-pinning an anton SHA. Empty (the default) leaves the pin
+          as committed, which is correct for the main/prod line.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -20,6 +32,17 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
+
+      # Repoint anton-agent at the line under test before syncing. Ephemeral:
+      # it edits the working checkout, never a commit, so nothing is promoted.
+      # The committed pin (main-line) is untouched on disk after the run.
+      - name: Point anton-agent at the ${{ inputs.anton-ref }} line
+        if: inputs.anton-ref != ''
+        run: |
+          set -euo pipefail
+          sed -i -E 's#(anton-agent = \{ git = "[^"]*", rev = )"[^"]*"#\1"${{ inputs.anton-ref }}"#' pyproject.toml
+          grep -q 'rev = "${{ inputs.anton-ref }}"' pyproject.toml
+          uv lock --upgrade-package anton-agent
 
       - name: Install dependencies
         run: uv sync --group dev

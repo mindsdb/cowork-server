@@ -48,6 +48,11 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/tests-unit.yml
+    with:
+      # Staging line: validate against anton's staging HEAD, not the committed
+      # main-line pin. Without this a cross-repo change that lives on
+      # anton/staging can't be imported here until it reaches anton/main.
+      anton-ref: staging
 
   build-deploy:
     # The container image, for the per-PR environments and whatever comes after.
