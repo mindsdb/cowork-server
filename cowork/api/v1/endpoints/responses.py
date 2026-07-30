@@ -26,6 +26,7 @@ from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, get_principal
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import RunHandle, registry
+from cowork.streaming.answers import SubmitResult, broker
 
 
 logger = setup_logging()
@@ -159,6 +160,56 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
         return JSONResponse(status_code=404, content={"status": "not_found"})
     cancelled = await handle.cancel()
     return {"cancelled": cancelled, "conversation_id": req.conversation_id}
+
+
+class AnswerRequest(BaseModel):
+    conversation_id: str
+    question_id: str
+    values: list[str] | None = None
+    text: str | None = None
+    skipped: bool | None = None
+
+
+@router.post("/answer")
+async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
+    """Deliver the user's answer to a question a turn is blocked on.
+
+    404 mirrors /cancel: no run the caller may touch, or no such pending
+    question. 409 means somebody already answered — a second tab, or a
+    double click. The client's source of truth for what was chosen is the
+    response.ask_user_answered event, not its own click.
+    """
+    _require_streaming_scope(scope)
+    handle = _authorized_handle(registry.get(req.conversation_id), scope)
+    if handle is None:
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+
+    values = [v for v in (req.values or []) if v]
+    text = (req.text or "").strip()
+    skipped = bool(req.skipped)
+    if skipped and (values or text):
+        return JSONResponse(status_code=400, content={"status": "ambiguous_answer"})
+    if not (values or text or skipped):
+        return JSONResponse(status_code=400, content={"status": "empty_answer"})
+
+    payload: dict = {}
+    if values:
+        payload["values"] = values
+    if text:
+        payload["text"] = text
+    if skipped:
+        payload["skipped"] = True
+
+    result = broker.submit(req.conversation_id, req.question_id, payload)
+    if result is SubmitResult.NOT_FOUND:
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+    if result is SubmitResult.ALREADY_ANSWERED:
+        return JSONResponse(
+            status_code=409, content={"accepted": False, "status": "already_answered"}
+        )
+    if result is SubmitResult.INVALID_OPTION:
+        return JSONResponse(status_code=400, content={"status": "invalid_option"})
+    return {"accepted": True}
 
 
 @router.get("/tail")
