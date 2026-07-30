@@ -12,6 +12,7 @@ import json
 import logging
 import uuid
 
+from cowork.handlers.turn_errors import remote_turn_error, response_failed_sse
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.turnqueue.redis_client import get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings
@@ -31,6 +32,7 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               user_id: str | None, input_text: str,
                               model: str | None, buffer,
                               history: list | None = None,
+                              harness_id: str | None = None,
                               on_event=None) -> None:
     """`on_event(kind, data)` is called per reply (turn_delta/turn_completed/
     turn_failed) so the caller can collect the turn for persistence."""
@@ -50,8 +52,12 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                 "model": model, "history": history or []},
     )
     await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
-    await buffer.append("sse", {"sse": _sse("response.created",
-                                            {"type": "response.created"})})
+    # conversation_id + harness mirror _inject_created on the in-process path:
+    # the client learns the canonical id (it may have sent a non-UUID one).
+    created = {"type": "response.created", "conversation_id": conversation_id}
+    if harness_id:
+        created["harness"] = harness_id
+    await buffer.append("sse", {"sse": _sse("response.created", created)})
 
     last_id = "0-0"
     while True:
@@ -66,6 +72,11 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                     continue
                 kind = reply.kind
                 data = reply.data or {}
+                if kind == "turn_failed":
+                    # Classify once; the SSE frame and the caller's persisted
+                    # events log must carry the same (code, message).
+                    code, message = remote_turn_error(data.get("error"))
+                    data = {**data, "code": code, "message": message}
                 if on_event is not None and kind in ("turn_delta", "turn_completed", "turn_failed"):
                     on_event(kind, data)
                 if kind == "turn_delta":
@@ -83,8 +94,10 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                         "Remote turn failed conversation=%s correlation_id=%s error=%s",
                         conversation_id, corr, data.get("error"),
                     )
-                    await buffer.append("sse", {"sse": _sse(
-                        "response.completed",
-                        {"type": "response.completed", "error": data.get("error")})})
+                    # Same response.failed frame the in-process path emits, so
+                    # the client renders the existing error card (a bare
+                    # response.completed+error renders as nothing).
+                    await buffer.append("sse", {"sse": response_failed_sse(
+                        data["message"], data["code"])})
                     await buffer.close("error")
                     return

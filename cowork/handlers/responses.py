@@ -248,7 +248,11 @@ class ResponsesHandler:
             elif kind == "turn_completed":
                 collected_events.append({"type": "response.completed"})
             elif kind == "turn_failed":
-                collected_events.append({"type": "response.completed", "error": data.get("error")})
+                # Producer attaches the classified (code, message) it streamed.
+                collected_events.append(response_failed_payload(
+                    data.get("message") or GENERIC_TURN_ERROR_MESSAGE,
+                    data.get("code") or GENERIC_TURN_ERROR_CODE,
+                ))
 
         def persist() -> None:
             nonlocal persisted
@@ -277,6 +281,7 @@ class ResponsesHandler:
                 # Producer session, NOT self.scoped: this coroutine is detached
                 # and the request session may be closed by the time it runs.
                 history=self._remote_history(producer_session, conv_id),
+                harness_id=harness_id,
                 on_event=on_event,
             )
             persist()

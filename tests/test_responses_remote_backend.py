@@ -145,7 +145,9 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
 
     async def fake_produce_remote_turn(*, on_event=None, **kwargs):
         on_event("turn_delta", {"text": "partial"})
-        on_event("turn_failed", {"error": "boom"})
+        # The real producer attaches the classified (code, message) it streamed.
+        on_event("turn_failed", {"error": "RuntimeError: boom",
+                                 "code": "anton_error", "message": "An unexpected error occurred."})
 
     monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
 
@@ -156,7 +158,9 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
 
     assert saved["user"] == "hi"
     assert saved["assistant"] == "partial"
-    assert saved["events"][-1] == {"type": "response.completed", "error": "boom"}
+    # Persisted events mirror the streamed response.failed frame.
+    assert saved["events"][-1] == {"type": "response.failed", "code": "anton_error",
+                                   "error": "An unexpected error occurred."}
 
 
 @pytest.mark.parametrize("backend_env", [None, "inprocess"])

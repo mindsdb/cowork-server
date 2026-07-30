@@ -47,6 +47,45 @@ async def test_produce_remote_turn_streams_deltas(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_turn_failed_renders_as_response_failed(monkeypatch):
+    # A failed turn must stream the same response.failed frame the in-process
+    # path emits (the client renders nothing for a bare completed+error), with
+    # the pod's typed error string mapped to a friendly (code, message).
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply(
+        "turn_failed", {"error": "ProviderOverloadedError: Anthropic is momentarily overloaded."}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    buf = RecBuffer()
+    events = []
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=buf,
+                                   on_event=lambda kind, data: events.append((kind, data)))
+    failed = buf.records[-1][1]["sse"]
+    assert "response.failed" in failed
+    assert "provider_overloaded" in failed
+    assert "momentarily overloaded" in failed
+    assert buf.closed == "error"
+    # on_event sees the same classification the frame carried
+    assert events[-1][0] == "turn_failed"
+    assert events[-1][1]["code"] == "provider_overloaded"
+
+
+@pytest.mark.asyncio
+async def test_unmapped_turn_failure_is_redacted(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply(
+        "turn_failed", {"error": "RuntimeError: secret-internal-detail"}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    buf = RecBuffer()
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=buf)
+    failed = buf.records[-1][1]["sse"]
+    assert "response.failed" in failed
+    assert "anton_error" in failed
+    assert "secret-internal-detail" not in failed  # raw text never reaches the client
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_turn_history_defaults_empty(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
