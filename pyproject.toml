@@ -70,28 +70,9 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
-# MAIN-LINE anton, spelled exactly as on the main branch (`branch = "main"`) so
-# the two branches never diverge on this line — the release train's
-# main<->staging auto-merges then can't conflict on it or silently clobber it.
-# This is the source of truth for local dev and the prod wheel/lock.
-#
-# The staging line does NOT hand-pin an anton SHA. CI repoints anton-agent to
-# anton/staging (robustly, via `uv add`) for the staging-line unit tests
-# (.github/workflows/tests-unit.yml, from publish-staging.yml and PRs into
-# staging) and for the non-prod image build (build-deploy.yml), so staging code
-# is always validated against anton/staging without editing this file. See
-# ENG-1159.
-#
-# LOCAL DEV CAVEAT during an in-flight cross-repo release: if cowork-server
-# staging uses an anton symbol that is on anton/staging but not yet anton/main
-# (true for StreamReasoningDelta until the 8/2/26 promotion), a plain local
-# `uv sync` on staging resolves anton/main and won't have it. CI overrides, but
-# your laptop reads only this file. Pull staging anton into your venv without
-# touching the committed pin (self-resolves once anton/staging reaches main):
-#   uv sync --group dev
-#   uv pip install --reinstall-package anton-agent \
-#     "anton-agent @ git+https://github.com/mindsdb/anton.git@staging"
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
+# Update this anton-agent SHA pin if there are any further updates to anton before the 8/2/26 release
+# After 8/2/26 release, be sure to change the pin back to "main", with a hotfix
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "cff09f27c8f73ed8ca99d515c30933a935edec1f" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 

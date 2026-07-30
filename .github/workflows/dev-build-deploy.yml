@@ -41,6 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.decide.outputs.run }}
+      anton-ref: ${{ steps.decide.outputs.anton-ref }}
     steps:
       - name: Decide whether this PR needs the pipeline
         id: decide
@@ -51,6 +52,18 @@ jobs:
           THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [ "$BASE_REF" = "staging" ]; then
+            ANTON_SHA=$(git ls-remote https://github.com/mindsdb/anton.git refs/heads/staging | awk 'NR == 1 { print $1 }')
+            if [ -z "$ANTON_SHA" ]; then
+              echo "Could not resolve anton/staging" >&2
+              exit 1
+            fi
+            echo "anton-ref=$ANTON_SHA" >> "$GITHUB_OUTPUT"
+            echo "Resolved anton/staging to $ANTON_SHA" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "anton-ref=" >> "$GITHUB_OUTPUT"
+          fi
+
           if [ "$HEAD_REPO" != "$THIS_REPO" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             {
@@ -74,12 +87,13 @@ jobs:
   run-unit-tests:
     # Deliberately ungated: these run on `ubuntu-latest` with no secrets, so a
     # fork contributor gets the CI that matters to them.
+    needs: [gate]
     uses: ./.github/workflows/tests-unit.yml
     with:
-      # A feature PR merges into staging, so test against anton's staging HEAD;
-      # a staging->main promotion PR (base = main) keeps the committed pin so it
-      # validates exactly what main will ship. github.base_ref is the PR target.
-      anton-ref: ${{ github.base_ref == 'staging' && 'staging' || '' }}
+      # A feature PR into staging uses the immutable SHA resolved by the gate.
+      # A staging->main promotion or main-targeted hotfix gets an empty value,
+      # so tests and images both validate the committed main-line lock.
+      anton-ref: ${{ needs.gate.outputs.anton-ref }}
 
   workflow-lint:
     # actionlint, the caller/callee permission check, and a zizmor audit, from the
@@ -100,6 +114,7 @@ jobs:
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: development
+      anton-ref: ${{ needs.gate.outputs.anton-ref }}
       pr-environment: true
     secrets: inherit
 

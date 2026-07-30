@@ -40,6 +40,12 @@ on:
         description: "Runner label for the build and scan"
         type: string
         default: mdb-dev
+      anton-ref:
+        description: >-
+          Exact anton git ref to install in this image. Empty keeps the
+          committed pyproject/uv.lock source.
+        type: string
+        default: ""
       pr-environment:
         description: "Run the per-PR environment rollout and its access comment"
         type: boolean
@@ -71,25 +77,24 @@ jobs:
       - uses: actions/checkout@v5
       - uses: mindsdb/github-actions/setup-env@main
 
-      # Non-prod images (per-PR + staging) must run against anton's staging
-      # HEAD, not the committed main-line pin: cowork-server's staging code
-      # imports anton symbols that only reach anton/main at release. Repoint the
-      # workspace here (uv add updates pyproject + lock) so the Dockerfile's
-      # `uv sync --frozen` installs staging anton. build-push-ecr builds from
-      # this same checkout, so the edited pyproject/uv.lock is what the image
-      # layer sees.
+      # Staging-line callers resolve anton/staging once and pass the immutable
+      # SHA here. Repoint the workspace (uv add updates pyproject + lock) so the
+      # Dockerfile's `uv sync --frozen` installs the exact Anton revision that
+      # unit tests validated. Main-line callers leave anton-ref empty and use
+      # the committed source and lock.
       #
-      # Prod is unaffected: it builds from the committed lock. (Prod does not
-      # call this workflow today — publish.yml ships a wheel, not an image — but
-      # the guard states the intent so a future prod image stays reproducible.)
+      # build-push-ecr builds from this same checkout, so the edited
+      # pyproject/uv.lock is what the image layer sees.
       - name: Setup uv
-        if: inputs.build-environment != 'production'
+        if: inputs.anton-ref != ''
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
-      - name: Point anton-agent at staging (non-prod images)
-        if: inputs.build-environment != 'production'
-        run: uv add "anton-agent @ git+https://github.com/mindsdb/anton.git@staging" --no-sync
+      - name: Point anton-agent at the requested ref
+        if: inputs.anton-ref != ''
+        env:
+          ANTON_REF: ${{ inputs.anton-ref }}
+        run: uv add "anton-agent @ git+https://github.com/mindsdb/anton.git@${ANTON_REF}" --no-sync
       - id: build
         uses: mindsdb/github-actions/build-push-ecr@main
         with:
