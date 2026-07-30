@@ -9,8 +9,6 @@ questions instead of an agent that appears to hang.
 
 from __future__ import annotations
 
-import pytest
-
 
 def test_flag_defaults_to_off(monkeypatch):
     monkeypatch.delenv("COWORK_ASK_USER_ENABLED", raising=False)
@@ -94,3 +92,46 @@ def test_a_session_with_a_choice_elicitor_has_the_ask_user_tool():
     names = {t["name"] for t in session.tool_registry.dump()}
     assert "ask_user" in names
     assert "select_path" in names
+
+
+def test_a_console_would_defeat_the_kill_switch():
+    """anton builds its own CLIElicitor when a console is present, even with
+    elicitor=None — so the kill switch depends on cowork never passing one.
+    This documents the hazard the next test guards against.
+    """
+    from rich.console import Console
+
+    from anton.core.session import ChatSession, ChatSessionConfig
+
+    session = ChatSession(
+        ChatSessionConfig(llm_client=_mock_llm(), elicitor=None, console=Console(quiet=True))
+    )
+    session._build_tools()
+    names = {t["name"] for t in session.tool_registry.dump()}
+    assert "ask_user" in names
+
+
+def test_harness_never_passes_a_console_to_chat_session_config():
+    """A source-level assertion, justified here because the property under
+    test is the *absence* of a `console=` keyword argument from the
+    harness's ChatSessionConfig(...) call. Absent code has no runtime
+    behaviour to exercise — there is no call to make or return value to
+    inspect that would prove a kwarg was never passed — so reading the
+    source of the one function that builds the config is the only way to
+    observe the invariant test_a_console_would_defeat_the_kill_switch just
+    showed matters. If this ever fires, either cowork now must build its own
+    CLIElicitor with the tool's "choice" support disabled, or a bare
+    `console=None` was added (a no-op for anton, but establishes a place for
+    a future `console=self._console` to slip in unnoticed).
+    """
+    import inspect
+
+    from cowork.harnesses.anton_harness.harness import AntonHarness
+
+    source = inspect.getsource(AntonHarness._build_chat_session)
+    assert "console=" not in source, (
+        "AntonHarness._build_chat_session must not pass console= to "
+        "ChatSessionConfig: anton falls back to its own CLIElicitor "
+        "(which supports 'choice') whenever elicitor is None and a console "
+        "is present, silently reopening the ask_user kill switch."
+    )
