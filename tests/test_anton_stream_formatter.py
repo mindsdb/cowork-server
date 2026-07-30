@@ -2,8 +2,25 @@ from __future__ import annotations
 
 import json
 
-from anton.core.llm.provider import StreamReasoningDelta, StreamTextDelta
+import pytest
+
+from anton.core.llm.provider import StreamTextDelta
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+# Mirror the production guard in anton_harness/stream_formatter.py: StreamReasoningDelta
+# arrived with the reasoning-subtype channel (ENG-1109) and does not exist in anton
+# builds before it (e.g. anton/main until staging is promoted). Skip rather than fail
+# collection — the formatter degrades to a dead branch on older anton, so there is
+# nothing to exercise until the symbol is present.
+try:
+    from anton.core.llm.provider import StreamReasoningDelta
+except ImportError:
+    StreamReasoningDelta = None
+
+pytestmark = pytest.mark.skipif(
+    StreamReasoningDelta is None,
+    reason="anton build predates StreamReasoningDelta (ENG-1109); reasoning mapping is inert until anton is promoted",
+)
 
 
 async def _events(*items):
