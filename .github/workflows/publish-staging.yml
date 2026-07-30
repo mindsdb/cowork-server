@@ -40,24 +40,21 @@ concurrency:
 # one run tree without breaking publishing.
 jobs:
   resolve-anton:
-    name: Resolve Anton staging revision
+    name: Resolve Anton staging package
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      anton-ref: ${{ steps.resolve.outputs.anton-ref }}
+      anton-version: ${{ steps.resolve.outputs.anton-version }}
     steps:
-      - name: Resolve anton/staging to an immutable SHA
+      - uses: actions/checkout@v5
+      - name: Resolve the package built from anton/staging HEAD
         id: resolve
         run: |
           set -euo pipefail
-          ANTON_SHA=$(git ls-remote https://github.com/mindsdb/anton.git refs/heads/staging | awk 'NR == 1 { print $1 }')
-          if [ -z "$ANTON_SHA" ]; then
-            echo "Could not resolve anton/staging" >&2
-            exit 1
-          fi
-          echo "anton-ref=$ANTON_SHA" >> "$GITHUB_OUTPUT"
-          echo "Resolved anton/staging to $ANTON_SHA" >> "$GITHUB_STEP_SUMMARY"
+          ANTON_VERSION=$(.github/scripts/resolve-anton-package.sh staging)
+          echo "anton-version=$ANTON_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using anton-agent==$ANTON_VERSION from anton/staging" >> "$GITHUB_STEP_SUMMARY"
 
   unit-tests:
     # Explicit, though `contents: read` is also the repo default. A caller job's
@@ -71,7 +68,7 @@ jobs:
     uses: ./.github/workflows/tests-unit.yml
     with:
       # Use the same immutable Anton revision as the staging image build.
-      anton-ref: ${{ needs.resolve-anton.outputs.anton-ref }}
+      anton-version: ${{ needs.resolve-anton.outputs.anton-version }}
 
   build-deploy:
     # The container image, for the per-PR environments and whatever comes after.
@@ -84,7 +81,7 @@ jobs:
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: staging
-      anton-ref: ${{ needs.resolve-anton.outputs.anton-ref }}
+      anton-version: ${{ needs.resolve-anton.outputs.anton-version }}
     secrets: inherit
 
   release:
@@ -101,7 +98,7 @@ jobs:
 
   publish:
     name: Build and publish pre-release to PyPI
-    needs: release
+    needs: [resolve-anton, release]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -118,23 +115,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Exact cowork-server/anton pairing for the rc stream: pin anton-agent
-      # to its latest staging rc so this wheel records the anton that was
-      # current when it published. The desktop passes the pin as a DIRECT
-      # `--with anton-agent==<rc>` requirement at install time (uv honors
-      # pre-release markers only in direct requirements) — no resolution-wide
-      # prerelease flag is ever used.
-      - name: Pin anton-agent to its latest staging rc
-        run: |
-          set -euo pipefail
-          LATEST=$(curl -fsSL --retry 3 https://pypi.org/pypi/anton-agent/json | jq -r '[.releases | to_entries[] | select(.key | test("^[0-9]+(\\.[0-9]+)*(rc[0-9]+)?$")) | select((.value | length) > 0) | select(any(.value[]; .yanked != true)) | {v: .key, t: ([.value[].upload_time_iso_8601] | max)}] | sort_by(.t) | last | .v')
-          if [[ "$LATEST" == *rc* ]]; then
-            sed -i 's/"anton-agent>=[^"]*"/"anton-agent=='"$LATEST"'"/' pyproject.toml
-            grep -q '"anton-agent=='"$LATEST"'"' pyproject.toml
-            echo "Pinned anton-agent==$LATEST"
-          else
-            echo "Latest anton-agent is a stable release ($LATEST); keeping the loose constraint"
-          fi
+      # Use the exact same immutable package already validated by unit tests
+      # and the staging image. The desktop reads this exact pin from the
+      # cowork-server wheel and restates it as a direct install requirement.
+      - name: Pin the validated anton-agent staging package
+        env:
+          ANTON_VERSION: ${{ needs.resolve-anton.outputs.anton-version }}
+        run: .github/scripts/use-anton-package.sh "${ANTON_VERSION}"
 
       - name: Build package
         env:
@@ -155,7 +142,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, build-deploy, release, publish]
+    needs: [resolve-anton, unit-tests, build-deploy, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read

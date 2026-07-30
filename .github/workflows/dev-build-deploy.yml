@@ -41,8 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.decide.outputs.run }}
-      anton-ref: ${{ steps.decide.outputs.anton-ref }}
+      anton-version: ${{ steps.decide.outputs.anton-version }}
     steps:
+      - uses: actions/checkout@v5
       - name: Decide whether this PR needs the pipeline
         id: decide
         env:
@@ -52,16 +53,12 @@ jobs:
           THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ "$BASE_REF" = "staging" ]; then
-            ANTON_SHA=$(git ls-remote https://github.com/mindsdb/anton.git refs/heads/staging | awk 'NR == 1 { print $1 }')
-            if [ -z "$ANTON_SHA" ]; then
-              echo "Could not resolve anton/staging" >&2
-              exit 1
-            fi
-            echo "anton-ref=$ANTON_SHA" >> "$GITHUB_OUTPUT"
-            echo "Resolved anton/staging to $ANTON_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BASE_REF" = "staging" ] || [ "$BASE_REF" = "main" ]; then
+            ANTON_VERSION=$(.github/scripts/resolve-anton-package.sh "$BASE_REF")
+            echo "anton-version=$ANTON_VERSION" >> "$GITHUB_OUTPUT"
+            echo "Using anton-agent==$ANTON_VERSION from anton/$BASE_REF" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "anton-ref=" >> "$GITHUB_OUTPUT"
+            echo "anton-version=" >> "$GITHUB_OUTPUT"
           fi
 
           if [ "$HEAD_REPO" != "$THIS_REPO" ]; then
@@ -90,10 +87,9 @@ jobs:
     needs: [gate]
     uses: ./.github/workflows/tests-unit.yml
     with:
-      # A feature PR into staging uses the immutable SHA resolved by the gate.
-      # A staging->main promotion or main-targeted hotfix gets an empty value,
-      # so tests and images both validate the committed main-line lock.
-      anton-ref: ${{ needs.gate.outputs.anton-ref }}
+      # Resolve the package built from the PR target's matching Anton branch:
+      # staging -> staging rc, main -> stable. Tests and images use one artifact.
+      anton-version: ${{ needs.gate.outputs.anton-version }}
 
   workflow-lint:
     # actionlint, the caller/callee permission check, and a zizmor audit, from the
@@ -114,7 +110,7 @@ jobs:
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: development
-      anton-ref: ${{ needs.gate.outputs.anton-ref }}
+      anton-version: ${{ needs.gate.outputs.anton-version }}
       pr-environment: true
     secrets: inherit
 

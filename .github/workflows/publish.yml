@@ -30,6 +30,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve-anton:
+    name: Resolve Anton stable package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      anton-version: ${{ steps.resolve.outputs.anton-version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve the package built from anton/main HEAD
+        id: resolve
+        run: |
+          set -euo pipefail
+          ANTON_VERSION=$(.github/scripts/resolve-anton-package.sh main)
+          echo "anton-version=$ANTON_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using anton-agent==$ANTON_VERSION from anton/main" >> "$GITHUB_STEP_SUMMARY"
+
   unit-tests:
     # Explicit, though `contents: read` is also the repo default. A caller job's
     # `permissions` is the CAP on the workflow it calls, so leaving it off makes
@@ -38,7 +55,10 @@ jobs:
     # tests-unit.yml declares `contents: read` itself, so this matches exactly.
     permissions:
       contents: read
+    needs: resolve-anton
     uses: ./.github/workflows/tests-unit.yml
+    with:
+      anton-version: ${{ needs.resolve-anton.outputs.anton-version }}
 
   release:
     needs: unit-tests
@@ -83,7 +103,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, release, publish]
+    needs: [resolve-anton, unit-tests, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
