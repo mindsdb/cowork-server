@@ -2,12 +2,13 @@
 contract. These guards fail CI the moment the migration's env map or the
 provider normalization could drift from the model.
 """
-from cowork.common.settings.user_settings import (
+from cowork.common.settings.env_boundary import (
     ENV_ALIAS_TO_SETTING,
     SETTING_ENV_ALIASES,
-    UserSettings,
+    env_to_db_updates,
     normalize_provider_value,
 )
+from cowork.common.settings.user_settings import UserSettings
 
 
 def test_env_aliases_reference_only_real_fields():
@@ -57,13 +58,14 @@ def test_normalize_provider_value_single_implementation():
     )
 
 
-def test_migration_normalizer_delegates_to_the_canonical_one():
-    from cowork.migrations import _normalize_provider_value
-
-    assert (
-        _normalize_provider_value(
-            "openai-compatible", {"ANTON_MINDS_API_KEY": "sk-x"}
-        )
-        == "minds_cloud"
+def test_env_to_db_updates_normalizes_providers():
+    # The inbound .env->DB conversion: a Minds key alongside an openai-compatible
+    # provider means minds_cloud; without it, a genuine custom endpoint.
+    with_key = env_to_db_updates(
+        {"ANTON_PLANNING_PROVIDER": "openai-compatible", "ANTON_MINDS_API_KEY": "sk-x"}
     )
-    assert _normalize_provider_value("openai-compatible", {}) == "openai_compatible"
+    assert with_key["planning_provider"] == "minds_cloud"
+    without_key = env_to_db_updates({"ANTON_PLANNING_PROVIDER": "openai-compatible"})
+    assert without_key["planning_provider"] == "openai_compatible"
+    # Unmapped / empty vars are skipped.
+    assert env_to_db_updates({"ANTON_TERMS_CONSENT": "true", "ANTON_MINDS_URL": ""}) == {}

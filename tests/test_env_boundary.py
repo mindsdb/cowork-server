@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import cowork.services.settings as settings_mod
-from cowork.common.settings.env_export import build_env_export, merge_env_lines
+from cowork.common.settings.env_boundary import db_to_env, merge_env_lines
 from cowork.common.settings.user_settings import UserSettings
 from cowork.db.session import get_open_session
 from cowork.services.settings import SettingService
@@ -16,7 +16,7 @@ from cowork.services.settings import SettingService
 
 # ── pure derivation ────────────────────────────────────────────────────
 
-def test_build_env_export_formats_and_excludes_models():
+def test_db_to_env_formats_and_excludes_models():
     s = UserSettings(
         anthropic_api_key="sk-secret",
         planning_provider="minds_cloud",
@@ -24,20 +24,20 @@ def test_build_env_export_formats_and_excludes_models():
         planning_model="latest:sonnet",  # not aliased (ENG-739)
     )
     present = {"anthropic_api_key", "planning_provider", "minds_url", "planning_model"}
-    out = build_env_export(s, present)
+    out = db_to_env(s, present)
     assert out["ANTON_ANTHROPIC_API_KEY"] == "sk-secret"  # decrypted plaintext
     assert out["ANTON_PLANNING_PROVIDER"] == "minds-cloud"  # dash form
     assert out["ANTON_MINDS_URL"] == "https://mdb.example"
     assert not any("MODEL" in k for k in out)
 
 
-def test_build_env_export_only_exports_stored_keys():
+def test_db_to_env_only_exports_stored_keys():
     # minds_url has a non-None default but no row → must not be exported
     s = UserSettings(anthropic_api_key="sk-x")
-    out = build_env_export(s, present_keys={"anthropic_api_key"})
+    out = db_to_env(s, present_keys={"anthropic_api_key"})
     assert out == {"ANTON_ANTHROPIC_API_KEY": "sk-x"}
     assert "ANTON_MINDS_URL" not in out
-    assert build_env_export(UserSettings(), present_keys=set()) == {}
+    assert db_to_env(UserSettings(), present_keys=set()) == {}
 
 
 def test_merge_preserves_unmanaged_and_replaces_managed():
