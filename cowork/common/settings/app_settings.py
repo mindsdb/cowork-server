@@ -448,6 +448,30 @@ class AppSettings(Settings):
         ),
     )  # COWORK_CHANNELS_HARNESS
 
+    # Deployment-level defaults for the per-user agent tool budgets. Users who
+    # set the corresponding UserSettings override these; users who don't get
+    # these values. Hosted deployments (where inference cost lands on the
+    # operator and the Settings UI is unreachable — sidebar entries are
+    # desktop-only) can lower them without touching per-user rows; commented
+    # entries live in deployment/cowork-server/values-{prod,staging}.yaml.
+    # NOTE: get_app_settings() is @lru_cache'd, so changing the COWORK_DEFAULT_*
+    # env requires a process restart — "I changed the env and nothing happened"
+    # means the old value is cached for the life of the process.
+    default_max_tool_rounds: int = Field(
+        default=50,
+        ge=5,
+        le=500,
+        validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TOOL_ROUNDS"),
+        description="Default for the per-user 'Max Steps per Task' agent budget.",
+    )  # COWORK_DEFAULT_MAX_TOOL_ROUNDS
+    default_max_continuations: int = Field(
+        default=5,
+        ge=0,
+        le=25,
+        validation_alias=AliasChoices("COWORK_DEFAULT_MAX_CONTINUATIONS"),
+        description="Default for the per-user 'Max Auto-Continues' agent budget.",
+    )  # COWORK_DEFAULT_MAX_CONTINUATIONS
+
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*

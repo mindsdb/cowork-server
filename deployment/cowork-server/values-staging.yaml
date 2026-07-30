@@ -28,3 +28,14 @@ deployment:
     # headers are rejected with 401.
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
+
+    # Agent tool budgets — deployment-level DEFAULTS for users who never set
+    # the per-user setting (hosted has no Settings UI; inference cost lands on
+    # the operator). Uncommented values below equal the code defaults, so
+    # enabling them as-is is behavior-neutral; LOWER them to run hosted more
+    # conservatively. Changing these requires a pod restart (env is read once
+    # per process).
+    # - name: COWORK_DEFAULT_MAX_TOOL_ROUNDS
+    #   value: "50"
+    # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
+    #   value: "5"
