@@ -131,6 +131,7 @@ async def format_responses_stream(
     from anton.core.llm.provider import (
         StreamComplete,
         StreamContextCompacted,
+        StreamReasoningDelta,
         StreamTaskProgress,
         StreamTextDelta,
         StreamToolResult,
@@ -288,6 +289,21 @@ async def format_responses_stream(
                     "eta_seconds": getattr(event, "eta_seconds", None),
                     "tool_use_id": getattr(event, "id", None) or "",
                 })
+
+        elif isinstance(event, StreamReasoningDelta):
+            # The model's own reasoning text — NOT part of the final answer.
+            # Shape matches hermes_harness's existing thought.progress +
+            # subtype convention exactly, so the frontend's ephemeral
+            # "current thought" handling (responseStreamAdapter.js) picks
+            # this up identically without any client-side change.
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_progress.value,
+                "content": event.text,
+                "subtype": "reasoning",
+            })
 
         elif isinstance(event, StreamContextCompacted):
             seq += 1
