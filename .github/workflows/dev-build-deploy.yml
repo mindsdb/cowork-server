@@ -75,6 +75,11 @@ jobs:
     # Deliberately ungated: these run on `ubuntu-latest` with no secrets, so a
     # fork contributor gets the CI that matters to them.
     uses: ./.github/workflows/tests-unit.yml
+    with:
+      # A feature PR merges into staging, so test against anton's staging HEAD;
+      # a staging->main promotion PR (base = main) keeps the committed pin so it
+      # validates exactly what main will ship. github.base_ref is the PR target.
+      anton-ref: ${{ github.base_ref == 'staging' && 'staging' || '' }}
 
   workflow-lint:
     # actionlint, the caller/callee permission check, and a zizmor audit, from the
