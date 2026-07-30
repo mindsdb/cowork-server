@@ -26,7 +26,11 @@ def build_elicitor(conversation_id: str):
 
     Returning None is the kill switch: anton only registers `ask_user` when
     an elicitor supports "choice", so the model reverts to asking in plain
-    text with no silent-failure window.
+    text with no silent-failure window. This holds only as long as the
+    ChatSessionConfig built from this value is not also given a `console`:
+    with elicitor=None and a console present, anton constructs its own
+    CLIElicitor (which does support "choice"), silently reopening the
+    switch. See tests/test_ask_user_flag.py for the guard.
     """
     if not get_app_settings().ask_user_enabled:
         return None
