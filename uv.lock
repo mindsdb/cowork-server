@@ -143,8 +143,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.7.27.3.dev62+g80a7de87d"
-source = { git = "https://github.com/mindsdb/anton.git?branch=feat%2Fwhole-turn-skeleton#80a7de87d98ebc63a20eb34e8bd4c5d94d1b04de" }
+version = "2.26.7.27.3.dev68+g06186eaee"
+source = { git = "https://github.com/mindsdb/anton.git?branch=feat%2Fwhole-turn-skeleton#06186eaee57f55f62c005f4edba66d9006d45558" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
