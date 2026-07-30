@@ -24,8 +24,19 @@ for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
   pypi_json=$(curl -fsSL --retry 3 "${ANTON_PYPI_URL}")
   if [[ "${CHANNEL}" == "main" ]]; then
     version=$(jq -r '.info.version // empty' <<<"${pypi_json}")
+    if [[ -n "${branch_sha}" && -n "${version}" ]]; then
+      tag_sha=$(
+        git ls-remote "${ANTON_REPO_URL}" "refs/tags/v${version}" |
+          awk 'NR == 1 { print $1 }'
+      )
+    else
+      tag_sha=""
+    fi
   else
-    version=$(
+    # Search every live rc, newest upload first, rather than assuming the
+    # globally newest upload belongs to the newest branch commit. This remains
+    # correct even if queued publisher runs complete out of order.
+    versions=$(
       jq -r '
         [
           .releases
@@ -35,21 +46,31 @@ for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
           | select(any(.value[]; .yanked != true))
           | {
               version: .key,
-              uploaded: ([.value[].upload_time_iso_8601] | max)
-            }
+            uploaded: ([.value[].upload_time_iso_8601] | max)
+          }
         ]
         | sort_by(.uploaded)
-        | last
-        | .version // empty
+        | reverse
+        | .[].version
       ' <<<"${pypi_json}"
     )
+    rc_tags=$(git ls-remote "${ANTON_REPO_URL}" "refs/tags/v*rc*")
+    version=""
+    tag_sha=""
+    while IFS= read -r candidate; do
+      [[ -n "${candidate}" ]] || continue
+      candidate_sha=$(
+        awk -v ref="refs/tags/v${candidate}" '$2 == ref { print $1; exit }' <<<"${rc_tags}"
+      )
+      if [[ -n "${candidate_sha}" && "${candidate_sha}" == "${branch_sha}" ]]; then
+        version="${candidate}"
+        tag_sha="${candidate_sha}"
+        break
+      fi
+    done <<<"${versions}"
   fi
 
   if [[ -n "${branch_sha}" && -n "${version}" ]]; then
-    tag_sha=$(
-      git ls-remote "${ANTON_REPO_URL}" "refs/tags/v${version}" |
-        awk 'NR == 1 { print $1 }'
-    )
     if [[ -n "${tag_sha}" && "${tag_sha}" == "${branch_sha}" ]]; then
       echo "Resolved anton-agent==${version} from anton/${CHANNEL}@${branch_sha}" >&2
       printf '%s\n' "${version}"
