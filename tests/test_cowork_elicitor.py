@@ -12,7 +12,7 @@ import pytest
 
 from anton.core.interaction.elicit import AskOption, AskRequest
 from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
-from cowork.streaming.answers import AnswerBroker
+from cowork.streaming.answers import AnswerBroker, SubmitResult
 
 CID = "conv-1"
 QID = "ask:abc"
@@ -93,12 +93,55 @@ async def test_timeout_status_when_nobody_answers(wired):
     assert (await elicitor.ask(QID, request)).status == "timeout"
 
 
+async def test_a_timeout_does_not_cancel_the_broker_s_future(wired):
+    """ask()'s own wait_for must not mutate state the broker owns.
+
+    Without asyncio.shield, the timeout cancels the future in place while it is
+    still in the broker's _pending dict. submit() gates on future.done(), which
+    a cancelled future satisfies, so the answer would be reported
+    ALREADY_ANSWERED and then silently dropped. end() has not run yet at this
+    point, so the entry is still the broker's to own.
+    """
+    broker, elicitor = wired
+    request = _request(timeout_s=0.05)
+    await elicitor.begin(QID, request)
+    assert (await elicitor.ask(QID, request)).status == "timeout"
+
+    # end() deliberately not called yet: this is the window the shield protects.
+    assert broker.submit(CID, QID, {"values": ["pg"]}) is SubmitResult.ACCEPTED
+
+
+async def test_timeout_falls_back_to_instance_timeout_s(wired):
+    """request.timeout_s is None -- ask() must fall back to self.timeout_s."""
+    broker = AnswerBroker()
+    elicitor = CoworkElicitor(CID, broker, timeout_s=0.05)
+    request = _request(timeout_s=None)
+    await elicitor.begin(QID, request)
+    assert (await elicitor.ask(QID, request)).status == "timeout"
+
+
+async def test_an_empty_payload_is_treated_as_an_empty_answered_answer(wired):
+    """broker.submit(cid, qid, {}) is not rejected: it resolves the future
+    with an empty answered AskAnswer, indistinguishable from a real one.
+
+    This is intentional-by-omission here: the HTTP endpoint (a later task)
+    rejects an empty request body before it ever reaches the broker, so
+    production never constructs this. Documented here, not fixed here.
+    """
+    broker, elicitor = wired
+    request = _request()
+    await elicitor.begin(QID, request)
+    broker.submit(CID, QID, {})
+    answer = await elicitor.ask(QID, request)
+    assert answer.status == "answered"
+    assert (answer.values, answer.text) == ((), "")
+
+
 async def test_end_drops_the_broker_entry(wired):
     broker, elicitor = wired
     request = _request()
     await elicitor.begin(QID, request)
     await elicitor.end(QID)
-    from cowork.streaming.answers import SubmitResult
 
     assert broker.submit(CID, QID, {"values": ["pg"]}) is SubmitResult.NOT_FOUND
 
