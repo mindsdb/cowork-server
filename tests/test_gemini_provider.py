@@ -10,6 +10,7 @@ import asyncio
 import cowork.services.providers as providers
 from cowork.services.providers import (
     GEMINI_BASE_URL,
+    _is_auth_error,
     _provider_error_message,
     validate_openai_compatible,
 )
@@ -94,6 +95,51 @@ def test_validate_maps_gemini_bad_key_400_to_invalid_key(monkeypatch):
         validate_openai_compatible("bad", GEMINI_BASE_URL, "gemini-3.6-flash")
     )
     assert result == {"ok": False, "error": "Invalid API key"}
+
+
+def test_validate_400_permission_message_is_not_invalid_key(monkeypatch):
+    # A key that is fine but lacks model permission — Google returns 400 with a
+    # message that CONTAINS "API key" but is not a bad key. It must surface
+    # verbatim, not be relabeled "Invalid API key" and send the user to
+    # regenerate a good key (ENG-1145 review).
+    resp = _Resp(400, [{"error": {
+        "message": "The API key does not have permission to use this model.",
+    }}])
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _client_for(resp))
+    result = asyncio.run(
+        validate_openai_compatible("real-key", GEMINI_BASE_URL, "gemini-3.6-flash")
+    )
+    assert result["ok"] is False
+    assert result["error"] != "Invalid API key"
+    assert "does not have permission" in result["error"]
+
+
+def test_validate_400_quota_message_is_not_invalid_key(monkeypatch):
+    # Out of quota — also contains "API key" — must not read as a bad key.
+    resp = _Resp(400, [{"error": {
+        "message": "Quota exceeded for this API key. Upgrade your plan.",
+    }}])
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _client_for(resp))
+    result = asyncio.run(
+        validate_openai_compatible("real-key", GEMINI_BASE_URL, "gemini-3.6-flash")
+    )
+    assert result["ok"] is False
+    assert result["error"] != "Invalid API key"
+    assert "Quota exceeded" in result["error"]
+
+
+def test_is_auth_error_matrix():
+    # The shared bad-key rule (must stay in step with cowork's provider-error.ts).
+    assert _is_auth_error(401, None)
+    assert _is_auth_error(403, "anything")
+    # Gemini's real bad-key 400.
+    assert _is_auth_error(400, "API key not valid. Please pass a valid API key.")
+    # 400s that merely mention the key but are NOT bad keys.
+    assert not _is_auth_error(400, "The API key does not have permission to use this model.")
+    assert not _is_auth_error(400, "Quota exceeded for this API key. Upgrade your plan.")
+    # A model-not-found message is not auth at all.
+    assert not _is_auth_error(400, "models/gemini-2.5-flash is no longer available")
+    assert not _is_auth_error(400, None)
 
 
 def test_validate_ok_on_200(monkeypatch):
