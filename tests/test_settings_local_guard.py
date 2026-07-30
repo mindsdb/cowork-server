@@ -1,10 +1,10 @@
 """reveal-key and /raw must refuse non-loopback callers (ENG-457).
 
 These endpoints return unmasked provider secrets (a single key, or the whole
-dotenv). `_require_local` is defense-in-depth for a network-exposed deployment
-— e.g. a self-host compose that binds 0.0.0.0 — so even with no app-layer auth
-they only answer a loopback client. The desktop sidecar + UI talk over
-127.0.0.1, so the legitimate flow is unaffected.
+dotenv). `guards.require_local` is defense-in-depth for a network-exposed
+deployment — e.g. a self-host compose that binds 0.0.0.0 — so even with no
+app-layer auth they only answer a loopback client. The desktop sidecar + UI
+talk over 127.0.0.1, so the legitimate flow is unaffected.
 """
 
 from types import SimpleNamespace
@@ -20,18 +20,18 @@ def _request(host):
 
 
 def test_require_local_allows_loopback():
-    from cowork.api.v1.endpoints.settings import _require_local
+    from cowork.api.v1.endpoints.guards import require_local
 
-    _require_local(_request("127.0.0.1"))
-    _require_local(_request("::1"))
+    require_local(_request("127.0.0.1"))
+    require_local(_request("::1"))
 
 
 @pytest.mark.parametrize("host", ["10.0.0.5", "0.0.0.0", "192.168.1.10", "", None])
 def test_require_local_rejects_non_loopback(host):
-    from cowork.api.v1.endpoints.settings import _require_local
+    from cowork.api.v1.endpoints.guards import require_local
 
     with pytest.raises(HTTPException) as exc:
-        _require_local(_request(host))
+        require_local(_request(host))
     assert exc.value.status_code == 403
 
 
