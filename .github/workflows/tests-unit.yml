@@ -33,16 +33,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Repoint anton-agent at the line under test before syncing. Ephemeral:
-      # it edits the working checkout, never a commit, so nothing is promoted.
-      # The committed pin (main-line) is untouched on disk after the run.
-      - name: Point anton-agent at the ${{ inputs.anton-ref }} line
+      # Repoint anton-agent at the ref under test, using uv's own dependency
+      # editing — robust to however the committed pin is spelled (branch, rev,
+      # or SHA), unlike a text substitution. --no-sync updates pyproject + lock
+      # only; the install happens in the next step. Ephemeral: it edits the
+      # checkout in place, never a commit, so nothing is promoted. The ref is
+      # passed via env, not interpolated into the command, to avoid injection.
+      - name: Point anton-agent at the ${{ inputs.anton-ref }} ref
         if: inputs.anton-ref != ''
-        run: |
-          set -euo pipefail
-          sed -i -E 's#(anton-agent = \{ git = "[^"]*", rev = )"[^"]*"#\1"${{ inputs.anton-ref }}"#' pyproject.toml
-          grep -q 'rev = "${{ inputs.anton-ref }}"' pyproject.toml
-          uv lock --upgrade-package anton-agent
+        env:
+          ANTON_REF: ${{ inputs.anton-ref }}
+        run: uv add "anton-agent @ git+https://github.com/mindsdb/anton.git@${ANTON_REF}" --no-sync
 
       - name: Install dependencies
         run: uv sync --group dev
