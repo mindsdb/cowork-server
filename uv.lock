@@ -144,7 +144,7 @@ wheels = [
 [[package]]
 name = "anton-agent"
 version = "2.26.7.27.2.dev57+gcff09f27c"
-source = { git = "https://github.com/mindsdb/anton.git?branch=staging#cff09f27c8f73ed8ca99d515c30933a935edec1f" }
+source = { git = "https://github.com/mindsdb/anton.git?rev=cff09f27c8f73ed8ca99d515c30933a935edec1f#cff09f27c8f73ed8ca99d515c30933a935edec1f" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -451,7 +451,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=staging" },
+    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?rev=cff09f27c8f73ed8ca99d515c30933a935edec1f" },
     { name = "cryptography", specifier = ">=48.0.0" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
