@@ -12,6 +12,7 @@ import json
 import logging
 import uuid
 
+from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.turnqueue.redis_client import get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings
 
@@ -35,17 +36,17 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     corr = _new_correlation_id()
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
-    job = {
-        "op": "anton_turn",
-        "conversation_id": conversation_id,
-        "correlation_id": corr,
-        "reply_stream": reply_stream,
-        "organization_id": org_id,
-        "user_id": user_id,
-        "params": {"input": input_text, "workspace_path": "/workspace",
-                   "model": model, "history": history or []},
-    }
-    await r.xadd(settings.jobs_stream, {"payload": json.dumps(job)})
+    job = TurnJob(
+        op="anton_turn",
+        conversation_id=conversation_id,
+        correlation_id=corr,
+        reply_stream=reply_stream,
+        organization_id=org_id,
+        user_id=user_id,
+        params={"input": input_text, "workspace_path": "/workspace",
+                "model": model, "history": history or []},
+    )
+    await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
     await buffer.append("sse", {"sse": _sse("response.created",
                                             {"type": "response.created"})})
 
@@ -57,11 +58,11 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         for _stream, entries in resp:
             for entry_id, fields in entries:
                 last_id = entry_id
-                payload = json.loads(fields["payload"])
-                if payload.get("correlation_id") != corr:
+                reply = TurnReply.model_validate_json(fields["payload"])
+                if reply.correlation_id != corr:
                     continue
-                kind = payload["kind"]
-                data = payload.get("data") or {}
+                kind = reply.kind
+                data = reply.data or {}
                 if kind == "turn_delta":
                     await buffer.append("sse", {"sse": _sse(
                         "response.output_text.delta",
