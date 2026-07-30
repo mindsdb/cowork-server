@@ -8,7 +8,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from anton.core.datasources.data_vault import LocalDataVault
@@ -34,6 +34,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
     "google-analytics": ("google_analytics_client_id",  "google_analytics_client_secret"),
     "linear":           ("linear_client_id",            "linear_client_secret"),
     "github":           ("github_client_id",            "github_client_secret"),
+    "hubspot":          ("hubspot_client_id",           "hubspot_client_secret"),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -79,6 +80,14 @@ def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
     return {"email": email or login, "name": name or login}
 
 
+def _fetch_userinfo_hubspot(access_token: str) -> dict[str, Any]:
+    """HubSpot has no OIDC-style userinfo endpoint — identity comes from the
+    token-introspection endpoint, which returns the authorizing user's email
+    under `user`. No separate display name is available there."""
+    result = _json_request(f"https://api.hubapi.com/oauth/v1/access-tokens/{access_token}")
+    return {"email": str(result.get("user") or "").strip(), "name": ""}
+
+
 # engine → identity-fetch function. The one piece of connector onboarding
 # that can't be pure spec-JSON data — response shape (REST vs GraphQL) is
 # genuinely provider-specific code, not configuration. New OAuth-builtin
@@ -91,6 +100,7 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "google_analytics_4": _fetch_userinfo_google,
     "linear": _fetch_userinfo_linear,
     "github": _fetch_userinfo_github,
+    "hubspot": _fetch_userinfo_hubspot,
 }
 
 
@@ -117,11 +127,26 @@ def _revoke_github(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_hubspot(token: str, client_id: str, client_secret: str) -> None:
+    """HubSpot's revoke endpoint takes the refresh token in the URL path with
+    DELETE, not a generic POST/form-body token param like the other
+    providers' revoke_url pattern. No client credentials needed for the
+    call itself — kept in the signature only to match _REVOKE_HANDLERS'
+    shared shape."""
+    request = Request(
+        f"https://api.hubapi.com/oauth/v1/refresh-tokens/{token}",
+        method="DELETE",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
 # engine → custom revoke function, for providers whose revoke call doesn't
 # fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
 # Checked before the generic path in revoke() below.
 _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
+    "hubspot": _revoke_hubspot,
 }
 
 
@@ -144,7 +169,17 @@ class OAuthService:
         return OAuthStateStore(settings.state_path)
 
     def _redirect_uri(self, service: str, settings: OAuthSettings) -> str:
-        return f"{settings.server_origin.rstrip('/')}/api/v1/connectors/oauth/{service}/callback"
+        origin = settings.server_origin.rstrip('/')
+        # HubSpot-style providers reject a raw IP literal in the redirect_uri
+        # (see OAuthConfig.redirect_host) — swap in just the hostname when a
+        # connector declares one; every other connector leaves this unset and
+        # gets the untouched server_origin, same as before this existed.
+        oauth_cfg = self._oauth_config_for(OAUTH_SERVICES[service].engine)
+        if oauth_cfg and oauth_cfg.redirect_host:
+            parts = urlsplit(origin)
+            netloc = oauth_cfg.redirect_host + (f":{parts.port}" if parts.port else "")
+            origin = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+        return f"{origin}/api/v1/connectors/oauth/{service}/callback"
 
     def _oauth_config_for(self, engine: str) -> OAuthConfig | None:
         """The connector's whole OAuth shape (auth_url/token_url/revoke_url/
@@ -200,6 +235,11 @@ class OAuthService:
             "code_challenge_method": "S256",
             **oauth_cfg.extra_auth_params,
         }
+        # See OAuthConfig.optional_scopes — providers that split required vs
+        # optional scopes across two URL params (HubSpot) need this; every
+        # other connector leaves optional_scopes empty and gets no param.
+        if oauth_cfg.optional_scopes:
+            query_params["optional_scope"] = " ".join(oauth_cfg.optional_scopes)
         auth_url = oauth_cfg.auth_url + "?" + urlencode(query_params)
 
         return OAuthStartResponse(auth_url=auth_url, redirect_uri=redirect_uri, started_at=started_at, state=state)

@@ -27,10 +27,38 @@
     "logo_color": "#FF7A59",
     "methods": [
       {
+        "id": "browser_oauth_builtin",
+        "label": "In-Browser Connect",
+        "description": "Opens HubSpot sign-in in your browser. No credentials required — just click Connect.",
+        "recommended": true,
+        "hidden": false,
+        "fields": [],
+        "oauth": {
+          "auth_url": "https://app.hubspot.com/oauth/authorize",
+          "token_url": "https://api.hubapi.com/oauth/v1/token",
+          "scopes": [
+            "oauth",
+            "crm.objects.contacts.read",
+            "crm.objects.companies.read",
+            "crm.objects.deals.read"
+          ],
+          "optional_scopes": [
+            "crm.objects.contacts.write",
+            "crm.objects.companies.write",
+            "crm.objects.deals.write"
+          ],
+          "service_id": "hubspot",
+          "supports_refresh": true,
+          "supports_revoke": true,
+          "redirect_port": 47291,
+          "redirect_host": "localhost"
+        }
+      },
+      {
         "id": "private-app",
         "label": "Private app token",
         "description": "Paste a Private App access token from HubSpot. Simplest path — no OAuth dance, the token already encodes the scopes you grant when you create it.",
-        "recommended": true,
+        "recommended": false,
         "how_to": "## Generate a HubSpot Private App access token\n\nPrivate Apps replaced HubSpot's classic API keys in 2022. They're per-portal, scoped, and revocable from HubSpot's UI in two clicks.\n\n### Steps\n\n1. Sign in to your HubSpot portal as a user with **Super admin** rights.\n2. Open **Settings → Integrations → Private Apps** (in the left sidebar of the settings panel).\n3. Click **Create a private app** at the top right.\n4. On the **Basic Info** tab, name it `Anton` (or whatever helps you recognize it later) and add a short description.\n5. Switch to the **Scopes** tab and check the scopes Anton will need. A reasonable starter set:\n   - `crm.objects.contacts.read` / `crm.objects.contacts.write`\n   - `crm.objects.companies.read` / `crm.objects.companies.write`\n   - `crm.objects.deals.read` / `crm.objects.deals.write`\n   - `tickets` (if you use tickets)\n   - `crm.lists.read` / `crm.lists.write`\n6. Click **Create app** at the top right. HubSpot shows the access token (`pat-na1-…` or `pat-eu1-…`).\n7. Copy the token and paste it into the field below. Treat it like a password — anyone with it can read/write everything in the scopes you granted.\n\n### Notes\n\n- You can come back any time to add or remove scopes, or rotate the token.\n- Anton stores the token locally in the data vault; it never leaves your machine except as `Authorization: Bearer …` headers to `api.hubapi.com`.\n- Read [HubSpot's Private Apps guide](https://developers.hubspot.com/docs/api/private-apps) for the full background.\n",
         "help_url": "https://developers.hubspot.com/docs/api/private-apps",
         "fields": [
