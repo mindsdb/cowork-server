@@ -40,6 +40,12 @@ on:
         description: "Runner label for the build and scan"
         type: string
         default: mdb-dev
+      anton-revision:
+        description: >-
+          Exact Anton commit to install in this image. Empty keeps the
+          committed pyproject/uv.lock dependency.
+        type: string
+        default: ""
       pr-environment:
         description: "Run the per-PR environment rollout and its access comment"
         type: boolean
@@ -70,6 +76,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: mindsdb/github-actions/setup-env@main
+      - name: Setup uv
+        if: inputs.anton-revision != ''
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Use the requested Anton revision
+        if: inputs.anton-revision != ''
+        env:
+          ANTON_REVISION: ${{ inputs.anton-revision }}
+        run: .github/scripts/use-anton-revision.sh "${ANTON_REVISION}"
       - id: build
         uses: mindsdb/github-actions/build-push-ecr@main
         with:
