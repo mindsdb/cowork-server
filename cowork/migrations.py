@@ -34,11 +34,8 @@ from pydantic import ValidationError
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
-from cowork.common.settings.user_settings import (
-    ENV_ALIAS_TO_SETTING,
-    UserSettings,
-    normalize_provider_value,
-)
+from cowork.common.settings.env_boundary import ENV_ALIAS_TO_SETTING, env_to_db_updates
+from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
@@ -55,7 +52,7 @@ _MIGRATION_SENTINEL = "_env_migrated_v2"
 
 # Map of .env keys -> DB setting keys for all fields that overlap between
 # AntonSettings (.env) and UserSettings (DB). Derived from the single canonical
-# alias map in user_settings (SETTING_ENV_ALIASES) so this table can no longer
+# alias map in env_boundary (SETTING_ENV_ALIASES) so this table can no longer
 # drift from the client's copy — see the note there, incl. why the model keys
 # (ANTON_PLANNING_MODEL / ANTON_CODING_MODEL) are deliberately excluded
 # (ENG-739). Drives both the first-boot .env→DB seed (migrate_env_to_db) and the
@@ -80,18 +77,6 @@ def _parse_env_file() -> dict[str, str]:
     return result
 
 
-def _normalize_provider_value(val: str, dotenv: dict[str, str]) -> str:
-    """Translate .env provider strings to DB enum values.
-
-    Thin adapter over the canonical ``normalize_provider_value`` in
-    user_settings — kept so the .env-shaped call sites here don't each repeat
-    the "does this dotenv carry a Minds key" check.
-    """
-    return normalize_provider_value(
-        val, minds_key_present=bool(dotenv.get("ANTON_MINDS_API_KEY"))
-    )
-
-
 def sync_env_vars_to_db(session: Session, dotenv: dict[str, str]) -> list[str]:
     """Upsert a dict of ANTON_* env vars into the settings DB.
 
@@ -99,14 +84,7 @@ def sync_env_vars_to_db(session: Session, dotenv: dict[str, str]) -> list[str]:
     keys that have no mapping in ``_ENV_TO_SETTING``.
     """
     svc = SettingService(session)
-    updates: dict[str, str] = {}
-    for env_key, setting_key in _ENV_TO_SETTING.items():
-        val = dotenv.get(env_key)
-        if not val:
-            continue
-        if setting_key.endswith("_provider"):
-            val = _normalize_provider_value(val, dotenv)
-        updates[setting_key] = val
+    updates = env_to_db_updates(dotenv)
 
     for key, value in updates.items():
         svc._validate_key(key)
@@ -135,12 +113,7 @@ def migrate_env_to_db(session: Session) -> bool:
 
     if dotenv:
         migrated_keys: list[str] = []
-        for env_key, setting_key in _ENV_TO_SETTING.items():
-            val = dotenv.get(env_key)
-            if not val:
-                continue
-            if setting_key.endswith("_provider"):
-                val = _normalize_provider_value(val, dotenv)
+        for setting_key, val in env_to_db_updates(dotenv).items():
             try:
                 # export_env=False: this loop seeds the DB *from* .env; a per-key
                 # re-export mid-loop would strip the keys not migrated yet. The
@@ -148,7 +121,7 @@ def migrate_env_to_db(session: Session) -> bool:
                 svc.upsert_setting(setting_key, val, export_env=False)
                 migrated_keys.append(setting_key)
             except Exception as e:
-                logger.debug("Skipping env migration for %s: %s", env_key, e)
+                logger.debug("Skipping env migration for %s: %s", setting_key, e)
 
         if migrated_keys:
             logger.info(

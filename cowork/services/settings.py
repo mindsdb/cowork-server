@@ -9,9 +9,9 @@ from sqlmodel import Session, select
 from cowork.common.encryption import decrypt, encrypt
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.env_export import (
+from cowork.common.settings.env_boundary import (
     atomic_write_env,
-    build_env_export,
+    db_to_env,
     merge_env_lines,
 )
 from cowork.common.settings.user_settings import (
@@ -181,7 +181,7 @@ class SettingService:
             if get_app_settings().tenancy_mode != "local":
                 return
             rows = self._fetch_all_rows()
-            managed = build_env_export(self._load(rows), {row.key for row in rows})
+            managed = db_to_env(self._load(rows), {row.key for row in rows})
             path = cowork_home() / ".env"
             existing = path.read_text(encoding="utf-8") if path.exists() else ""
             content = merge_env_lines(existing, managed)
