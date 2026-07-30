@@ -25,7 +25,12 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
     "minds-cloud": [],
     "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     "openai": ["gpt-5.5", "gpt-5.5-mini", "o3", "o4-mini"],
-    "gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-flash-preview"],
+    # Live-overlaid from Google's OpenAI-compatible /models when a Gemini key is
+    # configured (see recommended_models endpoint); this static list is only the
+    # fallback for the pre-key onboarding pick and offline loads. The old
+    # gemini-2.5-* ids and the never-real "gemini-3-flash-preview" all 404 for
+    # new users, so the fallback lists only current ids (ENG-1145).
+    "gemini": ["gemini-3.6-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"],
     "openai-compatible": [],
 }
 
@@ -38,7 +43,10 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
     "minds-cloud": ("sonnet", "haiku", "kimi"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
     "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
-    "gemini": ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash"),
+    # All three roles default to the one id confirmed to resolve on a fresh
+    # free-tier Google key (ENG-1145); gemini-2.5-pro was zero-quota for new
+    # free-tier keys and gemini-2.5-flash 404s. Pro stays reachable via the picker.
+    "gemini": ("gemini-3.6-flash", "gemini-3.6-flash", "gemini-3.6-flash"),
     "openai-compatible": ("", "", ""),
 }
 
@@ -54,13 +62,13 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
-    "gemini": "gemini-2.5-pro",
+    "gemini": "gemini-3.6-flash",
     "minds_cloud": "sonnet",
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.6-flash",
     "minds_cloud": "haiku",
 }
 # Router role: the cheap front-model that runs history summarization (and later
@@ -71,7 +79,7 @@ CODING_MODEL_DEFAULTS: dict[str, str] = {
 ROUTER_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.6-flash",
     "minds_cloud": "kimi",
 }
 
