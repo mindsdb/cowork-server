@@ -33,7 +33,6 @@ from pydantic import ValidationError
 
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.paths import cowork_home
-from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.env_boundary import ENV_ALIAS_TO_SETTING, env_to_db_updates
 from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
@@ -173,7 +172,10 @@ def backfill_minds_url(session: Session) -> bool:
             changed.append(key)
     if changed:
         session.commit()
-        invalidate_user_settings_cache()
+        # Route through the exporting hook (not a bare cache-invalidate) so the
+        # rewritten minds_url also reaches the CLI's .env — otherwise the DB moves
+        # to the canonical host while .env keeps the dead mdb.ai one (ENG-1127 review).
+        svc._after_write()
         logger.info(
             "Backfilled legacy MindsHub host (mdb.ai -> %s) in: %s",
             canonical, ", ".join(changed),

@@ -155,3 +155,64 @@ def test_migration_write_does_not_export(local_export):
     finally:
         _cleanup(session, "minds_url")
         session.close()
+
+
+def test_backfill_minds_url_exports_to_env_too(local_export):
+    # ENG-1127 review: the legacy-host backfill writes minds_url directly, so it
+    # must also export — otherwise the DB moves to the canonical host while the
+    # CLI's .env keeps the dead mdb.ai endpoint.
+    from cowork.common.settings.app_settings import default_minds_api_host
+    from cowork.migrations import backfill_minds_url
+
+    env_path = local_export
+    canonical = default_minds_api_host()
+    session = get_open_session()
+    try:
+        _cleanup(session, "minds_url")
+        svc = SettingService(session)
+        svc.upsert_setting("minds_url", "https://mdb.ai", export_env=False)
+        env_path.write_text("ANTON_MINDS_URL=https://mdb.ai\n", encoding="utf-8")
+
+        assert backfill_minds_url(session) is True
+        # Both stores land on the canonical host.
+        assert svc.load().minds_url == canonical
+        env_text = env_path.read_text(encoding="utf-8")
+        assert f"ANTON_MINDS_URL={canonical}" in env_text
+        assert "https://mdb.ai" not in env_text
+    finally:
+        _cleanup(session, "minds_url")
+        session.close()
+
+
+def test_export_serializes_concurrent_writers(local_export, monkeypatch):
+    # ENG-1127 review: the read/merge/write must be serialized so two concurrent
+    # exporters can't lost-update the file. Instrument the critical section and
+    # assert at most one thread is ever inside it.
+    import threading
+    import time
+
+    state = {"cur": 0, "max": 0}
+    guard = threading.Lock()
+    real = settings_mod.db_to_env
+
+    def instrumented(settings, present_keys):
+        with guard:
+            state["cur"] += 1
+            state["max"] = max(state["max"], state["cur"])
+        time.sleep(0.03)  # widen the window an unserialized export would overlap in
+        with guard:
+            state["cur"] -= 1
+        return real(settings, present_keys)
+
+    monkeypatch.setattr(settings_mod, "db_to_env", instrumented)
+
+    def export():
+        SettingService(get_open_session())._export_env_for_cli()
+
+    threads = [threading.Thread(target=export) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert state["max"] == 1
