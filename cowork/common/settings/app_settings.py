@@ -35,7 +35,7 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 # providers use their smallest model. The frontend falls back
 # to the coding slot when the 3rd is absent, so an older client still works.
 RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
-    "minds-cloud": ("sonnet", "haiku", "kimi"),
+    "minds-cloud": ("kimi", "haiku", "gpt-mini"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
     "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
     "gemini": ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash"),
@@ -55,7 +55,7 @@ PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
     "gemini": "gemini-2.5-pro",
-    "minds_cloud": "sonnet",
+    "minds_cloud": "kimi",
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
@@ -63,16 +63,18 @@ CODING_MODEL_DEFAULTS: dict[str, str] = {
     "gemini": "gemini-2.5-flash",
     "minds_cloud": "haiku",
 }
-# Router role: the cheap front-model that runs history summarization (and later
-# gates each turn, respond-vs-delegate). Defaults: MindsHub →
-# `kimi` (Kimi K2 — fast and cheap; the deprecated `latest:` prefix still
-# resolves but the bare alias is preferred), direct providers → their smallest
-# model (same as the coding tier). Keyed by Provider.value (snake_case).
+# Router role: the cheap front-model that runs history summarization AND gates
+# each turn (respond-vs-delegate, ENG-648/ENG-1135). It MUST be fast and
+# non-reasoning — the gate call sits in front of every turn, so a slow reasoning
+# model here (the old `kimi` default) adds ~6s to complex turns and negates the
+# trivial-turn savings. Defaults: MindsHub → `gpt-mini` (measured ~1s gate,
+# collapsing trivial turns from 8–12s to ~1.5s); direct providers → their
+# smallest model (same as the coding tier). Keyed by Provider.value (snake_case).
 ROUTER_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
     "gemini": "gemini-2.5-flash",
-    "minds_cloud": "kimi",
+    "minds_cloud": "gpt-mini",
 }
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
