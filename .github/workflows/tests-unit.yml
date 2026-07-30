@@ -3,13 +3,13 @@ name: Unit Tests
 on:
   workflow_call:
     inputs:
-      anton-ref:
+      anton-version:
         description: >-
-          Exact anton git ref to test against, overriding the committed
-          anton-agent pin for this job only. Staging-line callers resolve
-          anton/staging once and pass its immutable SHA so tests and images use
-          the same dependency snapshot. Empty (the default) leaves the
-          committed pin unchanged for the main/prod line.
+          Exact published anton-agent version to test against, overriding the
+          committed dependency for this job only. Release-line callers resolve
+          the package built from the matching Anton branch once so tests,
+          images, and wheels use the same artifact. Empty leaves the committed
+          dependency unchanged for callers with no release channel.
         type: string
         default: ""
 
@@ -31,17 +31,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Repoint anton-agent at the ref under test, using uv's own dependency
-      # editing — robust to however the committed pin is spelled (branch, rev,
-      # or SHA), unlike a text substitution. --no-sync updates pyproject + lock
-      # only; the install happens in the next step. Ephemeral: it edits the
-      # checkout in place, never a commit, so nothing is promoted. The ref is
-      # passed via env, not interpolated into the command, to avoid injection.
-      - name: Point anton-agent at the requested ref
-        if: inputs.anton-ref != ''
+      # Replace the committed dependency with the exact requested artifact.
+      # Ephemeral: this edits only the job checkout and is never promoted.
+      - name: Use the requested anton-agent package
+        if: inputs.anton-version != ''
         env:
-          ANTON_REF: ${{ inputs.anton-ref }}
-        run: uv add "anton-agent @ git+https://github.com/mindsdb/anton.git@${ANTON_REF}" --no-sync
+          ANTON_VERSION: ${{ inputs.anton-version }}
+        run: .github/scripts/use-anton-package.sh "${ANTON_VERSION}"
 
       - name: Install dependencies
         run: uv sync --group dev
