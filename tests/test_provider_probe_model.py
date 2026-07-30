@@ -79,3 +79,34 @@ def test_ping_provider_missing_key_still_fails_fast(monkeypatch):
     _patch(monkeypatch)
     status, detail = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": ""}))
     assert status == "fail" and "key" in detail.lower()
+
+
+def test_ping_minds_cloud_surfaces_provider_message(monkeypatch):
+    # minds-cloud is the one provider routed through _chat_probe (real chat
+    # completions), so its failures carry the gateway's actionable reason
+    # (wallet/allowance/model). The dot detail must show it, not a bare
+    # "HTTP 429" (ENG-1145 review, ENG-576).
+    class _FailResp:
+        status_code = 429
+
+        def json(self):
+            return {"error": {"message": "Wallet allowance exhausted. Top up to continue."}}
+
+    class _FailClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            return _FailResp()
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _FailClient)
+    status, detail = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}))
+    assert status == "fail"
+    assert "HTTP 429" in detail
+    assert "Wallet allowance exhausted" in detail
