@@ -136,6 +136,100 @@ def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
         session.close()
 
 
+def test_recommended_models_overlays_gemini(monkeypatch):
+    """A dedicated Gemini key overlays Google's live /models onto the gemini
+    bucket, replacing the static fallback (ENG-1145)."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    keys: list[str] = []
+
+    async def fake_gemini(api_key, force_refresh=False):
+        keys.append(api_key)
+        return ["gemini-3.6-flash", "gemini-3.1-pro-preview"]
+
+    async def no_minds(*a, **k):
+        return None, {}, {}, {}
+
+    monkeypatch.setattr(settings_endpoint, "fetch_gemini_models", fake_gemini)
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", no_minds)
+
+    session = get_open_session()
+    try:
+        _delete_settings(session, "minds_api_key", "providers_json", "openai_api_key")
+        _set_settings(session, gemini_api_key="AIza-secret")
+
+        result = asyncio.run(recommended_models(session))
+
+        assert result["recommendedModels"]["gemini"] == ["gemini-3.6-flash", "gemini-3.1-pro-preview"]
+        # Fetched with the DEDICATED gemini key.
+        assert keys == ["AIza-secret"]
+    finally:
+        _delete_settings(session, "gemini_api_key")
+        session.close()
+
+
+def test_recommended_models_gemini_falls_back_to_static(monkeypatch):
+    """When the live fetch fails (offline / stale key), the gemini bucket keeps
+    the static RECOMMENDED_MODELS list rather than emptying."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.common.settings.app_settings import RECOMMENDED_MODELS
+    from cowork.db.session import get_open_session
+
+    async def fake_gemini(api_key, force_refresh=False):
+        return None
+
+    monkeypatch.setattr(settings_endpoint, "fetch_gemini_models", fake_gemini)
+
+    session = get_open_session()
+    try:
+        _delete_settings(session, "minds_api_key", "providers_json", "openai_api_key")
+        _set_settings(session, gemini_api_key="AIza-secret")
+
+        result = asyncio.run(recommended_models(session))
+
+        assert result["recommendedModels"]["gemini"] == list(RECOMMENDED_MODELS["gemini"])
+    finally:
+        _delete_settings(session, "gemini_api_key")
+        session.close()
+
+
+def test_recommended_models_no_gemini_fetch_without_dedicated_key(monkeypatch):
+    """An OpenAI-only user (shared openai key, no dedicated gemini key) must NOT
+    trigger a Gemini /models fetch — that would send their OpenAI key to Google."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    called = False
+
+    async def fake_gemini(api_key, force_refresh=False):
+        nonlocal called
+        called = True
+        return ["should-not-appear"]
+
+    async def no_minds(*a, **k):
+        return None, {}, {}, {}
+
+    monkeypatch.setattr(settings_endpoint, "fetch_gemini_models", fake_gemini)
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", no_minds)
+
+    session = get_open_session()
+    try:
+        _delete_settings(session, "minds_api_key", "providers_json", "gemini_api_key")
+        _set_settings(session, openai_api_key="sk-openai-only")
+
+        result = asyncio.run(recommended_models(session))
+
+        assert called is False
+        assert "should-not-appear" not in result["recommendedModels"]["gemini"]
+    finally:
+        _delete_settings(session, "openai_api_key")
+        session.close()
+
+
 def test_recommended_models_no_openai_compatible_card(monkeypatch):
     from cowork.api.v1.endpoints import settings as settings_endpoint
     from cowork.api.v1.endpoints.settings import recommended_models

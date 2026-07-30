@@ -29,6 +29,7 @@ from cowork.schemas.settings import (
 )
 from cowork.services.providers import (
     check_config_status,
+    fetch_gemini_models,
     fetch_minds_models,
     ping_providers,
     resolve_stored_key,
@@ -338,6 +339,21 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
         _fill_missing(model_efforts, live_efforts)
         _fill_missing(model_enabled, live_enabled)
         _fill_missing(model_labels, live_labels)
+
+    # Gemini is BYOK-over-OpenAI-compatible; overlay Google's live /models so the
+    # picker tracks Google's current catalog instead of the static list, whose
+    # gemini-2.5-* ids 404 for new users (ENG-1145). Falls back to the static
+    # list on any failure — notably during onboarding, when the key isn't saved
+    # yet, so the pre-key pick still comes from RECOMMENDED_MODELS["gemini"].
+    #
+    # Read the DEDICATED gemini slot, NOT provider_api_key_str (which falls back
+    # to the shared openai key): an OpenAI-only user must not trigger a Google
+    # fetch — that both wastes a call and would send their OpenAI key to Google.
+    gemini_key = s.gemini_api_key.get_secret_value() if s.gemini_api_key is not None else ""
+    if gemini_key:
+        live = await fetch_gemini_models(gemini_key, force_refresh=refresh)
+        if live:
+            recommended["gemini"] = live
 
     return {
         "recommendedModels": recommended,

@@ -262,6 +262,121 @@ async def fetch_minds_models(
     return _remember(((ids or None), efforts, enabled, labels))
 
 
+# ── Gemini model listing — live picker source for the BYOK gemini card ─
+_GEMINI_MODELS_TTL = 300.0       # successful fetch
+_GEMINI_MODELS_FAIL_TTL = 30.0   # negative result
+# (timestamp, ids-or-None), keyed by a per-process fingerprint of the api key
+# — NOT the raw secret, and NOT a constant URL. The listing is scoped to the
+# key ("models that key can see"), so keying on a constant would serve one key's
+# catalog to the next key (or a second settings session) for the whole TTL.
+_gemini_models_cache: dict[int, tuple[float, Optional[list[str]]]] = {}
+
+# Native models.list — used INSTEAD of the OpenAI-compat /models list because it
+# carries capability metadata (supportedGenerationMethods); the openai-compat
+# list has none. Keeping every non-embedding id would let the picker advertise
+# image/TTS/video/Live models that Anton's chat.completions path can't call and
+# that fail deterministically at runtime (ENG-1145 review).
+_GEMINI_NATIVE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+# generateContent is overloaded for multimodal OUTPUT (image/tts/audio) as well
+# as chat, so capability alone doesn't exclude those families — drop them by id
+# substring as a conservative backstop.
+_GEMINI_NON_CHAT_ID_HINTS = (
+    "embedding", "embed", "aqa",
+    "imagen", "-image", "image-",
+    "tts", "audio", "veo", "video", "live",
+)
+
+
+def _gemini_key_fingerprint(api_key: str) -> int:
+    """Per-process, non-reversible cache-partition id for a Gemini credential.
+
+    Deliberately the builtin ``hash()`` (a per-process salted SipHash), NOT a
+    cryptographic hash. This only buckets an in-memory cache that dies with the
+    process, so a stable-across-runs digest buys nothing — and running the key
+    through ``hashlib`` gains no security here yet trips CodeQL's password-hashing
+    check (which reads ``api_key`` as a password and objects to a fast hash). The
+    id is not the raw secret, so a cache/heap dump can't recover the key, and it
+    still isolates one credential's cached model list from another's.
+    """
+    return hash(api_key)
+
+
+def _is_chat_capable_gemini(model: dict, model_id: str) -> bool:
+    """A native models.list row Anton can call via chat.completions.
+
+    Requires generateContent support and excludes the specialized multimodal /
+    embedding families that advertise generateContent for non-text output."""
+    methods = model.get("supportedGenerationMethods")
+    if not isinstance(methods, list) or "generateContent" not in methods:
+        return False
+    lowered = model_id.lower()
+    return not any(hint in lowered for hint in _GEMINI_NON_CHAT_ID_HINTS)
+
+
+async def fetch_gemini_models(
+    api_key: str, *, force_refresh: bool = False
+) -> Optional[list[str]]:
+    """Live, chat-capable Gemini model ids, or None.
+
+    Gemini is a BYOK provider Cowork routes over the OpenAI-compatible transport,
+    so the picker should list exactly the models the user's key can call rather
+    than a hardcoded set that goes stale as Google retires ids — the shipped
+    gemini-2.5-* defaults 404 for new users (ENG-1145). Returns None on any
+    failure so the caller falls back to the static ``RECOMMENDED_MODELS["gemini"]``.
+
+    Reads Google's NATIVE ``models.list`` (which carries
+    ``supportedGenerationMethods``) and keeps only chat-capable models — the
+    openai-compat ``/models`` list has no capability field, so it can't tell a
+    chat model from an image/TTS/video one. Ids are normalized from
+    ``models/<id>`` to ``<id>`` (the form the chat.completions surface accepts).
+    """
+    if not api_key:
+        return None
+
+    cache_key = _gemini_key_fingerprint(api_key)
+    now = time.monotonic()
+    cached = _gemini_models_cache.get(cache_key)
+    if cached:
+        ts, val = cached
+        ttl = _GEMINI_MODELS_TTL if val else _GEMINI_MODELS_FAIL_TTL
+        if (now - ts) < ttl and not (force_refresh and val):
+            return val
+
+    def _remember(val: Optional[list[str]]) -> Optional[list[str]]:
+        _gemini_models_cache[cache_key] = (time.monotonic(), val)
+        return val
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(6.0), follow_redirects=True
+        ) as client:
+            r = await client.get(
+                _GEMINI_NATIVE_MODELS_URL,
+                params={"pageSize": 1000},
+                headers={"x-goog-api-key": api_key},
+            )
+        if r.status_code >= 400:
+            logger.debug("gemini models.list returned HTTP %s", r.status_code)
+            return _remember(None)
+        data = r.json()
+    except Exception as exc:
+        logger.debug("gemini models.list failed: %s", exc)
+        return _remember(None)
+
+    rows = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return _remember(None)
+    ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name", ""))
+        model_id = (name.split("/", 1)[1] if name.startswith("models/") else name).strip()
+        if model_id and _is_chat_capable_gemini(row, model_id):
+            ids.append(model_id)
+    return _remember(ids or None)
+
+
 # ── Config readiness ─────────────────────────────────────────────────
 
 
