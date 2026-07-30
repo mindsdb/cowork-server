@@ -29,6 +29,14 @@ class OAuthConfig(BaseModel):
     auth_url: str
     token_url: str
     scopes: list[str] = []
+    # Some providers (HubSpot, confirmed 2026-07-30) require required and
+    # optional scopes in SEPARATE authorize-URL query params (`scope` vs
+    # `optional_scope`) — sending everything through `scope` triggers
+    # "mismatch between the scopes in the install URL and the app's
+    # configured scopes". Scopes here are added to `optional_scope`
+    # instead of `scope`; leave empty (the default) for providers with a
+    # single flat scope list, unaffected by this field's existence.
+    optional_scopes: list[str] = []
     extra_auth_params: dict[str, str] = {}
     # Only meaningful when supports_revoke is True — where to POST the
     # token being revoked (RFC 7009-style: token in the form-encoded body).
@@ -40,6 +48,16 @@ class OAuthConfig(BaseModel):
     # directly instead of a random free port. Omit for providers that
     # accept any loopback port (the default, matches Google's behavior).
     redirect_port: int | None = None
+    # Some providers (HubSpot, confirmed 2026-07-30) reject any redirect_uri
+    # containing a raw IP literal (127.0.0.1) at OAuth-app registration time —
+    # only a valid https:// URL or exactly http://localhost[:port][/path] is
+    # accepted. Set this to override just the hostname portion of the
+    # loopback/server redirect_uri (both the desktop PKCE flow and the
+    # server-hosted web-route callback keep binding to 127.0.0.1 — localhost
+    # resolves to the same address, so only the string sent to the provider
+    # changes). Omit for providers that accept 127.0.0.1 (the default,
+    # matches every other connector's current behavior).
+    redirect_host: str | None = None
     # Only set on the `browser_oauth_builtin` method — the service-id slug
     # (e.g. "google-drive") used in the /connectors/oauth/{service}/... web
     # fallback routes. The engine name and this slug have already diverged
