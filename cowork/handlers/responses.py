@@ -506,15 +506,46 @@ class ResponsesHandler:
         )
 
 
+# A card waiting on a human produces no events, so the stream can be quiet
+# for the whole question timeout. Cloudflare (proxied, in the path for every
+# cloud instance) drops quiet connections; the documented threshold is about
+# time-to-first-byte rather than mid-stream idle, so confirm the real number
+# by experiment — but a heartbeat is required regardless of where it sits.
+SSE_KEEPALIVE_SECONDS = 20.0
+
+
 async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None]:
     """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
     just ends the stream — the harness's own response.completed/failed frame
-    was already written as a normal record."""
-    async for rec in buffer.tail(from_seq):
-        if rec.is_terminal:
-            return
-        sse = rec.data.get("sse")
-        if sse:
-            yield sse
+    was already written as a normal record.
+
+    Emits a comment heartbeat whenever the buffer has been quiet for
+    ``SSE_KEEPALIVE_SECONDS``, so an intermediary cannot mistake a pending
+    ask_user card for a dead connection.
+    """
+    records = buffer.tail(from_seq).__aiter__()
+    pending = asyncio.ensure_future(records.__anext__())
+    try:
+        while True:
+            try:
+                rec = await asyncio.wait_for(
+                    asyncio.shield(pending), timeout=SSE_KEEPALIVE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            except StopAsyncIteration:
+                return
+            pending = asyncio.ensure_future(records.__anext__())
+            if rec.is_terminal:
+                return
+            sse = rec.data.get("sse")
+            if sse:
+                yield sse
+    finally:
+        pending.cancel()
+        aclose = getattr(records, "aclose", None)
+        if aclose is not None:
+            await aclose()
