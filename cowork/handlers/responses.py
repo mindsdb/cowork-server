@@ -188,14 +188,13 @@ class ResponsesHandler:
         call below is unchanged from before this branch existed.
         """
         if TurnQueueSettings().backend == "remote":
-            return produce_remote_turn(
-                conversation_id=str(conv_id),
-                org_id=self.scoped.scope.org_id,
-                user_id=self.scoped.scope.user_id,
+            return self._produce_remote(
+                conv_id=conv_id,
                 input_text=self._prompt_text(harness_input),
+                original_content=original_content,
                 model=model,
+                harness_id=harness_id,
                 buffer=buffer,
-                history=self._remote_history(conv_id),
             )
         return self._produce(
             conv_id=conv_id,
@@ -210,15 +209,89 @@ class ResponsesHandler:
             trace_metadata=trace_metadata,
         )
 
-    def _remote_history(self, conv_id) -> list[dict]:
+    @staticmethod
+    def _remote_history(session, conv_id) -> list[dict]:
         """Prior user/assistant messages in canonical order, as OpenAI-shaped
         dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
-        ordered = ConversationService(self.scoped).get_ordered_messages(conv_id)
+        ordered = ConversationService(session).get_ordered_messages(conv_id)
         return [
             m.to_openai_message().model_dump(mode="json")
             for m in ordered
             if m.role in {"user", "assistant"}
         ]
+
+    async def _produce_remote(
+        self,
+        *,
+        conv_id: UUID,
+        input_text: str,
+        original_content,
+        model: str | None,
+        harness_id: str | None,
+        buffer,
+    ) -> None:
+        """Remote-backend counterpart of _produce: run the turn through the
+        queue and persist user + assistant together on terminal (deferred, so
+        _remote_history reads prior turns without the current input)."""
+        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
+        collected_text: list[str] = []
+        collected_events: list[dict] = []
+        persisted = False
+
+        def on_event(kind: str, data: dict) -> None:
+            # Mirror the SSE frames the producer streams, so the client
+            # rebuilds the same turn from the events log on reload.
+            if kind == "turn_delta":
+                text = data.get("text", "")
+                collected_text.append(text)
+                collected_events.append({"type": "response.output_text.delta", "delta": text})
+            elif kind == "turn_completed":
+                collected_events.append({"type": "response.completed"})
+            elif kind == "turn_failed":
+                collected_events.append({"type": "response.completed", "error": data.get("error")})
+
+        def persist() -> None:
+            nonlocal persisted
+            if persisted:
+                return
+            persisted = True
+            try:
+                # Re-anchor first: the conversation may be gone or out of scope.
+                ConversationService(producer_session).get_conversation(conv_id)
+                ConversationService(producer_session).save_user_message(conv_id, original_content)
+                producer_session.commit()
+                ConversationService(producer_session).save_assistant_turn(
+                    conv_id, "".join(collected_text), collected_events, harness=harness_id,
+                )
+            except Exception:
+                logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
+
+        try:
+            await produce_remote_turn(
+                conversation_id=str(conv_id),
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+                input_text=input_text,
+                model=model,
+                buffer=buffer,
+                # Producer session, NOT self.scoped: this coroutine is detached
+                # and the request session may be closed by the time it runs.
+                history=self._remote_history(producer_session, conv_id),
+                on_event=on_event,
+            )
+            persist()
+        except asyncio.CancelledError:
+            # Partial text generated before cancellation is persisted.
+            persist()
+            await buffer.close("cancelled")
+        except Exception:
+            logger.exception("[responses] remote turn failed for conversation %s", conv_id)
+            await buffer.append("sse", {"sse": response_failed_sse(
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            persist()
+            await buffer.close("error")
+        finally:
+            producer_session.close()
 
     async def _produce(
         self,

@@ -3,8 +3,8 @@ through the Redis-backed remote producer instead of the in-process detached
 run; unset/"inprocess" must stay byte-identical to today.
 
 Built without __init__ (same pattern as tests/test_turn_errors.py) so no
-DB/harness setup is needed - _select_producer only touches self.scoped,
-self._produce and self._remote_history (stubbed here; it needs a DB session).
+DB/harness setup is needed - the DB-touching pieces (_remote_history and
+the persistence layer inside _produce_remote) are stubbed.
 """
 from __future__ import annotations
 
@@ -53,32 +53,110 @@ def test_remote_backend_selected(monkeypatch):
 
     called = {}
 
-    def fake_produce_remote_turn(**kwargs):
-        called.update(kwargs)
-        return "remote-sentinel"
-
-    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
-
     handler = _handler()
 
     def _boom(**kwargs):
         raise AssertionError("in-process _produce must not run when backend=remote")
 
     handler._produce = _boom
-    prior = [{"role": "user", "content": "earlier"}]
-    handler._remote_history = lambda conv_id: prior
+
+    def fake_produce_remote(**kwargs):
+        called.update(kwargs)
+        return "remote-sentinel"
+
+    handler._produce_remote = fake_produce_remote
 
     kwargs = _kwargs()
     result = handler._select_producer(**kwargs)
 
     assert result == "remote-sentinel"
-    assert called["conversation_id"] == str(kwargs["conv_id"])
-    assert called["org_id"] == "org-123"
-    assert called["user_id"] == "user-456"
+    assert called["conv_id"] == kwargs["conv_id"]
     assert called["input_text"] == "hello there"
+    assert called["original_content"] == "hello there"
     assert called["model"] == "anton"
+    assert called["harness_id"] == "anton"
     assert called["buffer"] is kwargs["buffer"]
-    assert called["history"] == prior
+
+
+def _remote_handler(monkeypatch, saved):
+    """Handler wired for _produce_remote with the DB layer faked out."""
+    handler = _handler()
+    handler.principal = object()
+    handler._remote_history = lambda session, conv_id: []
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return object()
+
+        def save_user_message(self, conv_id, content):
+            saved["user"] = content
+
+        def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
+            saved["assistant"] = text
+            saved["events"] = events
+            saved["harness"] = harness
+
+    class FakeSession:
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
+    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_persists_user_and_assistant(monkeypatch):
+    # The remote path must persist the turn like _produce does — without this,
+    # reloads lose the conversation and _remote_history reads an empty DB.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_produce_remote_turn(*, on_event=None, **kwargs):
+        on_event("turn_delta", {"text": "he"})
+        on_event("turn_delta", {"text": "llo"})
+        on_event("turn_completed", {})
+
+    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=object(),
+    )
+
+    assert saved["user"] == "hi"
+    assert saved["assistant"] == "hello"
+    assert saved["harness"] == "anton"
+    assert saved["events"][-1] == {"type": "response.completed"}
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_persists_on_failure(monkeypatch):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_produce_remote_turn(*, on_event=None, **kwargs):
+        on_event("turn_delta", {"text": "partial"})
+        on_event("turn_failed", {"error": "boom"})
+
+    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=object(),
+    )
+
+    assert saved["user"] == "hi"
+    assert saved["assistant"] == "partial"
+    assert saved["events"][-1] == {"type": "response.completed", "error": "boom"}
 
 
 @pytest.mark.parametrize("backend_env", [None, "inprocess"])

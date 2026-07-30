@@ -30,7 +30,10 @@ def _sse(event: str, payload: dict) -> str:
 async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               user_id: str | None, input_text: str,
                               model: str | None, buffer,
-                              history: list | None = None) -> None:
+                              history: list | None = None,
+                              on_event=None) -> None:
+    """`on_event(kind, data)` is called per reply (turn_delta/turn_completed/
+    turn_failed) so the caller can collect the turn for persistence."""
     settings = TurnQueueSettings()
     r = get_redis()
     corr = _new_correlation_id()
@@ -63,6 +66,8 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                     continue
                 kind = reply.kind
                 data = reply.data or {}
+                if on_event is not None and kind in ("turn_delta", "turn_completed", "turn_failed"):
+                    on_event(kind, data)
                 if kind == "turn_delta":
                     await buffer.append("sse", {"sse": _sse(
                         "response.output_text.delta",
