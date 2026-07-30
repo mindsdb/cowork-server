@@ -7,6 +7,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
@@ -18,6 +19,21 @@ from cowork.services.connectors.connections import service
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+def build_elicitor(conversation_id: str):
+    """The question strategy for this conversation, or None when disabled.
+
+    Returning None is the kill switch: anton only registers `ask_user` when
+    an elicitor supports "choice", so the model reverts to asking in plain
+    text with no silent-failure window.
+    """
+    if not get_app_settings().ask_user_enabled:
+        return None
+    from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
+    from cowork.streaming.answers import broker
+
+    return CoworkElicitor(conversation_id, broker, timeout_s=300)
 
 
 _REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"
@@ -708,6 +724,7 @@ class AntonHarness:
             initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),
+            elicitor=build_elicitor(str(conversation.id)),
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
