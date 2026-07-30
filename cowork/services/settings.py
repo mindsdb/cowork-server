@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from enum import Enum
 
 from cryptography.fernet import InvalidToken
@@ -22,6 +23,12 @@ from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
 
 logger = logging.getLogger(__name__)
+
+# Serializes the .env export's read/merge/write so two concurrent settings writes
+# can't lost-update the file — the last exporter re-reads the DB under the lock and
+# installs the latest committed state (ENG-1127 review). In-process; the client's
+# own .env writes go away in Phase B, making the server the sole writer.
+_env_export_lock = threading.Lock()
 
 
 def _mask_provider_keys(providers_json: str) -> str:
@@ -180,13 +187,17 @@ class SettingService:
         try:
             if get_app_settings().tenancy_mode != "local":
                 return
-            rows = self._fetch_all_rows()
-            managed = db_to_env(self._load(rows), {row.key for row in rows})
-            path = cowork_home() / ".env"
-            existing = path.read_text(encoding="utf-8") if path.exists() else ""
-            content = merge_env_lines(existing, managed)
-            if content != existing:
-                atomic_write_env(path, content)
+            # Serialize the whole read/merge/write. The DB read is INSIDE the lock,
+            # so the last exporter to acquire it installs the latest committed
+            # state — no lost update between concurrent settings writes.
+            with _env_export_lock:
+                rows = self._fetch_all_rows()
+                managed = db_to_env(self._load(rows), {row.key for row in rows})
+                path = cowork_home() / ".env"
+                existing = path.read_text(encoding="utf-8") if path.exists() else ""
+                content = merge_env_lines(existing, managed)
+                if content != existing:
+                    atomic_write_env(path, content)
         except Exception as exc:  # noqa: BLE001 - export is best-effort
             logger.warning("settings: .env export for the CLI failed: %s", exc)
 
