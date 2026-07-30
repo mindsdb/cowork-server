@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -524,6 +525,14 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
     Emits a comment heartbeat whenever the buffer has been quiet for
     ``SSE_KEEPALIVE_SECONDS``, so an intermediary cannot mistake a pending
     ask_user card for a dead connection.
+
+    Prefetch semantics: unlike a plain ``async for``, this loop keeps one
+    ``__anext__()`` in flight while the current record is being yielded, so it
+    runs one record ahead of the wire. That is safe only because
+    ``buffer.tail(from_seq)`` is replayable — if the consumer goes away and a
+    prefetched record is discarded unrendered, the client reconnects via
+    ``GET /responses/tail`` from its last rendered seq and the record is
+    replayed. Do not introduce a non-replayable source under this loop.
     """
     records = buffer.tail(from_seq).__aiter__()
     pending = asyncio.ensure_future(records.__anext__())
@@ -538,14 +547,24 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
                 continue
             except StopAsyncIteration:
                 return
-            pending = asyncio.ensure_future(records.__anext__())
+            # Checked BEFORE prefetching: the terminal record ends the stream,
+            # so scheduling another __anext__() here would only be cancelled.
             if rec.is_terminal:
                 return
+            pending = asyncio.ensure_future(records.__anext__())
             sse = rec.data.get("sse")
             if sse:
                 yield sse
     finally:
+        # Let the cancellation actually land before closing. Task.cancel() is
+        # asynchronous, so closing immediately after it hits the underlying async
+        # generator while ag_running_async is still set, and aclose() raises
+        # "RuntimeError: aclose(): asynchronous generator is already running" —
+        # which then REPLACES the CancelledError on the real disconnect path
+        # (StreamingResponse cancels this task), leaving the iterator open.
         pending.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait([pending])
         aclose = getattr(records, "aclose", None)
         if aclose is not None:
             await aclose()
