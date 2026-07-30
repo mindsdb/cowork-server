@@ -70,7 +70,8 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
- # Revert anton-agent pin to "main", as a hotfix, once 8/2/26 release is out
+# Update this anton-agent SHA pin if there are any further updates to anton before the 8/2/26 release
+# After 8/2/26 release, be sure to change the pin back to "main", with a hotfix
 anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "cff09f27c8f73ed8ca99d515c30933a935edec1f" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
