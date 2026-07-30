@@ -70,24 +70,28 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
-# This pin is the MAIN-LINE anton, and the source of truth for local dev and
-# for the prod wheel/lock. It intentionally does NOT track anton/staging.
+# MAIN-LINE anton, spelled exactly as on the main branch (`branch = "main"`) so
+# the two branches never diverge on this line — the release train's
+# main<->staging auto-merges then can't conflict on it or silently clobber it.
+# This is the source of truth for local dev and the prod wheel/lock.
 #
-# The staging line no longer needs a hand-pinned anton SHA: CI repoints
-# anton-agent to anton/staging for the staging-line unit tests
-# (.github/workflows/tests-unit.yml, driven by publish-staging.yml and PRs into
+# The staging line does NOT hand-pin an anton SHA. CI repoints anton-agent to
+# anton/staging (robustly, via `uv add`) for the staging-line unit tests
+# (.github/workflows/tests-unit.yml, from publish-staging.yml and PRs into
 # staging) and for the non-prod image build (build-deploy.yml), so staging code
-# is validated against anton/staging without editing this file. See ENG-1159.
+# is always validated against anton/staging without editing this file. See
+# ENG-1159.
 #
-# It is currently pinned to an immutable anton/staging SHA only because the
-# 8/2/26 coordinated release needs StreamReasoningDelta, which is on
-# anton/staging but not yet anton/main. THE MOMENT anton/staging is promoted to
-# anton/main, revert this to the branch and relock — a one-liner, no SHA hunting:
-#   sed -i -E 's#(anton-agent = \{ git = "[^"]*", rev = )"[^"]*"#\1"main"#' pyproject.toml
-#   uv lock --upgrade-package anton-agent
-# After that revert, no further hand-pinning is ever needed: the CI override
-# above keeps every future cross-repo change unblocked on the staging line.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "cff09f27c8f73ed8ca99d515c30933a935edec1f" }
+# LOCAL DEV CAVEAT during an in-flight cross-repo release: if cowork-server
+# staging uses an anton symbol that is on anton/staging but not yet anton/main
+# (true for StreamReasoningDelta until the 8/2/26 promotion), a plain local
+# `uv sync` on staging resolves anton/main and won't have it. CI overrides, but
+# your laptop reads only this file. Pull staging anton into your venv without
+# touching the committed pin (self-resolves once anton/staging reaches main):
+#   uv sync --group dev
+#   uv pip install --reinstall-package anton-agent \
+#     "anton-agent @ git+https://github.com/mindsdb/anton.git@staging"
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 

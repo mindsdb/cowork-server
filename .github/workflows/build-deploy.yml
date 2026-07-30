@@ -73,10 +73,11 @@ jobs:
 
       # Non-prod images (per-PR + staging) must run against anton's staging
       # HEAD, not the committed main-line pin: cowork-server's staging code
-      # imports anton symbols that only reach anton/main at release. Repoint and
-      # relock the workspace here so the Dockerfile's `uv sync --frozen` installs
-      # staging anton. build-push-ecr builds from this same checkout, so the
-      # edited pyproject/uv.lock is what the image layer sees.
+      # imports anton symbols that only reach anton/main at release. Repoint the
+      # workspace here (uv add updates pyproject + lock) so the Dockerfile's
+      # `uv sync --frozen` installs staging anton. build-push-ecr builds from
+      # this same checkout, so the edited pyproject/uv.lock is what the image
+      # layer sees.
       #
       # Prod is unaffected: it builds from the committed lock. (Prod does not
       # call this workflow today — publish.yml ships a wheel, not an image — but
@@ -88,11 +89,7 @@ jobs:
           python-version: "3.12"
       - name: Point anton-agent at staging (non-prod images)
         if: inputs.build-environment != 'production'
-        run: |
-          set -euo pipefail
-          sed -i -E 's#(anton-agent = \{ git = "[^"]*", rev = )"[^"]*"#\1"staging"#' pyproject.toml
-          grep -q 'rev = "staging"' pyproject.toml
-          uv lock --upgrade-package anton-agent
+        run: uv add "anton-agent @ git+https://github.com/mindsdb/anton.git@staging" --no-sync
       - id: build
         uses: mindsdb/github-actions/build-push-ecr@main
         with:
