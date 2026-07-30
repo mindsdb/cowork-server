@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from cowork.db.scoped import ScopedSession
+from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
@@ -36,6 +37,11 @@ class ScheduleService:
         project_id: UUID | None = None,
         enabled: bool = True,
     ) -> Schedule:
+        # Anchor the parent (same as conversations): the target project must be
+        # visible in scope, or a foreign org's project id could be attached.
+        target_project_id = project_id or GENERAL_PROJECT_ID
+        if self.session.get(Project, target_project_id) is None:
+            raise ValueError("Project not found")
         schedule = Schedule(
             title=title,
             prompt=prompt,
@@ -43,7 +49,7 @@ class ScheduleService:
             next_run_at=next_run_at,
             model=model,
             timezone=timezone,
-            project_id=project_id or GENERAL_PROJECT_ID,
+            project_id=target_project_id,
             enabled=enabled,
         )
         self.session.add(schedule)
@@ -53,6 +59,9 @@ class ScheduleService:
 
     def update_schedule(self, schedule_id: UUID, **kwargs) -> Schedule:
         schedule = self.get_schedule(schedule_id)
+        new_project_id = kwargs.get("project_id")
+        if new_project_id is not None and self.session.get(Project, new_project_id) is None:
+            raise ValueError("Project not found")
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
