@@ -2,13 +2,6 @@ name: Unit Tests
 
 on:
   workflow_call:
-    inputs:
-      anton-revision:
-        description: >-
-          Exact Anton commit to test against. Empty keeps the committed
-          pyproject/uv.lock dependency.
-        type: string
-        default: ""
 
 permissions:
   contents: read
@@ -27,12 +20,6 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
-
-      - name: Use the requested Anton revision
-        if: inputs.anton-revision != ''
-        env:
-          ANTON_REVISION: ${{ inputs.anton-revision }}
-        run: .github/scripts/use-anton-revision.sh "${ANTON_REVISION}"
 
       - name: Install dependencies
         run: uv sync --group dev

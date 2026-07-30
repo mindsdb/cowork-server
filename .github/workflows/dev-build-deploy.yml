@@ -41,7 +41,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.decide.outputs.run }}
-      anton-revision: ${{ steps.decide.outputs.anton-revision }}
     steps:
       - name: Decide whether this PR needs the pipeline
         id: decide
@@ -52,22 +51,6 @@ jobs:
           THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
-          if [ "$BASE_REF" = "staging" ]; then
-            ANTON_REVISION=$(
-              git ls-remote https://github.com/mindsdb/anton.git refs/heads/staging |
-                awk 'NR == 1 { print $1 }'
-            )
-            if [[ ! "$ANTON_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Could not resolve anton/staging to a commit." >&2
-              exit 1
-            fi
-            echo "anton-revision=$ANTON_REVISION" >> "$GITHUB_OUTPUT"
-            echo "Using anton/staging@$ANTON_REVISION" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "anton-revision=" >> "$GITHUB_OUTPUT"
-          fi
-
           if [ "$HEAD_REPO" != "$THIS_REPO" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             {
@@ -91,10 +74,7 @@ jobs:
   run-unit-tests:
     # Deliberately ungated: these run on `ubuntu-latest` with no secrets, so a
     # fork contributor gets the CI that matters to them.
-    needs: [gate]
     uses: ./.github/workflows/tests-unit.yml
-    with:
-      anton-revision: ${{ needs.gate.outputs.anton-revision }}
 
   workflow-lint:
     # actionlint, the caller/callee permission check, and a zizmor audit, from the
@@ -115,7 +95,6 @@ jobs:
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: development
-      anton-revision: ${{ needs.gate.outputs.anton-revision }}
       pr-environment: true
     secrets: inherit
 
