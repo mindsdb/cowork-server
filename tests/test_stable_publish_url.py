@@ -243,8 +243,9 @@ def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
     root = _make_fullstack(tmp_path)
     captured = {}
 
-    def _fake_publish_artifact(raw_path):
+    def _fake_publish_artifact(raw_path, access=None):
         captured["path"] = raw_path
+        captured["access"] = access
         return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
 
     with patch.object(tools_mod, "_publish_artifact", _fake_publish_artifact):
@@ -259,7 +260,7 @@ def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
 def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
     root = _make_fullstack(tmp_path)
 
-    def _raise(raw_path):
+    def _raise(raw_path, access=None):
         raise ValueError("Configure your Minds API key in Settings before publishing")
 
     with patch.object(tools_mod, "_publish_artifact", _raise):
@@ -274,7 +275,7 @@ def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: P
     # Review #1: a non-key ValueError must not be reported as "no API key".
     root = _make_fullstack(tmp_path)
 
-    def _raise(raw_path):
+    def _raise(raw_path, access=None):
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
     with patch.object(tools_mod, "_publish_artifact", _raise):

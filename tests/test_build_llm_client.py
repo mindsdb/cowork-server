@@ -25,7 +25,11 @@ def build(monkeypatch):
     """Return a `build(settings) -> (client, calls)` helper.
 
     `calls` maps "openai"/"anthropic" → list of constructor kwarg dicts, in the
-    order build_llm_client built them (planning first, then coding)."""
+    order build_llm_client built them. When the installed anton's LLMClient
+    accepts a router role, build_llm_client constructs that one first, so the
+    list may start with a router call before planning/coding — tests index
+    `[-1]` (always the coding call) rather than `[0]` so they don't depend on
+    whether the router role happened to resolve to the same provider."""
     calls: dict[str, list[dict]] = {}
 
     def _capture(kind):
@@ -65,7 +69,7 @@ def test_gemini_targets_google_with_shared_key_fallback(build):
     )
     _client, calls = build(settings)
     assert "anthropic" not in calls
-    kw = calls["openai"][0]
+    kw = calls["openai"][-1]
     assert kw["api_key"] == "AIza-shared"
     assert kw["base_url"] == GEMINI_BASE_URL  # Google, NOT the contaminated slot
 
@@ -78,7 +82,7 @@ def test_openai_never_inherits_contaminated_base(build):
         openai_base_url="https://api.mindshub.ai/v1",  # contaminated; must be ignored
     )
     _client, calls = build(settings)
-    kw = calls["openai"][0]
+    kw = calls["openai"][-1]
     assert kw["api_key"] == "sk-openai"
     assert kw["base_url"] is None  # SDK default host, never the shared slot
 
@@ -94,7 +98,7 @@ def test_openai_compatible_uses_dedicated_key_and_own_base(build):
         openai_base_url="https://my-proxy.example.com/v1",
     )
     _client, calls = build(settings)
-    kw = calls["openai"][0]
+    kw = calls["openai"][-1]
     assert kw["api_key"] == "sk-compat"  # dedicated slot, not shared openai
     assert kw["base_url"] == "https://my-proxy.example.com/v1"
 
@@ -108,7 +112,7 @@ def test_anthropic_gets_no_base_url_kwarg(build):
     )
     _client, calls = build(settings)
     assert "openai" not in calls
-    kw = calls["anthropic"][0]
+    kw = calls["anthropic"][-1]
     assert kw["api_key"] == "sk-ant"
     assert "base_url" not in kw  # AnthropicProvider takes no base_url kwarg
 
@@ -150,6 +154,6 @@ def test_minds_cloud_uses_minds_key_and_derived_base(build):
         openai_api_key=SecretStr("sk-openai-should-not-win"),
     )
     _client, calls = build(settings)
-    kw = calls["openai"][0]
+    kw = calls["openai"][-1]
     assert kw["api_key"] == "mdb-key"  # minds slot, not the OpenAI slot
     assert kw["base_url"] == "https://api.mindshub.ai/v1"
