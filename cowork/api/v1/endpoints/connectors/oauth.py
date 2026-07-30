@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, HTTPException, Query, status
+from fastapi import APIRouter, Body, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 
+from cowork.api.v1.endpoints.guards import require_local
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
@@ -19,9 +20,12 @@ def start_oauth(service: str, body: OAuthStartRequest = Body(default_factory=OAu
 
 
 @router.get("/{engine}/credentials")
-def get_oauth_credentials(engine: str):
+def get_oauth_credentials(engine: str, request: Request):
     """Return client_id and client_secret for a builtin-OAuth engine.
     Called by Electron main process only — never exposed to the renderer."""
+    # Returns a raw client_secret — same loopback restriction as the settings
+    # reveal-key and /raw endpoints (ENG-868).
+    require_local(request)
     service_id = _ENGINE_TO_SERVICE.get(engine)
     if service_id is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth engine: {engine!r}")
