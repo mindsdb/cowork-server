@@ -167,7 +167,7 @@ deployment:
           key: INTERNAL_AUTH_SHARED_SECRET
     
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
-      value: "600"
+      value: "1200"
 
     # ====================================
     # PROVIDER API KEYS
