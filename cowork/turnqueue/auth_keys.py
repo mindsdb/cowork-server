@@ -11,11 +11,10 @@ import httpx
 
 
 async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
-                        credential: str, ttl_seconds: int, settings) -> str:
+                        ttl_seconds: int, settings) -> str:
     expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
     url = f"{settings.auth_internal_base_url.rstrip('/')}/v1/internal/turn-keys/"
-    headers = {"X-Internal-Auth": settings.auth_internal_secret,
-               "Authorization": credential}   # tenant's own Bearer, cross-checked by auth
+    headers = {"X-Internal-Auth": settings.auth_internal_secret}
     body = {"user_id": user_id, "organization_id": org_id,
             "instance_id": correlation_id, "expiry_date": expiry, "rotate": False}
     async with httpx.AsyncClient(timeout=5.0) as client:

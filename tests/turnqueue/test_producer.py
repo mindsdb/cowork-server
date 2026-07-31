@@ -1,26 +1,20 @@
 import json
 import pytest
-from pydantic import SecretStr
 
 from cowork.turnqueue import producer as prod
 
 
-class _FakeUserSettings:
-    minds_api_key = SecretStr("mdb_tenant_key")
-
-
 @pytest.fixture(autouse=True)
 def _stub_llm_mint(monkeypatch):
-    """Every produce_remote_turn call now mints a turn key + loads tenant
-    settings before enqueuing. Stub both by default so the pre-existing tests
-    (which only exercise the reply-loop/SSE behavior) don't need to know
-    about the llm block; tests that care override these explicitly."""
+    """Every produce_remote_turn call now mints a turn key before enqueuing.
+    Stub it by default so the pre-existing tests (which only exercise the
+    reply-loop/SSE behavior) don't need to know about the llm block; tests
+    that care override this explicitly."""
 
     async def _fake_mint(**kw):
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
-    monkeypatch.setattr(prod, "get_user_settings", lambda: _FakeUserSettings())
 
 
 class FakeRedis:
@@ -132,7 +126,6 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
-    monkeypatch.setattr(prod, "get_user_settings", lambda: _FakeUserSettings())
 
     await prod.produce_remote_turn(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
@@ -144,23 +137,9 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
     assert llm == {"provider": "minds-cloud", "api_key": "mdb_turnkey",
                    "base_url": llm["base_url"]}
     assert llm["base_url"]
-    # The mint call is authenticated with the tenant's OWN long-lived
-    # MindsHub key (UserSettings.minds_api_key), not an inbound header.
-    assert captured["credential"] == "Bearer mdb_tenant_key"
+    # Only the internal shared secret authenticates the mint call; no
+    # per-tenant credential is looked up or passed.
+    assert "credential" not in captured
     assert captured["correlation_id"] == "r"
     assert captured["user_id"] == "u1"
     assert captured["org_id"] == "o1"
-
-
-@pytest.mark.asyncio
-async def test_produce_remote_turn_fails_without_minds_key(monkeypatch):
-    class _NoKeySettings:
-        minds_api_key = None
-
-    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
-    monkeypatch.setattr(prod, "get_redis", lambda: fake)
-    monkeypatch.setattr(prod, "get_user_settings", lambda: _NoKeySettings())
-
-    with pytest.raises(ValueError):
-        await prod.produce_remote_turn(conversation_id="conv-1", org_id="o1", user_id="u1",
-                                       input_text="hi", model=None, buffer=RecBuffer())
