@@ -18,7 +18,6 @@ from cowork.turnqueue.auth_keys import mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.turnqueue.redis_client import get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_minds_api_host
-from cowork.common.settings.user_settings import get_user_settings
 
 logger = logging.getLogger(__name__)
 
@@ -35,31 +34,15 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
                           correlation_id: str, settings: TurnQueueSettings) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
-    MVP is MindsHub-inference-only, so this is the only credential shape. The
-    mint call is authenticated with the tenant's own long-lived MindsHub key
-    (``UserSettings.minds_api_key``), not any inbound request header. A tenant
-    with no minds key cannot produce a remote turn.
-
-    KNOWN LIMITATION (multi-tenant): the key is read from the process-global,
-    unscoped ``get_user_settings()`` cache - the same pattern build_llm_client
-    and the harnesses use - NOT from the explicit ``org_id``/``user_id`` this
-    function already receives. This is fail-safe, not a leak: if the ambient
-    settings belonged to a different tenant, auth's mint cross-check (the body
-    user/org must match the Bearer-resolved identity) returns 403 rather than
-    minting for the wrong tenant. Before a real multi-tenant rollout, resolve
-    the minds key from the passed ``org_id``/``user_id`` instead of the cache.
+    The mint call is authenticated with the internal shared secret
+    (`X-Internal-Auth`) only - there is no per-tenant credential to look up or
+    send. `org_id`/`user_id` (the request principal's identity) tell auth
+    which tenant the key is scoped to; auth resolves them itself, so no
+    per-user provider key is needed or read here.
     """
-    user_settings = get_user_settings()
-    if user_settings.minds_api_key is None:
-        raise ValueError(
-            "Cannot produce a remote turn: no MindsHub API key is configured "
-            "for this tenant (minds-cloud is the only supported provider)."
-        )
-    credential = f"Bearer {user_settings.minds_api_key.get_secret_value()}"
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
-        credential=credential, ttl_seconds=settings.turn_key_ttl_seconds,
-        settings=settings,
+        ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
     )
     base_url = minds_chat_base_url(default_minds_api_host())
     return {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}

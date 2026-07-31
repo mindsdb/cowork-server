@@ -30,10 +30,11 @@ async def test_mint_turn_key_posts_and_returns_plaintext(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
     key = await mint_turn_key(
         user_id="u1", org_id="o1", correlation_id="corr-1",
-        credential="Bearer mdb_user", ttl_seconds=1200, settings=_Settings(),
+        ttl_seconds=1200, settings=_Settings(),
     )
     assert key == "mdb_turnkey123"
     assert captured["url"].endswith("/v1/internal/turn-keys/")
     assert captured["headers"]["X-Internal-Auth"] == "shh"
+    assert "Authorization" not in captured["headers"]
     assert captured["json"]["instance_id"] == "corr-1"
     assert captured["json"]["expiry_date"]  # present
