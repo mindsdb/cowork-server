@@ -37,7 +37,9 @@ def build_elicitor(conversation_id: str):
     from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
     from cowork.streaming.answers import broker
 
-    return CoworkElicitor(conversation_id, broker, timeout_s=300)
+    # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
+    # place the number lives, so this call site does not restate it.
+    return CoworkElicitor(conversation_id, broker)
 
 
 _REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"

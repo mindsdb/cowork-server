@@ -18,7 +18,13 @@ from cowork.streaming.answers import AnswerBroker
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CoworkElicitor"]
+__all__ = ["DEFAULT_TIMEOUT_S", "CoworkElicitor"]
+
+# Long enough for a real decision, short enough that a forgotten card returns
+# the model to work. There is no other bound: dispatch_tool is not wrapped in
+# wait_for and there is no turn idle timeout. Named so the harness's call site
+# does not have to restate it — one number, one place.
+DEFAULT_TIMEOUT_S = 300
 
 
 class CoworkElicitor:
@@ -38,13 +44,10 @@ class CoworkElicitor:
         conversation_id: str,
         broker: AnswerBroker,
         *,
-        timeout_s: int = 300,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
     ) -> None:
         self._conversation_id = conversation_id
         self._broker = broker
-        # Long enough for a real decision, short enough that a forgotten card
-        # returns the model to work. There is no other bound: dispatch_tool is
-        # not wrapped in wait_for and there is no turn idle timeout.
         self.timeout_s = timeout_s
 
     async def begin(self, question_id: str, request: AskRequest) -> None:
