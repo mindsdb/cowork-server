@@ -6,7 +6,6 @@ and all necessary configurations for the Cowork service.
 """
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +18,7 @@ from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, syn
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
+from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
@@ -160,7 +160,7 @@ def create_app() -> FastAPI:
 
     # Optional bearer-token auth.  Off by default; enabled when
     # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
-    # when COWORK_AUTH_TOKEN is not set, then persisted to ~/.cowork/.env
+    # when COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env
     # so the desktop app and subsequent server runs share the same secret.
     #
     # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
@@ -188,7 +188,7 @@ def create_app() -> FastAPI:
         )
 
     if settings.require_auth:
-        env_path = Path.home() / ".cowork" / ".env"
+        env_path = cowork_home() / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)
         sync_auth_token(env_path, token)
         app.add_middleware(

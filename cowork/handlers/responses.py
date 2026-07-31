@@ -68,7 +68,6 @@ class ResponsesHandler:
         trace_metadata = identity_trace_metadata(self.principal, request.trace_metadata)
 
         conversation_service = ConversationService(self.scoped)
-        project_id = self._resolve_project_id(request)
 
         harness_input = self._build_harness_input(request)
         original_content = self._extract_original_content(request)
@@ -88,7 +87,7 @@ class ResponsesHandler:
                     # under an id no conversation ever gets (ENG-264).
                     conversation = conversation_service.create_conversation(
                         topic=self._prompt_text(harness_input)[:80],
-                        project_id=project_id,
+                        project_id=self._resolve_project_id(request),
                         conversation_id=conv_id,
                     )
             else:
@@ -98,13 +97,13 @@ class ResponsesHandler:
                 # attachments uploaded against the client's id (ENG-264).
                 conversation = conversation_service.create_conversation(
                     topic=self._prompt_text(harness_input)[:80],
-                    project_id=project_id,
+                    project_id=self._resolve_project_id(request),
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
             conversation = conversation_service.create_conversation(
                 topic=self._prompt_text(harness_input)[:80],
-                project_id=project_id,
+                project_id=self._resolve_project_id(request),
             )
 
         self.last_conversation_id = str(conversation.id)
@@ -590,6 +589,13 @@ class ResponsesHandler:
             )
 
     def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
+        """Project for a conversation being CREATED this turn.
+
+        Only called on the creation paths: an existing conversation already
+        pins its project via conversation.project_id, and the client-held
+        name it echoes can be stale after a project rename — resolving it
+        eagerly used to 404 every later turn of the task (ENG-1028).
+        """
         service = ProjectService(self.scoped)
         if request.project_id is not None:
             return request.project_id
