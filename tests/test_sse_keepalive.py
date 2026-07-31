@@ -163,6 +163,156 @@ async def test_cancelled_consumer_propagates_and_closes_the_iterator(monkeypatch
     assert closed is True
 
 
+class _CountingIterator:
+    """Delegating proxy that counts aclose() calls.
+
+    sse_from_buffer does `buffer.tail(...).__aiter__()` and then looks up
+    `aclose` on the result, so a proxy here sees exactly the calls the
+    generator's finally block makes.
+    """
+
+    def __init__(self, agen) -> None:
+        self._agen = agen
+        self.aclose_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        return self._agen.__anext__()
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        await self._agen.aclose()
+
+
+class _ExhaustingBuffer:
+    """A tail() that ends WITHOUT a terminal record.
+
+    Not exotic: buffer.tail() returns as soon as `self._closed` is set
+    (cowork/streaming/buffer.py), so a GET /responses/tail issued just after a
+    turn completed takes this path every time — the terminal record was already
+    consumed by the original stream, and the reconnect drains the replay and
+    falls off the end.
+    """
+
+    def __init__(self, *records) -> None:
+        self._records = records
+        self.iterator: _CountingIterator | None = None
+
+    def tail(self, from_seq: int = 0):
+        async def _agen():
+            for rec in self._records:
+                yield rec
+
+        self.iterator = _CountingIterator(_agen())
+        return self.iterator
+
+
+async def test_already_closed_empty_buffer_ends_cleanly(monkeypatch):
+    """The `except StopAsyncIteration` exit on the very first __anext__():
+    an already-closed buffer with nothing to replay. No frames, no raise,
+    iterator closed exactly once."""
+    monkeypatch.setattr("cowork.handlers.responses.SSE_KEEPALIVE_SECONDS", 5.0)
+    buffer = _ExhaustingBuffer()
+
+    frames = [f async for f in sse_from_buffer(buffer, 0)]
+
+    assert frames == []
+    assert buffer.iterator.aclose_calls == 1
+
+
+async def test_exhaustion_without_a_terminal_record_ends_cleanly(monkeypatch):
+    """The same exit reached on a later iteration: records replay, then the
+    prefetched __anext__() raises StopAsyncIteration instead of yielding a
+    terminal record. Every frame is delivered, nothing is raised, and the
+    iterator is closed exactly once."""
+    monkeypatch.setattr("cowork.handlers.responses.SSE_KEEPALIVE_SECONDS", 5.0)
+    buffer = _ExhaustingBuffer(
+        _Rec(is_terminal=False, sse="event: a\ndata: {}\n\n"),
+        _Rec(is_terminal=False, sse="event: b\ndata: {}\n\n"),
+    )
+
+    frames = [f async for f in sse_from_buffer(buffer, 0)]
+
+    assert frames == ["event: a\ndata: {}\n\n", "event: b\ndata: {}\n\n"]
+    assert buffer.iterator.aclose_calls == 1
+
+
+async def test_cancellation_during_the_finally_is_reraised_not_lost(monkeypatch):
+    """A cancellation arriving while the finally block waits for the prefetch
+    to die must not vanish.
+
+    The finally deliberately swallows that CancelledError so aclose() still
+    runs — but by then Task.__step has cleared must_cancel, so if it is not
+    re-raised the generator finishes cleanly and the cancellation is simply
+    gone: here `await gen.aclose()` would return normally and its task would
+    complete instead of being cancelled.
+
+    Arranged deterministically: the prefetched __anext__() resists
+    cancellation for 0.2 s (it awaits again inside its own `except
+    CancelledError`), so `asyncio.wait([pending])` in the finally is
+    measurably suspended, and the cancel is delivered inside that window.
+    Reached via aclose() rather than a task cancel, so there is no
+    pre-existing CancelledError in flight that would mask a lost one.
+
+    Mutation proof (recorded 2026-07-31): deleting the trailing
+    `if cancelled is not None: raise cancelled` makes this fail with
+    "cancellation was swallowed and lost" while every other test here stays
+    green.
+    """
+    monkeypatch.setattr("cowork.handlers.responses.SSE_KEEPALIVE_SECONDS", 5.0)
+
+    class _StubbornIterator:
+        def __init__(self) -> None:
+            self.first = True
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.first:
+                self.first = False
+                return _Rec(is_terminal=False, sse="event: a\ndata: {}\n\n")
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                # Awaiting inside the handler is legal (must_cancel is already
+                # cleared) and is what makes this task slow to die.
+                await asyncio.sleep(0.2)
+                raise
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    iterator = _StubbornIterator()
+
+    class _Buffer:
+        def tail(self, from_seq: int = 0):
+            return iterator
+
+    gen = sse_from_buffer(_Buffer(), 0)
+    assert (await gen.__anext__()).startswith("event: a")
+    # Let the prefetched __anext__() reach its sleep.
+    await asyncio.sleep(0.01)
+
+    async def closer():
+        await gen.aclose()
+
+    task = asyncio.create_task(closer())
+    # Long enough for closer() to be inside the finally's asyncio.wait, short
+    # enough that the stubborn prefetch has not finished dying.
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled(), "cancellation was swallowed and lost"
+    # ...and the belt did not cost the thing it protects: still closed.
+    assert iterator.closed is True
+
+
 async def test_exception_from_tail_propagates_to_the_consumer(monkeypatch):
     """A failure inside buffer.tail() mid-stream must reach the client
     unreshaped, not be swallowed into a silent end-of-stream."""

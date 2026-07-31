@@ -11,7 +11,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StringConstraints
 from sqlmodel import Session
 from starlette.responses import JSONResponse
 
@@ -162,11 +162,28 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     return {"cancelled": cancelled, "conversation_id": req.conversation_id}
 
 
+# Bounds on the answer body. Not a security boundary — one server process per
+# user, and the payload is the user answering their own agent — but the values
+# subset check is set-based, so an unbounded list would be built and hashed
+# before anything rejected it. Sized so no legitimate GUI answer can hit them:
+# anton caps a choice question at MAX_OPTIONS=10 options and the broker now
+# rejects duplicates, so a well-formed `values` is at most 10 entries;
+# _MAX_VALUE_LENGTH clears any plausible option value (they are model-authored
+# short tokens); _MAX_TEXT_LENGTH is well past what someone types into a
+# free-form answer box. Exceeding these is a 422 from Pydantic rather than one
+# of the spec's 400 statuses: a malformed request, not a rejected answer.
+_MAX_VALUES = 64
+_MAX_VALUE_LENGTH = 512
+_MAX_TEXT_LENGTH = 8192
+
+
 class AnswerRequest(BaseModel):
     conversation_id: str
     question_id: str
-    values: list[str] | None = None
-    text: str | None = None
+    values: list[Annotated[str, StringConstraints(max_length=_MAX_VALUE_LENGTH)]] | None = (
+        Field(default=None, max_length=_MAX_VALUES)
+    )
+    text: str | None = Field(default=None, max_length=_MAX_TEXT_LENGTH)
     skipped: bool | None = None
 
 
@@ -200,16 +217,27 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     if skipped:
         payload["skipped"] = True
 
+    # Exhaustive on purpose, with a raising default: authorization is already
+    # settled by here (:_authorized_handle above), so the cost of a fall-through
+    # is not an access-control hole but a desynchronised UI — a new
+    # SubmitResult member would answer 200 {"accepted": true} while the
+    # future stayed unresolved, so the card would render as delivered and the
+    # turn would hang to its 300 s timeout. A 500 is the right direction for
+    # "the server does not understand its own state".
     result = broker.submit(req.conversation_id, req.question_id, payload)
-    if result is SubmitResult.NOT_FOUND:
-        return JSONResponse(status_code=404, content={"status": "not_found"})
-    if result is SubmitResult.ALREADY_ANSWERED:
-        return JSONResponse(
-            status_code=409, content={"accepted": False, "status": "already_answered"}
-        )
-    if result is SubmitResult.INVALID_OPTION:
-        return JSONResponse(status_code=400, content={"status": "invalid_option"})
-    return {"accepted": True}
+    match result:
+        case SubmitResult.ACCEPTED:
+            return {"accepted": True}
+        case SubmitResult.NOT_FOUND:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        case SubmitResult.ALREADY_ANSWERED:
+            return JSONResponse(
+                status_code=409, content={"accepted": False, "status": "already_answered"}
+            )
+        case SubmitResult.INVALID_OPTION:
+            return JSONResponse(status_code=400, content={"status": "invalid_option"})
+        case _:
+            raise AssertionError(f"unhandled SubmitResult: {result}")
 
 
 @router.get("/tail")

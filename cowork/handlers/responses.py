@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -507,11 +506,16 @@ class ResponsesHandler:
         )
 
 
-# A card waiting on a human produces no events, so the stream can be quiet
-# for the whole question timeout. Cloudflare (proxied, in the path for every
-# cloud instance) drops quiet connections; the documented threshold is about
-# time-to-first-byte rather than mid-stream idle, so confirm the real number
-# by experiment — but a heartbeat is required regardless of where it sits.
+# A card waiting on a human produces no events, so the stream can be quiet for
+# the whole question timeout. Cloudflare (proxied, in the path for every cloud
+# instance) drops quiet connections; its documented threshold covers
+# time-to-first-byte rather than mid-stream idle, so the exact mid-stream bound
+# is unpublished. 20 s is chosen to be below any plausible one — Cloudflare's
+# own published timeouts start at 100 s and no proxy in common use idles out
+# under 30 s — and sits inside the design's 15-30 s window. If a stream is ever
+# observed dropping mid-question in the cloud, the thing to measure is the
+# elapsed time between the last byte written and the disconnect, at the edge;
+# do not tune this value from a local test, where no proxy is in the path.
 SSE_KEEPALIVE_SECONDS = 20.0
 
 
@@ -563,8 +567,24 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
         # which then REPLACES the CancelledError on the real disconnect path
         # (StreamingResponse cancels this task), leaving the iterator open.
         pending.cancel()
-        with contextlib.suppress(BaseException):
+        # Narrower than suppress(BaseException) and exactly as wide as needed:
+        # asyncio.wait() returns (done, pending) *sets* and never re-raises the
+        # awaited task's exception, so nothing the prefetch did can surface
+        # here. The only reachable exception is a cancellation of the enclosing
+        # task arriving during this await — swallowing that is deliberate, so
+        # that aclose() below still runs.
+        cancelled: asyncio.CancelledError | None = None
+        try:
             await asyncio.wait([pending])
+        except asyncio.CancelledError as exc:
+            cancelled = exc
         aclose = getattr(records, "aclose", None)
         if aclose is not None:
             await aclose()
+        # ...but do not LOSE it. Task.__step has already cleared must_cancel by
+        # the time we catch it, so on the normal-exhaustion path the generator
+        # would return cleanly, the consumer's `async for` would end normally,
+        # and the cancellation would vanish. Re-raise now that the iterator is
+        # closed.
+        if cancelled is not None:
+            raise cancelled
