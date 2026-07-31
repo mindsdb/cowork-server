@@ -45,7 +45,15 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
         ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
     )
     base_url = settings.minds_base_url or minds_chat_base_url(default_minds_api_host())
-    return {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
+    block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
+    # Coding-model calls (verifier, scratchpad nested calls) must use a model
+    # the turn key can pay for, not anton's built-in default. Same
+    # unscoped-cache caveat as the mint above.
+    from cowork.common.settings.user_settings import get_user_settings
+    coding_model = get_user_settings().resolved_coding_model
+    if coding_model:
+        block["coding_model"] = coding_model
+    return block
 
 
 async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
