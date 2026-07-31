@@ -36,10 +36,18 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     MVP is MindsHub-inference-only, so this is the only credential shape. The
-    mint call is authenticated as the turn TENANT's own long-lived MindsHub
-    key (``UserSettings.minds_api_key``) rather than any inbound request
-    header: ``get_user_settings()`` resolves the current request's tenant at
-    produce time. A tenant with no minds key cannot produce a remote turn.
+    mint call is authenticated with the tenant's own long-lived MindsHub key
+    (``UserSettings.minds_api_key``), not any inbound request header. A tenant
+    with no minds key cannot produce a remote turn.
+
+    KNOWN LIMITATION (multi-tenant): the key is read from the process-global,
+    unscoped ``get_user_settings()`` cache - the same pattern build_llm_client
+    and the harnesses use - NOT from the explicit ``org_id``/``user_id`` this
+    function already receives. This is fail-safe, not a leak: if the ambient
+    settings belonged to a different tenant, auth's mint cross-check (the body
+    user/org must match the Bearer-resolved identity) returns 403 rather than
+    minting for the wrong tenant. Before a real multi-tenant rollout, resolve
+    the minds key from the passed ``org_id``/``user_id`` instead of the cache.
     """
     user_settings = get_user_settings()
     if user_settings.minds_api_key is None:
