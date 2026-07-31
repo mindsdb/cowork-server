@@ -134,15 +134,33 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
 
     payload = json.loads(fake.added[0][1]["payload"])
     llm = payload["params"]["llm"]
-    assert llm == {"provider": "minds-cloud", "api_key": "mdb_turnkey",
-                   "base_url": llm["base_url"]}
+    assert llm["provider"] == "minds-cloud"
+    assert llm["api_key"] == "mdb_turnkey"
     assert llm["base_url"]
+    assert llm["coding_model"]  # rides along so the pod's coding calls stay payable
     # Only the internal shared secret authenticates the mint call; no
     # per-tenant credential is looked up or passed.
     assert "credential" not in captured
     assert captured["correlation_id"] == "r"
     assert captured["user_id"] == "u1"
     assert captured["org_id"] == "o1"
+
+
+@pytest.mark.asyncio
+async def test_mint_llm_block_carries_coding_model(monkeypatch):
+    # Without it the pod keeps anton's paid coding default -> 402 on the
+    # verifier/nested calls for unfunded orgs.
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    class FakeUS:
+        resolved_coding_model = "mindshub_air"
+
+    import cowork.common.settings.user_settings as us_mod
+    monkeypatch.setattr(us_mod, "get_user_settings", lambda: FakeUS())
+
+    settings = TurnQueueSettings(minds_base_url="https://api.example.dev/v1")
+    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    assert block["coding_model"] == "mindshub_air"
 
 
 @pytest.mark.asyncio
@@ -153,8 +171,8 @@ async def test_mint_llm_block_uses_base_url_override():
 
     settings = TurnQueueSettings(minds_base_url="https://api-pr-cowork-server-243.dev.mindshub.ai/v1")
     block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
-    assert block == {"provider": "minds-cloud", "api_key": "mdb_turnkey",
-                     "base_url": "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"}
+    assert block["base_url"] == "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"
+    assert block["provider"] == "minds-cloud" and block["api_key"] == "mdb_turnkey"
 
 
 @pytest.mark.asyncio
