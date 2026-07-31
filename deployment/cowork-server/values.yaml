@@ -169,6 +169,11 @@ deployment:
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
 
+    # Explicit inference base URL for this env (per-PR host the env-slug logic
+    # can't derive). The pod's turn calls this; the minted key is valid here.
+    - name: COWORK_TURN_MINDS_BASE_URL
+      value: "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"
+
     # ====================================
     # PROVIDER API KEYS
     # ====================================
