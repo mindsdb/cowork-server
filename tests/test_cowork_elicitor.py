@@ -18,8 +18,8 @@ CID = "conv-1"
 QID = "ask:abc"
 
 
-def _request(timeout_s=300) -> AskRequest:
-    return AskRequest(
+def _request(timeout_s=300, **over) -> AskRequest:
+    base = dict(
         prompt="Which database?",
         timeout_s=timeout_s,
         options=(
@@ -27,6 +27,8 @@ def _request(timeout_s=300) -> AskRequest:
             AskOption(value="my", label="mysql"),
         ),
     )
+    base.update(over)
+    return AskRequest(**base)
 
 
 @pytest.fixture()
@@ -69,10 +71,18 @@ async def test_text_only_answer(wired):
 
 
 async def test_values_and_text_together(wired):
+    """Two buttons plus a typed third answer — legitimate only for a
+    multi-select question, since the broker rejects two values for
+    select="one". Asserted ACCEPTED first: a rejection would leave the future
+    unresolved and this test would spend the full 300 s timeout before failing
+    on the wrong assertion."""
     broker, elicitor = wired
-    request = _request()
+    request = _request(select="many")
     await elicitor.begin(QID, request)
-    broker.submit(CID, QID, {"values": ["pg", "my"], "text": "and duckdb"})
+    assert (
+        broker.submit(CID, QID, {"values": ["pg", "my"], "text": "and duckdb"})
+        is SubmitResult.ACCEPTED
+    )
     answer = await elicitor.ask(QID, request)
     assert answer.values == ("pg", "my")
     assert answer.text == "and duckdb"
