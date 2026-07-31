@@ -44,6 +44,15 @@ class SubmitResult(Enum):
 
 @dataclass
 class _Pending:
+    """One open question: the future its answer resolves, plus the request.
+
+    The request is not a convenience — it is the *only* record of what was
+    offered, and ``submit`` needs it to check an incoming answer against the
+    declared contract (which options, how many of them, whether free text was
+    invited). Without it the HTTP path would accept any shape and the model
+    would receive an answer to a question it did not ask.
+    """
+
     future: asyncio.Future
     request: "AskRequest"
 
@@ -80,24 +89,55 @@ class AnswerBroker:
         return future
 
     def submit(self, conversation_id: str, question_id: str, answer: dict) -> SubmitResult:
+        """Resolve the question's future with *answer*, if it fits the offer.
+
+        Validation lives here rather than in the endpoint on purpose: the
+        request is only reachable from this side, and a second caller (a future
+        transport, a test harness) must not be able to route around the rule.
+        """
         pending = self._pending.get((conversation_id, question_id))
         if pending is None:
             return SubmitResult.NOT_FOUND
         if pending.future.done():
             return SubmitResult.ALREADY_ANSWERED
 
-        values = answer.get("values") or []
-        if values and not answer.get("skipped"):
-            offered = {option.value for option in pending.request.options}
-            if not set(values) <= offered:
+        if not answer.get("skipped"):
+            rejection = self._violation(pending.request, answer)
+            if rejection is not None:
                 logger.info(
-                    "Rejected answer for %s: values %s not among the offered options.",
-                    question_id, sorted(set(values) - offered),
+                    "Rejected answer for question %s on conversation %s: %s",
+                    question_id, conversation_id, rejection,
                 )
                 return SubmitResult.INVALID_OPTION
 
         pending.future.set_result(answer)
         return SubmitResult.ACCEPTED
+
+    @staticmethod
+    def _violation(request: "AskRequest", answer: dict) -> str | None:
+        """Why *answer* does not fit *request*, or None if it does.
+
+        Rejects rather than truncates. ``CLIElicitor`` truncates a
+        multi-selection down to one because a human typed it at a terminal and
+        the intent is recoverable; the HTTP caller is a GUI that rendered this
+        exact card, so a shape it never offered is a frontend bug and silently
+        altering the answer would hide it. All three shapes map onto the
+        spec's ``invalid_option``, since from the model's side they are the
+        same failure: an answer that was not on the menu.
+        """
+        values = answer.get("values") or []
+        if values:
+            offered = {option.value for option in request.options}
+            unknown = sorted(set(values) - offered)
+            if unknown:
+                return f"values {unknown} were never offered"
+            if len(set(values)) != len(values):
+                return "values contains duplicates"
+            if request.select == "one" and len(values) > 1:
+                return f"{len(values)} values for a single-choice question"
+        if answer.get("text") and not request.allow_custom:
+            return "free-form text for a question that does not allow it"
+        return None
 
     def close(self, conversation_id: str, question_id: str) -> None:
         """Drop the entry. Idempotent — the owning ``elicit()`` calls this in
@@ -105,6 +145,17 @@ class AnswerBroker:
         pending = self._pending.pop((conversation_id, question_id), None)
         if pending is not None and not pending.future.done():
             pending.future.cancel()
+
+    def reset(self) -> None:
+        """Drop every entry, cancelling any future still unresolved.
+
+        For tests: this object is a process global, so a question opened by one
+        test would otherwise stay answerable in the next. Cancelling (rather
+        than just clearing) keeps the ``close()`` invariant — an entry never
+        leaves this map with a live future nobody will ever resolve.
+        """
+        for key in list(self._pending):
+            self.close(*key)
 
 
 # Single global instance per server process, mirroring streaming.registry.
