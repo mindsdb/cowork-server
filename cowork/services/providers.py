@@ -278,6 +278,55 @@ def check_config_status(settings: UserSettings) -> dict[str, Any]:
 # ── Provider pinging ─────────────────────────────────────────────────
 
 
+def _provider_error_message(resp: httpx.Response) -> Optional[str]:
+    """Best-effort human message from a provider error response, or None.
+
+    Handles OpenAI's object body (``{"error": {"message": ...}}``) AND Google's
+    Gemini OpenAI-compat *chat* errors, which arrive as a single-element ARRAY
+    (``[{"error": {"message": ...}}]``) — the shape that made ENG-1145 surface as
+    a contentless "HTTP 404" everywhere the message was read as ``.error.message``
+    on the top-level object. Also tolerates a bare ``{"message": ...}``."""
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if isinstance(data, list):
+        data = data[0] if data and isinstance(data[0], dict) else {}
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message")
+        return msg.strip() if isinstance(msg, str) and msg.strip() else None
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    msg = data.get("message")
+    return msg.strip() if isinstance(msg, str) and msg.strip() else None
+
+
+# Auth-SHAPED provider messages: only the genuinely "your key is bad" phrasings.
+# A bare "api key" substring also appears in permission ("The API key does not
+# have permission to use this model") and quota ("Quota exceeded for this API
+# key") errors — neither of which a new key fixes — so matching that substring
+# sends a user with a perfectly good key off to regenerate it. Must stay in step
+# with cowork's src/main/provider-error.ts AUTH_SHAPED (ENG-1145 review).
+_AUTH_SHAPED_RE = re.compile(
+    r"api[_ ]?key (is )?(not valid|invalid)|invalid api[_ ]?key|pass a valid api[_ ]?key",
+    re.IGNORECASE,
+)
+
+
+def _is_auth_error(status_code: int, msg: Optional[str]) -> bool:
+    """Whether a provider error is a bad-key failure (fix the key), vs something
+    the message should be surfaced for verbatim. 401/403 are auth by status;
+    Gemini answers a bad key with 400, so fall back to an auth-shaped message —
+    but only the tight forms above, letting permission/quota messages pass
+    through (ENG-1145 review)."""
+    if status_code in (401, 403):
+        return True
+    return bool(msg and _AUTH_SHAPED_RE.search(msg))
+
+
 async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
     """Ping a single provider and return (status, detail)."""
     ptype = p.get("type")
@@ -287,7 +336,13 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
     async def _check(url: str, headers: dict[str, str]) -> tuple[str, str]:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, headers=headers)
-            return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
+        if r.status_code < 400:
+            return ("ok", f"HTTP {r.status_code}")
+        # Include the provider's own message in the fail detail so the Settings
+        # dot tooltip distinguishes a bad key from a real outage — Gemini returns
+        # 400 "Please pass a valid API key", not 401 (ENG-1145).
+        msg = _provider_error_message(r)
+        return ("fail", f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}")
 
     async def _chat_probe(url: str, headers: dict[str, str], model: str) -> tuple[str, str]:
         """Exercise the actual inference path with a tiny completion.
@@ -305,7 +360,15 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
         payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
-        return ("ok", f"HTTP {r.status_code}") if r.status_code < 400 else ("fail", f"HTTP {r.status_code}")
+        if r.status_code < 400:
+            return ("ok", f"HTTP {r.status_code}")
+        # Same as _check: surface the gateway's own message so minds-cloud's
+        # Settings dot carries the actionable reason (wallet/allowance/model)
+        # instead of a bare "HTTP 502"/"HTTP 429". _chat_probe exercises real
+        # chat completions, so its failures carry exactly that (ENG-1145 review,
+        # ENG-576). Body read after close is safe — non-streaming POST.
+        msg = _provider_error_message(r)
+        return ("fail", f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}")
 
     try:
         if ptype == "anthropic":
@@ -387,8 +450,7 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
-            msg = r.json().get("error", {}).get("message", f"HTTP {r.status_code}") if r.content else f"HTTP {r.status_code}"
-            return {"ok": False, "error": msg}
+            return {"ok": False, "error": _provider_error_message(r) or f"HTTP {r.status_code}"}
     except Exception:
         return {"ok": False, "error": "Cannot connect"}
 
@@ -413,8 +475,7 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
             return {"ok": False, "error": "Invalid API key"}
         if 200 <= r.status_code < 300:
             return {"ok": True}
-        msg = r.json().get("error", {}).get("message", f"HTTP {r.status_code}") if r.content else f"HTTP {r.status_code}"
-        return {"ok": False, "error": msg}
+        return {"ok": False, "error": _provider_error_message(r) or f"HTTP {r.status_code}"}
     except Exception:
         return {"ok": False, "error": "Cannot connect"}
 
@@ -433,10 +494,15 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
-            if r.status_code in (401, 403):
+            msg = _provider_error_message(r)
+            # Gemini (and some others) return 400 — not 401/403 — for a bad key,
+            # so key on an auth-shaped message too, or a bad key reads as an
+            # opaque "HTTP 400" the user can't act on. Tight match: a permission
+            # or quota message also contains "api key" but is not a bad key
+            # (ENG-1145 review).
+            if _is_auth_error(r.status_code, msg):
                 return {"ok": False, "error": "Invalid API key"}
-            msg = r.json().get("error", {}).get("message", f"HTTP {r.status_code}") if r.content else f"HTTP {r.status_code}"
-            return {"ok": False, "error": msg}
+            return {"ok": False, "error": msg or f"HTTP {r.status_code}"}
     except Exception:
         return {"ok": False, "error": "Cannot connect"}
 

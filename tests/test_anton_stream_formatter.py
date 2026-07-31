@@ -2,8 +2,25 @@ from __future__ import annotations
 
 import json
 
-from anton.core.llm.provider import StreamReasoningDelta, StreamTextDelta
+import pytest
+
+from anton.core.llm.provider import StreamTextDelta
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+# Mirror the production guard in anton_harness/stream_formatter.py: StreamReasoningDelta
+# arrived with the reasoning-subtype channel (ENG-1109) and does not exist in anton
+# builds before it (e.g. anton/main until staging is promoted). Skip rather than fail
+# collection — the formatter degrades to a dead branch on older anton, so there is
+# nothing to exercise until the symbol is present.
+try:
+    from anton.core.llm.provider import StreamReasoningDelta
+except ImportError:
+    StreamReasoningDelta = None
+
+pytestmark = pytest.mark.skipif(
+    StreamReasoningDelta is None,
+    reason="anton build predates StreamReasoningDelta (ENG-1109); reasoning mapping is inert until anton is promoted",
+)
 
 
 async def _events(*items):
@@ -50,3 +67,30 @@ class TestReasoningDeltaMapping:
         text_deltas = [e for e in events if e.get("type") == "response.output_text.delta"]
         assert len(text_deltas) == 1
         assert text_deltas[0]["delta"] == "The real answer."
+
+
+class TestReasoningDeltaImportGuard:
+    async def test_formatter_survives_anton_without_reasoning_delta(self, monkeypatch):
+        # ENG-1167: StreamReasoningDelta (ENG-1109) is newer than the anton a
+        # version-skewed install can resolve — desktop staging builds install
+        # anton from PyPI, which lags the staging branch. The formatter runs on
+        # every turn, so an unguarded `from anton.core.llm.provider import
+        # StreamReasoningDelta` would raise ImportError and break all chat with
+        # a generic error. Simulate a pre-ENG-1109 anton by removing the symbol
+        # and assert the turn still streams cleanly.
+        import anton.core.llm.provider as provider_mod
+
+        monkeypatch.delattr(provider_mod, "StreamReasoningDelta", raising=False)
+
+        chunks = [
+            c async for c in format_responses_stream(
+                _events(StreamTextDelta(text="hello")),
+                model="claude-sonnet-4-6",
+            )
+        ]
+        events = _parse_sse(chunks)
+        types = [e.get("type") for e in events]
+        assert "response.created" in types
+        assert "response.completed" in types
+        text_deltas = [e for e in events if e.get("type") == "response.output_text.delta"]
+        assert [d["delta"] for d in text_deltas] == ["hello"]
