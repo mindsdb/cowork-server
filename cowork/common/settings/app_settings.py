@@ -320,6 +320,14 @@ class TurnQueueSettings(Settings):
         default=1200,
         description="TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within auth's turn_key_max_ttl_seconds).",
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    minds_base_url: str = Field(
+        default="",
+        description=(
+            "Explicit MindsHub inference base URL (OpenAI-compatible, incl. /v1) the pod's "
+            "turn calls. Overrides the env-slug default (default_minds_api_host); required for "
+            "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
+        ),
+    )  # COWORK_TURN_MINDS_BASE_URL
 
 
 class AppSettings(Settings):

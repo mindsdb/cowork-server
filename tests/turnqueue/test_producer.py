@@ -143,3 +143,24 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
     assert captured["correlation_id"] == "r"
     assert captured["user_id"] == "u1"
     assert captured["org_id"] == "o1"
+
+
+@pytest.mark.asyncio
+async def test_mint_llm_block_uses_base_url_override():
+    """An explicit minds_base_url (per-PR / non-standard env) overrides the
+    env-slug derivation, so the pod calls the right environment's inference."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    settings = TurnQueueSettings(minds_base_url="https://api-pr-cowork-server-243.dev.mindshub.ai/v1")
+    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    assert block == {"provider": "minds-cloud", "api_key": "mdb_turnkey",
+                     "base_url": "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"}
+
+
+@pytest.mark.asyncio
+async def test_mint_llm_block_derives_base_url_when_override_empty():
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    settings = TurnQueueSettings(minds_base_url="")
+    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    assert "mindshub.ai" in block["base_url"] and block["base_url"].endswith("/v1")
