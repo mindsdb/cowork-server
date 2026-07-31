@@ -300,6 +300,18 @@ class TurnQueueSettings(Settings):
         default="scratchpad:requests",
         description="Redis stream key turn jobs are queued on when backend is 'remote'.",
     )
+    auth_internal_base_url: str = Field(
+        default="",
+        description="Base URL of the auth service's internal API, used to mint per-turn MindsHub keys.",
+    )  # COWORK_TURN_AUTH_INTERNAL_BASE_URL
+    auth_internal_secret: str = Field(
+        default="",
+        description="Shared secret sent as X-Internal-Auth when minting per-turn MindsHub keys.",
+    )  # COWORK_TURN_AUTH_INTERNAL_SECRET
+    turn_key_ttl_seconds: int = Field(
+        default=1200,
+        description="TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within auth's turn_key_max_ttl_seconds).",
+    )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
 
 
 class AppSettings(Settings):
