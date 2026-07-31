@@ -14,7 +14,11 @@ def test_flag_defaults_to_off(monkeypatch):
     monkeypatch.delenv("COWORK_ASK_USER_ENABLED", raising=False)
     from cowork.common.settings.app_settings import AppSettings
 
-    assert AppSettings().ask_user_enabled is False
+    # _env_file=None on purpose: Settings.model_config points env_file at
+    # _env_file_chain() (~/.anton/.env, <COWORK_HOME>/.env, ./.env), and
+    # delenv does not neutralise a file. Without this, "defaults to off" would
+    # silently weaken to "off on this machine".
+    assert AppSettings(_env_file=None).ask_user_enabled is False
 
 
 def test_flag_reads_the_env_var(monkeypatch):
