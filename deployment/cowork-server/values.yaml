@@ -156,6 +156,18 @@ deployment:
     # namespaces, use the FQDN (redis-master.<namespace>.svc.cluster.local).
     - name: COWORK_TURN_REDIS_URL
       value: "redis://redis-master.dev.svc.cluster.local:6379/0"
+    
+    - name: COWORK_TURN_AUTH_INTERNAL_BASE_URL
+      value: "http://auth:80"
+
+    - name: COWORK_TURN_AUTH_INTERNAL_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: auth-secrets
+          key: INTERNAL_AUTH_SHARED_SECRET
+    
+    - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
+      value: "600"
 
     # ====================================
     # PROVIDER API KEYS
