@@ -14,7 +14,18 @@ from pydantic import BaseModel, Field
 
 
 class TurnJob(BaseModel):
-    """Mirror of scratchpad-controller ScratchpadJobPayload (job the controller consumes)."""
+    """Mirror of scratchpad-controller ScratchpadJobPayload (job the controller consumes).
+
+    ``params`` carries an ``llm`` block minted per turn by
+    ``cowork.turnqueue.producer._mint_llm_block``:
+    ``{"provider": "minds-cloud", "api_key": <short-TTL mdb_ turn key>,
+    "base_url": <MindsHub chat base URL>}``. MVP is MindsHub-inference-only, so
+    this is the only provider/credential shape carried here. The key is scoped
+    to this turn's correlation id and expires within minutes (see
+    ``TurnQueueSettings.turn_key_ttl_seconds``); it travels cowork -> Redis job
+    -> controller -> exec stdin -> anton and must never be placed in the pod
+    env or argv (pods are reused across turns).
+    """
 
     op: str
     conversation_id: str

@@ -13,9 +13,12 @@ import logging
 import uuid
 
 from cowork.handlers.turn_errors import remote_turn_error, response_failed_sse
+from cowork.services.providers import minds_chat_base_url
+from cowork.turnqueue.auth_keys import mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.turnqueue.redis_client import get_redis
-from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.common.settings.app_settings import TurnQueueSettings, default_minds_api_host
+from cowork.common.settings.user_settings import get_user_settings
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,32 @@ def _new_correlation_id() -> str:
 
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+
+async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
+                          correlation_id: str, settings: TurnQueueSettings) -> dict:
+    """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
+
+    MVP is MindsHub-inference-only, so this is the only credential shape. The
+    mint call is authenticated as the turn TENANT's own long-lived MindsHub
+    key (``UserSettings.minds_api_key``) rather than any inbound request
+    header: ``get_user_settings()`` resolves the current request's tenant at
+    produce time. A tenant with no minds key cannot produce a remote turn.
+    """
+    user_settings = get_user_settings()
+    if user_settings.minds_api_key is None:
+        raise ValueError(
+            "Cannot produce a remote turn: no MindsHub API key is configured "
+            "for this tenant (minds-cloud is the only supported provider)."
+        )
+    credential = f"Bearer {user_settings.minds_api_key.get_secret_value()}"
+    api_key = await mint_turn_key(
+        user_id=user_id, org_id=org_id, correlation_id=correlation_id,
+        credential=credential, ttl_seconds=settings.turn_key_ttl_seconds,
+        settings=settings,
+    )
+    base_url = minds_chat_base_url(default_minds_api_host())
+    return {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
 
 
 async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
@@ -41,6 +70,10 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     corr = _new_correlation_id()
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
+    llm_block = await _mint_llm_block(
+        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+    )
+
     job = TurnJob(
         op="anton_turn",
         conversation_id=conversation_id,
@@ -49,7 +82,7 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         organization_id=org_id,
         user_id=user_id,
         params={"input": input_text, "workspace_path": "/workspace",
-                "model": model, "history": history or []},
+                "model": model, "history": history or [], "llm": llm_block},
     )
     await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
     # conversation_id + harness mirror _inject_created on the in-process path:
