@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 def _local_request():
     """Loopback stand-in for the Request arg the raw-settings endpoints now
-    take — they 403 non-loopback callers (settings._require_local, ENG-457)."""
+    take — they 403 non-loopback callers (guards.require_local, ENG-457)."""
     return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 

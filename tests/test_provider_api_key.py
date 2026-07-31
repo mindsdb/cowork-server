@@ -100,8 +100,8 @@ class TestResolverIsolation:
         assert s.config_status["config_ready"] is True
         # The resolved MODEL must be non-None — otherwise build_llm_client gets
         # model=None and throws despite config_ready=True (the live bug).
-        assert s.resolved_planning_model == "gemini-2.5-pro"
-        assert s.resolved_coding_model == "gemini-2.5-flash"
+        assert s.resolved_planning_model == "gemini-3.6-flash"
+        assert s.resolved_coding_model == "gemini-3.6-flash"
 
     def test_switch_to_oc_does_not_misroute_the_default_model(self):
         # Realistic case: planning_provider=anthropic (keyless), only an OC key.
@@ -128,8 +128,8 @@ class TestResolverIsolation:
             gemini_api_key=SecretStr("AIza"),
         )
         assert s.resolved_planning_provider == Provider.GEMINI
-        assert s.resolved_planning_model == "gemini-2.5-pro"
-        assert s.resolved_coding_model == "gemini-2.5-flash"
+        assert s.resolved_planning_model == "gemini-3.6-flash"
+        assert s.resolved_coding_model == "gemini-3.6-flash"
         assert s.config_status["config_ready"] is True
 
     def test_legacy_shared_openai_key_still_resolves(self):

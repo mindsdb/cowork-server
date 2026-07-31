@@ -5,6 +5,10 @@ class SettingUpsertRequest(BaseModel):
     value: str
 
 
+class SettingsBulkUpsertRequest(BaseModel):
+    values: dict[str, str]
+
+
 class SettingResponse(BaseModel):
     key: str
     label: str

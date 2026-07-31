@@ -25,7 +25,12 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
     "minds-cloud": [],
     "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     "openai": ["gpt-5.5", "gpt-5.5-mini", "o3", "o4-mini"],
-    "gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-flash-preview"],
+    # Live-overlaid from Google's OpenAI-compatible /models when a Gemini key is
+    # configured (see recommended_models endpoint); this static list is only the
+    # fallback for the pre-key onboarding pick and offline loads. The old
+    # gemini-2.5-* ids and the never-real "gemini-3-flash-preview" all 404 for
+    # new users, so the fallback lists only current ids (ENG-1145).
+    "gemini": ["gemini-3.6-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"],
     "openai-compatible": [],
 }
 
@@ -38,7 +43,10 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
     "minds-cloud": ("sonnet", "haiku", "kimi"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
     "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
-    "gemini": ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash"),
+    # All three roles default to the one id confirmed to resolve on a fresh
+    # free-tier Google key (ENG-1145); gemini-2.5-pro was zero-quota for new
+    # free-tier keys and gemini-2.5-flash 404s. Pro stays reachable via the picker.
+    "gemini": ("gemini-3.6-flash", "gemini-3.6-flash", "gemini-3.6-flash"),
     "openai-compatible": ("", "", ""),
 }
 
@@ -54,13 +62,13 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
-    "gemini": "gemini-2.5-pro",
+    "gemini": "gemini-3.6-flash",
     "minds_cloud": "sonnet",
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.6-flash",
     "minds_cloud": "haiku",
 }
 # Router role: the cheap front-model that runs history summarization (and later
@@ -71,7 +79,7 @@ CODING_MODEL_DEFAULTS: dict[str, str] = {
 ROUTER_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.6-flash",
     "minds_cloud": "kimi",
 }
 
@@ -452,6 +460,30 @@ class AppSettings(Settings):
             "selection, which never applies to channels."
         ),
     )  # COWORK_CHANNELS_HARNESS
+
+    # Deployment-level defaults for the per-user agent tool budgets. Users who
+    # set the corresponding UserSettings override these; users who don't get
+    # these values. Hosted deployments (where inference cost lands on the
+    # operator and the Settings UI is unreachable — sidebar entries are
+    # desktop-only) can lower them without touching per-user rows; commented
+    # entries live in deployment/cowork-server/values-{prod,staging}.yaml.
+    # NOTE: get_app_settings() is @lru_cache'd, so changing the COWORK_DEFAULT_*
+    # env requires a process restart — "I changed the env and nothing happened"
+    # means the old value is cached for the life of the process.
+    default_max_tool_rounds: int = Field(
+        default=50,
+        ge=5,
+        le=500,
+        validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TOOL_ROUNDS"),
+        description="Default for the per-user 'Max Steps per Task' agent budget.",
+    )  # COWORK_DEFAULT_MAX_TOOL_ROUNDS
+    default_max_continuations: int = Field(
+        default=5,
+        ge=0,
+        le=25,
+        validation_alias=AliasChoices("COWORK_DEFAULT_MAX_CONTINUATIONS"),
+        description="Default for the per-user 'Max Auto-Continues' agent budget.",
+    )  # COWORK_DEFAULT_MAX_CONTINUATIONS
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
