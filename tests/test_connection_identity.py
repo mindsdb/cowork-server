@@ -347,7 +347,12 @@ class TestDisplayName:
         detail = svc.get("gmail", "a-x-com")
         assert detail.display_name == "a@x.com"          # identity-only now
         assert "_label" not in detail.fields            # not rendered as a raw `_`-field row
-        assert detail.fields["label"] == "Support"      # echoed back so the edit form pre-fills
+        assert "label" not in detail.fields             # no longer echoed into fields
+        # persist_connection assigned a default user_label (the engine id) for
+        # this brand-new connection since only the legacy `label` was given,
+        # not `user_label` — the default takes precedence over the `_label`
+        # fallback because `_user_label` is present (non-empty) on the record.
+        assert detail.user_label == "gmail"
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # still masked
 
 
@@ -600,4 +605,30 @@ class TestSetConnectionLabelReturnsValue:
         result = set_connection_label("gmail", "support", "   ", vault=vault)
         assert result is None
         assert "_user_label" not in (vault.load("gmail", "support") or {})
+
+
+class TestServicePopulatesUserLabel:
+    def test_list_includes_user_label(self, tmp_path, monkeypatch):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("postgres", "a1b2c3", {"host": "x", "_user_label": "prod-db"})
+        svc = ConnectionsService()
+        monkeypatch.setattr(svc, "_vault", lambda: vault)
+        results = svc.list()
+        assert results[0].user_label == "prod-db"
+
+    def test_list_falls_back_to_legacy_label(self, tmp_path, monkeypatch):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("gmail", "acct1", {"email": "a@b.com", "_label": "Support"})
+        svc = ConnectionsService()
+        monkeypatch.setattr(svc, "_vault", lambda: vault)
+        results = svc.list()
+        assert results[0].user_label == "Support"
+
+    def test_get_includes_user_label(self, tmp_path, monkeypatch):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("postgres", "a1b2c3", {"host": "x", "_user_label": "prod-db"})
+        svc = ConnectionsService()
+        monkeypatch.setattr(svc, "_vault", lambda: vault)
+        detail = svc.get("postgres", "a1b2c3")
+        assert detail.user_label == "prod-db"
 
