@@ -156,6 +156,7 @@ class SaveConnectionResponse(BaseModel):
     engine: str
     name: str
     method: str | None
+    user_label: str | None = None
 
 
 class ConnectionSummaryResponse(BaseModel):
@@ -166,6 +167,7 @@ class ConnectionSummaryResponse(BaseModel):
     display_name: str | None = None
     created_at: str | None = None
     label: str | None = None
+    user_label: str | None = None
     logo: str | None = None
     logo_color: str | None = None
     # "needs_reconnect" when the connection's token was lost/revoked; absent
@@ -180,6 +182,7 @@ class ConnectionDetailResponse(BaseModel):
     engine: str
     name: str
     display_name: str | None = None
+    user_label: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     connector_id: str | None = None
