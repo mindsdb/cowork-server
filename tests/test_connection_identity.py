@@ -308,10 +308,13 @@ class TestConnectionLabel:
 
 
 class TestDisplayName:
-    """The card/detail display name: label → identity → (slug fallback client-side)."""
+    """The card/detail display name: derived identity only (email/host) —
+    no longer prefers `_label`/`_user_label`; the connection's title comes
+    from `user_label` directly now (see TestConnectionDisplayNameNoLongerPrefersLabel
+    and Task 17's ConnectionsService.list/get tests)."""
 
     def test_helper_priority(self):
-        assert connection_display_name({"_label": "Support", "email": "a@x.com"}) == "Support"
+        assert connection_display_name({"_label": "Support", "email": "a@x.com"}) == "a@x.com"
         assert connection_display_name({"email": "a@x.com"}) == "a@x.com"
         assert connection_display_name({"account_email": "o@x.com"}) == "o@x.com"
         assert connection_display_name({"host": "h", "database": "d"}) == "h/d"
@@ -329,8 +332,9 @@ class TestDisplayName:
         svc = ConnectionsService()
         monkeypatch.setattr(svc, "_vault", lambda: vault)
         by_name = {s.name: s.display_name for s in svc.list()}
-        assert by_name["a-x-com"] == "Support"   # label preferred
-        assert by_name["b-x-com"] == "b@x.com"    # else the identity
+        # display_name is identity-only now — the label no longer changes it.
+        assert by_name["a-x-com"] == "a@x.com"
+        assert by_name["b-x-com"] == "b@x.com"
 
     def test_get_surfaces_display_name_and_hides_label_field(self, tmp_path, monkeypatch):
         vault = LocalDataVault(tmp_path)
@@ -341,10 +345,24 @@ class TestDisplayName:
         svc = ConnectionsService()
         monkeypatch.setattr(svc, "_vault", lambda: vault)
         detail = svc.get("gmail", "a-x-com")
-        assert detail.display_name == "Support"
+        assert detail.display_name == "a@x.com"          # identity-only now
         assert "_label" not in detail.fields            # not rendered as a raw `_`-field row
         assert detail.fields["label"] == "Support"      # echoed back so the edit form pre-fills
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # still masked
+
+
+class TestConnectionDisplayNameNoLongerPrefersLabel:
+    def test_ignores_label_returns_identity_instead(self):
+        fields = {"_label": "Support", "email": "reg@mail.com"}
+        assert connection_display_name(fields) == "reg@mail.com"
+
+    def test_still_returns_host_database_identity(self):
+        fields = {"host": "db.example.com", "database": "prod_db"}
+        assert connection_display_name(fields) == "db.example.com/prod_db"
+
+    def test_returns_none_when_nothing_derivable(self):
+        fields = {"_label": "Support", "_connector_id": "gmail"}
+        assert connection_display_name(fields) is None
 
 
 class TestOAuthIdentity:
