@@ -294,15 +294,17 @@ class TestConnectionLabel:
     def test_set_connection_label_updates_in_place(self, tmp_path):
         vault = LocalDataVault(tmp_path)
         slug = persist_connection("gmail", "app-password", "", GMAIL_CREDS, vault=vault)
-        assert set_connection_label("gmail", slug, "Support", vault=vault) is True
-        assert vault.load("gmail", slug)["_label"] == "Support"
+        # `set_connection_label()` now writes `_user_label` (not `_label`) and
+        # returns the stored value (post-deduplication), not a bool.
+        assert set_connection_label("gmail", slug, "Support", vault=vault) == "Support"
+        assert vault.load("gmail", slug)["_user_label"] == "Support"
         # identity + secret untouched
         assert vault.load("gmail", slug)["email"] == "user@gmail.com"
         assert vault.read_record("gmail", slug)["secure_keys"] == ["app_password"]
 
-    def test_set_connection_label_missing_connection_returns_false(self, tmp_path):
+    def test_set_connection_label_missing_connection_returns_none(self, tmp_path):
         vault = LocalDataVault(tmp_path)
-        assert set_connection_label("gmail", "nope", "X", vault=vault) is False
+        assert set_connection_label("gmail", "nope", "X", vault=vault) is None
 
 
 class TestDisplayName:
@@ -451,4 +453,133 @@ class TestOAuthCallbackDedup:
         conns = vault.list_connections()
         assert len(conns) == 1
         assert conns[0]["name"] == "martyna-mindsdb-com"
+
+
+class TestPersistConnectionUserLabel:
+    def test_new_connection_gets_explicit_user_label(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection(
+            "postgres", "host-port", "", {"host": "db.example.com"},
+            user_label="prod-db", vault=vault,
+        )
+        record = vault.read_record("postgres", slug)
+        assert record["fields"]["_user_label"] == "prod-db"
+
+    def test_user_label_deduplicated_against_existing(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        persist_connection(
+            "postgres", "host-port", "", {"host": "a"}, user_label="prod-db", vault=vault,
+        )
+        slug2 = persist_connection(
+            "mysql", "host-port", "", {"host": "b"}, user_label="prod-db", vault=vault,
+        )
+        record2 = vault.read_record("mysql", slug2)
+        assert record2["fields"]["_user_label"] == "prod-db 2"
+
+    def test_editing_keeps_own_label_unbumped(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        # `persist_connection()`'s return value IS the vault "name" — it is
+        # NOT prefixed with `{connector_id}-` the way anton's `save_connection()`
+        # helper builds a slug. For a host-derived identity, `derive_connection_name`
+        # returns something like "db-example-com" (no relation to the string
+        # "postgres"), so `slug.split("-", 1)[1]` would NOT recover a usable
+        # name — it would chop the derived slug itself in an arbitrary place.
+        # Pass `slug` straight through as `name` on the second call instead.
+        #
+        # The second call must submit the SAME credentials (just `host`,
+        # nothing added) as the first. `resolve_unique_slug()` only treats
+        # this as "the same connection" when `is_same_account()` agrees the
+        # non-secret identity matches — and identity comparison includes
+        # every non-`_`-prefixed, non-secret field except `expires_at`/`scope`
+        # (`_VOLATILE_IDENTITY_FIELDS`). Adding `"port": "5432"` on the second
+        # call would make `is_same_account()` return False, so the second
+        # `persist_connection()` call would create a sibling record instead
+        # of updating the first one in place — `exclude=(connector_id, slug)`
+        # would then never actually exclude anything relevant, and the test
+        # would pass without exercising the `exclude` behavior at all.
+        slug = persist_connection(
+            "postgres", "host-port", "", {"host": "db.example.com"},
+            user_label="prod-db", vault=vault,
+        )
+        persist_connection(
+            "postgres", "host-port", slug, {"host": "db.example.com"},
+            user_label="prod-db", vault=vault,
+        )
+        record = vault.read_record("postgres", slug)
+        assert record["fields"]["_user_label"] == "prod-db"
+        # Proves the second call updated the existing record rather than
+        # silently creating a sibling.
+        assert len(vault.list_connections()) == 1
+
+    def test_random_fallback_is_8_chars(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        # Only the random-fallback branch produces a `{connector_id}-{hex}`
+        # shaped string — this is the one case where splitting on the first
+        # "-" recovers the hex suffix. (An unregistered engine with no
+        # recognizable identity field, like `opaque` here, has nothing for
+        # `derive_connection_name` to key off, so it falls through to random.)
+        slug = persist_connection(
+            "unknownengine", None, "", {"opaque": "1"}, vault=vault,
+        )
+        suffix = slug.split("-", 1)[1]
+        assert len(suffix) == 8
+
+    def test_new_connection_gets_default_label_when_none_passed(self, tmp_path):
+        # Without this, a connection saved via cowork with no explicit
+        # `user_label` in the request (the common case for a first-time
+        # "Connect Postgres" through the GUI) would end up with NO label at
+        # all — inconsistent with anton, where the CLI prompt always has a
+        # default and can never be skipped entirely.
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection(
+            "postgres", "host-port", "", {"host": "db.example.com"}, vault=vault,
+        )
+        record = vault.read_record("postgres", slug)
+        assert record["fields"]["_user_label"] == "postgres"
+
+    def test_editing_without_a_label_does_not_assign_one(self, tmp_path):
+        # The `existing is None` guard on the default-label fix above: an
+        # existing connection that has no label (e.g. migrated from before
+        # this feature) must not silently get one assigned just because a
+        # later save didn't pass `user_label` either.
+        #
+        # Same trap as `test_editing_keeps_own_label_unbumped` above — the
+        # credentials on the second call must be IDENTICAL to what's already
+        # stored (just `host`), not `host` + a newly-added `port`.
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("postgres", "legacy", {"host": "db.example.com"})  # no _user_label
+        persist_connection(
+            "postgres", "host-port", "legacy", {"host": "db.example.com"},
+            vault=vault,
+        )
+        record = vault.read_record("postgres", "legacy")
+        assert "_user_label" not in record["fields"]
+        assert len(vault.list_connections()) == 1
+
+
+class TestSetConnectionLabelReturnsValue:
+    def test_returns_stored_value(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("gmail", "support", {"email": "a@b.com"})
+        result = set_connection_label("gmail", "support", "Support", vault=vault)
+        assert result == "Support"
+
+    def test_deduplicates_against_existing_labels(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("gmail", "acct1", {"email": "a@b.com", "_user_label": "Support"})
+        vault.save("gmail", "acct2", {"email": "c@d.com"})
+        result = set_connection_label("gmail", "acct2", "Support", vault=vault)
+        assert result == "Support 2"
+
+    def test_returns_none_for_missing_connection(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        result = set_connection_label("gmail", "missing", "Support", vault=vault)
+        assert result is None
+
+    def test_returns_none_for_blank_label(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("gmail", "support", {"email": "a@b.com"})
+        result = set_connection_label("gmail", "support", "   ", vault=vault)
+        assert result is None
+        assert "_user_label" not in (vault.load("gmail", "support") or {})
 
