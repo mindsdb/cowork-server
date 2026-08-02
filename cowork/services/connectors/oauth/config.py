@@ -26,4 +26,5 @@ OAUTH_SERVICES: dict[str, OAuthServiceConfig] = {
     "google-ads": OAuthServiceConfig(engine="google_ads"),
     "google-analytics": OAuthServiceConfig(engine="google_analytics_4"),
     "linear": OAuthServiceConfig(engine="linear"),
+    "github": OAuthServiceConfig(engine="github"),
 }

@@ -9,6 +9,7 @@ import hashlib
 import logging
 import mimetypes
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -201,6 +202,24 @@ def delete_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
         raise HTTPException(status_code=400, detail="Path is a directory")
     target.unlink()
     return {"status": "deleted", "path": path}
+
+
+@router.delete("/{project_name}/skill_drafts/{slug}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
+    """Remove a staged skill draft once it is Saved (or dismissed).
+
+    Idempotent: a missing draft is a no-op — Save may race the sweep, and a
+    lingering draft is the safe default we're clearing, not a hard error. The
+    slug is confined to a direct child of the drafts dir (no traversal).
+    """
+    # Resolve, then require the target to stay inside the drafts dir — rejects any
+    # traversal in `slug` regardless of what it contains.
+    drafts_root = os.path.realpath(_project_dir(project_name, scoped) / ".anton" / "skill_drafts")
+    folder = os.path.realpath(os.path.join(drafts_root, slug))
+    if not folder.startswith(drafts_root + os.sep):
+        raise HTTPException(status_code=400, detail="invalid slug")
+    if os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 @router.post("/preview-mount-file")

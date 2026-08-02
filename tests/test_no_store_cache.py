@@ -15,7 +15,7 @@ from cowork.server import app
 from cowork.services.settings import _mask_provider_keys
 
 # Present as a loopback client so /settings/reveal-key + /raw pass the
-# local-only guard (settings._require_local, ENG-457).
+# local-only guard (guards.require_local, ENG-457).
 client = TestClient(app, client=("127.0.0.1", 50000))
 
 
