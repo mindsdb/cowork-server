@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -293,24 +294,46 @@ def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts
 # under the already-off-limits `.anton/` dir, so a draft is invisible to BOTH
 # the artifacts scan and skill-discovery) and surface each as a self-contained
 # `response.skill_created` event. Mirrors the artifact snapshot/diff above, but
-# is deliberately NOT indexed as a TaskObject — a draft is transient until Save.
+# is deliberately NOT indexed as a TaskObject — a draft persists on disk until
+# the user Saves or dismisses it.
 
 # A skill folder is a draft iff it holds the canonical SKILL.md filename.
 _DRAFT_FILE_MAX = 200_000  # per sibling file; skills are small text — cap defensively
 
 
-def snapshot_skill_drafts(drafts_base) -> set[str]:
-    """The set of skill-draft folder names under `.anton/skill_drafts`."""
+def _draft_content_hash(skill_md_path: Path) -> str:
+    """SHA-256 of a draft's SKILL.md bytes ('' if unreadable).
+
+    ponytail: hashes SKILL.md only, not sibling files — a sibling-only edit
+    won't re-emit a card. Skills are refined by rewriting SKILL.md, so this
+    covers the real case; upgrade to a whole-folder hash if sibling-only edits
+    must surface.
+    """
+    try:
+        return hashlib.sha256(skill_md_path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def snapshot_skill_drafts(drafts_base) -> dict[str, str]:
+    """Map each skill-draft folder name under `.anton/skill_drafts` to a content
+    hash of its SKILL.md.
+
+    Keying on content (not just the folder name) lets the turn-end diff re-emit
+    a card when a draft is refined in place across turns, not only when a new
+    folder first appears.
+    """
     from anton.core.tools.skill_format import SKILL_FILE
 
     base = Path(drafts_base)
     if not base.is_dir():
-        return set()
-    return {
-        child.name
-        for child in base.iterdir()
-        if child.is_dir() and (child / SKILL_FILE).is_file()
-    }
+        return {}
+    snapshot: dict[str, str] = {}
+    for child in base.iterdir():
+        skill_md = child / SKILL_FILE
+        if child.is_dir() and skill_md.is_file():
+            snapshot[child.name] = _draft_content_hash(skill_md)
+    return snapshot
 
 
 def snapshot_stray_skills(project_skills_dir) -> set[str]:
@@ -399,17 +422,110 @@ def _skill_draft_payload(folder: Path) -> dict | None:
     }
 
 
-def finalize_turn_skill_drafts(project_path, before_drafts: set[str], before_strays: set[str]) -> list[dict]:
-    """End-of-turn skill-draft handling from a single dir diff.
+def _seed_draft_from_store(folder: Path, slug: str) -> None:
+    """Copy a saved skill's SKILL.md + sibling files into an empty draft folder.
+
+    Lets "edit an existing skill" start from the stored version (Save then
+    upserts it back) instead of the agent hunting for and mutating the live
+    store in place. Best-effort: a missing store entry or copy failure just
+    leaves the folder empty (a fresh draft), never raises into the turn.
+
+    ponytail: copies top-level files only (skills are flat text) — mirrors
+    `_skill_draft_payload`, which also skips subdirs.
+    """
+    from anton.core.tools.skill_format import SKILL_FILE
+
+    try:
+        from cowork.common.settings.app_settings import get_app_settings
+
+        src = Path(get_app_settings().skill.root_dir) / slug
+    except Exception:
+        return
+    if not (src / SKILL_FILE).is_file():
+        return
+    try:
+        for child in src.iterdir():
+            if child.is_file():
+                shutil.copy2(child, folder / child.name)
+    except OSError:
+        logger.warning("Could not seed skill draft %r from store", slug, exc_info=True)
+
+
+# LLM-facing contract for the `create_skill_draft` tool, shared verbatim by both
+# harnesses (hermes registers it in run_agent's registry, anton as a ToolDef) so
+# the tool reads identically regardless of agent.
+CREATE_SKILL_DRAFT_DESCRIPTION = (
+    "Claim a staging folder for a skill you are building or improving for the "
+    "user (e.g. while running the skill-creator skill). Call this BEFORE writing "
+    "the skill; it returns {slug, path, skill_file} — write your SKILL.md to "
+    "`skill_file` (and any sibling files into `path`). If a skill with this name "
+    "is already saved, the folder is pre-filled with its current contents so you "
+    "edit from the saved version. The skill is staged, NOT saved: it surfaces as "
+    "a card the user explicitly saves or downloads. NEVER write a skill into the "
+    "project `skills/` directory and NEVER use `create_artifact` for a skill."
+)
+
+CREATE_SKILL_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "The skill's name (becomes its slug, e.g. 'competitive-analysis').",
+        },
+        "description": {
+            "type": "string",
+            "description": "Optional one-line trigger description shown on the card.",
+        },
+    },
+    "required": ["name"],
+}
+
+
+def stage_skill_draft(drafts_root, name: str) -> dict:
+    """Claim a draft folder for `name` under `drafts_root`; return its location.
+
+    If a saved skill with the same slug exists AND the draft folder isn't already
+    populated, seed it with the stored skill (see `_seed_draft_from_store`) so an
+    edit starts from the saved version. Returns `{slug, path, skill_file}`, or
+    `{error}` on invalid input.
+
+    Shared by both harnesses' `create_skill_draft` tool so the claim + seed
+    behaviour is identical regardless of agent.
+    """
+    from anton.core.tools.skill_format import SKILL_FILE, normalize_name
+
+    name = str(name or "").strip()
+    if not name:
+        return {"error": "`name` is required."}
+    slug = normalize_name(name)
+    if not slug:
+        return {"error": "`name` must contain at least one alphanumeric character."}
+
+    folder = Path(drafts_root) / slug
+    folder.mkdir(parents=True, exist_ok=True)
+    if not (folder / SKILL_FILE).is_file():
+        _seed_draft_from_store(folder, slug)
+    return {
+        "slug": slug,
+        "path": str(folder),
+        "skill_file": str(folder / SKILL_FILE),
+    }
+
+
+def finalize_turn_skill_drafts(project_path, before_drafts: dict[str, str], before_strays: set[str]) -> list[dict]:
+    """End-of-turn skill-draft handling from a content diff of the drafts dir.
 
     1. Relocate any NEW stray (non-symlink) skill folder the agent wrote into
        `<project>/skills` over into the drafts dir — kills the auto-save leak
        even if the prompt/tool routing failed. Moving it in makes it show up in
        the drafts diff below, so it travels the same card path.
-    2. Diff the drafts dir and return a self-contained payload per new draft.
+    2. Diff the drafts dir by SKILL.md content and return a self-contained
+       payload for every draft that is NEW or CHANGED since the turn started.
 
-    Returns `[]` when nothing new. Best-effort: every step is guarded so a draft
-    can never break a turn.
+    Draft folders PERSIST — they are not swept here, so an unsaved skill stays on
+    disk and later refinements re-emit an updated card (cleanup happens on
+    Save/Dismiss, not per turn). Returns `[]` when nothing new or changed.
+    Best-effort: every step is guarded so a draft can never break a turn.
     """
     base = Path(project_path)
     drafts_base = base / ".anton" / "skill_drafts"
@@ -428,18 +544,22 @@ def finalize_turn_skill_drafts(project_path, before_drafts: set[str], before_str
     except Exception:
         logger.warning("Stray-skill relocation failed", exc_info=True)
 
-    # 2. Diff drafts, build payloads, then remove each folder — the payload is
-    # self-contained so staging files are not needed after this point.
+    # 2. Diff drafts by content: emit a payload for every draft whose SKILL.md is
+    # new or changed since the turn started. Folders are KEPT on disk so a draft
+    # survives across turns and later refinements re-emit an updated card.
+    #
+    # ponytail: drafts are removed only on Save (client sweeps via
+    # DELETE .../skill_drafts/{slug}) or when the whole project is deleted. An
+    # unsaved draft the user abandons is never GC'd — it lingers under
+    # `.anton/skill_drafts/`. TODO: age-based GC or a "Unsaved skills" panel with
+    # Dismiss to reap orphans (a deleted conversation can orphan its only card).
+    before = dict(before_drafts or {})
     after = snapshot_skill_drafts(drafts_base)
-    new = sorted(after - set(before_drafts or ()))
     payloads: list[dict] = []
-    for slug in new:
-        folder = drafts_base / slug
-        payload = _skill_draft_payload(folder)
+    for slug in sorted(after):
+        if after[slug] == before.get(slug):
+            continue  # unchanged since turn start → no card
+        payload = _skill_draft_payload(drafts_base / slug)
         if payload is not None:
             payloads.append(payload)
-        try:
-            shutil.rmtree(folder)
-        except OSError:
-            logger.warning("Could not remove skill draft folder %r", slug, exc_info=True)
     return payloads

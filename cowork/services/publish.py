@@ -23,14 +23,14 @@ from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+from anton.publish_access import access_from_owner_side
+from anton.publish_access import normalize_emails as _normalize_emails
+from anton.publish_access import resolve_access as _resolve_access
+from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
 from cowork.services.artifacts import (
-    _artifact_root_for,
     _content_mtime,
-    _fullstack_types,
-    _load_metadata,
     _load_published_map,
-    _pick_primary,
-    _user_files,
+    _scan_artifact_dirs,
     html_artifacts,
     resolve_artifact_path,
 )
@@ -91,39 +91,17 @@ def _utc_now_iso() -> str:
 
 
 def _resolve_publish_target(artifact: Path) -> tuple[Path, Path, str, bool]:
-    """Decide what to publish given a resolved artifact path (file OR dir).
+    """Decide what to publish + where `.published.json` lives + its key.
 
-    Folder-based artifacts are addressed by their folder; legacy loose-HTML
-    (and chat-bubble / Utilities-list) artifacts by their file. In both cases:
-      - fullstack (metadata.json type ∈ FULLSTACK_ARTIFACT_TYPES) → publish
-        the artifact *directory* (anton bundles backend.py + static/ +
-        requirements.txt only when handed a dir), `.published.json` at root;
-      - static → publish the single primary *file* (anton's `_zip_html`
-        renames it to index.html + pulls referenced siblings; handing it a
-        dir would over-bundle metadata.json/data and skip the rename),
-        `.published.json` in that file's parent.
-    The map is always keyed by the primary file name — matching how
-    `_published_url_for` / `list_artifacts` read it back.
+    Thin wrapper over the single source of truth in anton
+    (`anton.publish_access.resolve_publish_target`); cowork supplies its own
+    container dirs (`_scan_artifact_dirs()`) so the metadata-climb is bounded
+    to the registered `.anton/artifacts/` roots. Keeping this wrapper preserves
+    the existing cowork call sites and signature.
 
     Returns (publish_target, published_dir, published_key, is_fullstack).
     """
-    if artifact.is_dir():
-        # Folder addressed directly — its primary file lives inside.
-        artifact_root = artifact
-        meta = _load_metadata(artifact_root) or {}
-        primary = _pick_primary(artifact_root, _user_files(artifact_root), primary_hint=meta.get("primary"))
-    else:
-        # File addressed directly — it *is* the primary; climb to its root.
-        artifact_root = _artifact_root_for(artifact)
-        meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
-        primary = artifact
-
-    if (meta or {}).get("type") in _fullstack_types():
-        key = primary.name if primary else "index.html"
-        return artifact_root, artifact_root, key, True
-    if primary:
-        return primary, primary.parent, primary.name, False
-    return artifact_root, artifact_root, "index.html", False
+    return _anton_resolve_publish_target(artifact, _scan_artifact_dirs())
 
 
 def _resolve_publish_endpoint(settings) -> tuple[str, str]:
@@ -164,90 +142,8 @@ def list_publishable() -> dict:
     }
 
 
-def _normalize_emails(values) -> list[str]:
-    """Strip + lowercase + de-dupe, preserving first-seen order."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in values or []:
-        email = str(raw).strip().lower()
-        if email and email not in seen:
-            seen.add(email)
-            out.append(email)
-    return out
-
-
-def _resolve_access(
-    password: str | None, access: dict | None, previous: Any
-) -> tuple[dict, int, int, dict]:
-    """Resolve the effective publish access from the request + prior state.
-
-    Returns ``(effective_access, pwd_version, access_version, owner_side)``:
-
-    - ``effective_access`` — the cowork→anton shape passed to ``publish()``
-      (``{"mode": "public"}`` / ``{"mode": "password", "password": ...}`` /
-      ``{"mode": "restricted", "emails": [...], "org_allowed": bool}``).
-    - ``pwd_version`` / ``access_version`` — monotonic versions, bumped only
-      when the password (resp. restricted list/org) actually changes vs the
-      previous publish, so stale viewer grants invalidate (mirrors the prior
-      ``pwd_version`` logic).
-    - ``owner_side`` — fields to persist in ``.published.json`` (kept
-      back-compatible: ``requires_password`` is always present).
-
-    A request with no usable selection (empty password, or restricted with no
-    emails and no org) degrades to ``public`` rather than publishing an
-    artifact nobody can open.
-    """
-    prev = previous if isinstance(previous, dict) else {}
-    password = (password or "").strip() or None
-
-    mode = (access or {}).get("mode") if access else None
-    if not mode:
-        mode = "password" if password else "public"
-
-    prev_pwd_version = prev.get("pwd_version", 0) or 0
-    prev_access_version = prev.get("access_version", 0) or 0
-    pwd_version = prev_pwd_version or 1
-    access_version = prev_access_version or 1
-
-    if mode == "password":
-        pw = ((access or {}).get("password") or password or "").strip() or None
-        if pw:
-            prev_password = prev.get("access_password")
-            pwd_version = (prev_pwd_version + 1) if pw != prev_password else (prev_pwd_version or 1)
-            owner_side = {
-                "mode": "password",
-                "requires_password": True,
-                "access_password": pw,
-                "pwd_version": pwd_version,
-            }
-            return {"mode": "password", "password": pw}, pwd_version, access_version, owner_side
-        mode = "public"  # empty password → public
-
-    if mode == "restricted":
-        emails = _normalize_emails((access or {}).get("emails"))
-        org_allowed = bool((access or {}).get("org_allowed"))
-        if emails or org_allowed:
-            prev_restricted = prev.get("mode") == "restricted"
-            prev_emails = prev.get("emails") if prev_restricted else None
-            prev_org = prev.get("org_allowed") if prev_restricted else None
-            changed = (emails != prev_emails) or (org_allowed != prev_org)
-            access_version = (prev_access_version + 1) if changed else (prev_access_version or 1)
-            owner_side = {
-                "mode": "restricted",
-                "requires_password": False,
-                "emails": emails,
-                "org_allowed": org_allowed,
-                "access_version": access_version,
-            }
-            return (
-                {"mode": "restricted", "emails": emails, "org_allowed": org_allowed},
-                pwd_version,
-                access_version,
-                owner_side,
-            )
-        mode = "public"  # nothing selected → public
-
-    return {"mode": "public"}, pwd_version, access_version, {"mode": "public", "requires_password": False}
+# _normalize_emails / _resolve_access now live in anton.publish_access (single
+# source of truth) and are imported at the top of this module.
 
 
 # Static artifact extensions a user can publish to a MindsHub web page.
@@ -598,18 +494,9 @@ def update_artifact(raw_path: str) -> dict:
     if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
         raise FileNotFoundError("No published version to update")
 
-    # Rebuild the cowork→publish access shape from the stored owner-side state.
-    mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
-    if mode == "password":
-        access = {"mode": "password", "password": entry.get("access_password", "") or ""}
-    elif mode == "restricted":
-        access = {
-            "mode": "restricted",
-            "emails": entry.get("emails", []) or [],
-            "org_allowed": bool(entry.get("org_allowed")),
-        }
-    else:
-        access = {"mode": "public"}
+    # Rebuild the cowork→publish access shape from the stored owner-side state
+    # (single source of truth in anton.publish_access).
+    access = access_from_owner_side(entry)
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
     result = publish_artifact(raw_path, access=access)
@@ -797,3 +684,19 @@ def published_state(raw_path: str) -> dict:
         "url": str(entry.get("url") or "") if live else "",
         "published": live,
     }
+
+
+def published_owner_state(raw_path: str) -> dict:
+    """Raw owner-side `.published.json` entry, resolved exactly like
+    `publish_artifact`. Returns {} for any unresolvable/absent record. Unlike
+    `published_state`, exposes the access fields (mode/access_password/emails/
+    org_allowed) needed to preserve access on re-publish."""
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    except Exception:
+        return {}
+    if artifact is None:
+        return {}
+    _t, published_dir, published_key, _fs = _resolve_publish_target(artifact)
+    entry = _load_published_map(published_dir).get(published_key)
+    return entry if isinstance(entry, dict) else {}

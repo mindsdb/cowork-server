@@ -38,12 +38,13 @@ IMAGE_FORMAT_USER_MESSAGE = (
 # `included_allowance_exhausted`). Without this the turn would die mid-stream
 # with no completion event and no error frame — the SSE connection just closes
 # and the renderer's spinner stops, which reads as "Anton is dead" rather than
-# an out-of-credits message. The desktop renders a richer card for the
-# `token_limit` code (Add credits / Bring your own keys); this text is the
-# fallback copy.
+# an out-of-credits message. The desktop renders a card for the `token_limit`
+# code and shows THIS text as the card body (it always outranks the client's
+# fallback copy) with a single Add-credits button (ENG-1169) — so this copy
+# must not instruct actions the card doesn't offer (the old text advertised a
+# "bring your own key" button that no longer exists).
 TOKEN_LIMIT_USER_MESSAGE = (
-    "You're out of credits. Add credits to keep going, or bring your own LLM "
-    "provider key in Settings."
+    "You're out of credits. Add credits to keep working."
 )
 
 # Wire-level code for the out-of-credits case. Named `token_limit` for wire

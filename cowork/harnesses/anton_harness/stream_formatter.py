@@ -139,6 +139,23 @@ async def format_responses_stream(
         StreamToolUseStart,
     )
 
+    # StreamReasoningDelta is newer than the rest — it arrived with the
+    # reasoning-subtype channel (ENG-1109) and does not exist in anton-agent
+    # builds before it. Desktop staging installs resolve anton from PyPI, which
+    # lags the staging branch (staging cowork-server can be paired with an
+    # older published anton until anton is promoted), so importing it in the
+    # same unconditional block would make THIS formatter — run on every single
+    # turn — raise ImportError, which the responses route can only redact to a
+    # generic "An unexpected error occurred", breaking all chat (ENG-1167).
+    # Guard it: an older anton simply never emits reasoning deltas, so falling
+    # back to a sentinel class no event can be an instance of leaves the branch
+    # below dead and the turn degrades gracefully instead of failing.
+    try:
+        from anton.core.llm.provider import StreamReasoningDelta
+    except ImportError:
+        class StreamReasoningDelta:  # type: ignore[no-redef]
+            """Placeholder for pre-ENG-1109 anton; never instantiated."""
+
     resp_id = f"resp-{uuid.uuid4().hex[:12]}"
     msg_id = f"msg-{uuid.uuid4().hex[:12]}"
     seq = 0
@@ -288,6 +305,21 @@ async def format_responses_stream(
                     "eta_seconds": getattr(event, "eta_seconds", None),
                     "tool_use_id": getattr(event, "id", None) or "",
                 })
+
+        elif isinstance(event, StreamReasoningDelta):
+            # The model's own reasoning text — NOT part of the final answer.
+            # Shape matches hermes_harness's existing thought.progress +
+            # subtype convention exactly, so the frontend's ephemeral
+            # "current thought" handling (responseStreamAdapter.js) picks
+            # this up identically without any client-side change.
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_progress.value,
+                "content": event.text,
+                "subtype": "reasoning",
+            })
 
         elif isinstance(event, StreamContextCompacted):
             seq += 1
