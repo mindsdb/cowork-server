@@ -12,6 +12,7 @@ import pytest
 import cowork.services.settings as settings_mod
 from cowork.common.settings import env_boundary as eb
 from cowork.common.settings.env_boundary import db_to_env, merge_env_lines
+from cowork.services.providers import GEMINI_BASE_URL
 from cowork.common.settings.user_settings import UserSettings
 from cowork.db.session import get_open_session
 from cowork.services.settings import SettingService
@@ -41,7 +42,7 @@ def test_db_to_env_translates_gemini_to_openai_compatible():
     out = db_to_env(s, present_keys={"gemini_api_key", "planning_provider", "coding_provider"})
     assert out["ANTON_PLANNING_PROVIDER"] == "openai-compatible"
     assert out["ANTON_OPENAI_API_KEY"] == "sk-gem"             # gemini key rides the OpenAI slot
-    assert out["ANTON_OPENAI_BASE_URL"].startswith("https://generativelanguage.googleapis.com")
+    assert out["ANTON_OPENAI_BASE_URL"] == GEMINI_BASE_URL     # Google's OpenAI-compatible endpoint
     assert "ANTON_GEMINI_API_KEY" not in out                   # a field the CLI ignores
     assert "gemini" not in out.get("ANTON_PLANNING_PROVIDER", "")
 
@@ -57,7 +58,7 @@ def test_db_to_env_allows_representable_mixed_providers():
     assert out["ANTON_ANTHROPIC_API_KEY"] == "sk-an"
     assert out["ANTON_CODING_PROVIDER"] == "openai-compatible"     # gemini -> oc
     assert out["ANTON_OPENAI_API_KEY"] == "sk-ge"                  # gemini key, OpenAI slot
-    assert out["ANTON_OPENAI_BASE_URL"].startswith("https://generativelanguage")
+    assert out["ANTON_OPENAI_BASE_URL"] == GEMINI_BASE_URL
 
 
 def test_db_to_env_skips_unrepresentable_openai_gemini_mix():
