@@ -19,45 +19,58 @@ from cowork.services.settings import SettingService
 
 # ── pure derivation ────────────────────────────────────────────────────
 
-def test_db_to_env_formats_and_excludes_models():
-    s = UserSettings(
-        anthropic_api_key="sk-secret",
-        planning_provider="minds_cloud",
-        minds_url="https://mdb.example",
-        planning_model="latest:sonnet",  # not aliased (ENG-739)
-    )
-    present = {"anthropic_api_key", "planning_provider", "minds_url", "planning_model"}
+def test_db_to_env_pairs_provider_with_its_model():
+    # A provider is exported WITH its resolved model (ENG-1127 review): never a
+    # provider line without a matching model.
+    s = UserSettings(minds_api_key="sk-minds", minds_url="https://mdb.example",
+                     planning_provider="minds_cloud", coding_provider="minds_cloud")
+    present = {"minds_api_key", "minds_url", "planning_provider", "coding_provider"}
     out = db_to_env(s, present)
-    assert out["ANTON_ANTHROPIC_API_KEY"] == "sk-secret"  # decrypted plaintext
-    assert out["ANTON_PLANNING_PROVIDER"] == "minds-cloud"  # dash form
+    assert out["ANTON_PLANNING_PROVIDER"] == "minds-cloud"      # dash form
+    assert out["ANTON_MINDS_API_KEY"] == "sk-minds"             # decrypted plaintext
     assert out["ANTON_MINDS_URL"] == "https://mdb.example"
-    assert not any("MODEL" in k for k in out)
+    assert out["ANTON_PLANNING_MODEL"]                          # model rides with the provider
+    assert out["ANTON_CODING_MODEL"]
 
 
-def test_db_to_env_only_exports_stored_keys():
-    # minds_url has a non-None default but no row → must not be exported
-    s = UserSettings(anthropic_api_key="sk-x")
-    out = db_to_env(s, present_keys={"anthropic_api_key"})
-    assert out == {"ANTON_ANTHROPIC_API_KEY": "sk-x"}
-    assert "ANTON_MINDS_URL" not in out
+def test_db_to_env_translates_gemini_to_openai_compatible():
+    # The pinned CLI has no first-class gemini provider — it runs Gemini as
+    # openai-compatible + Google's base URL + the key in the OpenAI slot. The
+    # export must render that shape, not the literal provider=gemini the CLI rejects.
+    s = UserSettings(gemini_api_key="sk-gem", planning_provider="gemini", coding_provider="gemini")
+    out = db_to_env(s, present_keys={"gemini_api_key", "planning_provider", "coding_provider"})
+    assert out["ANTON_PLANNING_PROVIDER"] == "openai-compatible"
+    assert out["ANTON_OPENAI_API_KEY"] == "sk-gem"             # gemini key rides the OpenAI slot
+    assert out["ANTON_OPENAI_BASE_URL"].startswith("https://generativelanguage.googleapis.com")
+    assert "ANTON_GEMINI_API_KEY" not in out                   # a field the CLI ignores
+    assert "gemini" not in out.get("ANTON_PLANNING_PROVIDER", "")
+
+
+def test_db_to_env_exports_nothing_when_unconfigured():
+    # No key anywhere → no provider/model/creds; flags export only when stored.
     assert db_to_env(UserSettings(), present_keys=set()) == {}
+    # A resolved provider with no key exports no provider line for that role.
+    out = db_to_env(UserSettings(), present_keys={"planning_provider"})
+    assert "ANTON_PLANNING_PROVIDER" not in out
 
 
 def test_merge_preserves_unmanaged_and_replaces_managed():
     existing = (
         "COWORK_AUTH_TOKEN=tok-123\n"
-        "ANTON_PLANNING_MODEL=latest:sonnet\n"
+        "ANTON_PLANNING_MODEL=latest:sonnet\n"  # now MANAGED (ENG-1127): dropped unless re-supplied
         "ANTON_ANTHROPIC_API_KEY=stale\n"
         "ANTON_FIRST_RUN_DONE=true\n"
         "# a comment\n"
     )
     merged = merge_env_lines(existing, {"ANTON_ANTHROPIC_API_KEY": "fresh", "ANTON_MINDS_URL": "https://m"})
     lines = merged.strip().split("\n")
-    # Unmanaged lines survive verbatim.
+    # Genuinely unmanaged lines survive verbatim.
     assert "COWORK_AUTH_TOKEN=tok-123" in lines
-    assert "ANTON_PLANNING_MODEL=latest:sonnet" in lines
     assert "ANTON_FIRST_RUN_DONE=true" in lines
     assert "# a comment" in lines
+    # Model vars are managed now — a stale one not re-supplied is dropped (the
+    # export always re-supplies the resolved model, so no mismatch survives).
+    assert "ANTON_PLANNING_MODEL=latest:sonnet" not in lines
     # The stale managed line is replaced, not duplicated.
     assert "ANTON_ANTHROPIC_API_KEY=stale" not in lines
     assert lines.count("ANTON_ANTHROPIC_API_KEY=fresh") == 1
@@ -85,10 +98,13 @@ def test_merge_env_lines_rejects_crlf_injection():
 
 
 def test_db_to_env_drops_newline_bearing_value(monkeypatch):
-    s = UserSettings()
+    # A minds-cloud user so minds_url is genuinely part of the export, then poison
+    # it — the injection guard (not a missing key) is what must drop it.
+    s = UserSettings(minds_api_key="sk-minds", planning_provider="minds_cloud")
     monkeypatch.setattr(s, "minds_url", "https://x\nDATABASE_URI=sqlite:///evil.db", raising=False)
-    out = db_to_env(s, present_keys={"minds_url"})
-    assert "ANTON_MINDS_URL" not in out  # poisoned value refused, not exported
+    out = db_to_env(s, present_keys={"minds_api_key", "planning_provider"})
+    assert "ANTON_MINDS_API_KEY" in out    # the clean sibling still exports
+    assert "ANTON_MINDS_URL" not in out    # poisoned value refused by the guard
 
 
 def test_export_never_writes_injected_line_end_to_end(local_export):
@@ -139,9 +155,12 @@ def test_save_all_exports_env_and_preserves_unmanaged(local_export):
         assert "ANTON_MINDS_API_KEY=sk-abc" in text
         assert "ANTON_MINDS_URL=https://mdb" in text
         assert "ANTON_PLANNING_PROVIDER=minds-cloud" in text
-        # unmanaged lines the server must not touch
+        # Genuinely unmanaged lines the server must not touch.
         assert "COWORK_AUTH_TOKEN=tok-1" in text
-        assert "ANTON_PLANNING_MODEL=latest:sonnet" in text
+        # The model is managed now: the stale hand-set pin is replaced by the
+        # resolved model that pairs with the exported provider (no mismatch).
+        assert "ANTON_PLANNING_MODEL=latest:sonnet" not in text
+        assert "ANTON_PLANNING_MODEL=" in text
         assert oct(env_path.stat().st_mode)[-3:] == "600"
     finally:
         _cleanup(session, "minds_api_key", "minds_url", "planning_provider")
@@ -161,9 +180,9 @@ def test_export_skipped_for_org_tenancy(monkeypatch, tmp_path):
         session.close()
 
 
-def test_clear_credentials_wipes_creds_from_env_but_keeps_model(local_export):
+def test_clear_credentials_wipes_creds_and_orphaned_model_from_env(local_export):
     env_path = local_export
-    env_path.write_text("ANTON_PLANNING_MODEL=latest:sonnet\n", encoding="utf-8")
+    env_path.write_text("COWORK_AUTH_TOKEN=keep\n", encoding="utf-8")
     session = get_open_session()
     try:
         _cleanup(session, "minds_api_key", "minds_url", "planning_provider")
@@ -171,13 +190,18 @@ def test_clear_credentials_wipes_creds_from_env_but_keeps_model(local_export):
         svc.save_all(
             {"minds_api_key": "sk-abc", "minds_url": "https://mdb", "planning_provider": "minds_cloud"}
         )
-        assert "ANTON_MINDS_API_KEY=sk-abc" in env_path.read_text(encoding="utf-8")
+        exported = env_path.read_text(encoding="utf-8")
+        assert "ANTON_MINDS_API_KEY=sk-abc" in exported
+        assert "ANTON_PLANNING_MODEL=" in exported  # provider+model exported as a pair
 
         svc.clear_credentials()
         text = env_path.read_text(encoding="utf-8")
         assert "ANTON_MINDS_API_KEY" not in text   # credential wiped from the CLI too
         assert "ANTON_MINDS_URL" not in text
-        assert "ANTON_PLANNING_MODEL=latest:sonnet" in text  # CLI model pin survives
+        # With no key left, no provider resolves — so its now-orphaned model line
+        # is dropped too, rather than left mismatched against a gone provider.
+        assert "ANTON_PLANNING_MODEL" not in text
+        assert "COWORK_AUTH_TOKEN=keep" in text     # unmanaged line untouched
     finally:
         _cleanup(session, "minds_api_key", "minds_url", "planning_provider")
         session.close()
@@ -207,8 +231,12 @@ def test_backfill_minds_url_exports_to_env_too(local_export):
     canonical = default_minds_api_host()
     session = get_open_session()
     try:
-        _cleanup(session, "minds_url")
+        _cleanup(session, "minds_url", "minds_api_key", "planning_provider")
         svc = SettingService(session)
+        # A real minds-cloud user (has the key) on the legacy host — only then is
+        # minds the resolved provider, so ANTON_MINDS_URL is part of the export.
+        svc.upsert_setting("minds_api_key", "sk-minds", export_env=False)
+        svc.upsert_setting("planning_provider", "minds_cloud", export_env=False)
         svc.upsert_setting("minds_url", "https://mdb.ai", export_env=False)
         env_path.write_text("ANTON_MINDS_URL=https://mdb.ai\n", encoding="utf-8")
 
@@ -219,7 +247,7 @@ def test_backfill_minds_url_exports_to_env_too(local_export):
         assert f"ANTON_MINDS_URL={canonical}" in env_text
         assert "https://mdb.ai" not in env_text
     finally:
-        _cleanup(session, "minds_url")
+        _cleanup(session, "minds_url", "minds_api_key", "planning_provider")
         session.close()
 
 
