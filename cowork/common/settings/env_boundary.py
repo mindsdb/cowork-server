@@ -170,33 +170,64 @@ def _anton_provider_name(p: Provider) -> str:
     return "openai-compatible" if p is Provider.GEMINI else p.ui_value
 
 
+def _openai_slot_demand(settings: UserSettings, p: Provider) -> tuple[str, str | None] | None:
+    """The ``(key, base)`` a provider needs in Anton's shared OpenAI slot.
+
+    ``None`` for providers that don't touch that slot (anthropic uses its own
+    key slot; minds-cloud uses the dedicated ``minds_*`` slots and derives the
+    OpenAI creds in ``model_post_init``). openai / openai-compatible / gemini all
+    ride ``ANTON_OPENAI_API_KEY`` / ``ANTON_OPENAI_BASE_URL``, so their demands
+    must AGREE for a config to be representable — see ``_env_representable``.
+    """
+    if p in (Provider.ANTHROPIC, Provider.MINDS_CLOUD):
+        return None
+    from cowork.services.providers import provider_base_url  # lazy: avoid import cycle
+    return (
+        provider_api_key_str(settings, p),
+        provider_base_url(p.ui_value, openai_base_url=settings.openai_base_url or ""),
+    )
+
+
+def _env_representable(settings: UserSettings, providers: list[Provider]) -> bool:
+    """Whether the resolved per-role ``providers`` fit Anton's on-disk model.
+
+    Anton has ONE global ``ANTON_OPENAI_API_KEY`` / ``ANTON_OPENAI_BASE_URL`` pair,
+    handed to BOTH its openai and openai-compatible factories, and its minds
+    derivation only fires when that OpenAI key is unset. So a config is
+    representable only when every OpenAI-slot role agrees on the same ``(key,
+    base)`` AND minds-cloud never coexists with an explicit OpenAI-slot role
+    (planning=OpenAI + coding=Gemini, or MindsHub + OpenAI, otherwise silently
+    misroute one role's key to the other's endpoint — ENG-1127 review).
+    """
+    openai_demands = {d for p in providers if (d := _openai_slot_demand(settings, p)) is not None}
+    minds_present = Provider.MINDS_CLOUD in providers
+    return len(openai_demands) <= 1 and not (minds_present and openai_demands)
+
+
 def _emit_provider_creds(out: dict[str, str], settings: UserSettings, p: Provider) -> None:
     """Write ``p``'s API key (and base URL) into the ANTON_* slots the CLI reads.
 
-    openai / openai-compatible / gemini share the single ``ANTON_OPENAI_API_KEY`` /
-    ``ANTON_OPENAI_BASE_URL`` slots (as they do in AntonSettings); minds-cloud uses
-    the dedicated ``minds_*`` slots and derives its base from them. Uses
-    ``setdefault`` so the first (highest-priority, planning-first) provider wins
-    the shared OpenAI slot — Anton can't serve two different OpenAI-compatible
-    endpoints at once, so a mixed cross-role config resolves deterministically.
+    Only called for a representable set (see ``_env_representable``), so the
+    OpenAI slot is never contended; minds-cloud uses the dedicated ``minds_*``
+    slots and derives its base from them.
     """
     from cowork.services.providers import provider_base_url  # lazy: avoid import cycle
 
     key = provider_api_key_str(settings, p)
     if p is Provider.ANTHROPIC:
         if key:
-            out.setdefault("ANTON_ANTHROPIC_API_KEY", key)
+            out["ANTON_ANTHROPIC_API_KEY"] = key
     elif p is Provider.MINDS_CLOUD:
         if key:
-            out.setdefault("ANTON_MINDS_API_KEY", key)
+            out["ANTON_MINDS_API_KEY"] = key
         if settings.minds_url:
-            out.setdefault("ANTON_MINDS_URL", settings.minds_url)
+            out["ANTON_MINDS_URL"] = settings.minds_url
     else:  # OPENAI / OPENAI_COMPATIBLE / GEMINI — all via the OpenAI slot
         if key:
-            out.setdefault("ANTON_OPENAI_API_KEY", key)
+            out["ANTON_OPENAI_API_KEY"] = key
         base = provider_base_url(p.ui_value, openai_base_url=settings.openai_base_url or "")
         if base:
-            out.setdefault("ANTON_OPENAI_BASE_URL", base)
+            out["ANTON_OPENAI_BASE_URL"] = base
 
 
 def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
@@ -213,6 +244,11 @@ def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
     valid; a role whose resolved provider has no key exports nothing, so an
     unconfigured or freshly-cleared install leaves the CLI on its own defaults.
 
+    A mixed cross-role config the CLI cannot represent (planning=OpenAI +
+    coding=Gemini, MindsHub + OpenAI, …) exports NO provider cluster rather than
+    a silently-misrouting one — the product can run those via per-role clients,
+    but the standalone CLI has a single OpenAI slot (ENG-1127 review).
+
     The remaining settings (memory flags, publish URL) have no cross-field
     resolution and export by a straight present-gated alias.
     """
@@ -226,17 +262,29 @@ def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
         ("ANTON_ROUTER_PROVIDER", "ANTON_ROUTER_MODEL",
          settings.resolved_router_provider, settings.resolved_router_model),
     )
-    creds_order: list[Provider] = []  # planning-first: wins the shared OpenAI slot
-    for prov_var, model_var, prov, model in roles:
-        if not provider_api_key_str(settings, prov):
-            continue  # resolved provider has no key — nothing runnable for this role
-        out[prov_var] = _anton_provider_name(prov)
-        if model:
-            out[model_var] = model
-        if prov not in creds_order:
-            creds_order.append(prov)
-    for prov in creds_order:
-        _emit_provider_creds(out, settings, prov)
+    keyed_roles = [
+        (prov_var, model_var, prov, model)
+        for prov_var, model_var, prov, model in roles
+        if provider_api_key_str(settings, prov)  # resolved provider has a key → runnable
+    ]
+    unique_providers: list[Provider] = []
+    for _, _, prov, _ in keyed_roles:
+        if prov not in unique_providers:
+            unique_providers.append(prov)  # planning-first order preserved
+
+    if _env_representable(settings, unique_providers):
+        for prov_var, model_var, prov, model in keyed_roles:
+            out[prov_var] = _anton_provider_name(prov)
+            if model:
+                out[model_var] = model
+        for prov in unique_providers:
+            _emit_provider_creds(out, settings, prov)
+    elif unique_providers:
+        logger.warning(
+            "settings: skipping .env provider export — roles resolve to providers the "
+            "standalone CLI cannot represent together (%s); leaving the CLI on its own config",
+            ", ".join(p.value for p in unique_providers),
+        )
 
     for db_key, env_var in _OUTBOUND_FLAG_ALIASES.items():
         if db_key not in present_keys:

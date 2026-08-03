@@ -46,6 +46,43 @@ def test_db_to_env_translates_gemini_to_openai_compatible():
     assert "gemini" not in out.get("ANTON_PLANNING_PROVIDER", "")
 
 
+def test_db_to_env_allows_representable_mixed_providers():
+    # anthropic + gemini use INDEPENDENT Anton slots (anthropic key vs the OpenAI
+    # slot), so this mixed config IS representable and exports both roles.
+    s = UserSettings(anthropic_api_key="sk-an", gemini_api_key="sk-ge",
+                     planning_provider="anthropic", coding_provider="gemini", router_provider="anthropic")
+    out = db_to_env(s, present_keys={"anthropic_api_key", "gemini_api_key",
+                                     "planning_provider", "coding_provider", "router_provider"})
+    assert out["ANTON_PLANNING_PROVIDER"] == "anthropic"
+    assert out["ANTON_ANTHROPIC_API_KEY"] == "sk-an"
+    assert out["ANTON_CODING_PROVIDER"] == "openai-compatible"     # gemini -> oc
+    assert out["ANTON_OPENAI_API_KEY"] == "sk-ge"                  # gemini key, OpenAI slot
+    assert out["ANTON_OPENAI_BASE_URL"].startswith("https://generativelanguage")
+
+
+def test_db_to_env_skips_unrepresentable_openai_gemini_mix():
+    # planning=OpenAI + coding=Gemini both need the single OpenAI slot but with a
+    # DIFFERENT key+base — Anton can't represent it, so export no provider cluster
+    # rather than misroute OpenAI's key to Google's endpoint (ENG-1127 review).
+    s = UserSettings(openai_api_key="sk-oa", gemini_api_key="sk-ge",
+                     planning_provider="openai", coding_provider="gemini", router_provider="openai")
+    out = db_to_env(s, present_keys={"openai_api_key", "gemini_api_key",
+                                     "planning_provider", "coding_provider", "router_provider"})
+    assert not any(k.startswith("ANTON_PLANNING") or k.startswith("ANTON_CODING")
+                   or k.startswith("ANTON_OPENAI") for k in out)
+
+
+def test_db_to_env_skips_unrepresentable_minds_plus_openai_mix():
+    # MindsHub derives its OpenAI creds in Anton's model_post_init ONLY when the
+    # OpenAI key is unset; a coding=OpenAI role sets it, breaking the derivation.
+    # So MindsHub + OpenAI is not representable either.
+    s = UserSettings(minds_api_key="sk-m", minds_url="https://api.mindshub.ai", openai_api_key="sk-oa",
+                     planning_provider="minds_cloud", coding_provider="openai", router_provider="minds_cloud")
+    out = db_to_env(s, present_keys={"minds_api_key", "minds_url", "openai_api_key",
+                                     "planning_provider", "coding_provider", "router_provider"})
+    assert not any("PROVIDER" in k or "OPENAI" in k or "MINDS" in k for k in out)
+
+
 def test_db_to_env_exports_nothing_when_unconfigured():
     # No key anywhere → no provider/model/creds; flags export only when stored.
     assert db_to_env(UserSettings(), present_keys=set()) == {}
