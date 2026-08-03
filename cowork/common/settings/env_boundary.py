@@ -16,8 +16,11 @@ map (ENG-739): a model is CLI-only and must never ride a bulk ``.env`` sync.
 """
 from __future__ import annotations
 
+import errno
+import logging
 import os
 import tempfile
+import time
 from enum import Enum
 from pathlib import Path
 
@@ -142,19 +145,81 @@ def merge_env_lines(existing: str, managed: dict[str, str]) -> str:
     return "\n".join(kept) + "\n"
 
 
+logger = logging.getLogger(__name__)
+
+# Transient Windows share-mode locks (the CLI or a version-skewed server holding
+# ``.env`` open, an AV scan, a delete-pending handle still closing) abort the
+# rename with one of these — the exact EPERM class that wedged onboarding on the
+# CLIENT before it grew a retry (ENG-1209). Now that the server is the writer
+# (ENG-1127), the same hardening has to live here. POSIX has no mandatory
+# locking, so these are effectively Windows-only.
+_TRANSIENT_LOCK_ERRNOS = frozenset({errno.EPERM, errno.EACCES, errno.EBUSY, errno.ENOTEMPTY})
+_REPLACE_ATTEMPTS = 6
+_REPLACE_BASE_DELAY_S = 0.06
+
+# Orphaned temps from a hard-kill / power-loss between the write and the rename
+# hold the full plaintext key, so they must never linger; sweep only STALE ones
+# so a concurrent writer's fresh in-flight temp is spared.
+_STALE_TMP_S = 5 * 60
+
+
+def _is_transient_lock_error(exc: OSError) -> bool:
+    return exc.errno in _TRANSIENT_LOCK_ERRNOS
+
+
+def _sweep_stale_temps(directory: Path) -> None:
+    """Remove orphaned ``.env.*.tmp`` files older than ``_STALE_TMP_S``.
+
+    Only stale temps go — a live writer's temp is fresh and spared, so this can't
+    yank one out from under a concurrent rename.
+    """
+    try:
+        now = time.time()
+        for entry in directory.glob(".env.*.tmp"):
+            try:
+                if now - entry.stat().st_mtime > _STALE_TMP_S:
+                    entry.unlink()
+            except OSError:
+                pass  # gone already or unreadable — best-effort
+    except OSError:
+        pass  # dir unreadable — nothing to sweep
+
+
+def _replace_with_retry(tmp: str, dest: str) -> None:
+    """``os.replace`` the finished temp onto ``dest``, retrying transient locks.
+
+    The temp is already written to a fresh, unlocked path; only the rename
+    contends with a Windows share-mode lock, so that is all we retry — with a
+    widening backoff (~60ms..360ms, ~1.3s total) that mirrors the client's
+    ``retryOnTransientLock`` (ENG-1209). A non-lock error (ENOENT, ENOTDIR, a
+    genuinely unwritable target) rethrows at once.
+    """
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, dest)
+            return
+        except OSError as exc:
+            if attempt < _REPLACE_ATTEMPTS - 1 and _is_transient_lock_error(exc):
+                time.sleep(_REPLACE_BASE_DELAY_S * (attempt + 1))
+                continue
+            raise
+
+
 def atomic_write_env(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically, owner-only (0o600).
 
     Temp file + ``os.replace`` so a crash or a concurrent CLI read never sees a
-    truncated ``.env``; 0o600 because the file holds plaintext API keys.
+    truncated ``.env``; 0o600 because the file holds plaintext API keys. The
+    rename is retried on transient Windows share-mode locks (ENG-1209/ENG-1127).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_temps(path.parent)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".env.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
         os.chmod(tmp, 0o600)
-        os.replace(tmp, str(path))
+        _replace_with_retry(tmp, str(path))
     except BaseException:
         try:
             os.unlink(tmp)
