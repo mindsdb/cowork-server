@@ -191,10 +191,7 @@ class ResponsesHandler:
         collected_events: list[dict] = []
         turn_rows: list[dict] = []
         persisted = False
-        # Captured NOW, before the turn runs — persistence is deferred to the
-        # end, so the DB's func.now() would otherwise stamp the message with the
-        # turn's END time. Using the send time keeps `created_at` aligned with
-        # the live-turn timestamp the agent embeds (UTC).
+        # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
 
         def event_sink(event_type: str, data: dict) -> None:
@@ -352,9 +349,7 @@ class ResponsesHandler:
         collected_text: list[str] = []
         collected_events: list[dict] = []
         turn_rows: list[dict] = []
-        # Send time captured before the turn — persistence is deferred to the
-        # end, so it stamps `created_at` with the turn's send time rather than
-        # its end time (aligns with the agent's live-turn timestamp).
+        # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
 
         def event_sink(event_type: str, data: dict) -> None:
