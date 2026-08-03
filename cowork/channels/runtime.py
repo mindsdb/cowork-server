@@ -419,6 +419,10 @@ class AntonChannelRuntime:
         _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
+        # Send time captured before the turn — persistence is deferred to the
+        # `finally` below, so this stamps `created_at` with the send time rather
+        # than the turn's end time (aligns with the agent's live-turn timestamp).
+        sent_at = datetime.now(timezone.utc)
 
         collected: list[str] = []
         events: list[dict] = []
@@ -448,7 +452,9 @@ class AntonChannelRuntime:
             # would replay the message into this turn AND resend it as the live
             # input. In `finally` so a crashed turn still records the inbound
             # message, matching the pre-history-replay behaviour.
-            ConversationService(scoped).save_user_message(conversation.id, content)
+            ConversationService(scoped).save_user_message(
+                conversation.id, content, created_at=sent_at
+            )
 
         reply = "".join(collected)
         ConversationService(scoped).save_assistant_turn(
