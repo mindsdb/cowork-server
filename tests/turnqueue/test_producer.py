@@ -147,20 +147,24 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mint_llm_block_carries_coding_model(monkeypatch):
-    # Without it the pod keeps anton's paid coding default -> 402 on the
-    # verifier/nested calls for unfunded orgs.
-    from cowork.common.settings.app_settings import TurnQueueSettings
-
-    class FakeUS:
-        resolved_coding_model = "mindshub_air"
-
-    import cowork.common.settings.user_settings as us_mod
-    monkeypatch.setattr(us_mod, "get_user_settings", lambda: FakeUS())
+async def test_mint_llm_block_uses_minds_coding_default():
+    # The pod runs on minds-cloud, so the coding model must be a minds alias.
+    # Default = the minds-cloud coding default, NOT the tenant's resolved model
+    # (which for a hosted user defaults to an Anthropic name minds 404s).
+    from cowork.common.settings.app_settings import TurnQueueSettings, CODING_MODEL_DEFAULTS
 
     settings = TurnQueueSettings(minds_base_url="https://api.example.dev/v1")
     block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
-    assert block["coding_model"] == "mindshub_air"
+    assert block["coding_model"] == CODING_MODEL_DEFAULTS["minds_cloud"]
+
+
+@pytest.mark.asyncio
+async def test_mint_llm_block_coding_model_override():
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    settings = TurnQueueSettings(minds_base_url="https://x/v1", minds_coding_model="sonnet")
+    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    assert block["coding_model"] == "sonnet"
 
 
 @pytest.mark.asyncio
