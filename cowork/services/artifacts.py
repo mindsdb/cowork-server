@@ -88,8 +88,15 @@ TEXT_EXTENSIONS = {
 
 # ─── Helpers ──────────────────────────────────────────────────────
 
-def _human_mtime(path: Path) -> str:
-    secs = time.time() - path.stat().st_mtime
+def _human_mtime(ts: float) -> str:
+    """ts <= 0 means "no user content files yet" (see _content_mtime's
+    ENG-372 empty-folder case) — there is no real age to report, so this
+    returns "" rather than a garbage "updated 19000+ days ago" computed
+    from the Unix epoch. Callers fall back to displaying "—" for "".
+    """
+    if ts <= 0:
+        return ""
+    secs = time.time() - ts
     if secs < 60:    return "updated just now"
     if secs < 3600:  return f"updated {int(secs // 60)}m ago"
     if secs < 86400: return f"updated {int(secs // 3600)}h ago"
@@ -607,7 +614,7 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
         "type": artifact_type,
         "kind": kind,
         "ext": primary_ext,
-        "updated": _human_mtime(folder / "metadata.json"),
+        "updated": _human_mtime(content_mtime),
         "mtime": content_mtime,
         "live": is_live,
         "bg": BG_CYCLE[idx % len(BG_CYCLE)],
