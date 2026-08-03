@@ -26,7 +26,11 @@ from pathlib import Path
 
 from pydantic import SecretStr
 
-from cowork.common.settings.user_settings import Provider, UserSettings
+from cowork.common.settings.user_settings import (
+    Provider,
+    UserSettings,
+    provider_api_key_str,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +59,24 @@ SETTING_ENV_ALIASES: dict[str, str] = {
 # Inverse view (ANTON_* -> DB key) for the inbound (.env-first) callers.
 ENV_ALIAS_TO_SETTING: dict[str, str] = {v: k for k, v in SETTING_ENV_ALIASES.items()}
 
+# The per-role model vars the outbound export owns. Absent from SETTING_ENV_ALIASES
+# because the INBOUND (.env->DB) direction must never map a model (ENG-739: a
+# stale ``latest:`` line must not re-pin the picker). OUTBOUND they ARE managed —
+# a provider is exported WITH its resolved model so the CLI can never end up with
+# a provider/model mismatch (ENG-1127 review); being managed also means a stale
+# model line is dropped when its provider is cleared.
+_MODEL_ENV_VARS: tuple[str, ...] = (
+    "ANTON_PLANNING_MODEL",
+    "ANTON_CODING_MODEL",
+    "ANTON_ROUTER_MODEL",
+)
+
 # The ANTON_* vars the outbound export owns; every other .env line is preserved.
-MANAGED_ENV_VARS: tuple[str, ...] = tuple(SETTING_ENV_ALIASES.values())
+# Includes the two key vars the export no longer WRITES (ANTON_GEMINI_API_KEY,
+# ANTON_OPENAI_API_KEY_CUSTOM — the pinned CLI has no field for them; gemini/oc
+# creds ride the OpenAI slot) so a stale line from an older writer is still
+# reconciled away.
+MANAGED_ENV_VARS: tuple[str, ...] = tuple(SETTING_ENV_ALIASES.values()) + _MODEL_ENV_VARS
 
 
 def normalize_provider_value(val: str, *, minds_key_present: bool) -> str:
@@ -125,30 +145,117 @@ def _is_dotenv_safe(value: str) -> bool:
     return "\n" not in value and "\r" not in value
 
 
-def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
-    """The aliased settings that are actually STORED -> ``{ANTON_*: value}``.
+# The non-provider settings still export by a straight present-gated alias:
+# booleans and the publish URL have no cross-field resolution. The provider /
+# key / base-url / model cluster is rendered separately (see db_to_env) because
+# it needs the SAME resolution the CLI and build_llm_client apply.
+_OUTBOUND_FLAG_ALIASES: dict[str, str] = {
+    "memory_enabled": "ANTON_MEMORY_ENABLED",
+    "memory_mode": "ANTON_MEMORY_MODE",
+    "episodic_memory": "ANTON_EPISODIC_MEMORY",
+    "proactive_dashboards": "ANTON_PROACTIVE_DASHBOARDS",
+    "act_first": "ANTON_ACT_FIRST",
+    "publish_url": "ANTON_PUBLISH_URL",
+}
 
-    Only keys in ``present_keys`` (that have a DB row) export: ``settings`` carries
-    a resolved default for every unset field, so exporting on non-``None`` alone
-    would push server defaults onto the CLI and leave a stale line after a clear.
+
+def _anton_provider_name(p: Provider) -> str:
+    """A cowork ``Provider`` -> the provider name Anton understands ON DISK.
+
+    Anton has no first-class gemini provider: its own ``anton setup`` writes
+    gemini as ``openai-compatible`` + Google's base URL + the key in the OpenAI
+    slot, and ``LLMClient.from_settings`` maps ``minds-cloud`` -> openai-compatible
+    itself. So gemini is translated here; everything else is its kebab ui_value.
+    """
+    return "openai-compatible" if p is Provider.GEMINI else p.ui_value
+
+
+def _emit_provider_creds(out: dict[str, str], settings: UserSettings, p: Provider) -> None:
+    """Write ``p``'s API key (and base URL) into the ANTON_* slots the CLI reads.
+
+    openai / openai-compatible / gemini share the single ``ANTON_OPENAI_API_KEY`` /
+    ``ANTON_OPENAI_BASE_URL`` slots (as they do in AntonSettings); minds-cloud uses
+    the dedicated ``minds_*`` slots and derives its base from them. Uses
+    ``setdefault`` so the first (highest-priority, planning-first) provider wins
+    the shared OpenAI slot — Anton can't serve two different OpenAI-compatible
+    endpoints at once, so a mixed cross-role config resolves deterministically.
+    """
+    from cowork.services.providers import provider_base_url  # lazy: avoid import cycle
+
+    key = provider_api_key_str(settings, p)
+    if p is Provider.ANTHROPIC:
+        if key:
+            out.setdefault("ANTON_ANTHROPIC_API_KEY", key)
+    elif p is Provider.MINDS_CLOUD:
+        if key:
+            out.setdefault("ANTON_MINDS_API_KEY", key)
+        if settings.minds_url:
+            out.setdefault("ANTON_MINDS_URL", settings.minds_url)
+    else:  # OPENAI / OPENAI_COMPATIBLE / GEMINI — all via the OpenAI slot
+        if key:
+            out.setdefault("ANTON_OPENAI_API_KEY", key)
+        base = provider_base_url(p.ui_value, openai_base_url=settings.openai_base_url or "")
+        if base:
+            out.setdefault("ANTON_OPENAI_BASE_URL", base)
+
+
+def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
+    """A loaded ``UserSettings`` -> the ``{ANTON_*: value}`` the CLI can RUN.
+
+    Not a raw field dump: the provider / model / key / base cluster is rendered in
+    Anton's on-disk vocabulary via the SAME resolution the server's own
+    ``build_llm_client`` uses (``resolved_*`` + ``provider_base_url`` +
+    ``provider_api_key``). So a DB ``gemini`` provider exports as
+    ``openai-compatible`` + Google's base URL + the key in the OpenAI slot — the
+    shape the standalone CLI (and ``anton setup``) understands — instead of the
+    literal ``provider=gemini`` the pinned CLI rejects (ENG-1127 review). Each
+    role's provider is written WITH its resolved model so the pair is always
+    valid; a role whose resolved provider has no key exports nothing, so an
+    unconfigured or freshly-cleared install leaves the CLI on its own defaults.
+
+    The remaining settings (memory flags, publish URL) have no cross-field
+    resolution and export by a straight present-gated alias.
     """
     out: dict[str, str] = {}
-    for db_key, env_var in SETTING_ENV_ALIASES.items():
+
+    roles = (
+        ("ANTON_PLANNING_PROVIDER", "ANTON_PLANNING_MODEL",
+         settings.resolved_planning_provider, settings.resolved_planning_model),
+        ("ANTON_CODING_PROVIDER", "ANTON_CODING_MODEL",
+         settings.resolved_coding_provider, settings.resolved_coding_model),
+        ("ANTON_ROUTER_PROVIDER", "ANTON_ROUTER_MODEL",
+         settings.resolved_router_provider, settings.resolved_router_model),
+    )
+    creds_order: list[Provider] = []  # planning-first: wins the shared OpenAI slot
+    for prov_var, model_var, prov, model in roles:
+        if not provider_api_key_str(settings, prov):
+            continue  # resolved provider has no key — nothing runnable for this role
+        out[prov_var] = _anton_provider_name(prov)
+        if model:
+            out[model_var] = model
+        if prov not in creds_order:
+            creds_order.append(prov)
+    for prov in creds_order:
+        _emit_provider_creds(out, settings, prov)
+
+    for db_key, env_var in _OUTBOUND_FLAG_ALIASES.items():
         if db_key not in present_keys:
             continue
         value = getattr(settings, db_key, None)
-        if value is None:
-            continue
-        text = _env_str(value)
-        if text == "":
-            continue
-        if not _is_dotenv_safe(text):
-            # A newline-bearing value is a dotenv-injection vector, never a real
-            # key/URL — drop it rather than corrupt the file (best-effort export).
-            logger.warning("settings: refusing to export %s — value spans multiple lines", env_var)
-            continue
-        out[env_var] = text
-    return out
+        if value is not None:
+            text = _env_str(value)
+            if text:
+                out[env_var] = text
+
+    # One injection guard over everything emitted (keys, URLs, models, flags): a
+    # CR/LF-bearing value is a dotenv-injection vector, never a real setting.
+    safe: dict[str, str] = {}
+    for var, val in out.items():
+        if _is_dotenv_safe(val):
+            safe[var] = val
+        else:
+            logger.warning("settings: refusing to export %s — value spans multiple lines", var)
+    return safe
 
 
 def merge_env_lines(existing: str, managed: dict[str, str]) -> str:
