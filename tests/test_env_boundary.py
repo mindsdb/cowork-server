@@ -71,6 +71,42 @@ def test_merge_drops_cleared_managed_key():
     assert "COWORK_AUTH_TOKEN=tok" in merged
 
 
+# ── dotenv-injection guard (Finding 3) ─────────────────────────────────
+
+def test_merge_env_lines_rejects_crlf_injection():
+    # A CR/LF in a value must not become a second (unmanaged, surviving) line.
+    poisoned = "https://x\nDATABASE_URI=sqlite:///tmp/evil.db"
+    merged = merge_env_lines("", {"ANTON_MINDS_URL": poisoned, "ANTON_MINDS_API_KEY": "sk-ok"})
+    assert "DATABASE_URI" not in merged          # injected assignment dropped
+    assert "ANTON_MINDS_URL" not in merged        # the poisoned value is not smuggled
+    assert "ANTON_MINDS_API_KEY=sk-ok" in merged  # clean siblings still export
+    # every emitted line is a single well-formed assignment
+    assert all(ln.count("=") >= 1 for ln in merged.split("\n") if ln)
+
+
+def test_db_to_env_drops_newline_bearing_value(monkeypatch):
+    s = UserSettings()
+    monkeypatch.setattr(s, "minds_url", "https://x\nDATABASE_URI=sqlite:///evil.db", raising=False)
+    out = db_to_env(s, present_keys={"minds_url"})
+    assert "ANTON_MINDS_URL" not in out  # poisoned value refused, not exported
+
+
+def test_export_never_writes_injected_line_end_to_end(local_export):
+    # Full path: a poisoned DB value must never reach the CLI's .env as a 2nd line.
+    env_path = local_export
+    session = get_open_session()
+    try:
+        _cleanup(session, "minds_url", "minds_api_key")
+        svc = SettingService(session)
+        svc.save_all({"minds_api_key": "sk-clean", "minds_url": "https://h\nDATABASE_URI=x"})
+        text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        assert "DATABASE_URI" not in text
+        assert "ANTON_MINDS_API_KEY=sk-clean" in text  # the clean sibling still lands
+    finally:
+        _cleanup(session, "minds_url", "minds_api_key")
+        session.close()
+
+
 # ── SettingService integration ─────────────────────────────────────────
 
 @pytest.fixture

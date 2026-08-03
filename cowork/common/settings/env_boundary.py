@@ -28,6 +28,8 @@ from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
 
+logger = logging.getLogger(__name__)
+
 # DB setting key -> its ANTON_* .env variable, for every field that overlaps
 # between AntonSettings (.env) and UserSettings (DB). Single canonical map (was
 # hand-maintained in two places that drifted — ENG-1125).
@@ -110,6 +112,19 @@ def _env_str(value: object) -> str:
     return str(value)
 
 
+def _is_dotenv_safe(value: str) -> bool:
+    """A value is safe to write as ``VAR=value`` only if it stays on one line.
+
+    A CR/LF in the value would terminate the assignment and turn the remainder
+    into a *new* line — e.g. ``minds_url = "https://x\\nDATABASE_URI=…"`` injects
+    an unmanaged ``DATABASE_URI`` that survives every later merge and is consumed
+    on the next CLI/server start. The exported fields (keys, URLs, providers,
+    booleans) never legitimately contain a newline, so we reject rather than
+    quote — a poisoned value is dropped, not smuggled into the file.
+    """
+    return "\n" not in value and "\r" not in value
+
+
 def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
     """The aliased settings that are actually STORED -> ``{ANTON_*: value}``.
 
@@ -127,6 +142,11 @@ def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
         text = _env_str(value)
         if text == "":
             continue
+        if not _is_dotenv_safe(text):
+            # A newline-bearing value is a dotenv-injection vector, never a real
+            # key/URL — drop it rather than corrupt the file (best-effort export).
+            logger.warning("settings: refusing to export %s — value spans multiple lines", env_var)
+            continue
         out[env_var] = text
     return out
 
@@ -138,14 +158,18 @@ def merge_env_lines(existing: str, managed: dict[str, str]) -> str:
     across identical states); unmanaged lines (auth token, CLI model pins,
     comments) keep their place. A managed key absent from ``managed`` loses its
     line — that is how a logout wipes credentials from the CLI's file too.
+
+    Newline-bearing managed values are skipped as a serialization invariant so a
+    single assignment can never expand into a second (injected) one, even if a
+    caller hands in an unsanitized dict.
     """
     drop = tuple(f"{var}=" for var in MANAGED_ENV_VARS)
     kept = [ln for ln in existing.split("\n") if ln and not ln.startswith(drop)]
-    kept.extend(f"{var}={value}" for var, value in managed.items())
+    kept.extend(
+        f"{var}={value}" for var, value in managed.items() if _is_dotenv_safe(value)
+    )
     return "\n".join(kept) + "\n"
 
-
-logger = logging.getLogger(__name__)
 
 # Transient Windows share-mode locks (the CLI or a version-skewed server holding
 # ``.env`` open, an AV scan, a delete-pending handle still closing) abort the
