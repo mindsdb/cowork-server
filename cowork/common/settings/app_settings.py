@@ -328,6 +328,14 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
+    minds_coding_model: str = Field(
+        default="",
+        description=(
+            "MindsHub model alias for the pod's coding calls (completion verifier + nested "
+            "scratchpad calls). The pod always runs on minds-cloud, so this must be a minds "
+            "alias the env serves. Empty = the minds-cloud coding default (CODING_MODEL_DEFAULTS)."
+        ),
+    )  # COWORK_TURN_MINDS_CODING_MODEL
 
 
 class AppSettings(Settings):
