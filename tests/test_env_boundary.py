@@ -3,11 +3,14 @@
 Pure derivation plus the SettingService integration (local-tenancy-only,
 preserves unmanaged lines, migration never re-exports).
 """
+import errno
+import os
 from types import SimpleNamespace
 
 import pytest
 
 import cowork.services.settings as settings_mod
+from cowork.common.settings import env_boundary as eb
 from cowork.common.settings.env_boundary import db_to_env, merge_env_lines
 from cowork.common.settings.user_settings import UserSettings
 from cowork.db.session import get_open_session
@@ -216,3 +219,65 @@ def test_export_serializes_concurrent_writers(local_export, monkeypatch):
         t.join()
 
     assert state["max"] == 1
+
+
+# ── atomic_write_env: Windows share-mode lock hardening (ENG-1209/ENG-1127) ──
+
+def test_atomic_write_env_retries_transient_lock(tmp_path, monkeypatch):
+    # The CLI (or a version-skewed server) holding .env open EPERM'd the rename on
+    # Windows (ENG-1209). Now that the server writes it, the rename must retry.
+    dest = tmp_path / ".env"
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(errno.EACCES, "share-mode lock")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(eb.os, "replace", flaky_replace)
+    monkeypatch.setattr(eb.time, "sleep", lambda *_: None)  # no real backoff in tests
+
+    eb.atomic_write_env(dest, "ANTON_MINDS_URL=https://m\n")
+
+    assert calls["n"] == 3  # two transient failures, third lands
+    assert dest.read_text(encoding="utf-8") == "ANTON_MINDS_URL=https://m\n"
+    assert list(tmp_path.glob(".env.*.tmp")) == []  # temp consumed by the rename
+
+
+def test_atomic_write_env_rethrows_non_transient_and_cleans_temp(tmp_path, monkeypatch):
+    # A non-lock error (ENOENT, unwritable target, …) must fail fast, not burn the
+    # retry budget, and must never leave the plaintext-key temp behind.
+    dest = tmp_path / ".env"
+    calls = {"n": 0}
+
+    def broken_replace(src, dst):
+        calls["n"] += 1
+        raise OSError(errno.ENOENT, "gone")
+
+    monkeypatch.setattr(eb.os, "replace", broken_replace)
+    monkeypatch.setattr(eb.time, "sleep", lambda *_: None)
+
+    with pytest.raises(OSError):
+        eb.atomic_write_env(dest, "x\n")
+
+    assert calls["n"] == 1  # rethrown on the first attempt, no retry
+    assert not dest.exists()
+    assert list(tmp_path.glob(".env.*.tmp")) == []  # temp cleaned up on failure
+
+
+def test_atomic_write_env_sweeps_stale_temp_keeps_fresh(tmp_path):
+    # Orphaned temps hold the full plaintext key, so a stale one is reclaimed; a
+    # concurrent writer's fresh in-flight temp is spared.
+    stale = tmp_path / ".env.stale123.tmp"
+    stale.write_text("ANTON_MINDS_API_KEY=leaked\n", encoding="utf-8")
+    fresh = tmp_path / ".env.fresh456.tmp"
+    fresh.write_text("in-flight\n", encoding="utf-8")
+    old = os.stat(fresh).st_mtime - (eb._STALE_TMP_S + 60)
+    os.utime(stale, (old, old))
+
+    eb.atomic_write_env(tmp_path / ".env", "ANTON_MINDS_URL=https://m\n")
+
+    assert not stale.exists()  # orphaned plaintext-key temp reclaimed
+    assert fresh.exists()      # a live writer's temp is not yanked mid-rename
