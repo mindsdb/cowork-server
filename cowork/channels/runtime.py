@@ -419,9 +419,7 @@ class AntonChannelRuntime:
         _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
-        # Send time captured before the turn — persistence is deferred to the
-        # `finally` below, so this stamps `created_at` with the send time rather
-        # than the turn's end time (aligns with the agent's live-turn timestamp).
+        # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
 
         collected: list[str] = []

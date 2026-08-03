@@ -122,15 +122,7 @@ class ConversationService:
     def save_user_message(
         self, conversation_id: UUID, content, created_at: datetime | None = None
     ) -> Message:
-        """Persist a user message with the next monotonic `seq` (see _next_seq).
-
-        `created_at` overrides the DB `func.now()` default so the stored stamp
-        reflects when the message was SENT, not when it is persisted (persistence
-        is deferred to the end of the turn). Passing the turn's start time keeps
-        the history stamp aligned with the live-turn stamp the agent already
-        embeds (see anton `_stamp_user_content`). `None` falls back to the DB
-        default.
-        """
+        """Persist a user message with the next monotonic `seq` (see _next_seq)."""
         message = Message(
             conversation_id=conversation_id,
             role="user",
