@@ -265,6 +265,60 @@ def _keyed_unique_providers(settings: UserSettings) -> list[Provider]:
     return unique
 
 
+# Provider names (as written to ANTON_*_PROVIDER) that MUST ship an
+# ANTON_OPENAI_BASE_URL. Without it, Anton's OpenAIProvider defaults to
+# https://api.openai.com/v1/ and would send a Minds/custom key to OpenAI
+# (ENG-1127 review). anthropic/openai are safe with no base — their SDK default
+# host is the correct one.
+_BASE_REQUIRED_PROVIDERS = frozenset({"openai-compatible", "minds-cloud"})
+
+
+def _provider_cluster(settings: UserSettings) -> dict[str, str] | None:
+    """The ANTON_* provider/model/key/base cluster to export, validated ATOMICALLY.
+
+    Returns ``{}`` when nothing is configured (cleared — the caller reconciles the
+    cluster away), the full cluster when it's faithfully representable for the CLI,
+    or ``None`` when it is NOT — the caller then PRESERVES the existing ``.env``
+    cluster instead of writing a partial/misrouting one. Unrepresentable means: the
+    roles don't fit Anton's single OpenAI slot; a base-requiring provider has no
+    base (else the key leaks to api.openai.com); or any value isn't dotenv-safe.
+    Validated as a UNIT — never field-by-field — because a provider+key without its
+    base is worse than exporting nothing (ENG-1127 review).
+    """
+    unique = _keyed_unique_providers(settings)
+    if not unique:
+        return {}  # nothing configured / cleared — safe to reconcile the cluster away
+    if not _env_representable(settings, unique):
+        return None
+
+    roles = (
+        ("ANTON_PLANNING_PROVIDER", "ANTON_PLANNING_MODEL",
+         settings.resolved_planning_provider, settings.resolved_planning_model),
+        ("ANTON_CODING_PROVIDER", "ANTON_CODING_MODEL",
+         settings.resolved_coding_provider, settings.resolved_coding_model),
+        ("ANTON_ROUTER_PROVIDER", "ANTON_ROUTER_MODEL",
+         settings.resolved_router_provider, settings.resolved_router_model),
+    )
+    cluster: dict[str, str] = {}
+    for prov_var, model_var, prov, model in roles:
+        if not provider_api_key_str(settings, prov):
+            continue  # resolved provider has no key → nothing runnable for this role
+        cluster[prov_var] = _anton_provider_name(prov)
+        if model:
+            cluster[model_var] = model
+    for prov in unique:
+        _emit_provider_creds(cluster, settings, prov)
+
+    needs_base = any(
+        v in _BASE_REQUIRED_PROVIDERS for k, v in cluster.items() if k.endswith("_PROVIDER")
+    )
+    if needs_base and not cluster.get("ANTON_OPENAI_BASE_URL"):
+        return None  # would default to api.openai.com and leak the key
+    if any(not _is_dotenv_safe(v) for v in cluster.values()):
+        return None  # a poisoned value taints the whole cluster
+    return cluster
+
+
 def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
     """A loaded ``UserSettings`` -> the ``{ANTON_*: value}`` the CLI can RUN.
 
@@ -289,53 +343,33 @@ def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
     """
     out: dict[str, str] = {}
 
-    roles = (
-        ("ANTON_PLANNING_PROVIDER", "ANTON_PLANNING_MODEL",
-         settings.resolved_planning_provider, settings.resolved_planning_model),
-        ("ANTON_CODING_PROVIDER", "ANTON_CODING_MODEL",
-         settings.resolved_coding_provider, settings.resolved_coding_model),
-        ("ANTON_ROUTER_PROVIDER", "ANTON_ROUTER_MODEL",
-         settings.resolved_router_provider, settings.resolved_router_model),
-    )
-    unique_providers = _keyed_unique_providers(settings)
-
-    if _env_representable(settings, unique_providers):
-        for prov_var, model_var, prov, model in roles:
-            if not provider_api_key_str(settings, prov):
-                continue  # resolved provider has no key → nothing runnable for this role
-            out[prov_var] = _anton_provider_name(prov)
-            if model:
-                out[model_var] = model
-        for prov in unique_providers:
-            _emit_provider_creds(out, settings, prov)
-    elif unique_providers:
-        # The provider cluster is NOT written; env_reconcile_vars keeps it out of
-        # the merge's drop-set too, so a previously-valid CLI config is preserved
-        # rather than wiped (ENG-1127 review).
+    cluster = _provider_cluster(settings)
+    if cluster is None:
+        # Not representable: leave the cluster out entirely. env_reconcile_vars
+        # also keeps it out of the merge's drop-set, so a previously-valid CLI
+        # config is preserved rather than wiped (ENG-1127 review).
         logger.warning(
-            "settings: not exporting the .env provider cluster — roles resolve to providers "
-            "the standalone CLI cannot represent together (%s); preserving the CLI's existing config",
-            ", ".join(p.value for p in unique_providers),
+            "settings: not exporting the .env provider cluster — the resolved config can't be "
+            "faithfully represented for the standalone CLI; preserving its existing config"
         )
+    else:
+        out.update(cluster)  # {} when nothing is configured
 
+    # Flags have no cross-field dependency, so they export (and CR/LF-guard) per
+    # field — dropping one can't misconfigure the others.
     for db_key, env_var in _OUTBOUND_FLAG_ALIASES.items():
         if db_key not in present_keys:
             continue
         value = getattr(settings, db_key, None)
-        if value is not None:
-            text = _env_str(value)
-            if text:
-                out[env_var] = text
+        if value is None:
+            continue
+        text = _env_str(value)
+        if text and _is_dotenv_safe(text):
+            out[env_var] = text
+        elif text:
+            logger.warning("settings: refusing to export %s — value spans multiple lines", env_var)
 
-    # One injection guard over everything emitted (keys, URLs, models, flags): a
-    # CR/LF-bearing value is a dotenv-injection vector, never a real setting.
-    safe: dict[str, str] = {}
-    for var, val in out.items():
-        if _is_dotenv_safe(val):
-            safe[var] = val
-        else:
-            logger.warning("settings: refusing to export %s — value spans multiple lines", var)
-    return safe
+    return out
 
 
 def env_reconcile_vars(settings: UserSettings) -> tuple[str, ...]:
@@ -344,11 +378,12 @@ def env_reconcile_vars(settings: UserSettings) -> tuple[str, ...]:
     When the provider config can't be represented for the CLI, only the flag vars
     reconcile — the provider/model/key/base cluster is PRESERVED so an
     unrepresentable save doesn't wipe a previously-valid CLI config. A genuinely
-    cleared config (no keys anywhere) is representable, so its cluster still
-    reconciles away — that is how a logout still wipes the CLI's credentials
-    (ENG-1127 review).
+    cleared config (no keys anywhere) yields an empty cluster (not ``None``), so it
+    still reconciles away — that is how a logout still wipes the CLI's credentials
+    (ENG-1127 review). Keyed off the exact same ``_provider_cluster`` decision the
+    export uses, so "wrote nothing" and "preserve" never disagree.
     """
-    if _env_representable(settings, _keyed_unique_providers(settings)):
+    if _provider_cluster(settings) is not None:
         return MANAGED_ENV_VARS
     return _FLAG_ENV_VARS
 

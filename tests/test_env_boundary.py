@@ -124,6 +124,37 @@ def test_router_only_minds_exports_explicit_openai_slot_and_round_trips():
     assert isinstance(client.router_provider, OpenAIProvider)
 
 
+def test_db_to_env_drops_cluster_when_openai_compatible_has_no_base():
+    # An openai-compatible provider with no base would make Anton default to
+    # api.openai.com and leak the key. The cluster is withheld atomically rather
+    # than exporting provider+key without the base (ENG-1127 review).
+    s = UserSettings(openai_compatible_api_key="sk-oc",
+                     planning_provider="openai_compatible", coding_provider="openai_compatible")
+    out = db_to_env(s, {"openai_compatible_api_key", "planning_provider", "coding_provider"})
+    assert not any(k.startswith("ANTON_OPENAI") or k.endswith("_PROVIDER") for k in out)
+    # With a base present, the same config exports cleanly.
+    s2 = UserSettings(openai_compatible_api_key="sk-oc", openai_base_url="https://my.host/v1",
+                      planning_provider="openai_compatible", coding_provider="openai_compatible")
+    out2 = db_to_env(s2, {"openai_compatible_api_key", "openai_base_url",
+                          "planning_provider", "coding_provider"})
+    assert out2["ANTON_OPENAI_BASE_URL"] == "https://my.host/v1"
+    assert out2["ANTON_OPENAI_API_KEY"] == "sk-oc"
+
+
+def test_db_to_env_pairs_router_with_its_own_providers_model():
+    # coding=Anthropic + router=OpenAI, no stored router model: the router default
+    # must come from router_provider (an OpenAI model), not coding_provider — else
+    # the CLI gets ANTON_ROUTER_PROVIDER=openai with a Claude model and fails when
+    # the router runs (ENG-1127 review).
+    s = UserSettings(anthropic_api_key="sk-an", openai_api_key="sk-oa",
+                     planning_provider="anthropic", coding_provider="anthropic", router_provider="openai")
+    out = db_to_env(s, {"anthropic_api_key", "openai_api_key",
+                        "planning_provider", "coding_provider", "router_provider"})
+    assert out["ANTON_ROUTER_PROVIDER"] == "openai"
+    assert "claude" not in out["ANTON_ROUTER_MODEL"].lower()  # not the coding (Anthropic) model
+    assert _anton_roundtrip(out).router_provider is not None   # pinned CLI builds it
+
+
 def test_db_to_env_exports_nothing_when_unconfigured():
     # No key anywhere → no provider/model/creds; flags export only when stored.
     assert db_to_env(UserSettings(), present_keys=set()) == {}
@@ -175,18 +206,19 @@ def test_merge_env_lines_rejects_crlf_injection():
     assert all(ln.count("=") >= 1 for ln in merged.split("\n") if ln)
 
 
-def test_db_to_env_drops_newline_bearing_value(monkeypatch):
-    # A minds-cloud user so minds_url is genuinely part of the export, then poison
-    # it — the injection guard (not a missing key) is what must drop it.
+def test_db_to_env_drops_whole_cluster_on_newline_bearing_value(monkeypatch):
+    # A poisoned value taints the WHOLE provider cluster atomically — a provider+key
+    # without its (dropped) base is worse than no export (ENG-1127 review). So even
+    # the clean sibling key is withheld, not just the poisoned URL.
     s = UserSettings(minds_api_key="sk-minds", planning_provider="minds_cloud")
     monkeypatch.setattr(s, "minds_url", "https://x\nDATABASE_URI=sqlite:///evil.db", raising=False)
     out = db_to_env(s, present_keys={"minds_api_key", "planning_provider"})
-    assert "ANTON_MINDS_API_KEY" in out    # the clean sibling still exports
-    assert "ANTON_MINDS_URL" not in out    # poisoned value refused by the guard
+    assert not any(k.startswith("ANTON_MINDS") or k.startswith("ANTON_OPENAI") for k in out)
 
 
 def test_export_never_writes_injected_line_end_to_end(local_export):
-    # Full path: a poisoned DB value must never reach the CLI's .env as a 2nd line.
+    # Full path: a poisoned DB value must never reach the CLI's .env — the cluster
+    # is withheld atomically, so no injected line and no partial cluster land.
     env_path = local_export
     session = get_open_session()
     try:
@@ -195,7 +227,7 @@ def test_export_never_writes_injected_line_end_to_end(local_export):
         svc.save_all({"minds_api_key": "sk-clean", "minds_url": "https://h\nDATABASE_URI=x"})
         text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
         assert "DATABASE_URI" not in text
-        assert "ANTON_MINDS_API_KEY=sk-clean" in text  # the clean sibling still lands
+        assert "ANTON_MINDS_API_KEY" not in text  # whole cluster withheld, not a partial one
     finally:
         _cleanup(session, "minds_url", "minds_api_key")
         session.close()
