@@ -143,6 +143,16 @@ class TestBuildTraceMetadata:
         build_trace_metadata(base)
         assert base == {"harness": "anton"}
 
+    def test_a_broken_stamp_never_fails_the_turn(self, monkeypatch):
+        # Telemetry on the hot path: an unattributable turn is acceptable, a
+        # failed turn is not. Anything unexpected degrades to the base dict.
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("dist metadata exploded")
+
+        monkeypatch.setattr(build_info, "_dist_version", _boom)
+        monkeypatch.setattr(build_info, "install_channel", _boom)
+        assert build_trace_metadata({"harness": "anton"}) == {"harness": "anton"}
+
     def test_real_process_reports_its_own_versions(self):
         # No monkeypatching: proves the keys resolve against real installed
         # metadata in the test environment (cowork-server + anton are both

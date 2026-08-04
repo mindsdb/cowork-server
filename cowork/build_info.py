@@ -112,11 +112,19 @@ def build_trace_metadata(base: dict[str, str] | None = None) -> dict[str, str]:
     that change — the exact delivery lag this ticket exists for.
     """
     merged = dict(base or {})
-    server_version = _dist_version(_SERVER_DIST)
-    anton_version = _dist_version(_ANTON_DIST)
-    if server_version:
-        merged[KEY_SERVER_VERSION] = server_version
-    if anton_version:
-        merged[KEY_ANTON_VERSION] = anton_version
-    merged[KEY_INSTALL_CHANNEL] = install_channel()
+    # Belt for the hot path: this runs on every turn (API, channel bot,
+    # scheduled run) purely for observability. Nothing inside is expected to
+    # raise — the pieces have their own handlers — but an unattributable turn
+    # is a far better failure than a failed turn, so a surprise here degrades
+    # to "no build stamp" instead of 500-ing a user's message.
+    try:
+        server_version = _dist_version(_SERVER_DIST)
+        anton_version = _dist_version(_ANTON_DIST)
+        if server_version:
+            merged[KEY_SERVER_VERSION] = server_version
+        if anton_version:
+            merged[KEY_ANTON_VERSION] = anton_version
+        merged[KEY_INSTALL_CHANNEL] = install_channel()
+    except Exception:  # pragma: no cover - exercised by the degradation test
+        logger.warning("build_info: could not stamp the build on this turn", exc_info=True)
     return merged
