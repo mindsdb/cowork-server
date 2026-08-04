@@ -96,10 +96,15 @@ class FileService:
 
     async def create_file(self, upload: UploadFile, purpose: str) -> FileResponse:
         contents = await upload.read()
-        filename = upload.filename or "upload"
+        # Untrusted filename: keep the basename only so `../` or an absolute
+        # path can't escape the per-file dir. `.name` also leaves bare "."/".." —
+        # reject those.
+        safe_name = Path(upload.filename or "upload").name.strip()
+        if safe_name in ("", ".", ".."):
+            safe_name = "upload"
 
         file = File(
-            filename=filename,
+            filename=safe_name,
             content_type=upload.content_type or "application/octet-stream",
             size=len(contents),
             purpose=purpose,
@@ -111,7 +116,7 @@ class FileService:
         file_dir = self._root_dir() / str(file.id)
         try:
             file_dir.mkdir(parents=True)
-            dest = file_dir / filename
+            dest = file_dir / safe_name
             dest.write_bytes(contents)
         except Exception:
             self.session.rollback()
@@ -159,7 +164,9 @@ class FileService:
         file = self.session.get(File, file_id)
         if file is None:
             return False
-        file_dir = Path(file.path).parent
+        # Dir from the file id, not the stored path — a legacy row could hold an
+        # escaped path, and rmtree-ing its parent would delete an arbitrary dir.
+        file_dir = self._root_dir() / str(file.id)
         self.session.delete(file)
         self.session.commit()
         unlink_file_dirs([file_dir])
@@ -179,7 +186,10 @@ class FileService:
         `unlink_file_dirs` AFTER committing.
         """
         rows = list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
-        dirs = [Path(f.path).parent for f in rows if f.path]
+        # Dir from the file id, not the stored path (see delete_file): a legacy
+        # row could hold an escaped path, and rmtree-ing its parent would delete
+        # an arbitrary directory.
+        dirs = [self._root_dir() / str(f.id) for f in rows]
         for f in rows:
             self.session.delete(f)
         return dirs
