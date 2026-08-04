@@ -183,6 +183,11 @@ async def format_responses_stream(
 
     tool_json_parts: dict[str, list[str]] = {}
     tool_names: dict[str, str] = {}
+    # Tool-use ids that have emitted at least one tool_progress phase —
+    # only these get closed via thought.tool_call.end when their tool_done
+    # arrives. Every other generic tool keeps falling through to the plain
+    # thought.progress role, unchanged.
+    progress_tool_ids: set[str] = set()
 
     resp = Response(id=resp_id, model=model, status=ResponseStatus.created)
     seq += 1
@@ -236,7 +241,12 @@ async def format_responses_stream(
                 tool_json_parts[event.id].append(event.json_delta)
 
         elif isinstance(event, StreamToolUseEnd):
-            name = tool_names.pop(event.id, "")
+            # NOT popped here (was: tool_names.pop(...)) — tool_progress and
+            # tool_done for this id arrive strictly AFTER StreamToolUseEnd in
+            # the real event order (the LLM stream fully proliferates
+            # start/end before anton dispatches the tool), so the name must
+            # stay available until tool_done finally pops it below.
+            name = tool_names.get(event.id, "")
             parts = tool_json_parts.pop(event.id, [])
             accumulated = "".join(parts)
             if "scratchpad" in name:
@@ -287,24 +297,75 @@ async def format_responses_stream(
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
             is_scratchpad_phase = phase_str in ("scratchpad_start", "scratchpad_done")
-            now = time.time()
-            should_emit = is_scratchpad_phase or (now - last_progress >= PROGRESS_THROTTLE)
-            if should_emit:
-                if not is_scratchpad_phase:
-                    last_progress = now
-                label = PHASE_LABELS.get(event.phase, event.phase)
-                msg = f"{label}: {event.message}" if event.message else label
-                seq += 1
-                yield _event("response.in_progress", {
-                    "type": "response.in_progress",
-                    "sequence_number": seq,
-                    "thought_role": Role.thought_progress.value,
-                    "content": msg,
-                    "phase": event.phase,
-                    "message": event.message,
-                    "eta_seconds": getattr(event, "eta_seconds", None),
-                    "tool_use_id": getattr(event, "id", None) or "",
-                })
+            is_tool_progress = phase_str == "tool_progress"
+            is_tool_done = phase_str == "tool_done" and event.id in progress_tool_ids
+
+            if is_tool_progress and not event.id:
+                # Can't correlate to a step at all — drop it before it
+                # touches progress_tool_ids or spends the throttle window
+                # on nothing.
+                pass
+            else:
+                # First tool_progress for a given id must never be dropped
+                # by throttling — losing it would mean the lazily-created
+                # step in the renderer is never created, and a later
+                # tool_done for the same id would then have nothing to
+                # close (thought.tool_call.end on the frontend is a no-op
+                # when there's no matching step).
+                is_first_progress_for_id = is_tool_progress and event.id not in progress_tool_ids
+                if is_tool_progress:
+                    progress_tool_ids.add(event.id)
+
+                # tool_done is never throttled for the same reason
+                # scratchpad_done isn't — it's the ONLY event that closes a
+                # tool-progress step, and it's yielded right after the last
+                # tool_progress (well within one PROGRESS_THROTTLE window).
+                never_throttle = is_scratchpad_phase or is_tool_done or is_first_progress_for_id
+                now = time.time()
+                should_emit = never_throttle or (now - last_progress >= PROGRESS_THROTTLE)
+
+                if should_emit:
+                    if not never_throttle:
+                        last_progress = now
+                    seq += 1
+                    if is_tool_progress:
+                        yield _event("response.in_progress", {
+                            "type": "response.in_progress",
+                            "sequence_number": seq,
+                            "thought_role": Role.thought_tool_call_progress.value,
+                            "content": event.message or "",
+                            "tool_name": tool_names.get(event.id, ""),
+                            "tool_use_id": event.id or "",
+                        })
+                    elif is_tool_done:
+                        yield _event("response.in_progress", {
+                            "type": "response.in_progress",
+                            "sequence_number": seq,
+                            "thought_role": Role.thought_tool_call_end.value,
+                            "tool_use_id": event.id,
+                            # Real measured duration from anton — without
+                            # it, the frontend can only measure from the
+                            # first tool_progress (the step is created
+                            # lazily), undercounting time spent before the
+                            # first progress line. Same field scratchpad
+                            # already relies on for executionDurationMs.
+                            "eta_seconds": getattr(event, "eta_seconds", None),
+                        })
+                        progress_tool_ids.discard(event.id)
+                        tool_names.pop(event.id, None)
+                    else:
+                        label = PHASE_LABELS.get(event.phase, event.phase)
+                        msg = f"{label}: {event.message}" if event.message else label
+                        yield _event("response.in_progress", {
+                            "type": "response.in_progress",
+                            "sequence_number": seq,
+                            "thought_role": Role.thought_progress.value,
+                            "content": msg,
+                            "phase": event.phase,
+                            "message": event.message,
+                            "eta_seconds": getattr(event, "eta_seconds", None),
+                            "tool_use_id": getattr(event, "id", None) or "",
+                        })
 
         elif isinstance(event, StreamReasoningDelta):
             # The model's own reasoning text — NOT part of the final answer.
