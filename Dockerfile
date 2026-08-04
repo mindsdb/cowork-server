@@ -34,14 +34,25 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Final: slim runtime with just the venv + source.
 FROM python:3.12-slim AS final
 
+# Non-root: this image runs in per-PR dev environments (see
+# .github/workflows/build-deploy.yml) and is a candidate for staging/prod via
+# Helm. A real home dir matters, not just a UID — cowork/common/paths.py
+# defaults all app state (db, uploads, memory, connector vault) under
+# Path.home()/".cowork", so the user needs a writable HOME for that to work.
+RUN groupadd --system app \
+    && useradd --system --create-home --home-dir /home/app --gid app --shell /usr/sbin/nologin app
+
 WORKDIR /app
 
-COPY --from=builder /app /app
+COPY --from=builder --chown=app:app /app /app
 
 # Put the venv on PATH; run the app directly from it.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/app
+
+USER app
 
 EXPOSE 9010
 

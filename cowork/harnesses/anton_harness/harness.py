@@ -516,6 +516,10 @@ class AntonHarness:
             "coding_provider", "coding_model",
             "memory_enabled", "memory_mode",
             "episodic_memory", "proactive_dashboards", "act_first",
+            # Non-nullable ints with defaults — unlike the entries above,
+            # db_val is never None here, so these ALWAYS override anton's own
+            # 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
+            "max_tool_rounds", "max_continuations",
         ):
             db_val = getattr(user, attr, None)
             if db_val is None:
