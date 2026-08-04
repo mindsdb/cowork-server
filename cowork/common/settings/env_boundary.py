@@ -158,6 +158,11 @@ _OUTBOUND_FLAG_ALIASES: dict[str, str] = {
     "publish_url": "ANTON_PUBLISH_URL",
 }
 
+# The flag vars vs the provider/model/key/base cluster within MANAGED_ENV_VARS.
+# The cluster is preserved as a group when a config can't be represented for the
+# CLI, so an unrepresentable save doesn't wipe a valid config — see env_reconcile_vars.
+_FLAG_ENV_VARS: tuple[str, ...] = tuple(_OUTBOUND_FLAG_ALIASES.values())
+
 
 def _anton_provider_name(p: Provider) -> str:
     """A cowork ``Provider`` -> the provider name Anton understands ON DISK.
@@ -173,15 +178,23 @@ def _anton_provider_name(p: Provider) -> str:
 def _openai_slot_demand(settings: UserSettings, p: Provider) -> tuple[str, str | None] | None:
     """The ``(key, base)`` a provider needs in Anton's shared OpenAI slot.
 
-    ``None`` for providers that don't touch that slot (anthropic uses its own
-    key slot; minds-cloud uses the dedicated ``minds_*`` slots and derives the
-    OpenAI creds in ``model_post_init``). openai / openai-compatible / gemini all
-    ride ``ANTON_OPENAI_API_KEY`` / ``ANTON_OPENAI_BASE_URL``, so their demands
-    must AGREE for a config to be representable — see ``_env_representable``.
+    ``None`` only for anthropic, which uses its own dedicated key slot. Everything
+    else — openai / openai-compatible / gemini AND minds-cloud — runs through
+    Anton's single ``ANTON_OPENAI_API_KEY`` / ``ANTON_OPENAI_BASE_URL`` pair, so
+    their demands must AGREE for a config to be representable (see
+    ``_env_representable``). minds-cloud is included because we export its OpenAI
+    slot EXPLICITLY rather than trust Anton's ``model_post_init`` derivation, which
+    only fires for a planning/coding openai-compatible role, never router-only
+    (ENG-1127 review).
     """
-    if p in (Provider.ANTHROPIC, Provider.MINDS_CLOUD):
+    if p is Provider.ANTHROPIC:
         return None
-    from cowork.services.providers import provider_base_url  # lazy: avoid import cycle
+    from cowork.services.providers import minds_chat_base_url, provider_base_url  # lazy: avoid cycle
+    if p is Provider.MINDS_CLOUD:
+        return (
+            provider_api_key_str(settings, p),
+            minds_chat_base_url(settings.minds_url) if settings.minds_url else None,
+        )
     return (
         provider_api_key_str(settings, p),
         provider_base_url(p.ui_value, openai_base_url=settings.openai_base_url or ""),
@@ -192,42 +205,64 @@ def _env_representable(settings: UserSettings, providers: list[Provider]) -> boo
     """Whether the resolved per-role ``providers`` fit Anton's on-disk model.
 
     Anton has ONE global ``ANTON_OPENAI_API_KEY`` / ``ANTON_OPENAI_BASE_URL`` pair,
-    handed to BOTH its openai and openai-compatible factories, and its minds
-    derivation only fires when that OpenAI key is unset. So a config is
-    representable only when every OpenAI-slot role agrees on the same ``(key,
-    base)`` AND minds-cloud never coexists with an explicit OpenAI-slot role
-    (planning=OpenAI + coding=Gemini, or MindsHub + OpenAI, otherwise silently
-    misroute one role's key to the other's endpoint — ENG-1127 review).
+    handed to BOTH its openai and openai-compatible factories (and minds-cloud maps
+    to openai-compatible). So a config is representable only when every provider
+    that rides that shared slot agrees on the same ``(key, base)`` — e.g.
+    planning=OpenAI + coding=Gemini, or MindsHub + OpenAI, cannot be represented
+    and would silently misroute one role's key to the other's endpoint (ENG-1127
+    review). anthropic uses an independent slot, so it never conflicts.
     """
     openai_demands = {d for p in providers if (d := _openai_slot_demand(settings, p)) is not None}
-    minds_present = Provider.MINDS_CLOUD in providers
-    return len(openai_demands) <= 1 and not (minds_present and openai_demands)
+    return len(openai_demands) <= 1
 
 
 def _emit_provider_creds(out: dict[str, str], settings: UserSettings, p: Provider) -> None:
     """Write ``p``'s API key (and base URL) into the ANTON_* slots the CLI reads.
 
     Only called for a representable set (see ``_env_representable``), so the
-    OpenAI slot is never contended; minds-cloud uses the dedicated ``minds_*``
-    slots and derives its base from them.
+    shared OpenAI slot is never contended.
     """
-    from cowork.services.providers import provider_base_url  # lazy: avoid import cycle
+    from cowork.services.providers import minds_chat_base_url, provider_base_url  # lazy: avoid cycle
 
     key = provider_api_key_str(settings, p)
     if p is Provider.ANTHROPIC:
         if key:
             out["ANTON_ANTHROPIC_API_KEY"] = key
     elif p is Provider.MINDS_CLOUD:
+        # Minds runs as openai-compatible. Export the OpenAI slot EXPLICITLY —
+        # Anton's model_post_init only derives it for a planning/coding oc role,
+        # so a router-only Minds role would otherwise build with no key/base
+        # (ENG-1127 review). Keep the minds_* slots too for Anton's other minds
+        # features (datasources, etc.).
         if key:
             out["ANTON_MINDS_API_KEY"] = key
+            out["ANTON_OPENAI_API_KEY"] = key
         if settings.minds_url:
             out["ANTON_MINDS_URL"] = settings.minds_url
+            base = minds_chat_base_url(settings.minds_url)
+            if base:
+                out["ANTON_OPENAI_BASE_URL"] = base
     else:  # OPENAI / OPENAI_COMPATIBLE / GEMINI — all via the OpenAI slot
         if key:
             out["ANTON_OPENAI_API_KEY"] = key
         base = provider_base_url(p.ui_value, openai_base_url=settings.openai_base_url or "")
         if base:
             out["ANTON_OPENAI_BASE_URL"] = base
+
+
+def _keyed_unique_providers(settings: UserSettings) -> list[Provider]:
+    """The resolved planning/coding/router providers that have a key, deduped and
+    planning-first. The unit both the export and the reconcile decision reason over.
+    """
+    unique: list[Provider] = []
+    for p in (
+        settings.resolved_planning_provider,
+        settings.resolved_coding_provider,
+        settings.resolved_router_provider,
+    ):
+        if provider_api_key_str(settings, p) and p not in unique:
+            unique.append(p)
+    return unique
 
 
 def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
@@ -262,27 +297,24 @@ def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
         ("ANTON_ROUTER_PROVIDER", "ANTON_ROUTER_MODEL",
          settings.resolved_router_provider, settings.resolved_router_model),
     )
-    keyed_roles = [
-        (prov_var, model_var, prov, model)
-        for prov_var, model_var, prov, model in roles
-        if provider_api_key_str(settings, prov)  # resolved provider has a key → runnable
-    ]
-    unique_providers: list[Provider] = []
-    for _, _, prov, _ in keyed_roles:
-        if prov not in unique_providers:
-            unique_providers.append(prov)  # planning-first order preserved
+    unique_providers = _keyed_unique_providers(settings)
 
     if _env_representable(settings, unique_providers):
-        for prov_var, model_var, prov, model in keyed_roles:
+        for prov_var, model_var, prov, model in roles:
+            if not provider_api_key_str(settings, prov):
+                continue  # resolved provider has no key → nothing runnable for this role
             out[prov_var] = _anton_provider_name(prov)
             if model:
                 out[model_var] = model
         for prov in unique_providers:
             _emit_provider_creds(out, settings, prov)
     elif unique_providers:
+        # The provider cluster is NOT written; env_reconcile_vars keeps it out of
+        # the merge's drop-set too, so a previously-valid CLI config is preserved
+        # rather than wiped (ENG-1127 review).
         logger.warning(
-            "settings: skipping .env provider export — roles resolve to providers the "
-            "standalone CLI cannot represent together (%s); leaving the CLI on its own config",
+            "settings: not exporting the .env provider cluster — roles resolve to providers "
+            "the standalone CLI cannot represent together (%s); preserving the CLI's existing config",
             ", ".join(p.value for p in unique_providers),
         )
 
@@ -306,19 +338,39 @@ def db_to_env(settings: UserSettings, present_keys: set[str]) -> dict[str, str]:
     return safe
 
 
-def merge_env_lines(existing: str, managed: dict[str, str]) -> str:
-    """Rewrite the managed lines in ``existing``, preserving everything else.
+def env_reconcile_vars(settings: UserSettings) -> tuple[str, ...]:
+    """The managed vars this export is authoritative for (drop-if-absent this run).
 
-    Managed ANTON_* lines are dropped then re-appended in alias order (byte-stable
-    across identical states); unmanaged lines (auth token, CLI model pins,
-    comments) keep their place. A managed key absent from ``managed`` loses its
-    line — that is how a logout wipes credentials from the CLI's file too.
+    When the provider config can't be represented for the CLI, only the flag vars
+    reconcile — the provider/model/key/base cluster is PRESERVED so an
+    unrepresentable save doesn't wipe a previously-valid CLI config. A genuinely
+    cleared config (no keys anywhere) is representable, so its cluster still
+    reconciles away — that is how a logout still wipes the CLI's credentials
+    (ENG-1127 review).
+    """
+    if _env_representable(settings, _keyed_unique_providers(settings)):
+        return MANAGED_ENV_VARS
+    return _FLAG_ENV_VARS
+
+
+def merge_env_lines(
+    existing: str, managed: dict[str, str], reconcile: tuple[str, ...] = MANAGED_ENV_VARS
+) -> str:
+    """Rewrite the ``reconcile`` vars in ``existing``, preserving everything else.
+
+    A var is dropped from ``existing`` if it's in ``reconcile`` (so a cleared key
+    loses its line) OR is being (re-)written from ``managed`` (so there's never a
+    duplicate); every other line — unmanaged (auth token, comments) AND any
+    managed var outside ``reconcile`` this run — keeps its place. Callers narrow
+    ``reconcile`` (via ``env_reconcile_vars``) to preserve the provider cluster
+    when the config can't be represented for the CLI.
 
     Newline-bearing managed values are skipped as a serialization invariant so a
     single assignment can never expand into a second (injected) one, even if a
     caller hands in an unsanitized dict.
     """
-    drop = tuple(f"{var}=" for var in MANAGED_ENV_VARS)
+    drop_vars = set(reconcile) | set(managed)
+    drop = tuple(f"{var}=" for var in drop_vars)
     kept = [ln for ln in existing.split("\n") if ln and not ln.startswith(drop)]
     kept.extend(
         f"{var}={value}" for var, value in managed.items() if _is_dotenv_safe(value)

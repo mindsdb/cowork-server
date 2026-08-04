@@ -13,6 +13,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.env_boundary import (
     atomic_write_env,
     db_to_env,
+    env_reconcile_vars,
     merge_env_lines,
 )
 from cowork.common.settings.user_settings import (
@@ -192,10 +193,11 @@ class SettingService:
             # state — no lost update between concurrent settings writes.
             with _env_export_lock:
                 rows = self._fetch_all_rows()
-                managed = db_to_env(self._load(rows), {row.key for row in rows})
+                settings = self._load(rows)
+                managed = db_to_env(settings, {row.key for row in rows})
                 path = cowork_home() / ".env"
                 existing = path.read_text(encoding="utf-8") if path.exists() else ""
-                content = merge_env_lines(existing, managed)
+                content = merge_env_lines(existing, managed, env_reconcile_vars(settings))
                 if content != existing:
                     atomic_write_env(path, content)
         except Exception as exc:  # noqa: BLE001 - export is best-effort

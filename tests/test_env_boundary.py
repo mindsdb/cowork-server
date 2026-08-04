@@ -84,6 +84,46 @@ def test_db_to_env_skips_unrepresentable_minds_plus_openai_mix():
     assert not any("PROVIDER" in k or "OPENAI" in k or "MINDS" in k for k in out)
 
 
+def _anton_roundtrip(env_dict):
+    """Feed a db_to_env export into the pinned Anton and build its client.
+
+    Returns the LLMClient (raises if Anton rejects the config). Restores os.environ.
+    """
+    from anton.config.settings import AntonSettings
+    from anton.core.llm.client import LLMClient
+
+    saved = {k: os.environ[k] for k in list(os.environ) if k.startswith("ANTON_")}
+    for k in list(os.environ):
+        if k.startswith("ANTON_"):
+            del os.environ[k]
+    os.environ.update(env_dict)
+    try:
+        return LLMClient.from_settings(AntonSettings())
+    finally:
+        for k in list(os.environ):
+            if k.startswith("ANTON_"):
+                del os.environ[k]
+        os.environ.update(saved)
+
+
+def test_router_only_minds_exports_explicit_openai_slot_and_round_trips():
+    # planning/coding=Anthropic, router=MindsHub. Anton's model_post_init derives
+    # the OpenAI slot ONLY for a planning/coding openai-compatible role, never
+    # router-only — so the export must write the router's OpenAI slot EXPLICITLY,
+    # or Anton builds the router with no key/base (ENG-1127 review).
+    from anton.core.llm.openai import OpenAIProvider
+
+    s = UserSettings(anthropic_api_key="sk-an", minds_api_key="sk-m", minds_url="https://api.mindshub.ai",
+                     planning_provider="anthropic", coding_provider="anthropic", router_provider="minds_cloud")
+    out = db_to_env(s, {"anthropic_api_key", "minds_api_key", "minds_url",
+                        "planning_provider", "coding_provider", "router_provider"})
+    assert out["ANTON_ROUTER_PROVIDER"] == "minds-cloud"
+    assert out["ANTON_OPENAI_API_KEY"] == "sk-m"     # minds key in the OpenAI slot, explicit
+    assert out["ANTON_OPENAI_BASE_URL"]              # minds base, explicit (not left to derivation)
+    client = _anton_roundtrip(out)                   # the pinned CLI accepts and builds it
+    assert isinstance(client.router_provider, OpenAIProvider)
+
+
 def test_db_to_env_exports_nothing_when_unconfigured():
     # No key anywhere → no provider/model/creds; flags export only when stored.
     assert db_to_env(UserSettings(), present_keys=set()) == {}
@@ -242,6 +282,35 @@ def test_clear_credentials_wipes_creds_and_orphaned_model_from_env(local_export)
         assert "COWORK_AUTH_TOKEN=keep" in text     # unmanaged line untouched
     finally:
         _cleanup(session, "minds_api_key", "minds_url", "planning_provider")
+        session.close()
+
+
+def test_unrepresentable_save_preserves_existing_cli_config(local_export):
+    # Start with a valid single-provider config in .env, then move the DB to a
+    # config Anton can't represent (minds + openai). The export must NOT wipe the
+    # working cluster — merge_env_lines only reconciles what env_reconcile_vars
+    # deems authoritative this run (ENG-1127 review); only a genuine clear wipes it.
+    env_path = local_export
+    keys = ("minds_api_key", "minds_url", "planning_provider", "coding_provider", "openai_api_key")
+    session = get_open_session()
+    try:
+        _cleanup(session, *keys)
+        svc = SettingService(session)
+        # 1) representable minds config -> a valid cluster is written.
+        svc.save_all({"minds_api_key": "sk-m", "minds_url": "https://api.mindshub.ai",
+                      "planning_provider": "minds_cloud", "coding_provider": "minds_cloud"})
+        first = env_path.read_text(encoding="utf-8")
+        assert "ANTON_MINDS_API_KEY=sk-m" in first
+        assert "ANTON_PLANNING_PROVIDER=minds-cloud" in first
+
+        # 2) move coding to OpenAI (its own key) -> minds+openai is unrepresentable.
+        svc.save_all({"openai_api_key": "sk-oa", "coding_provider": "openai"})
+        after = env_path.read_text(encoding="utf-8")
+        # The previously-valid cluster is preserved, not wiped.
+        assert "ANTON_MINDS_API_KEY=sk-m" in after
+        assert "ANTON_PLANNING_PROVIDER=minds-cloud" in after
+    finally:
+        _cleanup(session, *keys)
         session.close()
 
 
