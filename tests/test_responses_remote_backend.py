@@ -93,6 +93,7 @@ def _remote_handler(monkeypatch, saved):
 
         def save_user_message(self, conv_id, content, *, pending=False):
             saved["user"] = content
+            saved["user_pending"] = pending
 
         def finalize_pending(self, conv_id):
             saved["finalized"] = True
@@ -117,10 +118,11 @@ def _remote_handler(monkeypatch, saved):
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_finalizes_user_and_persists_assistant(monkeypatch):
-    # ENG-1231: the user message is persisted (pending) upstream in handle(); on
-    # terminal the producer finalizes it (rejoining LLM history) and persists the
-    # assistant turn. It no longer writes the user row itself.
+async def test_produce_remote_persists_pending_user_then_finalizes_and_saves_assistant(monkeypatch):
+    # ENG-1231: the producer persists the user message (pending) as its first
+    # action — inside the coroutine, so a registry-deduped duplicate start whose
+    # coroutine is discarded never writes a row — then on terminal finalizes the
+    # flag (rejoining LLM history) and persists the assistant turn.
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
 
@@ -136,8 +138,9 @@ async def test_produce_remote_finalizes_user_and_persists_assistant(monkeypatch)
         model="anton", harness_id="anton", buffer=object(),
     )
 
-    assert saved["finalized"] is True
-    assert "user" not in saved  # the producer no longer writes the user row
+    assert saved["user"] == "hi"
+    assert saved["user_pending"] is True   # persisted in-flight at producer start
+    assert saved["finalized"] is True      # flag cleared on terminal
     assert saved["assistant"] == "hello"
     assert saved["harness"] == "anton"
     assert saved["events"][-1] == {"type": "response.completed"}
@@ -161,6 +164,8 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
         model="anton", harness_id="anton", buffer=object(),
     )
 
+    assert saved["user"] == "hi"
+    assert saved["user_pending"] is True
     assert saved["finalized"] is True
     assert saved["assistant"] == "partial"
     # Persisted events mirror the streamed response.failed frame.

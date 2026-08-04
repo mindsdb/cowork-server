@@ -74,3 +74,16 @@ def test_non_pending_user_message_is_in_history_immediately(svc, conv):
     # The non-streaming / channels path persists without the flag.
     svc.save_user_message(conv.id, "hi", pending=False)
     assert len(svc.get_ordered_messages(conv.id)) == 1
+
+
+def test_finalize_before_empty_assistant_turn_still_finalizes(svc, conv):
+    # The producers call finalize_pending BEFORE save_assistant_turn. On an empty
+    # turn, save_assistant_turn early-returns (no text/events/tool_rows) and writes
+    # nothing — but the pending flag must already be cleared, so the question isn't
+    # stranded out of history.
+    svc.save_user_message(conv.id, "hello?", pending=True)
+    svc.finalize_pending(conv.id)
+    svc.save_assistant_turn(conv.id, "", [], tool_rows=None)  # early-returns, writes nothing
+
+    hist = svc.get_ordered_messages(conv.id)
+    assert [m.role for m in hist] == ["user"]  # user finalized; no assistant row written

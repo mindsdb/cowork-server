@@ -132,16 +132,14 @@ class ResponsesHandler:
             # tails the buffer. Closing the connection never reaches the
             # producer — only an explicit /cancel does.
             #
-            # Persist the user message NOW, marked pending (ENG-1231), so a refresh
-            # or reconnect mid-turn still shows the question via GET /items. It's
-            # committed on the request session before the producer starts, so a
-            # concurrent read sees it. The harness reads history through
-            # get_ordered_messages, which excludes pending rows, so the producer
-            # doesn't replay the current input as duplicate context — and the
-            # producer clears the flag (finalize_pending) when the turn ends.
-            ConversationService(self.scoped).save_user_message(
-                conversation.id, original_content, pending=True,
-            )
+            # The user message is persisted (pending) as the producer's FIRST
+            # action, not here (ENG-1231). registry.start() dedups a duplicate
+            # start for an already-in-flight conversation and discards the second
+            # producer coroutine unawaited — persisting here (before that dedup)
+            # would commit a pending row whose producer never runs and never
+            # finalizes, stranding it out of LLM history. Persisting inside the
+            # producer ties the write to the one coroutine that actually runs, so
+            # there is at most one pending row per conversation.
             buffer = new_buffer(str(conversation.id), turn_id)
             producer_coro = self._select_producer(
                 conv_id=conversation.id,
@@ -288,6 +286,14 @@ class ResponsesHandler:
                 logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
 
         try:
+            # Persist the user message (pending) as the first thing this producer
+            # does (ENG-1231) — see the note in handle(). Committed here, before
+            # streaming, so a refresh/reconnect mid-turn shows the question via
+            # /items. _remote_history reads get_ordered_messages, which excludes
+            # pending, so the current input isn't replayed into the remote job.
+            ConversationService(producer_session).save_user_message(
+                conv_id, original_content, pending=True,
+            )
             await produce_remote_turn(
                 conversation_id=str(conv_id),
                 org_id=self.scoped.scope.org_id,
@@ -337,10 +343,12 @@ class ResponsesHandler:
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
-        Runs in its OWN DB session (it outlives the request). Persistence is
-        deferred to the end so the harness reads history WITHOUT the current
-        user message; on terminal we persist user + assistant together.
-        Never reaches the HTTP response — readers tail the buffer.
+        Runs in its OWN DB session (it outlives the request). Persists the user
+        message (pending) as its first action so a mid-turn refresh shows the
+        question, reads history via get_ordered_messages (which excludes pending,
+        so the current input isn't double-fed), and on terminal finalizes the
+        pending flag + persists the assistant turn (ENG-1231). Never reaches the
+        HTTP response — readers tail the buffer.
         """
         # Fresh session (outlives the request), scoped from the immutable
         # principal captured at handler construction — never request state.
@@ -386,6 +394,13 @@ class ResponsesHandler:
 
         try:
             conv = ConversationService(producer_session).get_conversation(conv_id)
+            # Persist the user message (pending) as the first thing this producer
+            # does (ENG-1231) — see the note in handle(). The harness reads history
+            # via get_ordered_messages, which excludes pending, so this write isn't
+            # replayed into the turn as duplicate context.
+            ConversationService(producer_session).save_user_message(
+                conv_id, original_content, pending=True,
+            )
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,
