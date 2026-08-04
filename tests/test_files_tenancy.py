@@ -6,10 +6,12 @@ scope from the session (never derives one from the conversation row).
 """
 from __future__ import annotations
 
+import io
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from fastapi import UploadFile
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -240,3 +242,34 @@ def test_harness_works_in_local_mode(engine, monkeypatch):
     get_app_settings.cache_clear()
     _raw, conv = _conversation_with_file(engine, LOCAL_SCOPE)
     assert "doc.txt" in _conversation_attachment_context(conv)
+
+
+# ── upload safety: untrusted filename + size cap (not tenancy, but this is the
+# FileService test home and reuses `engine`/`_svc`) ──────────────────────────
+
+def _upload(name: str, data: bytes = b"x") -> UploadFile:
+    return UploadFile(file=io.BytesIO(data), filename=name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["../../../../etc/pwned", "/etc/cron.d/pwned", ".."])
+async def test_upload_filename_cannot_escape_root(engine, tmp_path, name):
+    svc = _svc(engine, _scope(ORG_A))
+    res = await svc.create_file(_upload(name), purpose="assistants")
+    stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
+    assert (tmp_path / "files").resolve() in stored.parents  # contained
+    assert stored.name in ("pwned", "upload")                # basename or fallback
+    assert not (tmp_path / "etc").exists()
+
+
+def test_delete_never_rmtrees_an_escaped_legacy_path(engine, tmp_path):
+    # A legacy row whose stored path escaped the root must not let delete rmtree it.
+    svc = _svc(engine, _scope(ORG_A))
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("x")
+    f = File(filename="x", content_type="text/plain", size=1,
+             purpose="assistants", path=str(victim / "x"))
+    svc.session.add(f); svc.session.commit(); svc.session.refresh(f)
+    assert svc.delete_file(f.id) is True
+    assert (victim / "keep.txt").exists()  # untouched
