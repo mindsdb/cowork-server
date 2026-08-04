@@ -480,6 +480,11 @@ class ConversationService:
         """All messages of a conversation in canonical order (see
         _MESSAGE_ORDER). Includes history-only tool rows — harnesses replay
         them into the LLM context; use get_messages for the UI-facing view."""
+        # Anchor the parent: Message has no org_id, so tenancy comes from
+        # resolving the conversation through the scoped session — a foreign
+        # id must answer like a nonexistent one, not leak another org's
+        # history (the remote-turn replay path passes ids from the wire).
+        self.get_conversation(conversation_id)  # raises if not found
         return list(self.session.exec(
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
