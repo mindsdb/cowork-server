@@ -32,16 +32,20 @@ def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
-    schedule = ScheduleService(scoped).create_schedule(
-        title=body.title,
-        prompt=body.prompt,
-        cadence=body.cadence,
-        next_run_at=body.next_run_at,
-        model=body.model or "default",
-        timezone=body.timezone,
-        project_id=body.project_id,
-        enabled=body.enabled,
-    )
+    try:
+        schedule = ScheduleService(scoped).create_schedule(
+            title=body.title,
+            prompt=body.prompt,
+            cadence=body.cadence,
+            next_run_at=body.next_run_at,
+            model=body.model or "default",
+            timezone=body.timezone,
+            project_id=body.project_id,
+            enabled=body.enabled,
+        )
+    except ValueError as e:
+        # e.g. a project_id that isn't visible in this scope
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return _serialize(schedule, scoped)
 
 
