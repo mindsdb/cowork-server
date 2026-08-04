@@ -38,10 +38,13 @@ class FakeHarness:
         self.turn_history = turn_history
         self.inputs: list[list[dict]] = []
         self.channel_contexts: list = []
+        self.trace_metadata: list = []
 
-    async def stream_response(self, *, conversation, input, channel_context=None):
+    async def stream_response(self, *, conversation, input, channel_context=None,
+                              trace_metadata=None):
         self.inputs.append(input)
         self.channel_contexts.append(channel_context)
+        self.trace_metadata.append(trace_metadata)
         if False:
             yield
 
@@ -149,6 +152,12 @@ def test_telegram_end_to_end(monkeypatch):
             assert assistant.content == REPLY and assistant.harness == "anton"
             assert inbound_events(s)[0].status == "routed"
             s.close()
+
+            # A channel turn never passes through ResponsesHandler, so it has
+            # to carry its own build stamp (ENG-1279) — otherwise every bot
+            # turn is unattributable to the release that produced it.
+            assert fake_harness.trace_metadata[0]["cowork_server_version"]
+            assert fake_harness.trace_metadata[0]["install_channel"]
 
             # No tool events in this turn → reply delivered verbatim, no link.
             sends = [p for (m, p) in calls if m == "sendMessage"]

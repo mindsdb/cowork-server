@@ -14,6 +14,7 @@ from typing import Any
 from uuid import UUID
 
 from anton.core.dispatch import OutboundMessage
+from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, scope_for_background_context
 from cowork.db.session import get_open_session
@@ -440,6 +441,10 @@ class AntonChannelRuntime:
             conversation=conversation,
             input=blocks,
             channel_context=channel_context,
+            # Channel turns don't pass through ResponsesHandler, so they need
+            # their own build stamp (ENG-1279) — a bot turn is otherwise
+            # unattributable to the release that produced it.
+            trace_metadata=build_trace_metadata(),
         )
         try:
             async for _chunk in harness.formatter(stream, harness_id, event_sink):
