@@ -91,8 +91,11 @@ def _remote_handler(monkeypatch, saved):
         def get_conversation(self, conv_id):
             return object()
 
-        def save_user_message(self, conv_id, content):
+        def save_user_message(self, conv_id, content, *, pending=False):
             saved["user"] = content
+
+        def finalize_pending(self, conv_id):
+            saved["finalized"] = True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["assistant"] = text
@@ -114,9 +117,10 @@ def _remote_handler(monkeypatch, saved):
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_persists_user_and_assistant(monkeypatch):
-    # The remote path must persist the turn like _produce does — without this,
-    # reloads lose the conversation and _remote_history reads an empty DB.
+async def test_produce_remote_finalizes_user_and_persists_assistant(monkeypatch):
+    # ENG-1231: the user message is persisted (pending) upstream in handle(); on
+    # terminal the producer finalizes it (rejoining LLM history) and persists the
+    # assistant turn. It no longer writes the user row itself.
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
 
@@ -132,7 +136,8 @@ async def test_produce_remote_persists_user_and_assistant(monkeypatch):
         model="anton", harness_id="anton", buffer=object(),
     )
 
-    assert saved["user"] == "hi"
+    assert saved["finalized"] is True
+    assert "user" not in saved  # the producer no longer writes the user row
     assert saved["assistant"] == "hello"
     assert saved["harness"] == "anton"
     assert saved["events"][-1] == {"type": "response.completed"}
@@ -156,7 +161,7 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
         model="anton", harness_id="anton", buffer=object(),
     )
 
-    assert saved["user"] == "hi"
+    assert saved["finalized"] is True
     assert saved["assistant"] == "partial"
     # Persisted events mirror the streamed response.failed frame.
     assert saved["events"][-1] == {"type": "response.failed", "code": "anton_error",

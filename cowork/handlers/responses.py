@@ -130,9 +130,18 @@ class ResponsesHandler:
             # Detached + resumable. The agent run executes in a background
             # task that writes events to a per-turn buffer; this request just
             # tails the buffer. Closing the connection never reaches the
-            # producer — only an explicit /cancel does. The user message is
-            # persisted by the producer at the end (deferred), so the harness
-            # reads history WITHOUT the current turn (see _produce).
+            # producer — only an explicit /cancel does.
+            #
+            # Persist the user message NOW, marked pending (ENG-1231), so a refresh
+            # or reconnect mid-turn still shows the question via GET /items. It's
+            # committed on the request session before the producer starts, so a
+            # concurrent read sees it. The harness reads history through
+            # get_ordered_messages, which excludes pending rows, so the producer
+            # doesn't replay the current input as duplicate context — and the
+            # producer clears the flag (finalize_pending) when the turn ends.
+            ConversationService(self.scoped).save_user_message(
+                conversation.id, original_content, pending=True,
+            )
             buffer = new_buffer(str(conversation.id), turn_id)
             producer_coro = self._select_producer(
                 conv_id=conversation.id,
@@ -265,10 +274,14 @@ class ResponsesHandler:
             persisted = True
             try:
                 # Re-anchor first: the conversation may be gone or out of scope.
-                ConversationService(producer_session).get_conversation(conv_id)
-                ConversationService(producer_session).save_user_message(conv_id, original_content)
-                producer_session.commit()
-                ConversationService(producer_session).save_assistant_turn(
+                svc = ConversationService(producer_session)
+                svc.get_conversation(conv_id)
+                # The user message was already persisted (pending) at turn start
+                # (ENG-1231). Clear the flag first — even if save_assistant_turn
+                # early-returns on an empty turn — so the question rejoins replayed
+                # history; then persist the assistant turn.
+                svc.finalize_pending(conv_id)
+                svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                 )
             except Exception:
@@ -357,12 +370,14 @@ class ResponsesHandler:
             try:
                 # Re-anchor before ANY write: the conversation may be gone
                 # (deleted mid-turn) or out of scope on this fresh session.
-                ConversationService(producer_session).get_conversation(conv_id)
-                ConversationService(producer_session).save_user_message(
-                    conv_id, original_content, created_at=sent_at
-                )
-                producer_session.commit()
-                ConversationService(producer_session).save_assistant_turn(
+                svc = ConversationService(producer_session)
+                svc.get_conversation(conv_id)
+                # The user message was already persisted (pending) at turn start
+                # (ENG-1231). Clear the flag first — even if save_assistant_turn
+                # early-returns on an empty turn — so the question rejoins replayed
+                # history; then persist the assistant turn.
+                svc.finalize_pending(conv_id)
+                svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                     tool_rows=turn_rows,
                 )

@@ -120,20 +120,51 @@ class ConversationService:
         return 0 if last is None else last.seq + 1
 
     def save_user_message(
-        self, conversation_id: UUID, content, created_at: datetime | None = None
+        self,
+        conversation_id: UUID,
+        content,
+        created_at: datetime | None = None,
+        *,
+        pending: bool = False,
     ) -> Message:
-        """Persist a user message with the next monotonic `seq` (see _next_seq)."""
+        """Persist a user message with the next monotonic `seq` (see _next_seq).
+
+        `pending=True` marks the message in-flight (ENG-1231): the streaming path
+        persists it at turn start so a mid-turn refresh shows the question, but it
+        is kept out of replayed LLM history (get_ordered_messages) until the turn
+        ends and finalize_pending clears the flag.
+        """
         message = Message(
             conversation_id=conversation_id,
             role="user",
             content=content,
             seq=self._next_seq(conversation_id),
             created_at=created_at,
+            pending=pending,
         )
         self.session.add(message)
         self.session.commit()
         self.session.refresh(message)
         return message
+
+    def finalize_pending(self, conversation_id: UUID) -> None:
+        """Clear the in-flight flag on this conversation's pending user message(s)
+        at turn end (ENG-1231), so the finished turn rejoins replayed LLM history.
+
+        Idempotent: a no-op when nothing is pending. Turns are serialized per
+        conversation, so in practice there is at most one pending row.
+        """
+        pending_rows = self.session.exec(
+            self.session.select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.pending == True)  # noqa: E712 — SQL boolean column, not Python identity
+        ).all()
+        if not pending_rows:
+            return
+        for message in pending_rows:
+            message.pending = False
+            self.session.add(message)
+        self.session.commit()
 
     def last_message_at(self, conversation_id: UUID) -> datetime | None:
         """Timestamp of the most recent message, or None for an empty
@@ -498,20 +529,27 @@ class ConversationService:
         if deleted:
             self.session.commit()
 
-    def get_ordered_messages(self, conversation_id: UUID) -> list[Message]:
+    def get_ordered_messages(self, conversation_id: UUID, *, include_pending: bool = False) -> list[Message]:
         """All messages of a conversation in canonical order (see
         _MESSAGE_ORDER). Includes history-only tool rows — harnesses replay
-        them into the LLM context; use get_messages for the UI-facing view."""
+        them into the LLM context; use get_messages for the UI-facing view.
+
+        Excludes the in-flight pending user message by default (ENG-1231): this is
+        the LLM-history read, and the current turn's input arrives separately, so
+        replaying it here would double-feed it. Pass include_pending=True only if a
+        caller genuinely needs the not-yet-finalized row."""
         # Anchor the parent: Message has no org_id, so tenancy comes from
         # resolving the conversation through the scoped session — a foreign
         # id must answer like a nonexistent one, not leak another org's
         # history (the remote-turn replay path passes ids from the wire).
         self.get_conversation(conversation_id)  # raises if not found
-        return list(self.session.exec(
+        stmt = (
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(*_MESSAGE_ORDER)
-        ).all())
+        )
+        if not include_pending:
+            stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
+        return list(self.session.exec(stmt.order_by(*_MESSAGE_ORDER)).all())
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
