@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -94,9 +95,13 @@ def _remote_handler(monkeypatch, saved):
         def save_user_message(self, conv_id, content, *, pending=False):
             saved["user"] = content
             saved["user_pending"] = pending
+            msg = SimpleNamespace(id=uuid4())
+            saved["user_id"] = msg.id
+            return msg
 
-        def finalize_pending(self, conv_id):
+        def finalize_pending(self, conv_id, message_id=None):
             saved["finalized"] = True
+            saved["finalized_id"] = message_id
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["assistant"] = text
@@ -141,6 +146,9 @@ async def test_produce_remote_persists_pending_user_then_finalizes_and_saves_ass
     assert saved["user"] == "hi"
     assert saved["user_pending"] is True   # persisted in-flight at producer start
     assert saved["finalized"] is True      # flag cleared on terminal
+    # Finalize is scoped to THIS turn's row, so a completing turn can't absorb a
+    # pending row stranded by an earlier crashed turn into history.
+    assert saved["finalized_id"] == saved["user_id"]
     assert saved["assistant"] == "hello"
     assert saved["harness"] == "anton"
     assert saved["events"][-1] == {"type": "response.completed"}
@@ -167,10 +175,51 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
     assert saved["user"] == "hi"
     assert saved["user_pending"] is True
     assert saved["finalized"] is True
+    assert saved["finalized_id"] == saved["user_id"]
     assert saved["assistant"] == "partial"
     # Persisted events mirror the streamed response.failed frame.
     assert saved["events"][-1] == {"type": "response.failed", "code": "anton_error",
                                    "error": "An unexpected error occurred."}
+
+
+class _FakeBuffer:
+    async def append(self, *args, **kwargs):
+        pass
+
+    async def close(self, *args, **kwargs):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_pending_persist_failure_does_not_clear_all_pending(monkeypatch):
+    # ENG-1231 hardening: if the pending user persist itself raises before its id
+    # is captured, this turn owns no pending row — persist() must NOT fall back to
+    # finalize_pending(conv, None), which would clear (and fold into history) a
+    # pending row stranded by an earlier crashed turn.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    def raising_save_user_message(self, conv_id, content, *, pending=False):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(
+        responses_mod.ConversationService, "save_user_message", raising_save_user_message,
+    )
+
+    async def fake_produce_remote_turn(*, on_event=None, **kwargs):
+        raise AssertionError("turn must not run when the user persist failed")
+
+    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    # No row was persisted for this turn, so finalize must not have run at all —
+    # in particular never the clear-all (message_id=None) form.
+    assert "finalized" not in saved
+    assert saved.get("finalized_id") is None
 
 
 @pytest.mark.parametrize("backend_env", [None, "inprocess"])
