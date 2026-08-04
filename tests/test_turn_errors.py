@@ -143,6 +143,44 @@ async def test_stream_emits_friendly_failed_event_for_image_error():
     assert "PNG or JPEG" in payload["error"]
 
 
+async def test_produce_pending_persist_failure_does_not_clear_all_pending():
+    # ENG-1231 hardening (in-process _produce, mirror of the _produce_remote test):
+    # if the pending user persist raises before its id is captured, this turn owns
+    # no pending row — persist() must NOT fall back to finalize_pending(conv, None),
+    # which would clear a pending row stranded by an earlier crashed turn.
+    from unittest.mock import MagicMock, patch
+
+    handler = _handler_with_raising_formatter(Exception("unused — save fails first"))
+
+    class _Buffer:
+        async def append(self, _kind, data):
+            pass
+
+        async def close(self, _status):
+            pass
+
+    with (
+        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
+        patch("cowork.handlers.responses.ConversationService") as conv_svc,
+        patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
+    ):
+        conv_svc.return_value.get_conversation.return_value = MagicMock()
+        conv_svc.return_value.save_user_message.side_effect = RuntimeError("db down")
+        await handler._produce(
+            conv_id=uuid4(),
+            harness_input=[{"type": "text", "text": "hi"}],
+            original_content="hi",
+            model="anton",
+            disabled=None,
+            harness_name="anton",
+            harness_id="anton",
+            buffer=_Buffer(),
+        )
+        # No row was persisted for this turn → finalize must not have run at all,
+        # in particular never the clear-all (message_id=None) form.
+        conv_svc.return_value.finalize_pending.assert_not_called()
+
+
 async def test_stream_redacts_generic_error():
     frames = await _collect_produce_sse(
         _handler_with_raising_formatter(Exception("psycopg2: password authentication failed for user 'admin'"))

@@ -147,18 +147,30 @@ class ConversationService:
         self.session.refresh(message)
         return message
 
-    def finalize_pending(self, conversation_id: UUID) -> None:
-        """Clear the in-flight flag on this conversation's pending user message(s)
-        at turn end (ENG-1231), so the finished turn rejoins replayed LLM history.
+    def finalize_pending(self, conversation_id: UUID, message_id: UUID | None = None) -> None:
+        """Clear the in-flight flag at turn end (ENG-1231), so the finished turn
+        rejoins replayed LLM history.
 
-        Idempotent: a no-op when nothing is pending. Turns are serialized per
-        conversation, so in practice there is at most one pending row.
+        Pass `message_id` to finalize only that turn's row — the streaming
+        producers do this so a completing turn cannot silently absorb an unrelated
+        pending row that was stranded by a hard crash (killed between the pending
+        persist and finalize) on an earlier turn. Such an orphan stays pending
+        (still shown in the UI, still excluded from history) instead of being
+        folded into history as a question with no answer.
+
+        With no `message_id`, clears every pending row for the conversation — a
+        defensive/idempotent form for callers that just want a clean slate.
+
+        Idempotent: a no-op when nothing matches.
         """
-        pending_rows = self.session.exec(
+        stmt = (
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
             .where(Message.pending == True)  # noqa: E712 — SQL boolean column, not Python identity
-        ).all()
+        )
+        if message_id is not None:
+            stmt = stmt.where(Message.id == message_id)
+        pending_rows = self.session.exec(stmt).all()
         if not pending_rows:
             return
         for message in pending_rows:

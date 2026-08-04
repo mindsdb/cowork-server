@@ -248,6 +248,7 @@ class ResponsesHandler:
         collected_text: list[str] = []
         collected_events: list[dict] = []
         persisted = False
+        pending_message_id: UUID | None = None
 
         def on_event(kind: str, data: dict) -> None:
             # Mirror the SSE frames the producer streams, so the client
@@ -277,8 +278,13 @@ class ResponsesHandler:
                 # The user message was already persisted (pending) at turn start
                 # (ENG-1231). Clear the flag first — even if save_assistant_turn
                 # early-returns on an empty turn — so the question rejoins replayed
-                # history; then persist the assistant turn.
-                svc.finalize_pending(conv_id)
+                # history; then persist the assistant turn. Scope to THIS turn's
+                # row so a completing turn can't absorb a pending row stranded by
+                # an earlier crashed turn into history. If the pending persist
+                # never succeeded (id unset), this turn owns no row — skip
+                # finalize rather than fall back to clearing every pending row.
+                if pending_message_id is not None:
+                    svc.finalize_pending(conv_id, pending_message_id)
                 svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                 )
@@ -291,9 +297,9 @@ class ResponsesHandler:
             # streaming, so a refresh/reconnect mid-turn shows the question via
             # /items. _remote_history reads get_ordered_messages, which excludes
             # pending, so the current input isn't replayed into the remote job.
-            ConversationService(producer_session).save_user_message(
+            pending_message_id = ConversationService(producer_session).save_user_message(
                 conv_id, original_content, pending=True,
-            )
+            ).id
             await produce_remote_turn(
                 conversation_id=str(conv_id),
                 org_id=self.scoped.scope.org_id,
@@ -359,6 +365,7 @@ class ResponsesHandler:
         persisted = False
         # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
+        pending_message_id: UUID | None = None
 
         def event_sink(event_type: str, data: dict) -> None:
             # Tool block-rows are for LLM-history persistence, not UI replay —
@@ -383,8 +390,13 @@ class ResponsesHandler:
                 # The user message was already persisted (pending) at turn start
                 # (ENG-1231). Clear the flag first — even if save_assistant_turn
                 # early-returns on an empty turn — so the question rejoins replayed
-                # history; then persist the assistant turn.
-                svc.finalize_pending(conv_id)
+                # history; then persist the assistant turn. Scope to THIS turn's
+                # row so a completing turn can't absorb a pending row stranded by
+                # an earlier crashed turn into history. If the pending persist
+                # never succeeded (id unset), this turn owns no row — skip
+                # finalize rather than fall back to clearing every pending row.
+                if pending_message_id is not None:
+                    svc.finalize_pending(conv_id, pending_message_id)
                 svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                     tool_rows=turn_rows,
@@ -398,9 +410,9 @@ class ResponsesHandler:
             # does (ENG-1231) — see the note in handle(). The harness reads history
             # via get_ordered_messages, which excludes pending, so this write isn't
             # replayed into the turn as duplicate context.
-            ConversationService(producer_session).save_user_message(
-                conv_id, original_content, pending=True,
-            )
+            pending_message_id = ConversationService(producer_session).save_user_message(
+                conv_id, original_content, created_at=sent_at, pending=True,
+            ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,

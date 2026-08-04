@@ -63,6 +63,29 @@ def test_finalize_pending_returns_the_turn_to_history(svc, conv):
     assert [m["role"] for m in svc.get_messages(conv.id)] == ["user"]
 
 
+def test_finalize_pending_scoped_to_message_id_leaves_other_pending_rows(svc, conv):
+    # A hard crash (killed between the pending persist and finalize) can strand a
+    # pending row. A later turn must finalize ONLY its own row — else it folds the
+    # orphaned, unanswered question into replayed LLM history. The producers pass
+    # message_id for exactly this reason.
+    stranded = svc.save_user_message(conv.id, "orphaned?", pending=True)
+    current = svc.save_user_message(conv.id, "answered?", pending=True)
+
+    svc.finalize_pending(conv.id, current.id)
+
+    # Only the current turn's row rejoined history; the orphan stays pending.
+    hist_contents = [m.content for m in svc.get_ordered_messages(conv.id)]
+    assert hist_contents == ["answered?"]
+    pending_only = svc.get_ordered_messages(conv.id, include_pending=True)
+    assert {m.content: m.pending for m in pending_only} == {
+        "orphaned?": True,
+        "answered?": False,
+    }
+    # ...and both remain visible in the UI regardless of pending state.
+    assert {m["content"] for m in svc.get_messages(conv.id)} == {"orphaned?", "answered?"}
+    assert stranded.id != current.id
+
+
 def test_finalize_pending_is_idempotent_and_safe_when_nothing_pending(svc, conv):
     svc.finalize_pending(conv.id)  # nothing pending → no-op, no error
     svc.save_user_message(conv.id, "done", pending=False)  # already final
