@@ -515,8 +515,11 @@ class UserSettings(Settings):
                 self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
             )
         if self.router_model is None:
+            # Default from the router's OWN provider — deriving from coding_provider
+            # paired an independently-set router (e.g. router=OpenAI, coding=Anthropic)
+            # with the wrong vendor's model (ENG-1127 review).
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
+                self.router_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
             )
         return self
 

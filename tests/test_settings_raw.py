@@ -21,12 +21,14 @@ def _delete_settings(session, *keys: str) -> None:
             pass
 
 
-def test_raw_settings_write_syncs_credentials_but_not_models(tmp_path, monkeypatch):
-    # ENG-739: /settings/raw syncs credentials + provider selection to the DB,
-    # but NOT model keys — a model in .env is CLI-only and must never be pushed
-    # to the DB, or a bulk sync (web token refresh, re-login) would re-pin a
-    # user who fixed a locked-model 403 via the picker. The .env line is still
-    # written to disk for the standalone CLI.
+def test_raw_settings_write_syncs_only_incoming_not_the_whole_env(tmp_path, monkeypatch):
+    # ENG-1127 review: /settings/raw must sync ONLY the recognised vars in THIS
+    # request to the DB, never the whole merged .env. The server now mirrors
+    # DB->.env, so the file can hold a preserved/translated cluster (a stale
+    # minds-cloud line, a gemini role written as openai-compatible); re-syncing all
+    # of it would overwrite the authoritative DB choice from the CLI's derived
+    # file. Models are still never synced (ENG-739). The full .env is still written
+    # to disk for the standalone CLI.
     from cowork.api.v1.endpoints import settings as settings_endpoint
     from cowork.api.v1.endpoints.settings import _RawSettingsBody, write_raw_settings
     from cowork.db.session import get_open_session
@@ -34,40 +36,43 @@ def test_raw_settings_write_syncs_credentials_but_not_models(tmp_path, monkeypat
 
     env_path = tmp_path / ".anton" / ".env"
     env_path.parent.mkdir(parents=True)
-    env_path.write_text(
-        "\n".join(
-            [
-                "ANTON_MINDS_API_KEY=existing-key",
-                "ANTON_PLANNING_PROVIDER=openai-compatible",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    # A STALE cluster line already on disk that the incoming request does NOT touch.
+    env_path.write_text("ANTON_CODING_PROVIDER=minds-cloud\n", encoding="utf-8")
     monkeypatch.setattr(settings_endpoint, "_ENV_PATH", env_path)
 
     session = get_open_session()
+    keys = ("minds_api_key", "planning_provider", "planning_model", "coding_provider")
     try:
-        _delete_settings(session, "minds_api_key", "planning_provider", "planning_model")
+        _delete_settings(session, *keys)
 
-        response = write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session, _local_request())
-
+        response = write_raw_settings(
+            _RawSettingsBody(content="\n".join([
+                "ANTON_MINDS_API_KEY=new-key",
+                "ANTON_PLANNING_PROVIDER=minds_cloud",
+                "ANTON_PLANNING_MODEL=_reason_",
+            ])),
+            session, _local_request(),
+        )
         assert response == {"ok": True}
-        raw = settings_endpoint.read_raw_settings(_local_request())
-        assert raw["ANTON_MINDS_API_KEY"] == "existing-key"
-        # The model line IS preserved in .env (CLI-only surface)…
-        assert raw["ANTON_PLANNING_MODEL"] == "_reason_"
 
-        # …but is NOT synced to the DB: the row stays unset (resolves to a
-        # default), while credentials + provider are synced as before.
         service = SettingService(session)
-        assert service._fetch_row("planning_model") is None
         loaded = service.load()
-        assert loaded.minds_api_key.get_secret_value() == "existing-key"
+        # Incoming credential + provider synced to the DB.
+        assert loaded.minds_api_key.get_secret_value() == "new-key"
         assert loaded.planning_provider.value == "minds_cloud"
-        assert loaded.planning_model != "_reason_"
+        # Model in the request is NOT synced (ENG-739).
+        assert service._fetch_row("planning_model") is None
+        # The STALE on-disk coding_provider is NOT pulled into the DB (Finding 1).
+        assert service._fetch_row("coding_provider") is None
+
+        # The full .env is still written to disk for the CLI — merge preserves the
+        # untouched stale line and the CLI-only model line.
+        raw = settings_endpoint.read_raw_settings(_local_request())
+        assert raw["ANTON_MINDS_API_KEY"] == "new-key"
+        assert raw["ANTON_CODING_PROVIDER"] == "minds-cloud"
+        assert raw["ANTON_PLANNING_MODEL"] == "_reason_"
     finally:
-        _delete_settings(session, "minds_api_key", "planning_provider", "planning_model")
+        _delete_settings(session, *keys)
         session.close()
 
 
