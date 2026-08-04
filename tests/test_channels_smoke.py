@@ -142,7 +142,8 @@ def test_telegram_end_to_end(monkeypatch):
             assert binding.channel_type == "telegram" and binding.anton_conversation_id is not None
             sessions = s.exec(select(ChannelSession)).all()
             assert len(sessions) == 1 and sessions[0].binding_id == binding.id
-            msgs = s.exec(select(Message).where(Message.conversation_id == binding.anton_conversation_id)).all()
+            conversation_id = binding.anton_conversation_id
+            msgs = s.exec(select(Message).where(Message.conversation_id == conversation_id)).all()
             assert sorted(m.role for m in msgs) == ["assistant", "user"]
             assistant = next(m for m in msgs if m.role == "assistant")
             assert assistant.content == REPLY and assistant.harness == "anton"
@@ -159,7 +160,11 @@ def test_telegram_end_to_end(monkeypatch):
             await drain_background_tasks()
             s = get_open_session()
             assert len(inbound_events(s)) == 1
-            assert len([m for m in s.exec(select(Message)).all() if m.role == "assistant"]) == 1
+            # Scoped to THIS binding's conversation: the test DB is shared by
+            # the whole session, so a global Message count is really counting
+            # every other test's turns too (it only passed by file ordering).
+            replies = s.exec(select(Message).where(Message.conversation_id == conversation_id)).all()
+            assert len([m for m in replies if m.role == "assistant"]) == 1
             s.close()
             assert len([p for (m, p) in calls if m == "sendMessage"]) == 1
 
