@@ -1,8 +1,8 @@
 # Builder: resolve + install dependencies and the project into a venv with uv.
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS builder
 
 # uv binary (pinned to match the repo's lockfile tooling).
-COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.6.14@sha256:3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664 /uv /uvx /bin/
 
 # git: pyproject sources anton-agent / hermes-agent from GitHub, and hatch-vcs
 # reads git metadata for the version. build-essential is NOT needed — psycopg
@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 
 # Final: slim runtime with just the venv + source.
-FROM python:3.12-slim AS final
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS final
 
 # Non-root: this image runs in per-PR dev environments (see
 # .github/workflows/build-deploy.yml) and is a candidate for staging/prod via
