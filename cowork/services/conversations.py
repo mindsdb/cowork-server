@@ -256,6 +256,25 @@ class ConversationService:
         self.session.refresh(conversation)
         return conversation
 
+    def update_history_compaction(
+        self,
+        conversation_id: UUID,
+        summary: str,
+        cutoff_message_id: UUID,
+    ) -> None:
+        """Persist anton's latest compacted history summary + cutoff.
+
+        Best-effort: silently no-ops if the conversation is gone (this runs
+        from a turn's cleanup path, after the turn's real outcome is settled).
+        """
+        conversation = self.session.get(Conversation, conversation_id)
+        if conversation is None:
+            return
+        conversation.history_summary = summary
+        conversation.history_summary_cutoff_id = cutoff_message_id
+        self.session.add(conversation)
+        self.session.commit()
+
     def delete_conversation(self, conversation_id: UUID) -> bool:
         conversation = self.session.get(Conversation, conversation_id)
         if conversation is None:

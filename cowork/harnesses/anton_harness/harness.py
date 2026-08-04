@@ -273,8 +273,10 @@ class AntonHarness:
         cards: list[dict] = []
         skill_drafts: list[dict] = []
         turn_rows: list[dict] | None = None
+        session = None
+        seed_info: dict | None = None
         try:
-            session, temp_vault_dir = await self._build_chat_session(
+            session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
@@ -322,6 +324,15 @@ class AntonHarness:
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            if session is not None and seed_info is not None:
+                # Best-effort — must never mask the turn's real outcome.
+                try:
+                    self._persist_history_compaction(conversation, session, seed_info)
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to persist history compaction for conversation %s",
+                        conv_id,
+                    )
             # One dir diff → index the new artifacts AND build their cards.
             # Runs on every exit (success, error, cancel) so an artifact is
             # always indexed; cards are yielded just below on normal completion.
@@ -335,6 +346,93 @@ class AntonHarness:
             yield SkillCreated(draft)
         if turn_rows:
             yield TurnHistory(turn_rows)
+
+    @staticmethod
+    def _seed_history(ordered_messages: list, history_summary: str | None, cutoff_id, stamp) -> tuple[list[dict], dict]:
+        """Build initial_history as [summary] + [messages after cutoff] when
+        the saved compaction is still valid, else full history.
+
+        Returns `(initial_history, seed_info)` — `seed_info` is what
+        `_persist_history_compaction` needs to map this turn's compaction
+        result back onto `ordered_messages`.
+
+        Anton's `_summarize_history` never cuts mid tool_use/tool_result pair,
+        so `cutoff_id` always lands on a clean boundary: the tail's first
+        message is a real user text or an assistant message, never an orphan
+        tool_result. That makes the `role == "user"` separator check below
+        both safe and sufficient.
+        """
+        tail_start = 0
+        if history_summary and cutoff_id:
+            for i, m in enumerate(ordered_messages):
+                if m.id == cutoff_id:
+                    tail_start = i + 1
+                    break
+            else:
+                history_summary = None  # cutoff message is gone — stale
+
+        tail = [stamp(m) for m in ordered_messages[tail_start:]]
+        if history_summary:
+            summary_msg = {"role": "user", "content": history_summary}
+            if tail and tail[0].get("role") == "user":
+                # Same fix anton's own _summarize_history applies: two
+                # consecutive user messages break/degrade most providers.
+                initial_history = [
+                    summary_msg,
+                    {"role": "assistant", "content": "Understood — using that as reference."},
+                    *tail,
+                ]
+                synthetic_prefix_len = 2
+            else:
+                initial_history = [summary_msg, *tail]
+                synthetic_prefix_len = 1
+        else:
+            initial_history = tail
+            synthetic_prefix_len = 0
+
+        seed_info = {
+            "ordered_messages": ordered_messages,
+            "tail_start": tail_start,
+            "synthetic_prefix_len": synthetic_prefix_len,
+        }
+        return initial_history, seed_info
+
+    @staticmethod
+    def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
+        """Save anton's compacted summary + cutoff if it compacted this turn.
+
+        `seed_info["ordered_messages"]`/`["tail_start"]` are what this turn's
+        `initial_history` was built from; `["synthetic_prefix_len"]` is how
+        many non-real entries (summary, plus an assistant separator if one was
+        needed) were prepended ahead of them — `covered_through` from
+        `session.last_compaction` counts those too, so they must be subtracted
+        before mapping onto `ordered_messages`.
+
+        `getattr` (not `session.last_compaction` directly): an anton build
+        predating this property must no-op here, not raise — cowork-server and
+        anton ship and deploy independently.
+        """
+        compaction = getattr(session, "last_compaction", None)
+        if compaction is None:
+            return
+        offset = seed_info["synthetic_prefix_len"]
+        covered = compaction["covered_through"] - offset
+        if covered <= 0:
+            return
+        ordered_messages = seed_info["ordered_messages"]
+        idx = seed_info["tail_start"] + covered - 1
+        if not (0 <= idx < len(ordered_messages)):
+            return
+        from sqlalchemy.orm import object_session
+        from cowork.db.scoped import adopt_scoped_session
+        from cowork.services.conversations import ConversationService
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            return
+        ConversationService(adopt_scoped_session(db_session)).update_history_compaction(
+            conversation.id, compaction["summary"], ordered_messages[idx].id,
+        )
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -686,10 +784,20 @@ class AntonHarness:
                 om["content"] = f"[{ts}] {om['content']}"
             return om
 
-        initial_history = [
-            _stamped(m) for m in ordered_messages
-            if m.role in {"user", "assistant"}
-        ]
+        replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
+        # Replay [summary] + [messages after cutoff] instead of full history
+        # when a saved compaction is still valid (ENG-664). Disabled → plain
+        # full history and `seed_info = None`, which skips persistence too.
+        if user.history_compaction_enabled:
+            initial_history, seed_info = self._seed_history(
+                replayable,
+                conversation.history_summary,
+                conversation.history_summary_cutoff_id,
+                _stamped,
+            )
+        else:
+            initial_history = [_stamped(m) for m in replayable]
+            seed_info = None
 
         config = ChatSessionConfig(
             llm_client=llm_client,
@@ -733,7 +841,7 @@ class AntonHarness:
             ],
             cells=cells
         )
-        return ChatSession(config), temp_vault_dir
+        return ChatSession(config), temp_vault_dir, seed_info
 
     @staticmethod
     def _build_llm_client():
