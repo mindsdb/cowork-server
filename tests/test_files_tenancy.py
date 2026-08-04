@@ -270,6 +270,8 @@ def test_delete_never_rmtrees_an_escaped_legacy_path(engine, tmp_path):
     (victim / "keep.txt").write_text("x")
     f = File(filename="x", content_type="text/plain", size=1,
              purpose="assistants", path=str(victim / "x"))
-    svc.session.add(f); svc.session.commit(); svc.session.refresh(f)
+    svc.session.add(f)
+    svc.session.commit()
+    svc.session.refresh(f)
     assert svc.delete_file(f.id) is True
     assert (victim / "keep.txt").exists()  # untouched
