@@ -275,3 +275,21 @@ def test_delete_never_rmtrees_an_escaped_legacy_path(engine, tmp_path):
     svc.session.refresh(f)
     assert svc.delete_file(f.id) is True
     assert (victim / "keep.txt").exists()  # untouched
+
+
+def test_delete_by_purpose_never_rmtrees_an_escaped_legacy_path(engine, tmp_path):
+    # Same escape as delete_file, via the conversation/project cleanup path.
+    from cowork.services.files import unlink_file_dirs
+    svc = _svc(engine, _scope(ORG_A))
+    victim = tmp_path / "victim2"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("x")
+    f = File(filename="x", content_type="text/plain", size=1,
+             purpose="attachment:legacy", path=str(victim / "x"))
+    svc.session.add(f)
+    svc.session.commit()
+
+    dirs = svc.delete_by_purpose("attachment:legacy")
+    svc.session.commit()
+    unlink_file_dirs(dirs)  # the caller unlinks after committing
+    assert (victim / "keep.txt").exists()  # untouched

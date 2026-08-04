@@ -186,7 +186,10 @@ class FileService:
         `unlink_file_dirs` AFTER committing.
         """
         rows = list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
-        dirs = [Path(f.path).parent for f in rows if f.path]
+        # Dir from the file id, not the stored path (see delete_file): a legacy
+        # row could hold an escaped path, and rmtree-ing its parent would delete
+        # an arbitrary directory.
+        dirs = [self._root_dir() / str(f.id) for f in rows]
         for f in rows:
             self.session.delete(f)
         return dirs
