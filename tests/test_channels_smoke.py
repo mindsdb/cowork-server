@@ -685,13 +685,24 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
         s.close()
         return sorted({m.harness for m in msgs if m.role == "assistant"})
 
-    settings = get_user_settings()
-    monkeypatch.setattr(settings, "channels_harness", "hermes")
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    def set_channels_harness(name):
+        # Persist to the DB — get_user_settings() loads fresh (no cache), so the
+        # runtime must read the stored value, not a mutated in-memory object.
+        s = get_open_session()
+        try:
+            SettingService(s).upsert_setting("channels_harness", name)
+        finally:
+            s.close()
+
+    set_channels_harness("hermes")
     turn(700, 200)
     assert harnesses_of(700) == ["hermes"] and hermes_harness.inputs
 
     # Flipping the setting must never switch an existing conversation: pinned.
-    monkeypatch.setattr(settings, "channels_harness", "anton")
+    set_channels_harness("anton")
     turn(700, 201)
     assert harnesses_of(700) == ["hermes"]
 
@@ -700,7 +711,7 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
     assert harnesses_of(701) == ["anton"]
 
     # Unregistered name falls back to the default rather than failing the turn.
-    monkeypatch.setattr(settings, "channels_harness", "ghost")
+    set_channels_harness("ghost")
     turn(702, 203)
     assert harnesses_of(702) == ["anton"]
 
