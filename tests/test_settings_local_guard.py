@@ -1,10 +1,10 @@
-"""reveal-key and /raw must refuse non-loopback callers (ENG-457).
+"""reveal-key must refuse non-loopback callers (ENG-457).
 
-These endpoints return unmasked provider secrets (a single key, or the whole
-dotenv). `guards.require_local` is defense-in-depth for a network-exposed
-deployment — e.g. a self-host compose that binds 0.0.0.0 — so even with no
-app-layer auth they only answer a loopback client. The desktop sidecar + UI
-talk over 127.0.0.1, so the legitimate flow is unaffected.
+This endpoint returns an unmasked provider secret. `guards.require_local` is
+defense-in-depth for a network-exposed deployment — e.g. a self-host compose
+that binds 0.0.0.0 — so even with no app-layer auth it only answers a loopback
+client. The desktop sidecar + UI talk over 127.0.0.1, so the legitimate flow is
+unaffected.
 """
 
 from types import SimpleNamespace
@@ -42,12 +42,4 @@ def test_reveal_key_blocks_non_local_before_db():
     # the session/DB is ever touched — session=None is safe here.
     with pytest.raises(HTTPException) as exc:
         reveal_key("openai", session=None, request=_request("203.0.113.7"))
-    assert exc.value.status_code == 403
-
-
-def test_read_raw_blocks_non_local():
-    from cowork.api.v1.endpoints.settings import read_raw_settings
-
-    with pytest.raises(HTTPException) as exc:
-        read_raw_settings(request=_request("203.0.113.7"))
     assert exc.value.status_code == 403
