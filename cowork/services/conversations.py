@@ -119,13 +119,16 @@ class ConversationService:
         ).first()
         return 0 if last is None else last.seq + 1
 
-    def save_user_message(self, conversation_id: UUID, content) -> Message:
+    def save_user_message(
+        self, conversation_id: UUID, content, created_at: datetime | None = None
+    ) -> Message:
         """Persist a user message with the next monotonic `seq` (see _next_seq)."""
         message = Message(
             conversation_id=conversation_id,
             role="user",
             content=content,
             seq=self._next_seq(conversation_id),
+            created_at=created_at,
         )
         self.session.add(message)
         self.session.commit()

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -190,6 +191,8 @@ class ResponsesHandler:
         collected_events: list[dict] = []
         turn_rows: list[dict] = []
         persisted = False
+        # Send time captured before the turn
+        sent_at = datetime.now(timezone.utc)
 
         def event_sink(event_type: str, data: dict) -> None:
             # Tool block-rows are for LLM-history persistence, not UI replay —
@@ -210,7 +213,9 @@ class ResponsesHandler:
                 # Re-anchor before ANY write: the conversation may be gone
                 # (deleted mid-turn) or out of scope on this fresh session.
                 ConversationService(producer_session).get_conversation(conv_id)
-                ConversationService(producer_session).save_user_message(conv_id, original_content)
+                ConversationService(producer_session).save_user_message(
+                    conv_id, original_content, created_at=sent_at
+                )
                 producer_session.commit()
                 ConversationService(producer_session).save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
@@ -344,6 +349,8 @@ class ResponsesHandler:
         collected_text: list[str] = []
         collected_events: list[dict] = []
         turn_rows: list[dict] = []
+        # Send time captured before the turn
+        sent_at = datetime.now(timezone.utc)
 
         def event_sink(event_type: str, data: dict) -> None:
             if event_type == "response.turn_history":
@@ -373,7 +380,7 @@ class ResponsesHandler:
         # Persist the user message now — after the harness has read history for
         # this turn — so it isn't replayed into the turn as duplicate context.
         user_message = ConversationService(self.scoped).save_user_message(
-            conversation_id, original_content,
+            conversation_id, original_content, created_at=sent_at,
         )
         self._save_assistant_turn(conversation_id, assistant_text, collected_events, turn_rows)
 
