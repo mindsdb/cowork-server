@@ -20,6 +20,7 @@ from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
+from cowork import hub_pin
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
 
@@ -93,6 +94,9 @@ async def lifespan(app: FastAPI):
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
     start_scheduler()
     await _start_channels(app)
+    # Hosted only (no-op with no hub env): keeps the hibernation sweep from
+    # stopping an instance whose messaging channels would go dark (ENG-1003).
+    hub_pin.start()
     try:
         yield
     finally:
@@ -101,6 +105,7 @@ async def lifespan(app: FastAPI):
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
 
+        await hub_pin.stop()
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
         await app.state.channel_adapters.shutdown()

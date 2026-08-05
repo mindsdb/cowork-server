@@ -24,6 +24,7 @@ from cowork.schemas.channels import (
 )
 from cowork.channels.lifecycle import LifecycleError
 from cowork.channels.ingress import sync_channel_ingress
+from cowork import hub_pin
 from cowork.services.channel_bindings import (
     BindingConflictError,
     BindingNotFoundError,
@@ -65,6 +66,12 @@ async def _reconcile_ingress(request: Request, channel_type: str) -> None:
     change to the channel's live adapter (config/setup/teardown/reload)."""
     manager = getattr(request.app.state, "channel_ingress", None)
     await sync_channel_ingress(manager, _live_adapters(request), channel_type)
+    # Hosted instances tell the hub whether channels are connected so the
+    # hibernation sweep doesn't stop them (ENG-1003). This only asks for an
+    # early report — hub_pin recomputes the truth itself, so this is an
+    # accelerator and never the source of the state. Hooked here because every
+    # route that can change channel state already funnels through this call.
+    hub_pin.nudge()
 
 
 @router.get("/status", response_model=ChannelStatusResponse)
