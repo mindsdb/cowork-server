@@ -10,14 +10,12 @@ from the now-legacy ``~/.anton/.env`` path).  Bumping to v2 lets users who
 had the old sentinel fire against the wrong path get a fresh migration run
 from the correct ``~/.cowork/.env`` location.
 
-After migration the DB is **authoritative** for all overlapping fields.
-The ``.env`` file continues to exist for:
-  - The standalone ``anton`` CLI (reads ``AntonSettings`` from ``.env``)
-  - Onboarding (writes ``.env`` first, then syncs to DB)
-  - Fields that only exist in ``AntonSettings`` (workspace paths, etc.)
-
-Cowork-server runtime code should read from ``get_user_settings()`` (DB),
-never from the ``.env`` directly.
+After migration the DB is **authoritative**. This is a one-way seed: the
+server no longer writes ``~/.cowork/.env`` back (the DB->.env export was
+removed in ENG-1295, and the standalone ``anton`` CLI now owns its own
+``~/.anton/.env``). Reading a legacy ``~/.cowork/.env`` here only bootstraps
+the DB on first upgrade; cowork-server runtime code reads from
+``get_user_settings()`` (DB), never from ``.env`` directly.
 """
 from __future__ import annotations
 
@@ -114,10 +112,9 @@ def migrate_env_to_db(session: Session) -> bool:
         migrated_keys: list[str] = []
         for setting_key, val in env_to_db_updates(dotenv).items():
             try:
-                # export_env=False: this loop seeds the DB *from* .env; a per-key
-                # re-export mid-loop would strip the keys not migrated yet. The
-                # next real write exports the reconciled file (ENG-1127).
-                svc.upsert_setting(setting_key, val, export_env=False)
+                # Seed the DB from a legacy .env (ENG-1295). One-time, sentinel-
+                # guarded; the DB is authoritative thereafter.
+                svc.upsert_setting(setting_key, val)
                 migrated_keys.append(setting_key)
             except Exception as e:
                 logger.debug("Skipping env migration for %s: %s", setting_key, e)
@@ -172,9 +169,7 @@ def backfill_minds_url(session: Session) -> bool:
             changed.append(key)
     if changed:
         session.commit()
-        # Route through the exporting hook (not a bare cache-invalidate) so the
-        # rewritten minds_url also reaches the CLI's .env — otherwise the DB moves
-        # to the canonical host while .env keeps the dead mdb.ai one (ENG-1127 review).
+        # Invalidate the settings cache so the next read sees the rewritten host.
         svc._after_write()
         logger.info(
             "Backfilled legacy MindsHub host (mdb.ai -> %s) in: %s",

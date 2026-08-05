@@ -1,6 +1,5 @@
 import json
 import logging
-import threading
 from enum import Enum
 
 from cryptography.fernet import InvalidToken
@@ -8,14 +7,6 @@ from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.encryption import decrypt, encrypt
-from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.env_boundary import (
-    atomic_write_env,
-    db_to_env,
-    env_reconcile_vars,
-    merge_env_lines,
-)
 from cowork.common.settings.user_settings import (
     UserSettings,
     invalidate_user_settings_cache,
@@ -24,12 +15,6 @@ from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
 
 logger = logging.getLogger(__name__)
-
-# Serializes the .env export's read/merge/write so two concurrent settings writes
-# can't lost-update the file — the last exporter re-reads the DB under the lock and
-# installs the latest committed state (ENG-1127 review). In-process; the client's
-# own .env writes go away in Phase B, making the server the sole writer.
-_env_export_lock = threading.Lock()
 
 
 def _mask_provider_keys(providers_json: str) -> str:
@@ -169,45 +154,16 @@ class SettingService:
             row.value = store_val
         self.session.add(row)
 
-    def _after_write(self, *, export_env: bool = True) -> None:
-        """Post-commit hook shared by the settings mutators.
-
-        Invalidates the cache and (desktop install) mirrors the DB to the CLI's
-        ``.env`` (ENG-1127); ``export_env=False`` skips the mirror for the seeding migration.
-        """
+    def _after_write(self) -> None:
+        """Post-commit hook shared by the settings mutators: invalidate the
+        user-settings cache so the next read sees the committed state."""
         invalidate_user_settings_cache()
-        if export_env:
-            self._export_env_for_cli()
 
-    def _export_env_for_cli(self) -> None:
-        """Mirror the DB's aliased settings to the CLI's ``.env`` (best-effort).
-
-        Local (desktop) tenancy only — a cloud pod must not spill decrypted secrets
-        to disk (ENG-1127). Never raises — a stale ``.env`` must not fail a save.
-        """
-        try:
-            if get_app_settings().tenancy_mode != "local":
-                return
-            # Serialize the whole read/merge/write. The DB read is INSIDE the lock,
-            # so the last exporter to acquire it installs the latest committed
-            # state — no lost update between concurrent settings writes.
-            with _env_export_lock:
-                rows = self._fetch_all_rows()
-                settings = self._load(rows)
-                managed = db_to_env(settings, {row.key for row in rows})
-                path = cowork_home() / ".env"
-                existing = path.read_text(encoding="utf-8") if path.exists() else ""
-                content = merge_env_lines(existing, managed, env_reconcile_vars(settings))
-                if content != existing:
-                    atomic_write_env(path, content)
-        except Exception as exc:  # noqa: BLE001 - export is best-effort
-            logger.warning("settings: .env export for the CLI failed: %s", exc)
-
-    def upsert_setting(self, key: str, value: str, *, export_env: bool = True) -> SettingResponse:
+    def upsert_setting(self, key: str, value: str) -> SettingResponse:
         store_val, validated = self._encode_for_store(key, value)
         self._write_row(key, store_val)
         self.session.commit()
-        self._after_write(export_env=export_env)
+        self._after_write()
         return self._to_response(key, validated, True)
 
     def save_all(self, updates: dict[str, str]) -> list[str]:
