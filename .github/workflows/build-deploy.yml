@@ -86,6 +86,7 @@ jobs:
         with:
           image: ${{ needs.build.outputs.image }}
           snyk-token: ${{ secrets.SNYK_TOKEN }}
+          policy-path: .snyk
 
   deploy-pr-env:
     runs-on: ${{ inputs.build-runner }}
