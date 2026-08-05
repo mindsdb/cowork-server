@@ -7,19 +7,19 @@ ignore:
   SNYK-DEBIAN13-ATTR-17678182:
     - '*':
         reason: >
-          Link Following in attr/libattr1 (introduced via python:3.12-slim base
-          image). No fixed Debian package available yet. Low practical risk in a
-          containerized, single-user server context. Tracking until Debian ships
-          a patched version.
+          CVE-2026-54371 (High, CVSS 7.1): Link Following in attr/libattr1
+          (introduced via python:3.12-slim base image). No fixed Debian package
+          available yet. Low practical risk in a containerized, single-user
+          server context. Tracking until Debian ships a patched version.
         expires: 2026-11-03T00:00:00.000Z
         created: 2026-08-05T00:00:00.000Z
   SNYK-DEBIAN13-ACL-17677866:
     - '*':
         reason: >
-          Link Following in acl/libacl1 (introduced via python:3.12-slim base
-          image). No fixed Debian package available yet. Low practical risk in a
-          containerized, single-user server context. Tracking until Debian ships
-          a patched version.
+          CVE-2026-54369 (High, CVSS 7.1): Link Following in acl/libacl1
+          (introduced via python:3.12-slim base image). No fixed Debian package
+          available yet. Low practical risk in a containerized, single-user
+          server context. Tracking until Debian ships a patched version.
         expires: 2026-11-03T00:00:00.000Z
         created: 2026-08-05T00:00:00.000Z
 patch: {}
