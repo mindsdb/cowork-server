@@ -467,6 +467,10 @@ def build_cowork_lookup_connector_tool():
         input_schema=_LOOKUP_CONNECTOR_SCHEMA,
         handler=_cowork_lookup_connector,
         prompt=_LOOKUP_CONNECTOR_PROMPT,
+        # Deferred (ENG-764): unlocked when the model recalls the guided
+        # data-source connection skill. Its `prompt` stays out of the system
+        # prompt until then, since it's built from registered tools only.
+        unlock_skill="connect-datasource",
     )
 
 
@@ -717,6 +721,7 @@ def build_cowork_request_credentials_tool():
         input_schema=_REQUEST_CREDENTIALS_SCHEMA,
         handler=_cowork_request_credentials,
         prompt=_REQUEST_CREDENTIALS_PROMPT,
+        unlock_skill="connect-datasource",
     )
 
 
@@ -785,6 +790,7 @@ def build_cowork_label_connection_tool():
         input_schema=_LABEL_CONNECTION_SCHEMA,
         handler=_cowork_label_connection,
         prompt=_LABEL_CONNECTION_PROMPT,
+        unlock_skill="connect-datasource",
     )
 
 
