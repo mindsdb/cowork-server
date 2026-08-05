@@ -519,15 +519,85 @@ class ResponsesHandler:
         )
 
 
+# A card waiting on a human produces no events, so the stream can be quiet for
+# the whole question timeout. Cloudflare (proxied, in the path for every cloud
+# instance) drops quiet connections; its documented threshold covers
+# time-to-first-byte rather than mid-stream idle, so the exact mid-stream bound
+# is unpublished. 20 s is chosen to be below any plausible one — Cloudflare's
+# own published timeouts start at 100 s and no proxy in common use idles out
+# under 30 s — and sits inside the design's 15-30 s window. If a stream is ever
+# observed dropping mid-question in the cloud, the thing to measure is the
+# elapsed time between the last byte written and the disconnect, at the edge;
+# do not tune this value from a local test, where no proxy is in the path.
+SSE_KEEPALIVE_SECONDS = 20.0
+
+
 async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None]:
     """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
     just ends the stream — the harness's own response.completed/failed frame
-    was already written as a normal record."""
-    async for rec in buffer.tail(from_seq):
-        if rec.is_terminal:
-            return
-        sse = rec.data.get("sse")
-        if sse:
-            yield sse
+    was already written as a normal record.
+
+    Emits a comment heartbeat whenever the buffer has been quiet for
+    ``SSE_KEEPALIVE_SECONDS``, so an intermediary cannot mistake a pending
+    ask_user card for a dead connection.
+
+    Prefetch semantics: unlike a plain ``async for``, this loop keeps one
+    ``__anext__()`` in flight while the current record is being yielded, so it
+    runs one record ahead of the wire. That is safe only because
+    ``buffer.tail(from_seq)`` is replayable — if the consumer goes away and a
+    prefetched record is discarded unrendered, the client reconnects via
+    ``GET /responses/tail`` from its last rendered seq and the record is
+    replayed. Do not introduce a non-replayable source under this loop.
+    """
+    records = buffer.tail(from_seq).__aiter__()
+    pending = asyncio.ensure_future(records.__anext__())
+    try:
+        while True:
+            try:
+                rec = await asyncio.wait_for(
+                    asyncio.shield(pending), timeout=SSE_KEEPALIVE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            except StopAsyncIteration:
+                return
+            # Checked BEFORE prefetching: the terminal record ends the stream,
+            # so scheduling another __anext__() here would only be cancelled.
+            if rec.is_terminal:
+                return
+            pending = asyncio.ensure_future(records.__anext__())
+            sse = rec.data.get("sse")
+            if sse:
+                yield sse
+    finally:
+        # Let the cancellation actually land before closing. Task.cancel() is
+        # asynchronous, so closing immediately after it hits the underlying async
+        # generator while ag_running_async is still set, and aclose() raises
+        # "RuntimeError: aclose(): asynchronous generator is already running" —
+        # which then REPLACES the CancelledError on the real disconnect path
+        # (StreamingResponse cancels this task), leaving the iterator open.
+        pending.cancel()
+        # Narrower than suppress(BaseException) and exactly as wide as needed:
+        # asyncio.wait() returns (done, pending) *sets* and never re-raises the
+        # awaited task's exception, so nothing the prefetch did can surface
+        # here. The only reachable exception is a cancellation of the enclosing
+        # task arriving during this await — swallowing that is deliberate, so
+        # that aclose() below still runs.
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            await asyncio.wait([pending])
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        aclose = getattr(records, "aclose", None)
+        if aclose is not None:
+            await aclose()
+        # ...but do not LOSE it. Task.__step has already cleared must_cancel by
+        # the time we catch it, so on the normal-exhaustion path the generator
+        # would return cleanly, the consumer's `async for` would end normally,
+        # and the cancellation would vanish. Re-raise now that the iterator is
+        # closed.
+        if cancelled is not None:
+            raise cancelled

@@ -378,6 +378,19 @@ class AppSettings(Settings):
             "from which a per-request principal is built."
         ),
     )
+    ask_user_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
+        description=(
+            "Whether the agent may ask interactive multiple-choice questions "
+            "(the `ask_user` tool). Off by default because the renderer must "
+            "ship first: the frontend and this server are versioned "
+            "independently, and a client that does not know the "
+            "`response.ask_user` event drops it silently, leaving the agent "
+            "apparently hung until the question times out. Turn on only after "
+            "the frontend is rolled out."
+        ),
+    )
     identity_enforce: Literal["audit", "enforce"] = Field(
         default="audit",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),

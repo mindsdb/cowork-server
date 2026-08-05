@@ -135,6 +135,16 @@ class RunRegistry:
         """
         self._by_cid.pop(conversation_id, None)
 
+    def reset(self) -> None:
+        """Forget every handle without touching the producer tasks.
+
+        For tests: this object is a process global, so a handle registered by
+        one test stays visible to the next. Deliberately does NOT cancel the
+        tasks — the caller owns those, and cancelling here would make a
+        cleanup helper a scheduling side effect.
+        """
+        self._by_cid.clear()
+
     async def gc_finished(self, max_age_seconds: float = 300.0) -> int:
         """Drop handles whose producer finished > max_age ago. The buffer
         file stays on disk — only the in-memory handle is freed."""
