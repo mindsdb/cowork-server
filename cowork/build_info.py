@@ -34,6 +34,11 @@ KEY_INSTALL_CHANNEL = "install_channel"
 _SERVER_DIST = "cowork-server"
 _ANTON_DIST = "anton-agent"
 
+# The closed set of channel values. A release measurement groups/filters on
+# these, so an override outside this set is ignored (with a warning) rather
+# than minted into a new population.
+VALID_CHANNELS = frozenset({"hosted", "git", "pypi", "local", "unknown"})
+
 
 @lru_cache(maxsize=None)
 def _dist_version(name: str) -> str | None:
@@ -55,25 +60,45 @@ def install_channel() -> str:
     while the git channel tracks a branch — so the channel is recorded
     alongside the versions rather than inferred from them.
 
-    ``hosted`` wins over the install source because a hosted deployment's
-    provenance is a property of the snapshot image, not of the user's machine.
-    Otherwise the answer comes from pip's ``direct_url.json``, the same signal
-    the desktop updater switches on (``parseVcsInfo`` in cowork's
-    ``update-logic.ts``): a VCS record means a git install; an editable /
-    directory install is a developer checkout; no record at all means the
-    package came from an index. ``unknown`` is returned rather than a guess
-    when the metadata is missing or unreadable, so an absent channel is
-    explicit in the data instead of being silently bucketed with PyPI.
+    An explicit ``COWORK_INSTALL_CHANNEL`` wins over everything: a deployer
+    declaring the channel knows more than any inference from inside the
+    process. The hub snapshot instances need this — they run tenancy ``local``
+    (org mode would change auth semantics) with cowork-server installed from
+    PyPI *inside* the docker image, so inference would file a snapshot-bake
+    deployment under ``pypi``, merging the slowest delivery channel into the
+    wheel population. Their ``docker run`` passes
+    ``COWORK_INSTALL_CHANNEL=hosted`` (anton_services snapshots/cowork).
+
+    ``hosted`` is otherwise derived from org tenancy — a multi-tenant cloud
+    deployment's provenance is a property of its image, not of how pip
+    fetched the package inside it. Failing both, the answer comes from pip's
+    ``direct_url.json``, the same signal the desktop updater switches on
+    (``parseVcsInfo`` in cowork's ``update-logic.ts``): a VCS record means a
+    git install; an editable / directory install is a developer checkout; no
+    record at all means the package came from an index. ``unknown`` is
+    returned rather than a guess when the metadata is missing or unreadable,
+    so an absent channel is explicit in the data instead of being silently
+    bucketed with PyPI.
     """
     # Imported lazily: app settings pull in the settings stack, and this module
     # is imported from the request path.
     from cowork.common.settings.app_settings import get_app_settings
 
     try:
-        if get_app_settings().tenancy_mode == "org":
+        settings = get_app_settings()
+        override = (settings.install_channel_override or "").strip().lower()
+        if override:
+            if override in VALID_CHANNELS:
+                return override
+            logger.warning(
+                "build_info: ignoring COWORK_INSTALL_CHANNEL=%r (expected one of %s)",
+                override,
+                sorted(VALID_CHANNELS),
+            )
+        if settings.tenancy_mode == "org":
             return "hosted"
     except Exception:  # pragma: no cover - defensive: never fail a turn over telemetry
-        logger.warning("build_info: could not read tenancy mode", exc_info=True)
+        logger.warning("build_info: could not read deployment settings", exc_info=True)
 
     try:
         raw = distribution(_SERVER_DIST).read_text("direct_url.json")

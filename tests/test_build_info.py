@@ -40,9 +40,12 @@ class _FakeDist:
         return self._direct_url
 
 
-def _patch_channel_inputs(monkeypatch, *, tenancy: str = "local", direct_url: str | None = None):
+def _patch_channel_inputs(
+    monkeypatch, *, tenancy: str = "local", direct_url: str | None = None, override: str = ""
+):
     class _Settings:
         tenancy_mode = tenancy
+        install_channel_override = override
 
     monkeypatch.setattr(
         "cowork.common.settings.app_settings.get_app_settings", lambda: _Settings()
@@ -51,6 +54,35 @@ def _patch_channel_inputs(monkeypatch, *, tenancy: str = "local", direct_url: st
 
 
 class TestInstallChannel:
+    def test_explicit_override_beats_tenancy_and_install_source(self, monkeypatch):
+        # The hub snapshot case: local tenancy (org would change auth
+        # semantics) with a git/PyPI-installed cowork-server inside the docker
+        # image. Inference from inside the process is wrong there — the
+        # deployer declares the channel via COWORK_INSTALL_CHANNEL.
+        _patch_channel_inputs(
+            monkeypatch,
+            tenancy="local",
+            direct_url=json.dumps({"vcs_info": {"commit_id": "abc123"}}),
+            override="hosted",
+        )
+        assert build_info.install_channel() == "hosted"
+
+    def test_invalid_override_degrades_to_inference(self, monkeypatch, caplog):
+        # A typo'd override must not mint a new channel population; it is
+        # warned about and inference proceeds as if it were unset.
+        _patch_channel_inputs(
+            monkeypatch,
+            direct_url=json.dumps({"vcs_info": {"commit_id": "abc123"}}),
+            override="lightsail",
+        )
+        with caplog.at_level("WARNING"):
+            assert build_info.install_channel() == "git"
+        assert "COWORK_INSTALL_CHANNEL" in caplog.text
+
+    def test_override_is_normalized(self, monkeypatch):
+        _patch_channel_inputs(monkeypatch, direct_url=None, override="  Hosted ")
+        assert build_info.install_channel() == "hosted"
+
     def test_hosted_wins_over_install_source(self, monkeypatch):
         # A hosted deployment's provenance belongs to the snapshot image, not
         # to how pip happened to fetch the package inside it.
@@ -90,6 +122,7 @@ class TestInstallChannel:
 
         class _Settings:
             tenancy_mode = "local"
+            install_channel_override = ""
 
         monkeypatch.setattr(
             "cowork.common.settings.app_settings.get_app_settings", lambda: _Settings()
@@ -160,7 +193,7 @@ class TestBuildTraceMetadata:
         merged = build_trace_metadata(None)
         assert merged[KEY_SERVER_VERSION]
         assert merged[KEY_ANTON_VERSION]
-        assert merged[KEY_INSTALL_CHANNEL] in {"hosted", "git", "pypi", "local", "unknown"}
+        assert merged[KEY_INSTALL_CHANNEL] in build_info.VALID_CHANNELS
 
 
 class TestStampReachesTheHarness:
