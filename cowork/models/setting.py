@@ -1,3 +1,4 @@
+import sqlalchemy as sa
 from sqlmodel import Field
 
 from cowork.models.base import BaseSQLModel
@@ -6,12 +7,48 @@ from cowork.models.base import BaseSQLModel
 class Setting(BaseSQLModel, table=True):
     __tablename__ = "settings"
 
-    # Scope columns are inert until the settings split — see
-    # _TENANCY_DEFERRED_TABLES in cowork/db/scoped.py.
+    # Per-scope uniqueness (migration c8e1a4f7b2d9): one global row (scope
+    # NULL), one per org, one per (org, user). A user is identified by (org_id,
+    # user_id) — the same person in two orgs must NOT share a row — so the user
+    # index carries org_id too. The CHECK pins the three valid row shapes so a
+    # NULL owner or a bogus scope string can't slip past the partial indexes.
+    __table_args__ = (
+        sa.Index(
+            "uq_settings_key_global",
+            "key",
+            unique=True,
+            sqlite_where=sa.text("scope IS NULL"),
+            postgresql_where=sa.text("scope IS NULL"),
+        ),
+        sa.Index(
+            "uq_settings_key_org",
+            "key",
+            "org_id",
+            unique=True,
+            sqlite_where=sa.text("scope = 'org'"),
+            postgresql_where=sa.text("scope = 'org'"),
+        ),
+        sa.Index(
+            "uq_settings_key_user",
+            "key",
+            "org_id",
+            "user_id",
+            unique=True,
+            sqlite_where=sa.text("scope = 'user'"),
+            postgresql_where=sa.text("scope = 'user'"),
+        ),
+        sa.CheckConstraint(
+            "(scope IS NULL AND org_id IS NULL AND user_id IS NULL) OR "
+            "(scope = 'org' AND org_id IS NOT NULL AND user_id IS NULL) OR "
+            "(scope = 'user' AND org_id IS NOT NULL AND user_id IS NOT NULL)",
+            name="ck_settings_scope_shape",
+        ),
+    )
 
-    key: str = Field(max_length=128, unique=True, index=True)
+    # No longer globally unique — uniqueness is per-scope (above); the plain
+    # index backs the by-key fallback lookups.
+    key: str = Field(max_length=128, index=True)
     value: str
-    # No indexes yet — the only live query path is by `key`.
     scope: str | None = Field(default=None, max_length=16, description="'org' | 'user'; NULL = legacy/global row")
     user_id: str | None = Field(default=None, max_length=36, description="Owning user for user-scoped rows")
     org_id: str | None = Field(default=None, max_length=36, description="Owning org for org-scoped rows")
