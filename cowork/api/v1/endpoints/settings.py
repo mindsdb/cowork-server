@@ -263,10 +263,34 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
     # A model absent from this map falls back to the client's id-derived label.
     model_labels: dict[str, str] = {}
 
+    # Grouping metadata for the picker:
+    #   modelProviders id → the provider serving the model ("anthropic"), which
+    #                  decides its section.
+    #   modelFamilies  id → the moving alias the model belongs to. Dense for every
+    #                  model MindsHub describes, and equal to the id on a moving
+    #                  alias, so `families[id] == id` marks a model "latest" and
+    #                  anything else names the alias it is a frozen version of.
+    #
+    # Both are keyed by model id ALONE and are NOT scoped to the minds-cloud
+    # bucket — population is gated on a MindsHub key being configured, with no
+    # reference to which provider the user actually selected. So they are empty
+    # only for a user with no MindsHub key at all, NOT for a user on BYOK.
+    #
+    # A consumer must therefore decide per model, by looking its id up, and must
+    # not read "the map is non-empty" as "this model is described". For
+    # `modelLabels`/`modelEnabled` an absent key is a benign fallback, but for
+    # `modelFamilies` absence is actively interpreted: read as "is its own head" it
+    # tags every BYOK model "latest", including dated snapshots that never move.
+    model_providers: dict[str, str] = {}
+    model_families: dict[str, str] = {}
+
     s = SettingService(session, scope).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+        listing = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
+        )
+        live, live_efforts, live_enabled, live_labels = (
+            listing.ids, listing.efforts, listing.enabled, listing.labels
         )
         if live:
             recommended["minds-cloud"] = live
@@ -301,6 +325,8 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
+        model_providers.update(listing.providers)
+        model_families.update(listing.families)
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -326,13 +352,16 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+        oc_listing = await fetch_minds_models(
             oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
+        )
+        live, live_efforts, live_enabled, live_labels = (
+            oc_listing.ids, oc_listing.efforts, oc_listing.enabled, oc_listing.labels
         )
         if live:
             recommended["openai-compatible"] = live
-        # These three maps are keyed by model id alone, not by (provider, id),
-        # so a custom endpoint serving an id MindsHub also serves would other-
+        # These maps are keyed by model id alone, not by (provider, id), so a
+        # custom endpoint serving an id MindsHub also serves would other-
         # wise decide that model's label, effort levels and locked state for the
         # minds-cloud bucket too — letting a BYO base URL rename or lock a
         # MindsHub model in the picker. MindsHub is fetched first and wins;
@@ -340,6 +369,12 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         _fill_missing(model_efforts, live_efforts)
         _fill_missing(model_enabled, live_enabled)
         _fill_missing(model_labels, live_labels)
+        # Same precedence for the grouping metadata, for the same reason: a BYO
+        # endpoint must not be able to move a MindsHub model into another vendor's
+        # section or relabel it as an old version of something. Empty in practice —
+        # a plain OpenAI-compatible endpoint publishes neither field.
+        _fill_missing(model_providers, oc_listing.providers)
+        _fill_missing(model_families, oc_listing.families)
 
     return {
         "recommendedModels": recommended,
@@ -347,6 +382,8 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelLabels": model_labels,
+        "modelProviders": model_providers,
+        "modelFamilies": model_families,
     }
 
 

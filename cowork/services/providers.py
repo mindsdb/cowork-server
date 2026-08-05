@@ -5,7 +5,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -116,10 +116,43 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-# Cache value: (timestamp, (ids, efforts_map, enabled_map, labels_map)). ids is None on failure.
-_minds_models_cache: dict[
-    str, tuple[float, tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]]]
-] = {}
+
+
+class MindsModelListing(NamedTuple):
+    """What one `/v1/models` fetch yields, keyed by model id where it's a map.
+
+    A named tuple rather than a plain tuple because the picker needs six pieces
+    of this, and positional unpacking of five same-typed dicts is a silent
+    field-order bug waiting to happen in a stubbed test.
+
+    ``ids`` is None on any failure, which is how the caller knows to keep the
+    list it already has instead of emptying the picker. The maps are keyed by
+    model id and are empty (never None) whenever the gateway doesn't publish that
+    field — a plain OpenAI-compatible endpoint publishes none of
+    ``labels``/``providers``/``families``.
+    """
+
+    ids: Optional[list[str]]
+    efforts: dict[str, dict]
+    enabled: dict[str, bool]
+    # MindsHub's human-readable `label` ("Claude Sonnet 5"). Display-only.
+    labels: dict[str, str]
+    # Who makes the model ("anthropic", "moonshot", …), so the picker can group
+    # the catalog into vendor sections.
+    providers: dict[str, str]
+    # The moving alias each model belongs to, defaulted to the id itself.
+    # ``families[id] == id`` means the version behind this alias moves, which is
+    # what the picker tags "latest"; anything else names the moving alias this
+    # row is a frozen version of.
+    families: dict[str, str]
+
+
+# Every failure path returns this same value, so "we got nothing" is one object
+# rather than six literals that have to agree.
+_EMPTY_LISTING = MindsModelListing(None, {}, {}, {}, {}, {})
+
+# Cache value: (timestamp, listing). listing.ids is None on failure.
+_minds_models_cache: dict[str, tuple[float, MindsModelListing]] = {}
 
 
 # Substrings that identify an embeddings model by id, used only for endpoints
@@ -147,15 +180,17 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
 
 async def fetch_minds_models(
     minds_url: str, api_key: str, *, force_refresh: bool = False
-) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]]:
+) -> MindsModelListing:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
-    Returns ``(ids, efforts, enabled, labels)`` where ``ids`` is the model-id
-    list (or None on any failure so the caller falls back to the static
-    list), ``efforts`` maps a model id to ``{"efforts": [...], "default":
-    "..."}`` for every model that advertises ``reasoning_efforts``,
-    ``enabled`` maps a model id to its ``enabled`` flag, and ``labels`` maps a
-    model id to MindsHub's human-readable ``label`` string. MindsHub marks a
+    Returns a :class:`MindsModelListing`. ``ids`` is the model-id list (or None
+    on any failure so the caller falls back to the static list), ``efforts`` maps
+    a model id to ``{"efforts": [...], "default": "..."}`` for every model that
+    advertises ``reasoning_efforts``, ``enabled`` maps a model id to its
+    ``enabled`` flag, ``labels`` maps a model id to MindsHub's human-readable
+    ``label`` string, and ``providers``/``families`` carry the picker's grouping
+    metadata — who makes the model, and which moving alias it belongs to.
+    MindsHub marks a
     model the org's wallet can't currently pay for / whose free allowance is
     spent as ``"enabled": false`` so the picker can show it as locked with an
     "add credits" affordance; a model missing from ``enabled`` is treated as
@@ -176,22 +211,20 @@ async def fetch_minds_models(
     full HTTP timeout for as long as the outage lasts.
     """
     if not minds_url or not api_key:
-        return None, {}, {}, {}
+        return _EMPTY_LISTING
     base = minds_chat_base_url(minds_url)
 
     now = time.monotonic()
     cached = _minds_models_cache.get(base)
     if cached:
         ts, val = cached
-        ttl = _MINDS_MODELS_TTL if val[0] else _MINDS_MODELS_FAIL_TTL
+        ttl = _MINDS_MODELS_TTL if val.ids else _MINDS_MODELS_FAIL_TTL
         # force_refresh only overrides the success TTL — see the negative-cache
         # note above.
-        if (now - ts) < ttl and not (force_refresh and val[0]):
+        if (now - ts) < ttl and not (force_refresh and val.ids):
             return val
 
-    def _remember(
-        val: tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]],
-    ) -> tuple[Optional[list[str]], dict[str, dict], dict[str, bool], dict[str, str]]:
+    def _remember(val: MindsModelListing) -> MindsModelListing:
         _minds_models_cache[base] = (time.monotonic(), val)
         return val
 
@@ -211,24 +244,40 @@ async def fetch_minds_models(
             )
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember((None, {}, {}, {}))
+            return _remember(_EMPTY_LISTING)
         data = r.json()
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
-        return _remember((None, {}, {}, {}))
+        return _remember(_EMPTY_LISTING)
 
     # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
     # Accept a bare list too, defensively. Each row may carry the non-standard
     # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
-    # (str), `enabled` (bool), and `label` (str) — OpenAI clients ignore
-    # unknown keys; we surface them for the picker.
+    # (str), `enabled` (bool), and `label` / `provider` / `family` (str) —
+    # OpenAI clients ignore unknown keys; we surface them for the picker.
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return _remember((None, {}, {}, {}))
+        return _remember(_EMPTY_LISTING)
     ids: list[str] = []
     efforts: dict[str, dict] = {}
     enabled: dict[str, bool] = {}
     labels: dict[str, str] = {}
+    providers: dict[str, str] = {}
+    families: dict[str, str] = {}
+
+    def _text(row: dict, key: str) -> Optional[str]:
+        """A non-empty string field, or None. Anything else is treated as absent.
+
+        The picker degrades cleanly on a missing field (no grouping) but not on a
+        present-but-junk one, so a null / number / blank from an unexpected
+        gateway is read as "didn't publish it" rather than becoming a section
+        heading called "42".
+        """
+        value = row.get(key)
+        if not isinstance(value, str):
+            return None
+        return value.strip() or None
+
     for row in rows:
         if not isinstance(row, dict) or not row.get("id"):
             continue
@@ -259,7 +308,18 @@ async def fetch_minds_models(
         label = row.get("label")
         if isinstance(label, str) and label.strip():
             labels[model_id] = label.strip()
-    return _remember(((ids or None), efforts, enabled, labels))
+        if provider := _text(row, "provider"):
+            providers[model_id] = provider
+            # Defaulted to the id so the map is dense: "this alias moves" then
+            # reads as families[id] == id for every model, with no missing-key
+            # branch at the render site. Keyed off `provider` because a family
+            # with no vendor to group it under is metadata the picker can't
+            # place — a gateway publishing neither yields {} for both, which is
+            # how the app knows to fall back to an ungrouped list.
+            families[model_id] = _text(row, "family") or model_id
+    return _remember(
+        MindsModelListing((ids or None), efforts, enabled, labels, providers, families)
+    )
 
 
 # ── Config readiness ─────────────────────────────────────────────────
