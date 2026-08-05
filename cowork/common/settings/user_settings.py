@@ -1,6 +1,11 @@
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
-from typing import Annotated, Any, Callable, get_args
+from typing import TYPE_CHECKING, Annotated, Any, Callable, get_args
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 
@@ -176,6 +181,15 @@ class _DynamicOptions:
         return self._fn()
 
 
+class _OrgScoped:
+    """Annotated marker: this setting is org-level config (admin-owned) rather
+    than a personal preference. Untagged fields are per-user; SecretStr
+    credentials are org regardless. Read by setting_is_org_scoped."""
+
+
+ORG = _OrgScoped()
+
+
 def _harness_options() -> list[str]:
     from cowork.harnesses.base import available_harness_ids
     return available_harness_ids()
@@ -286,12 +300,12 @@ class UserSettings(Settings):
         title="MindsHub API Key",
         description="API key for MindsHub. Required if using MindsHub as a provider.",
     )
-    minds_url: str = Field(
+    minds_url: Annotated[str, ORG] = Field(
         default_factory=default_minds_url,
         title="MindsHub URL",
         description="Base URL for the MindsHub API.",
     )
-    planning_provider: Provider = Field(
+    planning_provider: Annotated[Provider, ORG] = Field(
         default=Provider.ANTHROPIC,
         title="Planning Provider",
         description="The provider to use for the reasoning/planning model.",
@@ -301,7 +315,7 @@ class UserSettings(Settings):
         title="Planning Model",
         description="The reasoning model used for planning. Defaults to the recommended model for the selected provider.",
     )
-    coding_provider: Provider = Field(
+    coding_provider: Annotated[Provider, ORG] = Field(
         default=Provider.ANTHROPIC,
         title="Coding Provider",
         description="The provider to use for the coding model.",
@@ -333,7 +347,7 @@ class UserSettings(Settings):
     # point routing + summarization at a cheap model independently of the
     # coding (scratchpad) model. Falls back to the coding role in anton when
     # unset, so leaving these at defaults is behavior-preserving.
-    router_provider: Provider = Field(
+    router_provider: Annotated[Provider, ORG] = Field(
         default=Provider.ANTHROPIC,
         title="Routing & Summarization Provider",
         description="The provider for the routing/summarization model.",
@@ -347,12 +361,12 @@ class UserSettings(Settings):
             "provider (MindsHub → kimi; other providers → their smallest model)."
         ),
     )
-    harness: Annotated[str, _DynamicOptions(_harness_options)] = Field(
+    harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
         default="anton",
         title="Harness",
         description="The AI harness used to generate responses.",
     )
-    channels_harness: Annotated[str, _DynamicOptions(_harness_options)] = Field(
+    channels_harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
         default_factory=lambda: (get_app_settings().channels_harness or "anton"),
         title="Channel Agent",
         description="The AI harness that serves messaging-channel conversations.",
@@ -455,7 +469,7 @@ class UserSettings(Settings):
     # Defaults come from app settings so hosted deployments (operator-paid
     # inference, no Settings UI on web) can lower them via env without
     # touching per-user rows.
-    max_tool_rounds: int = Field(
+    max_tool_rounds: Annotated[int, ORG] = Field(
         default_factory=lambda: get_app_settings().default_max_tool_rounds,
         ge=5,
         le=500,
@@ -469,7 +483,7 @@ class UserSettings(Settings):
             "variable."
         ),
     )
-    max_continuations: int = Field(
+    max_continuations: Annotated[int, ORG] = Field(
         default_factory=lambda: get_app_settings().default_max_continuations,
         ge=0,
         le=25,
@@ -483,42 +497,42 @@ class UserSettings(Settings):
             "ANTON_MAX_CONTINUATIONS environment variable."
         ),
     )
-    publish_url: str = Field(
+    publish_url: Annotated[str, ORG] = Field(
         default="",
         title="Publish URL",
         description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
-    openai_base_url: str = Field(
+    openai_base_url: Annotated[str, ORG] = Field(
         default="",
         title="OpenAI Base URL",
         description="Base URL for OpenAI-compatible providers.",
     )
-    model_mode: str = Field(
+    model_mode: Annotated[str, ORG] = Field(
         default="default",
         title="Model Mode",
         description="Whether to use default or custom model assignments (default or custom).",
     )
-    model_overrides: str = Field(
+    model_overrides: Annotated[str, ORG] = Field(
         default="{}",
         title="Model Overrides",
         description="JSON-encoded per-role provider/model overrides when model_mode is custom.",
     )
-    providers_json: str = Field(
+    providers_json: Annotated[str, ORG] = Field(
         default="[]",
         title="Providers",
         description="JSON-encoded list of configured provider entries for the settings UI.",
     )
-    provider_status: str = Field(
+    provider_status: Annotated[str, ORG] = Field(
         default="{}",
         title="Provider Status",
         description="JSON-encoded map of provider type → last connectivity-test status (ok|fail). Persisted so the Settings dots survive a reload.",
     )
-    provider_status_details: str = Field(
+    provider_status_details: Annotated[str, ORG] = Field(
         default="{}",
         title="Provider Status Details",
         description="JSON-encoded map of provider type → last connectivity-test detail (e.g. an HTTP code).",
     )
-    minds_model_enabled: str = Field(
+    minds_model_enabled: Annotated[str, ORG] = Field(
         default="{}",
         title="MindsHub Model Availability",
         description=(
@@ -723,7 +737,10 @@ class UserSettings(Settings):
     @staticmethod
     def field_is_sensitive(field_name: str) -> bool:
         annotation = UserSettings.model_fields[field_name].annotation
-        return SecretStr in get_args(annotation)
+        # A bare `SecretStr` has no type args; `SecretStr | None` carries it in
+        # the union args. Handle both so a future non-optional credential is
+        # still encrypted + classified as org, not stored as plaintext.
+        return annotation is SecretStr or SecretStr in get_args(annotation)
 
     @staticmethod
     def field_options(field_name: str) -> list[str] | None:
@@ -740,27 +757,65 @@ class UserSettings(Settings):
         return None
 
 
-_cache: UserSettings | None = None
+def setting_is_org_scoped(key: str) -> bool:
+    """True for org-level config, False for a personal preference. channel.*
+    keys and SecretStr credentials are org structurally; other fields are org
+    iff tagged with the ORG marker. Only decides where a write lands, not read
+    fallback."""
+    if key.startswith("channel."):
+        return True
+    field = UserSettings.model_fields.get(key)
+    if field is None:
+        return False
+    if UserSettings.field_is_sensitive(key):
+        return True
+    return any(isinstance(m, _OrgScoped) for m in field.metadata)
 
 
-def get_user_settings() -> UserSettings:
-    global _cache
-    if _cache is None:
-        _cache = _load_from_db()
-    return _cache
+_current_scope: ContextVar["TenantScope | None"] = ContextVar("settings_scope", default=None)
+
+
+@contextmanager
+def use_settings_scope(scope: "TenantScope"):
+    """Bind the tenant scope get_user_settings() resolves against for the
+    duration of the block — set at the turn boundary (the detached producer) and
+    per request, so deep readers don't each need the scope threaded in."""
+    token = _current_scope.set(scope)
+    try:
+        yield
+    finally:
+        _current_scope.reset(token)
+
+
+def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
+    """Resolved settings for a scope: the explicit arg, else the ambient scope
+    (use_settings_scope), else LOCAL_SCOPE. An unscoped read resolves global
+    rows only — never another org's data — so a missed scope degrades to
+    deployment defaults, it cannot leak across orgs.
+
+    Loads fresh from the DB every call — no process-global cache. A cached
+    credential can't survive a rotation on another replica, and there's no
+    load-vs-invalidate race. If a hot path needs it, add a per-request/turn
+    cache (naturally scoped and short-lived), not a process singleton.
+    """
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    scope = scope or _current_scope.get() or LOCAL_SCOPE
+    return _load_from_db(scope)
 
 
 def invalidate_user_settings_cache() -> None:
-    global _cache
-    _cache = None
+    # No process-global cache anymore (get_user_settings loads fresh). Kept as a
+    # no-op so existing post-write callers don't need to change.
+    pass
 
 
-def _load_from_db() -> UserSettings:
+def _load_from_db(scope: "TenantScope") -> UserSettings:
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
     session = get_open_session()
     try:
-        return SettingService(session).load()
+        return SettingService(session, scope).load()
     finally:
         session.close()
