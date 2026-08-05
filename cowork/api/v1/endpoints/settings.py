@@ -403,6 +403,7 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
     require_local(request)
 
     from cowork.migrations import sync_env_vars_to_db
+    from cowork.common.settings.env_boundary import atomic_write_env, _is_dotenv_safe
 
     incoming = _parse_dotenv_content(body.content)
 
@@ -410,17 +411,23 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
         existing = _read_env_dict()
         existing.update(incoming)
 
-        # Sync recognised ANTON_* vars to the DB first. If validation fails,
-        # leave the legacy .env untouched so the DB remains authoritative.
-        sync_env_vars_to_db(session, existing)
+        # Sync ONLY the recognised vars actually in THIS request to the DB — never
+        # the whole merged .env. The server now mirrors DB->.env (ENG-1127), so the
+        # file can hold a preserved/translated cluster (a stale minds-cloud line, or
+        # a gemini role written as openai-compatible); re-syncing all of it would
+        # overwrite the authoritative DB choice from the CLI's derived file. If
+        # validation fails, leave the legacy .env untouched so the DB stays authoritative.
+        sync_env_vars_to_db(session, incoming)
 
-        _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-        lines = [f"{k}={v}" for k, v in existing.items()]
-        _ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        try:
-            _ENV_PATH.chmod(0o600)
-        except OSError:
-            pass
+        # Write through the same hardened path as the managed export (atomic
+        # replace, 0o600, transient-Windows-lock retry) instead of a bare
+        # write_text, and skip any newline-bearing var so this legacy writer can't
+        # smuggle a second line either (ENG-1127 review).
+        lines = [
+            f"{k}={v}" for k, v in existing.items()
+            if _is_dotenv_safe(k) and _is_dotenv_safe(v)
+        ]
+        atomic_write_env(_ENV_PATH, "\n".join(lines) + "\n")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

@@ -181,77 +181,6 @@ def _harness_options() -> list[str]:
     return available_harness_ids()
 
 
-# ── .env ↔ DB setting aliases ────────────────────────────────────────
-#
-# One canonical map of DB setting key → its ANTON_* .env variable name, for
-# every field that overlaps between AntonSettings (.env, read by the standalone
-# ``anton`` CLI) and UserSettings (DB). This is the single source the .env→DB
-# seed (``migrations``), the ``POST /settings/raw`` merge sync, and the client
-# all derive from. The same map was previously hand-maintained in both
-# ``migrations._ENV_TO_SETTING`` and the client's ``syncSettings.ts`` — the two
-# had already drifted (the client copy silently omitted gemini, the OpenAI-
-# compatible key, router_provider, memory_enabled, act_first, proactive_
-# dashboards and publish_url), which is exactly the class of bug ENG-941/ENG-1125
-# retires.
-#
-# planning_model / coding_model are DELIBERATELY absent (ENG-739): a model in
-# .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
-# token-refresh would re-pin a picker choice from a stale ``latest:`` line.
-#
-# max_tool_rounds / max_continuations are DELIBERATELY absent too, for the
-# ENG-739 reason plus a harder failure mode: anton's own CoreSettings accepts
-# any int, so a stale anton-CLI line like ANTON_MAX_TOOL_ROUNDS=1000 in the
-# shared ~/.cowork/.env is valid for the CLI but fails UserSettings' bounds —
-# and because sync_env_vars_to_db validates every mapped key and raises on the
-# first failure, one such line would 400 every credential push / token
-# refresh. Budgets enter the DB only via explicit writes (Settings UI / API).
-#
-# General inclusion rule: a key belongs here only if (a) every value anton's
-# own settings accept for it is also valid for UserSettings, and (b)
-# re-syncing a stale .env line can never override a choice the user made in
-# the product. When in doubt, leave it out — .env lines still work for the
-# standalone anton CLI.
-SETTING_ENV_ALIASES: dict[str, str] = {
-    "anthropic_api_key": "ANTON_ANTHROPIC_API_KEY",
-    "openai_api_key": "ANTON_OPENAI_API_KEY",
-    "openai_compatible_api_key": "ANTON_OPENAI_API_KEY_CUSTOM",
-    "gemini_api_key": "ANTON_GEMINI_API_KEY",
-    "minds_api_key": "ANTON_MINDS_API_KEY",
-    "planning_provider": "ANTON_PLANNING_PROVIDER",
-    "coding_provider": "ANTON_CODING_PROVIDER",
-    "router_provider": "ANTON_ROUTER_PROVIDER",
-    "minds_url": "ANTON_MINDS_URL",
-    "openai_base_url": "ANTON_OPENAI_BASE_URL",
-    "memory_enabled": "ANTON_MEMORY_ENABLED",
-    "memory_mode": "ANTON_MEMORY_MODE",
-    "episodic_memory": "ANTON_EPISODIC_MEMORY",
-    "proactive_dashboards": "ANTON_PROACTIVE_DASHBOARDS",
-    "act_first": "ANTON_ACT_FIRST",
-    "publish_url": "ANTON_PUBLISH_URL",
-}
-
-# Inverse view (ANTON_* .env var → DB setting key) for .env-first callers, i.e.
-# the first-boot migration seed and the ``POST /settings/raw`` merge sync.
-ENV_ALIAS_TO_SETTING: dict[str, str] = {v: k for k, v in SETTING_ENV_ALIASES.items()}
-
-
-def normalize_provider_value(val: str, *, minds_key_present: bool) -> str:
-    """Translate a .env / UI provider string to the DB ``Provider`` enum value.
-
-    The single home for the hyphen→underscore canonicalization plus the
-    "a Minds key is present, so ``openai-compatible`` really means
-    ``minds_cloud``" heuristic. This was reimplemented in
-    ``migrations._normalize_provider_value``, the client's ``syncSettings.ts``,
-    and ``settingsTransform.js`` — three copies that could disagree, silently
-    routing a provider to the wrong client (the inverse direction, DB→UI, is
-    ``Provider.ui_value``).
-    """
-    canonical = val.replace("-", "_")
-    if canonical == Provider.OPENAI_COMPATIBLE.value and minds_key_present:
-        return Provider.MINDS_CLOUD.value
-    return canonical
-
-
 class UserSettings(Settings):
     # The recommended-model catalog and per-provider model defaults are
     # global, application-level config and live in app_settings
@@ -591,8 +520,11 @@ class UserSettings(Settings):
                 self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
             )
         if self.router_model is None:
+            # Default from the router's OWN provider — deriving from coding_provider
+            # paired an independently-set router (e.g. router=OpenAI, coding=Anthropic)
+            # with the wrong vendor's model (ENG-1127 review).
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
+                self.router_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
             )
         return self
 
