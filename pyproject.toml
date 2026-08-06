@@ -24,6 +24,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
     "psycopg[binary]>=3.2",
+    "redis>=5,<6",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "tzlocal>=5.0",
@@ -70,7 +71,7 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "feat/whole-turn-skeleton" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
