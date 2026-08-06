@@ -787,6 +787,13 @@ def use_settings_scope(scope: "TenantScope"):
         _current_scope.reset(token)
 
 
+def current_settings_scope() -> "TenantScope | None":
+    """The ambient tenant scope bound by use_settings_scope (None outside a
+    bound request/turn) — for org-keying non-settings resources on the same
+    boundary, e.g. the in-process harness memory root."""
+    return _current_scope.get()
+
+
 def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
     """Resolved settings for a scope: explicit arg, else ambient
     (use_settings_scope), else LOCAL_SCOPE. Unscoped resolves global rows only,
