@@ -46,7 +46,7 @@ class SharedMemoryStore(MemoryStore):
             if root is not None
             else Path(get_app_settings().memory.root_dir).expanduser()
         )
-        # Org mode: per-org root — rules/lessons feed agent context (injection risk).
+        # Org mode: per-org root; local mode uses the shared root unchanged.
         super().__init__(scoped_storage_root(base, scope))
 
     def list_slots(self) -> list[MemorySlot]:
