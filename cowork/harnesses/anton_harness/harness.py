@@ -502,7 +502,13 @@ class AntonHarness:
         from cowork.common.settings.user_settings import get_user_settings
         from pydantic import SecretStr
 
-        anton_settings = AntonSettings()
+        # Isolate the embedded base from the user's standalone CLI config
+        # (ENG-1295): the standalone `anton` now owns ~/.anton/.env, so loading
+        # the .env chain here would bleed a user's personal CLI settings (e.g.
+        # ANTON_MAX_TOKENS, ANTON_MEMORY_MODE) into Cowork sessions. Build with
+        # no .env base so embedded settings come only from anton defaults + the
+        # DB overlay applied below.
+        anton_settings = AntonSettings(_env_file=None)
         anton_settings.resolve_workspace(str(base))
 
         # Per-project skills

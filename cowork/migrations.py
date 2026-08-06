@@ -10,14 +10,12 @@ from the now-legacy ``~/.anton/.env`` path).  Bumping to v2 lets users who
 had the old sentinel fire against the wrong path get a fresh migration run
 from the correct ``~/.cowork/.env`` location.
 
-After migration the DB is **authoritative** for all overlapping fields.
-The ``.env`` file continues to exist for:
-  - The standalone ``anton`` CLI (reads ``AntonSettings`` from ``.env``)
-  - Onboarding (writes ``.env`` first, then syncs to DB)
-  - Fields that only exist in ``AntonSettings`` (workspace paths, etc.)
-
-Cowork-server runtime code should read from ``get_user_settings()`` (DB),
-never from the ``.env`` directly.
+After migration the DB is **authoritative**. This is a one-way seed: the
+server no longer writes ``~/.cowork/.env`` back (the DB->.env export was
+removed in ENG-1295, and the standalone ``anton`` CLI now owns its own
+``~/.anton/.env``). Reading a legacy ``~/.cowork/.env`` here only bootstraps
+the DB on first upgrade; cowork-server runtime code reads from
+``get_user_settings()`` (DB), never from ``.env`` directly.
 """
 from __future__ import annotations
 
@@ -33,12 +31,8 @@ from pydantic import ValidationError
 
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
 from cowork.common.paths import cowork_home
-from cowork.common.settings import invalidate_user_settings_cache
-from cowork.common.settings.user_settings import (
-    ENV_ALIAS_TO_SETTING,
-    UserSettings,
-    normalize_provider_value,
-)
+from cowork.common.settings.env_boundary import ENV_ALIAS_TO_SETTING, env_to_db_updates
+from cowork.common.settings.user_settings import UserSettings
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
@@ -55,7 +49,7 @@ _MIGRATION_SENTINEL = "_env_migrated_v2"
 
 # Map of .env keys -> DB setting keys for all fields that overlap between
 # AntonSettings (.env) and UserSettings (DB). Derived from the single canonical
-# alias map in user_settings (SETTING_ENV_ALIASES) so this table can no longer
+# alias map in env_boundary (SETTING_ENV_ALIASES) so this table can no longer
 # drift from the client's copy — see the note there, incl. why the model keys
 # (ANTON_PLANNING_MODEL / ANTON_CODING_MODEL) are deliberately excluded
 # (ENG-739). Drives both the first-boot .env→DB seed (migrate_env_to_db) and the
@@ -80,18 +74,6 @@ def _parse_env_file() -> dict[str, str]:
     return result
 
 
-def _normalize_provider_value(val: str, dotenv: dict[str, str]) -> str:
-    """Translate .env provider strings to DB enum values.
-
-    Thin adapter over the canonical ``normalize_provider_value`` in
-    user_settings — kept so the .env-shaped call sites here don't each repeat
-    the "does this dotenv carry a Minds key" check.
-    """
-    return normalize_provider_value(
-        val, minds_key_present=bool(dotenv.get("ANTON_MINDS_API_KEY"))
-    )
-
-
 def sync_env_vars_to_db(session: Session, dotenv: dict[str, str]) -> list[str]:
     """Upsert a dict of ANTON_* env vars into the settings DB.
 
@@ -99,14 +81,7 @@ def sync_env_vars_to_db(session: Session, dotenv: dict[str, str]) -> list[str]:
     keys that have no mapping in ``_ENV_TO_SETTING``.
     """
     svc = SettingService(session)
-    updates: dict[str, str] = {}
-    for env_key, setting_key in _ENV_TO_SETTING.items():
-        val = dotenv.get(env_key)
-        if not val:
-            continue
-        if setting_key.endswith("_provider"):
-            val = _normalize_provider_value(val, dotenv)
-        updates[setting_key] = val
+    updates = env_to_db_updates(dotenv)
 
     for key, value in updates.items():
         svc._validate_key(key)
@@ -135,17 +110,14 @@ def migrate_env_to_db(session: Session) -> bool:
 
     if dotenv:
         migrated_keys: list[str] = []
-        for env_key, setting_key in _ENV_TO_SETTING.items():
-            val = dotenv.get(env_key)
-            if not val:
-                continue
-            if setting_key.endswith("_provider"):
-                val = _normalize_provider_value(val, dotenv)
+        for setting_key, val in env_to_db_updates(dotenv).items():
             try:
+                # Seed the DB from a legacy .env (ENG-1295). One-time, sentinel-
+                # guarded; the DB is authoritative thereafter.
                 svc.upsert_setting(setting_key, val)
                 migrated_keys.append(setting_key)
             except Exception as e:
-                logger.debug("Skipping env migration for %s: %s", env_key, e)
+                logger.debug("Skipping env migration for %s: %s", setting_key, e)
 
         if migrated_keys:
             logger.info(
@@ -197,7 +169,8 @@ def backfill_minds_url(session: Session) -> bool:
             changed.append(key)
     if changed:
         session.commit()
-        invalidate_user_settings_cache()
+        # Invalidate the settings cache so the next read sees the rewritten host.
+        svc._after_write()
         logger.info(
             "Backfilled legacy MindsHub host (mdb.ai -> %s) in: %s",
             canonical, ", ".join(changed),

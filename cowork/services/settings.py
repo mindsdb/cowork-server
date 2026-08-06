@@ -154,11 +154,16 @@ class SettingService:
             row.value = store_val
         self.session.add(row)
 
+    def _after_write(self) -> None:
+        """Post-commit hook shared by the settings mutators: invalidate the
+        user-settings cache so the next read sees the committed state."""
+        invalidate_user_settings_cache()
+
     def upsert_setting(self, key: str, value: str) -> SettingResponse:
         store_val, validated = self._encode_for_store(key, value)
         self._write_row(key, store_val)
         self.session.commit()
-        invalidate_user_settings_cache()
+        self._after_write()
         return self._to_response(key, validated, True)
 
     def save_all(self, updates: dict[str, str]) -> list[str]:
@@ -180,7 +185,7 @@ class SettingService:
             self._write_row(key, store_val)
         if encoded:
             self.session.commit()
-            invalidate_user_settings_cache()
+            self._after_write()
         return list(encoded.keys())
 
     def bulk_upsert(self, updates: dict[str, str]) -> list[str]:
@@ -228,7 +233,7 @@ class SettingService:
             return False
         self.session.delete(row)
         self.session.commit()
-        invalidate_user_settings_cache()
+        self._after_write()
         return True
 
     def clear_credentials(self) -> list[str]:
@@ -261,6 +266,6 @@ class SettingService:
                 deleted.append(key)
         if deleted:
             self.session.commit()
-            invalidate_user_settings_cache()
+            self._after_write()
         return deleted
 

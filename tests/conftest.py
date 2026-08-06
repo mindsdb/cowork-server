@@ -20,6 +20,9 @@ os.environ["COWORK_PROJECTS_DIR"] = str(TMP / "projects")
 # File bytes too — without this, any test using FileService writes into the
 # developer's real ~/.cowork/files/ and orphans dirs there.
 os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
+# Home dir too: the one-time .env->DB migration reads $COWORK_HOME/.env, so
+# without this a test could read the developer's real ~/.cowork/.env.
+os.environ["COWORK_HOME"] = str(TMP)
 os.environ["ENV"] = "test"
 
 import pytest

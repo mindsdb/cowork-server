@@ -19,7 +19,6 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints.guards import require_local
-from cowork.common.paths import cowork_home
 from cowork.db.session import get_session
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
@@ -343,88 +342,3 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
         "modelEnabled": model_enabled,
         "modelLabels": model_labels,
     }
-
-
-# ── Raw .env access (legacy, used by Onboarding) ─────────────────────
-
-_ENV_PATH = cowork_home() / ".env"
-
-
-def _parse_dotenv_content(content: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        result[key.strip()] = val.strip().strip('"').strip("'")
-    return result
-
-
-def _read_env_dict() -> dict[str, str]:
-    if not _ENV_PATH.exists():
-        return {}
-    try:
-        return _parse_dotenv_content(_ENV_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-
-@router.get("/raw")
-def read_raw_settings(request: Request):
-    # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
-    # restriction as reveal-key.
-    require_local(request)
-    return _read_env_dict()
-
-
-class _RawSettingsBody(BaseModel):
-    content: str
-
-
-@router.post("/raw")
-def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
-    """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
-
-    Uses key-level merge (not full overwrite) because callers like the
-    OAuth token refresh only send a subset of keys — a full overwrite
-    would wipe model config and other settings from .env.
-
-    The .env persists for the standalone ``anton`` CLI and is read by
-    ``GET /raw``; the DB is authoritative for cowork-server.  By syncing
-    to both we keep them consistent regardless of which frontend code
-    path writes settings (onboarding, OAuth token refresh, etc.)."""
-    # Writing the dotenv lands provider secrets on disk — same loopback
-    # restriction as the /raw read.
-    require_local(request)
-
-    from cowork.migrations import sync_env_vars_to_db
-
-    incoming = _parse_dotenv_content(body.content)
-
-    try:
-        existing = _read_env_dict()
-        existing.update(incoming)
-
-        # Sync recognised ANTON_* vars to the DB first. If validation fails,
-        # leave the legacy .env untouched so the DB remains authoritative.
-        sync_env_vars_to_db(session, existing)
-
-        _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-        lines = [f"{k}={v}" for k, v in existing.items()]
-        _ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        try:
-            _ENV_PATH.chmod(0o600)
-        except OSError:
-            pass
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Settings could not be saved.") from e
-
-    return {"ok": True}
-
-
-# NOTE: .env → DB migration now runs at server startup via
-# cowork.migrations.migrate_env_to_db(), called from dev_setup.
