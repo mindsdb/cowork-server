@@ -7,11 +7,9 @@ from cowork.models.base import BaseSQLModel
 class Setting(BaseSQLModel, table=True):
     __tablename__ = "settings"
 
-    # Per-scope uniqueness (migration c8e1a4f7b2d9): one global row (scope
-    # NULL), one per org, one per (org, user). A user is identified by (org_id,
-    # user_id) — the same person in two orgs must NOT share a row — so the user
-    # index carries org_id too. The CHECK pins the three valid row shapes so a
-    # NULL owner or a bogus scope string can't slip past the partial indexes.
+    # Per-scope uniqueness (migration c8e1a4f7b2d9): one global row (scope NULL),
+    # one per org, one per (org, user) — the same user in two orgs must not share
+    # a row. The CHECK pins the valid row shapes. Mirrors the migration.
     __table_args__ = (
         sa.Index(
             "uq_settings_key_global",

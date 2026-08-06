@@ -788,16 +788,9 @@ def use_settings_scope(scope: "TenantScope"):
 
 
 def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
-    """Resolved settings for a scope: the explicit arg, else the ambient scope
-    (use_settings_scope), else LOCAL_SCOPE. An unscoped read resolves global
-    rows only — never another org's data — so a missed scope degrades to
-    deployment defaults, it cannot leak across orgs.
-
-    Loads fresh from the DB every call — no process-global cache. A cached
-    credential can't survive a rotation on another replica, and there's no
-    load-vs-invalidate race. If a hot path needs it, add a per-request/turn
-    cache (naturally scoped and short-lived), not a process singleton.
-    """
+    """Resolved settings for a scope: explicit arg, else ambient
+    (use_settings_scope), else LOCAL_SCOPE. Unscoped resolves global rows only,
+    never another org's data. Loads fresh every call — no process-global cache."""
     from cowork.db.scoped import LOCAL_SCOPE
 
     scope = scope or _current_scope.get() or LOCAL_SCOPE
@@ -805,8 +798,8 @@ def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
 
 
 def invalidate_user_settings_cache() -> None:
-    # No process-global cache anymore (get_user_settings loads fresh). Kept as a
-    # no-op so existing post-write callers don't need to change.
+    # No cache anymore (get_user_settings loads fresh); kept as a no-op so
+    # post-write callers don't need to change.
     pass
 
 

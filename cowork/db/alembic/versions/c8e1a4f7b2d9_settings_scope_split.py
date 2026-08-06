@@ -1,22 +1,11 @@
 """settings scope split
 
 Replace the global UNIQUE(settings.key) with per-scope uniqueness: one row per
-key for the deployment (scope NULL), per org, and per (org, user). A user is
-identified by (org_id, user_id) — the same person in two orgs must not share a
-row — so the user index carries org_id.
-
-init (93375a6617f4) created BOTH a table-level UNIQUE(key) constraint AND a
-unique ix_settings_key index; both must go. SQLite has the constraint inline in
-the table, so it's removed via a batch rebuild (which also stamps the row-shape
-CHECK); Postgres drops the reflected constraint directly.
-
-A CHECK pins the three valid row shapes so a NULL owner or a bogus scope string
-can't slip past the partial (filtered) indexes. Existing rows are all NULL-scope
-with NULL owners, so they satisfy the global shape unchanged.
-
-Downgrade restores UNIQUE(key); it PREFLIGHTS for duplicate keys and aborts
-before touching anything if a real un-split is impossible, so a rejected
-downgrade leaves the schema intact.
+key for the deployment (scope NULL), per org, and per (org, user). init created
+BOTH a table-level UNIQUE(key) AND a unique index; both go (SQLite via batch
+rebuild, Postgres via drop_constraint). A CHECK pins the valid row shapes.
+Downgrade restores UNIQUE(key) but preflights duplicates and aborts (schema
+intact) if un-splitting is impossible.
 
 Revision ID: c8e1a4f7b2d9
 Revises: b3d7f1a9c5e2
@@ -62,10 +51,8 @@ def upgrade() -> None:
     # from the current model via create_all won't have it) + add the CHECK.
     has_key_uc, uq_name = _key_unique_constraint(bind)
     if bind.dialect.name == "sqlite":
-        # init created it UNNAMED; SQLite reflects name=None, which can't be
-        # dropped by name. Give batch a naming convention that reproduces
-        # alembic's default `uq_<table>_<col>` name, then drop by that (the
-        # documented pattern for unnamed constraints).
+        # init's UNIQUE(key) is unnamed (reflects as name=None); a naming
+        # convention lets batch drop it by alembic's default uq_<table>_<col>.
         naming = {"uq": "uq_%(table_name)s_%(column_0_name)s"}
         with op.batch_alter_table("settings", schema=None, naming_convention=naming) as batch:
             if has_key_uc:
