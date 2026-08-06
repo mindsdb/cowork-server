@@ -7,6 +7,8 @@ overlays its live model list. fetch_minds_models is stubbed so no network is hit
 import asyncio
 import json
 
+from cowork.db.scoped import LOCAL_SCOPE
+
 
 def _delete_settings(session, *keys: str) -> None:
     from cowork.services.settings import SettingService
@@ -57,7 +59,7 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session))
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["openai-compatible"] == ["model-a", "model-b"]
         assert result["modelEfforts"]["model-a"] == {"efforts": ["low", "high"], "default": "low"}
@@ -117,7 +119,7 @@ def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session))
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         # MindsHub's description of `sonnet` survives on all three maps.
         assert result["modelLabels"]["sonnet"] == "Claude Sonnet 5"
@@ -154,7 +156,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
     try:
         _delete_settings(session, "minds_api_key", "providers_json", "openai_api_key")
 
-        result = asyncio.run(recommended_models(session))
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["openai-compatible"] == []
         assert result["modelEnabled"] == {}
@@ -186,7 +188,7 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json")
 
-        result = asyncio.run(recommended_models(session))
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "opus", "gpt"]
         assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
@@ -224,7 +226,7 @@ def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
         )
         _delete_settings(session, "providers_json")
 
-        asyncio.run(recommended_models(session))
+        asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         stored = SettingService(session).get_setting("minds_model_enabled").value
         assert json.loads(stored) == {"mindshub_air": True, "opus": False}
@@ -263,8 +265,8 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
 
         monkeypatch.setattr(SettingService, "upsert_setting", spy_upsert)
 
-        asyncio.run(recommended_models(session))  # map absent → 1 write
-        asyncio.run(recommended_models(session))  # identical map stored → no write
+        asyncio.run(recommended_models(session, LOCAL_SCOPE))  # map absent → 1 write
+        asyncio.run(recommended_models(session, LOCAL_SCOPE))  # identical map stored → no write
 
         assert len(writes) == 1, writes
     finally:
@@ -299,7 +301,7 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json", "minds_model_enabled")
 
-        asyncio.run(recommended_models(session))
+        asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         stored = SettingService(session).get_setting("minds_model_enabled").value
         assert list(json.loads(stored).keys()) == ["zephyr_base", "air-mini", "sonnet"]
