@@ -47,9 +47,6 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-# ── CRUD ─────────────────────────────────────────────────────────────
-
-
 @router.get("/", response_model=list[SettingResponse])
 def list_settings(session: SessionDep) -> list[SettingResponse]:
     return SettingService(session).list_settings()
