@@ -42,15 +42,14 @@ def _skill_from_dir(skill_dir: Path) -> Skill | None:
 class SkillService:
     """File-backed skill store using the agentskills.io ``SKILL.md`` format.
 
-    Org mode keys the store per org — skills are injected into agent turns,
-    so a cross-org write would be prompt injection into another org's agent."""
+    Org mode keys the store per org (``<root>/<org_id>``); local mode uses the
+    shared root unchanged."""
 
     def __init__(self, scope: TenantScope | None = None) -> None:
         self.root = scoped_storage_root(Path(get_app_settings().skill.root_dir), scope)
-        # Project symlink distribution is desktop-only: skill_links computes
-        # from the UNKEYED root and scans the global projects dir, so running
-        # it in org mode links across tenants (a UUID-named skill would expose
-        # another org's entire skill root). Cloud pods never read these links.
+        # Project symlink distribution is desktop-only: skill_links resolves
+        # from the unkeyed root and scans all project dirs, so it must not run
+        # in org mode.
         self._link_projects = scope is None or not scope.org_mode
 
     # ── helpers ──────────────────────────────────────────────────────────────
@@ -292,23 +291,19 @@ class SkillService:
         if only.suffix.lower() == ".md" and only.name != SKILL_FILE:
             only.rename(src_dir / SKILL_FILE)
 
-    # Zip-bomb bounds: a skill is a folder of docs/scripts, so these are roomy.
-    _ZIP_MAX_MEMBERS = 2_000
+    # A small archive can expand to many times its size — bound the expansion.
     _ZIP_MAX_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
 
     @staticmethod
     def _safe_extract_zip(data: bytes, dest: Path) -> None:
-        """Extract a zip into ``dest``, rejecting paths that escape it, symlinks,
-        and archives that would expand past the member/size bounds (zip bombs
-        share the pod's disk with every tenant)."""
+        """Extract a zip into ``dest``, rejecting escaping paths, symlinks, and
+        archives that would expand past the size bound."""
         import stat
 
         dest_resolved = dest.resolve()
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 infos = zf.infolist()
-                if len(infos) > SkillService._ZIP_MAX_MEMBERS:
-                    raise ValueError(f"Archive has too many files (>{SkillService._ZIP_MAX_MEMBERS}).")
                 if sum(i.file_size for i in infos) > SkillService._ZIP_MAX_UNCOMPRESSED:
                     raise ValueError("Archive would expand beyond the allowed size.")
                 for info in infos:

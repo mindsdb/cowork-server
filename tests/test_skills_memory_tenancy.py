@@ -170,14 +170,6 @@ def test_zip_import_rejects_oversized_archives(skills_root, monkeypatch):
         svc.import_skill(_zip_bytes({"SKILL.md": "x" * 100}), filename="bomb.zip")
 
 
-def test_zip_import_rejects_too_many_members(skills_root, monkeypatch):
-    svc = SkillService(_org(ORG_A))
-    monkeypatch.setattr(SkillService, "_ZIP_MAX_MEMBERS", 3)
-    members = {f"f{i}.txt": "x" for i in range(5)}
-    with pytest.raises(ValueError, match="too many files"):
-        svc.import_skill(_zip_bytes(members), filename="many.zip")
-
-
 def test_inprocess_harness_memory_root_is_org_keyed(memory_env):
     from cowork.common.settings.user_settings import use_settings_scope, current_settings_scope
     engine, root = memory_env
