@@ -99,7 +99,8 @@ def get_channel_agent() -> ChannelAgentResponse:
 def set_channel_agent(
     body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep
 ) -> ChannelAgentResponse:
-    # Same request session twice: SettingService stays raw until the settings split.
+    # Channel config is local-only (_require_local_channels → 501 in org mode),
+    # so an unscoped SettingService writing the global row is correct here.
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 

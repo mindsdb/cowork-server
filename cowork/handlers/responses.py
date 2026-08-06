@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import TurnQueueSettings
-from cowork.common.settings.user_settings import get_user_settings
+from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
 from cowork.streaming import new_buffer, registry
@@ -58,8 +58,11 @@ class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
         self.principal = principal
-        self.scoped = ScopedSession(session, scope_from_principal(principal))
-        self.harness = get_harness(get_user_settings().harness)
+        self.scope = scope_from_principal(principal)
+        self.scoped = ScopedSession(session, self.scope)
+        # Resolve settings once; reuse the harness name in handle()/the producer.
+        self.harness_name = get_user_settings(self.scope).harness
+        self.harness = get_harness(self.harness_name)
         self.last_conversation_id: str | None = None
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
@@ -137,7 +140,7 @@ class ResponsesHandler:
                 original_content=original_content,
                 model=request.model,
                 disabled=disabled,
-                harness_name=get_user_settings().harness,
+                harness_name=self.harness_name,
                 harness_id=getattr(self.harness, "id", None),
                 buffer=buffer,
                 trace_tags=request.trace_tags,
@@ -157,14 +160,15 @@ class ResponsesHandler:
         # The user message is persisted by _collect after the turn (deferred),
         # so the harness reads history WITHOUT the current turn — otherwise the
         # fresh-query history would replay it AND resend it as the live input.
-        stream = self.harness.stream_response(
-            conversation=conversation,
-            input=harness_input,
-            disabled_connections=disabled,
-            trace_tags=request.trace_tags,
-            trace_metadata=trace_metadata,
-        )
-        return await self._collect(stream, conversation.id, request.model, original_content)
+        with use_settings_scope(self.scope):
+            stream = self.harness.stream_response(
+                conversation=conversation,
+                input=harness_input,
+                disabled_connections=disabled,
+                trace_tags=request.trace_tags,
+                trace_metadata=trace_metadata,
+            )
+            return await self._collect(stream, conversation.id, request.model, original_content)
 
     def _select_producer(
         self,
@@ -298,7 +302,13 @@ class ResponsesHandler:
         finally:
             producer_session.close()
 
-    async def _produce(
+    async def _produce(self, **kwargs) -> None:
+        # Detached task: bind the turn's org scope so every settings reader in the
+        # harness/provider/publish subtree resolves this org's config.
+        with use_settings_scope(scope_from_principal(self.principal)):
+            await self._run_turn(**kwargs)
+
+    async def _run_turn(
         self,
         *,
         conv_id: UUID,
