@@ -293,6 +293,51 @@ class StreamSettings(Settings):
     )
 
 
+class TurnQueueSettings(Settings):
+    model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
+
+    backend: str = Field(
+        default="inprocess",
+        description="Turn-queue backend: 'inprocess' (single-instance, default) or 'remote' (Redis-backed, multi-instance).",
+    )
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis connection URL used when backend is 'remote'.",
+    )
+    jobs_stream: str = Field(
+        default="scratchpad:requests",
+        description="Redis stream key turn jobs are queued on when backend is 'remote'.",
+    )
+    auth_internal_base_url: str = Field(
+        default="",
+        description="Base URL of the auth service's internal API, used to mint per-turn MindsHub keys.",
+    )  # COWORK_TURN_AUTH_INTERNAL_BASE_URL
+    auth_internal_secret: str = Field(
+        default="",
+        description="Shared secret sent as X-Internal-Auth when minting per-turn MindsHub keys.",
+    )  # COWORK_TURN_AUTH_INTERNAL_SECRET
+    turn_key_ttl_seconds: int = Field(
+        default=1200,
+        description="TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within auth's turn_key_max_ttl_seconds).",
+    )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    minds_base_url: str = Field(
+        default="",
+        description=(
+            "Explicit MindsHub inference base URL (OpenAI-compatible, incl. /v1) the pod's "
+            "turn calls. Overrides the env-slug default (default_minds_api_host); required for "
+            "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
+        ),
+    )  # COWORK_TURN_MINDS_BASE_URL
+    minds_coding_model: str = Field(
+        default="",
+        description=(
+            "MindsHub model alias for the pod's coding calls (completion verifier + nested "
+            "scratchpad calls). The pod always runs on minds-cloud, so this must be a minds "
+            "alias the env serves. Empty = the minds-cloud coding default (CODING_MODEL_DEFAULTS)."
+        ),
+    )  # COWORK_TURN_MINDS_CODING_MODEL
+
+
 class AppSettings(Settings):
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 

@@ -140,6 +140,41 @@ deployment:
           key: COWORK_MASTER_KEY
 
     # ====================================
+    # TURN EXECUTION
+    # ====================================
+
+    # Route each agent turn to the scratchpad-controller over Redis instead of
+    # running it in-process. The controller runs the turn in an isolated gVisor
+    # pod. The code default is "inprocess" (desktop); cloud sets "remote" here.
+    # Prerequisites for this to work in a given env (see the whole-turn plans):
+    #   1. the minds-anton-scratchpad image is rebuilt with `python -m anton.cloud_turn`,
+    #   2. the scratchpad-controller is deployed and consuming the jobs stream,
+    #   3. COWORK_TURN_REDIS_URL below resolves to that Redis from this namespace.
+    - name: COWORK_TURN_BACKEND
+      value: "remote"
+    # Same Redis the controller consumes. If cowork and Redis are in different
+    # namespaces, use the FQDN (redis-master.<namespace>.svc.cluster.local).
+    - name: COWORK_TURN_REDIS_URL
+      value: "redis://redis-master.dev.svc.cluster.local:6379/0"
+    
+    - name: COWORK_TURN_AUTH_INTERNAL_BASE_URL
+      value: "http://auth:80"
+
+    - name: COWORK_TURN_AUTH_INTERNAL_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: auth-secrets
+          key: INTERNAL_AUTH_SHARED_SECRET
+    
+    - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
+      value: "1200"
+
+    # Explicit inference base URL for this env (per-PR host the env-slug logic
+    # can't derive). The pod's turn calls this; the minted key is valid here.
+    - name: COWORK_TURN_MINDS_BASE_URL
+      value: "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"
+
+    # ====================================
     # PROVIDER API KEYS
     # ====================================
 
