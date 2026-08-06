@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi import HTTPException
 from sqlmodel import Session
 
+from cowork.build_info import build_trace_metadata
 from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.db.session import get_open_session
@@ -68,8 +69,11 @@ class ResponsesHandler:
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
-        # Identity into the run's trace metadata; server-derived keys win.
-        trace_metadata = identity_trace_metadata(self.principal, request.trace_metadata)
+        # Identity + the running build into the run's trace metadata;
+        # server-derived keys win. The build stamp (ENG-1279) is what lets a
+        # metric be attributed to a release instead of to a date on which
+        # several changes happened to ship together.
+        trace_metadata = build_trace_metadata(identity_trace_metadata(self.principal, request.trace_metadata))
 
         conversation_service = ConversationService(self.scoped)
 
