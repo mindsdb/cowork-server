@@ -80,6 +80,7 @@ def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
                 ),
                 session,
                 LOCAL_SCOPE,
+                None,
             )
         assert exc.value.status_code == 400
         assert SettingService(session)._fetch_row("tone") is None
