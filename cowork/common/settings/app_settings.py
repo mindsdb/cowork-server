@@ -423,6 +423,20 @@ class AppSettings(Settings):
             "from which a per-request principal is built."
         ),
     )
+    install_channel_override: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_INSTALL_CHANNEL"),
+        description=(
+            "Deployer-declared install channel for trace attribution "
+            "(ENG-1279), overriding inference from tenancy/pip metadata. "
+            "Needed where inference is wrong from inside the process: hub "
+            "snapshot instances run local tenancy with a PyPI-installed "
+            "cowork-server inside their docker image, so they pass 'hosted' "
+            "here. Plain str, not a Literal — an invalid value must degrade "
+            "to inference (build_info validates and warns), never fail "
+            "settings load over telemetry. Empty (default) = infer."
+        ),
+    )
     identity_enforce: Literal["audit", "enforce"] = Field(
         default="audit",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
