@@ -50,9 +50,6 @@ SessionDep = Annotated[Session, Depends(get_session)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
-# ── CRUD ─────────────────────────────────────────────────────────────
-
-
 @router.get("/", response_model=list[SettingResponse])
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()

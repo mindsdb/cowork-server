@@ -739,3 +739,38 @@ async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
     assert payload["reconnectable"] is True
+
+
+# -- remote_turn_error: string classification for pod turn_failed errors ------
+
+def test_remote_error_token_limit():
+    from cowork.handlers.turn_errors import remote_turn_error, TOKEN_LIMIT_CODE
+    code, msg = remote_turn_error("TokenLimitExceeded: Server returned 429 ...")
+    assert code == TOKEN_LIMIT_CODE
+    assert "credits" in msg
+
+
+def test_remote_error_overloaded_passes_curated_copy():
+    from cowork.handlers.turn_errors import remote_turn_error, PROVIDER_OVERLOADED_CODE
+    code, msg = remote_turn_error(
+        "ProviderOverloadedError: The model provider is experiencing an incident.")
+    assert code == PROVIDER_OVERLOADED_CODE
+    assert msg == "The model provider is experiencing an incident."
+
+
+def test_remote_error_auth():
+    from cowork.handlers.turn_errors import remote_turn_error, AUTH_ERROR_CODE
+    code, _ = remote_turn_error("ConnectionError: Invalid API key - check your configuration.")
+    assert code == AUTH_ERROR_CODE
+
+
+def test_remote_error_unknown_is_redacted():
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error("RuntimeError: secret internals")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "secret" not in msg
+
+
+def test_remote_error_none_is_redacted():
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    assert remote_turn_error(None)[0] == GENERIC_TURN_ERROR_CODE
