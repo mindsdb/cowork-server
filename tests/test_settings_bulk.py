@@ -7,6 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints.settings import bulk_upsert_settings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.session import get_open_session
 from cowork.schemas.settings import SettingsBulkUpsertRequest
 from cowork.services.settings import SettingService
@@ -78,6 +79,7 @@ def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
                     values={"tone": "casual", "planning_provider": "nope"}
                 ),
                 session,
+                LOCAL_SCOPE,
             )
         assert exc.value.status_code == 400
         assert SettingService(session)._fetch_row("tone") is None
@@ -101,6 +103,7 @@ async def test_test_providers_does_not_persist(monkeypatch):
 
         result = await ep.test_providers(
             session,
+            LOCAL_SCOPE,
             ep._TestProvidersBody(providers=[{"type": "anthropic", "apiKey": "***"}]),
         )
         assert result["providerStatus"] == {"anthropic": "ok"}
