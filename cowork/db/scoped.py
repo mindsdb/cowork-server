@@ -17,6 +17,7 @@ Local mode (the desktop sidecar) never filters — today's behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, Request
@@ -82,6 +83,17 @@ def scope_for_background_context() -> TenantScope:
     raise MissingTenantScopeError(
         "background conversation creation requires a service principal (not yet implemented in org mode)"
     )
+
+
+def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
+    """Org-keyed root for filesystem stores: ``base`` in local mode,
+    ``base/<org_id>`` in org mode, fail-closed without an org. org_id is a
+    normalized UUID (TrustedHeaderMiddleware), so it's path-safe."""
+    if scope is None or not scope.org_mode:
+        return base
+    if not scope.org_id:
+        raise MissingTenantScopeError("filesystem store requires an organization in scope")
+    return base / scope.org_id
 
 
 def scope_of_session(session: Session) -> TenantScope | None:
