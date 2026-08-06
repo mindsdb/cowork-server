@@ -58,7 +58,9 @@ class ResponsesHandler:
         self.principal = principal
         self.scope = scope_from_principal(principal)
         self.scoped = ScopedSession(session, self.scope)
-        self.harness = get_harness(get_user_settings(self.scope).harness)
+        # Resolve settings once; reuse the harness name in handle()/the producer.
+        self.harness_name = get_user_settings(self.scope).harness
+        self.harness = get_harness(self.harness_name)
         self.last_conversation_id: str | None = None
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
@@ -142,7 +144,7 @@ class ResponsesHandler:
                     original_content=original_content,
                     model=request.model,
                     disabled=disabled,
-                    harness_name=get_user_settings(self.scope).harness,
+                    harness_name=self.harness_name,
                     harness_id=getattr(self.harness, "id", None),
                     buffer=buffer,
                     trace_tags=request.trace_tags,
@@ -166,8 +168,7 @@ class ResponsesHandler:
             return await self._collect(stream, conversation.id, request.model, original_content)
 
     async def _produce(self, **kwargs) -> None:
-        # Detached task: bind the turn's org scope (from the captured principal,
-        # matching the producer session below) so every settings reader in the
+        # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
         with use_settings_scope(scope_from_principal(self.principal)):
             await self._run_turn(**kwargs)

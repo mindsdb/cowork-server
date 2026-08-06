@@ -95,10 +95,9 @@ def scope_of_session(session: Session) -> TenantScope | None:
     return session.info.get("tenant_scope")
 
 
-# Tables whose ownership columns stay inert. Closed list on purpose: deferring
-# a table is a scoped-layer decision, never a model-side flag. settings stays
-# key-based until the settings split — rows are deployment-owned and env-seeded
-# with NULL org, so org-mode reads must not filter and writes must not stamp.
+# Tables the generic scoped layer leaves alone. `settings` is here because
+# SettingService owns its tenancy explicitly (routes keys to global/org/user
+# rows itself), so the generic org-filter/stamp must not also touch it.
 _TENANCY_DEFERRED_TABLES = frozenset({"settings"})
 
 
