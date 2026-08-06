@@ -130,9 +130,16 @@ class ResponsesHandler:
             # Detached + resumable. The agent run executes in a background
             # task that writes events to a per-turn buffer; this request just
             # tails the buffer. Closing the connection never reaches the
-            # producer — only an explicit /cancel does. The user message is
-            # persisted by the producer at the end (deferred), so the harness
-            # reads history WITHOUT the current turn (see _produce).
+            # producer — only an explicit /cancel does.
+            #
+            # The user message is persisted (pending) as the producer's FIRST
+            # action, not here (ENG-1231). registry.start() dedups a duplicate
+            # start for an already-in-flight conversation and discards the second
+            # producer coroutine unawaited — persisting here (before that dedup)
+            # would commit a pending row whose producer never runs and never
+            # finalizes, stranding it out of LLM history. Persisting inside the
+            # producer ties the write to the one coroutine that actually runs, so
+            # there is at most one pending row per conversation.
             buffer = new_buffer(str(conversation.id), turn_id)
             producer_coro = self._select_producer(
                 conv_id=conversation.id,
@@ -241,6 +248,7 @@ class ResponsesHandler:
         collected_text: list[str] = []
         collected_events: list[dict] = []
         persisted = False
+        pending_message_id: UUID | None = None
 
         def on_event(kind: str, data: dict) -> None:
             # Mirror the SSE frames the producer streams, so the client
@@ -265,16 +273,33 @@ class ResponsesHandler:
             persisted = True
             try:
                 # Re-anchor first: the conversation may be gone or out of scope.
-                ConversationService(producer_session).get_conversation(conv_id)
-                ConversationService(producer_session).save_user_message(conv_id, original_content)
-                producer_session.commit()
-                ConversationService(producer_session).save_assistant_turn(
+                svc = ConversationService(producer_session)
+                svc.get_conversation(conv_id)
+                # The user message was already persisted (pending) at turn start
+                # (ENG-1231). Clear the flag first — even if save_assistant_turn
+                # early-returns on an empty turn — so the question rejoins replayed
+                # history; then persist the assistant turn. Scope to THIS turn's
+                # row so a completing turn can't absorb a pending row stranded by
+                # an earlier crashed turn into history. If the pending persist
+                # never succeeded (id unset), this turn owns no row — skip
+                # finalize rather than fall back to clearing every pending row.
+                if pending_message_id is not None:
+                    svc.finalize_pending(conv_id, pending_message_id)
+                svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                 )
             except Exception:
                 logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
 
         try:
+            # Persist the user message (pending) as the first thing this producer
+            # does (ENG-1231) — see the note in handle(). Committed here, before
+            # streaming, so a refresh/reconnect mid-turn shows the question via
+            # /items. _remote_history reads get_ordered_messages, which excludes
+            # pending, so the current input isn't replayed into the remote job.
+            pending_message_id = ConversationService(producer_session).save_user_message(
+                conv_id, original_content, pending=True,
+            ).id
             await produce_remote_turn(
                 conversation_id=str(conv_id),
                 org_id=self.scoped.scope.org_id,
@@ -324,10 +349,12 @@ class ResponsesHandler:
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
-        Runs in its OWN DB session (it outlives the request). Persistence is
-        deferred to the end so the harness reads history WITHOUT the current
-        user message; on terminal we persist user + assistant together.
-        Never reaches the HTTP response — readers tail the buffer.
+        Runs in its OWN DB session (it outlives the request). Persists the user
+        message (pending) as its first action so a mid-turn refresh shows the
+        question, reads history via get_ordered_messages (which excludes pending,
+        so the current input isn't double-fed), and on terminal finalizes the
+        pending flag + persists the assistant turn (ENG-1231). Never reaches the
+        HTTP response — readers tail the buffer.
         """
         # Fresh session (outlives the request), scoped from the immutable
         # principal captured at handler construction — never request state.
@@ -338,6 +365,7 @@ class ResponsesHandler:
         persisted = False
         # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
+        pending_message_id: UUID | None = None
 
         def event_sink(event_type: str, data: dict) -> None:
             # Tool block-rows are for LLM-history persistence, not UI replay —
@@ -357,12 +385,19 @@ class ResponsesHandler:
             try:
                 # Re-anchor before ANY write: the conversation may be gone
                 # (deleted mid-turn) or out of scope on this fresh session.
-                ConversationService(producer_session).get_conversation(conv_id)
-                ConversationService(producer_session).save_user_message(
-                    conv_id, original_content, created_at=sent_at
-                )
-                producer_session.commit()
-                ConversationService(producer_session).save_assistant_turn(
+                svc = ConversationService(producer_session)
+                svc.get_conversation(conv_id)
+                # The user message was already persisted (pending) at turn start
+                # (ENG-1231). Clear the flag first — even if save_assistant_turn
+                # early-returns on an empty turn — so the question rejoins replayed
+                # history; then persist the assistant turn. Scope to THIS turn's
+                # row so a completing turn can't absorb a pending row stranded by
+                # an earlier crashed turn into history. If the pending persist
+                # never succeeded (id unset), this turn owns no row — skip
+                # finalize rather than fall back to clearing every pending row.
+                if pending_message_id is not None:
+                    svc.finalize_pending(conv_id, pending_message_id)
+                svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                     tool_rows=turn_rows,
                 )
@@ -371,6 +406,13 @@ class ResponsesHandler:
 
         try:
             conv = ConversationService(producer_session).get_conversation(conv_id)
+            # Persist the user message (pending) as the first thing this producer
+            # does (ENG-1231) — see the note in handle(). The harness reads history
+            # via get_ordered_messages, which excludes pending, so this write isn't
+            # replayed into the turn as duplicate context.
+            pending_message_id = ConversationService(producer_session).save_user_message(
+                conv_id, original_content, created_at=sent_at, pending=True,
+            ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,
