@@ -253,7 +253,7 @@ def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "https://4nton.ai/a/uuid-1" in out
+    assert "https://4nton.ai/a/uuid-1" in getattr(out, "content", out)
     assert captured["path"].endswith("static/index.html")
 
 
@@ -268,7 +268,7 @@ def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "STOP" in out and "API key" in out
+    assert "STOP" in getattr(out, "content", out) and "API key" in getattr(out, "content", out)
 
 
 def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: Path):
@@ -283,9 +283,10 @@ def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: P
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "STOP" not in out
-    assert "PUBLISH FAILED" in out
-    assert "Only HTML and Markdown" in out
+    text = getattr(out, "content", out)
+    assert "STOP" not in text
+    assert "PUBLISH FAILED" in text
+    assert "Only HTML and Markdown" in text
 
 
 # ---------------------------------------------------------------------------
