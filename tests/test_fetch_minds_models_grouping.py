@@ -129,6 +129,24 @@ def test_a_gateway_that_publishes_no_metadata_yields_empty_maps(monkeypatch):
     assert listing.families == {}
 
 
+def test_an_undescribed_row_is_left_out_of_a_partly_described_listing(monkeypatch):
+    """One listing, one described row and one not: the maps stay partial.
+
+    This is the shape that actually reaches the app (a gateway that describes some
+    of what it serves), and the reason the maps must be read per id rather than as
+    "non-empty, so everything here is described". Densifying `families` over all of
+    `ids` as soon as any row carries a provider would put `local-llama` in as its
+    own head and have the app tag it "latest" on a claim the gateway never made.
+    """
+    _serve(monkeypatch, {"data": [_row("sonnet", provider="anthropic"), _row("local-llama")]})
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.ids == ["sonnet", "local-llama"]
+    assert listing.providers == {"sonnet": "anthropic"}
+    assert listing.families == {"sonnet": "sonnet"}
+
+
 # Junk is applied to ONE field at a time on purpose. Giving both the same value
 # collapses every case to "both absent" and the assertions become {} == {}, which
 # leaves the two interesting branches uncovered: a valid provider with a junk
@@ -228,7 +246,7 @@ def test_the_pre_existing_fields_survive_the_named_tuple(monkeypatch):
     ],
 )
 def test_failure_paths_return_the_empty_listing(monkeypatch, body, status):
-    """Every failure path returns one shared value of the right arity.
+    """Every failure path returns the same empty listing, of the right arity.
 
     ids is None rather than [] — that is what tells the caller to keep the list it
     already holds instead of emptying the picker.
@@ -237,8 +255,25 @@ def test_failure_paths_return_the_empty_listing(monkeypatch, body, status):
 
     listing = asyncio.run(fetch_minds_models(_URL, _KEY))
 
-    assert listing == providers._EMPTY_LISTING
+    assert listing == providers._empty_listing()
     assert listing.ids is None
+
+
+def test_each_failure_gets_its_own_maps(monkeypatch):
+    """Two failed fetches compare equal but don't share their dict objects.
+
+    A failure is cached per base URL, so handing every entry the same maps would
+    let one in-place write downstream corrupt the cached failure of every gateway
+    at once. Nothing mutates them today; this keeps that cheap to rely on.
+    """
+    _serve(monkeypatch, {"error": "nope"}, 503)
+
+    first = asyncio.run(fetch_minds_models(_URL, _KEY))
+    second = asyncio.run(fetch_minds_models("https://other.example", _KEY))
+
+    assert first == second
+    assert first.families is not second.families
+    assert first.enabled is not second.enabled
 
 
 def test_missing_url_or_key_short_circuits(monkeypatch):
@@ -247,5 +282,5 @@ def test_missing_url_or_key_short_circuits(monkeypatch):
 
     monkeypatch.setattr(providers.httpx, "AsyncClient", _explode)
 
-    assert asyncio.run(fetch_minds_models("", _KEY)) == providers._EMPTY_LISTING
-    assert asyncio.run(fetch_minds_models(_URL, "")) == providers._EMPTY_LISTING
+    assert asyncio.run(fetch_minds_models("", _KEY)) == providers._empty_listing()
+    assert asyncio.run(fetch_minds_models(_URL, "")) == providers._empty_listing()

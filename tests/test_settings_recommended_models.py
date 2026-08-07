@@ -160,6 +160,156 @@ def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
         session.close()
 
 
+def test_custom_endpoint_cannot_describe_a_model_minds_listed_undescribed(monkeypatch):
+    """A gateway older than provider/family describes nothing, and that still wins.
+
+    While this server runs ahead of the MindsHub release that publishes the two
+    fields, both minds maps come back empty for models MindsHub does serve. Reading
+    "the target has no entry for this id" as "MindsHub didn't claim this one" would
+    then let a custom endpoint answering `{"id": "sonnet", "family": "haiku"}` file
+    MindsHub's own sonnet under haiku as an older version of it. What is reserved is
+    every id MindsHub listed, described or not.
+    """
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False):
+        if "mindshub" in base_url:
+            # The pre-grouping gateway: ids and enabled flags, no metadata.
+            return _listing(["sonnet", "haiku"], enabled={"sonnet": True, "haiku": True})
+        # A custom endpoint that happens to serve the same alias, and files it
+        # under another one. No provider, so `families` is its only claim.
+        return _listing(["sonnet", "local-llama"], families={"sonnet": "haiku"})
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session,
+            minds_api_key="mdb_test",
+            minds_url="https://api.mindshub.ai",
+            providers_json=json.dumps(
+                [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+            ),
+            openai_api_key="sk-test",
+        )
+
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+
+        # No family for sonnet at all is the right answer here: the app lists it
+        # without a "latest" tag rather than under a head it was never pinned to.
+        assert "sonnet" not in result["modelFamilies"]
+        assert result["modelFamilies"] == {}
+        assert result["modelProviders"] == {}
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "providers_json", "openai_api_key",
+            "minds_model_enabled",
+        )
+        session.close()
+
+
+def test_custom_endpoint_cannot_supply_a_provider_minds_could_not_place(monkeypatch):
+    """A minds row with a family but no usable provider is in one map, not both.
+
+    fetch_minds_models records such a row in `families` only, so a check against
+    `modelProviders` alone finds no entry and would hand the model's section to the
+    custom endpoint: a frozen anthropic snapshot rendered under someone else's
+    heading.
+    """
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False):
+        if "mindshub" in base_url:
+            return _listing(["sonnet-4-5"], families={"sonnet-4-5": "sonnet"})
+        return _listing(
+            ["sonnet-4-5"],
+            providers={"sonnet-4-5": "someone-else"},
+            families={"sonnet-4-5": "sonnet-4-5"},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session,
+            minds_api_key="mdb_test",
+            minds_url="https://api.mindshub.ai",
+            providers_json=json.dumps(
+                [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+            ),
+            openai_api_key="sk-test",
+        )
+
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+
+        assert result["modelProviders"] == {}
+        # And the pin MindsHub did publish survives, so the app still knows this is
+        # a frozen version rather than a moving alias.
+        assert result["modelFamilies"] == {"sonnet-4-5": "sonnet"}
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "providers_json", "openai_api_key",
+            "minds_model_enabled",
+        )
+        session.close()
+
+
+def test_grouping_maps_stay_partial_across_two_listings(monkeypatch):
+    """MindsHub describes its models, the custom endpoint describes none of its own.
+
+    The served maps are partial, not empty: `sonnet` is described and `local-llama`
+    is not, in the same response. Filling every listed id in (because some id in the
+    map has metadata) would have the app tag `local-llama` "latest" and group it
+    under a vendor neither gateway named.
+    """
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False):
+        if "mindshub" in base_url:
+            return _listing(
+                ["sonnet"],
+                providers={"sonnet": "anthropic"},
+                families={"sonnet": "sonnet"},
+            )
+        return _listing(["sonnet", "local-llama"])  # ids only: a plain BYO endpoint
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session,
+            minds_api_key="mdb_test",
+            minds_url="https://api.mindshub.ai",
+            providers_json=json.dumps(
+                [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+            ),
+            openai_api_key="sk-test",
+        )
+
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+
+        assert result["modelProviders"] == {"sonnet": "anthropic"}
+        assert result["modelFamilies"] == {"sonnet": "sonnet"}
+        # Both buckets still list everything their own gateway serves.
+        assert result["recommendedModels"]["minds-cloud"] == ["sonnet"]
+        assert result["recommendedModels"]["openai-compatible"] == ["sonnet", "local-llama"]
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "providers_json", "openai_api_key",
+            "minds_model_enabled",
+        )
+        session.close()
+
+
 def test_recommended_models_no_openai_compatible_card(monkeypatch):
     from cowork.api.v1.endpoints import settings as settings_endpoint
     from cowork.api.v1.endpoints.settings import recommended_models

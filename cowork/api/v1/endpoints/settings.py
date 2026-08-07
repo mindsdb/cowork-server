@@ -218,9 +218,15 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
 
-def _fill_missing(target: dict, extra: dict) -> None:
-    """Add only the keys `target` doesn't already have (first writer wins)."""
+def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None) -> None:
+    """Add only the keys `target` doesn't already have (first writer wins).
+
+    `skip` reserves ids the later writer may not fill even where `target` has no
+    entry for them, for a map whose gaps carry meaning of their own.
+    """
     for key, value in extra.items():
+        if skip and key in skip:
+            continue
         target.setdefault(key, value)
 
 
@@ -284,14 +290,19 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
     model_providers: dict[str, str] = {}
     model_families: dict[str, str] = {}
 
+    # Every model id MindsHub listed, whether or not it described it. The custom
+    # endpoint overlay below reserves these ids for the grouping maps.
+    minds_ids: set[str] = set()
+
     s = SettingService(session, scope).load()
     if s.minds_api_key is not None and s.minds_url:
         listing = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
-        live, live_efforts, live_enabled, live_labels = (
-            listing.ids, listing.efforts, listing.enabled, listing.labels
-        )
+        live = listing.ids
+        live_efforts = listing.efforts
+        live_enabled = listing.enabled
+        live_labels = listing.labels
         if live:
             recommended["minds-cloud"] = live
             # Cache the availability map so model-default resolution
@@ -327,6 +338,7 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
+        minds_ids.update(live or ())
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -355,9 +367,10 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         oc_listing = await fetch_minds_models(
             oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
         )
-        live, live_efforts, live_enabled, live_labels = (
-            oc_listing.ids, oc_listing.efforts, oc_listing.enabled, oc_listing.labels
-        )
+        live = oc_listing.ids
+        live_efforts = oc_listing.efforts
+        live_enabled = oc_listing.enabled
+        live_labels = oc_listing.labels
         if live:
             recommended["openai-compatible"] = live
         # These maps are keyed by model id alone, not by (provider, id), so a
@@ -371,10 +384,31 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         _fill_missing(model_labels, live_labels)
         # Same precedence for the grouping metadata, for the same reason: a BYO
         # endpoint must not be able to move a MindsHub model into another vendor's
-        # section or relabel it as an old version of something. Empty in practice —
-        # a plain OpenAI-compatible endpoint publishes neither field.
-        _fill_missing(model_providers, oc_listing.providers)
-        _fill_missing(model_families, oc_listing.families)
+        # section or relabel it as an old version of something. But here the
+        # reservation is every id MindsHub LISTED, not just the ids it described,
+        # because MindsHub can serve a model and say nothing about it:
+        #
+        #   - deployed ahead of the MindsHub release that publishes these fields,
+        #     both MindsHub maps are empty for every model it serves, so a custom
+        #     endpoint answering `{"id": "sonnet", "family": "haiku"}` would file
+        #     MindsHub's own sonnet under haiku as an older version of it;
+        #   - a MindsHub row carrying a family but no usable provider is recorded
+        #     in families only (see fetch_minds_models), never in providers, so a
+        #     custom endpoint's provider would pick that model's section.
+        #
+        # In both cases MindsHub's silence is its answer, and the app degrades on
+        # it correctly (no section / no "latest" tag); a BYO endpoint's answer for
+        # a model it doesn't serve is a wrong one, not a better one.
+        #
+        # Not covered here, because it can't be: when the MindsHub fetch fails,
+        # recommendedModels["minds-cloud"] comes back [], which the app's
+        # overlayLists skips so the picker keeps the minds ids it already holds,
+        # while these maps come back describing the custom endpoint's ids only and
+        # the app's overlayMap swaps its held map out wholesale. Those held minds
+        # ids lose their grouping metadata until a fetch succeeds again.
+        reserved_ids = minds_ids | model_providers.keys() | model_families.keys()
+        _fill_missing(model_providers, oc_listing.providers, skip=reserved_ids)
+        _fill_missing(model_families, oc_listing.families, skip=reserved_ids)
 
     return {
         "recommendedModels": recommended,

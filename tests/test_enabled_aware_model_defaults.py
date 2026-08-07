@@ -180,9 +180,9 @@ def test_recommended_models_failed_fetch_preserves_cache(monkeypatch):
     from cowork.services.settings import SettingService
 
     async def fake_fetch(base_url, api_key, force_refresh=False):
-        from cowork.services.providers import _EMPTY_LISTING
+        from cowork.services.providers import _empty_listing
 
-        return _EMPTY_LISTING  # fetch failed
+        return _empty_listing()  # fetch failed
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
     session = get_open_session()

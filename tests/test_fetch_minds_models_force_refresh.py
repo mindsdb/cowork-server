@@ -98,8 +98,8 @@ def test_force_refresh_honors_a_cached_failure(monkeypatch):
     first = asyncio.run(fetch_minds_models(_URL, "mdb_test"))
     second = asyncio.run(fetch_minds_models(_URL, "mdb_test", force_refresh=True))
 
-    assert first == providers._EMPTY_LISTING
-    assert second == providers._EMPTY_LISTING
+    assert first == providers._empty_listing()
+    assert second == providers._empty_listing()
     assert len(calls) == 1, "cached failure must be honored even under force_refresh"
 
 
