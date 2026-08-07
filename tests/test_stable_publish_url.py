@@ -257,6 +257,24 @@ def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
     assert captured["path"].endswith("static/index.html")
 
 
+def test_tool_publish_falls_back_to_string_on_old_anton(tmp_path: Path):
+    # An anton without the SideEffectResult envelope (ENG-696) must still
+    # publish — the tool returns the plain pre-envelope string. Setting the
+    # module to None in sys.modules makes the `from ... import` raise ImportError.
+    import sys
+
+    root = _make_fullstack(tmp_path)
+    with patch.object(tools_mod, "_publish_artifact",
+                      lambda p, access=None: {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}), \
+         patch.dict(sys.modules, {"anton.core.tools.side_effect": None}):
+        out = _run(tools_mod._cowork_publish_or_preview(
+            _FakeSession(tmp_path),
+            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
+        ))
+    assert isinstance(out, str)
+    assert out == "Published successfully! View URL: https://4nton.ai/a/uuid-1"
+
+
 def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
     root = _make_fullstack(tmp_path)
 
