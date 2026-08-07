@@ -241,7 +241,7 @@ def test_recommended_models_surfaces_the_grouping_metadata(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json")
 
-        result = asyncio.run(recommended_models(session))
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         assert result["modelProviders"]["sonnet"] == "anthropic"
         # A moving alias names itself; a pin names its head. That difference is the
@@ -274,7 +274,7 @@ def test_recommended_models_keeps_serving_the_pre_existing_keys(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json")
 
-        result = asyncio.run(recommended_models(session))
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         assert {
             "recommendedModels", "recommendedPair", "modelEfforts", "modelEnabled", "modelLabels",
@@ -311,7 +311,7 @@ def test_recommended_models_grouping_maps_empty_for_a_byok_endpoint(monkeypatch)
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session))
+        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["openai-compatible"] == ["model-a", "model-b"]
         assert result["modelProviders"] == {}

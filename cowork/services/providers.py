@@ -305,18 +305,22 @@ async def fetch_minds_models(
             efforts[model_id] = entry
         # Display-only — the id (model_id) stays the value used for
         # selection/storage/resolution everywhere else.
-        label = row.get("label")
-        if isinstance(label, str) and label.strip():
-            labels[model_id] = label.strip()
+        if label := _text(row, "label"):
+            labels[model_id] = label
+        family = _text(row, "family")
         if provider := _text(row, "provider"):
             providers[model_id] = provider
-            # Defaulted to the id so the map is dense: "this alias moves" then
-            # reads as families[id] == id for every model, with no missing-key
-            # branch at the render site. Keyed off `provider` because a family
-            # with no vendor to group it under is metadata the picker can't
-            # place — a gateway publishing neither yields {} for both, which is
-            # how the app knows to fall back to an ungrouped list.
-            families[model_id] = _text(row, "family") or model_id
+            # Defaulted to the id so the map is dense for every model this gateway
+            # describes: "this alias moves" then reads as families[id] == id, with
+            # no missing-key branch at the render site.
+            families[model_id] = family or model_id
+        elif family:
+            # A family with no provider: unplaceable in a section, but it must
+            # still be recorded. Leaving it out makes it ABSENT from the map, and
+            # a consumer reading absent as "is its own head" would tag a frozen
+            # version "latest" — the one claim it must never make. Recorded, the
+            # app sees a pin whose head it cannot find and lists it plainly.
+            families[model_id] = family
     return _remember(
         MindsModelListing((ids or None), efforts, enabled, labels, providers, families)
     )

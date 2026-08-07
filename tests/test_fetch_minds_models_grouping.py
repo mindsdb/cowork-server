@@ -129,28 +129,68 @@ def test_a_gateway_that_publishes_no_metadata_yields_empty_maps(monkeypatch):
     assert listing.families == {}
 
 
-@pytest.mark.parametrize("junk", [None, 42, "", "   ", [], {}])
-def test_non_string_or_blank_metadata_is_treated_as_absent(monkeypatch, junk):
-    """The picker degrades on a missing field but not on a present-but-junk one.
+# Junk is applied to ONE field at a time on purpose. Giving both the same value
+# collapses every case to "both absent" and the assertions become {} == {}, which
+# leaves the two interesting branches uncovered: a valid provider with a junk
+# family (the only case where the `or model_id` fallback fires on junk input), and
+# a junk provider with a valid family.
+_JUNK = [None, 42, "", "   ", [], {}, True]
 
-    So anything that isn't a non-empty string reads as "the gateway didn't publish
-    this", rather than becoming a section heading called "42" or "".
+
+@pytest.mark.parametrize("junk", _JUNK)
+def test_junk_provider_is_treated_as_absent(monkeypatch, junk):
+    """Anything that isn't a non-empty string reads as "not published".
+
+    Otherwise an unexpected gateway turns `42` into a section heading.
     """
-    _serve(monkeypatch, {"data": [_row("model-a", provider=junk, family=junk)]})
+    _serve(monkeypatch, {"data": [_row("model-a", provider=junk)]})
 
     listing = asyncio.run(fetch_minds_models(_URL, _KEY))
 
     assert listing.ids == ["model-a"]
     assert listing.providers == {}
-    # No provider means no family either: a family with no vendor to group it
-    # under is metadata the picker can't place.
     assert listing.families == {}
 
 
-def test_a_family_without_a_provider_is_dropped(monkeypatch):
+@pytest.mark.parametrize("junk", _JUNK)
+def test_junk_family_falls_back_to_the_id_when_the_provider_is_valid(monkeypatch, junk):
+    """The dense default has to fire on junk input, not just on an absent key.
+
+    A blank `family` is the shape a console edit produces, and it must read as "this
+    alias is its own head" rather than as a pin pointing at "".
+    """
+    _serve(monkeypatch, {"data": [_row("sonnet", provider="anthropic", family=junk)]})
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.providers == {"sonnet": "anthropic"}
+    assert listing.families == {"sonnet": "sonnet"}
+
+
+@pytest.mark.parametrize("junk", _JUNK)
+def test_a_valid_family_survives_a_junk_provider(monkeypatch, junk):
+    """The row is unplaceable in a section, but the family must still be recorded.
+
+    Dropping it makes the row ABSENT from the map, and a consumer reading absent as
+    "is its own head" would tag a frozen version "latest" — the one claim it must
+    never make.
+    """
+    _serve(monkeypatch, {"data": [_row("sonnet-4-5", provider=junk, family="sonnet")]})
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.providers == {}
+    assert listing.families == {"sonnet-4-5": "sonnet"}
+
+
+def test_a_family_without_a_provider_is_still_recorded(monkeypatch):
     _serve(monkeypatch, {"data": [_row("orphan", family="something")]})
 
-    assert asyncio.run(fetch_minds_models(_URL, _KEY)).families == {}
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    # Not dropped: absent would be read as "is its own head" and tagged latest.
+    assert listing.families == {"orphan": "something"}
+    assert listing.providers == {}
 
 
 def test_the_pre_existing_fields_survive_the_named_tuple(monkeypatch):
