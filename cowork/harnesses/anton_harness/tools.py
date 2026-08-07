@@ -200,7 +200,27 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     # action == 'publish' — delegate to the service (single source of truth for
     # target resolution, fullstack bundling, vault secrets, access, history,
     # and report_id reuse).
-    from anton.core.tools.side_effect import SideEffectResult, now_iso
+    #
+    # The SideEffectResult envelope (ENG-696) lives in anton; cowork-server and
+    # anton deploy independently, so an older anton without it must not break
+    # publishing. When absent, fall back to the plain `message` string — the
+    # exact pre-envelope return value, so behavior is byte-identical there.
+    try:
+        from anton.core.tools.side_effect import SideEffectResult, now_iso
+    except ImportError:
+        SideEffectResult = None
+
+    def _ok(message: str, **fields):
+        if SideEffectResult is None:
+            return message
+        return SideEffectResult(
+            success=True, message=message, committed_at=now_iso(), **fields
+        ).to_outcome()
+
+    def _fail(message: str, reason: str = ""):
+        if SideEffectResult is None:
+            return message
+        return SideEffectResult.failed(message, reason=reason)
 
     try:
         result = _publish_artifact(abs_path, access=access)
@@ -212,19 +232,17 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # they already have and block a legitimate retry.
         if "api key" in str(exc).lower():
             logger.info("Cowork publish blocked: %s", exc)
-            return SideEffectResult.failed(
+            return _fail(
                 "STOP: No Minds API key configured. Tell the user to set their "
                 "Minds API key in Settings (or in their .env) before publishing. "
                 "Do NOT call this tool again until they confirm the key is set.",
                 reason="missing_api_key",
             )
         logger.info("Cowork publish rejected: %s", exc)
-        return SideEffectResult.failed(f"PUBLISH FAILED: {exc}", reason="ValueError")
+        return _fail(f"PUBLISH FAILED: {exc}", reason="ValueError")
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
-        return SideEffectResult.failed(
-            f"PUBLISH FAILED: {exc}", reason=type(exc).__name__
-        )
+        return _fail(f"PUBLISH FAILED: {exc}", reason=type(exc).__name__)
 
     inner = result.get("result", {}) if isinstance(result, dict) else {}
     view_url = result.get("url", "") if isinstance(result, dict) else ""
@@ -233,23 +251,19 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if not view_url:
         # Committed (the service returned) but the URL is missing — success is
         # true, external_url stays null so the ambiguity is explicit, not prose.
-        return SideEffectResult(
-            success=True,
-            message="Published, but no view URL was returned.",
+        return _ok(
+            "Published, but no view URL was returned.",
             resource_id=report_id,
             idempotency_key=report_id,
-            committed_at=now_iso(),
             content_hash=(f"md5:{md5}" if md5 else None),
-        ).to_outcome()
-    return SideEffectResult(
-        success=True,
-        message=f"Published successfully! View URL: {view_url}",
+        )
+    return _ok(
+        f"Published successfully! View URL: {view_url}",
         resource_id=report_id,
         external_url=view_url,
         idempotency_key=report_id,
-        committed_at=now_iso(),
         content_hash=(f"md5:{md5}" if md5 else None),
-    ).to_outcome()
+    )
 
 
 def build_cowork_publish_tool():
