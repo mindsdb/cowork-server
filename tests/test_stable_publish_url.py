@@ -253,8 +253,26 @@ def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "https://4nton.ai/a/uuid-1" in out
+    assert "https://4nton.ai/a/uuid-1" in getattr(out, "content", out)
     assert captured["path"].endswith("static/index.html")
+
+
+def test_tool_publish_falls_back_to_string_on_old_anton(tmp_path: Path):
+    # An anton without the SideEffectResult envelope (ENG-696) must still
+    # publish — the tool returns the plain pre-envelope string. Setting the
+    # module to None in sys.modules makes the `from ... import` raise ImportError.
+    import sys
+
+    root = _make_fullstack(tmp_path)
+    with patch.object(tools_mod, "_publish_artifact",
+                      lambda p, access=None: {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}), \
+         patch.dict(sys.modules, {"anton.core.tools.side_effect": None}):
+        out = _run(tools_mod._cowork_publish_or_preview(
+            _FakeSession(tmp_path),
+            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
+        ))
+    assert isinstance(out, str)
+    assert out == "Published successfully! View URL: https://4nton.ai/a/uuid-1"
 
 
 def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
@@ -268,7 +286,7 @@ def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "STOP" in out and "API key" in out
+    assert "STOP" in getattr(out, "content", out) and "API key" in getattr(out, "content", out)
 
 
 def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: Path):
@@ -283,9 +301,10 @@ def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: P
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "STOP" not in out
-    assert "PUBLISH FAILED" in out
-    assert "Only HTML and Markdown" in out
+    text = getattr(out, "content", out)
+    assert "STOP" not in text
+    assert "PUBLISH FAILED" in text
+    assert "Only HTML and Markdown" in text
 
 
 # ---------------------------------------------------------------------------
