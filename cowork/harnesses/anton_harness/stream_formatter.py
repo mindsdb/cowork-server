@@ -350,6 +350,14 @@ async def format_responses_stream(
                             # first progress line. Same field scratchpad
                             # already relies on for executionDurationMs.
                             "eta_seconds": getattr(event, "eta_seconds", None),
+                            # Tool's own verdict (anton ToolOutcome.ok,
+                            # ENG-1276) — None/True render as success on the
+                            # frontend, only an explicit False marks the step
+                            # failed. Without this, tool_done firing (which is
+                            # unconditional by design, even on a handler
+                            # exception) rendered as an unconditional success —
+                            # the exact gap anton PR #304's review caught.
+                            "ok": getattr(event, "ok", None),
                         })
                         progress_tool_ids.discard(event.id)
                         tool_names.pop(event.id, None)

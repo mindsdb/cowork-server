@@ -72,6 +72,43 @@ class TestToolProgressRoleMapping:
         assert len(done) == 1
         assert done[0]["tool_use_id"] == "tc_1"
         assert done[0]["eta_seconds"] == 1.5
+        assert done[0]["ok"] is None
+
+    async def test_tool_done_forwards_the_ok_verdict(self):
+        # Without this, a failed tool renders as a success everywhere
+        # downstream — tool_done fires unconditionally by design (even on a
+        # handler exception), and with no verdict attached every consumer
+        # has no choice but to treat "it fired" as "it succeeded"
+        # (anton PR #304 review).
+        #
+        # Set post-construction, not via the constructor: the anton-agent
+        # version this repo's uv.lock resolves today predates the `ok`
+        # field (it's added on the anton side of this same fix and hasn't
+        # been promoted past `main` yet — see the design doc's rollout
+        # notes). `getattr(event, "ok", None)` in the formatter already
+        # handles an anton without the field at all; this only needs to
+        # simulate an anton new enough to *set* it.
+        tool_done = StreamTaskProgress(
+            phase="tool_done", message="streaming_probe",
+            eta_seconds=0.5, id="tc_1",
+        )
+        tool_done.ok = False
+        chunks = [
+            c async for c in format_responses_stream(
+                _events(
+                    StreamToolUseStart(id="tc_1", name="streaming_probe"),
+                    StreamToolUseEnd(id="tc_1"),
+                    StreamTaskProgress(phase="tool_progress", message="step 1", id="tc_1"),
+                    tool_done,
+                ),
+                model="claude-sonnet-4-6",
+            )
+        ]
+        events = _parse_sse(chunks)
+
+        done = [e for e in events if e.get("thought_role") == "thought.tool_call.end"]
+        assert len(done) == 1
+        assert done[0]["ok"] is False
 
     async def test_only_the_first_progress_per_id_is_throttle_exempt_but_tool_done_always_is(self, monkeypatch):
         # Mirrors production's throttle window (PROGRESS_THROTTLE = 0.25s).
