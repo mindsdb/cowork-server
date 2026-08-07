@@ -18,8 +18,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.api.v1.endpoints.guards import require_local
+from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.paths import cowork_home
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
@@ -45,18 +46,17 @@ from cowork.common.settings.user_settings import Provider, provider_api_key_str
 router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
-
-
-# ── CRUD ─────────────────────────────────────────────────────────────
+# Tenant scope for every settings read/write (local mode → LOCAL_SCOPE).
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 @router.get("/", response_model=list[SettingResponse])
-def list_settings(session: SessionDep) -> list[SettingResponse]:
-    return SettingService(session).list_settings()
+def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
+    return SettingService(session, scope).list_settings()
 
 
 @router.put("/")
-def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep):
+def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep, scope: ScopeDep):
     """Upsert many settings in one transaction (all-or-nothing).
 
     The Settings form saves through here: either every value validates and is
@@ -64,7 +64,7 @@ def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep):
     PUT loop, which could leave the DB half-written on a partial failure.
     """
     try:
-        updated = SettingService(session).save_all(body.values)
+        updated = SettingService(session, scope).save_all(body.values)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"updated": updated}
@@ -75,17 +75,18 @@ def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
     session: SessionDep,
+    scope: ScopeDep,
 ) -> SettingResponse:
     try:
-        return SettingService(session).upsert_setting(key, body.value)
+        return SettingService(session, scope).upsert_setting(key, body.value)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.delete("/{key}")
-def delete_setting(key: str, session: SessionDep):
+def delete_setting(key: str, session: SessionDep, scope: ScopeDep):
     try:
-        deleted = SettingService(session).delete_setting(key)
+        deleted = SettingService(session, scope).delete_setting(key)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     if not deleted:
@@ -100,8 +101,8 @@ def delete_setting(key: str, session: SessionDep):
 
 
 @router.post("/validate")
-def validate_settings(session: SessionDep):
-    s = SettingService(session).load()
+def validate_settings(session: SessionDep, scope: ScopeDep):
+    s = SettingService(session, scope).load()
     cs = check_config_status(s)
     return {
         "status": "ok" if cs["configReady"] else "needs_config",
@@ -113,8 +114,8 @@ def validate_settings(session: SessionDep):
 
 
 @router.get("/configured")
-def check_configured(session: SessionDep):
-    s = SettingService(session).load()
+def check_configured(session: SessionDep, scope: ScopeDep):
+    s = SettingService(session, scope).load()
     if s.minds_api_key is not None:
         return {"configured": True, "provider": "minds-cloud"}
     if s.anthropic_api_key is not None:
@@ -132,15 +133,16 @@ def check_configured(session: SessionDep):
 
 
 @router.post("/logout")
-def logout_clear_credentials(session: SessionDep):
+def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB.
 
     Called by the Electron main process during sign-out so that
     ``/health`` returns ``config_ready: false`` on the next query.
     Provider and model preferences are kept so they survive a
     re-login without requiring the onboarding flow to restore them.
+    Scoped: clears only the caller's org rows, never the global ones.
     """
-    deleted = SettingService(session).clear_credentials()
+    deleted = SettingService(session, scope).clear_credentials()
     return {"ok": True, "deleted": deleted}
 
 
@@ -150,7 +152,7 @@ def install_status():
 
 
 @router.get("/reveal-key/{name}")
-def reveal_key(name: str, session: SessionDep, request: Request):
+def reveal_key(name: str, session: SessionDep, scope: ScopeDep, request: Request):
     # reveal-key returns an unmasked provider secret — loopback only (ENG-457).
     require_local(request)
     name_map = {
@@ -164,7 +166,7 @@ def reveal_key(name: str, session: SessionDep, request: Request):
     provider = name_map.get(name.lower())
     if provider is None:
         raise HTTPException(status_code=404, detail="Unknown key name")
-    s = SettingService(session).load()
+    s = SettingService(session, scope).load()
     # provider_api_key_str applies the gemini/openai-compatible → openai fallback.
     return {"value": provider_api_key_str(s, provider)}
 
@@ -174,7 +176,7 @@ class _TestProvidersBody(BaseModel):
 
 
 @router.post("/test-providers")
-async def test_providers(session: SessionDep, body: _TestProvidersBody | None = None):
+async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
     """Ping the given (or all stored) providers and return connectivity results.
 
     Read-only: a test is a point-in-time check and no longer writes to the DB.
@@ -182,7 +184,7 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
     outlive a revoked key or a drained wallet and read as passing when it no
     longer was (ENG-335). Callers render the returned results directly.
     """
-    s = SettingService(session).load()
+    s = SettingService(session, scope).load()
 
     if body and body.providers is not None:
         providers = list(body.providers)
@@ -223,7 +225,7 @@ def _fill_missing(target: dict, extra: dict) -> None:
 
 
 @router.get("/recommended-models")
-async def recommended_models(session: SessionDep, refresh: bool = False):
+async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
@@ -261,7 +263,7 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
     # A model absent from this map falls back to the client's id-derived label.
     model_labels: dict[str, str] = {}
 
-    s = SettingService(session).load()
+    s = SettingService(session, scope).load()
     if s.minds_api_key is not None and s.minds_url:
         live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
@@ -295,7 +297,7 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
                 except (ValueError, TypeError):
                     stored = "{}"
                 if desired != stored:
-                    SettingService(session).upsert_setting("minds_model_enabled", desired)
+                    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
@@ -377,7 +379,8 @@ def _read_env_dict() -> dict[str, str]:
 @router.get("/raw")
 def read_raw_settings(request: Request):
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
-    # restriction as reveal-key.
+    # restriction as reveal-key, and desktop-only (deployment-global state).
+    require_local_tenancy()
     require_local(request)
     return _read_env_dict()
 
@@ -398,8 +401,9 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
     ``GET /raw``; the DB is authoritative for cowork-server.  By syncing
     to both we keep them consistent regardless of which frontend code
     path writes settings (onboarding, OAuth token refresh, etc.)."""
-    # Writing the dotenv lands provider secrets on disk — same loopback
-    # restriction as the /raw read.
+    # Writing the dotenv lands provider secrets on disk and syncs them into
+    # global settings rows — loopback-only, and desktop-only.
+    require_local_tenancy()
     require_local(request)
 
     from cowork.migrations import sync_env_vars_to_db

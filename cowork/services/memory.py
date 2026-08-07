@@ -13,7 +13,8 @@ from cowork.schemas.memory import MemoryResponse, MemoryScope
 class MemoryService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
-        self._global_store = SharedMemoryStore()
+        # Org mode → the store keys itself per org (see SharedMemoryStore).
+        self._global_store = SharedMemoryStore(scope=session.scope)
 
     async def get_memory(
         self,

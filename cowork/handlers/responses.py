@@ -11,10 +11,13 @@ from uuid import UUID
 from fastapi import HTTPException
 from sqlmodel import Session
 
-from cowork.common.settings.user_settings import get_user_settings
+from cowork.build_info import build_trace_metadata
+from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
 from cowork.streaming import new_buffer, registry
+from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -56,15 +59,21 @@ class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
         self.principal = principal
-        self.scoped = ScopedSession(session, scope_from_principal(principal))
-        self.harness = get_harness(get_user_settings().harness)
+        self.scope = scope_from_principal(principal)
+        self.scoped = ScopedSession(session, self.scope)
+        # Resolve settings once; reuse the harness name in handle()/the producer.
+        self.harness_name = get_user_settings(self.scope).harness
+        self.harness = get_harness(self.harness_name)
         self.last_conversation_id: str | None = None
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
-        # Identity into the run's trace metadata; server-derived keys win.
-        trace_metadata = identity_trace_metadata(self.principal, request.trace_metadata)
+        # Identity + the running build into the run's trace metadata;
+        # server-derived keys win. The build stamp (ENG-1279) is what lets a
+        # metric be attributed to a release instead of to a date on which
+        # several changes happened to ship together.
+        trace_metadata = build_trace_metadata(identity_trace_metadata(self.principal, request.trace_metadata))
 
         conversation_service = ConversationService(self.scoped)
 
@@ -125,28 +134,36 @@ class ResponsesHandler:
             # Detached + resumable. The agent run executes in a background
             # task that writes events to a per-turn buffer; this request just
             # tails the buffer. Closing the connection never reaches the
-            # producer — only an explicit /cancel does. The user message is
-            # persisted by the producer at the end (deferred), so the harness
-            # reads history WITHOUT the current turn (see _produce).
+            # producer — only an explicit /cancel does.
+            #
+            # The user message is persisted (pending) as the producer's FIRST
+            # action, not here (ENG-1231). registry.start() dedups a duplicate
+            # start for an already-in-flight conversation and discards the second
+            # producer coroutine unawaited — persisting here (before that dedup)
+            # would commit a pending row whose producer never runs and never
+            # finalizes, stranding it out of LLM history. Persisting inside the
+            # producer ties the write to the one coroutine that actually runs, so
+            # there is at most one pending row per conversation.
             buffer = new_buffer(str(conversation.id), turn_id)
+            producer_coro = self._select_producer(
+                conv_id=conversation.id,
+                harness_input=harness_input,
+                original_content=original_content,
+                model=request.model,
+                disabled=disabled,
+                harness_name=self.harness_name,
+                harness_id=getattr(self.harness, "id", None),
+                buffer=buffer,
+                trace_tags=request.trace_tags,
+                trace_metadata=trace_metadata,
+            )
             await registry.start(
                 conversation_id=str(conversation.id),
                 turn_id=turn_id,
                 buffer=buffer,
                 org_id=self.scoped.scope.org_id,
                 user_id=self.scoped.scope.user_id,
-                producer_coro=self._produce(
-                    conv_id=conversation.id,
-                    harness_input=harness_input,
-                    original_content=original_content,
-                    model=request.model,
-                    disabled=disabled,
-                    harness_name=get_user_settings().harness,
-                    harness_id=getattr(self.harness, "id", None),
-                    buffer=buffer,
-                    trace_tags=request.trace_tags,
-                    trace_metadata=trace_metadata,
-                ),
+                producer_coro=producer_coro,
             )
             return sse_from_buffer(buffer, 0)
 
@@ -154,16 +171,173 @@ class ResponsesHandler:
         # The user message is persisted by _collect after the turn (deferred),
         # so the harness reads history WITHOUT the current turn — otherwise the
         # fresh-query history would replay it AND resend it as the live input.
-        stream = self.harness.stream_response(
-            conversation=conversation,
-            input=harness_input,
-            disabled_connections=disabled,
-            trace_tags=request.trace_tags,
+        with use_settings_scope(self.scope):
+            stream = self.harness.stream_response(
+                conversation=conversation,
+                input=harness_input,
+                disabled_connections=disabled,
+                trace_tags=request.trace_tags,
+                trace_metadata=trace_metadata,
+            )
+            return await self._collect(stream, conversation.id, request.model, original_content)
+
+    def _select_producer(
+        self,
+        *,
+        conv_id: UUID,
+        harness_input: list[dict],
+        original_content,
+        model: str,
+        disabled: list[dict] | None,
+        harness_name: str,
+        harness_id: str | None,
+        buffer,
+        trace_tags: list[str] | None = None,
+        trace_metadata: dict[str, str] | None = None,
+    ):
+        """Choose the streaming producer coroutine.
+
+        `COWORK_TURN_BACKEND=remote` (`TurnQueueSettings().backend`) routes
+        the turn through the Redis-backed remote producer. Otherwise (the
+        default, "inprocess"), this runs in-process: the `self._produce(...)`
+        call below is unchanged from before this branch existed.
+        """
+        if TurnQueueSettings().backend == "remote":
+            return self._produce_remote(
+                conv_id=conv_id,
+                input_text=self._prompt_text(harness_input),
+                original_content=original_content,
+                model=model,
+                harness_id=harness_id,
+                buffer=buffer,
+            )
+        return self._produce(
+            conv_id=conv_id,
+            harness_input=harness_input,
+            original_content=original_content,
+            model=model,
+            disabled=disabled,
+            harness_name=harness_name,
+            harness_id=harness_id,
+            buffer=buffer,
+            trace_tags=trace_tags,
             trace_metadata=trace_metadata,
         )
-        return await self._collect(stream, conversation.id, request.model, original_content)
 
-    async def _produce(
+    @staticmethod
+    def _remote_history(session, conv_id) -> list[dict]:
+        """Prior user/assistant messages in canonical order, as OpenAI-shaped
+        dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
+        ordered = ConversationService(session).get_ordered_messages(conv_id)
+        return [
+            m.to_openai_message().model_dump(mode="json")
+            for m in ordered
+            if m.role in {"user", "assistant"}
+        ]
+
+    async def _produce_remote(
+        self,
+        *,
+        conv_id: UUID,
+        input_text: str,
+        original_content,
+        model: str | None,
+        harness_id: str | None,
+        buffer,
+    ) -> None:
+        """Remote-backend counterpart of _produce: run the turn through the
+        queue and persist user + assistant together on terminal (deferred, so
+        _remote_history reads prior turns without the current input)."""
+        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
+        collected_text: list[str] = []
+        collected_events: list[dict] = []
+        persisted = False
+        pending_message_id: UUID | None = None
+
+        def on_event(kind: str, data: dict) -> None:
+            # Mirror the SSE frames the producer streams, so the client
+            # rebuilds the same turn from the events log on reload.
+            if kind == "turn_delta":
+                text = data.get("text", "")
+                collected_text.append(text)
+                collected_events.append({"type": "response.output_text.delta", "delta": text})
+            elif kind == "turn_completed":
+                collected_events.append({"type": "response.completed"})
+            elif kind == "turn_failed":
+                # Producer attaches the classified (code, message) it streamed.
+                collected_events.append(response_failed_payload(
+                    data.get("message") or GENERIC_TURN_ERROR_MESSAGE,
+                    data.get("code") or GENERIC_TURN_ERROR_CODE,
+                ))
+
+        def persist() -> None:
+            nonlocal persisted
+            if persisted:
+                return
+            persisted = True
+            try:
+                # Re-anchor first: the conversation may be gone or out of scope.
+                svc = ConversationService(producer_session)
+                svc.get_conversation(conv_id)
+                # The user message was already persisted (pending) at turn start
+                # (ENG-1231). Clear the flag first — even if save_assistant_turn
+                # early-returns on an empty turn — so the question rejoins replayed
+                # history; then persist the assistant turn. Scope to THIS turn's
+                # row so a completing turn can't absorb a pending row stranded by
+                # an earlier crashed turn into history. If the pending persist
+                # never succeeded (id unset), this turn owns no row — skip
+                # finalize rather than fall back to clearing every pending row.
+                if pending_message_id is not None:
+                    svc.finalize_pending(conv_id, pending_message_id)
+                svc.save_assistant_turn(
+                    conv_id, "".join(collected_text), collected_events, harness=harness_id,
+                )
+            except Exception:
+                logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
+
+        try:
+            # Persist the user message (pending) as the first thing this producer
+            # does (ENG-1231) — see the note in handle(). Committed here, before
+            # streaming, so a refresh/reconnect mid-turn shows the question via
+            # /items. _remote_history reads get_ordered_messages, which excludes
+            # pending, so the current input isn't replayed into the remote job.
+            pending_message_id = ConversationService(producer_session).save_user_message(
+                conv_id, original_content, pending=True,
+            ).id
+            await produce_remote_turn(
+                conversation_id=str(conv_id),
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+                input_text=input_text,
+                model=model,
+                buffer=buffer,
+                # Producer session, NOT self.scoped: this coroutine is detached
+                # and the request session may be closed by the time it runs.
+                history=self._remote_history(producer_session, conv_id),
+                harness_id=harness_id,
+                on_event=on_event,
+            )
+            persist()
+        except asyncio.CancelledError:
+            # Partial text generated before cancellation is persisted.
+            persist()
+            await buffer.close("cancelled")
+        except Exception:
+            logger.exception("[responses] remote turn failed for conversation %s", conv_id)
+            await buffer.append("sse", {"sse": response_failed_sse(
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            persist()
+            await buffer.close("error")
+        finally:
+            producer_session.close()
+
+    async def _produce(self, **kwargs) -> None:
+        # Detached task: bind the turn's org scope so every settings reader in the
+        # harness/provider/publish subtree resolves this org's config.
+        with use_settings_scope(scope_from_principal(self.principal)):
+            await self._run_turn(**kwargs)
+
+    async def _run_turn(
         self,
         *,
         conv_id: UUID,
@@ -179,10 +353,12 @@ class ResponsesHandler:
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
-        Runs in its OWN DB session (it outlives the request). Persistence is
-        deferred to the end so the harness reads history WITHOUT the current
-        user message; on terminal we persist user + assistant together.
-        Never reaches the HTTP response — readers tail the buffer.
+        Runs in its OWN DB session (it outlives the request). Persists the user
+        message (pending) as its first action so a mid-turn refresh shows the
+        question, reads history via get_ordered_messages (which excludes pending,
+        so the current input isn't double-fed), and on terminal finalizes the
+        pending flag + persists the assistant turn (ENG-1231). Never reaches the
+        HTTP response — readers tail the buffer.
         """
         # Fresh session (outlives the request), scoped from the immutable
         # principal captured at handler construction — never request state.
@@ -193,6 +369,7 @@ class ResponsesHandler:
         persisted = False
         # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
+        pending_message_id: UUID | None = None
 
         def event_sink(event_type: str, data: dict) -> None:
             # Tool block-rows are for LLM-history persistence, not UI replay —
@@ -212,12 +389,19 @@ class ResponsesHandler:
             try:
                 # Re-anchor before ANY write: the conversation may be gone
                 # (deleted mid-turn) or out of scope on this fresh session.
-                ConversationService(producer_session).get_conversation(conv_id)
-                ConversationService(producer_session).save_user_message(
-                    conv_id, original_content, created_at=sent_at
-                )
-                producer_session.commit()
-                ConversationService(producer_session).save_assistant_turn(
+                svc = ConversationService(producer_session)
+                svc.get_conversation(conv_id)
+                # The user message was already persisted (pending) at turn start
+                # (ENG-1231). Clear the flag first — even if save_assistant_turn
+                # early-returns on an empty turn — so the question rejoins replayed
+                # history; then persist the assistant turn. Scope to THIS turn's
+                # row so a completing turn can't absorb a pending row stranded by
+                # an earlier crashed turn into history. If the pending persist
+                # never succeeded (id unset), this turn owns no row — skip
+                # finalize rather than fall back to clearing every pending row.
+                if pending_message_id is not None:
+                    svc.finalize_pending(conv_id, pending_message_id)
+                svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                     tool_rows=turn_rows,
                 )
@@ -226,6 +410,13 @@ class ResponsesHandler:
 
         try:
             conv = ConversationService(producer_session).get_conversation(conv_id)
+            # Persist the user message (pending) as the first thing this producer
+            # does (ENG-1231) — see the note in handle(). The harness reads history
+            # via get_ordered_messages, which excludes pending, so this write isn't
+            # replayed into the turn as duplicate context.
+            pending_message_id = ConversationService(producer_session).save_user_message(
+                conv_id, original_content, created_at=sent_at, pending=True,
+            ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, disabled_connections=disabled,

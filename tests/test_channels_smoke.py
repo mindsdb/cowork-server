@@ -38,10 +38,13 @@ class FakeHarness:
         self.turn_history = turn_history
         self.inputs: list[list[dict]] = []
         self.channel_contexts: list = []
+        self.trace_metadata: list = []
 
-    async def stream_response(self, *, conversation, input, channel_context=None):
+    async def stream_response(self, *, conversation, input, channel_context=None,
+                              trace_metadata=None):
         self.inputs.append(input)
         self.channel_contexts.append(channel_context)
+        self.trace_metadata.append(trace_metadata)
         if False:
             yield
 
@@ -142,12 +145,19 @@ def test_telegram_end_to_end(monkeypatch):
             assert binding.channel_type == "telegram" and binding.anton_conversation_id is not None
             sessions = s.exec(select(ChannelSession)).all()
             assert len(sessions) == 1 and sessions[0].binding_id == binding.id
-            msgs = s.exec(select(Message).where(Message.conversation_id == binding.anton_conversation_id)).all()
+            conversation_id = binding.anton_conversation_id
+            msgs = s.exec(select(Message).where(Message.conversation_id == conversation_id)).all()
             assert sorted(m.role for m in msgs) == ["assistant", "user"]
             assistant = next(m for m in msgs if m.role == "assistant")
             assert assistant.content == REPLY and assistant.harness == "anton"
             assert inbound_events(s)[0].status == "routed"
             s.close()
+
+            # A channel turn never passes through ResponsesHandler, so it has
+            # to carry its own build stamp (ENG-1279) — otherwise every bot
+            # turn is unattributable to the release that produced it.
+            assert fake_harness.trace_metadata[0]["cowork_server_version"]
+            assert fake_harness.trace_metadata[0]["install_channel"]
 
             # No tool events in this turn → reply delivered verbatim, no link.
             sends = [p for (m, p) in calls if m == "sendMessage"]
@@ -159,7 +169,11 @@ def test_telegram_end_to_end(monkeypatch):
             await drain_background_tasks()
             s = get_open_session()
             assert len(inbound_events(s)) == 1
-            assert len([m for m in s.exec(select(Message)).all() if m.role == "assistant"]) == 1
+            # Scoped to THIS binding's conversation: the test DB is shared by
+            # the whole session, so a global Message count is really counting
+            # every other test's turns too (it only passed by file ordering).
+            replies = s.exec(select(Message).where(Message.conversation_id == conversation_id)).all()
+            assert len([m for m in replies if m.role == "assistant"]) == 1
             s.close()
             assert len([p for (m, p) in calls if m == "sendMessage"]) == 1
 
@@ -685,13 +699,24 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
         s.close()
         return sorted({m.harness for m in msgs if m.role == "assistant"})
 
-    settings = get_user_settings()
-    monkeypatch.setattr(settings, "channels_harness", "hermes")
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    def set_channels_harness(name):
+        # Persist to the DB — get_user_settings() loads fresh (no cache), so the
+        # runtime must read the stored value, not a mutated in-memory object.
+        s = get_open_session()
+        try:
+            SettingService(s).upsert_setting("channels_harness", name)
+        finally:
+            s.close()
+
+    set_channels_harness("hermes")
     turn(700, 200)
     assert harnesses_of(700) == ["hermes"] and hermes_harness.inputs
 
     # Flipping the setting must never switch an existing conversation: pinned.
-    monkeypatch.setattr(settings, "channels_harness", "anton")
+    set_channels_harness("anton")
     turn(700, 201)
     assert harnesses_of(700) == ["hermes"]
 
@@ -700,7 +725,7 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
     assert harnesses_of(701) == ["anton"]
 
     # Unregistered name falls back to the default rather than failing the turn.
-    monkeypatch.setattr(settings, "channels_harness", "ghost")
+    set_channels_harness("ghost")
     turn(702, 203)
     assert harnesses_of(702) == ["anton"]
 
