@@ -7,6 +7,8 @@ behavior; org mode fails loudly until a service principal exists).
 """
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 from sqlmodel import Session, select
 
@@ -109,6 +111,24 @@ def test_messages_are_transitively_tenant_safe(db):
     b = _svc(db, _scope(ORG_B))
     with pytest.raises(ValueError, match="not found"):
         b.get_messages(conv.id)
+
+
+def test_ordered_messages_anchor_to_scoped_parent(db):
+    # get_ordered_messages is the harness replay path — it takes a bare id
+    # (the remote-turn path passes one from the wire), so a foreign id must
+    # answer exactly like a nonexistent one, not return another org's history.
+    a = _svc(db, _scope(ORG_A))
+    conv = a.create_conversation(topic="t", project_id=_project_id(db, "a-proj"))
+    a.save_assistant_turn(conv.id, "answer", [])
+
+    b = _svc(db, _scope(ORG_B))
+    with pytest.raises(ValueError, match="not found"):
+        b.get_ordered_messages(conv.id)
+    with pytest.raises(ValueError, match="not found"):
+        b.get_ordered_messages(uuid4())  # same shape as a nonexistent id
+
+    # the owning org still reads its history
+    assert [m.content for m in a.get_ordered_messages(conv.id)] == ["answer"]
 
 
 # ── detached producer contract ──────────────────────────────────────────────

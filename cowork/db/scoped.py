@@ -17,6 +17,7 @@ Local mode (the desktop sidecar) never filters — today's behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, Request
@@ -84,6 +85,17 @@ def scope_for_background_context() -> TenantScope:
     )
 
 
+def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
+    """Org-keyed root for filesystem stores: ``base`` in local mode,
+    ``base/<org_id>`` in org mode, fail-closed without an org. org_id is a
+    normalized UUID (TrustedHeaderMiddleware), so it's path-safe."""
+    if scope is None or not scope.org_mode:
+        return base
+    if not scope.org_id:
+        raise MissingTenantScopeError("filesystem store requires an organization in scope")
+    return base / scope.org_id
+
+
 def scope_of_session(session: Session) -> TenantScope | None:
     """The TenantScope a raw session was wrapped with, if any.
 
@@ -95,10 +107,9 @@ def scope_of_session(session: Session) -> TenantScope | None:
     return session.info.get("tenant_scope")
 
 
-# Tables whose ownership columns stay inert. Closed list on purpose: deferring
-# a table is a scoped-layer decision, never a model-side flag. settings stays
-# key-based until the settings split — rows are deployment-owned and env-seeded
-# with NULL org, so org-mode reads must not filter and writes must not stamp.
+# Tables the generic scoped layer leaves alone. `settings` is here because
+# SettingService owns its tenancy explicitly (routes keys to global/org/user
+# rows itself), so the generic org-filter/stamp must not also touch it.
 _TENANCY_DEFERRED_TABLES = frozenset({"settings"})
 
 
