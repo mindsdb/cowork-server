@@ -274,8 +274,12 @@ class OAuthSettings(Settings):
 
 
 class MemorySettings(Settings):
+    # populate_by_name: callers construct MemorySettings(root_dir=...) directly.
+    model_config = SettingsConfigDict(populate_by_name=True)
+
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "memory"),
+        validation_alias=AliasChoices("COWORK_MEMORY_DIR", "MEMORY_ROOT_DIR"),
         description="Root directory for all memory files",
     )
 

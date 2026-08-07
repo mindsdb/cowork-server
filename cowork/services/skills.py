@@ -16,6 +16,7 @@ from anton.core.tools.skill_format import (
     validate_name,
 )
 from cowork.common.settings import get_app_settings
+from cowork.db.scoped import TenantScope, scoped_storage_root
 from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
 from cowork.models.skill import (
     META_CREATED_AT,
@@ -39,12 +40,17 @@ def _skill_from_dir(skill_dir: Path) -> Skill | None:
 
 
 class SkillService:
-    """File-backed skill store using the agentskills.io ``SKILL.md`` format."""
+    """File-backed skill store using the agentskills.io ``SKILL.md`` format.
 
+    Org mode keys the store per org (``<root>/<org_id>``); local mode uses the
+    shared root unchanged."""
 
-
-    def __init__(self) -> None:
-        self.root = Path(get_app_settings().skill.root_dir)
+    def __init__(self, scope: TenantScope | None = None) -> None:
+        self.root = scoped_storage_root(Path(get_app_settings().skill.root_dir), scope)
+        # Project symlink distribution is desktop-only: skill_links resolves
+        # from the unkeyed root and scans all project dirs, so it must not run
+        # in org mode.
+        self._link_projects = scope is None or not scope.org_mode
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _skill_dir(self, slug: str) -> Path:
@@ -188,9 +194,11 @@ class SkillService:
         self._write(skill)
         if renaming:
             self._rename_dir(skill.name, new_slug)
-            remove_skill_links(skill.name)
+            if self._link_projects:
+                remove_skill_links(skill.name)
             skill.name = new_slug
-            reconcile_skill_links(skill)
+            if self._link_projects:
+                reconcile_skill_links(skill)
 
         return self.get_skill(skill.name)
 
@@ -283,15 +291,22 @@ class SkillService:
         if only.suffix.lower() == ".md" and only.name != SKILL_FILE:
             only.rename(src_dir / SKILL_FILE)
 
+    # A small archive can expand to many times its size — bound the expansion.
+    _ZIP_MAX_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
+
     @staticmethod
     def _safe_extract_zip(data: bytes, dest: Path) -> None:
-        """Extract a zip into ``dest``, rejecting paths that escape it or are symlinks."""
+        """Extract a zip into ``dest``, rejecting escaping paths, symlinks, and
+        archives that would expand past the size bound."""
         import stat
 
         dest_resolved = dest.resolve()
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                for info in zf.infolist():
+                infos = zf.infolist()
+                if sum(i.file_size for i in infos) > SkillService._ZIP_MAX_UNCOMPRESSED:
+                    raise ValueError("Archive would expand beyond the allowed size.")
+                for info in infos:
                     # Upper 16 bits of external_attr are Unix mode bits (0 on Windows zips).
                     unix_mode = info.external_attr >> 16
                     if unix_mode and stat.S_ISLNK(unix_mode):
@@ -308,7 +323,8 @@ class SkillService:
         if not skill_dir.exists():
             return False
         shutil.rmtree(skill_dir)
-        remove_skill_links(slug)
+        if self._link_projects:
+            remove_skill_links(slug)
         return True
 
     # ── low-level fs ─────────────────────────────────────────────────────────
@@ -321,8 +337,9 @@ class SkillService:
         tmp = skill_dir / f".{SKILL_FILE}.tmp"
         tmp.write_text(dump_skill(skill), encoding="utf-8")
         os.replace(tmp, target)  # atomic within the same directory
-        # Project per-project links to match the skill's metadata.
-        reconcile_skill_links(skill)
+        # Project per-project links to match the skill's metadata (desktop only).
+        if self._link_projects:
+            reconcile_skill_links(skill)
 
     def _rename_dir(self, old_slug: str, new_slug: str) -> None:
         self._ensure_root()
