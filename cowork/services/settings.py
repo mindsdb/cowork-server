@@ -10,7 +10,9 @@ from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.user_settings import (
     UserSettings,
     invalidate_user_settings_cache,
+    setting_is_org_scoped,
 )
+from cowork.db.scoped import TenantScope
 from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
 
@@ -38,14 +40,117 @@ def _mask_provider_keys(providers_json: str) -> str:
 
 
 class SettingService:
-    def __init__(self, session: Session) -> None:
+    """Read/write settings with per-scope routing.
+
+    A key's write scope comes from ``setting_is_org_scoped``; reads resolve
+    user → org → global (NULL-scope legacy/env row) → field default. Scope is
+    explicit here, not inherited from ScopedSession (``settings`` stays in
+    ``_TENANCY_DEFERRED_TABLES``). No scope → operates on global rows only, the
+    pre-split desktop behavior. Admin gating on org-key writes is an endpoint
+    concern; this layer only routes.
+    """
+
+    def __init__(self, session: Session, scope: TenantScope | None = None) -> None:
         self.session = session
+        self.scope = scope
+
+    def _org_active(self) -> bool:
+        return bool(self.scope and self.scope.org_mode and self.scope.org_id)
+
+    def _global_row(self, key: str) -> Setting | None:
+        return self.session.exec(
+            select(Setting).where(Setting.key == key, Setting.scope.is_(None))
+        ).first()
+
+    def _scoped_row(self, key: str, scope: str, *, org_id: str | None = None, user_id: str | None = None) -> Setting | None:
+        stmt = select(Setting).where(Setting.key == key, Setting.scope == scope)
+        if org_id is not None:
+            stmt = stmt.where(Setting.org_id == org_id)
+        if user_id is not None:
+            stmt = stmt.where(Setting.user_id == user_id)
+        return self.session.exec(stmt).first()
 
     def _fetch_row(self, key: str) -> Setting | None:
-        return self.session.exec(select(Setting).where(Setting.key == key)).first()
+        """Winning row for read: user → org → global. A user row is identified
+        by (org_id, user_id) — the same person in another org must not match."""
+        if not self._org_active():
+            return self._global_row(key)
+        if self.scope.user_id:
+            row = self._scoped_row(key, "user", org_id=self.scope.org_id, user_id=self.scope.user_id)
+            if row is not None:
+                return row
+        row = self._scoped_row(key, "org", org_id=self.scope.org_id)
+        if row is not None:
+            return row
+        return self._global_row(key)
+
+    def _own_row(self, key: str) -> Setting | None:
+        """Row at the key's own write scope, no fallback — delete/clear act on
+        this so a tenant removes its own override, never a deployment row."""
+        if not self._org_active():
+            return self._global_row(key)
+        if not setting_is_org_scoped(key) and self.scope.user_id:
+            return self._scoped_row(key, "user", org_id=self.scope.org_id, user_id=self.scope.user_id)
+        return self._scoped_row(key, "org", org_id=self.scope.org_id)
 
     def _fetch_all_rows(self) -> list[Setting]:
-        return list(self.session.exec(select(Setting)).all())
+        """One resolved row per key: global → org → user, most-specific wins."""
+        if not self._org_active():
+            return list(
+                self.session.exec(select(Setting).where(Setting.scope.is_(None))).all()
+            )
+        by_key: dict[str, Setting] = {}
+        for row in self.session.exec(select(Setting).where(Setting.scope.is_(None))).all():
+            by_key[row.key] = row
+        for row in self.session.exec(
+            select(Setting).where(Setting.scope == "org", Setting.org_id == self.scope.org_id)
+        ).all():
+            by_key[row.key] = row
+        if self.scope.user_id:
+            for row in self.session.exec(
+                select(Setting).where(
+                    Setting.scope == "user",
+                    Setting.org_id == self.scope.org_id,
+                    Setting.user_id == self.scope.user_id,
+                )
+            ).all():
+                by_key[row.key] = row
+        return list(by_key.values())
+
+    def _require_writable(self) -> None:
+        """Mutations fail closed in org mode with no org in scope: a write would
+        otherwise land in a global row visible to every tenant. Reads keep their
+        global fallback — this guards writes/deletes only."""
+        if self.scope and self.scope.org_mode and not self.scope.org_id:
+            from cowork.db.scoped import MissingTenantScopeError
+            raise MissingTenantScopeError("settings write requires an organization in scope")
+
+    def _require_write_target(self, key: str) -> None:
+        """A personal-key write needs a user in scope — checked up front so a
+        batch resolves every target BEFORE staging any row (all-or-nothing)."""
+        if self._org_active() and not setting_is_org_scoped(key) and not self.scope.user_id:
+            raise ValueError(f"'{key}' is a personal setting but no user is in scope")
+
+    def _new_row(self, key: str, store_val: str) -> Setting:
+        """A fresh Setting stamped for the key's write scope."""
+        if not self._org_active():
+            return Setting(key=key, value=store_val)
+        if setting_is_org_scoped(key):
+            return Setting(key=key, value=store_val, scope="org", org_id=self.scope.org_id)
+        if not self.scope.user_id:
+            raise ValueError(f"'{key}' is a personal setting but no user is in scope")
+        return Setting(
+            key=key, value=store_val, scope="user",
+            user_id=self.scope.user_id, org_id=self.scope.org_id,
+        )
+
+    def _write_row(self, key: str, store_val: str) -> None:
+        row = self._own_row(key)
+        if row is None:
+            row = self._new_row(key, store_val)
+        else:
+            row.value = store_val
+        self.session.add(row)
 
     @staticmethod
     def _validate_key(key: str) -> None:
@@ -146,18 +251,16 @@ class SettingService:
             return field_val.value, validated
         return (str(field_val) if field_val is not None else value), validated
 
-    def _write_row(self, key: str, store_val: str) -> None:
-        row = self._fetch_row(key)
-        if row is None:
-            row = Setting(key=key, value=store_val)
-        else:
-            row.value = store_val
-        self.session.add(row)
-
     def upsert_setting(self, key: str, value: str) -> SettingResponse:
+        self._require_writable()
         store_val, validated = self._encode_for_store(key, value)
-        self._write_row(key, store_val)
-        self.session.commit()
+        self._require_write_target(key)
+        try:
+            self._write_row(key, store_val)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
         invalidate_user_settings_cache()
         return self._to_response(key, validated, True)
 
@@ -165,69 +268,78 @@ class SettingService:
         """Validate and upsert many settings in ONE transaction (all-or-nothing).
 
         Unlike ``bulk_upsert`` (best-effort, used by the .env sync) this raises
-        on the first invalid key/value and writes NOTHING, so a Settings-form
-        save can't half-apply the way the per-key PUT loop could. ``***`` (the
-        unchanged-secret sentinel) and ``None`` are skipped, matching the
-        client's write-diff. Returns the keys written.
+        on the first invalid key/value/target and writes NOTHING, so a
+        Settings-form save can't half-apply. ``***`` (the unchanged-secret
+        sentinel) and ``None`` are skipped, matching the client's write-diff.
+        Returns the keys written.
         """
         encoded: dict[str, str] = {}
         for key, value in updates.items():
             if value is None or value == "***":
                 continue
-            store_val, _ = self._encode_for_store(key, value)  # raises → nothing written
+            store_val, _ = self._encode_for_store(key, value)  # raises → nothing staged
             encoded[key] = store_val
-        for key, store_val in encoded.items():
-            self._write_row(key, store_val)
+        # Resolve every write TARGET before staging any row, so a bad target
+        # (e.g. a personal key with no user in scope) fails all-or-nothing
+        # instead of leaving earlier rows staged for a caller to commit.
+        self._require_writable()
+        for key in encoded:
+            self._require_write_target(key)
+        try:
+            for key, store_val in encoded.items():
+                self._write_row(key, store_val)
+            if encoded:
+                self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
         if encoded:
-            self.session.commit()
             invalidate_user_settings_cache()
         return list(encoded.keys())
 
     def bulk_upsert(self, updates: dict[str, str]) -> list[str]:
-        """Upsert multiple settings in a single transaction.
+        """Upsert multiple settings in a single transaction (best-effort).
 
-        Returns the list of keys that were actually written.
-        Skips None values and masked placeholders (``***``).
+        Returns the keys actually written. Skips None, masked placeholders
+        (``***``), invalid values, and un-writable targets. Rolls back the whole
+        batch on an unexpected mutation error rather than leaving it staged.
         """
+        self._require_writable()
         written: list[str] = []
-        for key, value in updates.items():
-            if value is None or value == "***":
-                continue
-            self._validate_key(key)
-            try:
-                validated = UserSettings.model_validate({key: value})
-            except ValidationError:
-                continue
-
-            field_val = getattr(validated, key)
-            if UserSettings.field_is_sensitive(key):
-                raw = field_val.get_secret_value() if isinstance(field_val, SecretStr) else str(field_val)
-                store_val = encrypt(raw)
-            elif isinstance(field_val, Enum):
-                store_val = field_val.value
-            else:
-                store_val = str(field_val) if field_val is not None else value
-
-            row = self._fetch_row(key)
-            if row is None:
-                row = Setting(key=key, value=store_val)
-            else:
-                row.value = store_val
-            self.session.add(row)
-            written.append(key)
-
+        try:
+            for key, value in updates.items():
+                if value is None or value == "***":
+                    continue
+                self._validate_key(key)
+                try:
+                    store_val, _ = self._encode_for_store(key, value)
+                    self._require_write_target(key)
+                except ValueError:
+                    continue
+                self._write_row(key, store_val)
+                written.append(key)
+            if written:
+                self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
         if written:
-            self.session.commit()
             invalidate_user_settings_cache()
         return written
 
     def delete_setting(self, key: str) -> bool:
         self._validate_key(key)
-        row = self._fetch_row(key)
+        self._require_writable()
+        self._require_write_target(key)
+        row = self._own_row(key)
         if row is None:
             return False
-        self.session.delete(row)
-        self.session.commit()
+        try:
+            self.session.delete(row)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
         invalidate_user_settings_cache()
         return True
 
@@ -253,14 +365,19 @@ class SettingService:
             "provider_status",
             "provider_status_details",
         ]
+        self._require_writable()
         deleted: list[str] = []
-        for key in credential_keys:
-            row = self._fetch_row(key)
-            if row is not None:
-                self.session.delete(row)
-                deleted.append(key)
+        try:
+            for key in credential_keys:
+                row = self._own_row(key)
+                if row is not None:
+                    self.session.delete(row)
+                    deleted.append(key)
+            if deleted:
+                self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
         if deleted:
-            self.session.commit()
             invalidate_user_settings_cache()
         return deleted
-

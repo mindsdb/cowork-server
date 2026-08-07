@@ -7,6 +7,7 @@ isolation (the base-URL half is provider_base_url).
 """
 
 from pydantic import SecretStr
+from cowork.db.scoped import LOCAL_SCOPE
 
 from cowork.common.settings.user_settings import (
     Provider,
@@ -236,7 +237,7 @@ class TestCheckConfiguredGeminiOnly:
         self._clear(svc)
         try:
             svc.upsert_setting("gemini_api_key", "AIza-only")
-            res = check_configured(session)
+            res = check_configured(session, LOCAL_SCOPE)
             assert res["configured"] is True
             assert res["provider"] == "gemini"
         finally:
@@ -252,7 +253,7 @@ class TestCheckConfiguredGeminiOnly:
         self._clear(svc)
         try:
             svc.upsert_setting("openai_compatible_api_key", "sk-compat-only")
-            res = check_configured(session)
+            res = check_configured(session, LOCAL_SCOPE)
             assert res["configured"] is True
             assert res["provider"] == "openai-compatible"
         finally:

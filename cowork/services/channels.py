@@ -164,7 +164,8 @@ class ChannelConfigService:
         )
 
     def _fetch_setting(self, key: str) -> Setting | None:
-        # Setting is tenancy-deferred: key-based in every mode until the split.
+        # Channel creds are global (key-only) rows here, bypassing SettingService
+        # scope routing — safe only because channels are 501-gated in org mode.
         return self.session.exec(
             self.session.select(Setting).where(Setting.key == key)
         ).first()

@@ -594,8 +594,14 @@ class AntonHarness:
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
+        from cowork.common.settings.user_settings import current_settings_scope
+        from cowork.db.scoped import scoped_storage_root
 
-        global_memory_dir = Path(get_app_settings().memory.root_dir).expanduser()
+        # Org-keyed via the turn's ambient scope — the in-process harness must
+        # read/write the same per-org memory the /memory API serves.
+        global_memory_dir = scoped_storage_root(
+            Path(get_app_settings().memory.root_dir).expanduser(), current_settings_scope()
+        )
         global_memory_dir.mkdir(parents=True, exist_ok=True)
         cortex = Cortex(
             global_hc=Hippocampus(global_memory_dir),
