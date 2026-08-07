@@ -52,3 +52,23 @@ def test_read_raw_blocks_non_local():
     with pytest.raises(HTTPException) as exc:
         read_raw_settings(request=_request("203.0.113.7"))
     assert exc.value.status_code == 403
+
+
+def test_raw_endpoints_are_disabled_in_org_mode(monkeypatch):
+    # /raw reads+writes deployment-global state (the dotenv + global settings
+    # rows every org falls back to) and carries no tenant scope: loopback alone
+    # isn't a boundary once one deployment serves many orgs.
+    from cowork.api.v1.endpoints.settings import read_raw_settings, write_raw_settings
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    try:
+        with pytest.raises(HTTPException) as exc:
+            read_raw_settings(request=_request("127.0.0.1"))
+        assert exc.value.status_code == 501
+        with pytest.raises(HTTPException) as exc:
+            write_raw_settings(body=None, session=None, request=_request("127.0.0.1"))
+        assert exc.value.status_code == 501
+    finally:
+        get_app_settings.cache_clear()
