@@ -114,3 +114,21 @@ async def test_test_providers_does_not_persist(monkeypatch):
     finally:
         _cleanup(session, "anthropic_api_key", "provider_status", "provider_status_details")
         session.close()
+
+
+def test_bulk_upsert_skips_none_values():
+    # `None` is a skip sentinel alongside "***" (the client's write-diff sends
+    # it for untouched fields) — it must validate, not 422, and write nothing.
+    session = get_open_session()
+    try:
+        _cleanup(session, "greeting", "tone")
+        result = bulk_upsert_settings(
+            SettingsBulkUpsertRequest(values={"greeting": None, "tone": "formal"}),
+            session,
+            LOCAL_SCOPE,
+        )
+        assert result["updated"] == ["tone"]
+        assert SettingService(session)._fetch_row("greeting") is None
+    finally:
+        _cleanup(session, "greeting", "tone")
+        session.close()

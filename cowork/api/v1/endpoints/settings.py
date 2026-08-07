@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.api.v1.endpoints.guards import require_local
+from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
@@ -379,7 +379,8 @@ def _read_env_dict() -> dict[str, str]:
 @router.get("/raw")
 def read_raw_settings(request: Request):
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
-    # restriction as reveal-key.
+    # restriction as reveal-key, and desktop-only (deployment-global state).
+    require_local_tenancy()
     require_local(request)
     return _read_env_dict()
 
@@ -400,8 +401,9 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
     ``GET /raw``; the DB is authoritative for cowork-server.  By syncing
     to both we keep them consistent regardless of which frontend code
     path writes settings (onboarding, OAuth token refresh, etc.)."""
-    # Writing the dotenv lands provider secrets on disk — same loopback
-    # restriction as the /raw read.
+    # Writing the dotenv lands provider secrets on disk and syncs them into
+    # global settings rows — loopback-only, and desktop-only.
+    require_local_tenancy()
     require_local(request)
 
     from cowork.migrations import sync_env_vars_to_db
