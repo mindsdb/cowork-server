@@ -22,7 +22,7 @@ build_prompt_context method.
 from pathlib import Path
 
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.harnesses.memory.store import ProjectMemoryStore, PROJECT_SLOTS, SharedMemoryStore
+from cowork.harnesses.memory.store import GlobalMemoryStore, PROJECT_SLOTS, ProjectMemoryStore
 
 
 class BaseMemoryAdapter:
@@ -48,7 +48,7 @@ class BaseMemoryAdapter:
         return "# Project Memory\n\n" + "\n\n".join(parts) + "\n\nEnd of Project Memory."
 
     def _format_global_prompt_context(self) -> str:
-        store = SharedMemoryStore()
+        store = GlobalMemoryStore()
         parts = []
         for slot in self.PROMPT_INJECT_SLOTS:
             content = store.read(slot).strip()
