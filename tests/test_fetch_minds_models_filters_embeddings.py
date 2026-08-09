@@ -57,9 +57,8 @@ def test_fetch_minds_models_drops_embedding_rows(monkeypatch):
     monkeypatch.setattr(providers.httpx, "AsyncClient", _FakeClient)
     providers._minds_models_cache.clear()
 
-    ids, efforts, enabled, labels = asyncio.run(
-        fetch_minds_models("https://api.mindshub.ai", "mdb_test")
-    )
+    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test"))
+    ids, efforts, enabled, labels = listing.ids, listing.efforts, listing.enabled, listing.labels
 
     assert ids == ["mindshub_air", "sonnet"]
     assert "text-embed-3" not in ids
@@ -85,7 +84,7 @@ def test_embedding_ids_are_dropped_when_the_endpoint_has_no_flag(monkeypatch):
     monkeypatch.setattr(providers.httpx, "AsyncClient", _client_returning(rows))
     providers._minds_models_cache.clear()
 
-    ids, _efforts, _enabled, _labels = asyncio.run(fetch_minds_models("https://byo.example", "sk-test"))
+    ids = asyncio.run(fetch_minds_models("https://byo.example", "sk-test")).ids
 
     assert ids == ["gpt-4o"]
 
@@ -101,7 +100,7 @@ def test_explicit_embedding_false_beats_the_id_hint(monkeypatch):
     monkeypatch.setattr(providers.httpx, "AsyncClient", _client_returning(rows))
     providers._minds_models_cache.clear()
 
-    ids, _efforts, _enabled, _labels = asyncio.run(fetch_minds_models("https://byo.example", "sk-test"))
+    ids = asyncio.run(fetch_minds_models("https://byo.example", "sk-test")).ids
 
     assert ids == ["embed-chat-preview"]
 
@@ -114,6 +113,6 @@ def test_chat_models_are_not_dropped_by_a_coincidental_name(monkeypatch):
     monkeypatch.setattr(providers.httpx, "AsyncClient", _client_returning(rows))
     providers._minds_models_cache.clear()
 
-    ids, _efforts, _enabled, _labels = asyncio.run(fetch_minds_models("https://byo.example", "sk-test"))
+    ids = asyncio.run(fetch_minds_models("https://byo.example", "sk-test")).ids
 
     assert ids == ["bge-large", "gte-base", "e5-mistral", "embedded-agent-v1"]

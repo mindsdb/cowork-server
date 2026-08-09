@@ -61,6 +61,23 @@ def _downgrade_to(engine, uri: str, revision: str) -> None:
         command.downgrade(config, revision)
 
 
+def _upgrade_to(engine, uri: str, revision: str) -> None:
+    config = _alembic_config(uri)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, revision)
+
+
+def _insert_setting(connection, *, key, value, scope=None, org_id=None, user_id=None):
+    connection.execute(
+        text(
+            "INSERT INTO settings (id, key, value, scope, org_id, user_id) VALUES "
+            "(lower(hex(randomblob(16))), :key, :value, :scope, :org_id, :user_id)"
+        ),
+        {"key": key, "value": value, "scope": scope, "org_id": org_id, "user_id": user_id},
+    )
+
+
 def expected_head() -> str:
     # Resolve the head from the script directory so new migrations don't
     # require updating a hardcoded revision here.
@@ -150,8 +167,21 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
             "ix_schedules_org_id",
             "ix_pins_user_id_org_id",
             "uq_pins_item_user",
+            # The settings scope-split partial indexes (c8e1a4f7b2d9) filter on
+            # settings.scope, so they must go before that column is dropped too.
+            "uq_settings_key_global",
+            "uq_settings_key_org",
+            "uq_settings_key_user",
         ):
             connection.execute(text(f"DROP INDEX IF EXISTS {index}"))
+        # The settings row-shape CHECK (c8e1a4f7b2d9) references scope/org_id/
+        # user_id, so SQLite won't let those columns drop while it exists.
+        # Rebuild the table without it (batch) before the DROP COLUMN loop.
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+        _ops = Operations(MigrationContext.configure(connection))
+        with _ops.batch_alter_table("settings") as _batch:
+            _batch.drop_constraint("ck_settings_scope_shape", type_="check")
         for table, column in (
             ("projects", "org_id"), ("projects", "created_by"),
             ("conversations", "org_id"), ("conversations", "created_by"),
@@ -321,3 +351,54 @@ def test_startup_rekeys_stray_rows_written_by_old_builds(tmp_path, monkeypatch):
     run_schema_migrations(engine, uri)  # simulated next boot
 
     assert _purposes(db_path)["05" * 16] == f"attachment:{SID}"
+
+
+def test_settings_scope_split_removes_global_key_uniqueness(tmp_path, monkeypatch):
+    # The REAL migration path (init creates UNIQUE(key), c8e1a4f7b2d9 drops it),
+    # driven through alembic — NOT create_all, which never had the constraint.
+    import sqlalchemy
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    uri = _sqlite_uri(tmp_path / "split.db")
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "head")
+
+    # one key across all three scopes + two orgs + the SAME user in both orgs
+    with engine.begin() as c:
+        _insert_setting(c, key="k", value="g")
+        _insert_setting(c, key="k", value="oA", scope="org", org_id="A")
+        _insert_setting(c, key="k", value="oB", scope="org", org_id="B")
+        _insert_setting(c, key="k", value="uA", scope="user", org_id="A", user_id="u")
+        _insert_setting(c, key="k", value="uB", scope="user", org_id="B", user_id="u")
+
+    # but a duplicate within one scope is still rejected
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as c:
+            _insert_setting(c, key="k", value="dup", scope="org", org_id="A")
+
+
+def test_settings_scope_split_downgrade_preflights_duplicates(tmp_path, monkeypatch):
+    # A downgrade that can't restore UNIQUE(key) must abort BEFORE touching the
+    # schema, leaving the DB intact at head.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db = tmp_path / "dg.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as c:
+        _insert_setting(c, key="k", value="oA", scope="org", org_id="A")
+        _insert_setting(c, key="k", value="oB", scope="org", org_id="B")
+
+    with pytest.raises(Exception, match="cannot downgrade"):
+        _downgrade_to(engine, uri, "b3d7f1a9c5e2")
+
+    # schema untouched: still at head with the partial indexes present
+    assert _alembic_version(db) == expected_head()
+    with sqlite3.connect(db) as conn:
+        names = {
+            r[0] for r in conn.execute(
+                "select name from sqlite_master where type='index' and tbl_name='settings'"
+            )
+        }
+    assert {"uq_settings_key_global", "uq_settings_key_org", "uq_settings_key_user"} <= names

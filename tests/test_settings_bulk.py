@@ -7,6 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints.settings import bulk_upsert_settings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.session import get_open_session
 from cowork.schemas.settings import SettingsBulkUpsertRequest
 from cowork.services.settings import SettingService
@@ -78,6 +79,7 @@ def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
                     values={"tone": "casual", "planning_provider": "nope"}
                 ),
                 session,
+                LOCAL_SCOPE,
             )
         assert exc.value.status_code == 400
         assert SettingService(session)._fetch_row("tone") is None
@@ -101,6 +103,7 @@ async def test_test_providers_does_not_persist(monkeypatch):
 
         result = await ep.test_providers(
             session,
+            LOCAL_SCOPE,
             ep._TestProvidersBody(providers=[{"type": "anthropic", "apiKey": "***"}]),
         )
         assert result["providerStatus"] == {"anthropic": "ok"}
@@ -110,4 +113,22 @@ async def test_test_providers_does_not_persist(monkeypatch):
         assert svc._fetch_row("provider_status_details") is None
     finally:
         _cleanup(session, "anthropic_api_key", "provider_status", "provider_status_details")
+        session.close()
+
+
+def test_bulk_upsert_skips_none_values():
+    # `None` is a skip sentinel alongside "***" (the client's write-diff sends
+    # it for untouched fields) — it must validate, not 422, and write nothing.
+    session = get_open_session()
+    try:
+        _cleanup(session, "greeting", "tone")
+        result = bulk_upsert_settings(
+            SettingsBulkUpsertRequest(values={"greeting": None, "tone": "formal"}),
+            session,
+            LOCAL_SCOPE,
+        )
+        assert result["updated"] == ["tone"]
+        assert SettingService(session)._fetch_row("greeting") is None
+    finally:
+        _cleanup(session, "greeting", "tone")
         session.close()

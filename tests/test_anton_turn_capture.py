@@ -59,7 +59,7 @@ def _drive(monkeypatch, compact: bool):
     session = _FakeSession(compact=compact)
 
     async def _fake_build(self, conversation, disabled_connections, channel_context=None):
-        return session, None
+        return session, None, None
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
 
