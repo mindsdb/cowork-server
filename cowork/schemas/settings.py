@@ -6,7 +6,9 @@ class SettingUpsertRequest(BaseModel):
 
 
 class SettingsBulkUpsertRequest(BaseModel):
-    values: dict[str, str]
+    # `None` joins "***" as a skip sentinel — the client's write-diff sends it
+    # for untouched fields, and the service already skips both.
+    values: dict[str, str | None]
 
 
 class SettingResponse(BaseModel):

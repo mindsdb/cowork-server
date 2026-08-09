@@ -471,6 +471,29 @@ def friendly_turn_error(
     return None
 
 
+def remote_turn_error(error: str | None) -> tuple[str, str]:
+    """Map a remote pod's ``turn_failed`` error STRING to ``(code, message)``.
+
+    The in-process path classifies exceptions (`friendly_turn_error`); remote
+    turns arrive as scrubbed strings shaped ``"ExceptionType: message"`` (see
+    anton.cloud_turn._scrub), so this keys on the type-name prefix. Curated
+    anton copy (overloaded / model-gate) passes through; everything unmapped
+    gets the generic redacted message — never the raw provider text.
+    """
+    text = (error or "").strip()
+    type_name, _, message = text.partition(":")
+    message = message.strip()
+    if type_name == "TokenLimitExceeded":
+        return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
+    if type_name == "ProviderOverloadedError":
+        return PROVIDER_OVERLOADED_CODE, message or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
+    if type_name == "ModelUnavailableError":
+        return MODEL_ACCESS_DENIED_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
+    if type_name == "ConnectionError" and "api key" in message.lower():
+        return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
+    return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+
+
 def response_failed_payload(
     error: str,
     code: str,
