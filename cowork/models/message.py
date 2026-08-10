@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, Index
+from sqlalchemy import JSON, Index, false
 from sqlmodel import Column, Field, Relationship
 
 from cowork.models.base import BaseSQLModel
@@ -49,6 +49,19 @@ class Message(BaseSQLModel, table=True):
             "created_at (second precision); seq orders every message in the "
             "conversation deterministically, without depending on that "
             "resolution. Assigned as max(seq)+1 on insert; 0 for legacy rows."
+        ),
+    )
+
+    pending: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": false()},
+        description=(
+            "True while this turn's user message is in flight (ENG-1231). "
+            "The message is persisted at turn start so a refresh/reconnect "
+            "mid-turn still shows the question — get_messages (the UI view) "
+            "includes it, but get_ordered_messages (replayed LLM history) "
+            "excludes it so the harness doesn't double-feed the current input. "
+            "Cleared when the turn terminates."
         ),
     )
 

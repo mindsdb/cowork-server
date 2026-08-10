@@ -14,6 +14,7 @@ from typing import Any
 from uuid import UUID
 
 from anton.core.dispatch import OutboundMessage
+from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, scope_for_background_context
 from cowork.db.session import get_open_session
@@ -419,6 +420,8 @@ class AntonChannelRuntime:
         _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
+        # Send time captured before the turn
+        sent_at = datetime.now(timezone.utc)
 
         collected: list[str] = []
         events: list[dict] = []
@@ -438,6 +441,10 @@ class AntonChannelRuntime:
             conversation=conversation,
             input=blocks,
             channel_context=channel_context,
+            # Channel turns don't pass through ResponsesHandler, so they need
+            # their own build stamp (ENG-1279) — a bot turn is otherwise
+            # unattributable to the release that produced it.
+            trace_metadata=build_trace_metadata(),
         )
         try:
             async for _chunk in harness.formatter(stream, harness_id, event_sink):
@@ -448,7 +455,9 @@ class AntonChannelRuntime:
             # would replay the message into this turn AND resend it as the live
             # input. In `finally` so a crashed turn still records the inbound
             # message, matching the pre-history-replay behaviour.
-            ConversationService(scoped).save_user_message(conversation.id, content)
+            ConversationService(scoped).save_user_message(
+                conversation.id, content, created_at=sent_at
+            )
 
         reply = "".join(collected)
         ConversationService(scoped).save_assistant_turn(

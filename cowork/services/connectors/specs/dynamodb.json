@@ -42,7 +42,6 @@
             "label": "Access Key ID",
             "type": "text",
             "required": true,
-            "placeholder": "AKIAIOSFODNN7EXAMPLE",
             "description": "The AWS Access Key ID from IAM → Users → Security credentials."
           },
           {
@@ -51,7 +50,6 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "placeholder": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "description": "The secret shown once when you created the access key. Keep this safe."
           },
           {
@@ -163,7 +161,6 @@
             "label": "Access Key ID",
             "type": "text",
             "required": true,
-            "placeholder": "ASIAIOSFODNN7EXAMPLE",
             "description": "The temporary Access Key ID returned by STS AssumeRole. Starts with ASIA."
           },
           {
