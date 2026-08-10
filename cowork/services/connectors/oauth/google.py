@@ -409,6 +409,7 @@ class OAuthService:
         except Exception as exc:
             _log.warning("Could not load vault for catalogue: %s", exc)
             all_connections = []
+            vault = None
 
         state_data = self._store(oauth_settings)._load()
         items = []
@@ -421,10 +422,14 @@ class OAuthService:
             ready = bool(cid and csecret)
             config_error = "" if ready else f"OAuth credentials not configured for {service_id}."
 
-            connections = [
-                {"engine": engine, "name": c.get("name", ""), "label": c.get("name", "")}
-                for c in all_connections if c.get("engine") == engine
-            ]
+            connections = []
+            for c in all_connections:
+                if c.get("engine") != engine:
+                    continue
+                name = c.get("name", "")
+                fields = (vault.load(engine, name) if vault else None) or {}
+                user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
+                connections.append({"engine": engine, "name": name, "user_label": user_label})
 
             entry = state_data.get(service_id) or {}
             service_label = " ".join(w.capitalize() for w in service_id.replace("-", " ").split())

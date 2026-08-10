@@ -18,8 +18,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.api.v1.endpoints.guards import require_local
+from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.paths import cowork_home
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
@@ -45,18 +46,17 @@ from cowork.common.settings.user_settings import Provider, provider_api_key_str
 router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
-
-
-# ── CRUD ─────────────────────────────────────────────────────────────
+# Tenant scope for every settings read/write (local mode → LOCAL_SCOPE).
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 @router.get("/", response_model=list[SettingResponse])
-def list_settings(session: SessionDep) -> list[SettingResponse]:
-    return SettingService(session).list_settings()
+def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
+    return SettingService(session, scope).list_settings()
 
 
 @router.put("/")
-def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep):
+def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep, scope: ScopeDep):
     """Upsert many settings in one transaction (all-or-nothing).
 
     The Settings form saves through here: either every value validates and is
@@ -64,7 +64,7 @@ def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep):
     PUT loop, which could leave the DB half-written on a partial failure.
     """
     try:
-        updated = SettingService(session).save_all(body.values)
+        updated = SettingService(session, scope).save_all(body.values)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"updated": updated}
@@ -75,17 +75,18 @@ def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
     session: SessionDep,
+    scope: ScopeDep,
 ) -> SettingResponse:
     try:
-        return SettingService(session).upsert_setting(key, body.value)
+        return SettingService(session, scope).upsert_setting(key, body.value)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.delete("/{key}")
-def delete_setting(key: str, session: SessionDep):
+def delete_setting(key: str, session: SessionDep, scope: ScopeDep):
     try:
-        deleted = SettingService(session).delete_setting(key)
+        deleted = SettingService(session, scope).delete_setting(key)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     if not deleted:
@@ -100,8 +101,8 @@ def delete_setting(key: str, session: SessionDep):
 
 
 @router.post("/validate")
-def validate_settings(session: SessionDep):
-    s = SettingService(session).load()
+def validate_settings(session: SessionDep, scope: ScopeDep):
+    s = SettingService(session, scope).load()
     cs = check_config_status(s)
     return {
         "status": "ok" if cs["configReady"] else "needs_config",
@@ -113,8 +114,8 @@ def validate_settings(session: SessionDep):
 
 
 @router.get("/configured")
-def check_configured(session: SessionDep):
-    s = SettingService(session).load()
+def check_configured(session: SessionDep, scope: ScopeDep):
+    s = SettingService(session, scope).load()
     if s.minds_api_key is not None:
         return {"configured": True, "provider": "minds-cloud"}
     if s.anthropic_api_key is not None:
@@ -132,15 +133,16 @@ def check_configured(session: SessionDep):
 
 
 @router.post("/logout")
-def logout_clear_credentials(session: SessionDep):
+def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB.
 
     Called by the Electron main process during sign-out so that
     ``/health`` returns ``config_ready: false`` on the next query.
     Provider and model preferences are kept so they survive a
     re-login without requiring the onboarding flow to restore them.
+    Scoped: clears only the caller's org rows, never the global ones.
     """
-    deleted = SettingService(session).clear_credentials()
+    deleted = SettingService(session, scope).clear_credentials()
     return {"ok": True, "deleted": deleted}
 
 
@@ -150,7 +152,7 @@ def install_status():
 
 
 @router.get("/reveal-key/{name}")
-def reveal_key(name: str, session: SessionDep, request: Request):
+def reveal_key(name: str, session: SessionDep, scope: ScopeDep, request: Request):
     # reveal-key returns an unmasked provider secret — loopback only (ENG-457).
     require_local(request)
     name_map = {
@@ -164,7 +166,7 @@ def reveal_key(name: str, session: SessionDep, request: Request):
     provider = name_map.get(name.lower())
     if provider is None:
         raise HTTPException(status_code=404, detail="Unknown key name")
-    s = SettingService(session).load()
+    s = SettingService(session, scope).load()
     # provider_api_key_str applies the gemini/openai-compatible → openai fallback.
     return {"value": provider_api_key_str(s, provider)}
 
@@ -174,7 +176,7 @@ class _TestProvidersBody(BaseModel):
 
 
 @router.post("/test-providers")
-async def test_providers(session: SessionDep, body: _TestProvidersBody | None = None):
+async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
     """Ping the given (or all stored) providers and return connectivity results.
 
     Read-only: a test is a point-in-time check and no longer writes to the DB.
@@ -182,7 +184,7 @@ async def test_providers(session: SessionDep, body: _TestProvidersBody | None = 
     outlive a revoked key or a drained wallet and read as passing when it no
     longer was (ENG-335). Callers render the returned results directly.
     """
-    s = SettingService(session).load()
+    s = SettingService(session, scope).load()
 
     if body and body.providers is not None:
         providers = list(body.providers)
@@ -216,14 +218,20 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
 
-def _fill_missing(target: dict, extra: dict) -> None:
-    """Add only the keys `target` doesn't already have (first writer wins)."""
+def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None) -> None:
+    """Add only the keys `target` doesn't already have (first writer wins).
+
+    `skip` reserves ids the later writer may not fill even where `target` has no
+    entry for them, for a map whose gaps carry meaning of their own.
+    """
     for key, value in extra.items():
+        if skip and key in skip:
+            continue
         target.setdefault(key, value)
 
 
 @router.get("/recommended-models")
-async def recommended_models(session: SessionDep, refresh: bool = False):
+async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
@@ -261,11 +269,40 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
     # A model absent from this map falls back to the client's id-derived label.
     model_labels: dict[str, str] = {}
 
-    s = SettingService(session).load()
+    # Grouping metadata for the picker:
+    #   modelProviders id → the provider serving the model ("anthropic"), which
+    #                  decides its section.
+    #   modelFamilies  id → the moving alias the model belongs to. Dense for every
+    #                  model MindsHub describes, and equal to the id on a moving
+    #                  alias, so `families[id] == id` marks a model "latest" and
+    #                  anything else names the alias it is a frozen version of.
+    #
+    # Both are keyed by model id ALONE and are NOT scoped to the minds-cloud
+    # bucket — population is gated on a MindsHub key being configured, with no
+    # reference to which provider the user actually selected. So they are empty
+    # only for a user with no MindsHub key at all, NOT for a user on BYOK.
+    #
+    # A consumer must therefore decide per model, by looking its id up, and must
+    # not read "the map is non-empty" as "this model is described". For
+    # `modelLabels`/`modelEnabled` an absent key is a benign fallback, but for
+    # `modelFamilies` absence is actively interpreted: read as "is its own head" it
+    # tags every BYOK model "latest", including dated snapshots that never move.
+    model_providers: dict[str, str] = {}
+    model_families: dict[str, str] = {}
+
+    # Every model id MindsHub listed, whether or not it described it. The custom
+    # endpoint overlay below reserves these ids for the grouping maps.
+    minds_ids: set[str] = set()
+
+    s = SettingService(session, scope).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+        listing = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
+        live = listing.ids
+        live_efforts = listing.efforts
+        live_enabled = listing.enabled
+        live_labels = listing.labels
         if live:
             recommended["minds-cloud"] = live
             # Cache the availability map so model-default resolution
@@ -295,10 +332,13 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
                 except (ValueError, TypeError):
                     stored = "{}"
                 if desired != stored:
-                    SettingService(session).upsert_setting("minds_model_enabled", desired)
+                    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
+        model_providers.update(listing.providers)
+        model_families.update(listing.families)
+        minds_ids.update(live or ())
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -324,13 +364,17 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+        oc_listing = await fetch_minds_models(
             oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
         )
+        live = oc_listing.ids
+        live_efforts = oc_listing.efforts
+        live_enabled = oc_listing.enabled
+        live_labels = oc_listing.labels
         if live:
             recommended["openai-compatible"] = live
-        # These three maps are keyed by model id alone, not by (provider, id),
-        # so a custom endpoint serving an id MindsHub also serves would other-
+        # These maps are keyed by model id alone, not by (provider, id), so a
+        # custom endpoint serving an id MindsHub also serves would other-
         # wise decide that model's label, effort levels and locked state for the
         # minds-cloud bucket too — letting a BYO base URL rename or lock a
         # MindsHub model in the picker. MindsHub is fetched first and wins;
@@ -338,6 +382,33 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
         _fill_missing(model_efforts, live_efforts)
         _fill_missing(model_enabled, live_enabled)
         _fill_missing(model_labels, live_labels)
+        # Same precedence for the grouping metadata, for the same reason: a BYO
+        # endpoint must not be able to move a MindsHub model into another vendor's
+        # section or relabel it as an old version of something. But here the
+        # reservation is every id MindsHub LISTED, not just the ids it described,
+        # because MindsHub can serve a model and say nothing about it:
+        #
+        #   - deployed ahead of the MindsHub release that publishes these fields,
+        #     both MindsHub maps are empty for every model it serves, so a custom
+        #     endpoint answering `{"id": "sonnet", "family": "haiku"}` would file
+        #     MindsHub's own sonnet under haiku as an older version of it;
+        #   - a MindsHub row carrying a family but no usable provider is recorded
+        #     in families only (see fetch_minds_models), never in providers, so a
+        #     custom endpoint's provider would pick that model's section.
+        #
+        # In both cases MindsHub's silence is its answer, and the app degrades on
+        # it correctly (no section / no "latest" tag); a BYO endpoint's answer for
+        # a model it doesn't serve is a wrong one, not a better one.
+        #
+        # Not covered here, because it can't be: when the MindsHub fetch fails,
+        # recommendedModels["minds-cloud"] comes back [], which the app's
+        # overlayLists skips so the picker keeps the minds ids it already holds,
+        # while these maps come back describing the custom endpoint's ids only and
+        # the app's overlayMap swaps its held map out wholesale. Those held minds
+        # ids lose their grouping metadata until a fetch succeeds again.
+        reserved_ids = minds_ids | model_providers.keys() | model_families.keys()
+        _fill_missing(model_providers, oc_listing.providers, skip=reserved_ids)
+        _fill_missing(model_families, oc_listing.families, skip=reserved_ids)
 
     return {
         "recommendedModels": recommended,
@@ -345,6 +416,8 @@ async def recommended_models(session: SessionDep, refresh: bool = False):
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelLabels": model_labels,
+        "modelProviders": model_providers,
+        "modelFamilies": model_families,
     }
 
 
@@ -377,7 +450,8 @@ def _read_env_dict() -> dict[str, str]:
 @router.get("/raw")
 def read_raw_settings(request: Request):
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
-    # restriction as reveal-key.
+    # restriction as reveal-key, and desktop-only (deployment-global state).
+    require_local_tenancy()
     require_local(request)
     return _read_env_dict()
 
@@ -398,8 +472,9 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
     ``GET /raw``; the DB is authoritative for cowork-server.  By syncing
     to both we keep them consistent regardless of which frontend code
     path writes settings (onboarding, OAuth token refresh, etc.)."""
-    # Writing the dotenv lands provider secrets on disk — same loopback
-    # restriction as the /raw read.
+    # Writing the dotenv lands provider secrets on disk and syncs them into
+    # global settings rows — loopback-only, and desktop-only.
+    require_local_tenancy()
     require_local(request)
 
     from cowork.migrations import sync_env_vars_to_db

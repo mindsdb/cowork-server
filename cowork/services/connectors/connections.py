@@ -51,12 +51,15 @@ class ConnectionsService:
             # instead of the opaque slug.
             record = self._read_record(vault, engine, name)
             fields = (record or {}).get("fields") if record else {}
+            fields = fields or {}
+            user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
             result.append(ConnectionSummaryResponse(
                 engine=engine,
                 name=name,
-                display_name=connection_display_name(fields or {}),
+                display_name=connection_display_name(fields),
                 created_at=item.get("created_at"),
                 label=spec.label if spec else None,
+                user_label=user_label,
                 logo=spec.logo if spec else None,
                 logo_color=spec.logo_color if spec else None,
                 status=(fields or {}).get("status"),
@@ -81,16 +84,25 @@ class ConnectionsService:
                 masked_keys.append(key)
 
         display_name = connection_display_name(fields)
-        # Echo the stored label back as the form's `label` field so the edit
-        # form pre-fills "Name this connection" with the current value (the
-        # field is named `label`; the record stores it as `_label`).
-        stored_label = fields.pop("_label", None)
-        if stored_label:
-            fields["label"] = stored_label
+        user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
+        # Pop both out of `fields` (still needed — see below), just without
+        # re-adding either as `fields["label"]`/`fields["user_label"]` the way
+        # the old code echoed `_label`. `fields` is echoed back to the
+        # frontend as the raw credential-field map (masked secrets aside);
+        # `_user_label`/`_label` are bookkeeping, not credentials, and the
+        # mask loop above skips `_`-prefixed keys entirely (only
+        # `_connector_id`/`_method` are popped today) — leaving them in would
+        # ship two internal keys to the client as if they were unknown form
+        # fields, and if the edit form ever echoed them back unchanged on
+        # save, `persist_connection` would pop `user_label` from `credentials`
+        # again and treat it as an explicit value, closing an unintended loop.
+        fields.pop("_user_label", None)
+        fields.pop("_label", None)
         return ConnectionDetailResponse(
             engine=record.get("engine", engine),
             name=record.get("name", name),
             display_name=display_name,
+            user_label=user_label,
             created_at=record.get("created_at"),
             updated_at=record.get("updated_at"),
             connector_id=fields.pop("_connector_id", None),
