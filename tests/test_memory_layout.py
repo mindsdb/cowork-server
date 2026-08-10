@@ -5,7 +5,7 @@ import pytest
 from cowork.harnesses.memory.adapter import BaseMemoryAdapter
 from cowork.harnesses.memory.layout import MemoryLayout
 from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
-from cowork.harnesses.memory.store import SharedMemoryStore
+from cowork.harnesses.memory.store import GlobalMemoryStore
 
 
 class _TestAdapter(BaseMemoryAdapter):
@@ -81,7 +81,7 @@ def test_symlink_round_trip_via_store(layout, memory_root, tmp_path):
 
     layout.ensure_layout([adapter])
 
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     store.write(MemorySlot.LESSONS, "shared lesson")
 
     assert link_path.read_text(encoding="utf-8").strip() == "shared lesson"
