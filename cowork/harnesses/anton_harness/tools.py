@@ -769,13 +769,15 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     try:
         from cowork.services.connectors.persist import set_connection_label
 
-        ok = set_connection_label(engine, name, label)
+        stored = set_connection_label(engine, name, label)
     except Exception as exc:
         logger.exception("Cowork label_connection failed")
         return f"label_connection: could not set label ({exc})"
-    if not ok:
+    if stored is None:
         return f"label_connection: no connection `{engine}/{name}` found."
-    return f"Labeled `{engine}/{name}` as “{label}”."
+    if stored != label:
+        return f"Labeled `{engine}/{name}` as “{stored}” (“{label}” was already taken by another connection)."
+    return f"Labeled `{engine}/{name}` as “{stored}”."
 
 
 def build_cowork_label_connection_tool():
