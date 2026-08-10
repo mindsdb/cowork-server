@@ -64,6 +64,7 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               model: str | None, buffer,
                               history: list | None = None,
                               harness_id: str | None = None,
+                              memory: dict | None = None,
                               on_event=None) -> None:
     """`on_event(kind, data)` is called per reply (turn_delta/turn_completed/
     turn_failed) so the caller can collect the turn for persistence."""
@@ -76,6 +77,12 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
 
+    params = {"input": input_text, "workspace_path": "/workspace",
+              "model": model, "history": history or [], "llm": llm_block}
+    # Omitted when empty: a memory-less turn keeps the pre-existing payload shape.
+    if memory:
+        params["memory"] = memory
+
     job = TurnJob(
         op="anton_turn",
         conversation_id=conversation_id,
@@ -83,8 +90,7 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         reply_stream=reply_stream,
         organization_id=org_id,
         user_id=user_id,
-        params={"input": input_text, "workspace_path": "/workspace",
-                "model": model, "history": history or [], "llm": llm_block},
+        params=params,
     )
     await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
     # conversation_id + harness mirror _inject_created on the in-process path:
@@ -112,7 +118,9 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                     # events log must carry the same (code, message).
                     code, message = remote_turn_error(data.get("error"))
                     data = {**data, "code": code, "message": message}
-                if on_event is not None and kind in ("turn_delta", "turn_completed", "turn_failed"):
+                if on_event is not None and kind in (
+                    "turn_delta", "turn_memory", "turn_completed", "turn_failed"
+                ):
                     on_event(kind, data)
                 if kind == "turn_delta":
                     await buffer.append("sse", {"sse": _sse(
