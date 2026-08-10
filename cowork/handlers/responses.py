@@ -16,7 +16,7 @@ from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.streaming import new_buffer, registry
+from cowork.streaming import TurnLifecycle, new_buffer, registry
 from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
     Content,
@@ -194,7 +194,13 @@ class ResponsesHandler:
             # producer ties the write to the one coroutine that actually runs, so
             # there is at most one pending row per conversation.
             buffer = new_buffer(str(conversation.id), turn_id)
+            # Created here, before the coroutine, and handed to BOTH: it is the
+            # only channel by which a turn delete can tell this producer that
+            # the history it is writing into no longer exists (the handle it
+            # will be registered under does not exist yet).
+            lifecycle = TurnLifecycle()
             producer_coro = self._select_producer(
+                lifecycle=lifecycle,
                 conv_id=conversation.id,
                 harness_input=harness_input,
                 original_content=original_content,
@@ -213,6 +219,7 @@ class ResponsesHandler:
                 org_id=self.scoped.scope.org_id,
                 user_id=self.scoped.scope.user_id,
                 producer_coro=producer_coro,
+                lifecycle=lifecycle,
             )
             return sse_from_buffer(buffer, 0)
 
@@ -243,6 +250,7 @@ class ResponsesHandler:
         buffer,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
+        lifecycle: TurnLifecycle | None = None,
     ):
         """Choose the streaming producer coroutine.
 
@@ -250,9 +258,16 @@ class ResponsesHandler:
         the turn through the Redis-backed remote producer. Otherwise (the
         default, "inprocess"), this runs in-process: the `self._produce(...)`
         call below is unchanged from before this branch existed.
+
+        `lifecycle` is shared with the RunHandle so a turn delete can stop
+        either producer from persisting into truncated history; it defaults to
+        a fresh one so a directly-called producer (tests) still has a flag to
+        read.
         """
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         if TurnQueueSettings().backend == "remote":
             return self._produce_remote(
+                lifecycle=lifecycle,
                 conv_id=conv_id,
                 input_text=self._prompt_text(harness_input),
                 original_content=original_content,
@@ -261,6 +276,7 @@ class ResponsesHandler:
                 buffer=buffer,
             )
         return self._produce(
+            lifecycle=lifecycle,
             conv_id=conv_id,
             harness_input=harness_input,
             original_content=original_content,
@@ -293,10 +309,12 @@ class ResponsesHandler:
         model: str | None,
         harness_id: str | None,
         buffer,
+        lifecycle: TurnLifecycle | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: run the turn through the
         queue and persist user + assistant together on terminal (deferred, so
         _remote_history reads prior turns without the current input)."""
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
@@ -368,6 +386,10 @@ class ResponsesHandler:
             )
             persist()
         except asyncio.CancelledError:
+            if lifecycle.discarded:
+                # Same reasoning as _run_turn's discarded branch — see there.
+                logger.info("[responses] discarded remote turn %s — not persisting", conv_id)
+                return
             # Partial text generated before cancellation is persisted.
             persist()
             await buffer.close("cancelled")
@@ -399,6 +421,7 @@ class ResponsesHandler:
         buffer,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
+        lifecycle: TurnLifecycle | None = None,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -409,6 +432,7 @@ class ResponsesHandler:
         pending flag + persists the assistant turn (ENG-1231). Never reaches the
         HTTP response — readers tail the buffer.
         """
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         # Fresh session (outlives the request), scoped from the immutable
         # principal captured at handler construction — never request state.
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
@@ -480,6 +504,16 @@ class ResponsesHandler:
             persist()
             await buffer.close("completed")
         except asyncio.CancelledError:
+            if lifecycle.discarded:
+                # This cancellation came from a turn delete (registry.discard),
+                # not from Stop: the messages this turn belongs to are already
+                # gone. Persisting would write rows into truncated history, and
+                # closing the buffer would recreate the file that
+                # discard_conversation just removed — which the next turn would
+                # then tail, since turn_id == message count is reused after a
+                # truncation. So drop the turn entirely.
+                logger.info("[responses] discarded turn %s — not persisting", conv_id)
+                return
             # Nothing special is emitted on cancellation.
             # The partial text and events generated before cancellation are persisted.
             # A question that was on screen when Stop was pressed never got its
