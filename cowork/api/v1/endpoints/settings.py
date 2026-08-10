@@ -22,6 +22,7 @@ from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
+from cowork.principal import Principal, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
     SettingResponse,
@@ -41,13 +42,35 @@ from cowork.common.settings.app_settings import (
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
 )
-from cowork.common.settings.user_settings import Provider, provider_api_key_str
+from cowork.common.settings.user_settings import (
+    Provider,
+    provider_api_key_str,
+    setting_is_org_scoped,
+)
 
 router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
 # Tenant scope for every settings read/write (local mode → LOCAL_SCOPE).
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+PrincipalDep = Annotated[Principal | None, Depends(get_principal)]
+
+
+def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None) -> None:
+    """Org-level settings (provider keys, model policy, budgets) are admin-owned:
+    in org mode, a caller-supplied write to any org-classified key needs the
+    manage-organization role. Personal keys and local mode are untouched. 403,
+    not 404 — the key names are public schema, only the write is privileged.
+    System-derived writes are exempt (see the minds_model_enabled refresh in
+    recommended_models) — the caller can't steer the stored value."""
+    if not scope.org_mode:
+        return
+    org_keys = [k for k in keys if setting_is_org_scoped(k)]
+    if org_keys and not can_manage_org(principal):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"changing organization settings ({', '.join(sorted(org_keys))}) requires an org admin",
+        )
 
 
 @router.get("/", response_model=list[SettingResponse])
@@ -56,13 +79,18 @@ def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]
 
 
 @router.put("/")
-def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep, scope: ScopeDep):
+def bulk_upsert_settings(
+    body: SettingsBulkUpsertRequest, session: SessionDep, scope: ScopeDep, principal: PrincipalDep
+):
     """Upsert many settings in one transaction (all-or-nothing).
 
     The Settings form saves through here: either every value validates and is
     written, or the request 400s and nothing is written. Replaces the per-key
     PUT loop, which could leave the DB half-written on a partial failure.
     """
+    # Skipped values (None/"***") are never written — don't let them trip the gate.
+    live_keys = [k for k, v in (body.values or {}).items() if v is not None and v != "***"]
+    _require_org_admin_for(live_keys, scope, principal)
     try:
         updated = SettingService(session, scope).save_all(body.values)
     except ValueError as e:
@@ -76,7 +104,9 @@ def upsert_setting(
     body: SettingUpsertRequest,
     session: SessionDep,
     scope: ScopeDep,
+    principal: PrincipalDep,
 ) -> SettingResponse:
+    _require_org_admin_for([key], scope, principal)
     try:
         return SettingService(session, scope).upsert_setting(key, body.value)
     except ValueError as e:
@@ -84,7 +114,8 @@ def upsert_setting(
 
 
 @router.delete("/{key}")
-def delete_setting(key: str, session: SessionDep, scope: ScopeDep):
+def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: PrincipalDep):
+    _require_org_admin_for([key], scope, principal)
     try:
         deleted = SettingService(session, scope).delete_setting(key)
     except ValueError as e:
@@ -134,14 +165,14 @@ def check_configured(session: SessionDep, scope: ScopeDep):
 
 @router.post("/logout")
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
-    """Clear all stored credentials from the DB.
+    """Clear all stored credentials from the DB (desktop sign-out flow, so
+    ``/health`` returns ``config_ready: false``; preferences are kept).
 
-    Called by the Electron main process during sign-out so that
-    ``/health`` returns ``config_ready: false`` on the next query.
-    Provider and model preferences are kept so they survive a
-    re-login without requiring the onboarding flow to restore them.
-    Scoped: clears only the caller's org rows, never the global ones.
+    Org mode: a no-op. Credentials are org-owned there — one member signing
+    out must not wipe the keys the whole org runs on.
     """
+    if scope.org_mode:
+        return {"ok": True, "deleted": []}
     deleted = SettingService(session, scope).clear_credentials()
     return {"ok": True, "deleted": deleted}
 
@@ -332,6 +363,10 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
                 except (ValueError, TypeError):
                     stored = "{}"
                 if desired != stored:
+                    # Intentionally ungated by _require_org_admin_for: the value
+                    # is system-derived (MindsHub, via admin-set key/URL), so a
+                    # member can trigger this refresh but can't steer what's
+                    # stored — and gating it would leave the map stale.
                     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)

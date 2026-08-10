@@ -379,19 +379,41 @@ def _setting(client, headers, key):
     return next(s for s in rows if s["key"] == key)
 
 
+# Org-admin variants: org-key settings writes require manage-organization.
+A_ADMIN = {**A, "X-User-Roles": "manage-organization"}
+B_ADMIN = {**B, "X-User-Roles": "manage-organization"}
+
+
 def test_settings_writes_are_org_isolated(client):
-    # org A stores a provider credential
-    assert client.put("/api/v1/settings/openai_api_key", json={"value": "sk-A"}, headers=A).status_code == 200
+    # org A's admin stores a provider credential
+    assert client.put("/api/v1/settings/openai_api_key", json={"value": "sk-A"}, headers=A_ADMIN).status_code == 200
     # org B must NOT resolve it (reads fall back to global rows only, never A's org row)
     assert _setting(client, B, "openai_api_key")["is_set"] is False
     assert _setting(client, A, "openai_api_key")["is_set"] is True
 
     # org B setting the same key writes its OWN row, doesn't touch A's
-    assert client.put("/api/v1/settings/openai_api_key", json={"value": "sk-B"}, headers=B).status_code == 200
+    assert client.put("/api/v1/settings/openai_api_key", json={"value": "sk-B"}, headers=B_ADMIN).status_code == 200
     assert _setting(client, A, "openai_api_key")["is_set"] is True
     assert _setting(client, B, "openai_api_key")["is_set"] is True
 
-    # org A logout clears only A's credentials; B's survive
-    assert client.post("/api/v1/settings/logout", headers=A).status_code == 200
-    assert _setting(client, A, "openai_api_key")["is_set"] is False
+    # logout is a no-op in org mode: one member signing out must not wipe the
+    # keys the whole org runs on.
+    res = client.post("/api/v1/settings/logout", headers=A)
+    assert res.status_code == 200 and res.json()["deleted"] == []
+    assert _setting(client, A, "openai_api_key")["is_set"] is True
     assert _setting(client, B, "openai_api_key")["is_set"] is True
+
+
+def test_org_settings_writes_require_admin_role(client):
+    # a plain member (no manage-organization role) cannot change org config...
+    assert client.put("/api/v1/settings/minds_url", json={"value": "http://x"}, headers=A).status_code == 403
+    assert client.put("/api/v1/settings/", json={"values": {"minds_url": "http://x"}}, headers=A).status_code == 403
+    assert client.delete("/api/v1/settings/openai_api_key", headers=A).status_code == 403
+    # ...but personal preferences remain open to every member
+    assert client.put("/api/v1/settings/tone", json={"value": "casual"}, headers=A).status_code == 200
+    # and an admin can write org config
+    assert client.put("/api/v1/settings/minds_url", json={"value": "http://x"}, headers=A_ADMIN).status_code == 200
+    # skipped sentinel values ("***"/None) don't trip the gate for members
+    assert client.put(
+        "/api/v1/settings/", json={"values": {"openai_api_key": "***", "greeting": "hi"}}, headers=A
+    ).status_code == 200

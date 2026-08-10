@@ -114,6 +114,17 @@ def get_principal(request: Request) -> Principal | None:
     return getattr(request.state, "principal", None)
 
 
+# Keycloak org role that marks an organization admin (see auth's
+# role_context/authenticate: X-User-Roles carries realm + org roles).
+ORG_MANAGE_ROLE = "manage-organization"
+
+
+def can_manage_org(principal: Principal | None) -> bool:
+    """True when the caller may change org-level configuration. No principal
+    (local mode never gets here; org audit mode) → False, fail closed."""
+    return principal is not None and ORG_MANAGE_ROLE in principal.roles
+
+
 def identity_trace_metadata(
     principal: Principal | None, base: dict[str, str] | None
 ) -> dict[str, str] | None:
