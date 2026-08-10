@@ -215,7 +215,16 @@ def test_harness_fails_closed_on_scope_mismatch(engine, monkeypatch, caplog):
     stray = raw.get(Conversation, conv_b.id)
     with caplog.at_level("WARNING"):
         ctx = _conversation_attachment_context(stray)
-    assert ctx == ""
+    # Fail closed means: leak NOTHING about the other org's files. Assert that
+    # property directly rather than `ctx == ""` — since ENG-1357 the helper
+    # always returns the generic attachment affordance (org-agnostic constant
+    # text, no filenames or paths), so an empty-string assertion would fail
+    # for a reason that has nothing to do with tenancy.
+    assert "doc.txt" not in ctx
+    assert str(ORG_B) not in ctx
+    # Nor may it claim nothing is attached — a file IS attached, we just
+    # refused to look. See test_agent_attachment_context.py.
+    assert "No files are currently attached" not in ctx
     assert "does not match scope org" in caplog.text
 
 
@@ -233,7 +242,10 @@ def test_harness_fails_closed_without_scope_in_org_mode(engine, monkeypatch, cap
     raw.refresh(conv)
     with caplog.at_level("WARNING"):
         ctx = _conversation_attachment_context(conv)
-    assert ctx == ""
+    # Same as above: the guarantee is "no attachment listing", not "empty
+    # string". Nothing was looked up, so it must not assert emptiness either.
+    assert "doc.txt" not in ctx
+    assert "No files are currently attached" not in ctx
     assert "no tenant scope" in caplog.text
 
 
