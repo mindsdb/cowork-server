@@ -24,6 +24,28 @@ from cowork.services.conversations import ConversationService
 logger = logging.getLogger(__name__)
 
 
+def _extract_connection_label_fields(credentials: dict) -> tuple[str, str]:
+    """Pop `label`/`_label` and `user_label`/`_user_label` out of `credentials`
+    in place, returning (label, user_label). Both are non-credential display
+    fields that must never reach the probe or the saved credential set.
+
+    Both pops on each line are unconditional (not `a or b`, which would
+    short-circuit and skip the second `.pop()` whenever the first key is
+    present and truthy — leaving the other key sitting in `credentials`,
+    where it would be saved as an ordinary field instead of being merged into
+    the single display value it actually represents).
+    """
+    raw_label = credentials.pop("label", "")
+    raw_label_underscore = credentials.pop("_label", "")
+    label = str(raw_label or raw_label_underscore).strip()
+
+    raw_user_label = credentials.pop("user_label", "")
+    raw_user_label_underscore = credentials.pop("_user_label", "")
+    user_label = str(raw_user_label or raw_user_label_underscore).strip()
+
+    return label, user_label
+
+
 class ProbeHandler:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
@@ -115,11 +137,10 @@ class ProbeHandler:
                 k: v for k, v in values.items()
                 if k not in skipped and v is not None and v != ""
             }
-            # `label` is a human display name, not a credential — pull it out so
-            # it never reaches the probe, and hand it to persist as the label.
-            connection_label = str(
-                credentials.pop("label", "") or credentials.pop("_label", "")
-            ).strip()
+            # `label`/`user_label` are human display fields, not credentials —
+            # pull them out so they never reach the probe, and hand them to
+            # persist as the label/user_label.
+            connection_label, connection_user_label = _extract_connection_label_fields(credentials)
 
             # Connector spec — absent for agent-handcrafted (non-registry)
             # connectors; those fall back to the form_spec staged with the
@@ -143,8 +164,10 @@ class ProbeHandler:
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
                     slug = persist_connection(
                         connector_id, method, name, credentials,
-                        label=connection_label, vault=vault,
+                        label=connection_label, user_label=connection_user_label, vault=vault,
                     )
+                    saved_record = vault.read_record(connector_id, slug) or {}
+                    saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
                     yield _push("response.completed", {
@@ -166,7 +189,7 @@ class ProbeHandler:
                 })
                 yield _push("response.completed", {
                     "type": "response.completed",
-                    "response": {"id": response_id, "status": "success"},
+                    "response": {"id": response_id, "status": "success", "user_label": saved_user_label},
                 })
                 self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
                 return
@@ -296,15 +319,18 @@ class ProbeHandler:
 
             # Apply verdict
             saved_slug: str | None = None
+            saved_user_label: str | None = None
             if final_outcome.status == "success":
                 try:
                     from anton.core.datasources.data_vault import LocalDataVault
                     vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
                     slug = persist_connection(
                         connector_id, method, name, credentials,
-                        label=connection_label, vault=vault,
+                        label=connection_label, user_label=connection_user_label, vault=vault,
                     )
                     saved_slug = slug
+                    saved_record = vault.read_record(connector_id, slug) or {}
+                    saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
                 except Exception as exc:
                     logger.exception("Vault save failed despite probe success")
                     final_outcome.status = "failure"
@@ -324,7 +350,7 @@ class ProbeHandler:
                 })
                 yield _push("response.completed", {
                     "type": "response.completed",
-                    "response": {"id": response_id, "status": "success"},
+                    "response": {"id": response_id, "status": "success", "user_label": saved_user_label},
                 })
             elif final_outcome.status == "needs_input":
                 reason = final_outcome.follow_up or "We need a few more details before we can connect."
