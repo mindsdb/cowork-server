@@ -10,7 +10,14 @@ class TestCatalogueReturnsRealUserLabel:
     def test_catalogue_connection_has_user_label(self, tmp_path, monkeypatch):
         vault = LocalDataVault(Path(tmp_path) / "vault")
         vault.save("gmail", "abc123", {"email": "a@b.com", "_user_label": "Support"})
-        connector_settings = ConnectorSettings(vault_dir=str(tmp_path / "vault"))
+        # `ConnectorSettings(vault_dir=...)` does NOT work — `vault_dir` declares a
+        # `validation_alias` (COWORK_VAULT_DIR/CONNECTOR_VAULT_DIR) and this model
+        # has no `populate_by_name=True`, so pydantic only accepts the alias keys;
+        # the plain `vault_dir` kwarg is silently dropped (extra="ignore") and the
+        # field falls back to its real on-disk default. Override via the env var
+        # instead, matching TestOAuthCallbackDedup's working pattern.
+        monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+        connector_settings = ConnectorSettings()
         oauth_settings = OAuthSettings(state_path=str(tmp_path / "oauth_state.json"))
 
         svc = oauth_google.OAuthService()
