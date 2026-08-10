@@ -58,9 +58,11 @@ PrincipalDep = Annotated[Principal | None, Depends(get_principal)]
 
 def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None) -> None:
     """Org-level settings (provider keys, model policy, budgets) are admin-owned:
-    in org mode, writing any org-classified key needs the manage-organization
-    role. Personal keys and local mode are untouched. 403, not 404 — the key
-    names are public schema, only the write is privileged."""
+    in org mode, a caller-supplied write to any org-classified key needs the
+    manage-organization role. Personal keys and local mode are untouched. 403,
+    not 404 — the key names are public schema, only the write is privileged.
+    System-derived writes are exempt (see the minds_model_enabled refresh in
+    recommended_models) — the caller can't steer the stored value."""
     if not scope.org_mode:
         return
     org_keys = [k for k in keys if setting_is_org_scoped(k)]
@@ -326,6 +328,10 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
                 except (ValueError, TypeError):
                     stored = "{}"
                 if desired != stored:
+                    # Intentionally ungated by _require_org_admin_for: the value
+                    # is system-derived (MindsHub, via admin-set key/URL), so a
+                    # member can trigger this refresh but can't steer what's
+                    # stored — and gating it would leave the map stale.
                     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
