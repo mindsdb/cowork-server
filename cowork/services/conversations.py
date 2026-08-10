@@ -119,18 +119,64 @@ class ConversationService:
         ).first()
         return 0 if last is None else last.seq + 1
 
-    def save_user_message(self, conversation_id: UUID, content) -> Message:
-        """Persist a user message with the next monotonic `seq` (see _next_seq)."""
+    def save_user_message(
+        self,
+        conversation_id: UUID,
+        content,
+        created_at: datetime | None = None,
+        *,
+        pending: bool = False,
+    ) -> Message:
+        """Persist a user message with the next monotonic `seq` (see _next_seq).
+
+        `pending=True` marks the message in-flight (ENG-1231): the streaming path
+        persists it at turn start so a mid-turn refresh shows the question, but it
+        is kept out of replayed LLM history (get_ordered_messages) until the turn
+        ends and finalize_pending clears the flag.
+        """
         message = Message(
             conversation_id=conversation_id,
             role="user",
             content=content,
             seq=self._next_seq(conversation_id),
+            created_at=created_at,
+            pending=pending,
         )
         self.session.add(message)
         self.session.commit()
         self.session.refresh(message)
         return message
+
+    def finalize_pending(self, conversation_id: UUID, message_id: UUID | None = None) -> None:
+        """Clear the in-flight flag at turn end (ENG-1231), so the finished turn
+        rejoins replayed LLM history.
+
+        Pass `message_id` to finalize only that turn's row — the streaming
+        producers do this so a completing turn cannot silently absorb an unrelated
+        pending row that was stranded by a hard crash (killed between the pending
+        persist and finalize) on an earlier turn. Such an orphan stays pending
+        (still shown in the UI, still excluded from history) instead of being
+        folded into history as a question with no answer.
+
+        With no `message_id`, clears every pending row for the conversation — a
+        defensive/idempotent form for callers that just want a clean slate.
+
+        Idempotent: a no-op when nothing matches.
+        """
+        stmt = (
+            self.session.select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.pending == True)  # noqa: E712 — SQL boolean column, not Python identity
+        )
+        if message_id is not None:
+            stmt = stmt.where(Message.id == message_id)
+        pending_rows = self.session.exec(stmt).all()
+        if not pending_rows:
+            return
+        for message in pending_rows:
+            message.pending = False
+            self.session.add(message)
+        self.session.commit()
 
     def last_message_at(self, conversation_id: UUID) -> datetime | None:
         """Timestamp of the most recent message, or None for an empty
@@ -255,6 +301,25 @@ class ConversationService:
         self.session.commit()
         self.session.refresh(conversation)
         return conversation
+
+    def update_history_compaction(
+        self,
+        conversation_id: UUID,
+        summary: str,
+        cutoff_message_id: UUID,
+    ) -> None:
+        """Persist anton's latest compacted history summary + cutoff.
+
+        Best-effort: silently no-ops if the conversation is gone (this runs
+        from a turn's cleanup path, after the turn's real outcome is settled).
+        """
+        conversation = self.session.get(Conversation, conversation_id)
+        if conversation is None:
+            return
+        conversation.history_summary = summary
+        conversation.history_summary_cutoff_id = cutoff_message_id
+        self.session.add(conversation)
+        self.session.commit()
 
     def delete_conversation(self, conversation_id: UUID) -> bool:
         conversation = self.session.get(Conversation, conversation_id)
@@ -476,15 +541,27 @@ class ConversationService:
         if deleted:
             self.session.commit()
 
-    def get_ordered_messages(self, conversation_id: UUID) -> list[Message]:
+    def get_ordered_messages(self, conversation_id: UUID, *, include_pending: bool = False) -> list[Message]:
         """All messages of a conversation in canonical order (see
         _MESSAGE_ORDER). Includes history-only tool rows — harnesses replay
-        them into the LLM context; use get_messages for the UI-facing view."""
-        return list(self.session.exec(
+        them into the LLM context; use get_messages for the UI-facing view.
+
+        Excludes the in-flight pending user message by default (ENG-1231): this is
+        the LLM-history read, and the current turn's input arrives separately, so
+        replaying it here would double-feed it. Pass include_pending=True only if a
+        caller genuinely needs the not-yet-finalized row."""
+        # Anchor the parent: Message has no org_id, so tenancy comes from
+        # resolving the conversation through the scoped session — a foreign
+        # id must answer like a nonexistent one, not leak another org's
+        # history (the remote-turn replay path passes ids from the wire).
+        self.get_conversation(conversation_id)  # raises if not found
+        stmt = (
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(*_MESSAGE_ORDER)
-        ).all())
+        )
+        if not include_pending:
+            stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
+        return list(self.session.exec(stmt.order_by(*_MESSAGE_ORDER)).all())
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found

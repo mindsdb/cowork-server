@@ -274,8 +274,12 @@ class OAuthSettings(Settings):
 
 
 class MemorySettings(Settings):
+    # populate_by_name: callers construct MemorySettings(root_dir=...) directly.
+    model_config = SettingsConfigDict(populate_by_name=True)
+
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "memory"),
+        validation_alias=AliasChoices("COWORK_MEMORY_DIR", "MEMORY_ROOT_DIR"),
         description="Root directory for all memory files",
     )
 
@@ -291,6 +295,51 @@ class StreamSettings(Settings):
         validation_alias=AliasChoices("COWORK_STREAMS_DIR"),
         description="Root directory for file-backed turn-stream buffers",
     )
+
+
+class TurnQueueSettings(Settings):
+    model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
+
+    backend: str = Field(
+        default="inprocess",
+        description="Turn-queue backend: 'inprocess' (single-instance, default) or 'remote' (Redis-backed, multi-instance).",
+    )
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis connection URL used when backend is 'remote'.",
+    )
+    jobs_stream: str = Field(
+        default="scratchpad:requests",
+        description="Redis stream key turn jobs are queued on when backend is 'remote'.",
+    )
+    auth_internal_base_url: str = Field(
+        default="",
+        description="Base URL of the auth service's internal API, used to mint per-turn MindsHub keys.",
+    )  # COWORK_TURN_AUTH_INTERNAL_BASE_URL
+    auth_internal_secret: str = Field(
+        default="",
+        description="Shared secret sent as X-Internal-Auth when minting per-turn MindsHub keys.",
+    )  # COWORK_TURN_AUTH_INTERNAL_SECRET
+    turn_key_ttl_seconds: int = Field(
+        default=1200,
+        description="TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within auth's turn_key_max_ttl_seconds).",
+    )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    minds_base_url: str = Field(
+        default="",
+        description=(
+            "Explicit MindsHub inference base URL (OpenAI-compatible, incl. /v1) the pod's "
+            "turn calls. Overrides the env-slug default (default_minds_api_host); required for "
+            "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
+        ),
+    )  # COWORK_TURN_MINDS_BASE_URL
+    minds_coding_model: str = Field(
+        default="",
+        description=(
+            "MindsHub model alias for the pod's coding calls (completion verifier + nested "
+            "scratchpad calls). The pod always runs on minds-cloud, so this must be a minds "
+            "alias the env serves. Empty = the minds-cloud coding default (CODING_MODEL_DEFAULTS)."
+        ),
+    )  # COWORK_TURN_MINDS_CODING_MODEL
 
 
 class AppSettings(Settings):
@@ -376,6 +425,20 @@ class AppSettings(Settings):
             "multi-tenant cloud deployment behind the auth gateway — requests "
             "carry trusted identity headers (X-User-Id / X-Organization-Id) "
             "from which a per-request principal is built."
+        ),
+    )
+    install_channel_override: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_INSTALL_CHANNEL"),
+        description=(
+            "Deployer-declared install channel for trace attribution "
+            "(ENG-1279), overriding inference from tenancy/pip metadata. "
+            "Needed where inference is wrong from inside the process: hub "
+            "snapshot instances run local tenancy with a PyPI-installed "
+            "cowork-server inside their docker image, so they pass 'hosted' "
+            "here. Plain str, not a Literal — an invalid value must degrade "
+            "to inference (build_info validates and warns), never fail "
+            "settings load over telemetry. Empty (default) = infer."
         ),
     )
     identity_enforce: Literal["audit", "enforce"] = Field(
