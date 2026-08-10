@@ -1,4 +1,6 @@
+import asyncio
 import json
+
 import pytest
 
 from cowork.turnqueue import producer as prod
@@ -186,3 +188,112 @@ async def test_mint_llm_block_derives_base_url_when_override_empty():
     settings = TurnQueueSettings(minds_base_url="")
     block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
     assert "mindshub.ai" in block["base_url"] and block["base_url"].endswith("/v1")
+
+
+class SilentRedis:
+    """A worker that never answers: xread always times out empty."""
+
+    def __init__(self, delay=0.02):
+        self.added = []
+        self.reads = 0
+        self._delay = delay
+
+    async def xadd(self, stream, fields):
+        self.added.append((stream, fields))
+        return "1-0"
+
+    async def xread(self, streams, count=None, block=None):
+        self.reads += 1
+        await asyncio.sleep(self._delay)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_unresponsive_worker_fails_the_turn_instead_of_spinning(monkeypatch):
+    """With the worker down the reply loop used to `continue` forever: the
+    buffer was never closed, so tail() never returned and the SSE response
+    never ended — which the keepalive now keeps alive indefinitely. The loop
+    must give up and emit the same response.failed frame turn_failed emits."""
+    fake = SilentRedis()
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0.01")
+    buf = RecBuffer()
+    events = []
+
+    await asyncio.wait_for(prod.produce_remote_turn(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
+        model=None, buffer=buf, on_event=lambda kind, data: events.append((kind, data)),
+    ), timeout=5)
+
+    failed = buf.records[-1][1]["sse"]
+    assert "response.failed" in failed
+    assert "anton_error" in failed
+    # Closed, so the buffer's tail() ends and the SSE response with it.
+    assert buf.closed == "error"
+    # And persisted as a failure, so a reload shows the error card.
+    assert events[-1][0] == "turn_failed"
+    assert events[-1][1]["code"] == "anton_error"
+
+
+@pytest.mark.asyncio
+async def test_replies_refresh_the_idle_deadline(monkeypatch):
+    """The bound is on silence, not on turn duration: a turn that keeps
+    streaming must never be cut off by it."""
+
+    class TrickleRedis(SilentRedis):
+        """A live turn as the real client sees it: the blocking read times out
+        empty between the replies that do arrive."""
+
+        def __init__(self):
+            super().__init__(delay=0.02)
+            self._deltas_left = 9
+            self._quiet = False
+
+        async def xread(self, streams, count=None, block=None):
+            self.reads += 1
+            await asyncio.sleep(self._delay)
+            self._quiet = not self._quiet
+            if self._quiet:
+                return None
+            if self._deltas_left:
+                self._deltas_left -= 1
+                return [["scratchpad:reply:conv-1", [[f"{self.reads}-0",
+                                                      _reply("turn_delta", {"text": "x"})]]]]
+            return [["scratchpad:reply:conv-1", [[f"{self.reads}-0",
+                                                  _reply("turn_completed", {})]]]]
+
+    fake = TrickleRedis()
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    # Shorter than the whole turn (20 reads x 20ms = ~0.4s), several times
+    # longer than any single quiet gap (~0.04s) — so this can only pass if each
+    # reply pushes the deadline out, with enough slack for a loaded CI box.
+    monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0.15")
+    buf = RecBuffer()
+
+    await asyncio.wait_for(prod.produce_remote_turn(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
+        model=None, buffer=buf,
+    ), timeout=5)
+
+    assert buf.closed == "completed"
+    assert "response.failed" not in "".join(r[1]["sse"] for r in buf.records)
+
+
+@pytest.mark.asyncio
+async def test_idle_bound_can_be_disabled(monkeypatch):
+    """<= 0 keeps the old unbounded behavior for an operator who needs it."""
+    fake = SilentRedis(delay=0.005)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0")
+    buf = RecBuffer()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(prod.produce_remote_turn(
+            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
+            model=None, buffer=buf,
+        ), timeout=0.2)
+
+    assert buf.closed is None

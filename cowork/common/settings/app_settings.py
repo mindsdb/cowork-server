@@ -312,6 +312,16 @@ class TurnQueueSettings(Settings):
         default="scratchpad:requests",
         description="Redis stream key turn jobs are queued on when backend is 'remote'.",
     )
+    reply_idle_timeout_seconds: float = Field(
+        default=600.0,
+        description=(
+            "Fail a remote turn after this many seconds with no reply for it on the reply "
+            "stream (worker down, crashed, or wedged). Generous on purpose: the reply "
+            "protocol has no heartbeat, so a long tool run legitimately produces no reply "
+            "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
+            "which means an unresponsive worker leaves the turn spinning forever."
+        ),
+    )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
         default="",
         description="Base URL of the auth service's internal API, used to mint per-turn MindsHub keys.",
