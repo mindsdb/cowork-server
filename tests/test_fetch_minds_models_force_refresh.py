@@ -66,7 +66,8 @@ def test_force_refresh_bypasses_a_cached_success(monkeypatch):
     providers._minds_models_cache.clear()
 
     asyncio.run(fetch_minds_models(_URL, "mdb_test"))
-    ids, _efforts, enabled, labels = asyncio.run(fetch_minds_models(_URL, "mdb_test", force_refresh=True))
+    listing = asyncio.run(fetch_minds_models(_URL, "mdb_test", force_refresh=True))
+    ids, enabled, labels = listing.ids, listing.enabled, listing.labels
 
     assert len(calls) == 2, "force_refresh must re-hit the network"
     # The refreshed answer is returned, not the cached tuple.
@@ -97,8 +98,8 @@ def test_force_refresh_honors_a_cached_failure(monkeypatch):
     first = asyncio.run(fetch_minds_models(_URL, "mdb_test"))
     second = asyncio.run(fetch_minds_models(_URL, "mdb_test", force_refresh=True))
 
-    assert first == (None, {}, {}, {})
-    assert second == (None, {}, {}, {})
+    assert first == providers._empty_listing()
+    assert second == providers._empty_listing()
     assert len(calls) == 1, "cached failure must be honored even under force_refresh"
 
 

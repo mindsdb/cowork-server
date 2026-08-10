@@ -45,12 +45,17 @@ def save_connection_direct(body: DirectSaveRequest):
     values = dict(body.values)
     if values.get("access_token") or values.get("refresh_token"):
         values["auth_type"] = "oauth"
+    from pathlib import Path
+    from anton.core.datasources.data_vault import LocalDataVault
+    vault = LocalDataVault(Path(ConnectorSettings().vault_dir))
     try:
-        slug = persist_connection(body.connector_id, body.method, body.name, values)
+        slug = persist_connection(body.connector_id, body.method, body.name, values, vault=vault)
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
-    return {"ok": True, "name": slug, "label": slug}
+    saved = vault.read_record(body.connector_id, slug) or {}
+    user_label = str(saved.get("fields", {}).get("_user_label", "")).strip() or None
+    return {"ok": True, "name": slug, "label": slug, "user_label": user_label}
 
 
 @router.delete("/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT)
