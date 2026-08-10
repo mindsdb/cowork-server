@@ -127,7 +127,6 @@ def test_bulk_upsert_skips_none_values():
             SettingsBulkUpsertRequest(values={"greeting": None, "tone": "formal"}),
             session,
             LOCAL_SCOPE,
-            None,
         )
         assert result["updated"] == ["tone"]
         assert SettingService(session)._fetch_row("greeting") is None
