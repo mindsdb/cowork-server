@@ -186,6 +186,41 @@ def test_local_mode_still_reconciles_links(skills_root, tmp_path, monkeypatch):
     assert (proj / "skills" / "y").exists(), "desktop link distribution unchanged"
 
 
+def test_boot_reconcile_is_gated_off_in_org_mode(skills_root, monkeypatch):
+    # dev_setup's boot fan-out reads the UNKEYED root and scans every project
+    # dir — the same hole that got symlink distribution disabled in org mode.
+    import cowork.services.skill_links as skill_links
+    from cowork.dev_setup import _distribute_skill_links
+
+    calls: list = []
+    monkeypatch.setattr(skill_links, "reconcile_all", lambda skills: calls.append(skills))
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    _distribute_skill_links()
+    assert calls == [], "org mode must not run boot symlink distribution"
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    _distribute_skill_links()
+    assert len(calls) == 1, "desktop boot distribution unchanged"
+
+
+def test_unscoped_service_does_not_link_in_org_deployment(skills_root, tmp_path, monkeypatch):
+    # Migration/seeding build an UNSCOPED SkillService(); in an org deployment
+    # that must still never fan symlinks out of the unkeyed root. Keyed on
+    # deployment mode, not just the passed scope.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    proj = tmp_path / "projects" / "p1"
+    proj.mkdir(parents=True)
+
+    assert SkillService()._link_projects is False
+    SkillService().create_skill(label="Y", name="y", instructions="i")
+    assert not (proj / "skills").exists(), "org deployment must not fan out symlinks"
+
+
 def _zip_bytes(members: dict[str, str]) -> bytes:
     import io as _io
     import zipfile as _zf

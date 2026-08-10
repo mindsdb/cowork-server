@@ -110,6 +110,71 @@ async def test_produce_remote_turn_history_defaults_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_turn_forwards_skills(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    skills = {"csv-summary": {"files": {"SKILL.md": "---\nname: csv-summary\n---\nbody"}}}
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=RecBuffer(),
+                                   skills=skills)
+    assert json.loads(fake.added[0][1]["payload"])["params"]["skills"] == skills
+
+
+@pytest.mark.asyncio
+async def test_oversized_request_drops_skills_then_memory(monkeypatch):
+    # A valid memory + skills combination can exceed the pod's stdin cap. Rather
+    # than let the request line truncate into unparseable JSON, the producer
+    # sheds skills first, then memory, so the turn still runs.
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_MAX_REQUEST_BYTES", 4096)
+    monkeypatch.setattr(prod, "_REQUEST_BYTES_MARGIN", 0)
+
+    big_skills = {"s": {"files": {"SKILL.md": "x" * 5000}}}
+    big_memory = {"global": {"rules": "y" * 5000}}
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=RecBuffer(),
+                                   memory=big_memory, skills=big_skills)
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    # skills shed first; memory then also shed because it alone still overruns
+    assert "skills" not in params
+    assert "memory" not in params
+    assert prod._request_wire_size(params) <= 4096
+
+
+@pytest.mark.asyncio
+async def test_request_keeps_memory_when_dropping_skills_suffices(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_MAX_REQUEST_BYTES", 4096)
+    monkeypatch.setattr(prod, "_REQUEST_BYTES_MARGIN", 0)
+
+    big_skills = {"s": {"files": {"SKILL.md": "x" * 5000}}}
+    small_memory = {"global": {"rules": "keep me"}}
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=RecBuffer(),
+                                   memory=small_memory, skills=big_skills)
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "skills" not in params
+    assert params["memory"] == small_memory   # shedding skills alone was enough
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_turn_omits_empty_skills(monkeypatch):
+    # Like memory: a skill-less turn keeps the pre-existing payload shape.
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=RecBuffer(),
+                                   skills={})
+    assert "skills" not in json.loads(fake.added[0][1]["payload"])["params"]
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
