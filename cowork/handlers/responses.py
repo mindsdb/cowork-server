@@ -54,6 +54,55 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Statuses of the `response.ask_user_answered` event, as the harness emits them
+# (cowork/harnesses/anton_harness/stream_formatter.py). "cancelled" is the one
+# this module synthesizes when a turn is stopped while a question is on screen.
+ASK_USER_EVENT = "response.ask_user"
+ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
+
+
+def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
+    """Retirement events for every question in *events* that nothing retires.
+
+    Why the server has to do this: anton's ``elicit()`` emits
+    ``StreamAskUserAnswered`` from an ``except Exception`` branch, and
+    ``CancelledError`` is a ``BaseException`` — so pressing Stop while a
+    question is open skips the retirement. Emitting it from anton on that path
+    would not help either: once the turn is cancelled ``session.emit`` only
+    puts the event on a queue nobody drains any more. The server, by contrast,
+    knows the turn is over and knows exactly which questions it published.
+
+    Without this, ``_run_turn``'s cancellation path persists a ``response.ask_user``
+    with nothing that retires it, i.e. an internally inconsistent event log:
+    every consumer that replays it has to infer the missing half. Note the
+    shape carries no ``sequence_number`` — there is no live counter left to
+    draw one from, and the client keys purely on ``type`` + ``question_id``
+    (same as the synthesized ``response.failed`` payload next to it).
+    """
+    retired = {
+        e.get("question_id")
+        for e in events
+        if e.get("type") == ASK_USER_ANSWERED_EVENT
+    }
+    synthesized: list[dict] = []
+    for event in events:
+        if event.get("type") != ASK_USER_EVENT:
+            continue
+        question_id = event.get("question_id")
+        if question_id in retired:
+            continue
+        # Guard against a duplicated publish of the same id producing two
+        # retirements for one card.
+        retired.add(question_id)
+        synthesized.append({
+            "type": ASK_USER_ANSWERED_EVENT,
+            "question_id": question_id,
+            "status": "cancelled",
+            "values": [],
+            "text": "",
+        })
+    return synthesized
+
 
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
@@ -432,7 +481,12 @@ class ResponsesHandler:
             await buffer.close("completed")
         except asyncio.CancelledError:
             # Nothing special is emitted on cancellation.
-            # The partial text and evennts generated before cancellation are persisted.
+            # The partial text and events generated before cancellation are persisted.
+            # A question that was on screen when Stop was pressed never got its
+            # `response.ask_user_answered` (see cancelled_ask_user_retirements),
+            # so retire it here — otherwise the persisted log holds a published
+            # question that nothing in it ever closes.
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             persist()
             await buffer.close("cancelled")
             return
