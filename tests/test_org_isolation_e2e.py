@@ -372,3 +372,26 @@ def test_streaming_surfaces_isolated(client):
         assert handle.cancelled
     finally:
         registry._by_cid.pop(cid, None)
+
+
+def _setting(client, headers, key):
+    rows = client.get("/api/v1/settings/", headers=headers).json()
+    return next(s for s in rows if s["key"] == key)
+
+
+def test_settings_writes_are_org_isolated(client):
+    # org A stores a provider credential
+    assert client.put("/api/v1/settings/openai_api_key", json={"value": "sk-A"}, headers=A).status_code == 200
+    # org B must NOT resolve it (reads fall back to global rows only, never A's org row)
+    assert _setting(client, B, "openai_api_key")["is_set"] is False
+    assert _setting(client, A, "openai_api_key")["is_set"] is True
+
+    # org B setting the same key writes its OWN row, doesn't touch A's
+    assert client.put("/api/v1/settings/openai_api_key", json={"value": "sk-B"}, headers=B).status_code == 200
+    assert _setting(client, A, "openai_api_key")["is_set"] is True
+    assert _setting(client, B, "openai_api_key")["is_set"] is True
+
+    # org A logout clears only A's credentials; B's survive
+    assert client.post("/api/v1/settings/logout", headers=A).status_code == 200
+    assert _setting(client, A, "openai_api_key")["is_set"] is False
+    assert _setting(client, B, "openai_api_key")["is_set"] is True

@@ -5,6 +5,7 @@ This module defines the memory stores for canonical slot files on disk.
 from pathlib import Path
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import TenantScope, scoped_storage_root
 from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
 
 PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
@@ -39,12 +40,14 @@ class MemoryStore:
 
 
 class SharedMemoryStore(MemoryStore):
-    def __init__(self, root: Path | None = None) -> None:
-        super().__init__(
+    def __init__(self, root: Path | None = None, scope: TenantScope | None = None) -> None:
+        base = (
             root.expanduser()
             if root is not None
             else Path(get_app_settings().memory.root_dir).expanduser()
         )
+        # Org mode: per-org root; local mode uses the shared root unchanged.
+        super().__init__(scoped_storage_root(base, scope))
 
     def list_slots(self) -> list[MemorySlot]:
         return list(SLOT_REGISTRY.keys())

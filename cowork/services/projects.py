@@ -144,9 +144,11 @@ class ProjectService:
         self.session.commit()
         self.session.refresh(project)
 
-        from cowork.services.skill_links import reconcile_project
-        from cowork.services.skills import SkillService
-        reconcile_project(path, SkillService().list_skills())
+        # Skill symlink distribution is desktop-only (see SkillService).
+        if not self.session.scope.org_mode:
+            from cowork.services.skill_links import reconcile_project
+            from cowork.services.skills import SkillService
+            reconcile_project(path, SkillService(self.session.scope).list_skills())
 
         return project
 
@@ -178,12 +180,13 @@ class ProjectService:
                 # then reconcile links for the renamed dir.
                 from cowork.services.skill_links import reconcile_project
                 from cowork.services.skills import SkillService
-                svc = SkillService()
+                svc = SkillService(self.session.scope)
                 for skill in svc.list_skills():
                     if old_name in skill.projects:
                         updated = [final_name if p == old_name else p for p in skill.projects]
                         svc.update_skill(skill.name, projects=updated)
-                reconcile_project(new_path, svc.list_skills())
+                if not self.session.scope.org_mode:  # symlinks are desktop-only
+                    reconcile_project(new_path, svc.list_skills())
 
         if is_active is not None:
             if is_active:
