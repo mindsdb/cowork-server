@@ -22,6 +22,7 @@ from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
+from cowork.principal import Principal, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
     SettingResponse,
@@ -41,13 +42,35 @@ from cowork.common.settings.app_settings import (
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
 )
-from cowork.common.settings.user_settings import Provider, provider_api_key_str
+from cowork.common.settings.user_settings import (
+    Provider,
+    provider_api_key_str,
+    setting_is_org_scoped,
+)
 
 router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
 # Tenant scope for every settings read/write (local mode → LOCAL_SCOPE).
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+PrincipalDep = Annotated[Principal | None, Depends(get_principal)]
+
+
+def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None) -> None:
+    """Org-level settings (provider keys, model policy, budgets) are admin-owned:
+    in org mode, a caller-supplied write to any org-classified key needs the
+    manage-organization role. Personal keys and local mode are untouched. 403,
+    not 404 — the key names are public schema, only the write is privileged.
+    System-derived writes are exempt (see the minds_model_enabled refresh in
+    recommended_models) — the caller can't steer the stored value."""
+    if not scope.org_mode:
+        return
+    org_keys = [k for k in keys if setting_is_org_scoped(k)]
+    if org_keys and not can_manage_org(principal):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"changing organization settings ({', '.join(sorted(org_keys))}) requires an org admin",
+        )
 
 
 @router.get("/", response_model=list[SettingResponse])
@@ -56,13 +79,18 @@ def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]
 
 
 @router.put("/")
-def bulk_upsert_settings(body: SettingsBulkUpsertRequest, session: SessionDep, scope: ScopeDep):
+def bulk_upsert_settings(
+    body: SettingsBulkUpsertRequest, session: SessionDep, scope: ScopeDep, principal: PrincipalDep
+):
     """Upsert many settings in one transaction (all-or-nothing).
 
     The Settings form saves through here: either every value validates and is
     written, or the request 400s and nothing is written. Replaces the per-key
     PUT loop, which could leave the DB half-written on a partial failure.
     """
+    # Skipped values (None/"***") are never written — don't let them trip the gate.
+    live_keys = [k for k, v in (body.values or {}).items() if v is not None and v != "***"]
+    _require_org_admin_for(live_keys, scope, principal)
     try:
         updated = SettingService(session, scope).save_all(body.values)
     except ValueError as e:
@@ -76,7 +104,9 @@ def upsert_setting(
     body: SettingUpsertRequest,
     session: SessionDep,
     scope: ScopeDep,
+    principal: PrincipalDep,
 ) -> SettingResponse:
+    _require_org_admin_for([key], scope, principal)
     try:
         return SettingService(session, scope).upsert_setting(key, body.value)
     except ValueError as e:
@@ -84,7 +114,8 @@ def upsert_setting(
 
 
 @router.delete("/{key}")
-def delete_setting(key: str, session: SessionDep, scope: ScopeDep):
+def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: PrincipalDep):
+    _require_org_admin_for([key], scope, principal)
     try:
         deleted = SettingService(session, scope).delete_setting(key)
     except ValueError as e:
@@ -134,14 +165,14 @@ def check_configured(session: SessionDep, scope: ScopeDep):
 
 @router.post("/logout")
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
-    """Clear all stored credentials from the DB.
+    """Clear all stored credentials from the DB (desktop sign-out flow, so
+    ``/health`` returns ``config_ready: false``; preferences are kept).
 
-    Called by the Electron main process during sign-out so that
-    ``/health`` returns ``config_ready: false`` on the next query.
-    Provider and model preferences are kept so they survive a
-    re-login without requiring the onboarding flow to restore them.
-    Scoped: clears only the caller's org rows, never the global ones.
+    Org mode: a no-op. Credentials are org-owned there — one member signing
+    out must not wipe the keys the whole org runs on.
     """
+    if scope.org_mode:
+        return {"ok": True, "deleted": []}
     deleted = SettingService(session, scope).clear_credentials()
     return {"ok": True, "deleted": deleted}
 
@@ -218,9 +249,15 @@ async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
 
-def _fill_missing(target: dict, extra: dict) -> None:
-    """Add only the keys `target` doesn't already have (first writer wins)."""
+def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None) -> None:
+    """Add only the keys `target` doesn't already have (first writer wins).
+
+    `skip` reserves ids the later writer may not fill even where `target` has no
+    entry for them, for a map whose gaps carry meaning of their own.
+    """
     for key, value in extra.items():
+        if skip and key in skip:
+            continue
         target.setdefault(key, value)
 
 
@@ -263,11 +300,40 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
     # A model absent from this map falls back to the client's id-derived label.
     model_labels: dict[str, str] = {}
 
+    # Grouping metadata for the picker:
+    #   modelProviders id → the provider serving the model ("anthropic"), which
+    #                  decides its section.
+    #   modelFamilies  id → the moving alias the model belongs to. Dense for every
+    #                  model MindsHub describes, and equal to the id on a moving
+    #                  alias, so `families[id] == id` marks a model "latest" and
+    #                  anything else names the alias it is a frozen version of.
+    #
+    # Both are keyed by model id ALONE and are NOT scoped to the minds-cloud
+    # bucket — population is gated on a MindsHub key being configured, with no
+    # reference to which provider the user actually selected. So they are empty
+    # only for a user with no MindsHub key at all, NOT for a user on BYOK.
+    #
+    # A consumer must therefore decide per model, by looking its id up, and must
+    # not read "the map is non-empty" as "this model is described". For
+    # `modelLabels`/`modelEnabled` an absent key is a benign fallback, but for
+    # `modelFamilies` absence is actively interpreted: read as "is its own head" it
+    # tags every BYOK model "latest", including dated snapshots that never move.
+    model_providers: dict[str, str] = {}
+    model_families: dict[str, str] = {}
+
+    # Every model id MindsHub listed, whether or not it described it. The custom
+    # endpoint overlay below reserves these ids for the grouping maps.
+    minds_ids: set[str] = set()
+
     s = SettingService(session, scope).load()
     if s.minds_api_key is not None and s.minds_url:
-        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+        listing = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
+        live = listing.ids
+        live_efforts = listing.efforts
+        live_enabled = listing.enabled
+        live_labels = listing.labels
         if live:
             recommended["minds-cloud"] = live
             # Cache the availability map so model-default resolution
@@ -297,10 +363,17 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
                 except (ValueError, TypeError):
                     stored = "{}"
                 if desired != stored:
+                    # Intentionally ungated by _require_org_admin_for: the value
+                    # is system-derived (MindsHub, via admin-set key/URL), so a
+                    # member can trigger this refresh but can't steer what's
+                    # stored — and gating it would leave the map stale.
                     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
+        model_providers.update(listing.providers)
+        model_families.update(listing.families)
+        minds_ids.update(live or ())
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -326,13 +399,17 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         # set a dedicated openai_compatible_api_key is used (falls back to the
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
-        live, live_efforts, live_enabled, live_labels = await fetch_minds_models(
+        oc_listing = await fetch_minds_models(
             oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
         )
+        live = oc_listing.ids
+        live_efforts = oc_listing.efforts
+        live_enabled = oc_listing.enabled
+        live_labels = oc_listing.labels
         if live:
             recommended["openai-compatible"] = live
-        # These three maps are keyed by model id alone, not by (provider, id),
-        # so a custom endpoint serving an id MindsHub also serves would other-
+        # These maps are keyed by model id alone, not by (provider, id), so a
+        # custom endpoint serving an id MindsHub also serves would other-
         # wise decide that model's label, effort levels and locked state for the
         # minds-cloud bucket too — letting a BYO base URL rename or lock a
         # MindsHub model in the picker. MindsHub is fetched first and wins;
@@ -340,6 +417,33 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         _fill_missing(model_efforts, live_efforts)
         _fill_missing(model_enabled, live_enabled)
         _fill_missing(model_labels, live_labels)
+        # Same precedence for the grouping metadata, for the same reason: a BYO
+        # endpoint must not be able to move a MindsHub model into another vendor's
+        # section or relabel it as an old version of something. But here the
+        # reservation is every id MindsHub LISTED, not just the ids it described,
+        # because MindsHub can serve a model and say nothing about it:
+        #
+        #   - deployed ahead of the MindsHub release that publishes these fields,
+        #     both MindsHub maps are empty for every model it serves, so a custom
+        #     endpoint answering `{"id": "sonnet", "family": "haiku"}` would file
+        #     MindsHub's own sonnet under haiku as an older version of it;
+        #   - a MindsHub row carrying a family but no usable provider is recorded
+        #     in families only (see fetch_minds_models), never in providers, so a
+        #     custom endpoint's provider would pick that model's section.
+        #
+        # In both cases MindsHub's silence is its answer, and the app degrades on
+        # it correctly (no section / no "latest" tag); a BYO endpoint's answer for
+        # a model it doesn't serve is a wrong one, not a better one.
+        #
+        # Not covered here, because it can't be: when the MindsHub fetch fails,
+        # recommendedModels["minds-cloud"] comes back [], which the app's
+        # overlayLists skips so the picker keeps the minds ids it already holds,
+        # while these maps come back describing the custom endpoint's ids only and
+        # the app's overlayMap swaps its held map out wholesale. Those held minds
+        # ids lose their grouping metadata until a fetch succeeds again.
+        reserved_ids = minds_ids | model_providers.keys() | model_families.keys()
+        _fill_missing(model_providers, oc_listing.providers, skip=reserved_ids)
+        _fill_missing(model_families, oc_listing.families, skip=reserved_ids)
 
     return {
         "recommendedModels": recommended,
@@ -347,6 +451,8 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelLabels": model_labels,
+        "modelProviders": model_providers,
+        "modelFamilies": model_families,
     }
 
 
