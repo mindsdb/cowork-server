@@ -466,7 +466,10 @@ def build_cowork_lookup_connector_tool():
         ),
         input_schema=_LOOKUP_CONNECTOR_SCHEMA,
         handler=_cowork_lookup_connector,
-        # `connect-datasource` SKILL.md (see lookup_connector above).
+        # Deferred (ENG-764): unlocked when the model recalls the guided
+        # data-source connection skill. No `prompt` — the procedure lives in
+        # the `connect-datasource` SKILL.md; duplicating it here would re-enter
+        # the system prompt on every turn once the tool sticks after unlock.
         unlock_skill="connect-datasource",
     )
 
