@@ -67,6 +67,22 @@ _PROVIDER_KEY_FIELDS: dict["Provider", str] = {
 _SHARED_KEY_FALLBACK_FIELDS = frozenset({"gemini_api_key", "openai_compatible_api_key"})
 
 
+def _default_provider() -> "Provider":
+    """The provider a fresh install starts on.
+
+    Org mode runs MindsHub exclusively (BYOK in cloud is deferred, and the turn
+    producer hands the pod a minted minds-cloud credential), so a tenant with
+    nothing stored must not default to a BYOK provider it has no key for — that
+    reads as "unconfigured" forever and sends every new org into onboarding.
+    Desktop keeps its anthropic default.
+    """
+    return (
+        Provider.MINDS_CLOUD
+        if get_app_settings().tenancy_mode == "org"
+        else Provider.ANTHROPIC
+    )
+
+
 def provider_api_key(settings: "UserSettings", provider: "Provider"):
     """Resolve a provider's API key from its dedicated slot.
 
@@ -306,7 +322,7 @@ class UserSettings(Settings):
         description="Base URL for the MindsHub API.",
     )
     planning_provider: Annotated[Provider, ORG] = Field(
-        default=Provider.ANTHROPIC,
+        default_factory=_default_provider,
         title="Planning Provider",
         description="The provider to use for the reasoning/planning model.",
     )
@@ -316,7 +332,7 @@ class UserSettings(Settings):
         description="The reasoning model used for planning. Defaults to the recommended model for the selected provider.",
     )
     coding_provider: Annotated[Provider, ORG] = Field(
-        default=Provider.ANTHROPIC,
+        default_factory=_default_provider,
         title="Coding Provider",
         description="The provider to use for the coding model.",
     )
@@ -348,7 +364,7 @@ class UserSettings(Settings):
     # coding (scratchpad) model. Falls back to the coding role in anton when
     # unset, so leaving these at defaults is behavior-preserving.
     router_provider: Annotated[Provider, ORG] = Field(
-        default=Provider.ANTHROPIC,
+        default_factory=_default_provider,
         title="Routing & Summarization Provider",
         description="The provider for the routing/summarization model.",
     )
@@ -698,6 +714,14 @@ class UserSettings(Settings):
         on the shared openai_api_key fallback."""
         p = self.resolved_planning_provider
         has_key = provider_api_key(self, p) is not None
+        # Org mode: MindsHub needs no stored key. The turn producer mints a
+        # short-lived per-turn credential (turnqueue/auth_keys) and hands it to
+        # the pod, so nothing is persisted and nothing should be — readiness
+        # here means "the deployment can run a turn", not "this user pasted a
+        # key". Requiring one sent every cloud tenant into onboarding, where the
+        # only way out is writing admin-owned provider keys (403 for a member).
+        if not has_key and p is Provider.MINDS_CLOUD and get_app_settings().tenancy_mode == "org":
+            has_key = True
         # Also require resolvable models. build_llm_client builds BOTH roles and
         # hands resolved_planning_model AND resolved_coding_model to the
         # providers; openai-compatible has no canonical default, so either role
