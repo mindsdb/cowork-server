@@ -46,6 +46,7 @@ from cowork.db.scoped import ScopedSession, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
+from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
 from cowork.services.skills import SkillService
 
@@ -225,6 +226,34 @@ class ResponsesHandler:
         )
 
     @staticmethod
+    def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
+        """This org's memory slots for the pod. A read error degrades to a turn
+        without memory rather than failing the turn."""
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            return build_turn_memory(session.scope, conversation.project.path)
+        except Exception:
+            logger.exception("[responses] failed to read memory for conversation %s", conv_id)
+            return {}
+
+    @staticmethod
+    def _persist_turn_memory(session: ScopedSession, conv_id: UUID, entries: list) -> None:
+        """Apply what the pod asked to remember, re-anchoring the conversation
+        first (like persist(): one deleted mid-turn must not write memory).
+
+        Never fails the turn — a lost memory is recoverable, a lost reply isn't.
+        """
+        if not entries:
+            return
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            applied = apply_turn_memory(session.scope, conversation.project.path, entries)
+            logger.info("[responses] applied %d memory entr(ies) for conversation %s",
+                        applied, conv_id)
+        except Exception:
+            logger.exception("[responses] failed to apply memory for conversation %s", conv_id)
+
+    @staticmethod
     def _remote_history(session, conv_id) -> list[dict]:
         """Prior user/assistant messages in canonical order, as OpenAI-shaped
         dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
@@ -261,6 +290,8 @@ class ResponsesHandler:
                 text = data.get("text", "")
                 collected_text.append(text)
                 collected_events.append({"type": "response.output_text.delta", "delta": text})
+            elif kind == "turn_memory":
+                self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
             elif kind == "turn_completed":
                 collected_events.append({"type": "response.completed"})
             elif kind == "turn_failed":
@@ -315,6 +346,7 @@ class ResponsesHandler:
                 # and the request session may be closed by the time it runs.
                 history=self._remote_history(producer_session, conv_id),
                 harness_id=harness_id,
+                memory=self._remote_memory(producer_session, conv_id),
                 on_event=on_event,
             )
             persist()
