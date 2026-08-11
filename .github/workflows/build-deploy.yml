@@ -7,8 +7,8 @@
 # What actually ships this repo is the PyPI wheel, not a container image: the
 # desktop app installs `cowork-server` from PyPI (or git, per channel), so
 # `publish.yml` and `publish-staging.yml` are the real deploy path. The image
-# build exists for the per-PR environments and for the day the commented-out Helm
-# deploy below is switched on.
+# build exists for the per-PR environments and for the staging/prod Helm deploy
+# below.
 #
 # ON PERMISSIONS. A called workflow can never exceed its caller's grant, and that
 # cap is checked when the workflow FILE IS LOADED, not when a job runs. A job here
@@ -107,3 +107,56 @@ jobs:
       - name: Record that the environment is up
         id: rollout
         run: echo "deployed=true" >> "$GITHUB_OUTPUT"
+
+
+  deploy:
+    runs-on: ${{ inputs.build-runner }}
+    # `scan` too: it is blocking on a deploy branch (see `allow-vulns` above), and
+    # needing only `build` meant a failing scan and a rollout ran side by side.
+    needs: [build, scan]
+    # Only the two long-lived environments have a cluster to deploy to. A
+    # `development` build is either a PR (handled by `deploy-pr-env`) or nothing.
+    if: inputs.build-environment == 'staging' || inputs.build-environment == 'production'
+    env:
+      # `build-environment` names the image flavour (production); the Helm chart,
+      # namespace and Slack message name the environment (prod). One is not the
+      # other, so map once here rather than at each use.
+      DEPLOY_ENV: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
+    environment:
+      # Spelled out rather than `env.DEPLOY_ENV`: `environment` is resolved before
+      # the job's `env` block exists, and only takes github/needs/strategy/matrix/
+      # vars/inputs.
+      name: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
+      url: ${{ vars.MDB_ENV_URL }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mindsdb/gihub-actions/setup-env@main
+      - name: Notify of deployment starting
+        id: slack
+        uses: mindsdb/github-actions/slack-deploy-msg@main
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
+          status: 'started'
+          color: '#0099CC'
+          env-name: ${{ env.DEPLOY_ENV }}
+          env-url: ${{ vars.MDB_ENV_URL }}
+          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+      - uses: DevOps-Nirvana/aws-helm-multi-deploy-nodocker@v8
+        with:
+          environment-slug: ${{ env.DEPLOY_ENV }}
+          k8s-namespace: ${{ env.DEPLOY_ENV }}
+          # build-push-ecr tags the image `<build-for-environment>-<sha>`, so this
+          # is the image flavour, not DEPLOY_ENV.
+          image-tag: ${{ inputs.build-environment }}-${{ env.SLUG }}
+          timeout: 600s
+      - name: Notify of deployment finish
+        uses: mindsdb/github-actions/slack-deploy-msg@main
+        if: always()
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
+          status: "${{ job.status == 'success' && 'finished' || 'failed' }}"
+          color: "${{ job.status == 'success' && '#00C851' || '#FF4444' }}"
+          env-name: ${{ env.DEPLOY_ENV }}
+          env-url: ${{ vars.MDB_ENV_URL }}
+          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+          update-message-id: ${{ steps.slack.outputs.ts }}

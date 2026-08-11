@@ -24,6 +24,11 @@ dependencies = [
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
     "psycopg[binary]>=3.2",
+    # psycopg 3 is what the code targets, but the hosted DB URIs come from the
+    # shared mindsdb DB stack, which mints every service's URI as bare
+    # `postgresql://`. SQLAlchemy maps that scheme to the psycopg2 dialect, so
+    # the driver has to be present or `db-migrate` dies on import.
+    "psycopg2-binary>=2.9",
     "redis>=5,<6",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
