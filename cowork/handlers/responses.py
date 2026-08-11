@@ -48,7 +48,7 @@ from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
-from cowork.services.skills import SkillService
+from cowork.services.skills import SkillService, build_turn_skills
 
 
 import logging
@@ -237,6 +237,18 @@ class ResponsesHandler:
             return {}
 
     @staticmethod
+    def _remote_skills(session: ScopedSession, conv_id: UUID) -> dict:
+        """This org's skills for the pod, filtered to the conversation's project.
+        A read error degrades to a turn without skills rather than failing the
+        turn."""
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            return build_turn_skills(session.scope, conversation.project.path)
+        except Exception:
+            logger.exception("[responses] failed to read skills for conversation %s", conv_id)
+            return {}
+
+    @staticmethod
     def _persist_turn_memory(session: ScopedSession, conv_id: UUID, entries: list) -> None:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
@@ -347,6 +359,7 @@ class ResponsesHandler:
                 history=self._remote_history(producer_session, conv_id),
                 harness_id=harness_id,
                 memory=self._remote_memory(producer_session, conv_id),
+                skills=self._remote_skills(producer_session, conv_id),
                 on_event=on_event,
             )
             persist()
