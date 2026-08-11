@@ -22,6 +22,36 @@ from cowork.common.settings.app_settings import TurnQueueSettings, default_minds
 
 logger = logging.getLogger(__name__)
 
+# The pod reads the request as one line and truncates at 10 MiB (anton's
+# MAX_REQUEST_BYTES); a truncated line won't parse. Margin covers the newline +
+# controller-added fields.
+_MAX_REQUEST_BYTES = 10 * 1024 * 1024
+_REQUEST_BYTES_MARGIN = 64 * 1024
+
+
+def _request_wire_size(params: dict) -> int:
+    """Bytes the controller's request line will occupy for these params."""
+    return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
+
+
+def _fit_request(params: dict, conversation_id: str) -> dict:
+    """Shed optional add-ons until the request fits the pod's stdin cap.
+
+    skills then memory: both are re-sent every turn and degrade gracefully
+    (pod falls back to builtins / no memory). History is the floor we can't
+    shed here.
+    """
+    budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
+    for field in ("skills", "memory"):
+        if _request_wire_size(params) <= budget:
+            break
+        if params.pop(field, None) is not None:
+            logger.warning(
+                "[producer] dropped %s from turn %s: request line over %d-byte cap",
+                field, conversation_id, budget,
+            )
+    return params
+
 
 def _new_correlation_id() -> str:
     return str(uuid.uuid4())
@@ -91,6 +121,8 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               model: str | None, buffer,
                               history: list | None = None,
                               harness_id: str | None = None,
+                              memory: dict | None = None,
+                              skills: dict | None = None,
                               on_event=None) -> None:
     """`on_event(kind, data)` is called per reply (turn_delta/turn_completed/
     turn_failed) so the caller can collect the turn for persistence."""
@@ -103,6 +135,15 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
 
+    params = {"input": input_text, "workspace_path": "/workspace",
+              "model": model, "history": history or [], "llm": llm_block}
+    # Omitted when empty: a memory-less turn keeps the pre-existing payload shape.
+    if memory:
+        params["memory"] = memory
+    if skills:
+        params["skills"] = skills
+    params = _fit_request(params, conversation_id)
+
     job = TurnJob(
         op="anton_turn",
         conversation_id=conversation_id,
@@ -110,8 +151,7 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         reply_stream=reply_stream,
         organization_id=org_id,
         user_id=user_id,
-        params={"input": input_text, "workspace_path": "/workspace",
-                "model": model, "history": history or [], "llm": llm_block},
+        params=params,
     )
     await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
     # conversation_id + harness mirror _inject_created on the in-process path:
@@ -159,7 +199,9 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                     # events log must carry the same (code, message).
                     code, message = remote_turn_error(data.get("error"))
                     data = {**data, "code": code, "message": message}
-                if on_event is not None and kind in ("turn_delta", "turn_completed", "turn_failed"):
+                if on_event is not None and kind in (
+                    "turn_delta", "turn_memory", "turn_completed", "turn_failed"
+                ):
                     on_event(kind, data)
                 if kind == "turn_delta":
                     await buffer.append("sse", {"sse": _sse(
