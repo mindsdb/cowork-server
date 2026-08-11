@@ -640,14 +640,19 @@ def build_llm_client():
         if role == Provider.MINDS_CLOUD:
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
-            # Flavor tells anton whether this endpoint can execute web_search /
-            # web_fetch server-side (ENG-1359) — without it every OpenAIProvider
-            # defaults to the generic flavor, which can't natively search, and
-            # anton registers a fallback tool with no credential behind it.
+            # The MindsHub gateway executes web_search / web_fetch server-side
+            # over its chat.completions passthrough:
+            # - the flavor must be set, or OpenAIProvider defaults to generic,
+            #   reports no native web tools, and anton falls back to a
+            #   web_search that needs an Exa/Brave key Cowork never asks for;
+            # - state it outright rather than deriving it from the base URL —
+            #   this branch already knows the endpoint is MindsHub, and a
+            #   self-hosted gateway not spelling "mindshub.ai" would otherwise
+            #   fall through to generic and lose search entirely.
             return OpenAIProvider(
                 api_key=key.get_secret_value(),
                 base_url=base,
-                flavor=OpenAIProvider.resolve_web_flavor(role.value, base),
+                flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
@@ -662,10 +667,7 @@ def build_llm_client():
             if role == Provider.OPENAI_COMPATIBLE and not base:
                 raise ValueError("OpenAI-compatible base URL is not configured")
             return OpenAIProvider(
-                api_key=key.get_secret_value(),
-                base_url=base,
-                flavor=OpenAIProvider.resolve_web_flavor(role.value, base),
-                **effort_kw,
+                api_key=key.get_secret_value(), base_url=base, **effort_kw
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -675,13 +677,19 @@ def build_llm_client():
             raise ValueError(f"{role.label} API key is not configured")
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
+        #
+        # Direct OpenAI deliberately keeps the default (generic) flavor. The
+        # flavor that would enable OpenAI's native web tools, FLAVOR_OPENAI,
+        # also switches the whole transport from chat.completions to the
+        # Responses API, whose path in anton does not yet:
+        # - report truncation (no `response.incomplete` handler, so
+        #   stop_reason and token usage stay unset and truncation recovery
+        #   never fires),
+        # - forward images returned inside a tool_result,
+        # - attach Langfuse trace headers.
+        # Native web search here waits on those gaps being closed in anton.
         if cls is OpenAIProvider:
-            return cls(
-                api_key=key.get_secret_value(),
-                base_url=base,
-                flavor=OpenAIProvider.resolve_web_flavor(role.value, base),
-                **effort_kw,
-            )
+            return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
     # Routing & summarization role: the cheap front-model that runs history
