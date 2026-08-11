@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 
 from cowork.handlers.turn_errors import remote_turn_error, response_failed_sse
@@ -89,6 +90,32 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     return block
 
 
+# What the reply loop reports when the worker stops answering. Shaped like the
+# pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
+# classify it (today: the generic redacted message and the generic error card).
+UNRESPONSIVE_WORKER_ERROR = "TurnWorkerUnresponsive: the turn worker stopped responding"
+
+
+async def _fail_unresponsive_worker(*, buffer, on_event, idle_seconds: float,
+                                    conversation_id: str, corr: str) -> None:
+    """End a turn whose worker went silent, exactly like a `turn_failed` reply.
+
+    Same `response.failed` frame + `buffer.close("error")` as the reply-driven
+    failure path, and the same `on_event("turn_failed", ...)` so the caller
+    persists the failure — a bare close would render as nothing at all.
+    """
+    code, message = remote_turn_error(UNRESPONSIVE_WORKER_ERROR)
+    logger.warning(
+        "Remote turn abandoned: no reply for %.0fs conversation=%s correlation_id=%s",
+        idle_seconds, conversation_id, corr,
+    )
+    if on_event is not None:
+        on_event("turn_failed", {"error": UNRESPONSIVE_WORKER_ERROR,
+                                 "code": code, "message": message})
+    await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+    await buffer.close("error")
+
+
 async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               user_id: str | None, input_text: str,
                               model: str | None, buffer,
@@ -135,16 +162,36 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     await buffer.append("sse", {"sse": _sse("response.created", created)})
 
     last_id = "0-0"
+    idle_timeout = settings.reply_idle_timeout_seconds
+    last_reply_at = time.monotonic()
     while True:
         resp = await r.xread({reply_stream: last_id}, count=10, block=5000)
         if not resp:
+            # Unbounded, this loop spun forever whenever the worker was down:
+            # only a terminal reply closes the buffer, so FileStreamBuffer.tail
+            # never returned and the SSE response never ended. That used to
+            # self-heal by accident — an intermediary dropped the quiet
+            # connection, the renderer's read completed and the composer came
+            # back — but the keepalive comment now holds it open indefinitely,
+            # leaking the request task and the buffer's file handle for as long
+            # as the tab lives. So bound the wait and fail the turn.
+            if idle_timeout > 0 and time.monotonic() - last_reply_at > idle_timeout:
+                await _fail_unresponsive_worker(
+                    buffer=buffer, on_event=on_event, idle_seconds=idle_timeout,
+                    conversation_id=conversation_id, corr=corr,
+                )
+                return
             continue
         for _stream, entries in resp:
             for entry_id, fields in entries:
                 last_id = entry_id
                 reply = TurnReply.model_validate_json(fields["payload"])
                 if reply.correlation_id != corr:
+                    # Deliberately does NOT refresh the idle clock: liveness
+                    # means "this turn is progressing", and another turn's
+                    # replies say nothing about ours.
                     continue
+                last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}
                 if kind == "turn_failed":
