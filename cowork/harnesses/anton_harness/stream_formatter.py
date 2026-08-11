@@ -129,6 +129,8 @@ async def format_responses_stream(
     is reopened (without keeping localStorage state).
     """
     from anton.core.llm.provider import (
+        StreamAskUser,
+        StreamAskUserAnswered,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -423,6 +425,35 @@ async def format_responses_stream(
                 "type": "response.artifact_created",
                 "sequence_number": seq,
                 "artifact": event.artifact,
+            })
+
+        elif isinstance(event, StreamAskUser):
+            seq += 1
+            request = event.request
+            yield _event("response.ask_user", {
+                "type": "response.ask_user",
+                "sequence_number": seq,
+                "question_id": event.id,
+                "prompt": request.prompt,
+                "select": request.select,
+                "allow_custom": request.allow_custom,
+                "timeout_s": request.timeout_s,
+                "options": [
+                    {"value": o.value, "label": o.label, "detail": o.detail}
+                    for o in request.options
+                ],
+            })
+
+        elif isinstance(event, StreamAskUserAnswered):
+            seq += 1
+            answer = event.answer
+            yield _event("response.ask_user_answered", {
+                "type": "response.ask_user_answered",
+                "sequence_number": seq,
+                "question_id": event.id,
+                "status": answer.status,
+                "values": list(answer.values),
+                "text": answer.text,
             })
 
         elif isinstance(event, TurnHistory):

@@ -15,6 +15,7 @@ import pytest
 
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
+from cowork.streaming.registry import TurnLifecycle
 
 
 class _FakeScope:
@@ -249,5 +250,53 @@ def test_inprocess_backend_selected_by_default(monkeypatch, backend_env):
 
     assert result == "inprocess-sentinel"
     # Verbatim pass-through - none of _produce's existing args are dropped
-    # or reordered by the new selection branch.
+    # or reordered by the new selection branch. `lifecycle` rides along on top:
+    # the selector supplies one when the caller did not, so a directly-called
+    # producer still has a discard flag to read.
+    assert isinstance(called.pop("lifecycle"), TurnLifecycle)
     assert called == kwargs
+
+
+@pytest.mark.asyncio
+async def test_discarded_remote_turn_persists_nothing(monkeypatch):
+    """A turn delete cancels the producer (registry.discard) after truncating
+    history — the remote path must drop the turn instead of writing rows into a
+    conversation that no longer has room for them, and must not close (i.e.
+    recreate) the buffer file the delete just removed."""
+    import asyncio
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    class _ClosableBuffer:
+        def __init__(self):
+            self.closed = None
+
+        async def append(self, *args, **kwargs):
+            pass
+
+        async def close(self, reason, extra=None):
+            self.closed = reason
+
+    started = asyncio.Event()
+
+    async def fake_produce_remote_turn(**kwargs):
+        started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+
+    lifecycle = TurnLifecycle()
+    buffer = _ClosableBuffer()
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer, lifecycle=lifecycle,
+    ))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    lifecycle.discarded = True
+    task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert "assistant" not in saved and "finalized" not in saved
+    assert buffer.closed is None
