@@ -312,6 +312,16 @@ class TurnQueueSettings(Settings):
         default="scratchpad:requests",
         description="Redis stream key turn jobs are queued on when backend is 'remote'.",
     )
+    reply_idle_timeout_seconds: float = Field(
+        default=600.0,
+        description=(
+            "Fail a remote turn after this many seconds with no reply for it on the reply "
+            "stream (worker down, crashed, or wedged). Generous on purpose: the reply "
+            "protocol has no heartbeat, so a long tool run legitimately produces no reply "
+            "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
+            "which means an unresponsive worker leaves the turn spinning forever."
+        ),
+    )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
         default="",
         description="Base URL of the auth service's internal API, used to mint per-turn MindsHub keys.",
@@ -425,6 +435,19 @@ class AppSettings(Settings):
             "multi-tenant cloud deployment behind the auth gateway — requests "
             "carry trusted identity headers (X-User-Id / X-Organization-Id) "
             "from which a per-request principal is built."
+        ),
+    )
+    ask_user_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
+        description=(
+            "Whether the agent may ask interactive multiple-choice questions "
+            "(the `ask_user` tool). Off by default because the renderer must "
+            "ship first: the frontend and this server are versioned "
+            "independently, and a client that does not know the "
+            "`response.ask_user` event drops it silently, leaving the agent "
+            "apparently hung until the question times out. Turn on only after "
+            "the frontend is rolled out."
         ),
     )
     install_channel_override: str = Field(

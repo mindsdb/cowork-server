@@ -7,7 +7,7 @@ import cowork.harnesses.hermes_harness.memory_adapter  # noqa: F401
 from cowork.common.settings.app_settings import AppSettings, MemorySettings
 from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.harnesses.memory.store import SharedMemoryStore
+from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.models.setting import Setting
 
 
@@ -55,7 +55,7 @@ def test_migration_copies_legacy_files(db_session, memory_root, tmp_path, monkey
         },
     )
 
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     assert migrate_harness_memory_to_shared(db_session) is True
 
     assert store.read(MemorySlot.RULES).strip() == "Always use TypeScript"
@@ -69,7 +69,7 @@ def test_migration_copies_legacy_files(db_session, memory_root, tmp_path, monkey
 def test_migration_skips_when_canonical_slot_already_has_content(
     db_session, memory_root, tmp_path, monkeypatch
 ):
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     store.write(MemorySlot.RULES, "existing rules")
 
     anton_dir = tmp_path / "anton" / "memory"
@@ -119,7 +119,7 @@ def test_migration_combines_multiple_sources_for_same_slot(
         },
     )
 
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     assert migrate_harness_memory_to_shared(db_session) is True
 
     assert store.read(MemorySlot.PROFILE).strip() == "Anton profile note\n\nHermes user prefs"

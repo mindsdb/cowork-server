@@ -21,7 +21,7 @@ def _point_store_at(monkeypatch, root: Path) -> None:
     import cowork.common.settings.app_settings as app_settings
 
     skill = type("S", (), {"root_dir": str(root)})()
-    settings = type("Cfg", (), {"skill": skill})()
+    settings = type("Cfg", (), {"skill": skill, "tenancy_mode": "local"})()
     monkeypatch.setattr(app_settings, "get_app_settings", lambda: settings)
 
 SKILL_MD = """---
@@ -121,6 +121,68 @@ def test_stage_skill_draft_does_not_clobber_in_progress_draft(tmp_path: Path, mo
 def test_stage_skill_draft_rejects_empty_name(tmp_path: Path):
     assert "error" in stage_skill_draft(tmp_path, "")
     assert "error" in stage_skill_draft(tmp_path, "   ")
+
+
+def _point_org_store_at(monkeypatch, root: Path) -> None:
+    import cowork.common.settings.app_settings as app_settings
+
+    skill = type("S", (), {"root_dir": str(root)})()
+    settings = type("Cfg", (), {"skill": skill, "tenancy_mode": "org"})()
+    monkeypatch.setattr(app_settings, "get_app_settings", lambda: settings)
+
+
+def test_seed_in_org_mode_without_scope_fails_closed(tmp_path: Path, monkeypatch):
+    """The one path where agent input indexes a shared root: with no tenant
+    scope bound, org mode must seed nothing rather than read the unkeyed root."""
+    store = tmp_path / "store"
+    _write_skill(store / "my-skill")
+    _point_org_store_at(monkeypatch, store)
+
+    result = stage_skill_draft(tmp_path / "drafts", "my-skill")
+    assert result["slug"] == "my-skill"
+    assert not (tmp_path / "drafts" / "my-skill" / "SKILL.md").exists()
+
+
+def test_seed_in_org_mode_reads_the_orgs_own_root(tmp_path: Path, monkeypatch):
+    from cowork.common.settings.user_settings import use_settings_scope
+    from cowork.db.scoped import TenantScope
+
+    org = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    store = tmp_path / "store"
+    _write_skill(store / org / "my-skill")           # org-keyed store entry
+    _write_skill(store / "my-skill", body="UNKEYED — must not be read\n")
+    _point_org_store_at(monkeypatch, store)
+
+    with use_settings_scope(TenantScope(org_mode=True, org_id=org, user_id="u")):
+        stage_skill_draft(tmp_path / "drafts", "my-skill")
+
+    seeded = (tmp_path / "drafts" / "my-skill" / "SKILL.md").read_text(encoding="utf-8")
+    assert "UNKEYED" not in seeded and seeded.startswith("---")
+
+
+def test_seed_does_not_follow_symlinks_out_of_the_store(tmp_path: Path, monkeypatch):
+    """The store is shared across the org; a symlinked skill dir or child must
+    not let a draft seed copy in another org's (or arbitrary) files."""
+    import os
+
+    store = tmp_path / "store"
+    _write_skill(store / "real")
+    (store / "real" / "helper.py").write_text("real\n", encoding="utf-8")
+    secret = tmp_path / "elsewhere" / "SECRET.md"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("ANOTHER ORG SECRET\n", encoding="utf-8")
+    os.symlink(secret, store / "real" / "stolen.md")     # symlinked child
+    _point_store_at(monkeypatch, store)
+
+    drafts = tmp_path / "drafts"
+    stage_skill_draft(drafts, "real")
+    assert (drafts / "real" / "helper.py").exists()      # real file seeded
+    assert not (drafts / "real" / "stolen.md").exists()  # symlink not followed
+
+    # And a symlinked skill DIR seeds nothing at all.
+    os.symlink(tmp_path / "elsewhere", store / "linked")
+    stage_skill_draft(drafts, "linked")
+    assert list((drafts / "linked").iterdir()) == []
 
 
 def test_refined_draft_is_re_emitted_and_persists(tmp_path: Path):

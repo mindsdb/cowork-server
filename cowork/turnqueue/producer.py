@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 
 from cowork.handlers.turn_errors import remote_turn_error, response_failed_sse
@@ -20,6 +21,36 @@ from cowork.turnqueue.redis_client import get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_minds_api_host
 
 logger = logging.getLogger(__name__)
+
+# The pod reads the request as one line and truncates at 10 MiB (anton's
+# MAX_REQUEST_BYTES); a truncated line won't parse. Margin covers the newline +
+# controller-added fields.
+_MAX_REQUEST_BYTES = 10 * 1024 * 1024
+_REQUEST_BYTES_MARGIN = 64 * 1024
+
+
+def _request_wire_size(params: dict) -> int:
+    """Bytes the controller's request line will occupy for these params."""
+    return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
+
+
+def _fit_request(params: dict, conversation_id: str) -> dict:
+    """Shed optional add-ons until the request fits the pod's stdin cap.
+
+    skills then memory: both are re-sent every turn and degrade gracefully
+    (pod falls back to builtins / no memory). History is the floor we can't
+    shed here.
+    """
+    budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
+    for field in ("skills", "memory"):
+        if _request_wire_size(params) <= budget:
+            break
+        if params.pop(field, None) is not None:
+            logger.warning(
+                "[producer] dropped %s from turn %s: request line over %d-byte cap",
+                field, conversation_id, budget,
+            )
+    return params
 
 
 def _new_correlation_id() -> str:
@@ -59,11 +90,39 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     return block
 
 
+# What the reply loop reports when the worker stops answering. Shaped like the
+# pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
+# classify it (today: the generic redacted message and the generic error card).
+UNRESPONSIVE_WORKER_ERROR = "TurnWorkerUnresponsive: the turn worker stopped responding"
+
+
+async def _fail_unresponsive_worker(*, buffer, on_event, idle_seconds: float,
+                                    conversation_id: str, corr: str) -> None:
+    """End a turn whose worker went silent, exactly like a `turn_failed` reply.
+
+    Same `response.failed` frame + `buffer.close("error")` as the reply-driven
+    failure path, and the same `on_event("turn_failed", ...)` so the caller
+    persists the failure — a bare close would render as nothing at all.
+    """
+    code, message = remote_turn_error(UNRESPONSIVE_WORKER_ERROR)
+    logger.warning(
+        "Remote turn abandoned: no reply for %.0fs conversation=%s correlation_id=%s",
+        idle_seconds, conversation_id, corr,
+    )
+    if on_event is not None:
+        on_event("turn_failed", {"error": UNRESPONSIVE_WORKER_ERROR,
+                                 "code": code, "message": message})
+    await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+    await buffer.close("error")
+
+
 async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               user_id: str | None, input_text: str,
                               model: str | None, buffer,
                               history: list | None = None,
                               harness_id: str | None = None,
+                              memory: dict | None = None,
+                              skills: dict | None = None,
                               on_event=None) -> None:
     """`on_event(kind, data)` is called per reply (turn_delta/turn_completed/
     turn_failed) so the caller can collect the turn for persistence."""
@@ -76,6 +135,15 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
 
+    params = {"input": input_text, "workspace_path": "/workspace",
+              "model": model, "history": history or [], "llm": llm_block}
+    # Omitted when empty: a memory-less turn keeps the pre-existing payload shape.
+    if memory:
+        params["memory"] = memory
+    if skills:
+        params["skills"] = skills
+    params = _fit_request(params, conversation_id)
+
     job = TurnJob(
         op="anton_turn",
         conversation_id=conversation_id,
@@ -83,8 +151,7 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         reply_stream=reply_stream,
         organization_id=org_id,
         user_id=user_id,
-        params={"input": input_text, "workspace_path": "/workspace",
-                "model": model, "history": history or [], "llm": llm_block},
+        params=params,
     )
     await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
     # conversation_id + harness mirror _inject_created on the in-process path:
@@ -95,16 +162,36 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     await buffer.append("sse", {"sse": _sse("response.created", created)})
 
     last_id = "0-0"
+    idle_timeout = settings.reply_idle_timeout_seconds
+    last_reply_at = time.monotonic()
     while True:
         resp = await r.xread({reply_stream: last_id}, count=10, block=5000)
         if not resp:
+            # Unbounded, this loop spun forever whenever the worker was down:
+            # only a terminal reply closes the buffer, so FileStreamBuffer.tail
+            # never returned and the SSE response never ended. That used to
+            # self-heal by accident — an intermediary dropped the quiet
+            # connection, the renderer's read completed and the composer came
+            # back — but the keepalive comment now holds it open indefinitely,
+            # leaking the request task and the buffer's file handle for as long
+            # as the tab lives. So bound the wait and fail the turn.
+            if idle_timeout > 0 and time.monotonic() - last_reply_at > idle_timeout:
+                await _fail_unresponsive_worker(
+                    buffer=buffer, on_event=on_event, idle_seconds=idle_timeout,
+                    conversation_id=conversation_id, corr=corr,
+                )
+                return
             continue
         for _stream, entries in resp:
             for entry_id, fields in entries:
                 last_id = entry_id
                 reply = TurnReply.model_validate_json(fields["payload"])
                 if reply.correlation_id != corr:
+                    # Deliberately does NOT refresh the idle clock: liveness
+                    # means "this turn is progressing", and another turn's
+                    # replies say nothing about ours.
                     continue
+                last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}
                 if kind == "turn_failed":
@@ -112,7 +199,9 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                     # events log must carry the same (code, message).
                     code, message = remote_turn_error(data.get("error"))
                     data = {**data, "code": code, "message": message}
-                if on_event is not None and kind in ("turn_delta", "turn_completed", "turn_failed"):
+                if on_event is not None and kind in (
+                    "turn_delta", "turn_memory", "turn_completed", "turn_failed"
+                ):
                     on_event(kind, data)
                 if kind == "turn_delta":
                     await buffer.append("sse", {"sse": _sse(

@@ -16,7 +16,7 @@ from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.streaming import new_buffer, registry
+from cowork.streaming import TurnLifecycle, new_buffer, registry
 from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
     Content,
@@ -46,13 +46,63 @@ from cowork.db.scoped import ScopedSession, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
+from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
-from cowork.services.skills import SkillService
+from cowork.services.skills import SkillService, build_turn_skills
 
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Statuses of the `response.ask_user_answered` event, as the harness emits them
+# (cowork/harnesses/anton_harness/stream_formatter.py). "cancelled" is the one
+# this module synthesizes when a turn is stopped while a question is on screen.
+ASK_USER_EVENT = "response.ask_user"
+ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
+
+
+def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
+    """Retirement events for every question in *events* that nothing retires.
+
+    Why the server has to do this: anton's ``elicit()`` emits
+    ``StreamAskUserAnswered`` from an ``except Exception`` branch, and
+    ``CancelledError`` is a ``BaseException`` — so pressing Stop while a
+    question is open skips the retirement. Emitting it from anton on that path
+    would not help either: once the turn is cancelled ``session.emit`` only
+    puts the event on a queue nobody drains any more. The server, by contrast,
+    knows the turn is over and knows exactly which questions it published.
+
+    Without this, ``_run_turn``'s cancellation path persists a ``response.ask_user``
+    with nothing that retires it, i.e. an internally inconsistent event log:
+    every consumer that replays it has to infer the missing half. Note the
+    shape carries no ``sequence_number`` — there is no live counter left to
+    draw one from, and the client keys purely on ``type`` + ``question_id``
+    (same as the synthesized ``response.failed`` payload next to it).
+    """
+    retired = {
+        e.get("question_id")
+        for e in events
+        if e.get("type") == ASK_USER_ANSWERED_EVENT
+    }
+    synthesized: list[dict] = []
+    for event in events:
+        if event.get("type") != ASK_USER_EVENT:
+            continue
+        question_id = event.get("question_id")
+        if question_id in retired:
+            continue
+        # Guard against a duplicated publish of the same id producing two
+        # retirements for one card.
+        retired.add(question_id)
+        synthesized.append({
+            "type": ASK_USER_ANSWERED_EVENT,
+            "question_id": question_id,
+            "status": "cancelled",
+            "values": [],
+            "text": "",
+        })
+    return synthesized
 
 
 class ResponsesHandler:
@@ -145,7 +195,13 @@ class ResponsesHandler:
             # producer ties the write to the one coroutine that actually runs, so
             # there is at most one pending row per conversation.
             buffer = new_buffer(str(conversation.id), turn_id)
+            # Created here, before the coroutine, and handed to BOTH: it is the
+            # only channel by which a turn delete can tell this producer that
+            # the history it is writing into no longer exists (the handle it
+            # will be registered under does not exist yet).
+            lifecycle = TurnLifecycle()
             producer_coro = self._select_producer(
+                lifecycle=lifecycle,
                 conv_id=conversation.id,
                 harness_input=harness_input,
                 original_content=original_content,
@@ -164,6 +220,7 @@ class ResponsesHandler:
                 org_id=self.scoped.scope.org_id,
                 user_id=self.scoped.scope.user_id,
                 producer_coro=producer_coro,
+                lifecycle=lifecycle,
             )
             return sse_from_buffer(buffer, 0)
 
@@ -194,6 +251,7 @@ class ResponsesHandler:
         buffer,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
+        lifecycle: TurnLifecycle | None = None,
     ):
         """Choose the streaming producer coroutine.
 
@@ -201,9 +259,16 @@ class ResponsesHandler:
         the turn through the Redis-backed remote producer. Otherwise (the
         default, "inprocess"), this runs in-process: the `self._produce(...)`
         call below is unchanged from before this branch existed.
+
+        `lifecycle` is shared with the RunHandle so a turn delete can stop
+        either producer from persisting into truncated history; it defaults to
+        a fresh one so a directly-called producer (tests) still has a flag to
+        read.
         """
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         if TurnQueueSettings().backend == "remote":
             return self._produce_remote(
+                lifecycle=lifecycle,
                 conv_id=conv_id,
                 input_text=self._prompt_text(harness_input),
                 original_content=original_content,
@@ -212,6 +277,7 @@ class ResponsesHandler:
                 buffer=buffer,
             )
         return self._produce(
+            lifecycle=lifecycle,
             conv_id=conv_id,
             harness_input=harness_input,
             original_content=original_content,
@@ -223,6 +289,46 @@ class ResponsesHandler:
             trace_tags=trace_tags,
             trace_metadata=trace_metadata,
         )
+
+    @staticmethod
+    def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
+        """This org's memory slots for the pod. A read error degrades to a turn
+        without memory rather than failing the turn."""
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            return build_turn_memory(session.scope, conversation.project.path)
+        except Exception:
+            logger.exception("[responses] failed to read memory for conversation %s", conv_id)
+            return {}
+
+    @staticmethod
+    def _remote_skills(session: ScopedSession, conv_id: UUID) -> dict:
+        """This org's skills for the pod, filtered to the conversation's project.
+        A read error degrades to a turn without skills rather than failing the
+        turn."""
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            return build_turn_skills(session.scope, conversation.project.path)
+        except Exception:
+            logger.exception("[responses] failed to read skills for conversation %s", conv_id)
+            return {}
+
+    @staticmethod
+    def _persist_turn_memory(session: ScopedSession, conv_id: UUID, entries: list) -> None:
+        """Apply what the pod asked to remember, re-anchoring the conversation
+        first (like persist(): one deleted mid-turn must not write memory).
+
+        Never fails the turn — a lost memory is recoverable, a lost reply isn't.
+        """
+        if not entries:
+            return
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            applied = apply_turn_memory(session.scope, conversation.project.path, entries)
+            logger.info("[responses] applied %d memory entr(ies) for conversation %s",
+                        applied, conv_id)
+        except Exception:
+            logger.exception("[responses] failed to apply memory for conversation %s", conv_id)
 
     @staticmethod
     def _remote_history(session, conv_id) -> list[dict]:
@@ -244,10 +350,12 @@ class ResponsesHandler:
         model: str | None,
         harness_id: str | None,
         buffer,
+        lifecycle: TurnLifecycle | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: run the turn through the
         queue and persist user + assistant together on terminal (deferred, so
         _remote_history reads prior turns without the current input)."""
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
@@ -261,6 +369,8 @@ class ResponsesHandler:
                 text = data.get("text", "")
                 collected_text.append(text)
                 collected_events.append({"type": "response.output_text.delta", "delta": text})
+            elif kind == "turn_memory":
+                self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
             elif kind == "turn_completed":
                 collected_events.append({"type": "response.completed"})
             elif kind == "turn_failed":
@@ -315,10 +425,16 @@ class ResponsesHandler:
                 # and the request session may be closed by the time it runs.
                 history=self._remote_history(producer_session, conv_id),
                 harness_id=harness_id,
+                memory=self._remote_memory(producer_session, conv_id),
+                skills=self._remote_skills(producer_session, conv_id),
                 on_event=on_event,
             )
             persist()
         except asyncio.CancelledError:
+            if lifecycle.discarded:
+                # Same reasoning as _run_turn's discarded branch — see there.
+                logger.info("[responses] discarded remote turn %s — not persisting", conv_id)
+                return
             # Partial text generated before cancellation is persisted.
             persist()
             await buffer.close("cancelled")
@@ -350,6 +466,7 @@ class ResponsesHandler:
         buffer,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
+        lifecycle: TurnLifecycle | None = None,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -360,6 +477,7 @@ class ResponsesHandler:
         pending flag + persists the assistant turn (ENG-1231). Never reaches the
         HTTP response — readers tail the buffer.
         """
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         # Fresh session (outlives the request), scoped from the immutable
         # principal captured at handler construction — never request state.
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
@@ -431,8 +549,23 @@ class ResponsesHandler:
             persist()
             await buffer.close("completed")
         except asyncio.CancelledError:
+            if lifecycle.discarded:
+                # This cancellation came from a turn delete (registry.discard),
+                # not from Stop: the messages this turn belongs to are already
+                # gone. Persisting would write rows into truncated history, and
+                # closing the buffer would recreate the file that
+                # discard_conversation just removed — which the next turn would
+                # then tail, since turn_id == message count is reused after a
+                # truncation. So drop the turn entirely.
+                logger.info("[responses] discarded turn %s — not persisting", conv_id)
+                return
             # Nothing special is emitted on cancellation.
-            # The partial text and evennts generated before cancellation are persisted.
+            # The partial text and events generated before cancellation are persisted.
+            # A question that was on screen when Stop was pressed never got its
+            # `response.ask_user_answered` (see cancelled_ask_user_retirements),
+            # so retire it here — otherwise the persisted log holds a published
+            # question that nothing in it ever closes.
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             persist()
             await buffer.close("cancelled")
             return
@@ -710,15 +843,85 @@ class ResponsesHandler:
         )
 
 
+# A card waiting on a human produces no events, so the stream can be quiet for
+# the whole question timeout. Cloudflare (proxied, in the path for every cloud
+# instance) drops quiet connections; its documented threshold covers
+# time-to-first-byte rather than mid-stream idle, so the exact mid-stream bound
+# is unpublished. 20 s is chosen to be below any plausible one — Cloudflare's
+# own published timeouts start at 100 s and no proxy in common use idles out
+# under 30 s — and sits inside the design's 15-30 s window. If a stream is ever
+# observed dropping mid-question in the cloud, the thing to measure is the
+# elapsed time between the last byte written and the disconnect, at the edge;
+# do not tune this value from a local test, where no proxy is in the path.
+SSE_KEEPALIVE_SECONDS = 20.0
+
+
 async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None]:
     """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
     just ends the stream — the harness's own response.completed/failed frame
-    was already written as a normal record."""
-    async for rec in buffer.tail(from_seq):
-        if rec.is_terminal:
-            return
-        sse = rec.data.get("sse")
-        if sse:
-            yield sse
+    was already written as a normal record.
+
+    Emits a comment heartbeat whenever the buffer has been quiet for
+    ``SSE_KEEPALIVE_SECONDS``, so an intermediary cannot mistake a pending
+    ask_user card for a dead connection.
+
+    Prefetch semantics: unlike a plain ``async for``, this loop keeps one
+    ``__anext__()`` in flight while the current record is being yielded, so it
+    runs one record ahead of the wire. That is safe only because
+    ``buffer.tail(from_seq)`` is replayable — if the consumer goes away and a
+    prefetched record is discarded unrendered, the client reconnects via
+    ``GET /responses/tail`` from its last rendered seq and the record is
+    replayed. Do not introduce a non-replayable source under this loop.
+    """
+    records = buffer.tail(from_seq).__aiter__()
+    pending = asyncio.ensure_future(records.__anext__())
+    try:
+        while True:
+            try:
+                rec = await asyncio.wait_for(
+                    asyncio.shield(pending), timeout=SSE_KEEPALIVE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            except StopAsyncIteration:
+                return
+            # Checked BEFORE prefetching: the terminal record ends the stream,
+            # so scheduling another __anext__() here would only be cancelled.
+            if rec.is_terminal:
+                return
+            pending = asyncio.ensure_future(records.__anext__())
+            sse = rec.data.get("sse")
+            if sse:
+                yield sse
+    finally:
+        # Let the cancellation actually land before closing. Task.cancel() is
+        # asynchronous, so closing immediately after it hits the underlying async
+        # generator while ag_running_async is still set, and aclose() raises
+        # "RuntimeError: aclose(): asynchronous generator is already running" —
+        # which then REPLACES the CancelledError on the real disconnect path
+        # (StreamingResponse cancels this task), leaving the iterator open.
+        pending.cancel()
+        # Narrower than suppress(BaseException) and exactly as wide as needed:
+        # asyncio.wait() returns (done, pending) *sets* and never re-raises the
+        # awaited task's exception, so nothing the prefetch did can surface
+        # here. The only reachable exception is a cancellation of the enclosing
+        # task arriving during this await — swallowing that is deliberate, so
+        # that aclose() below still runs.
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            await asyncio.wait([pending])
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        aclose = getattr(records, "aclose", None)
+        if aclose is not None:
+            await aclose()
+        # ...but do not LOSE it. Task.__step has already cleared must_cancel by
+        # the time we catch it, so on the normal-exhaustion path the generator
+        # would return cleanly, the consumer's `async for` would end normally,
+        # and the cancellation would vanish. Re-raise now that the iterator is
+        # closed.
+        if cancelled is not None:
+            raise cancelled

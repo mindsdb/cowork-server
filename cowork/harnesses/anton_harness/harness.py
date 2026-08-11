@@ -7,6 +7,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
@@ -18,6 +19,27 @@ from cowork.services.connectors.connections import service
 
 logger = get_logger(__name__)
 settings = AntonHarnessSettings()
+
+
+def build_elicitor(conversation_id: str):
+    """The question strategy for this conversation, or None when disabled.
+
+    Returning None is the kill switch: anton only registers `ask_user` when
+    an elicitor supports "choice", so the model reverts to asking in plain
+    text with no silent-failure window. This holds only as long as the
+    ChatSessionConfig built from this value is not also given a `console`:
+    with elicitor=None and a console present, anton constructs its own
+    CLIElicitor (which does support "choice"), silently reopening the
+    switch. See tests/test_ask_user_flag.py for the guard.
+    """
+    if not get_app_settings().ask_user_enabled:
+        return None
+    from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
+    from cowork.streaming.answers import broker
+
+    # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
+    # place the number lives, so this call site does not restate it.
+    return CoworkElicitor(conversation_id, broker)
 
 
 _REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"
@@ -595,11 +617,11 @@ class AntonHarness:
 
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import current_settings_scope
-        from cowork.db.scoped import scoped_storage_root
+        from cowork.db.scoped import scoped_user_storage_root
 
-        # Org-keyed via the turn's ambient scope — the in-process harness must
-        # read/write the same per-org memory the /memory API serves.
-        global_memory_dir = scoped_storage_root(
+        # Per-(org, user) via the turn's ambient scope — the in-process harness
+        # must read/write the same global-scope memory the /memory API serves.
+        global_memory_dir = scoped_user_storage_root(
             Path(get_app_settings().memory.root_dir).expanduser(), current_settings_scope()
         )
         global_memory_dir.mkdir(parents=True, exist_ok=True)
@@ -832,6 +854,7 @@ class AntonHarness:
             initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),
+            elicitor=build_elicitor(str(conversation.id)),
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
