@@ -10,7 +10,7 @@ from cowork.common.settings.app_settings import AppSettings, MemorySettings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_session
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.harnesses.memory.store import ProjectMemoryStore, SharedMemoryStore
+from cowork.harnesses.memory.store import ProjectMemoryStore, GlobalMemoryStore
 from cowork.models.project import Project
 from cowork.schemas.memory import MemoryScope
 from cowork.services.memory import MemoryService
@@ -72,7 +72,7 @@ def client(engine, memory_settings):
 
 @pytest.mark.asyncio
 async def test_list_memory_returns_all_global_slots(session, memory_root, memory_settings):
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     store.write(MemorySlot.PROFILE, "user prefs")
 
     items = await MemoryService(session).list_memory()
@@ -92,13 +92,13 @@ async def test_update_global_memory(session, memory_root, memory_settings):
         content="Always use TypeScript",
     )
 
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     assert store.read(MemorySlot.RULES).strip() == "Always use TypeScript"
 
 
 @pytest.mark.asyncio
 async def test_delete_global_memory(session, memory_root, memory_settings):
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     store.write(MemorySlot.LESSONS, "lesson one")
 
     await MemoryService(session).delete_memory(
@@ -136,7 +136,7 @@ async def test_profile_rejected_for_project_scope(session, project, memory_setti
 
 
 def test_get_list_endpoint(client, memory_root, memory_settings):
-    SharedMemoryStore(root=memory_root).write(MemorySlot.RULES, "global rule")
+    GlobalMemoryStore(root=memory_root).write(MemorySlot.RULES, "global rule")
 
     response = client.get("/memory/")
     assert response.status_code == 200
@@ -160,12 +160,12 @@ def test_put_endpoint(client, memory_root, memory_settings):
     assert response.status_code == 200
     assert response.json()["category"] == "lessons"
 
-    store = SharedMemoryStore(root=memory_root)
+    store = GlobalMemoryStore(root=memory_root)
     assert store.read(MemorySlot.LESSONS).strip() == "shared lesson"
 
 
 def test_delete_endpoint(client, memory_root, memory_settings):
-    SharedMemoryStore(root=memory_root).write(MemorySlot.PROFILE, "profile data")
+    GlobalMemoryStore(root=memory_root).write(MemorySlot.PROFILE, "profile data")
 
     response = client.request(
         "DELETE",
@@ -174,7 +174,7 @@ def test_delete_endpoint(client, memory_root, memory_settings):
     )
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert SharedMemoryStore(root=memory_root).read(MemorySlot.PROFILE) == ""
+    assert GlobalMemoryStore(root=memory_root).read(MemorySlot.PROFILE) == ""
 
 
 def test_put_project_profile_returns_400(client, session, project, memory_settings):
