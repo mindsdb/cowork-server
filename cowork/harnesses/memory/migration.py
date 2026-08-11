@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 
 from cowork.common.paths import cowork_home
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.harnesses.memory.store import SharedMemoryStore
+from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.models.setting import Setting
 
 
@@ -51,7 +51,7 @@ def migrate_harness_memory_to_shared(session: Session) -> bool:
     ).first() is not None:
         return False
 
-    store = SharedMemoryStore()
+    store = GlobalMemoryStore()
     store._root.mkdir(parents=True, exist_ok=True)
 
     pre_existing = {slot: store.read(slot).strip() for slot in MemorySlot}
