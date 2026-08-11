@@ -17,6 +17,20 @@ from cowork.models.project import Project
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 
 
+def _distribute_skill_links() -> None:
+    """Boot-time symlink fan-out of the skill store into project dirs.
+
+    Desktop-only: in org mode this reads the unkeyed root and scans every
+    project dir. Cloud turns get skills via the payload (build_turn_skills).
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return
+    from cowork.services.skill_links import reconcile_all
+    from cowork.services.skills import SkillService
+
+    reconcile_all(SkillService().list_skills())
+
+
 def run_dev_setup() -> None:
     """Create local schema, seed required base rows, and run migrations."""
     settings = get_app_settings()
@@ -70,16 +84,14 @@ def run_dev_setup() -> None:
 
     ensure_all_layouts()
 
-    # Migrate DB-backed skills to agentskills.io files (one-time, idempotent).
-    from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
+    # Skill migration + builtin seeding write the unkeyed root via an unscoped
+    # SkillService. Desktop-only: org stores are per-org and API-populated, and
+    # cloud builtins ship in the pod image.
+    if get_app_settings().tenancy_mode != "org":
+        from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
 
-    with SQLSession(engine) as session:
-        migrate_skills_to_files(session)
-        # Seed packaged builtin skills (versioned, idempotent).
-        seed_builtin_skills(session)
-        # Project per-project skills/ links with the canonical store.
-        from cowork.services.skill_links import reconcile_all
-        from cowork.services.skills import SkillService
-
-        reconcile_all(SkillService().list_skills())
+        with SQLSession(engine) as session:
+            migrate_skills_to_files(session)
+            seed_builtin_skills(session)
+            _distribute_skill_links()
 
