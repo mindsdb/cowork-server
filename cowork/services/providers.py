@@ -640,8 +640,15 @@ def build_llm_client():
         if role == Provider.MINDS_CLOUD:
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
+            # Flavor tells anton whether this endpoint can execute web_search /
+            # web_fetch server-side (ENG-1359) — without it every OpenAIProvider
+            # defaults to the generic flavor, which can't natively search, and
+            # anton registers a fallback tool with no credential behind it.
             return OpenAIProvider(
-                api_key=key.get_secret_value(), base_url=base, **effort_kw
+                api_key=key.get_secret_value(),
+                base_url=base,
+                flavor=OpenAIProvider.resolve_web_flavor(role.value, base),
+                **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             if key is None:
@@ -655,7 +662,10 @@ def build_llm_client():
             if role == Provider.OPENAI_COMPATIBLE and not base:
                 raise ValueError("OpenAI-compatible base URL is not configured")
             return OpenAIProvider(
-                api_key=key.get_secret_value(), base_url=base, **effort_kw
+                api_key=key.get_secret_value(),
+                base_url=base,
+                flavor=OpenAIProvider.resolve_web_flavor(role.value, base),
+                **effort_kw,
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -666,7 +676,12 @@ def build_llm_client():
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
         if cls is OpenAIProvider:
-            return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
+            return cls(
+                api_key=key.get_secret_value(),
+                base_url=base,
+                flavor=OpenAIProvider.resolve_web_flavor(role.value, base),
+                **effort_kw,
+            )
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
     # Routing & summarization role: the cheap front-model that runs history
