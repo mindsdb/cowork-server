@@ -130,7 +130,7 @@ jobs:
       url: ${{ vars.MDB_ENV_URL }}
     steps:
       - uses: actions/checkout@v5
-      - uses: mindsdb/gihub-actions/setup-env@main
+      - uses: mindsdb/github-actions/setup-env@main
       - name: Notify of deployment starting
         id: slack
         uses: mindsdb/github-actions/slack-deploy-msg@main
