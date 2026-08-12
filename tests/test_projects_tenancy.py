@@ -408,3 +408,21 @@ def test_a_leftover_directory_is_not_adopted(db):
 
     assert Path(second.path) != first_path  # a fresh directory
     assert not (Path(second.path) / "stale.md").exists()
+
+
+def test_ensure_dir_never_creates_a_path_outside_the_sanitizer(db, tmp_path):
+    """A tampered stored path must not reach mkdir: ensure_dir_exists rebuilds the
+    target from the sanitized name and only creates it when it matches the row."""
+    a = _svc(db, _scope(ORG_A))
+    p = a.create_project("reports")
+    shutil.rmtree(p.path)
+    # Simulate a poisoned row pointing outside the org root.
+    raw = _raw(db)
+    row = raw.exec(select(Project).where(Project.name == "reports")).one()
+    escape = tmp_path / "escape-target"
+    row.path = str(escape)
+    raw.add(row); raw.commit()
+
+    a.ensure_dir_exists(a.get_project_by_name("reports"))
+
+    assert not escape.exists()  # the tampered path was never created

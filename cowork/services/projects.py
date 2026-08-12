@@ -184,13 +184,21 @@ class ProjectService:
         reason to 404 an org out of its own project. Scoped root only, so a
         stale path from another deployment is left alone.
         """
-        path = Path(project.path)
-        if path.is_dir():
+        if Path(project.path).is_dir():
             return
-        if not self._in_scoped_root(path):
+        # Rebuild the target from the (sanitized, containment-checked) name rather
+        # than mkdir-ing the stored string, so the value reaching the filesystem
+        # is always one _project_path produced — never a raw DB/HTTP value. Only
+        # create it when it matches what the row already claims, so a stale or
+        # foreign path is left alone rather than silently re-homed here.
+        try:
+            safe = self._project_path(project.name)
+        except ValueError:
             return
-        path.mkdir(parents=True, exist_ok=True)
-        logger.info("provisioned missing project directory: %s", path)
+        if safe.resolve() != Path(project.path).resolve():
+            return
+        safe.mkdir(parents=True, exist_ok=True)
+        logger.info("provisioned missing project directory: %s", safe)
 
     def _root_dir(self) -> Path:
         """Projects root, org-keyed in org mode (same helper as skills/memory).
