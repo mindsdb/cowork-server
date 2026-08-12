@@ -32,6 +32,7 @@ from cowork.schemas.settings import (
 from cowork.services.providers import (
     check_config_status,
     fetch_minds_models,
+    fetch_org_model_catalog,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -262,7 +263,7 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
 
 
 @router.get("/recommended-models")
-async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool = False):
+async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
@@ -326,10 +327,23 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
     minds_ids: set[str] = set()
 
     s = SettingService(session, scope).load()
-    if s.minds_api_key is not None and s.minds_url:
+    listing = None
+    if scope.org_mode:
+        # Org catalog: operator endpoint + the caller's own bearer, per org.
+        # Never the stored key or s.minds_url (both tenant-settable), or a
+        # member's JWT could be forwarded to an admin-chosen host.
+        bearer = request.headers.get("Authorization", "")
+        token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+        if token and scope.org_id:
+            listing = await fetch_org_model_catalog(
+                org_id=scope.org_id, bearer_token=token, refresh=refresh
+            )
+    elif s.minds_api_key is not None and s.minds_url:
+        # Desktop / BYOK: the user's stored key against its configured URL.
         listing = await fetch_minds_models(
             s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
+    if listing is not None:
         live = listing.ids
         live_efforts = listing.efforts
         live_enabled = listing.enabled
@@ -400,7 +414,8 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
         oc_listing = await fetch_minds_models(
-            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
+            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh,
+            tenant_key=scope.org_id if scope.org_mode else None,
         )
         live = oc_listing.ids
         live_efforts = oc_listing.efforts

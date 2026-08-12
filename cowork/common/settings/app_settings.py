@@ -59,6 +59,21 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 # while openai-compatible is the explicitly selected provider; on a *switch* to
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
+# The one model MindsHub's free monthly allowance covers; every other alias
+# bills the wallet. Org mode (managed, free-first) defaults to it so a tenant
+# with no wallet balance isn't 402'd on its first turn. Desktop keeps the
+# premium canonical defaults below.
+MINDS_FREE_MODEL = "mindshub_air"
+
+
+def role_defaults(base: dict[str, str]) -> dict[str, str]:
+    """Model defaults for the current deployment: org mode overrides the
+    minds-cloud default to the free-bucket model (no wallet balance yet);
+    desktop keeps the premium canonical maps below."""
+    if get_app_settings().tenancy_mode == "org":
+        return {**base, "minds_cloud": MINDS_FREE_MODEL}
+    return base
+
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
