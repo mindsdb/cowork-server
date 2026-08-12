@@ -4,14 +4,14 @@ import logging
 import re
 import shutil
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlmodel import select
 
 from cowork.common.paths import safe_join
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
+from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
 from cowork.models.project import Project
 
 logger = logging.getLogger(__name__)
@@ -36,30 +36,108 @@ class ProjectService:
         self.session = session
 
     def ensure_general_for_scope(self) -> Project | None:
-        """Bootstrap compat: claim the seeded GENERAL project for this org.
+        """The caller's default project, provisioned on demand.
 
-        The init migration seeds GENERAL with org_id NULL; an org deployment
-        must adopt it before scoped queries can see it. Narrow by design:
-        only this fixed row, only in org mode, only while org_id is NULL —
-        the claim is a conditional UPDATE so concurrent first requests can't
-        race, and created_by stays NULL (system-created). If another org
-        already claimed it (e.g. a cloned database), returns None → 404;
-        re-provision explicitly rather than silently reassigning.
+        Desktop keeps the seeded GENERAL row. Org mode gives each org its own row
+        and directory: one seeded id can't serve N tenants (the first org claimed
+        it, the rest got None → 404). Idempotent — called on every request.
         """
         scope = self.session.scope
         if not scope.org_mode or scope.org_id is None:
-            return self.session.get(Project, GENERAL_PROJECT_ID)
+            project = self.session.get(Project, GENERAL_PROJECT_ID)
+            if project is not None:
+                self._ensure_dir_exists(project)
+            return project
+
+        existing = self.get_project_by_name_or_none(GENERAL_PROJECT)
+        if existing is not None:
+            self._repoint_if_stale(existing)
+            self._ensure_dir_exists(existing)
+            return existing
+
+        path = self._project_path(GENERAL_PROJECT)
+        path.mkdir(parents=True, exist_ok=True)
+        self._insert_general_if_absent(path)
+        return self.get_project_by_name_or_none(GENERAL_PROJECT)
+
+    def _insert_general_if_absent(self, path: Path) -> None:
+        """Insert this org's default project unless it already has one.
+
+        Separate method so the no-duplicate property is testable — the caller's
+        pre-check would short-circuit before the insert.
+        """
+        scope = self.session.scope
+        # One atomic statement: `projects` has no unique constraint, so the two
+        # replicas would otherwise both insert on first load. Core insert, not
+        # session.add, so the flush hook can't stamp created_by — this project is
+        # the org's, not the first member's. Timestamps: column server_default.
         raw = unsafe_unscoped_session(self.session)  # bootstrap op, not query path
         raw.execute(
-            sa.update(Project)
-            .where(Project.id == GENERAL_PROJECT_ID, Project.org_id.is_(None))  # type: ignore[arg-type]
-            .values(org_id=scope.org_id)
+            sa.insert(Project)
+            .from_select(
+                ["id", "name", "path", "is_active", "org_id"],
+                sa.select(
+                    sa.literal(str(uuid4())),
+                    sa.literal(GENERAL_PROJECT),
+                    sa.literal(str(path)),
+                    sa.literal(False),
+                    sa.literal(scope.org_id),
+                ).where(
+                    ~sa.exists().where(
+                        Project.name == GENERAL_PROJECT,  # type: ignore[arg-type]
+                        Project.org_id == scope.org_id,  # type: ignore[arg-type]
+                    )
+                ),
+            )
         )
         raw.commit()
-        return self.session.get(Project, GENERAL_PROJECT_ID)
+
+    def _repoint_if_stale(self, project: Project) -> None:
+        """Move a row off a pre-org-keyed path, but only when nothing is there.
+
+        Such rows point at `<root>/<name>`, which _ensure_dir_exists won't
+        recreate, so they resolve to a missing directory forever. A path that
+        still has content stays put — swapping in an empty dir strands work.
+        """
+        current = Path(project.path)
+        try:
+            root = self._root_dir().resolve()
+            if current.resolve().parent == root or current.is_dir():
+                return
+        except OSError:
+            return
+        project.path = str(self._project_path(project.name))
+        self.session.add(project)
+        self.session.commit()
+        logger.info("re-pointed %r off a pre-org-keyed path: %s", project.name, current)
+
+    def _ensure_dir_exists(self, project: Project) -> None:
+        """Recreate a missing directory for a project the caller owns.
+
+        The row is authoritative; a missing dir is unprovisioned state, not a
+        reason to 404 an org out of its own project. Scoped root only, so a
+        stale path from another deployment is left alone.
+        """
+        path = Path(project.path)
+        if path.is_dir():
+            return
+        try:
+            root = self._root_dir().resolve()
+            if path.resolve().parent != root:
+                return
+        except OSError:
+            return
+        path.mkdir(parents=True, exist_ok=True)
+        logger.info("provisioned missing project directory: %s", path)
 
     def _root_dir(self) -> Path:
-        return Path(get_app_settings().project.root_dir)
+        """Projects root, org-keyed in org mode (same helper as skills/memory).
+
+        Without the org segment all tenants shared one directory: two orgs using
+        the same project name collided, and the second create hit an existing
+        dir — a cross-org existence oracle.
+        """
+        return scoped_storage_root(Path(get_app_settings().project.root_dir), self.session.scope)
 
     def _project_path(self, name: str) -> Path:
         # Containment guard: a project dir is always a direct child of the
@@ -137,7 +215,8 @@ class ProjectService:
         sanitized = self._sanitize_name(name)
         final_name = self._unique_name(sanitized)
         path = self._project_path(final_name)
-        path.mkdir(parents=True)
+        # exist_ok: the root is org-keyed, so a leftover dir is this org's own.
+        path.mkdir(parents=True, exist_ok=True)
         # self._scaffold(path)
         project = Project(name=final_name, path=str(path), is_active=False)
         self.session.add(project)
