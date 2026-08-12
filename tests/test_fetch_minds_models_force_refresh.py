@@ -112,8 +112,9 @@ def test_expired_failure_is_retried(monkeypatch):
 
     asyncio.run(fetch_minds_models(_URL, "mdb_test"))
     # Age the cached failure past its TTL.
-    ts, val = providers._minds_models_cache[providers.minds_chat_base_url(_URL)]
-    providers._minds_models_cache[providers.minds_chat_base_url(_URL)] = (
+    key = (providers.minds_chat_base_url(_URL), None)
+    ts, val = providers._minds_models_cache[key]
+    providers._minds_models_cache[key] = (
         ts - providers._MINDS_MODELS_FAIL_TTL - 1,
         val,
     )

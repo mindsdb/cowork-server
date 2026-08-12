@@ -127,6 +127,15 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     corr = _new_correlation_id()
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
+    # No client-picked model → the deployment's resolved default (org mode: the
+    # free-bucket model). Resolved here so the model reaching the pod is always
+    # a valid minds alias, independent of any harness's built-in default.
+    if not model:
+        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.db.scoped import TenantScope
+        scope = TenantScope(org_mode=bool(org_id), org_id=org_id, user_id=user_id)
+        model = get_user_settings(scope).resolved_planning_model
+
     llm_block = await _mint_llm_block(
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
