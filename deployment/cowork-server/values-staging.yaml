@@ -29,6 +29,15 @@ deployment:
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
 
+    # Turn execution — MUST be per env; base values.yaml points at dev. Unset,
+    # staging enqueued to dev's Redis (dev's controller ran staging turns) and
+    # called a dead per-PR inference host → "model endpoint returned 404".
+    - name: COWORK_TURN_REDIS_URL
+      value: "redis://redis-master.staging.svc.cluster.local:6379/0"
+
+    - name: COWORK_TURN_MINDS_BASE_URL
+      value: "https://api.staging.mindshub.ai/v1"
+
     # Agent tool budgets — deployment-level DEFAULTS for users who never set
     # the per-user setting (hosted has no Settings UI; inference cost lands on
     # the operator). Uncommented values below equal the code defaults, so

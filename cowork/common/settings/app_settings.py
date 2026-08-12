@@ -145,6 +145,25 @@ def default_minds_url() -> str:
     return f"{default_minds_api_host()}/v1"
 
 
+def default_turn_minds_api_host() -> str:
+    """MindsHub API host for the POD's turn — this deployment's OWN inference.
+
+    Per-PR envs are the one case ``default_minds_api_host`` gets wrong: they all
+    run ENV=development, so it yields dev's host, but each has its own inference
+    AND its own auth database — a key minted here is unknown to dev's auth (401).
+    Their namespace carries the slug, so derive from that (downward API, not a
+    Host header: a crafted Host would send the pod, and the minted key, to an
+    attacker's endpoint).
+
+    Everything else — dev, staging, prod, desktop — keeps the ENV-slug host,
+    which is already correct (notably prod, which has no slug at all).
+    """
+    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
+    if ns.startswith("pr-"):
+        return f"https://api-{ns}.dev.mindshub.ai"
+    return default_minds_api_host()
+
+
 def default_publish_url() -> str:
     """Environment-aware MindsHub publish/view URL."""
     slug = _env_slug()
