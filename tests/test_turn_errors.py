@@ -843,3 +843,28 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         "image_format",
         "anton_error",
     }
+
+
+def test_no_return_emits_a_literal_code():
+    """Every ``(code, message)`` return must take its code from a constant.
+
+    The inventory test above only sees ``*_CODE`` module constants — a code
+    returned as a bare string literal (how ``image_format`` originally
+    shipped, fixed in ENG-1282) would bypass it entirely. Parsing the module
+    keeps that authoring path closed: together the two tests cover both ways
+    a new code can reach the wire.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(te))
+    offenders = [
+        node.value.elts[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Tuple)
+        and node.value.elts
+        and isinstance(node.value.elts[0], ast.Constant)
+        and isinstance(node.value.elts[0].value, str)
+    ]
+    assert offenders == []
