@@ -47,7 +47,7 @@ from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.memory import apply_turn_memory, build_turn_memory
-from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
+from cowork.services.projects import ProjectService
 from cowork.services.skills import SkillService, build_turn_skills
 
 
@@ -800,10 +800,9 @@ class ResponsesHandler:
                 return service.get_project_by_name(request.project).id
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=f"Project not found: {request.project}") from exc
-        # Bootstrap site: a turn can be the org's first request — adopt the
-        # seeded GENERAL project before defaulting to it.
-        service.ensure_general_for_scope()
-        return GENERAL_PROJECT_ID
+        # Bootstrap site: a turn can be the org's first request, and each org has
+        # its OWN default row — the fixed constant resolves to None in org mode.
+        return service.default_project_id()
 
     @staticmethod
     def _image_block(filepath: Path, media_type: str) -> dict:
