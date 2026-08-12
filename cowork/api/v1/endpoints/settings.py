@@ -32,6 +32,7 @@ from cowork.schemas.settings import (
 from cowork.services.providers import (
     check_config_status,
     fetch_minds_models,
+    fetch_org_model_catalog,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -41,7 +42,6 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
-    default_minds_url,
 )
 from cowork.common.settings.user_settings import (
     Provider,
@@ -327,21 +327,23 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     minds_ids: set[str] = set()
 
     s = SettingService(session, scope).load()
-    minds_url = s.minds_url
-    minds_key = s.minds_api_key.get_secret_value() if s.minds_api_key is not None else None
-    # Org mode has no stored minds key, so forward the caller's own bearer (the
-    # /v1/models catalog is org-scoped) instead of minting one.
-    if minds_key is None and scope.org_mode:
+    listing = None
+    if scope.org_mode:
+        # Org catalog: operator endpoint + the caller's own bearer, per org.
+        # Never the stored key or s.minds_url (both tenant-settable), or a
+        # member's JWT could be forwarded to an admin-chosen host.
         bearer = request.headers.get("Authorization", "")
         token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
-        if token:
-            minds_key = token
-            minds_url = minds_url or default_minds_url()
-    if minds_key is not None and minds_url:
+        if token and scope.org_id:
+            listing = await fetch_org_model_catalog(
+                org_id=scope.org_id, bearer_token=token, refresh=refresh
+            )
+    elif s.minds_api_key is not None and s.minds_url:
+        # Desktop / BYOK: the user's stored key against its configured URL.
         listing = await fetch_minds_models(
-            minds_url, minds_key, force_refresh=refresh,
-            tenant_key=scope.org_id if scope.org_mode else None,
+            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
         )
+    if listing is not None:
         live = listing.ids
         live_efforts = listing.efforts
         live_enabled = listing.enabled
