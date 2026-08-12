@@ -188,7 +188,7 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
 
 
 async def fetch_minds_models(
-    minds_url: str, api_key: str, *, force_refresh: bool = False
+    minds_url: str, api_key: str, *, force_refresh: bool = False, tenant_key: str | None = None
 ) -> MindsModelListing:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
@@ -221,9 +221,12 @@ async def fetch_minds_models(
     if not minds_url or not api_key:
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
+    # Scope by tenant: `enabled` is org-specific, so a URL-only key would leak
+    # one org's locked-model map to another.
+    cache_key = f"{base}\x00{tenant_key}" if tenant_key else base
 
     now = time.monotonic()
-    cached = _minds_models_cache.get(base)
+    cached = _minds_models_cache.get(cache_key)
     if cached:
         ts, val = cached
         ttl = _MINDS_MODELS_TTL if val.ids else _MINDS_MODELS_FAIL_TTL
@@ -233,7 +236,7 @@ async def fetch_minds_models(
             return val
 
     def _remember(val: MindsModelListing) -> MindsModelListing:
-        _minds_models_cache[base] = (time.monotonic(), val)
+        _minds_models_cache[cache_key] = (time.monotonic(), val)
         return val
 
     try:

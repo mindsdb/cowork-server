@@ -77,14 +77,10 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     )
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
-    # The pod always runs on minds-cloud, so its coding calls (the completion
-    # verifier + nested scratchpad calls) must name a MINDS model alias. Do NOT
-    # use the tenant's resolved_coding_model: a hosted user with no configured
-    # provider resolves to the Anthropic default (claude-haiku-4-5-...), which
-    # minds inference 404s. Use the minds-cloud coding default, overridable
-    # per-env when a PR/env serves a different alias.
-    from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
-    coding_model = settings.minds_coding_model or CODING_MODEL_DEFAULTS.get("minds_cloud", "")
+    # Must be a MINDS alias (the pod runs on minds-cloud). Default to the
+    # free-bucket model: a fresh org has no wallet balance, so premium 402s.
+    from cowork.common.settings.app_settings import MINDS_FREE_MODEL
+    coding_model = settings.minds_coding_model or MINDS_FREE_MODEL
     if coding_model:
         block["coding_model"] = coding_model
     return block
