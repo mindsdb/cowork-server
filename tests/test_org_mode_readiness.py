@@ -29,14 +29,13 @@ _KEY_ENV = (
 
 
 def _mode(monkeypatch, mode: str) -> None:
-    """Override only tenancy_mode. A stub object won't do — several field
-    factories in UserSettings read other app settings (channels_harness, the
-    tool budgets), so the real settings must stay intact."""
+    """Set tenancy_mode via the real settings (env + cache clear), so every
+    module's get_app_settings() agrees — user_settings, app_settings.role_defaults,
+    and providers all read the same source."""
     for name in _KEY_ENV:
         monkeypatch.delenv(name, raising=False)
-    real = us.get_app_settings()
-    patched = real.model_copy(update={"tenancy_mode": mode})
-    monkeypatch.setattr(us, "get_app_settings", lambda: patched)
+    monkeypatch.setenv("COWORK_TENANCY_MODE", mode)
+    us.get_app_settings.cache_clear()
 
 
 def _settings(**kw) -> UserSettings:
@@ -47,11 +46,15 @@ def _settings(**kw) -> UserSettings:
 @pytest.fixture
 def org_mode(monkeypatch):
     _mode(monkeypatch, "org")
+    yield
+    us.get_app_settings.cache_clear()
 
 
 @pytest.fixture
 def local_mode(monkeypatch):
     _mode(monkeypatch, "local")
+    yield
+    us.get_app_settings.cache_clear()
 
 
 class TestOrgModeDefaults:
