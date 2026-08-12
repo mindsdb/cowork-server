@@ -154,6 +154,8 @@ deployment:
       value: "remote"
     # Same Redis the controller consumes. If cowork and Redis are in different
     # namespaces, use the FQDN (redis-master.<namespace>.svc.cluster.local).
+    # Per-env: each values-<env>.yaml MUST override this — a dev host left here
+    # sent staging's turns to dev's Redis and pods.
     - name: COWORK_TURN_REDIS_URL
       value: "redis://redis-master.dev.svc.cluster.local:6379/0"
     
@@ -169,8 +171,8 @@ deployment:
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
 
-    # Explicit inference base URL for this env (per-PR host the env-slug logic
-    # can't derive). The pod's turn calls this; the minted key is valid here.
+    # Inference base URL the pod's turn calls. Per-env: each values-<env>.yaml
+    # MUST override it — this default is a per-PR host that 404s once torn down.
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"
 

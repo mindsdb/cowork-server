@@ -2,11 +2,12 @@
 
 Two orgs against one database: everything org A creates must be invisible
 and untouchable for org B — and indistinguishable from nonexistent (404-shaped
-None/ValueError, never a "forbidden"). Also covers the GENERAL project
-bootstrap contract: fixed row only, atomic claim, no created_by attribution.
+None/ValueError, never a "forbidden"). Also covers the default-project
+contract: one per org, no duplicates, no created_by attribution.
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -83,10 +84,9 @@ def test_project_names_are_per_org(db):
     a = _svc(db, _scope(ORG_A))
     b = _svc(db, _scope(ORG_B))
     assert a.create_project("reports").name == "reports"
-    # Name uniqueness is org-scoped: org B is blind to A's "reports", so no
-    # -2 suffix. (Directory separation comes from per-org runtimes — one org
-    # per deployment — so the shared-root mkdir collision can't happen in
-    # production; asserted on the query, not create, for that reason.)
+    # Name uniqueness is org-scoped: B is blind to A's "reports", so no -2
+    # suffix. Directories are separated by the org-keyed root now, not by
+    # "one org per deployment" (that died with the shared-instance decision).
     assert b._unique_name("reports") == "reports"
 
 
@@ -94,9 +94,10 @@ def test_project_names_are_per_org(db):
 def test_project_paths_cannot_escape_the_root(db, tmp_path, evil):
     svc = _svc(db, _scope(ORG_A))
     project = svc.create_project(evil)
-    # The created dir must sit directly under the real projects root, not
-    # wherever the (sanitized) name happened to point.
-    projects_root = (tmp_path / "projects").resolve()
+    # The created dir must sit directly under this ORG's projects root (the root
+    # is org-keyed, like the skills/memory stores), not wherever the (sanitized)
+    # name happened to point.
+    projects_root = (tmp_path / "projects" / str(ORG_A)).resolve()
     assert Path(project.path).resolve().parent == projects_root
     assert "/" not in project.name and ".." != project.name
 
@@ -118,30 +119,36 @@ def test_local_mode_sees_everything(db):
 
 # ── GENERAL project bootstrap ───────────────────────────────────────────────
 
-def test_general_claim_is_idempotent_within_an_org(db):
+def test_general_is_idempotent_within_an_org(db):
     a = _svc(db, _scope(ORG_A))
     first = a.ensure_general_for_scope()
     second = a.ensure_general_for_scope()
     assert first is not None and second is not None
-    assert first.id == second.id == GENERAL_PROJECT_ID
+    assert first.id == second.id
     assert first.org_id == ORG_A
     assert first.created_by is None  # system-created, never attributed
 
 
-def test_general_claimed_by_a_is_gone_for_b(db):
+def test_every_org_gets_its_own_general(db):
+    """One seeded id can't serve N tenants: the first org claimed it and every
+    later org got None → 404."""
     a = _svc(db, _scope(ORG_A))
     b = _svc(db, _scope(ORG_B))
-    assert a.ensure_general_for_scope() is not None
 
-    assert b.ensure_general_for_scope() is None  # no restamp, no access
-    assert GENERAL_PROJECT not in {p.name for p in b.list_projects()}
-    # A's claim untouched
-    row = _raw(db).exec(select(Project).where(Project.id == GENERAL_PROJECT_ID)).one()
-    assert row.org_id == ORG_A
+    ga = a.ensure_general_for_scope()
+    gb = b.ensure_general_for_scope()
+
+    assert ga is not None and gb is not None
+    assert ga.id != gb.id  # separate rows, not a contested one
+    assert (ga.org_id, gb.org_id) == (ORG_A, ORG_B)
+    assert Path(ga.path) != Path(gb.path)  # and separate directories
+    # Each org sees exactly its own.
+    assert GENERAL_PROJECT in {p.name for p in a.list_projects()}
+    assert GENERAL_PROJECT in {p.name for p in b.list_projects()}
 
 
-def test_general_claim_only_touches_the_fixed_row(db):
-    # A legacy NULL-org project must NOT be adopted by the bootstrap.
+def test_general_does_not_adopt_a_legacy_null_org_row(db):
+    # A legacy NULL-org project must NOT be swept into an org.
     raw = _raw(db)
     raw.add(Project(name="legacy", path="/tmp/legacy", is_active=False))
     raw.commit()
@@ -152,9 +159,90 @@ def test_general_claim_only_touches_the_fixed_row(db):
     assert legacy.org_id is None
 
 
+def test_general_never_duplicates_across_concurrent_sessions(db):
+    """No unique constraint + 2 replicas + called on every request: two sessions
+    racing first load must converge on ONE row."""
+    a1 = _svc(db, _scope(ORG_A, "alice"))
+    a2 = _svc(db, _scope(ORG_A, "bob"))  # a second replica, same org
+
+    # Both past the pre-check before either writes. Calling
+    # ensure_general_for_scope twice would short-circuit and miss the race.
+    path = a1._project_path(GENERAL_PROJECT)
+    a1._insert_general_if_absent(path)
+    a2._insert_general_if_absent(path)
+
+    rows = _raw(db).exec(
+        select(Project).where(Project.org_id == ORG_A, Project.name == GENERAL_PROJECT)
+    ).all()
+    assert len(rows) == 1
+    assert a1.ensure_general_for_scope().id == rows[0].id
+
+
+def test_general_recreates_a_missing_directory(db):
+    """The live 404: row resolved, directory did not exist."""
+    a = _svc(db, _scope(ORG_A))
+    general = a.ensure_general_for_scope()
+    assert general is not None
+    shutil.rmtree(general.path)
+    assert not Path(general.path).is_dir()
+
+    again = a.ensure_general_for_scope()
+
+    assert again is not None and Path(again.path).is_dir()
+
+
 def test_general_in_local_mode_needs_no_claim(db):
     local = _svc(db, LOCAL_SCOPE)
     general = local.ensure_general_for_scope()
     assert general is not None
     row = _raw(db).exec(select(Project).where(Project.id == GENERAL_PROJECT_ID)).one()
     assert row.org_id is None  # local mode never stamps
+
+
+def test_general_repoints_a_legacy_unkeyed_path_with_no_content(db, tmp_path):
+    """Rows predating the org-keyed root point outside it. With no content there,
+    re-point them — otherwise the org stays 404'd."""
+    a = _svc(db, _scope(ORG_A))
+    legacy = tmp_path / "projects" / GENERAL_PROJECT  # un-keyed, never created
+    raw = _raw(db)
+    raw.add(Project(name=GENERAL_PROJECT, path=str(legacy), is_active=False, org_id=ORG_A))
+    raw.commit()
+
+    general = a.ensure_general_for_scope()
+
+    assert general is not None
+    assert Path(general.path).parent == (tmp_path / "projects" / str(ORG_A))
+    assert Path(general.path).is_dir()
+
+
+def test_general_keeps_a_legacy_path_that_still_has_content(db, tmp_path):
+    """The mirror case: a dir with real content must not be abandoned."""
+    a = _svc(db, _scope(ORG_A))
+    legacy = tmp_path / "projects" / GENERAL_PROJECT
+    legacy.mkdir(parents=True)
+    (legacy / "notes.md").write_text("real work")
+    raw = _raw(db)
+    raw.add(Project(name=GENERAL_PROJECT, path=str(legacy), is_active=False, org_id=ORG_A))
+    raw.commit()
+
+    general = a.ensure_general_for_scope()
+
+    assert general is not None
+    assert Path(general.path) == legacy
+    assert (Path(general.path) / "notes.md").read_text() == "real work"
+
+
+def test_same_project_name_in_two_orgs_gets_separate_directories(db):
+    """Rows were always keyed by org_id; the filesystem was not — two orgs using
+    `reports` shared one directory."""
+    a = _svc(db, _scope(ORG_A))
+    b = _svc(db, _scope(ORG_B))
+
+    pa = a.create_project("reports")
+    pb = b.create_project("reports")
+
+    assert pa.name == pb.name == "reports"  # no -2 suffix: names are per org
+    assert Path(pa.path) != Path(pb.path)
+    (Path(pa.path) / "a.md").write_text("org A")
+    (Path(pb.path) / "b.md").write_text("org B")
+    assert not (Path(pa.path) / "b.md").exists()  # no shared directory
