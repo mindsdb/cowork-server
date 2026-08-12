@@ -81,8 +81,8 @@ class TestOrgModeReadiness:
 
         # Readiness must imply build_llm_client can actually run: both roles
         # resolve, or the turn throws despite reading as ready.
-        assert s.resolved_planning_model == "sonnet"
-        assert s.resolved_coding_model == "haiku"
+        assert s.resolved_planning_model == "mindshub_air"
+        assert s.resolved_coding_model == "mindshub_air"
 
     def test_desktop_with_nothing_stored_is_still_unconfigured(self, local_mode):
         """The bypass is org-mode only — desktop must keep asking for a key."""
@@ -91,13 +91,27 @@ class TestOrgModeReadiness:
         assert cs["config_ready"] is False
         assert "API key" in cs["config_error"]
 
-    def test_byok_provider_in_org_mode_still_needs_its_key(self, org_mode):
-        """Scoped to MindsHub: only minds-cloud credentials are minted per turn,
-        so an org that deliberately selected a BYOK provider is not ready until
-        it supplies that provider's key."""
+    def test_byok_without_a_key_falls_back_to_minds_in_org_mode(self, org_mode):
+        """BYOK in cloud is deferred: an org that selected a BYOK provider but
+        stored no key falls back to the managed MindsHub provider (ready) rather
+        than blocking — minds-cloud is always keyed in org mode (per-turn mint)."""
         cs = _settings(
             planning_provider=Provider.ANTHROPIC,
             coding_provider=Provider.ANTHROPIC,
         ).config_status
 
-        assert cs["config_ready"] is False
+        assert cs["config_ready"] is True
+        assert cs["provider"] == Provider.MINDS_CLOUD.value
+
+
+def test_ambient_provider_keys_do_not_override_minds(monkeypatch, org_mode):
+    """The live bug: the pod carries ANTHROPIC_API_KEY/OPENAI_API_KEY in its env,
+    so the resolver picked Anthropic and the UI showed it instead of MindsHub.
+    Org mode must resolve to MindsHub regardless of ambient provider keys."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai-ambient")
+    cs = UserSettings().config_status  # reads the ambient env, like the pod
+
+    assert cs["provider"] == Provider.MINDS_CLOUD.value
+    assert cs["model"] == "mindshub_air"
+    assert cs["config_ready"] is True
