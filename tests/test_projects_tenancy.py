@@ -246,3 +246,99 @@ def test_same_project_name_in_two_orgs_gets_separate_directories(db):
     (Path(pa.path) / "a.md").write_text("org A")
     (Path(pb.path) / "b.md").write_text("org B")
     assert not (Path(pa.path) / "b.md").exists()  # no shared directory
+
+
+def test_general_id_round_trips_through_get_project(db):
+    """Review: sa.literal(str(uuid4())) binds as String and skips the Uuid bind
+    processor, so the stored id doesn't match how every other lookup binds.
+
+    Must use a FRESH session: the writing session's identity map would serve the
+    row from memory and never round-trip through the column type.
+    """
+    general = _svc(db, _scope(ORG_A)).ensure_general_for_scope()
+    assert general is not None
+
+    fresh = _svc(db, _scope(ORG_A))
+    assert fresh.get_project(general.id).id == general.id
+
+
+def test_unique_index_rejects_a_second_default_for_one_org(db):
+    """What arbitrates on Postgres, where two replicas can both pass NOT EXISTS."""
+    import sqlalchemy as sa
+    raw = _raw(db)
+    raw.exec(sa.text(
+        "CREATE UNIQUE INDEX uq_projects_default_per_org ON projects "
+        "(coalesce(org_id, '')) WHERE name = 'general'"
+    ))
+    _svc(db, _scope(ORG_A)).ensure_general_for_scope()
+
+    with pytest.raises(sa.exc.IntegrityError):
+        dup = _raw(db)
+        dup.add(Project(name=GENERAL_PROJECT, path="/tmp/dup", is_active=False, org_id=ORG_A))
+        dup.commit()
+
+
+def test_a_losing_insert_adopts_the_winners_row(db, monkeypatch):
+    """The loser must return the winner's row, not assume its own insert landed."""
+    import sqlalchemy as sa
+    winner = _svc(db, _scope(ORG_A, "alice")).ensure_general_for_scope()
+    assert winner is not None
+
+    loser = _svc(db, _scope(ORG_A, "bob"))
+    monkeypatch.setattr(
+        type(loser),
+        "get_project_by_name_or_none",
+        lambda self, name: None,  # pretend the pre-check saw nothing
+        raising=True,
+    )
+    monkeypatch.setattr(
+        type(loser),
+        "_execute_general_insert",
+        lambda self, raw, path, org_id: (_ for _ in ()).throw(
+            sa.exc.IntegrityError("insert", {}, Exception("duplicate"))
+        ),
+        raising=True,
+    )
+
+    loser._insert_general_if_absent(loser._project_path(GENERAL_PROJECT))  # must not raise
+
+    rows = _raw(db).exec(
+        select(Project).where(Project.org_id == ORG_A, Project.name == GENERAL_PROJECT)
+    ).all()
+    assert len(rows) == 1 and rows[0].id == winner.id
+
+
+def test_fresh_org_has_an_active_project(db):
+    """Review: provisioned with is_active=False, so a fresh org had zero active
+    projects and get_active_project raised on the first request."""
+    a = _svc(db, _scope(ORG_A))
+    a.ensure_general_for_scope()
+    assert a.get_active_project().name == GENERAL_PROJECT
+
+
+def test_a_member_cannot_take_the_default_projects_name(db):
+    """Review: a member could POST /projects named `general` before the system row
+    exists — it became user-attributed and undeletable, and the name-based lookup
+    then blocked the real default forever."""
+    a = _svc(db, _scope(ORG_A, "alice"))
+    hijack = a.create_project(GENERAL_PROJECT)
+
+    assert hijack.name != GENERAL_PROJECT  # the name is reserved
+    general = a.ensure_general_for_scope()
+    assert general is not None
+    assert general.created_by is None  # the real system row, not the member's
+    assert general.id != hijack.id
+
+
+def test_repointing_does_not_attribute_the_system_project(db, tmp_path):
+    """Review: ScopedSession.add stamps created_by when it's None, so healing a
+    stale path attributed the org's default to whoever triggered the heal."""
+    legacy = tmp_path / "projects" / GENERAL_PROJECT
+    raw = _raw(db)
+    raw.add(Project(name=GENERAL_PROJECT, path=str(legacy), is_active=False, org_id=ORG_A))
+    raw.commit()
+
+    general = _svc(db, _scope(ORG_A, "alice")).ensure_general_for_scope()
+
+    assert general is not None
+    assert general.created_by is None  # still system-created

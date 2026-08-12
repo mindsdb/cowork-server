@@ -29,6 +29,13 @@ deployment:
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
 
+    # Turn execution — MUST be set here: the base values.yaml default points at
+    # dev, which would have dev's controller running prod turns in dev pods.
+    # (COWORK_TURN_MINDS_BASE_URL needs no override — it derives to
+    # api.mindshub.ai for prod, which has no env sub-domain.)
+    - name: COWORK_TURN_REDIS_URL
+      value: "redis://redis-master.prod.svc.cluster.local:6379/0"
+
     # Agent tool budgets — deployment-level DEFAULTS for users who never set
     # the per-user setting (hosted has no Settings UI; inference cost lands on
     # the operator). Uncommented values below equal the code defaults, so
