@@ -10,6 +10,12 @@ import json
 from cowork.db.scoped import LOCAL_SCOPE
 
 
+class _FakeRequest:
+    # recommended_models reads request.headers only on the org-mode bearer path;
+    # these tests are LOCAL_SCOPE, so an empty header map is never consulted.
+    headers: dict = {}
+
+
 def _listing(ids, efforts=None, enabled=None, labels=None, providers=None, families=None):
     """A MindsModelListing with everything a test doesn't care about left empty.
 
@@ -50,7 +56,7 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
 
     calls: list[tuple[str, str]] = []
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         calls.append((base_url, api_key))
         return _listing(
             ["model-a", "model-b"],
@@ -72,7 +78,7 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["openai-compatible"] == ["model-a", "model-b"]
         assert result["modelEfforts"]["model-a"] == {"efforts": ["low", "high"], "default": "low"}
@@ -102,7 +108,7 @@ def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         if "mindshub" in base_url:
             return _listing(
                 ["sonnet", "haiku"],
@@ -136,7 +142,7 @@ def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         # MindsHub's description of `sonnet` survives on every id-keyed map.
         assert result["modelLabels"]["sonnet"] == "Claude Sonnet 5"
@@ -174,7 +180,7 @@ def test_custom_endpoint_cannot_describe_a_model_minds_listed_undescribed(monkey
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         if "mindshub" in base_url:
             # The pre-grouping gateway: ids and enabled flags, no metadata.
             return _listing(["sonnet", "haiku"], enabled={"sonnet": True, "haiku": True})
@@ -196,7 +202,7 @@ def test_custom_endpoint_cannot_describe_a_model_minds_listed_undescribed(monkey
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         # No family for sonnet at all is the right answer here: the app lists it
         # without a "latest" tag rather than under a head it was never pinned to.
@@ -223,7 +229,7 @@ def test_custom_endpoint_cannot_supply_a_provider_minds_could_not_place(monkeypa
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         if "mindshub" in base_url:
             return _listing(["sonnet-4-5"], families={"sonnet-4-5": "sonnet"})
         return _listing(
@@ -246,7 +252,7 @@ def test_custom_endpoint_cannot_supply_a_provider_minds_could_not_place(monkeypa
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert result["modelProviders"] == {}
         # And the pin MindsHub did publish survives, so the app still knows this is
@@ -272,7 +278,7 @@ def test_grouping_maps_stay_partial_across_two_listings(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         if "mindshub" in base_url:
             return _listing(
                 ["sonnet"],
@@ -295,7 +301,7 @@ def test_grouping_maps_stay_partial_across_two_listings(monkeypatch):
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert result["modelProviders"] == {"sonnet": "anthropic"}
         assert result["modelFamilies"] == {"sonnet": "sonnet"}
@@ -317,7 +323,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
 
     called = False
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         nonlocal called
         called = True
         return _listing(["x"])
@@ -328,7 +334,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
     try:
         _delete_settings(session, "minds_api_key", "providers_json", "openai_api_key")
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["openai-compatible"] == []
         assert result["modelEnabled"] == {}
@@ -343,7 +349,7 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         # MindsHub lists the whole picker catalog; paid models come back
         # enabled:false for a free caller so the UI can show them as locked.
         return _listing(
@@ -359,7 +365,7 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json")
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "opus", "gpt"]
         assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
@@ -377,7 +383,7 @@ def test_recommended_models_surfaces_the_grouping_metadata(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         return _listing(
             ["mindshub_air", "sonnet", "sonnet-4-5"],
             providers={"mindshub_air": "openai", "sonnet": "anthropic", "sonnet-4-5": "anthropic"},
@@ -391,7 +397,7 @@ def test_recommended_models_surfaces_the_grouping_metadata(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json")
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert result["modelProviders"]["sonnet"] == "anthropic"
         # A moving alias names itself; a pin names its head. That difference is the
@@ -414,7 +420,7 @@ def test_recommended_models_keeps_serving_the_pre_existing_keys(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         return _listing(["mindshub_air"], enabled={"mindshub_air": True})
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -424,7 +430,7 @@ def test_recommended_models_keeps_serving_the_pre_existing_keys(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json")
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert {
             "recommendedModels", "recommendedPair", "modelEfforts", "modelEnabled", "modelLabels",
@@ -445,7 +451,7 @@ def test_recommended_models_grouping_maps_empty_for_a_byok_endpoint(monkeypatch)
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         return _listing(["model-a", "model-b"])
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -461,7 +467,7 @@ def test_recommended_models_grouping_maps_empty_for_a_byok_endpoint(monkeypatch)
             openai_api_key="sk-test",
         )
 
-        result = asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        result = asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         assert result["recommendedModels"]["openai-compatible"] == ["model-a", "model-b"]
         assert result["modelProviders"] == {}
@@ -481,7 +487,7 @@ def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         return _listing(["mindshub_air", "opus"])  # ids present, enabled EMPTY
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -497,7 +503,7 @@ def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
         )
         _delete_settings(session, "providers_json")
 
-        asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         stored = SettingService(session).get_setting("minds_model_enabled").value
         assert json.loads(stored) == {"mindshub_air": True, "opus": False}
@@ -515,7 +521,7 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         return _listing(["mindshub_air", "opus"], enabled={"mindshub_air": True, "opus": False})
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -536,8 +542,8 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
 
         monkeypatch.setattr(SettingService, "upsert_setting", spy_upsert)
 
-        asyncio.run(recommended_models(session, LOCAL_SCOPE))  # map absent → 1 write
-        asyncio.run(recommended_models(session, LOCAL_SCOPE))  # identical map stored → no write
+        asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))  # map absent → 1 write
+        asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))  # identical map stored → no write
 
         assert len(writes) == 1, writes
     finally:
@@ -555,7 +561,7 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
         # Baseline listed FIRST by the gateway, but sorting alphabetically
         # would put 'air-mini' ahead of it.
         return _listing(
@@ -570,10 +576,69 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
         _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
         _delete_settings(session, "providers_json", "minds_model_enabled")
 
-        asyncio.run(recommended_models(session, LOCAL_SCOPE))
+        asyncio.run(recommended_models(_FakeRequest(), session, LOCAL_SCOPE))
 
         stored = SettingService(session).get_setting("minds_model_enabled").value
         assert list(json.loads(stored).keys()) == ["zephyr_base", "air-mini", "sonnet"]
     finally:
         _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
         session.close()
+
+
+def test_org_mode_forwards_caller_bearer_for_the_catalog(monkeypatch):
+    """Org mode stores no minds key, so the catalog fetch reuses the caller's
+    own (ingress-validated) bearer — the /v1/models list is org-scoped, so it
+    resolves to the same org with no key to mint."""
+    from cowork.api.v1.endpoints import settings as ep
+    from cowork.db.scoped import TenantScope
+    from cowork.db.session import get_open_session
+
+    seen = {}
+
+    async def fake_fetch(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+        seen["url"] = minds_url
+        seen["key"] = api_key
+        return _listing(["mindshub_air", "sonnet"], enabled={"mindshub_air": True, "sonnet": False})
+
+    monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
+
+    class Req:
+        headers = {"Authorization": "Bearer jwt-abc"}
+
+    org = TenantScope(org_mode=True, org_id="org-1", user_id="u-1")
+    result = asyncio.run(ep.recommended_models(Req(), get_open_session(), org))
+
+    assert seen["key"] == "jwt-abc"                       # forwarded, not minted
+    assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "sonnet"]
+    assert result["modelEnabled"]["sonnet"] is False      # wallet-lock surfaced
+
+
+def test_catalog_cache_is_not_shared_across_orgs(monkeypatch):
+    """The enabled map is org-specific (wallet-aware). Two orgs forwarding their
+    own bearer to the SAME inference URL must not share a cache entry, or one
+    org's locked-model map leaks to another."""
+    from cowork.api.v1.endpoints import settings as ep
+    from cowork.db.scoped import TenantScope
+    from cowork.db.session import get_open_session
+
+    maps = {
+        "jwt-A": _listing(["mindshub_air", "sonnet"], enabled={"mindshub_air": True, "sonnet": False}),
+        "jwt-B": _listing(["mindshub_air", "sonnet"], enabled={"mindshub_air": True, "sonnet": True}),
+    }
+
+    async def fake_fetch(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+        return maps[api_key]
+
+    monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
+
+    def _run(token, org):
+        class Req:
+            headers = {"Authorization": f"Bearer {token}"}
+        scope = TenantScope(org_mode=True, org_id=org, user_id="u")
+        return asyncio.run(ep.recommended_models(Req(), get_open_session(), scope))
+
+    a = _run("jwt-A", "org-A")
+    b = _run("jwt-B", "org-B")
+
+    assert a["modelEnabled"]["sonnet"] is False  # A: locked
+    assert b["modelEnabled"]["sonnet"] is True   # B: unlocked — not A's cached map
