@@ -171,10 +171,14 @@ deployment:
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
 
-    # Inference base URL the pod's turn calls. Per-env: each values-<env>.yaml
-    # MUST override it — this default is a per-PR host that 404s once torn down.
-    - name: COWORK_TURN_MINDS_BASE_URL
-      value: "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"
+    # Inference base URL the pod's turn calls. MUST be this env's own inference:
+    # the turn key is minted by this env's auth, and each inference validates
+    # against the auth in ITS namespace — PR envs run their own Postgres, so a
+    # key from one env is unknown to another (cross-env gives 401, not 404).
+    # Unset here on purpose: the producer derives it from its own host
+    # (cowork* -> api*), which is correct for dev, staging and per-PR alike.
+    # A hardcoded value here pinned a per-PR host and 404'd every env at once
+    # when that PR was reaped.
 
     # ====================================
     # PROVIDER API KEYS

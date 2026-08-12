@@ -18,7 +18,7 @@ from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.turnqueue.redis_client import get_redis
-from cowork.common.settings.app_settings import TurnQueueSettings, default_minds_api_host
+from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
         ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
     )
-    base_url = settings.minds_base_url or minds_chat_base_url(default_minds_api_host())
+    base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
     # The pod always runs on minds-cloud, so its coding calls (the completion
     # verifier + nested scratchpad calls) must name a MINDS model alias. Do NOT
