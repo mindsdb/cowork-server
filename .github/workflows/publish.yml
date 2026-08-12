@@ -9,10 +9,10 @@ name: Auto-release and publish to PyPI
 #
 # THIS IS THE PROD PIPELINE. `prod-build-deploy.yml` used to run on the same event
 # and contained nothing this file does not: the same unit tests and the same notify
-# job, with its build, scan, and deploy jobs all commented out. It was a second run
-# tree per release that reported on a subset of the first, so it is gone. No image
-# is built for prod, deliberately: the desktop app installs the wheel published
-# below, not a container.
+# job. It was a second run tree per release that reported on a subset of the first,
+# so it is gone and its image build lives here as the `build-deploy` job. The wheel
+# published below is still what the desktop app installs; the image serves the
+# hosted prod deployment.
 
 # No workflow-level `permissions:` block. It used to grant `contents: write` to
 # every job in this file, which only `release` needs — the unit tests and the
@@ -39,6 +39,19 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/tests-unit.yml
+
+  build-deploy:
+    # The container image and the prod Helm rollout. Independent of the release
+    # chain on purpose: a scan finding should not hold up the wheel the desktop
+    # installs from, and a failed publish should not hide a broken image. Both
+    # land in this one run tree, and `notify` covers both. Mirrors the same job
+    # in `publish-staging.yml`.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-deploy.yml
+    with:
+      build-environment: production
+    secrets: inherit
 
   release:
     needs: unit-tests
@@ -83,7 +96,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, release, publish]
+    needs: [unit-tests, build-deploy, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
