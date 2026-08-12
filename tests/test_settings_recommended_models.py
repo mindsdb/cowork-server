@@ -8,7 +8,7 @@ import asyncio
 import json
 
 from cowork.db.scoped import LOCAL_SCOPE
-from tests._fakes import FakeRequest
+from _fakes import FakeRequest
 
 
 def _listing(ids, efforts=None, enabled=None, labels=None, providers=None, families=None):

@@ -24,7 +24,7 @@ from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.db.scoped import LOCAL_SCOPE
-from tests._fakes import FakeRequest
+from _fakes import FakeRequest
 
 # The gateway's free-tier registry shape: whole catalog listed, paid models
 # disabled, the baseline model first and enabled.
