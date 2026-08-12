@@ -233,7 +233,8 @@ def _harness_options() -> list[str]:
 # .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
 # token-refresh would re-pin a picker choice from a stale ``latest:`` line.
 #
-# max_tool_rounds / max_continuations are DELIBERATELY absent too, for the
+# max_tool_rounds / max_continuations / max_turn_tokens are DELIBERATELY absent
+# too, for the
 # ENG-739 reason plus a harder failure mode: anton's own CoreSettings accepts
 # any int, so a stale anton-CLI line like ANTON_MAX_TOOL_ROUNDS=1000 in the
 # shared ~/.cowork/.env is valid for the CLI but fails UserSettings' bounds —
@@ -516,6 +517,22 @@ class UserSettings(Settings):
             "(you'll still get a summary of what's missing). Applies to the "
             "Anton agent and, for Cowork sessions, replaces the "
             "ANTON_MAX_CONTINUATIONS environment variable."
+        ),
+    )
+    max_turn_tokens: Annotated[int, ORG] = Field(
+        default_factory=lambda: get_app_settings().default_max_turn_tokens,
+        ge=100_000,
+        le=50_000_000,
+        title="Max Tokens per Task",
+        description=(
+            "The most tokens the agent may spend on one request before it "
+            "pauses and checks in with you. Tokens are the unit your plan's "
+            "monthly allowance is measured in — including tokens re-read from "
+            "cache — so a task that gets stuck can burn a large share of the "
+            "month without finishing. Raise it if you routinely give the agent "
+            "big jobs; lower it to cap what any single request can cost. "
+            "Applies to the Anton agent and, for Cowork sessions, replaces the "
+            "ANTON_MAX_TURN_TOKENS environment variable."
         ),
     )
     publish_url: Annotated[str, ORG] = Field(

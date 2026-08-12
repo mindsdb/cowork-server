@@ -570,10 +570,31 @@ class AntonHarness:
             # Non-nullable ints with defaults — unlike the entries above,
             # db_val is never None here, so these ALWAYS override anton's own
             # 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
-            "max_tool_rounds", "max_continuations",
+            # `max_turn_tokens` is the per-turn spend ceiling (ENG-1286); it
+            # overlays the SAME value anton defaults to rather than a looser
+            # one, because the distribution that sized it was measured on this
+            # traffic. It is bounded ge=100_000 rather than allowing 0, so the
+            # UI can loosen the guard but never switch it off — anton itself
+            # still treats 0 as "disabled" for CLI/host use.
+            "max_tool_rounds", "max_continuations", "max_turn_tokens",
         ):
             db_val = getattr(user, attr, None)
             if db_val is None:
+                continue
+            # Version skew guard. We pin anton as a git dep on branch="main"
+            # (pyproject [tool.uv.sources]), so cowork-server can ship a budget
+            # whose field has only reached anton's `staging` — it arrives on
+            # main at the weekly release, not when the anton PR merges. pydantic
+            # raises `ValueError: "AntonSettings" object has no field "x"` on
+            # setattr of an unknown field, and this loop runs on EVERY session
+            # build, so an unguarded overlay turns a one-week ordering gap into
+            # a total agent outage rather than a missing setting. Skip and log.
+            if not hasattr(anton_settings, attr):
+                logger.warning(
+                    "anton settings has no field %r — skipping overlay; the "
+                    "pinned anton predates this setting (harmless: anton falls "
+                    "back to its own default until the next release)", attr,
+                )
                 continue
             # Provider enum -> string value for AntonSettings.
             # The DB enum uses snake_case (openai_compatible, minds_cloud)
