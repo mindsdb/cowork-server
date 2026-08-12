@@ -356,6 +356,11 @@ class ResponsesHandler:
         queue and persist user + assistant together on terminal (deferred, so
         _remote_history reads prior turns without the current input)."""
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
+        # No client-picked model → the tenant's resolved planning model (org mode:
+        # the free-bucket default). Without this the pod falls to anton's built-in
+        # minds default, a premium alias that 402s a fresh org.
+        if not model:
+            model = get_user_settings(scope_from_principal(self.principal)).resolved_planning_model
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
