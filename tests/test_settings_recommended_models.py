@@ -585,22 +585,29 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
         session.close()
 
 
-def test_org_mode_forwards_caller_bearer_for_the_catalog(monkeypatch):
-    """Org mode stores no minds key, so the catalog fetch reuses the caller's
-    own (ingress-validated) bearer — the /v1/models list is org-scoped, so it
-    resolves to the same org with no key to mint."""
+def test_org_mode_uses_operator_catalog_with_caller_bearer(monkeypatch):
+    """Org mode: the catalog comes from fetch_org_model_catalog (operator URL +
+    caller bearer, per-org), NOT the stored key or the tenant-settable s.minds_url."""
     from cowork.api.v1.endpoints import settings as ep
     from cowork.db.scoped import TenantScope
     from cowork.db.session import get_open_session
 
+    # An admin-set minds_url must be ignored on this path (would otherwise be a
+    # JWT-forwarding sink). Prove it by making the endpoint's own fetch explode.
+    _set_settings(get_open_session(), minds_url="https://attacker.example/v1")
+
     seen = {}
 
-    async def fake_fetch(minds_url, api_key, *, force_refresh=False, tenant_key=None):
-        seen["url"] = minds_url
-        seen["key"] = api_key
+    async def fake_org_catalog(*, org_id, bearer_token, refresh=False):
+        seen["org_id"] = org_id
+        seen["token"] = bearer_token
         return _listing(["mindshub_air", "sonnet"], enabled={"mindshub_air": True, "sonnet": False})
 
-    monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
+    async def boom_fetch(*a, **k):  # the direct fetch must NOT run in org mode
+        raise AssertionError("org path must not call fetch_minds_models directly")
+
+    monkeypatch.setattr(ep, "fetch_org_model_catalog", fake_org_catalog)
+    monkeypatch.setattr(ep, "fetch_minds_models", boom_fetch)
 
     class Req:
         headers = {"Authorization": "Bearer jwt-abc"}
@@ -608,37 +615,45 @@ def test_org_mode_forwards_caller_bearer_for_the_catalog(monkeypatch):
     org = TenantScope(org_mode=True, org_id="org-1", user_id="u-1")
     result = asyncio.run(ep.recommended_models(Req(), get_open_session(), org))
 
-    assert seen["key"] == "jwt-abc"                       # forwarded, not minted
+    assert seen == {"org_id": "org-1", "token": "jwt-abc"}   # per-org, forwarded bearer
     assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "sonnet"]
-    assert result["modelEnabled"]["sonnet"] is False      # wallet-lock surfaced
+    assert result["modelEnabled"]["sonnet"] is False          # wallet-lock surfaced
 
 
-def test_catalog_cache_is_not_shared_across_orgs(monkeypatch):
-    """The enabled map is org-specific (wallet-aware). Two orgs forwarding their
-    own bearer to the SAME inference URL must not share a cache entry, or one
-    org's locked-model map leaks to another."""
-    from cowork.api.v1.endpoints import settings as ep
-    from cowork.db.scoped import TenantScope
-    from cowork.db.session import get_open_session
+def test_providers_cache_is_scoped_by_tenant(monkeypatch):
+    """Exercise the real _minds_models_cache: same URL, different tenant_key must
+    not share an entry (the enabled map is wallet-specific)."""
+    from cowork.services import providers as pv
 
-    maps = {
-        "jwt-A": _listing(["mindshub_air", "sonnet"], enabled={"mindshub_air": True, "sonnet": False}),
-        "jwt-B": _listing(["mindshub_air", "sonnet"], enabled={"mindshub_air": True, "sonnet": True}),
-    }
+    calls = []
 
-    async def fake_fetch(minds_url, api_key, *, force_refresh=False, tenant_key=None):
-        return maps[api_key]
+    async def fake_get(url, headers=None, **kw):
+        calls.append(headers.get("Authorization"))
+        class R:
+            status_code = 200
+            def json(self):
+                # tenant A locks sonnet, tenant B does not — keyed off the bearer
+                locked = "A" in headers["Authorization"]
+                return {"data": [
+                    {"id": "mindshub_air", "enabled": True},
+                    {"id": "sonnet", "enabled": not locked},
+                ]}
+        return R()
 
-    monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
+    class FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        get = staticmethod(fake_get)
 
-    def _run(token, org):
-        class Req:
-            headers = {"Authorization": f"Bearer {token}"}
-        scope = TenantScope(org_mode=True, org_id=org, user_id="u")
-        return asyncio.run(ep.recommended_models(Req(), get_open_session(), scope))
+    monkeypatch.setattr(pv.httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    pv._minds_models_cache.clear()
 
-    a = _run("jwt-A", "org-A")
-    b = _run("jwt-B", "org-B")
+    url = "https://api.staging.example/v1"
+    a = asyncio.run(pv.fetch_minds_models(url, "tok-A", tenant_key="org-A"))
+    b = asyncio.run(pv.fetch_minds_models(url, "tok-B", tenant_key="org-B"))
+    a_again = asyncio.run(pv.fetch_minds_models(url, "tok-A", tenant_key="org-A"))
 
-    assert a["modelEnabled"]["sonnet"] is False  # A: locked
-    assert b["modelEnabled"]["sonnet"] is True   # B: unlocked — not A's cached map
+    assert a.enabled["sonnet"] is False and b.enabled["sonnet"] is True  # no bleed
+    assert len(calls) == 2                       # A cached, B cached, A re-served from cache
+    keys = {k[1] for k in pv._minds_models_cache}
+    assert keys == {"org-A", "org-B"}            # one entry per tenant

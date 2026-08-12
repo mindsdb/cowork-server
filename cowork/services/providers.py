@@ -160,8 +160,9 @@ def _empty_listing() -> MindsModelListing:
     return MindsModelListing(None, {}, {}, {}, {}, {})
 
 
-# Cache value: (timestamp, listing). listing.ids is None on failure.
-_minds_models_cache: dict[str, tuple[float, MindsModelListing]] = {}
+# Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
+# (the `enabled` map is wallet-specific) and None for a single-user/BYOK fetch.
+_minds_models_cache: dict[tuple[str, str | None], tuple[float, MindsModelListing]] = {}
 
 
 # Substrings that identify an embeddings model by id, used only for endpoints
@@ -221,9 +222,7 @@ async def fetch_minds_models(
     if not minds_url or not api_key:
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
-    # Scope by tenant: `enabled` is org-specific, so a URL-only key would leak
-    # one org's locked-model map to another.
-    cache_key = f"{base}\x00{tenant_key}" if tenant_key else base
+    cache_key = (base, tenant_key)
 
     now = time.monotonic()
     cached = _minds_models_cache.get(cache_key)
@@ -335,6 +334,25 @@ async def fetch_minds_models(
     return _remember(
         MindsModelListing((ids or None), efforts, enabled, labels, providers, families)
     )
+
+
+async def fetch_org_model_catalog(
+    *, org_id: str, bearer_token: str, refresh: bool = False
+) -> MindsModelListing:
+    """MindsHub catalog for an org, cached per org.
+
+    Uses the OPERATOR endpoint (env/namespace-derived), never a tenant-settable
+    URL, and the caller's own bearer — so a member's JWT can't be forwarded to an
+    admin-chosen host. `org_id` is required; the `enabled` map is wallet-specific.
+    """
+    if not org_id:
+        raise ValueError("org catalog requires an organization id")
+    from cowork.common.settings.app_settings import (
+        TurnQueueSettings,
+        default_turn_minds_api_host,
+    )
+    url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
+    return await fetch_minds_models(url, bearer_token, force_refresh=refresh, tenant_key=org_id)
 
 
 # ── Config readiness ─────────────────────────────────────────────────
