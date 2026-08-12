@@ -342,3 +342,69 @@ def test_repointing_does_not_attribute_the_system_project(db, tmp_path):
 
     assert general is not None
     assert general.created_by is None  # still system-created
+
+
+def test_repoints_off_an_empty_legacy_directory(db, tmp_path):
+    """An empty dir is not content: it must move to the org-keyed path, not pin
+    the row to a pre-org-keyed location forever."""
+    legacy = tmp_path / "projects" / GENERAL_PROJECT
+    legacy.mkdir(parents=True)  # exists, but empty
+    raw = _raw(db)
+    raw.add(Project(name=GENERAL_PROJECT, path=str(legacy), is_active=False, org_id=ORG_A))
+    raw.commit()
+
+    general = _svc(db, _scope(ORG_A)).ensure_general_for_scope()
+
+    assert general is not None
+    assert Path(general.path).parent == (tmp_path / "projects" / str(ORG_A))
+
+
+def test_any_project_recovers_a_missing_directory(db):
+    """Review: the heal was wired only into the default project, so any other
+    project whose directory disappeared with the pod stayed broken."""
+    a = _svc(db, _scope(ORG_A))
+    reports = a.create_project("reports")
+    shutil.rmtree(reports.path)
+
+    a.ensure_dir_exists(reports)
+
+    assert Path(reports.path).is_dir()
+
+
+def test_rename_works_when_the_org_root_does_not_exist_yet(db, tmp_path):
+    """Review: rename into a not-yet-created <root>/<org_id> raised
+    FileNotFoundError, which the endpoint's `except ValueError` turns into a 500."""
+    legacy = tmp_path / "projects" / "legacy-proj"
+    legacy.mkdir(parents=True)
+    (legacy / "keep.md").write_text("content")
+    raw = _raw(db)
+    raw.add(Project(name="legacy-proj", path=str(legacy), is_active=False, org_id=ORG_A))
+    raw.commit()
+    a = _svc(db, _scope(ORG_A))
+    assert not (tmp_path / "projects" / str(ORG_A)).exists()  # org root absent
+
+    renamed = a.update_project(a.get_project_by_name("legacy-proj").id, name="renamed")
+
+    assert renamed.name == "renamed"
+    assert (Path(renamed.path) / "keep.md").read_text() == "content"
+
+
+def test_a_leftover_directory_is_not_adopted(db):
+    """Review: exist_ok=True dropped the backstop, so a create silently adopted a
+    leftover directory (stale contents included) or shared one with a racing
+    create — where deleting either would rmtree the other's files."""
+    a = _svc(db, _scope(ORG_A))
+    first = a.create_project("reports")
+    first_path = Path(first.path)
+
+    # Row gone, directory left behind (a crashed delete, a restored volume).
+    raw = _raw(db)
+    raw.delete(raw.exec(select(Project).where(Project.name == "reports")).one())
+    raw.commit()
+    first_path.mkdir(parents=True, exist_ok=True)
+    (first_path / "stale.md").write_text("previous tenant of this directory")
+
+    second = _svc(db, _scope(ORG_A)).create_project("reports")
+
+    assert Path(second.path) != first_path  # a fresh directory
+    assert not (Path(second.path) / "stale.md").exists()

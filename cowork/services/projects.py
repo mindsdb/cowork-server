@@ -46,13 +46,13 @@ class ProjectService:
         if not scope.org_mode or scope.org_id is None:
             project = self.session.get(Project, GENERAL_PROJECT_ID)
             if project is not None:
-                self._ensure_dir_exists(project)
+                self.ensure_dir_exists(project)
             return project
 
         existing = self.get_project_by_name_or_none(GENERAL_PROJECT)
         if existing is not None:
             self._repoint_if_stale(existing)
-            self._ensure_dir_exists(existing)
+            self.ensure_dir_exists(existing)
             return existing
 
         path = self._project_path(GENERAL_PROJECT)
@@ -135,27 +135,50 @@ class ProjectService:
         raw.execute(stmt)
         raw.commit()
 
-    def _repoint_if_stale(self, project: Project) -> None:
-        """Move a row off a pre-org-keyed path, but only when nothing is there.
+    def _in_scoped_root(self, path: Path) -> bool:
+        """Whether `path` sits directly in the caller's projects root.
 
-        Such rows point at `<root>/<name>`, which _ensure_dir_exists won't
-        recreate, so they resolve to a missing directory forever. A path that
-        still has content stays put — swapping in an empty dir strands work.
+        Shared by _repoint_if_stale and ensure_dir_exists, which had the same
+        containment block with the comparison inverted.
+        """
+        try:
+            return path.resolve().parent == self._root_dir().resolve()
+        except OSError:
+            return False
+
+    def _repoint_if_stale(self, project: Project) -> None:
+        """Move a row off a pre-org-keyed path when that path holds nothing.
+
+        Such rows point at `<root>/<name>`, which ensure_dir_exists won't
+        recreate, so they resolve to a missing directory forever. A path with
+        content stays put — swapping in an empty dir would strand the org's work.
+        An empty directory is not content, so it moves.
         """
         current = Path(project.path)
+        if self._in_scoped_root(current):
+            return  # already org-keyed
         try:
-            root = self._root_dir().resolve()
-            if current.resolve().parent == root or current.is_dir():
-                return
+            if current.is_dir() and any(current.iterdir()):
+                return  # real content — leave it where it is
         except OSError:
             return
-        project.path = str(self._project_path(project.name))
-        self.session.add(project)
-        self.session.commit()
+        new_path = str(self._project_path(project.name))
+        # Core UPDATE, not session.add: the flush hook stamps created_by on any row
+        # where it is None, which would attribute the org's system project to
+        # whoever happened to trigger the heal.
+        raw = unsafe_unscoped_session(self.session)
+        raw.execute(
+            sa.update(Project).where(Project.id == project.id).values(path=new_path)  # type: ignore[arg-type]
+        )
+        raw.commit()
+        raw.refresh(project)
         logger.info("re-pointed %r off a pre-org-keyed path: %s", project.name, current)
 
-    def _ensure_dir_exists(self, project: Project) -> None:
+    def ensure_dir_exists(self, project: Project) -> None:
         """Recreate a missing directory for a project the caller owns.
+
+        Public because any project can lose its directory (a fresh pod, a wiped
+        volume), not just the default one — see project_files._project_dir.
 
         The row is authoritative; a missing dir is unprovisioned state, not a
         reason to 404 an org out of its own project. Scoped root only, so a
@@ -164,11 +187,7 @@ class ProjectService:
         path = Path(project.path)
         if path.is_dir():
             return
-        try:
-            root = self._root_dir().resolve()
-            if path.resolve().parent != root:
-                return
-        except OSError:
+        if not self._in_scoped_root(path):
             return
         path.mkdir(parents=True, exist_ok=True)
         logger.info("provisioned missing project directory: %s", path)
@@ -259,6 +278,18 @@ class ProjectService:
             .order_by(Project.created_at, Project.id)
         ).first()
 
+    def _allocate_project_dir(self, base: str) -> tuple[str, Path]:
+        """Claim a directory by creating it, bumping the name on collision."""
+        candidate = self._unique_name(base)
+        for attempt in range(2, 52):
+            path = self._project_path(candidate)
+            try:
+                path.mkdir(parents=True)  # raises if it already exists
+                return candidate, path
+            except FileExistsError:
+                candidate = self._unique_name(f"{base}-{attempt}")
+        raise ValueError("Could not allocate a project directory")
+
     def create_project(self, name: str) -> Project:
         sanitized = self._sanitize_name(name)
         # `general` belongs to the system row. A member creating it first would own
@@ -266,10 +297,12 @@ class ProjectService:
         # which is looked up by name.
         if sanitized == GENERAL_PROJECT:
             sanitized = f"{GENERAL_PROJECT}-2"
-        final_name = self._unique_name(sanitized)
-        path = self._project_path(final_name)
-        # exist_ok: the root is org-keyed, so a leftover dir is this org's own.
-        path.mkdir(parents=True, exist_ok=True)
+        # No exist_ok: `_unique_name` is a read-then-write with no unique
+        # constraint behind it, so two concurrent creates can pick the same name.
+        # Letting mkdir fail keeps them from sharing one directory (where deleting
+        # either would rmtree the other's files) and stops a leftover directory
+        # being adopted with stale contents. On collision, take the next name.
+        final_name, path = self._allocate_project_dir(sanitized)
         # self._scaffold(path)
         project = Project(name=final_name, path=str(path), is_active=False)
         self.session.add(project)
@@ -304,6 +337,10 @@ class ProjectService:
                 old_path = Path(project.path)
                 new_path = self._project_path(final_name)
                 if old_path.exists():
+                    # The org's root may not exist yet (a legacy row still on an
+                    # un-keyed path): rename would raise FileNotFoundError, which
+                    # the endpoint's `except ValueError` turns into a 500.
+                    new_path.parent.mkdir(parents=True, exist_ok=True)
                     old_path.rename(new_path)
                 project.name = final_name
                 project.path = str(new_path)
