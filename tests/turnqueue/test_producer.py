@@ -216,13 +216,13 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
 @pytest.mark.asyncio
 async def test_mint_llm_block_uses_minds_coding_default():
     # The pod runs on minds-cloud, so the coding model must be a minds alias.
-    # Default = the minds-cloud coding default, NOT the tenant's resolved model
-    # (which for a hosted user defaults to an Anthropic name minds 404s).
-    from cowork.common.settings.app_settings import TurnQueueSettings, CODING_MODEL_DEFAULTS
+    # Default = the free-bucket model (mindshub_air): a fresh org has no wallet
+    # balance, so any premium alias 402s on the first turn.
+    from cowork.common.settings.app_settings import TurnQueueSettings, MINDS_FREE_MODEL
 
     settings = TurnQueueSettings(minds_base_url="https://api.example.dev/v1")
     block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
-    assert block["coding_model"] == CODING_MODEL_DEFAULTS["minds_cloud"]
+    assert block["coding_model"] == MINDS_FREE_MODEL
 
 
 @pytest.mark.asyncio
