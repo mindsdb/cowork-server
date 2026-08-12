@@ -24,10 +24,7 @@ from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.db.scoped import LOCAL_SCOPE
-
-
-class _FakeReq:
-    headers: dict = {}
+from tests._fakes import FakeRequest
 
 # The gateway's free-tier registry shape: whole catalog listed, paid models
 # disabled, the baseline model first and enabled.
@@ -169,7 +166,7 @@ def test_recommended_models_caches_enabled_map(monkeypatch):
     session = get_open_session()
     try:
         _set_settings(session, minds_api_key="mdb_test")
-        asyncio.run(recommended_models(_FakeReq(), session, LOCAL_SCOPE))
+        asyncio.run(recommended_models(FakeRequest(), session, LOCAL_SCOPE))
         cached = SettingService(session).load().minds_model_enabled
         assert json.loads(cached) == {"mindshub_air": True, "sonnet": False}
     finally:
@@ -192,7 +189,7 @@ def test_recommended_models_failed_fetch_preserves_cache(monkeypatch):
     session = get_open_session()
     try:
         _set_settings(session, minds_api_key="mdb_test", minds_model_enabled=FREE_MAP)
-        asyncio.run(recommended_models(_FakeReq(), session, LOCAL_SCOPE))
+        asyncio.run(recommended_models(FakeRequest(), session, LOCAL_SCOPE))
         cached = SettingService(session).load().minds_model_enabled
         assert json.loads(cached) == json.loads(FREE_MAP)  # untouched
     finally:
