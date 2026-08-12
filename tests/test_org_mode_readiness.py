@@ -8,6 +8,8 @@ writing ``planning_provider``/``coding_provider``, which are admin-owned, so a
 non-admin member got a 403 and could never reach the app.
 """
 
+import json
+
 import pytest
 
 from cowork.common.settings import user_settings as us
@@ -30,8 +32,8 @@ _KEY_ENV = (
 
 def _mode(monkeypatch, mode: str) -> None:
     """Set tenancy_mode via the real settings (env + cache clear), so every
-    module's get_app_settings() agrees — user_settings, app_settings.role_defaults,
-    and providers all read the same source."""
+    module's get_app_settings() agrees — user_settings, app_settings, and
+    providers all read the same source."""
     for name in _KEY_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("COWORK_TENANCY_MODE", mode)
@@ -105,6 +107,48 @@ class TestOrgModeReadiness:
 
         assert cs["config_ready"] is True
         assert cs["provider"] == Provider.MINDS_CLOUD.value
+
+
+class TestOrgModeCreditAwareDefaults:
+    """ENG-1439: an org WITH top-up credits gets the premium default trio
+    (kimi planning / gpt-codex coding / haiku routing); anything short of
+    positive payability evidence in the cached availability map stays on the
+    free-allowance model, so a fresh org is never 402'd on its first turn."""
+
+    PAID = json.dumps(
+        {"mindshub_air": True, "kimi": True, "gpt-codex": True, "haiku": True}
+    )
+    FREE = json.dumps(
+        {"mindshub_air": True, "kimi": False, "gpt-codex": False, "haiku": False}
+    )
+
+    def test_org_with_credits_gets_premium_defaults(self, org_mode):
+        s = _settings(minds_model_enabled=self.PAID)
+        assert s.resolved_planning_model == "kimi"
+        assert s.resolved_coding_model == "gpt-codex"
+        assert s.resolved_router_model == "haiku"
+
+    def test_org_without_credits_stays_on_free_model(self, org_mode):
+        s = _settings(minds_model_enabled=self.FREE)
+        assert s.resolved_planning_model == "mindshub_air"
+        assert s.resolved_coding_model == "mindshub_air"
+        assert s.resolved_router_model == "mindshub_air"
+
+    def test_org_cold_start_stays_on_free_model(self, org_mode):
+        # Empty map (fetch never ran) is not evidence of credit — free-first.
+        s = _settings()
+        assert s.resolved_router_model == "mindshub_air"
+
+    def test_org_default_missing_from_map_stays_free(self, org_mode):
+        # Unlike desktop (missing = available), org needs the default itself
+        # marked payable; a gateway that stops listing it downgrades to free.
+        s = _settings(minds_model_enabled=json.dumps({"mindshub_air": True, "kimi": True}))
+        assert s.resolved_planning_model == "kimi"
+        assert s.resolved_coding_model == "mindshub_air"
+
+    def test_org_explicit_choice_is_never_rewritten(self, org_mode):
+        s = _settings(minds_model_enabled=self.FREE, planning_model="opus")
+        assert s.resolved_planning_model == "opus"
 
 
 def test_ambient_provider_keys_do_not_override_minds(monkeypatch, org_mode):
