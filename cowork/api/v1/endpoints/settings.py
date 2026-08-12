@@ -41,6 +41,7 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
+    default_minds_url,
 )
 from cowork.common.settings.user_settings import (
     Provider,
@@ -262,7 +263,7 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
 
 
 @router.get("/recommended-models")
-async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool = False):
+async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
@@ -326,9 +327,20 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
     minds_ids: set[str] = set()
 
     s = SettingService(session, scope).load()
-    if s.minds_api_key is not None and s.minds_url:
+    minds_url = s.minds_url
+    minds_key = s.minds_api_key.get_secret_value() if s.minds_api_key is not None else None
+    # Org mode has no stored minds key, so forward the caller's own bearer (the
+    # /v1/models catalog is org-scoped) instead of minting one.
+    if minds_key is None and scope.org_mode:
+        bearer = request.headers.get("Authorization", "")
+        token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+        if token:
+            minds_key = token
+            minds_url = minds_url or default_minds_url()
+    if minds_key is not None and minds_url:
         listing = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
+            minds_url, minds_key, force_refresh=refresh,
+            tenant_key=scope.org_id if scope.org_mode else None,
         )
         live = listing.ids
         live_efforts = listing.efforts
@@ -400,7 +412,8 @@ async def recommended_models(session: SessionDep, scope: ScopeDep, refresh: bool
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
         oc_listing = await fetch_minds_models(
-            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh
+            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh,
+            tenant_key=scope.org_id if scope.org_mode else None,
         )
         live = oc_listing.ids
         live_efforts = oc_listing.efforts
