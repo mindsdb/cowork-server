@@ -12,6 +12,7 @@ from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_valid
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     MINDS_FREE_MODEL,
+    role_defaults,
     PLANNING_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
@@ -606,17 +607,6 @@ class UserSettings(Settings):
         self._enabled_map_cache = result
         return result
 
-    @staticmethod
-    def _role_defaults(base: dict[str, str]) -> dict[str, str]:
-        """Model defaults for the current deployment.
-
-        Org mode defaults minds-cloud to the free-bucket model (no wallet
-        balance yet); desktop keeps the premium canonical defaults.
-        """
-        if get_app_settings().tenancy_mode == "org":
-            return {**base, Provider.MINDS_CLOUD.value: MINDS_FREE_MODEL}
-        return base
-
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
         # Defaults are availability-aware for minds-cloud: when the canonical
@@ -629,15 +619,15 @@ class UserSettings(Settings):
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
-                self.planning_provider.value, self._role_defaults(PLANNING_MODEL_DEFAULTS), enabled_map
+                self.planning_provider.value, role_defaults(PLANNING_MODEL_DEFAULTS), enabled_map
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
-                self.coding_provider.value, self._role_defaults(CODING_MODEL_DEFAULTS), enabled_map
+                self.coding_provider.value, role_defaults(CODING_MODEL_DEFAULTS), enabled_map
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, self._role_defaults(ROUTER_MODEL_DEFAULTS), enabled_map
+                self.coding_provider.value, role_defaults(ROUTER_MODEL_DEFAULTS), enabled_map
             )
         return self
 
@@ -694,7 +684,7 @@ class UserSettings(Settings):
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
-            self._role_defaults(PLANNING_MODEL_DEFAULTS),
+            role_defaults(PLANNING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
@@ -704,7 +694,7 @@ class UserSettings(Settings):
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
-            self._role_defaults(CODING_MODEL_DEFAULTS),
+            role_defaults(CODING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
@@ -718,7 +708,7 @@ class UserSettings(Settings):
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
-            self._role_defaults(ROUTER_MODEL_DEFAULTS),
+            role_defaults(ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
