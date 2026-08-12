@@ -34,5 +34,9 @@ def health() -> dict:
         "server_version": _pkg_version("cowork-server"),
         "anton_version": _pkg_version("anton-agent"),
         "owner": get_app_settings().owner,
+        # Provider config is org-owned (admin-only writes) in org mode, so the
+        # client must not finalize onboarding by writing it. `config_ready` can't
+        # express this: it says the deployment can run, not who may configure it.
+        "org_mode": get_app_settings().tenancy_mode == "org",
         **settings.config_status,
     }
