@@ -32,6 +32,9 @@ IMAGE_FORMAT_USER_MESSAGE = (
     "Sorry, I couldn't process that image. Try uploading it as a PNG or JPEG."
 )
 
+# Wire-level code for the unsupported-image case.
+IMAGE_FORMAT_CODE = "image_format"
+
 # Curated copy for the out-of-credits case. In the wallet billing model this
 # fires when either the org's wallet is empty (gateway 402 `wallet_empty`) or
 # the free monthly included-token allowance is spent (gateway 429
@@ -467,7 +470,7 @@ def friendly_turn_error(
     if overloaded is not None:
         return overloaded[0], str(exc) or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
     if is_image_format_error(exc):
-        return "image_format", IMAGE_FORMAT_USER_MESSAGE
+        return IMAGE_FORMAT_CODE, IMAGE_FORMAT_USER_MESSAGE
     return None
 
 
