@@ -75,25 +75,46 @@ def test_context_skips_files_missing_from_disk(tmp_path):
         assert "gone.md" not in ctx
 
 
-def test_context_empty_when_no_attachments():
+def test_context_states_the_attachment_route_when_nothing_is_attached():
+    # ENG-1357: with no attachments this used to return "", so the agent was
+    # told what it may NOT read and never told how the user grants access.
+    # Asked to work on an unattached file it had no legitimate move left —
+    # picker can't render, asking for a path is forbidden, guessing is
+    # forbidden — and one real session resolved that by inventing the user's
+    # data. The empty case must name attachment as the remedy.
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-2")
-        assert _conversation_attachment_context(conv) == ""
+        ctx = _conversation_attachment_context(conv)
+
+    assert ctx != ""
+    assert "No files are currently attached" in ctx
+    assert "ask them to attach" in ctx
+    # And it must not push the agent toward the route the file-access policy
+    # forbids anyway.
+    assert "Do not ask them to type or paste a filesystem path" in ctx
 
 
-def test_context_safe_when_conversation_detached():
-    # A conversation with no bound session must not raise — just yields "".
+def test_context_does_not_claim_emptiness_when_it_could_not_look():
+    # A detached conversation means we FAILED TO LOOK, not that nothing is
+    # attached. Saying "no files are currently attached" here would be the
+    # Cyberdeck bug inverted: the user attached a file and the agent flatly
+    # denies it exists. Affordance yes, emptiness claim no.
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-3")
     session.close()  # detaches conv from its session
-    assert _conversation_attachment_context(conv) == ""
+
+    ctx = _conversation_attachment_context(conv)
+
+    assert "ask them to attach" in ctx
+    assert "No files are currently attached" not in ctx
 
 
-def test_context_logs_and_returns_empty_on_error(monkeypatch):
+def test_context_logs_and_keeps_the_affordance_on_error(monkeypatch):
     # An unexpected failure (e.g. the DB query blows up) must NOT crash the
     # turn — but it must also not fail silently, because a swallowed error
     # looks identical to "no attachments" and reintroduces the Cyberdeck bug.
-    # The helper must return "" AND log a warning so the failure is visible.
+    # It must log a warning, still tell the agent how attachment works, and
+    # NOT assert that nothing is attached (see the test above).
     from unittest.mock import MagicMock
 
     import cowork.harnesses.anton_harness.harness as harness_mod
@@ -110,8 +131,27 @@ def test_context_logs_and_returns_empty_on_error(monkeypatch):
         conv = _make_conversation(session, "Cyberdeck-ctx-err")
         ctx = _conversation_attachment_context(conv)
 
-    assert ctx == ""  # degrades gracefully
+    assert "ask them to attach" in ctx  # degrades to guidance, not silence
+    assert "No files are currently attached" not in ctx
     assert spy_logger.warning.called, "a failure must be logged, not swallowed silently"
+
+
+def test_context_omits_the_emptiness_claim_when_files_are_listed(monkeypatch, tmp_path):
+    # The positive case must not carry the negative sentence. Guards against a
+    # refactor that appends the empty-case text unconditionally.
+    with _session() as session:
+        conv = _make_conversation(session, "ctx-both")
+        purpose = attachment_purpose(str(conv.id))
+        p = tmp_path / "real.csv"
+        p.write_text("a,b\n1,2\n")
+        session.add(File(filename="real.csv", content_type="text/csv", size=8, purpose=purpose, path=str(p)))
+        session.commit()
+        session.refresh(conv)
+
+        ctx = _conversation_attachment_context(conv)
+
+    assert "real.csv" in ctx
+    assert "No files are currently attached" not in ctx
 
 
 def test_context_skips_one_corrupt_row_keeps_others(tmp_path, monkeypatch):
