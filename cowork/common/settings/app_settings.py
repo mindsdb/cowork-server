@@ -65,6 +65,15 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 # premium canonical defaults below.
 MINDS_FREE_MODEL = "mindshub_air"
 
+
+def role_defaults(base: dict[str, str]) -> dict[str, str]:
+    """Model defaults for the current deployment: org mode overrides the
+    minds-cloud default to the free-bucket model (no wallet balance yet);
+    desktop keeps the premium canonical maps below."""
+    if get_app_settings().tenancy_mode == "org":
+        return {**base, "minds_cloud": MINDS_FREE_MODEL}
+    return base
+
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
