@@ -10,7 +10,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+#: Ceiling for ``TurnJob.deadline_ms``. 24h is far past any real turn and far
+#: below any epoch value, so an epoch fails validation instead of silently
+#: disabling the controller's timeout. Mirrors payload.MAX_DEADLINE_MS.
+MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 
 
 class TurnJob(BaseModel):
@@ -33,8 +39,24 @@ class TurnJob(BaseModel):
     reply_stream: str
     organization_id: str | None = None
     user_id: str | None = None
+    #: How long the turn may run, in milliseconds. A duration, NOT an epoch
+    #: timestamp: the controller reads it as a relative budget, so an epoch value
+    #: would mean a ~57 year deadline and no timeout at all.
     deadline_ms: int | None = None
     params: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("deadline_ms")
+    @classmethod
+    def _deadline_is_a_duration(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if v <= 0:
+            raise ValueError("deadline_ms must be positive")
+        if v > MAX_DEADLINE_MS:
+            raise ValueError(
+                f"deadline_ms={v} exceeds {MAX_DEADLINE_MS}ms; it is a duration, not an epoch timestamp"
+            )
+        return v
 
 
 class TurnReply(BaseModel):
