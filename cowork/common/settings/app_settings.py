@@ -35,11 +35,11 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 }
 
 # Per-provider default model tuple served to the picker as `recommendedPair`.
-# Order: (planning, coding, router). The 3rd slot is the "routing and
-# summarization" role. MindsHub's trio is the cost-tuned pick (ENG-1439):
-# kimi plans, gpt-codex codes, haiku routes; direct providers use their
-# smallest model for both coding and routing. The frontend falls back
-# to the coding slot when the 3rd is absent, so an older client still works.
+# Order: (planning, coding, router). MindsHub picks the cheapest option per
+# role, except coding, which uses a code-specialized model. Direct providers
+# use their smallest model for both coding and routing. The frontend falls
+# back to the coding slot when the 3rd is absent, so an older client still
+# works.
 RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
     "minds-cloud": ("kimi", "gpt-codex", "haiku"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
@@ -61,23 +61,22 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
 # The one model MindsHub's free monthly allowance covers; every other alias
-# bills the wallet. Org mode (managed, free-first) resolves defaults to it
-# unless the cached availability map proves the wallet can pay for the
-# canonical default (see user_settings._enabled_aware_default), so a tenant
-# without top-up credits isn't 402'd on its first turn.
+# bills the wallet. Org mode resolves to it unless the cached availability
+# map shows the wallet can pay for the canonical default (see
+# _enabled_aware_default in user_settings).
 MINDS_FREE_MODEL = "mindshub_air"
 
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
     "gemini": "gemini-3.6-flash",
-    "minds_cloud": "kimi",
+    "minds_cloud": "kimi",  # cheapest/fastest option, picked for the high-volume planning role
 }
 CODING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
     "gemini": "gemini-3.6-flash",
-    "minds_cloud": "gpt-codex",
+    "minds_cloud": "gpt-codex",  # product pick for a code-specialized model, not benchmarked
 }
 # Router role: the cheap front-model that runs history summarization (and later
 # gates each turn, respond-vs-delegate). Defaults: MindsHub → `haiku`, direct
