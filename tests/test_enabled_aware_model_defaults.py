@@ -1,4 +1,4 @@
-"""Tier-aware model defaults (ENG-597, defaults retargeted by ENG-1439).
+"""Tier-aware model defaults (ENG-597).
 
 MindsHub gates models per plan tier: a free-tier key gets the paid models
 (kimi/gpt-codex/haiku — the canonical minds-cloud defaults) as ``enabled:

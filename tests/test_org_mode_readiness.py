@@ -13,6 +13,12 @@ import json
 import pytest
 
 from cowork.common.settings import user_settings as us
+from cowork.common.settings.app_settings import (
+    CODING_MODEL_DEFAULTS,
+    MINDS_FREE_MODEL,
+    PLANNING_MODEL_DEFAULTS,
+    ROUTER_MODEL_DEFAULTS,
+)
 from cowork.common.settings.user_settings import Provider, UserSettings
 
 
@@ -109,42 +115,41 @@ class TestOrgModeReadiness:
         assert cs["provider"] == Provider.MINDS_CLOUD.value
 
 
-class TestOrgModeCreditAwareDefaults:
-    """ENG-1439: an org WITH top-up credits gets the premium default trio
-    (kimi planning / gpt-codex coding / haiku routing); anything short of
-    positive payability evidence in the cached availability map stays on the
-    free-allowance model, so a fresh org is never 402'd on its first turn."""
+_PLANNING = PLANNING_MODEL_DEFAULTS["minds_cloud"]
+_CODING = CODING_MODEL_DEFAULTS["minds_cloud"]
+_ROUTER = ROUTER_MODEL_DEFAULTS["minds_cloud"]
 
-    PAID = json.dumps(
-        {"mindshub_air": True, "kimi": True, "gpt-codex": True, "haiku": True}
-    )
-    FREE = json.dumps(
-        {"mindshub_air": True, "kimi": False, "gpt-codex": False, "haiku": False}
-    )
+
+class TestOrgModeCreditAwareDefaults:
+    """An org with credit gets the canonical defaults; anything short of
+    positive evidence in the availability map stays on MINDS_FREE_MODEL."""
+
+    PAID = json.dumps({MINDS_FREE_MODEL: True, _PLANNING: True, _CODING: True, _ROUTER: True})
+    FREE = json.dumps({MINDS_FREE_MODEL: True, _PLANNING: False, _CODING: False, _ROUTER: False})
 
     def test_org_with_credits_gets_premium_defaults(self, org_mode):
         s = _settings(minds_model_enabled=self.PAID)
-        assert s.resolved_planning_model == "kimi"
-        assert s.resolved_coding_model == "gpt-codex"
-        assert s.resolved_router_model == "haiku"
+        assert s.resolved_planning_model == _PLANNING
+        assert s.resolved_coding_model == _CODING
+        assert s.resolved_router_model == _ROUTER
 
     def test_org_without_credits_stays_on_free_model(self, org_mode):
         s = _settings(minds_model_enabled=self.FREE)
-        assert s.resolved_planning_model == "mindshub_air"
-        assert s.resolved_coding_model == "mindshub_air"
-        assert s.resolved_router_model == "mindshub_air"
+        assert s.resolved_planning_model == MINDS_FREE_MODEL
+        assert s.resolved_coding_model == MINDS_FREE_MODEL
+        assert s.resolved_router_model == MINDS_FREE_MODEL
 
     def test_org_cold_start_stays_on_free_model(self, org_mode):
         # Empty map (fetch never ran) is not evidence of credit — free-first.
         s = _settings()
-        assert s.resolved_router_model == "mindshub_air"
+        assert s.resolved_router_model == MINDS_FREE_MODEL
 
     def test_org_default_missing_from_map_stays_free(self, org_mode):
         # Unlike desktop (missing = available), org needs the default itself
         # marked payable; a gateway that stops listing it downgrades to free.
-        s = _settings(minds_model_enabled=json.dumps({"mindshub_air": True, "kimi": True}))
-        assert s.resolved_planning_model == "kimi"
-        assert s.resolved_coding_model == "mindshub_air"
+        s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, _PLANNING: True}))
+        assert s.resolved_planning_model == _PLANNING
+        assert s.resolved_coding_model == MINDS_FREE_MODEL
 
     def test_org_explicit_choice_is_never_rewritten(self, org_mode):
         s = _settings(minds_model_enabled=self.FREE, planning_model="opus")

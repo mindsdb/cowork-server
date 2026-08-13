@@ -118,27 +118,12 @@ def _enabled_aware_default(
 ) -> str | None:
     """The provider's canonical default model, adjusted for availability.
 
-    MindsHub marks a model the org's wallet can't currently pay for (or whose
-    free allowance is exhausted) as ``enabled: false`` from ``/v1/models``, so
-    blindly handing out the canonical default could be denied every turn.
-    Applies only to minds-cloud: direct (BYOK) providers have no such
-    availability map (``minds_model_enabled``).
+    Applies only to minds-cloud; direct (BYOK) providers have no such
+    availability map. Desktop falls back to the first enabled model when the
+    default is locked; degraded/absent map data leaves it unchanged.
 
-    Org mode (managed, free-first) inverts the burden of proof (ENG-1439): the
-    canonical defaults are billed models, handed out only when the cached map
-    positively marks the default payable. Anything else — cold start before
-    the first fetch, a default the gateway stopped listing, a drained wallet —
-    resolves to the free-allowance model, so a tenant without top-up credits
-    is never 402'd on its first turn. Nothing persists the resolved value, so
-    topping up flips the default to the canonical model on the next settings
-    load, and draining flips it back.
-
-    Desktop stays optimistic: when the map marks the default as disabled, fall
-    back to the first enabled model in the map — the map preserves the
-    gateway's ``/v1/models`` ordering, which lists the free/baseline model
-    first. Deliberately conservative: an absent/empty map, a default missing
-    from the map, or a map with nothing enabled all leave the canonical
-    default untouched — degraded metadata must never change behavior.
+    Org mode instead requires the map to mark the default payable, else
+    falls back to MINDS_FREE_MODEL, so a credit-less org isn't charged.
     """
     default = defaults.get(provider_value)
     if provider_value != Provider.MINDS_CLOUD.value:
