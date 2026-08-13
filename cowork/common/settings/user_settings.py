@@ -119,11 +119,14 @@ def _enabled_aware_default(
     """The provider's canonical default model, adjusted for availability.
 
     Applies only to minds-cloud; direct (BYOK) providers have no such
-    availability map. Desktop falls back to the first enabled model when the
-    default is locked; degraded/absent map data leaves it unchanged.
+    availability map. A non-empty map always carries an explicit flag for
+    every alias the catalog serves, so a default that's locked OR simply
+    missing from it falls back to the first enabled model — missing means
+    gone (renamed/retired), not degraded data. An empty/absent map (no tier
+    data at all) leaves the default untouched.
 
-    Org mode instead requires the map to mark the default payable, else
-    falls back to MINDS_FREE_MODEL, so a credit-less org isn't charged.
+    Org mode requires the same positive evidence, but falls back to
+    MINDS_FREE_MODEL instead, so a credit-less org isn't charged.
     """
     default = defaults.get(provider_value)
     if provider_value != Provider.MINDS_CLOUD.value:
@@ -134,7 +137,7 @@ def _enabled_aware_default(
         return MINDS_FREE_MODEL
     if not enabled_map:
         return default
-    if default is None or enabled_map.get(default, True):
+    if default is None or enabled_map.get(default) is True:
         return default
     for model_id, enabled in enabled_map.items():
         if enabled:

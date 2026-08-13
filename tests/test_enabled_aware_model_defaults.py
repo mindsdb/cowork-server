@@ -81,10 +81,11 @@ def test_all_disabled_map_keeps_canonical_default():
     assert s.planning_model == "kimi"
 
 
-def test_default_missing_from_map_is_treated_as_available():
-    # Older gateway that doesn't list the default at all → default untouched.
+def test_default_missing_from_nonempty_map_falls_back_to_first_enabled():
+    # A non-empty map always carries every alias the catalog currently
+    # serves, so missing means gone (renamed/retired) — same as disabled.
     s = _minds(minds_model_enabled=json.dumps({"mindshub_air": True}))
-    assert s.planning_model == "kimi"
+    assert s.planning_model == "mindshub_air"
 
 
 def test_invalid_map_json_degrades_to_canonical_default():
