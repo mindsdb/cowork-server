@@ -466,11 +466,7 @@ def build_cowork_lookup_connector_tool():
         ),
         input_schema=_LOOKUP_CONNECTOR_SCHEMA,
         handler=_cowork_lookup_connector,
-        # Deferred (ENG-764): unlocked when the model recalls the guided
-        # data-source connection skill. No `prompt` — the procedure lives in
-        # the `connect-datasource` SKILL.md; duplicating it here would re-enter
-        # the system prompt on every turn once the tool sticks after unlock.
-        unlock_skill="connect-datasource",
+        prompt=_LOOKUP_CONNECTOR_PROMPT,
     )
 
 
@@ -720,8 +716,7 @@ def build_cowork_request_credentials_tool():
         ),
         input_schema=_REQUEST_CREDENTIALS_SCHEMA,
         handler=_cowork_request_credentials,
-        # `connect-datasource` SKILL.md (see lookup_connector above).
-        unlock_skill="connect-datasource",
+        prompt=_REQUEST_CREDENTIALS_PROMPT,
     )
 
 
@@ -747,6 +742,16 @@ _LABEL_CONNECTION_SCHEMA: dict[str, Any] = {
     },
     "required": ["engine", "name", "label"],
 }
+
+_LABEL_CONNECTION_PROMPT = (
+    "Use `label_connection` to give a saved connection a human role label once "
+    "the user tells you which is which — e.g. when two Gmail accounts are "
+    "connected and the user says `regtr@mail.com` is their support address, call "
+    "`label_connection(engine='gmail', name='<slug>', label='Support')`. The label "
+    "is shown beside the connection in Connected Data Sources so you can pick the "
+    "right account later. Never guess a label — ask the user first, then persist it."
+)
+
 
 async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     """Tool handler for `label_connection` — persist a human label on a saved
@@ -781,8 +786,7 @@ def build_cowork_label_connection_tool():
         ),
         input_schema=_LABEL_CONNECTION_SCHEMA,
         handler=_cowork_label_connection,
-        # `connect-datasource` SKILL.md (see lookup_connector above).
-        unlock_skill="connect-datasource",
+        prompt=_LABEL_CONNECTION_PROMPT,
     )
 
 
