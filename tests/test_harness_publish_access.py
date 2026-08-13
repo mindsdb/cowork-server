@@ -35,7 +35,7 @@ async def test_harness_forwards_explicit_password(tmp_path):
         )
     _, kwargs = fake.call_args
     assert kwargs["access"] == {"mode": "password", "password": "hunter2"}
-    assert "Published" in out
+    assert "Published" in getattr(out, "content", out)
 
 
 @pytest.mark.asyncio
