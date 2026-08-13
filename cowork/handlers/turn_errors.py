@@ -465,6 +465,46 @@ def _gateway_denial_code(exc: BaseException) -> str | None:
     return None
 
 
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """The ``Retry-After`` hint from anywhere in the cause chain, in seconds.
+
+    The gateway sends it on every velocity 429 as integer seconds. The renderer
+    needs it to time-gate its Retry button: an ungated retry re-sends a large
+    context into the limiter that just refused it, which is the same
+    amplification loop the fix removed — only user-initiated (ENG-1537).
+
+    Integer-seconds form only. The HTTP-date form is legal but nothing in use
+    emits it, and misreading a date as a number would gate the button for
+    centuries; unparseable, negative and non-finite values are dropped so the
+    caller falls back to an ungated (but honest) card.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        resp = getattr(cur, "response", None)
+        headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
+        if headers is not None:
+            try:
+                raw = headers.get("retry-after") or headers.get("Retry-After")
+            except Exception:
+                raw = None
+            if raw is not None:
+                try:
+                    secs = float(str(raw).strip())
+                except (TypeError, ValueError):
+                    secs = None
+                if (
+                    secs is not None
+                    and secs == secs  # not NaN
+                    and secs not in (float("inf"), float("-inf"))
+                    and secs >= 0
+                ):
+                    return secs
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
@@ -605,14 +645,17 @@ def response_failed_payload(
     reconnectable: bool | None = None,
     provider_label: str | None = None,
     model: str | None = None,
+    retry_after: float | None = None,
 ) -> dict:
     """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
     ``reconnectable`` / ``provider_label`` are included only for the
     ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
     "Open Settings" (BYOK); ``model`` only for the model-403 case so the card
-    can name the locked model ("Sonnet needs credits") — omitted otherwise to
-    keep the shape unchanged for every other failure.
+    can name the locked model ("Sonnet needs credits"); ``retry_after`` only for
+    ``rate_limited`` so the card can time-gate its Retry — omitted otherwise to
+    keep the shape unchanged for every other failure. All additive: an older
+    client ignores fields it doesn't read.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:
@@ -621,6 +664,8 @@ def response_failed_payload(
         payload["provider_label"] = provider_label
     if model is not None:
         payload["model"] = model
+    if retry_after is not None:
+        payload["retry_after"] = retry_after
     return payload
 
 
@@ -631,14 +676,16 @@ def response_failed_sse(
     reconnectable: bool | None = None,
     provider_label: str | None = None,
     model: str | None = None,
+    retry_after: float | None = None,
 ) -> str:
     """Build a ``response.failed`` SSE frame (same wire shape the renderer's
-    parser already handles, plus the optional auth/model fields)."""
+    parser already handles, plus the optional auth/model/retry-after fields)."""
     payload = response_failed_payload(
         error,
         code,
         reconnectable=reconnectable,
         provider_label=provider_label,
         model=model,
+        retry_after=retry_after,
     )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"

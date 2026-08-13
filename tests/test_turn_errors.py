@@ -626,6 +626,30 @@ def test_billing_denials_still_card_immediately(status, reason):
     assert message == te.TOKEN_LIMIT_USER_MESSAGE
 
 
+def test_retry_after_is_read_off_the_chain_for_the_card_gate():
+    # ENG-1537: the renderer needs the server's own interval to time-gate its
+    # Retry. Integer seconds only — a date form would gate the button for
+    # centuries, so it is dropped in favour of no gate.
+    exc = _gateway_failure(429, reason="rate_limited")
+    exc.__cause__.response.headers["Retry-After"] = "30"
+    assert te.retry_after_seconds(exc) == 30.0
+
+    dated = _gateway_failure(429, reason="rate_limited")
+    dated.__cause__.response.headers["Retry-After"] = "Wed, 21 Oct 2026 07:28:00 GMT"
+    assert te.retry_after_seconds(dated) is None
+
+    assert te.retry_after_seconds(_gateway_failure(429, reason="rate_limited")) is None
+    assert te.retry_after_seconds(Exception("bare")) is None
+
+
+def test_retry_after_rides_the_failed_payload_only_when_present():
+    # Additive field: absent unless we actually have a number, so the wire shape
+    # is unchanged for every other failure and older clients are unaffected.
+    with_hint = te.response_failed_payload("msg", te.RATE_LIMITED_CODE, retry_after=30.0)
+    assert with_hint["retry_after"] == 30.0
+    assert "retry_after" not in te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
+
+
 def test_reasonless_gateway_429_still_cards_as_credits():
     # A gateway old enough to omit the header only ever meant "allowance" by a
     # 429, so the legacy assumption is preserved for a 429 carrying neither a

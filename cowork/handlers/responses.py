@@ -35,11 +35,13 @@ from cowork.handlers.turn_errors import (
     MODEL_ACCESS_DENIED_CODE,
     MODEL_DISABLED_CODE,
     PROVIDER_OVERLOADED_CODE,
+    RATE_LIMITED_CODE,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
     provider_overloaded_info,
     response_failed_payload,
+    retry_after_seconds,
     response_failed_sse,
 )
 from cowork.db.scoped import ScopedSession, scope_from_principal
@@ -605,6 +607,15 @@ class ResponsesHandler:
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
+            elif code == RATE_LIMITED_CODE:
+                # Pass the server's own wait interval so the card can time-gate
+                # its Retry (ENG-1537). An ungated Retry re-sends a large
+                # context into the limiter that just refused it — the same
+                # amplification this fix removed, only user-initiated. Absent
+                # header → no gate, which is honest rather than invented.
+                _after = retry_after_seconds(exc)
+                if _after is not None:
+                    extra = {"retry_after": _after}
             elif code == PROVIDER_OVERLOADED_CODE:
                 # Transient-incident timeout (ENG-673): give the card the failing
                 # model AND the active provider, and flag whether the user is
