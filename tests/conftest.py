@@ -12,6 +12,10 @@ from pathlib import Path
 
 TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
 # Force isolation (assignment, not setdefault — never touch a real DB).
+# COWORK_HOME first: cowork_home() now fails closed for a source checkout with
+# COWORK_HOME unset (ENG-1541), and the suite runs from source, so pin it to
+# the throwaway root before any cowork module imports and resolves paths.
+os.environ["COWORK_HOME"] = str(TMP)
 os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
 os.environ["MASTER_KEY_PATH"] = str(TMP / "master.key")
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
