@@ -247,6 +247,11 @@ def _harness_options() -> list[str]:
 # re-syncing a stale .env line can never override a choice the user made in
 # the product. When in doubt, leave it out — .env lines still work for the
 # standalone anton CLI.
+#: Lowest non-zero per-turn spend ceiling a user may set (ENG-1286). Mirrored by
+#: `BUDGET_FIELDS.maxTurnTokens.min` in cowork's `settingsTransform.js`; the two
+#: are asserted equal in `tests/test_agent_budget_settings.py`.
+TURN_CEILING_FLOOR = 750_000
+
 SETTING_ENV_ALIASES: dict[str, str] = {
     "anthropic_api_key": "ANTON_ANTHROPIC_API_KEY",
     "openai_api_key": "ANTON_OPENAI_API_KEY",
@@ -521,16 +526,26 @@ class UserSettings(Settings):
     )
     max_turn_tokens: Annotated[int, ORG] = Field(
         default_factory=lambda: get_app_settings().default_max_turn_tokens,
-        # 750_000, not a rounder-looking 100_000. A turn's first LLM call costs
-        # roughly the conversation's context — ~190k on a long one — so a ceiling
-        # smaller than a couple of calls stops the turn before it has done
-        # anything. Measured against anton: 100_000 dispatched ZERO tools and
-        # still spent 400_000. anton now guarantees at least one tool round
-        # regardless, so this floor is a usability bound rather than a safety
-        # one: 750_000 is the lowest value where a 190k-context turn still gets
-        # several rounds, and it sits just above the p75 external turn (736k),
-        # so "the minimum" means "cut me off around the 75th percentile".
-        ge=750_000,
+        # Plain contiguous range. "No limit" in the UI is the TOP of it
+        # (50_000_000), not a sentinel: at that value the ceiling cannot fire in
+        # practice, because the step cap lands first (largest turn observed in
+        # 30 days of production: 8.26M). A 0-means-unlimited sentinel was built
+        # and then removed — it needed a hole in the range, a validator to guard
+        # the hole, and a special case in the client clamp, all to solve
+        # discoverability that the checkbox solves on its own. It also collided
+        # with `max_continuations` next door, where 0 means literally zero.
+        #
+        # The floor is 750_000, not a rounder-looking 100_000. A turn's first
+        # LLM call costs roughly the conversation's context — ~190k on a long
+        # one — so a ceiling smaller than a couple of calls stops the turn
+        # before it has done anything. Measured against anton: 100_000
+        # dispatched ZERO tools and still spent 400_000. anton now guarantees at
+        # least one tool round regardless, so this floor is a usability bound
+        # rather than a safety one: it is the lowest value where a 190k-context
+        # turn still gets several rounds, and it sits just above the p75
+        # external turn (736k), so "the minimum" means "cut me off around the
+        # 75th percentile".
+        ge=TURN_CEILING_FLOOR,
         le=50_000_000,
         title="Max Tokens per Task",
         description=(

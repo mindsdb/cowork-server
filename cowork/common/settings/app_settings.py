@@ -604,6 +604,11 @@ class AppSettings(Settings):
     # loosen a ceiling against the very population it was sized on.
     default_max_turn_tokens: int = Field(
         default=1_250_000,
+        # Deployment-level default. Kept at ge=750_000 rather than mirroring
+        # UserSettings' "0 = unlimited": an operator turning the guard off for a
+        # whole org silently is exactly the outcome the per-user sentinel exists
+        # to make deliberate. An operator who really wants that sets a huge
+        # number, which is at least visible in the value.
         ge=750_000,
         le=50_000_000,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),

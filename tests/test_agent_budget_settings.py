@@ -191,18 +191,32 @@ def test_hosted_deployments_can_lower_the_ceiling_via_env(monkeypatch):
     ).max_turn_tokens == 2_000_000
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "0",          # the UI must not be able to switch the guard OFF
-        "100000",     # measured against anton: dispatches ZERO tools, spends 400k
-        "400000",     # still zero tools at a 190k context
-        "749999",     # one below the floor
-        "99999999",   # above le=50_000_000
-        "lots",       # not a number
-    ],
-)
+@pytest.mark.parametrize("bad", ["400000", "99999999", "lots"])
 def test_turn_token_ceiling_out_of_bounds_rejected(bad):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        UserSettings.model_validate({"max_turn_tokens": bad})
+
+
+def test_the_top_of_the_range_is_the_no_limit_setting():
+    """"No limit" in the UI writes the MAX, not a sentinel.
+
+    At 50_000_000 the ceiling cannot fire in practice — the step cap lands first
+    (largest turn observed in 30 days: 8.26M) — so the top of the range is
+    effectively "off". That used to be a problem because it was undiscoverable;
+    the checkbox fixes that, which is why the 0-means-unlimited sentinel was
+    removed rather than kept. Keeping the range contiguous means no validator
+    guarding a hole and no special case in the client clamp.
+    """
+    assert UserSettings.model_validate(
+        {"max_turn_tokens": "50000000"}
+    ).max_turn_tokens == 50_000_000
+
+
+@pytest.mark.parametrize("bad", ["0", "1", "100000", "749999"])
+def test_below_the_floor_is_rejected(bad):
+    """Including 0 — there is no sentinel, so 0 is just an illegal ceiling."""
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
@@ -224,9 +238,9 @@ def test_the_floor_is_above_one_call_s_worth_of_context():
     the floor buys roughly three calls, which is the bound asserted here — not
     four, which the first version of this test claimed and which fails by 10k.
     """
-    field = UserSettings.model_fields["max_turn_tokens"]
-    ge = next(m.ge for m in field.metadata if hasattr(m, "ge"))
-    assert ge >= 3 * 190_000
+    from cowork.common.settings.user_settings import TURN_CEILING_FLOOR
+
+    assert TURN_CEILING_FLOOR >= 3 * 190_000
 
 
 def test_client_and_server_bounds_stay_in_lockstep():
@@ -239,10 +253,11 @@ def test_client_and_server_bounds_stay_in_lockstep():
     Update both together or not at all: cowork
     `src/renderer/cowork/lib/settingsTransform.js` -> BUDGET_FIELDS.
     """
+    from cowork.common.settings.user_settings import TURN_CEILING_FLOOR
+
     field = UserSettings.model_fields["max_turn_tokens"]
-    ge = next(m.ge for m in field.metadata if hasattr(m, "ge"))
     le = next(m.le for m in field.metadata if hasattr(m, "le"))
-    assert (ge, le) == (750_000, 50_000_000)
+    assert (TURN_CEILING_FLOOR, le) == (750_000, 50_000_000)
 
 
 def test_overlay_applies_every_budget_to_a_real_anton_settings():
