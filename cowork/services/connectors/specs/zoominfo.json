@@ -51,7 +51,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Your ZoomInfo account password. Anton uses this to obtain and refresh JWT tokens \u2014 it is stored encrypted locally."
+            "description": "Your ZoomInfo account password. Anton uses this to obtain and refresh JWT tokens \u2014 it is stored locally with restricted file permissions."
           }
         ]
       },
