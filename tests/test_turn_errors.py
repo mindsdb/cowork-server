@@ -538,6 +538,103 @@ def test_reason_header_allowance_exhausted_maps_to_out_of_credits():
     assert message == te.TOKEN_LIMIT_USER_MESSAGE
 
 
+# ── The two 429 flavours must never share a card (ENG-1537) ────────
+
+
+def test_velocity_rate_limit_is_not_out_of_credits():
+    # THE defect. `rate_limited` was the one gateway reason this module didn't
+    # know, so it fell to the bare-status 429 rule and rendered as
+    # "You're out of credits. Add credits to keep working." — advertising a
+    # purchase that cannot lift a per-minute token ceiling.
+    code, message = te.friendly_turn_error(_gateway_failure(429, reason="rate_limited"))
+    assert code == te.RATE_LIMITED_CODE
+    assert message == te.RATE_LIMITED_USER_MESSAGE
+    assert code != te.TOKEN_LIMIT_CODE
+    # The copy must not send the user to billing, in either direction.
+    assert "add credits" not in message.lower()
+
+
+def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
+    # ENG-1363: the Anthropic /v1/messages lane strips X-MindsHub-* headers.
+    # The gateway sets `code` and `reason` to the same value, so the body is a
+    # second carrier for the identical decision — without it, that lane would
+    # fall to the bare-status rule and show the credits card again.
+    exc = ConnectionError("Server returned 429")
+    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
+    inner.body = {"error": {"code": "rate_limited", "message": "Rate limit exceeded"}}
+    code, _ = te.friendly_turn_error(exc)
+    assert code == te.RATE_LIMITED_CODE
+
+
+def test_body_code_fallback_still_cards_a_wallet_denial():
+    # The same second carrier must keep working for the case that already
+    # works — a header-less wallet denial is out-of-credits, not a rate limit.
+    exc = ConnectionError("Server returned 402")
+    exc.__cause__ = inner = _FakeAPIStatusError(402, {}, url=_minds_gateway_url())
+    inner.body = {"code": "wallet_empty"}  # SDK-unwrapped dialect
+    assert te.friendly_turn_error(exc)[0] == te.TOKEN_LIMIT_CODE
+
+
+def test_unrelated_provider_body_code_is_not_read_as_a_gateway_denial():
+    # The body fallback only honours codes this module defines. A BYOK
+    # provider's own `code` must not be able to conjure a billing verdict.
+    exc = ConnectionError("Server returned 429")
+    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url="https://api.openai.com/v1/x")
+    inner.body = {"error": {"code": "some_openai_thing"}}
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_exhausted_rate_limit_wait_keeps_its_code_over_the_bare_status_rule():
+    # ENG-1537: when anton's wait budget runs out it re-raises with
+    # code="rate_limited", but the ORIGINAL 429 is still in the cause chain —
+    # so the bare-status rule would relabel the honest "waiting didn't clear
+    # it" failure as out-of-credits, undoing the whole point of the wait.
+    exhausted = _FakeOverloadedErr(
+        "Too many requests too quickly — the rate limit didn't clear in time.",
+        code="rate_limited",
+        model="sonnet",
+    )
+    exhausted.__cause__ = _FakeAPIStatusError(
+        429, {"X-MindsHub-Reason": "rate_limited"}, url=_minds_gateway_url()
+    )
+    code, _ = te.friendly_turn_error(exhausted)
+    assert code == te.RATE_LIMITED_CODE
+
+
+def test_a_real_provider_incident_still_maps_to_provider_overloaded():
+    # The rate-limit early check must not swallow the incident case it sits in
+    # front of.
+    incident = _FakeOverloadedErr(
+        "Anthropic is experiencing an incident and didn't recover in time.",
+        code="provider_overloaded",
+        model="sonnet",
+    )
+    assert te.friendly_turn_error(incident)[0] == te.PROVIDER_OVERLOADED_CODE
+
+
+@pytest.mark.parametrize("status,reason", [
+    (402, "wallet_empty"),
+    (429, "included_allowance_exhausted"),
+])
+def test_billing_denials_still_card_immediately(status, reason):
+    # ENG-1169 regression guard, in the other direction. These share the 429
+    # status (and 402) with the velocity limit but are permanent for the
+    # identical request — the allowance resets monthly — so they must keep
+    # going straight to the credits card and must never be routed to a wait.
+    code, message = te.friendly_turn_error(_gateway_failure(status, reason=reason))
+    assert code == te.TOKEN_LIMIT_CODE
+    assert message == te.TOKEN_LIMIT_USER_MESSAGE
+
+
+def test_reasonless_gateway_429_still_cards_as_credits():
+    # A gateway old enough to omit the header only ever meant "allowance" by a
+    # 429, so the legacy assumption is preserved for a 429 carrying neither a
+    # reason nor a body code. Narrowing this instead would have stripped the
+    # credits card from a real allowance exhaustion.
+    code, _ = te.friendly_turn_error(_gateway_failure(429))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
 def test_reason_header_policy_unavailable_is_transient_not_out_of_credits():
     code, message = te.friendly_turn_error(_gateway_failure(503, reason="policy_unavailable"))
     assert code == te.POLICY_UNAVAILABLE_CODE
@@ -841,6 +938,11 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         "model_disabled",
         "provider_overloaded",
         "image_format",
+        # ENG-1537. This tripwire did its job: adding the constant failed this
+        # test before the renderer branch existed, which is exactly the gap
+        # ENG-1282 built it to catch. The matching branch lands in
+        # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
+        "rate_limited",
         "anton_error",
     }
 

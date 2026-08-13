@@ -42,10 +42,23 @@ IMAGE_FORMAT_CODE = "image_format"
 # with no completion event and no error frame — the SSE connection just closes
 # and the renderer's spinner stops, which reads as "Anton is dead" rather than
 # an out-of-credits message. The desktop renders a card for the `token_limit`
-# code and shows THIS text as the card body (it always outranks the client's
-# fallback copy) with a single Add-credits button (ENG-1169) — so this copy
-# must not instruct actions the card doesn't offer (the old text advertised a
-# "bring your own key" button that no longer exists).
+# code with a single Add-credits button (ENG-1169) — so this copy must not
+# instruct actions the card doesn't offer (the old text advertised a "bring your
+# own key" button that no longer exists).
+#
+# NOTE, corrected 2026-08-13: this comment used to claim the server text
+# "always outranks the client's fallback copy". That is no longer true —
+# ENG-1304 made the desktop card use FIXED client copy for `token_limit` and
+# ignore this string (`ChatView.jsx`), because the gateway's wording predated
+# pay-as-you-go. So editing this message alone changes nothing a desktop user
+# sees; the client must change too. It still reaches non-desktop consumers and
+# is the fallback for a client that doesn't hardcode.
+# Both denials still share this copy. Splitting them — "your free monthly
+# allowance is spent, it resets on <date>" versus "your wallet is empty" — needs
+# an additive payload field plus client work (a new CODE would make an older
+# client fall through to the generic alert and LOSE its Add-credits button), so
+# it is deliberately NOT bundled with the rate-limit fix: that path is broken,
+# this one merely reads imprecisely. Tracked separately (ENG-1537 step 8).
 TOKEN_LIMIT_USER_MESSAGE = (
     "You're out of credits. Add credits to keep working."
 )
@@ -54,6 +67,22 @@ TOKEN_LIMIT_USER_MESSAGE = (
 # back-compat with clients already branching on it; it now covers both the
 # empty-wallet and spent-allowance reasons above.
 TOKEN_LIMIT_CODE = "token_limit"
+
+# Curated copy + wire code for a VELOCITY rate-limit (gateway 429
+# `rate_limited`) — the org exceeded requests/tokens per minute, NOT its credit
+# balance. ENG-1537: this was the fifth and only unmapped gateway reason, so it
+# fell through to the bare-status 429 rule below and rendered as out-of-credits
+# — telling the user to buy something that cannot raise a per-minute ceiling.
+# The gateway is explicit that the two are different (`rate_limited()` in
+# minds/inference/errors.py: "the caller should slow down and retry after
+# retry_after seconds, not wait for an allowance reset or add credits").
+# Copy names the remedy (wait) and rules out the one the user would otherwise
+# assume, because they have just been shown a credits card for this.
+RATE_LIMITED_CODE = "rate_limited"
+RATE_LIMITED_USER_MESSAGE = (
+    "Too many requests too quickly. Wait a moment and continue — "
+    "this isn't a credits problem."
+)
 
 # Curated copy + wire code for a transient billing/auth policy outage — the
 # gateway couldn't reach the service that decides whether a call is paid for
@@ -109,10 +138,17 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 
 # The X-MindsHub-Reason header values the inference gateway sets to name the
 # billing decision precisely. Preferred over status/message heuristics.
+#
+# This is the COMPLETE set the gateway can emit: `denial_error()`
+# (minds/inference/errors.py) maps four gate reasons explicitly and fails closed
+# to `policy_unavailable` for anything else, so no sixth value reaches a client.
+# Verified 2026-08-13 — `rate_limited` was the one missing here (ENG-1537), and
+# its absence is why a velocity limit read as out-of-credits.
 _REASON_WALLET_EMPTY = "wallet_empty"
 _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 _REASON_UNKNOWN_MODEL = "unknown_model"
+_REASON_RATE_LIMITED = "rate_limited"
 
 # Wire-level code for a transient provider incident that didn't clear within
 # anton's retry budget (ENG-673) — the model provider (or an upstream it depends
@@ -393,13 +429,57 @@ def _from_minds_gateway(host: str | None) -> bool:
     return expected is not None and host == expected
 
 
+def _gateway_denial_code(exc: BaseException) -> str | None:
+    """The gateway's body ``code`` from anywhere in the cause chain, if any.
+
+    Fallback discriminator for a lane that delivers the body but loses the
+    ``X-MindsHub-Reason`` header — the failure mode ENG-1363 reports on the
+    Anthropic ``/v1/messages`` door. The gateway sets ``code`` and ``reason`` to
+    the same value, so one substitutes for the other.
+
+    Reads both dialects: the OpenAI SDK peels the ``error`` envelope so ``code``
+    sits at top level, while a proxy may deliver it nested. Returns only values
+    this module knows, so an unrelated provider ``code`` can never be mistaken
+    for a gateway denial (ENG-1537).
+    """
+    known = (
+        _REASON_WALLET_EMPTY,
+        _REASON_ALLOWANCE_EXHAUSTED,
+        _REASON_POLICY_UNAVAILABLE,
+        _REASON_UNKNOWN_MODEL,
+        _REASON_RATE_LIMITED,
+    )
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        body = getattr(cur, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], dict):
+            body = body[0]  # Gemini's single-element-array dialect
+        if isinstance(body, dict):
+            env = body.get("error") if isinstance(body.get("error"), dict) else {}
+            code = body.get("code") or env.get("code")
+            if isinstance(code, str) and code in known:
+                return code
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
     Empty wallet and spent free-allowance both mean "out of credits" (the fix is
     to add credits), so they share the ``token_limit`` out-of-credits card. A
     policy outage is transient. An unknown model can't be fixed with credits.
+
+    A velocity ``rate_limited`` is NOT out of credits and must never share that
+    card: the ceiling is per-minute tokens, so buying credits cannot lift it and
+    the remedy is to wait (ENG-1537). It is listed here rather than left to the
+    bare-status 429 rule below precisely because that rule cannot tell the two
+    429s apart — and the gateway already did.
     """
+    if reason == _REASON_RATE_LIMITED:
+        return RATE_LIMITED_CODE, RATE_LIMITED_USER_MESSAGE
     if reason in (_REASON_WALLET_EMPTY, _REASON_ALLOWANCE_EXHAUSTED):
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if reason == _REASON_POLICY_UNAVAILABLE:
@@ -430,6 +510,27 @@ def friendly_turn_error(
         mapped = _map_gateway_reason(reason)
         if mapped is not None:
             return mapped
+
+    # Same decision from the body's `code` when the header didn't survive the
+    # trip (ENG-1363's Anthropic lane strips it). The gateway sets both fields
+    # to the same value, so this is the identical decision from a second
+    # carrier — NOT a heuristic. It must stay above the bare-status rule below:
+    # that rule cannot tell the velocity 429 from the allowance 429, and
+    # guessing "out of credits" for a rate limit is the ENG-1537 defect.
+    denial_code = _gateway_denial_code(exc)
+    if denial_code is not None:
+        mapped = _map_gateway_reason(denial_code)
+        if mapped is not None:
+            return mapped
+
+    # anton exhausted its rate-limit wait budget and re-raised with the code
+    # (ENG-1537). Checked here, above the bare-status rule, because that
+    # exception still carries the original 429 in its cause chain — so without
+    # this the honest "waiting didn't clear it" failure is relabelled
+    # out-of-credits, which is exactly what the wait was added to stop.
+    overloaded_early = provider_overloaded_info(exc)
+    if overloaded_early is not None and overloaded_early[0] == RATE_LIMITED_CODE:
+        return RATE_LIMITED_CODE, str(exc) or RATE_LIMITED_USER_MESSAGE
 
     # Precedence per ENG-673: token_limit / the billing-status fallback /
     # provider_auth / the ENG-598 model gate all WIN over provider_overloaded
