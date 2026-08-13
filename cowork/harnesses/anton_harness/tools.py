@@ -111,7 +111,7 @@ COWORK_PUBLISH_PROMPT = (
 )
 
 
-async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
+async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     """Server-side equivalent of anton.tools.handle_publish_or_preview.
 
     Mirrors the same `action` semantics:
@@ -200,6 +200,28 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     # action == 'publish' — delegate to the service (single source of truth for
     # target resolution, fullstack bundling, vault secrets, access, history,
     # and report_id reuse).
+    #
+    # The SideEffectResult envelope (ENG-696) lives in anton; cowork-server and
+    # anton deploy independently, so an older anton without it must not break
+    # publishing. When absent, fall back to the plain `message` string — the
+    # exact pre-envelope return value, so behavior is byte-identical there.
+    try:
+        from anton.core.tools.side_effect import SideEffectResult, now_iso
+    except ImportError:
+        SideEffectResult = None
+
+    def _ok(message: str, **fields):
+        if SideEffectResult is None:
+            return message
+        return SideEffectResult(
+            success=True, message=message, committed_at=now_iso(), **fields
+        ).to_outcome()
+
+    def _fail(message: str, reason: str = ""):
+        if SideEffectResult is None:
+            return message
+        return SideEffectResult.failed(message, reason=reason)
+
     try:
         result = _publish_artifact(abs_path, access=access)
     except ValueError as exc:
@@ -210,21 +232,38 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
         # they already have and block a legitimate retry.
         if "api key" in str(exc).lower():
             logger.info("Cowork publish blocked: %s", exc)
-            return (
+            return _fail(
                 "STOP: No Minds API key configured. Tell the user to set their "
                 "Minds API key in Settings (or in their .env) before publishing. "
-                "Do NOT call this tool again until they confirm the key is set."
+                "Do NOT call this tool again until they confirm the key is set.",
+                reason="missing_api_key",
             )
         logger.info("Cowork publish rejected: %s", exc)
-        return f"PUBLISH FAILED: {exc}"
+        return _fail(f"PUBLISH FAILED: {exc}", reason="ValueError")
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
-        return f"PUBLISH FAILED: {exc}"
+        return _fail(f"PUBLISH FAILED: {exc}", reason=type(exc).__name__)
 
+    inner = result.get("result", {}) if isinstance(result, dict) else {}
     view_url = result.get("url", "") if isinstance(result, dict) else ""
+    report_id = inner.get("report_id") or None
+    md5 = inner.get("md5") or None
     if not view_url:
-        return "Published, but no view URL was returned."
-    return f"Published successfully! View URL: {view_url}"
+        # Committed (the service returned) but the URL is missing — success is
+        # true, external_url stays null so the ambiguity is explicit, not prose.
+        return _ok(
+            "Published, but no view URL was returned.",
+            resource_id=report_id,
+            idempotency_key=report_id,
+            content_hash=(f"md5:{md5}" if md5 else None),
+        )
+    return _ok(
+        f"Published successfully! View URL: {view_url}",
+        resource_id=report_id,
+        external_url=view_url,
+        idempotency_key=report_id,
+        content_hash=(f"md5:{md5}" if md5 else None),
+    )
 
 
 def build_cowork_publish_tool():
@@ -466,11 +505,7 @@ def build_cowork_lookup_connector_tool():
         ),
         input_schema=_LOOKUP_CONNECTOR_SCHEMA,
         handler=_cowork_lookup_connector,
-        # Deferred (ENG-764): unlocked when the model recalls the guided
-        # data-source connection skill. No `prompt` — the procedure lives in
-        # the `connect-datasource` SKILL.md; duplicating it here would re-enter
-        # the system prompt on every turn once the tool sticks after unlock.
-        unlock_skill="connect-datasource",
+        prompt=_LOOKUP_CONNECTOR_PROMPT,
     )
 
 
@@ -720,8 +755,7 @@ def build_cowork_request_credentials_tool():
         ),
         input_schema=_REQUEST_CREDENTIALS_SCHEMA,
         handler=_cowork_request_credentials,
-        # `connect-datasource` SKILL.md (see lookup_connector above).
-        unlock_skill="connect-datasource",
+        prompt=_REQUEST_CREDENTIALS_PROMPT,
     )
 
 
@@ -747,6 +781,16 @@ _LABEL_CONNECTION_SCHEMA: dict[str, Any] = {
     },
     "required": ["engine", "name", "label"],
 }
+
+_LABEL_CONNECTION_PROMPT = (
+    "Use `label_connection` to give a saved connection a human role label once "
+    "the user tells you which is which — e.g. when two Gmail accounts are "
+    "connected and the user says `regtr@mail.com` is their support address, call "
+    "`label_connection(engine='gmail', name='<slug>', label='Support')`. The label "
+    "is shown beside the connection in Connected Data Sources so you can pick the "
+    "right account later. Never guess a label — ask the user first, then persist it."
+)
+
 
 async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     """Tool handler for `label_connection` — persist a human label on a saved
@@ -781,8 +825,7 @@ def build_cowork_label_connection_tool():
         ),
         input_schema=_LABEL_CONNECTION_SCHEMA,
         handler=_cowork_label_connection,
-        # `connect-datasource` SKILL.md (see lookup_connector above).
-        unlock_skill="connect-datasource",
+        prompt=_LABEL_CONNECTION_PROMPT,
     )
 
 
