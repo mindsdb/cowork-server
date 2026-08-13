@@ -30,27 +30,48 @@ INDEX = "uq_projects_default_per_org"
 _WHERE = sa.text("name = 'general'")
 
 
+# Tables whose rows reference a project id. None declare ON DELETE, so a loser
+# `general` row can't be deleted while children point at it (FK violation aborts
+# the whole upgrade on Postgres; SQLite doesn't enforce FKs, so tests miss it).
+# Repoint children to the surviving row first. anton_project_id is nullable, the
+# rest are NOT NULL — the UPDATE never introduces a NULL either way.
+_CHILD_FKS = (
+    ("conversations", "project_id"),
+    ("schedules", "project_id"),
+    ("task_objects", "project_id"),
+    ("channel_bindings", "anton_project_id"),
+)
+
+
 def upgrade() -> None:
-    # Collapse any duplicates a pre-index deployment already created, keeping the
-    # oldest row so existing conversations keep resolving to it.
-    op.execute(
+    conn = op.get_bind()
+    # Collapse any duplicate `general` rows a pre-index deployment created,
+    # keeping the OLDEST per org (same winner the index would have kept) so
+    # existing conversations keep resolving to it. Done in Python so the
+    # repoint-then-delete is identical on Postgres and SQLite.
+    rows = conn.execute(
         sa.text(
-            """
-            DELETE FROM projects
-            WHERE name = 'general'
-              AND id NOT IN (
-                SELECT id FROM (
-                  SELECT id,
-                         ROW_NUMBER() OVER (
-                           PARTITION BY coalesce(org_id, '') ORDER BY created_at, id
-                         ) AS rn
-                  FROM projects WHERE name = 'general'
-                ) ranked
-                WHERE rn = 1
-              )
-            """
+            "SELECT id, coalesce(org_id, '') AS okey FROM projects "
+            "WHERE name = 'general' ORDER BY okey, created_at, id"
         )
-    )
+    ).fetchall()
+    winner_by_org: dict[str, object] = {}
+    remap: dict[object, object] = {}  # loser id -> surviving id
+    for row in rows:
+        okey = row.okey
+        if okey not in winner_by_org:
+            winner_by_org[okey] = row.id
+        elif row.id != winner_by_org[okey]:
+            remap[row.id] = winner_by_org[okey]
+
+    for loser, winner in remap.items():
+        for table, col in _CHILD_FKS:
+            conn.execute(
+                sa.text(f"UPDATE {table} SET {col} = :w WHERE {col} = :l"),
+                {"w": winner, "l": loser},
+            )
+        conn.execute(sa.text("DELETE FROM projects WHERE id = :l"), {"l": loser})
+
     op.create_index(
         INDEX,
         "projects",
