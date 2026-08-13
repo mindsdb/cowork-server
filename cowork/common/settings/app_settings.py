@@ -344,7 +344,13 @@ class TurnQueueSettings(Settings):
     )
     jobs_stream: str = Field(
         default="scratchpad:requests",
-        description="Redis stream key turn jobs are queued on when backend is 'remote'.",
+        description=(
+            "Key prefix for turn job streams when backend is 'remote'. Each conversation "
+            "gets its own stream at '{prefix}:{conversation_id}', and '{prefix}:queues' is "
+            "the set of conversations that have one. The controller locks a conversation "
+            "before reading its stream, so a job for a busy pod is never delivered and "
+            "never blocks another conversation."
+        ),
     )
     reply_idle_timeout_seconds: float = Field(
         default=600.0,

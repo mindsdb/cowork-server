@@ -158,7 +158,10 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         user_id=user_id,
         params=params,
     )
-    await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
+    # Registry first: a conversation whose stream exists but isn't registered would
+    # be invisible to the controller. The reverse is harmless, it prunes empty queues.
+    await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
+    await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
     # conversation_id + harness mirror _inject_created on the in-process path:
     # the client learns the canonical id (it may have sent a non-UUID one).
     created = {"type": "response.created", "conversation_id": conversation_id}
