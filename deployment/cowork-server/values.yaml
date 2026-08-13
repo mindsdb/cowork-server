@@ -9,7 +9,12 @@ deployment:
   # This is the name of the deployment, this is used in a _lot_ of places in the helm charts so lets just specify it
   name: cowork-server
 
-  replicaCount: 2
+  # Pinned to 1 until the Redis stream backend exists. A turn's records go to a
+  # StreamBuffer and the registry of in-flight turns is a process-local dict, so
+  # on the file backend a second replica has neither: a reconnect or /cancel that
+  # lands on it 404s. See cowork/streaming/buffer.py RedisStreamBuffer (all
+  # methods raise) and cowork/streaming/registry.py.
+  replicaCount: 1
 
   image:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
