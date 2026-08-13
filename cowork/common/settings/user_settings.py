@@ -233,7 +233,8 @@ def _harness_options() -> list[str]:
 # .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
 # token-refresh would re-pin a picker choice from a stale ``latest:`` line.
 #
-# max_tool_rounds / max_continuations are DELIBERATELY absent too, for the
+# max_tool_rounds / max_continuations / max_turn_tokens are DELIBERATELY absent
+# too, for the
 # ENG-739 reason plus a harder failure mode: anton's own CoreSettings accepts
 # any int, so a stale anton-CLI line like ANTON_MAX_TOOL_ROUNDS=1000 in the
 # shared ~/.cowork/.env is valid for the CLI but fails UserSettings' bounds —
@@ -246,6 +247,11 @@ def _harness_options() -> list[str]:
 # re-syncing a stale .env line can never override a choice the user made in
 # the product. When in doubt, leave it out — .env lines still work for the
 # standalone anton CLI.
+#: Lowest non-zero per-turn spend ceiling a user may set (ENG-1286). Mirrored by
+#: `BUDGET_FIELDS.maxTurnTokens.min` in cowork's `settingsTransform.js`; the two
+#: are asserted equal in `tests/test_agent_budget_settings.py`.
+TURN_CEILING_FLOOR = 750_000
+
 SETTING_ENV_ALIASES: dict[str, str] = {
     "anthropic_api_key": "ANTON_ANTHROPIC_API_KEY",
     "openai_api_key": "ANTON_OPENAI_API_KEY",
@@ -516,6 +522,55 @@ class UserSettings(Settings):
             "(you'll still get a summary of what's missing). Applies to the "
             "Anton agent and, for Cowork sessions, replaces the "
             "ANTON_MAX_CONTINUATIONS environment variable."
+        ),
+    )
+    max_turn_tokens: Annotated[int, ORG] = Field(
+        default_factory=lambda: get_app_settings().default_max_turn_tokens,
+        # Plain contiguous range. "No limit" in the UI is the TOP of it
+        # (50_000_000), not a sentinel.
+        #
+        # "No limit" is EFFECTIVELY, not literally, true — and the bound is
+        # closer than it looks. A turn makes about
+        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at THIS
+        # repo's defaults (50 x 6) is ~306 calls, so 50M is reached at ~163k per
+        # call — below the ~190k context a long conversation carries. At the
+        # maxima a user can set (500 x 25) it is ~13,000 calls and ~3.8k per
+        # call. So the step cap does NOT always land first; it merely always has
+        # so far. The largest turn in 30 days of production was 8.26M, because
+        # real turns end and compaction intervenes long before that shape.
+        # Do not restate this as "the ceiling can never fire at max" — an
+        # earlier version of this comment did, using anton's own 25x3 defaults
+        # rather than Cowork's, which put the threshold at 480k per call and
+        # made it look unreachable.
+        #
+        # A 0-means-unlimited sentinel was built
+        # and then removed — it needed a hole in the range, a validator to guard
+        # the hole, and a special case in the client clamp, all to solve
+        # discoverability that the checkbox solves on its own. It also collided
+        # with `max_continuations` next door, where 0 means literally zero.
+        #
+        # The floor is 750_000, not a rounder-looking 100_000. A turn's first
+        # LLM call costs roughly the conversation's context — ~190k on a long
+        # one — so a ceiling smaller than a couple of calls stops the turn
+        # before it has done anything. Measured against anton: 100_000
+        # dispatched ZERO tools and still spent 400_000. anton now guarantees at
+        # least one tool round regardless, so this floor is a usability bound
+        # rather than a safety one: it is the lowest value where a 190k-context
+        # turn still gets several rounds, and it sits just above the p75
+        # external turn (736k), so "the minimum" means "cut me off around the
+        # 75th percentile".
+        ge=TURN_CEILING_FLOOR,
+        le=50_000_000,
+        title="Max Tokens per Task",
+        description=(
+            "The most tokens the agent may spend on one request before it "
+            "pauses and checks in with you. Tokens are the unit your plan's "
+            "monthly allowance is measured in — including tokens re-read from "
+            "cache — so a task that gets stuck can burn a large share of the "
+            "month without finishing. Raise it if you routinely give the agent "
+            "big jobs; lower it to cap what any single request can cost. "
+            "Applies to the Anton agent and, for Cowork sessions, replaces the "
+            "ANTON_MAX_TURN_TOKENS environment variable."
         ),
     )
     publish_url: Annotated[str, ORG] = Field(
