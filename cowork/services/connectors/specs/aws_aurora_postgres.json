@@ -168,7 +168,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Paired with the Access Key ID above. Stored encrypted locally by Anton."
+            "description": "Paired with the Access Key ID above. Stored locally by Anton with restricted file permissions."
           },
           {
             "name": "aws_region",

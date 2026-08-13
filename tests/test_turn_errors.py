@@ -812,3 +812,59 @@ def test_remote_error_unknown_is_redacted():
 def test_remote_error_none_is_redacted():
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
     assert remote_turn_error(None)[0] == GENERIC_TURN_ERROR_CODE
+
+
+# ── Wire-code inventory (ENG-1282) ────────────────────────────────
+
+def test_wire_code_inventory_matches_the_renderer_contract():
+    """Pin the set of turn-failure codes this module can emit.
+
+    The cowork renderer (mindsdb/cowork ``ChatView.jsx``) draws a card for
+    every code except the generic ``anton_error`` fallback, and its
+    ``ChatView.turnFailureCards.test.jsx`` sweeps for a matching branch per
+    code. The two lists must move together: adding a code here without a
+    renderer branch would make that failure render with no next step, which
+    is the gap ENG-1282 closed. If this test fails, add the branch (and the
+    code to the renderer test's list) in the same change that adds the code.
+    """
+    codes = {
+        value
+        for name, value in vars(te).items()
+        if name.endswith("_CODE") and isinstance(value, str)
+    }
+    assert codes == {
+        "token_limit",
+        "policy_unavailable",
+        "unknown_model",
+        "provider_auth",
+        "model_access_denied",
+        "model_disabled",
+        "provider_overloaded",
+        "image_format",
+        "anton_error",
+    }
+
+
+def test_no_return_emits_a_literal_code():
+    """Every ``(code, message)`` return must take its code from a constant.
+
+    The inventory test above only sees ``*_CODE`` module constants — a code
+    returned as a bare string literal (how ``image_format`` originally
+    shipped, fixed in ENG-1282) would bypass it entirely. Parsing the module
+    keeps that authoring path closed: together the two tests cover both ways
+    a new code can reach the wire.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(te))
+    offenders = [
+        node.value.elts[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Tuple)
+        and node.value.elts
+        and isinstance(node.value.elts[0], ast.Constant)
+        and isinstance(node.value.elts[0].value, str)
+    ]
+    assert offenders == []

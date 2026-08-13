@@ -42,10 +42,15 @@ class _PreviewMountRequest(BaseModel):
 
 def _project_dir(name: str, scoped: ScopedSession) -> Path:
     """Resolve a project name to its on-disk directory or 404."""
+    service = ProjectService(scoped)
     try:
-        project = ProjectService(scoped).get_project_by_name(name)
+        project = service.get_project_by_name(name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # Any project can lose its directory (fresh pod, wiped volume), not just the
+    # default one. The row is authoritative, so provision rather than 404 the
+    # owner out of their own project.
+    service.ensure_dir_exists(project)
     base = Path(project.path)
     if not base.is_dir():
         raise HTTPException(status_code=404, detail="Project directory not found on disk")

@@ -11,6 +11,8 @@ from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_valid
 
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
+    MINDS_FREE_MODEL,
+    role_defaults,
     PLANNING_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
@@ -163,8 +165,11 @@ def _resolved_model(
         so config_status's model gate reports "select a model" rather than
         silently running a wrong model.
     """
-    if resolved_provider == preferred_provider:
+    if resolved_provider == preferred_provider and user_model:
         return user_model
+    # No explicit choice (or provider switched): the resolved provider's default,
+    # availability-adjusted. openai-compatible has no default -> None, so the
+    # "select a model" gate still fires for it.
     return _enabled_aware_default(resolved_provider.value, defaults, enabled_map or {})
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
@@ -614,19 +619,23 @@ class UserSettings(Settings):
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
-                self.planning_provider.value, PLANNING_MODEL_DEFAULTS, enabled_map
+                self.planning_provider.value, role_defaults(PLANNING_MODEL_DEFAULTS), enabled_map
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
-                self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value, role_defaults(CODING_MODEL_DEFAULTS), enabled_map
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value, role_defaults(ROUTER_MODEL_DEFAULTS), enabled_map
             )
         return self
 
     def _has_key(self, p: Provider) -> bool:
+        # Org mode mints a per-turn key, so minds-cloud is usable with nothing
+        # stored; else a fresh org resolves to the pod's ambient ANTHROPIC key.
+        if p is Provider.MINDS_CLOUD and get_app_settings().tenancy_mode == "org":
+            return True
         # provider_api_key applies the gemini/openai-compatible → shared-openai
         # fallback, so a provider configured via EITHER its dedicated slot or the
         # legacy shared slot is correctly seen as keyed. (Raw getattr on the
@@ -675,7 +684,7 @@ class UserSettings(Settings):
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
-            PLANNING_MODEL_DEFAULTS,
+            role_defaults(PLANNING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
@@ -685,7 +694,7 @@ class UserSettings(Settings):
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
-            CODING_MODEL_DEFAULTS,
+            role_defaults(CODING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
@@ -699,7 +708,7 @@ class UserSettings(Settings):
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
-            ROUTER_MODEL_DEFAULTS,
+            role_defaults(ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
@@ -713,15 +722,8 @@ class UserSettings(Settings):
         ``provider_api_key`` so gemini/openai-compatible still count when relying
         on the shared openai_api_key fallback."""
         p = self.resolved_planning_provider
-        has_key = provider_api_key(self, p) is not None
-        # Org mode: MindsHub needs no stored key. The turn producer mints a
-        # short-lived per-turn credential (turnqueue/auth_keys) and hands it to
-        # the pod, so nothing is persisted and nothing should be — readiness
-        # here means "the deployment can run a turn", not "this user pasted a
-        # key". Requiring one sent every cloud tenant into onboarding, where the
-        # only way out is writing admin-owned provider keys (403 for a member).
-        if not has_key and p is Provider.MINDS_CLOUD and get_app_settings().tenancy_mode == "org":
-            has_key = True
+        # _has_key treats minds-cloud as keyed in org mode (per-turn mint).
+        has_key = self._has_key(p)
         # Also require resolvable models. build_llm_client builds BOTH roles and
         # hands resolved_planning_model AND resolved_coding_model to the
         # providers; openai-compatible has no canonical default, so either role

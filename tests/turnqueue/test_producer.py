@@ -20,7 +20,8 @@ def _stub_llm_mint(monkeypatch):
 
 
 class FakeRedis:
-    def __init__(self, replies): self.added = []; self._replies = replies
+    def __init__(self, replies): self.added = []; self.registered = []; self._replies = replies
+    async def sadd(self, key, member): self.registered.append((key, member)); return 1
     async def xadd(self, stream, fields): self.added.append((stream, fields)); return "1-0"
     async def xread(self, streams, count=None, block=None):
         if self._replies:
@@ -37,6 +38,20 @@ class RecBuffer:
 
 def _reply(kind, data):
     return {"payload": json.dumps({"correlation_id": "r", "kind": kind, "data": data})}
+
+
+@pytest.mark.asyncio
+async def test_job_goes_to_the_conversations_own_stream(monkeypatch):
+    """One stream per conversation, listed in the registry set. The controller locks a
+    conversation before reading its stream, so a busy pod's next job stays undelivered
+    instead of blocking every other conversation on one shared stream."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model=None, buffer=RecBuffer())
+    assert fake.added[0][0] == "scratchpad:requests:conv-1"
+    assert fake.registered == [("scratchpad:requests:queues", "conv-1")]
 
 
 @pytest.mark.asyncio
@@ -216,13 +231,13 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
 @pytest.mark.asyncio
 async def test_mint_llm_block_uses_minds_coding_default():
     # The pod runs on minds-cloud, so the coding model must be a minds alias.
-    # Default = the minds-cloud coding default, NOT the tenant's resolved model
-    # (which for a hosted user defaults to an Anthropic name minds 404s).
-    from cowork.common.settings.app_settings import TurnQueueSettings, CODING_MODEL_DEFAULTS
+    # Default = the free-bucket model (mindshub_air): a fresh org has no wallet
+    # balance, so any premium alias 402s on the first turn.
+    from cowork.common.settings.app_settings import TurnQueueSettings, MINDS_FREE_MODEL
 
     settings = TurnQueueSettings(minds_base_url="https://api.example.dev/v1")
     block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
-    assert block["coding_model"] == CODING_MODEL_DEFAULTS["minds_cloud"]
+    assert block["coding_model"] == MINDS_FREE_MODEL
 
 
 @pytest.mark.asyncio
@@ -260,8 +275,13 @@ class SilentRedis:
 
     def __init__(self, delay=0.02):
         self.added = []
+        self.registered = []
         self.reads = 0
         self._delay = delay
+
+    async def sadd(self, key, member):
+        self.registered.append((key, member))
+        return 1
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))
