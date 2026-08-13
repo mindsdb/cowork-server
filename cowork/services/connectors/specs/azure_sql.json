@@ -78,7 +78,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the SQL login. Stored encrypted locally and never sent to Anton servers."
+            "description": "Password for the SQL login. Stored locally with restricted file permissions, and never sent to Anton servers."
           },
           {
             "name": "encrypt",

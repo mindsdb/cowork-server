@@ -150,9 +150,27 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     )
 
 
+# How a file the agent cannot reach gets to it. Stated on EVERY turn, not
+# just turns that have attachments — the project context above tells the agent
+# what it may not access and used to say nothing about how access is granted,
+# so an agent asked to work on an unattached file had no legitimate move left.
+# It cannot ask for a path (forbidden two lines above, and by the file-access
+# policy), it cannot guess (forbidden by select_path's prompt), and the picker
+# cannot render in cowork — which is how one session ended up inventing the
+# user's sales data and reporting a forecast from it (ENG-1357).
+_ATTACHMENT_AFFORDANCE = (
+    " Files reach you in exactly two ways: they are already in the project "
+    "directory above, or the user attaches them to this conversation. If the "
+    "user refers to a file you cannot find in either place, ask them to attach "
+    "it to the conversation — that is how they grant you access. Do not ask "
+    "them to type or paste a filesystem path; you are not permitted to read "
+    "files that are neither in the project nor attached."
+)
+
+
 def _conversation_attachment_context(conversation) -> str:
-    """Prompt fragment listing the absolute paths of every file attached to
-    this conversation.
+    """Prompt fragment telling the agent which files are attached to this
+    conversation, and how the user can attach more.
 
     Uploads are stored under the files dir (``.cowork/files/<uuid>/<name>``),
     which is OUTSIDE the project workspace. An agent that only scans the
@@ -160,9 +178,17 @@ def _conversation_attachment_context(conversation) -> str:
     files were uploaded (the Cyberdeck bug). Handing it the exact paths lets
     it read them on demand on any turn — not just the turn they arrived on.
 
-    Returns "" when there are no attachments or they can't be resolved
-    (e.g. the conversation is detached from its session), so the caller can
-    append it unconditionally.
+    Never returns "": every turn carries ``_ATTACHMENT_AFFORDANCE`` so the
+    agent always knows attaching is the route to a file it cannot reach
+    (ENG-1357). Two distinct outcomes, and the distinction is load-bearing:
+
+    * **Known-empty** (no rows, or none still on disk) — say so, and name
+      attachment as the remedy.
+    * **Unknown** (detached session, no tenant scope, org mismatch, or a
+      swallowed exception) — emit the affordance ALONE. Asserting "no files
+      are attached" here would turn a failure to look into a confident false
+      negative, which is the Cyberdeck bug in the other direction: the user
+      attached a file and the agent flatly denies it exists.
     """
     try:
         from sqlalchemy.orm import object_session
@@ -172,7 +198,7 @@ def _conversation_attachment_context(conversation) -> str:
 
         db_session = object_session(conversation)
         if db_session is None:
-            return ""
+            return _ATTACHMENT_AFFORDANCE
         # Re-wrap with the ORIGINAL scope the conversation was loaded under —
         # never derived from the row itself. No recorded scope in org mode is
         # an invariant violation: log it and list nothing.
@@ -183,14 +209,14 @@ def _conversation_attachment_context(conversation) -> str:
                     "attachments: session carries no tenant scope in org mode — "
                     "listing skipped (conversation %s)", conversation.id,
                 )
-                return ""
+                return _ATTACHMENT_AFFORDANCE
             scope = LOCAL_SCOPE
         if scope.org_mode and conversation.org_id != scope.org_id:
             logger.warning(
                 "attachments: conversation %s org %r does not match scope org %r — listing skipped",
                 conversation.id, conversation.org_id, scope.org_id,
             )
-            return ""
+            return _ATTACHMENT_AFFORDANCE
         rows = FileService(ScopedSession(db_session, scope)).list_file_rows(
             purpose=attachment_purpose(str(conversation.id))
         )
@@ -214,7 +240,10 @@ def _conversation_attachment_context(conversation) -> str:
                     exc_info=True,
                 )
         if not attached:
-            return ""
+            return (
+                " No files are currently attached to this conversation."
+                + _ATTACHMENT_AFFORDANCE
+            )
         return (
             " The user has attached the following files to THIS conversation. "
             "They live OUTSIDE the project directory, so a project-only scan will "
@@ -242,7 +271,7 @@ def _conversation_attachment_context(conversation) -> str:
             conv_id,
             exc_info=True,
         )
-        return ""
+        return _ATTACHMENT_AFFORDANCE
 
 
 @register

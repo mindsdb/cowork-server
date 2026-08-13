@@ -58,7 +58,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Your Snowflake account password. Stored encrypted locally."
+            "description": "Your Snowflake account password. Stored locally with restricted file permissions."
           },
           {
             "name": "warehouse",

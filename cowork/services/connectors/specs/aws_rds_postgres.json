@@ -77,7 +77,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the database user above. Stored encrypted locally."
+            "description": "Password for the database user above. Stored locally with restricted file permissions."
           },
           {
             "name": "ssl_enabled",
@@ -152,7 +152,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Secret paired with the Access Key ID above. Stored encrypted locally."
+            "description": "Secret paired with the Access Key ID above. Stored locally with restricted file permissions."
           }
         ]
       }

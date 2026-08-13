@@ -7,12 +7,17 @@ from cowork.db.scoped import ScopedSession
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
-from cowork.services.projects import GENERAL_PROJECT_ID
 
 
 class ScheduleService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
+
+    def _default_project_id(self) -> UUID | None:
+        """The caller's default project. Imported lazily: projects imports this
+        module's models, so a top-level import would cycle."""
+        from cowork.services.projects import ProjectService
+        return ProjectService(self.session).default_project_id()
 
     def list_schedules(self, project_id: UUID | None = None) -> list[Schedule]:
         query = self.session.select(Schedule)
@@ -39,7 +44,7 @@ class ScheduleService:
     ) -> Schedule:
         # Anchor the parent (same as conversations): the target project must be
         # visible in scope, or a foreign org's project id could be attached.
-        target_project_id = project_id or GENERAL_PROJECT_ID
+        target_project_id = project_id or self._default_project_id()
         if self.session.get(Project, target_project_id) is None:
             raise ValueError("Project not found")
         schedule = Schedule(

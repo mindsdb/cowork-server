@@ -18,7 +18,7 @@ from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.turnqueue.redis_client import get_redis
-from cowork.common.settings.app_settings import TurnQueueSettings, default_minds_api_host
+from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +75,12 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
         ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
     )
-    base_url = settings.minds_base_url or minds_chat_base_url(default_minds_api_host())
+    base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
-    # The pod always runs on minds-cloud, so its coding calls (the completion
-    # verifier + nested scratchpad calls) must name a MINDS model alias. Do NOT
-    # use the tenant's resolved_coding_model: a hosted user with no configured
-    # provider resolves to the Anthropic default (claude-haiku-4-5-...), which
-    # minds inference 404s. Use the minds-cloud coding default, overridable
-    # per-env when a PR/env serves a different alias.
-    from cowork.common.settings.app_settings import CODING_MODEL_DEFAULTS
-    coding_model = settings.minds_coding_model or CODING_MODEL_DEFAULTS.get("minds_cloud", "")
+    # Must be a MINDS alias (the pod runs on minds-cloud). Default to the
+    # free-bucket model: a fresh org has no wallet balance, so premium 402s.
+    from cowork.common.settings.app_settings import MINDS_FREE_MODEL
+    coding_model = settings.minds_coding_model or MINDS_FREE_MODEL
     if coding_model:
         block["coding_model"] = coding_model
     return block
@@ -131,6 +127,15 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     corr = _new_correlation_id()
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
+    # No client-picked model → the deployment's resolved default (org mode: the
+    # free-bucket model). Resolved here so the model reaching the pod is always
+    # a valid minds alias, independent of any harness's built-in default.
+    if not model:
+        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.db.scoped import TenantScope
+        scope = TenantScope(org_mode=bool(org_id), org_id=org_id, user_id=user_id)
+        model = get_user_settings(scope).resolved_planning_model
+
     llm_block = await _mint_llm_block(
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
@@ -153,7 +158,10 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         user_id=user_id,
         params=params,
     )
-    await r.xadd(settings.jobs_stream, {"payload": job.model_dump_json()})
+    # Registry first: a conversation whose stream exists but isn't registered would
+    # be invisible to the controller. The reverse is harmless, it prunes empty queues.
+    await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
+    await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
     # conversation_id + harness mirror _inject_created on the in-process path:
     # the client learns the canonical id (it may have sent a non-UUID one).
     created = {"type": "response.created", "conversation_id": conversation_id}
