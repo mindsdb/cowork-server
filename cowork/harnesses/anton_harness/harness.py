@@ -620,7 +620,8 @@ class AntonHarness:
         project_skills_dir.mkdir(parents=True, exist_ok=True)
         anton_settings.skills_root = project_skills_dir
 
-        _overlay_user_settings(anton_settings, get_user_settings())
+        user = get_user_settings()
+        _overlay_user_settings(anton_settings, user)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
