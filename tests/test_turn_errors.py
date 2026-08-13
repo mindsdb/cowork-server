@@ -530,12 +530,48 @@ def test_reason_header_wallet_empty_maps_to_out_of_credits():
     assert message == te.TOKEN_LIMIT_USER_MESSAGE
 
 
-def test_reason_header_allowance_exhausted_maps_to_out_of_credits():
+def test_spent_free_allowance_is_its_own_card_not_out_of_credits():
+    # ENG-1537. These used to share the credits card, but they are different
+    # situations: `access.py` only issues this reason for a free-bucket model on
+    # an org that has NEVER topped up, so the user has not spent money — they
+    # used the monthly grant, which resets. Telling them "you're out of credits"
+    # both misdescribes it and hides the free way forward.
     code, message = te.friendly_turn_error(
         _gateway_failure(429, reason="included_allowance_exhausted")
     )
+    assert code == te.ALLOWANCE_EXHAUSTED_CODE
+    assert code != te.TOKEN_LIMIT_CODE
+    assert message == te.ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    # Still an actionable path to keep working — ENG-1169's requirement holds
+    # even though the code changed.
+    assert "add credits" in message.lower()
+
+
+def test_empty_wallet_keeps_the_out_of_credits_card():
+    # The other half of the split must be untouched: a drained wallet really is
+    # "out of credits" and keeps its existing card.
+    code, message = te.friendly_turn_error(_gateway_failure(402, reason="wallet_empty"))
     assert code == te.TOKEN_LIMIT_CODE
     assert message == te.TOKEN_LIMIT_USER_MESSAGE
+
+
+def test_allowance_reset_at_is_read_off_the_chain():
+    # The gate sends this on the allowance denial and NOT on a velocity one, so
+    # the card can name when the grant refreshes instead of only asking for money.
+    exc = _gateway_failure(429, reason="included_allowance_exhausted")
+    exc.__cause__.response.headers["X-MindsHub-Reset-At"] = "2026-09-01T00:00:00Z"
+    assert te.allowance_reset_at(exc) == "2026-09-01T00:00:00Z"
+    # Absent → the renderer falls back to "resets next month"; never invented here.
+    assert te.allowance_reset_at(_gateway_failure(429, reason="included_allowance_exhausted")) is None
+    assert te.allowance_reset_at(Exception("bare")) is None
+
+
+def test_reset_at_rides_the_failed_payload_only_when_present():
+    with_reset = te.response_failed_payload(
+        "msg", te.ALLOWANCE_EXHAUSTED_CODE, reset_at="2026-09-01T00:00:00Z"
+    )
+    assert with_reset["reset_at"] == "2026-09-01T00:00:00Z"
+    assert "reset_at" not in te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
 
 
 # ── The two 429 flavours must never share a card (ENG-1537) ────────
@@ -612,18 +648,19 @@ def test_a_real_provider_incident_still_maps_to_provider_overloaded():
     assert te.friendly_turn_error(incident)[0] == te.PROVIDER_OVERLOADED_CODE
 
 
-@pytest.mark.parametrize("status,reason", [
-    (402, "wallet_empty"),
-    (429, "included_allowance_exhausted"),
+@pytest.mark.parametrize("status,reason,expected", [
+    (402, "wallet_empty", "token_limit"),
+    (429, "included_allowance_exhausted", "included_allowance_exhausted"),
 ])
-def test_billing_denials_still_card_immediately(status, reason):
+def test_billing_denials_still_card_immediately(status, reason, expected):
     # ENG-1169 regression guard, in the other direction. These share the 429
     # status (and 402) with the velocity limit but are permanent for the
     # identical request — the allowance resets monthly — so they must keep
     # going straight to the credits card and must never be routed to a wait.
     code, message = te.friendly_turn_error(_gateway_failure(status, reason=reason))
-    assert code == te.TOKEN_LIMIT_CODE
-    assert message == te.TOKEN_LIMIT_USER_MESSAGE
+    assert code == expected
+    # Whichever card it is, it must offer the user a way to keep working.
+    assert "credits" in message.lower()
 
 
 def test_retry_after_is_read_off_the_chain_for_the_card_gate():
@@ -967,6 +1004,8 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # ENG-1282 built it to catch. The matching branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "rate_limited",
+        # ENG-1537 — the spent free allowance, split off the credits card.
+        "included_allowance_exhausted",
         "anton_error",
     }
 

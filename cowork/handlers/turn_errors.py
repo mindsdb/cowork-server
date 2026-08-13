@@ -68,6 +68,27 @@ TOKEN_LIMIT_USER_MESSAGE = (
 # empty-wallet and spent-allowance reasons above.
 TOKEN_LIMIT_CODE = "token_limit"
 
+# Curated copy + wire code for a spent FREE monthly allowance (gateway 429
+# `included_allowance_exhausted`). Split from `token_limit` in ENG-1537: both
+# denials used to share the out-of-credits card, but they are different
+# situations. `access.py` in auth decides it, and the logic is exact — this
+# reason fires ONLY for a free-bucket model on an org that has NEVER topped up
+# ("a non-free model always needs the wallet"). So the person seeing this card
+# has not spent money; they have used the monthly grant. Two consequences the
+# copy leans on:
+#   * There is a FREE way forward — the allowance resets, and the gate tells us
+#     when on `X-MindsHub-Reset-At`. Hiding that while asking for money is the
+#     defect.
+#   * Credits genuinely unlock the rest of the catalogue for this user, because
+#     non-free models need a wallet they do not have.
+# The date is interpolated client-side from `reset_at`; this string is the
+# fallback for consumers that don't render the card.
+ALLOWANCE_EXHAUSTED_CODE = "included_allowance_exhausted"
+ALLOWANCE_EXHAUSTED_USER_MESSAGE = (
+    "You've used this month's free tokens. Add credits to keep working now and "
+    "unlock Claude, GPT, Gemini, Kimi, DeepSeek and more."
+)
+
 # Curated copy + wire code for a VELOCITY rate-limit (gateway 429
 # `rate_limited`) — the org exceeded requests/tokens per minute, NOT its credit
 # balance. ENG-1537: this was the fifth and only unmapped gateway reason, so it
@@ -505,6 +526,36 @@ def retry_after_seconds(exc: BaseException) -> float | None:
     return None
 
 
+def allowance_reset_at(exc: BaseException) -> str | None:
+    """The ``X-MindsHub-Reset-At`` instant from anywhere in the cause chain.
+
+    The auth gate sets it from the billing window's end on an allowance denial
+    (`inference_authorize.py`, ``reset_at=window.end``) and deliberately leaves
+    it unset on a velocity denial — so its presence is itself a signal.
+
+    Passed through as the opaque ISO string the gate sent; the renderer owns
+    formatting and the "resets next month" fallback, because only it knows the
+    viewer's locale and timezone. Returned as-is rather than parsed here: a
+    server-side parse would have to pick a timezone, and picking the wrong one
+    shifts the date the user reads by a day (ENG-1537).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        resp = getattr(cur, "response", None)
+        headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
+        if headers is not None:
+            try:
+                raw = headers.get("x-mindshub-reset-at") or headers.get("X-MindsHub-Reset-At")
+            except Exception:
+                raw = None
+            if raw:
+                return str(raw)
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
@@ -520,7 +571,9 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """
     if reason == _REASON_RATE_LIMITED:
         return RATE_LIMITED_CODE, RATE_LIMITED_USER_MESSAGE
-    if reason in (_REASON_WALLET_EMPTY, _REASON_ALLOWANCE_EXHAUSTED):
+    if reason == _REASON_ALLOWANCE_EXHAUSTED:
+        return ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    if reason == _REASON_WALLET_EMPTY:
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if reason == _REASON_POLICY_UNAVAILABLE:
         return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
@@ -646,6 +699,7 @@ def response_failed_payload(
     provider_label: str | None = None,
     model: str | None = None,
     retry_after: float | None = None,
+    reset_at: str | None = None,
 ) -> dict:
     """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
@@ -666,6 +720,8 @@ def response_failed_payload(
         payload["model"] = model
     if retry_after is not None:
         payload["retry_after"] = retry_after
+    if reset_at is not None:
+        payload["reset_at"] = reset_at
     return payload
 
 
@@ -677,6 +733,7 @@ def response_failed_sse(
     provider_label: str | None = None,
     model: str | None = None,
     retry_after: float | None = None,
+    reset_at: str | None = None,
 ) -> str:
     """Build a ``response.failed`` SSE frame (same wire shape the renderer's
     parser already handles, plus the optional auth/model/retry-after fields)."""
@@ -687,5 +744,6 @@ def response_failed_sse(
         provider_label=provider_label,
         model=model,
         retry_after=retry_after,
+        reset_at=reset_at,
     )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"
