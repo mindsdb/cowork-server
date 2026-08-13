@@ -733,8 +733,54 @@ def test_reason_header_policy_unavailable_is_transient_not_out_of_credits():
 
 def test_reason_header_unknown_model_steers_to_settings_not_credits():
     code, message = te.friendly_turn_error(_gateway_failure(404, reason="unknown_model"))
-    assert code == te.UNKNOWN_MODEL_CODE
-    assert message == te.UNKNOWN_MODEL_USER_MESSAGE
+    assert code == te.MODEL_NOT_FOUND_CODE
+    assert code != te.TOKEN_LIMIT_CODE
+    assert message == te.MODEL_NOT_FOUND_USER_MESSAGE
+
+
+def test_unknown_model_prefers_antons_model_naming_copy_over_the_header():
+    """ENG-1358: the gateway 404 carries BOTH the reason header and anton's typed
+    ModelUnavailableError. The header's copy is generic ("That model isn't
+    available"); anton's names the offending id. The user can only act on the
+    latter, so it must win — returning the header copy is what left ENG-1358's
+    user with three dead turns and no idea which model was wrong.
+    """
+    exc = _FakeModelErr(
+        "The model 'deepseek-v4-flash' isn't available: The model "
+        "'deepseek-v4-flash' does not exist or you do not have access to it. "
+        "Switch models in Settings.",
+        "model_not_found",
+        "deepseek-v4-flash",
+    )
+    exc.__cause__ = _gateway_failure(404, reason="unknown_model")
+
+    code, message = te.friendly_turn_error(exc)
+    assert code == te.MODEL_NOT_FOUND_CODE
+    assert "deepseek-v4-flash" in message
+    assert message != te.MODEL_NOT_FOUND_USER_MESSAGE
+
+
+def test_model_not_found_is_a_model_unavailable_code():
+    """The renderer keys one card on this set; model_not_found must be in it or
+    the 404 falls through to a plain text line with no action (ENG-1358)."""
+    exc = _FakeModelErr(
+        "The model 'x' isn't available. Switch models in Settings.",
+        "model_not_found",
+        "x",
+    )
+    assert te.model_unavailable_info(exc) == ("model_not_found", "x")
+
+
+def test_remote_model_unavailable_does_not_promise_credits_will_fix_it():
+    """The remote wire loses the structured code, so a 404 and a legacy 403 look
+    identical. Defaulting to model_access_denied would render a "Top up balance"
+    button for a model that simply doesn't exist."""
+    code, message = te.remote_turn_error(
+        "ModelUnavailableError: The model 'deepseek-v4-flash' isn't available. "
+        "Switch models in Settings."
+    )
+    assert code == te.MODEL_NOT_FOUND_CODE
+    assert "deepseek-v4-flash" in message
 
 
 def test_bare_402_status_maps_to_out_of_credits_without_header():
@@ -1021,7 +1067,7 @@ def test_wire_code_inventory_matches_the_renderer_contract():
     assert codes == {
         "token_limit",
         "policy_unavailable",
-        "unknown_model",
+        "model_not_found",
         "provider_auth",
         "model_access_denied",
         "model_disabled",
@@ -1225,3 +1271,35 @@ def test_the_failure_handler_survives_a_hostile_retry_after():
     )
     assert payload["code"] == te.RATE_LIMITED_CODE
     assert "retry_at" not in payload      # dropped, not a crash
+# ── The wire `model` for model_not_found (ENG-1358 re-review) ────────
+
+
+def test_model_not_found_is_in_the_set_responses_uses_to_emit_model():
+    """responses.py attaches `model` to the failure frame for exactly these
+    codes. Naming the id IS the fix — if model_not_found drops out of this set
+    the card silently falls back to its unnamed copy, which is the defect the
+    ticket exists to close, and nothing else in the suite notices.
+
+    Shared as a set rather than re-listed inline in responses.py so a merge
+    conflict in that elif-chain has no tuple members to drop."""
+    assert te.MODEL_NOT_FOUND_CODE in te.MODEL_UNAVAILABLE_CODES
+    assert te.MODEL_ACCESS_DENIED_CODE in te.MODEL_UNAVAILABLE_CODES
+    assert te.MODEL_DISABLED_CODE in te.MODEL_UNAVAILABLE_CODES
+
+
+def test_responses_emits_model_for_every_model_unavailable_code():
+    """Guards the branch itself: the handler must reach the model-emitting arm
+    via the shared set, not a hand-maintained tuple."""
+    import inspect
+
+    from cowork.handlers import responses as rp
+
+    src = inspect.getsource(rp)
+    assert "elif code in MODEL_UNAVAILABLE_CODES:" in src, (
+        "responses.py must branch on the shared set — an inline tuple here is "
+        "what let a rebase silently drop model_not_found"
+    )
+    for code in te.MODEL_UNAVAILABLE_CODES:
+        payload = te.response_failed_payload("msg", code, model="deepseek-v4-flash")
+        assert payload["model"] == "deepseek-v4-flash"
+        assert payload["code"] == code
