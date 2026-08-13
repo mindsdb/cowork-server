@@ -202,12 +202,18 @@ def test_turn_token_ceiling_out_of_bounds_rejected(bad):
 def test_the_top_of_the_range_is_the_no_limit_setting():
     """"No limit" in the UI writes the MAX, not a sentinel.
 
-    At 50_000_000 the ceiling cannot fire in practice — the step cap lands first
-    (largest turn observed in 30 days: 8.26M) — so the top of the range is
-    effectively "off". That used to be a problem because it was undiscoverable;
-    the checkbox fixes that, which is why the 0-means-unlimited sentinel was
-    removed rather than kept. Keeping the range contiguous means no validator
-    guarding a hole and no special case in the client clamp.
+    At 50_000_000 the ceiling is effectively — not literally — off. A turn makes
+    roughly `max_tool_rounds x (max_continuations + 1)` LLM calls; at this
+    repo's defaults (50 x 6 = ~306) that reaches 50M at ~163k per call, which is
+    BELOW the ~190k a long conversation carries. It has never happened (largest
+    turn in 30 days: 8.26M) because real turns end and compaction intervenes,
+    but "the step cap always lands first" is not a guarantee.
+
+    The top of the range being the off switch used to be a problem because it
+    was undiscoverable; the checkbox fixes that, which is why the
+    0-means-unlimited sentinel was removed rather than kept. Keeping the range
+    contiguous means no validator guarding a hole and no special case in the
+    client clamp.
     """
     assert UserSettings.model_validate(
         {"max_turn_tokens": "50000000"}

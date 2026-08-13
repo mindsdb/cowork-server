@@ -527,9 +527,23 @@ class UserSettings(Settings):
     max_turn_tokens: Annotated[int, ORG] = Field(
         default_factory=lambda: get_app_settings().default_max_turn_tokens,
         # Plain contiguous range. "No limit" in the UI is the TOP of it
-        # (50_000_000), not a sentinel: at that value the ceiling cannot fire in
-        # practice, because the step cap lands first (largest turn observed in
-        # 30 days of production: 8.26M). A 0-means-unlimited sentinel was built
+        # (50_000_000), not a sentinel.
+        #
+        # "No limit" is EFFECTIVELY, not literally, true — and the bound is
+        # closer than it looks. A turn makes about
+        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at THIS
+        # repo's defaults (50 x 6) is ~306 calls, so 50M is reached at ~163k per
+        # call — below the ~190k context a long conversation carries. At the
+        # maxima a user can set (500 x 25) it is ~13,000 calls and ~3.8k per
+        # call. So the step cap does NOT always land first; it merely always has
+        # so far. The largest turn in 30 days of production was 8.26M, because
+        # real turns end and compaction intervenes long before that shape.
+        # Do not restate this as "the ceiling can never fire at max" — an
+        # earlier version of this comment did, using anton's own 25x3 defaults
+        # rather than Cowork's, which put the threshold at 480k per call and
+        # made it look unreachable.
+        #
+        # A 0-means-unlimited sentinel was built
         # and then removed — it needed a hole in the range, a validator to guard
         # the hole, and a special case in the client clamp, all to solve
         # discoverability that the checkbox solves on its own. It also collided
