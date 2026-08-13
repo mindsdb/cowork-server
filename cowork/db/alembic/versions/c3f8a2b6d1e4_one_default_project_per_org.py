@@ -30,25 +30,27 @@ INDEX = "uq_projects_default_per_org"
 _WHERE = sa.text("name = 'general'")
 
 
-# Tables whose rows reference a project id. None declare ON DELETE, so a loser
-# `general` row can't be deleted while children point at it (FK violation aborts
-# the whole upgrade on Postgres; SQLite doesn't enforce FKs, so tests miss it).
-# Repoint children to the surviving row first. anton_project_id is nullable, the
-# rest are NOT NULL — the UPDATE never introduces a NULL either way.
-_CHILD_FKS = (
-    ("conversations", "project_id"),
-    ("schedules", "project_id"),
-    ("task_objects", "project_id"),
-    ("channel_bindings", "anton_project_id"),
-)
+def _child_fks(conn) -> list[tuple[str, str]]:
+    """Every (table, column) in the live schema referencing projects.id.
+
+    Reflected rather than hardcoded so a column added by an earlier revision
+    can't be missed. No FK declares ON DELETE, so children must be repointed
+    before a duplicate `general` row can be deleted (Postgres enforces this;
+    SQLite doesn't, so tests won't catch a miss).
+    """
+    inspector = sa.inspect(conn)
+    fks = []
+    for table in inspector.get_table_names():
+        for fk in inspector.get_foreign_keys(table):
+            if fk["referred_table"] == "projects" and fk["referred_columns"] == ["id"]:
+                fks.append((table, fk["constrained_columns"][0]))
+    return fks
 
 
 def upgrade() -> None:
     conn = op.get_bind()
-    # Collapse any duplicate `general` rows a pre-index deployment created,
-    # keeping the OLDEST per org (same winner the index would have kept) so
-    # existing conversations keep resolving to it. Done in Python so the
-    # repoint-then-delete is identical on Postgres and SQLite.
+    # Collapse duplicate `general` rows from pre-index deployments, keeping
+    # the oldest per org so existing children keep resolving to it.
     rows = conn.execute(
         sa.text(
             "SELECT id, coalesce(org_id, '') AS okey FROM projects "
@@ -64,8 +66,9 @@ def upgrade() -> None:
         elif row.id != winner_by_org[okey]:
             remap[row.id] = winner_by_org[okey]
 
+    child_fks = _child_fks(conn) if remap else []
     for loser, winner in remap.items():
-        for table, col in _CHILD_FKS:
+        for table, col in child_fks:
             conn.execute(
                 sa.text(f"UPDATE {table} SET {col} = :w WHERE {col} = :l"),
                 {"w": winner, "l": loser},
