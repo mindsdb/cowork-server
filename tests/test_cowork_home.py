@@ -6,6 +6,9 @@ setting one env var. These tests pin that contract.
 """
 from pathlib import Path
 
+import pytest
+
+from cowork.common import paths
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import (
     AppSettings,
@@ -18,9 +21,28 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 
 
-def test_cowork_home_defaults_to_dot_cowork(monkeypatch):
+def test_cowork_home_defaults_to_dot_cowork_for_installed_build(monkeypatch):
+    # An installed wheel legitimately leaves COWORK_HOME unset (the desktop prod
+    # build does this) and gets ~/.cowork.
     monkeypatch.delenv("COWORK_HOME", raising=False)
+    monkeypatch.setattr(paths, "_running_from_source", lambda: False)
     assert cowork_home() == Path.home() / ".cowork"
+
+
+def test_cowork_home_source_checkout_refuses_prod_default(monkeypatch):
+    # A source/dev run with COWORK_HOME unset bypassed the desktop app; it must
+    # fail closed rather than silently migrate the production ~/.cowork (ENG-1541).
+    monkeypatch.delenv("COWORK_HOME", raising=False)
+    monkeypatch.setattr(paths, "_running_from_source", lambda: True)
+    with pytest.raises(RuntimeError, match="COWORK_HOME is unset"):
+        cowork_home()
+
+
+def test_running_from_source_detects_this_checkout():
+    # The guard only bites if the detector actually recognizes a source tree.
+    # These tests run from the cowork-server checkout, so it must report True.
+    paths._running_from_source.cache_clear()
+    assert paths._running_from_source() is True
 
 
 def test_cowork_home_honors_env_var(monkeypatch, tmp_path):
@@ -45,7 +67,10 @@ def test_isolated_build_does_not_inherit_legacy_anton_env(monkeypatch, tmp_path)
 def test_prod_build_still_reads_legacy_anton_env(monkeypatch):
     # The default (prod) home keeps the legacy fallback for un-migrated
     # installs, ordered BEFORE <COWORK_HOME>/.env so the migrated file wins.
+    # Simulate an installed build so the unset COWORK_HOME resolves to ~/.cowork
+    # rather than failing closed (ENG-1541).
     monkeypatch.delenv("COWORK_HOME", raising=False)
+    monkeypatch.setattr(paths, "_running_from_source", lambda: False)
     chain = _env_file_chain()
     legacy = str(Path.home() / ".anton" / ".env")
     assert legacy in chain
