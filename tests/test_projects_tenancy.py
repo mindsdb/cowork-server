@@ -410,6 +410,38 @@ def test_a_leftover_directory_is_not_adopted(db):
     assert not (Path(second.path) / "stale.md").exists()
 
 
+def test_delete_removes_the_projects_own_directory(db):
+    a = _svc(db, _scope(ORG_A))
+    p = a.create_project("reports")
+    path = Path(p.path)
+    assert path.is_dir()
+
+    assert a.delete_project(p.id) is True
+
+    assert not path.exists()
+
+
+def test_delete_never_rmtrees_a_path_outside_the_sanitizer(db, tmp_path):
+    """A tampered stored path must not reach rmtree: delete_project rebuilds the
+    target from the sanitized name and only deletes it when it matches the row.
+    The mismatched directory is left in place; the row still goes away."""
+    a = _svc(db, _scope(ORG_A))
+    p = a.create_project("reports")
+    # Simulate a poisoned row pointing outside the org root.
+    victim = tmp_path / "victim-dir"
+    victim.mkdir()
+    (victim / "precious.md").write_text("someone else's data")
+    raw = _raw(db)
+    row = raw.exec(select(Project).where(Project.name == "reports")).one()
+    row.path = str(victim)
+    raw.add(row); raw.commit()
+
+    assert _svc(db, _scope(ORG_A)).delete_project(p.id) is True
+
+    assert (victim / "precious.md").exists()  # the foreign directory survived
+    assert a.get_project_by_name_or_none("reports") is None  # the row is gone
+
+
 def test_ensure_dir_never_creates_a_path_outside_the_sanitizer(db, tmp_path):
     """A tampered stored path must not reach mkdir: ensure_dir_exists rebuilds the
     target from the sanitized name and only creates it when it matches the row."""
