@@ -182,9 +182,9 @@ def test_turn_token_ceiling_default_matches_anton_rather_than_exceeding_it():
 
 
 def test_hosted_deployments_can_lower_the_ceiling_via_env(monkeypatch):
-    monkeypatch.setenv("COWORK_DEFAULT_MAX_TURN_TOKENS", "400000")
+    monkeypatch.setenv("COWORK_DEFAULT_MAX_TURN_TOKENS", "800000")
     _clear_app_settings_cache()
-    assert UserSettings().max_turn_tokens == 400_000
+    assert UserSettings().max_turn_tokens == 800_000
     # An explicit per-user value still wins over the deployment default.
     assert UserSettings.model_validate(
         {"max_turn_tokens": "2000000"}
@@ -194,8 +194,10 @@ def test_hosted_deployments_can_lower_the_ceiling_via_env(monkeypatch):
 @pytest.mark.parametrize(
     "bad",
     [
-        "0",          # ge=100_000: the UI must not be able to switch the guard OFF
-        "50000",      # below ge: would stop nearly every turn immediately
+        "0",          # the UI must not be able to switch the guard OFF
+        "100000",     # measured against anton: dispatches ZERO tools, spends 400k
+        "400000",     # still zero tools at a 190k context
+        "749999",     # one below the floor
         "99999999",   # above le=50_000_000
         "lots",       # not a number
     ],
@@ -207,37 +209,111 @@ def test_turn_token_ceiling_out_of_bounds_rejected(bad):
         UserSettings.model_validate({"max_turn_tokens": bad})
 
 
-def test_overlay_skips_a_field_the_pinned_anton_does_not_have():
-    """Version skew must degrade, never crash.
+def test_the_floor_is_above_one_call_s_worth_of_context():
+    """Why 750_000 and not a rounder 100_000.
 
-    anton is a git dep pinned to branch="main", so a budget can exist in
-    cowork-server while the pinned anton still predates it — the field reaches
-    main at the weekly release, not when the anton PR merges. pydantic raises
-    `ValueError: object has no field "x"` on setattr of an unknown field, and
-    the overlay loop runs on EVERY session build, so an unguarded overlay turns
-    a one-week ordering gap into a total agent outage.
+    A turn's first LLM call costs roughly the conversation's context (~190k on a
+    long one). A ceiling below a couple of calls stops the turn before it has
+    done anything — measured against anton's real `turn_stream`, a 100_000
+    ceiling dispatched zero tools and still spent 400_000. anton now guarantees
+    at least one tool round at any ceiling, so this floor is a usability bound,
+    not the safety one; it is set where the tightest setting still does several
+    rounds of work.
 
-    Reproduces the raise on a stand-in model, then asserts the guard the
-    harness uses (`hasattr` before `setattr`) is what makes it survivable.
+    Measured at the floor with 190k contexts: 2 tool rounds, 760_000 spent. So
+    the floor buys roughly three calls, which is the bound asserted here — not
+    four, which the first version of this test claimed and which fails by 10k.
+    """
+    field = UserSettings.model_fields["max_turn_tokens"]
+    ge = next(m.ge for m in field.metadata if hasattr(m, "ge"))
+    assert ge >= 3 * 190_000
+
+
+def test_client_and_server_bounds_stay_in_lockstep():
+    """Mirror of cowork's `BUDGET_FIELDS.maxTurnTokens`.
+
+    The renderer clamps to its own range before writing; if the two drift, the
+    client happily sends a value the server rejects — and the settings write is
+    all-or-nothing, so it takes the user's unrelated changes down with it. The
+    JS side already asserts the server's numbers; this is the missing direction.
+    Update both together or not at all: cowork
+    `src/renderer/cowork/lib/settingsTransform.js` -> BUDGET_FIELDS.
+    """
+    field = UserSettings.model_fields["max_turn_tokens"]
+    ge = next(m.ge for m in field.metadata if hasattr(m, "ge"))
+    le = next(m.le for m in field.metadata if hasattr(m, "le"))
+    assert (ge, le) == (750_000, 50_000_000)
+
+
+def test_overlay_applies_every_budget_to_a_real_anton_settings():
+    """Drives the REAL overlay against a REAL AntonSettings.
+
+    The first version of this test declared its own stand-in model and
+    re-implemented the hasattr/setattr loop in the test body, so it never
+    imported `harness.py` — dropping `max_turn_tokens` from the tuple (silently
+    disabling the whole user-facing setting) shipped green.
+    """
+    from anton.config.settings import AntonSettings
+
+    from cowork.harnesses.anton_harness.harness import (
+        _OVERLAID_SETTINGS,
+        _overlay_user_settings,
+    )
+
+    # Asserted on the tuple, not only on the outcome: until anton's field
+    # reaches the pinned `main`, the outcome assertions below take their
+    # skew-guard branch, which is ALSO what dropping the key from the tuple
+    # produces. Without this line that mutation ships green.
+    assert "max_turn_tokens" in _OVERLAID_SETTINGS
+
+    a = AntonSettings(_env_file=None)
+    user = UserSettings.model_validate({
+        "max_tool_rounds": "80", "max_continuations": "2",
+        "max_turn_tokens": "900000",
+    })
+    applied = _overlay_user_settings(a, user)
+
+    assert a.max_tool_rounds == 80
+    assert a.max_continuations == 2
+    assert "max_tool_rounds" in applied and "max_continuations" in applied
+    if hasattr(AntonSettings(_env_file=None), "max_turn_tokens"):
+        assert a.max_turn_tokens == 900_000
+        assert "max_turn_tokens" in applied
+    else:  # pinned anton predates ENG-1286 — the skew guard must have skipped it
+        assert "max_turn_tokens" not in applied
+
+
+def test_overlay_survives_a_field_the_pinned_anton_does_not_have():
+    """Version skew must degrade, never crash — through the real function.
+
+    anton is a git dep pinned to branch="main", so a setting can exist here
+    while the pinned anton predates it; the field reaches main at the weekly
+    release, not when the anton PR merges. pydantic raises on setattr of an
+    unknown field, and the overlay runs on EVERY session build, so an unguarded
+    overlay turns a one-week ordering gap into a total agent outage.
+
+    Uses a stand-in for the OLD anton deliberately — we cannot install a past
+    version here — but drives cowork-server's real loop over it, which is the
+    half the previous test was missing.
     """
     from pydantic_settings import BaseSettings
+
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
 
     class PinnedAnton(BaseSettings):
         model_config = {"env_prefix": "ANTON_", "extra": "ignore"}
         max_tool_rounds: int = 25
 
     old = PinnedAnton()
+    # The raise this guards, pinned so the test states its own premise.
     with pytest.raises(ValueError):
         setattr(old, "max_turn_tokens", 1_250_000)
 
-    applied = []
-    for attr, val in (("max_tool_rounds", 50), ("max_turn_tokens", 1_250_000)):
-        if not hasattr(old, attr):
-            continue
-        setattr(old, attr, val)
-        applied.append(attr)
+    applied = _overlay_user_settings(
+        old, UserSettings.model_validate({"max_tool_rounds": "80"})
+    )
     assert applied == ["max_tool_rounds"]
-    assert old.max_tool_rounds == 50
+    assert old.max_tool_rounds == 80
 
 
 def test_anton_settings_accepts_the_ceiling_overlay():

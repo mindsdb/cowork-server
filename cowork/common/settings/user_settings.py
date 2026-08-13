@@ -521,7 +521,16 @@ class UserSettings(Settings):
     )
     max_turn_tokens: Annotated[int, ORG] = Field(
         default_factory=lambda: get_app_settings().default_max_turn_tokens,
-        ge=100_000,
+        # 750_000, not a rounder-looking 100_000. A turn's first LLM call costs
+        # roughly the conversation's context — ~190k on a long one — so a ceiling
+        # smaller than a couple of calls stops the turn before it has done
+        # anything. Measured against anton: 100_000 dispatched ZERO tools and
+        # still spent 400_000. anton now guarantees at least one tool round
+        # regardless, so this floor is a usability bound rather than a safety
+        # one: 750_000 is the lowest value where a 190k-context turn still gets
+        # several rounds, and it sits just above the p75 external turn (736k),
+        # so "the minimum" means "cut me off around the 75th percentile".
+        ge=750_000,
         le=50_000_000,
         title="Max Tokens per Task",
         description=(

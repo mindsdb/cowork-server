@@ -604,7 +604,7 @@ class AppSettings(Settings):
     # loosen a ceiling against the very population it was sized on.
     default_max_turn_tokens: int = Field(
         default=1_250_000,
-        ge=100_000,
+        ge=750_000,
         le=50_000_000,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
