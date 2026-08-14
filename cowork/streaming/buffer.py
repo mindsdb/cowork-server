@@ -14,10 +14,10 @@ Backends:
   - ``FileStreamBuffer`` — JSONL file per turn. Used for desktop and the
     current single-instance cloud container. Ported from the proven
     bundled-server implementation (mindsdb/cowork `turn_buffer.py`).
-  - ``RedisStreamBuffer`` — WIP. Backed by a Redis Stream so any web
-    replica can tail a run executed by a separate worker. Wired when we
-    move to multi-instance cloud (see class docstring). The interface is
-    identical so the responses handler / endpoints never change.
+  - ``RedisStreamBuffer`` — a Redis Stream per turn, so any web replica
+    can replay and tail a turn another replica is streaming. Used for
+    multi-instance cloud. The interface is identical so the responses
+    handler / endpoints never change.
 
 Select the backend with ``COWORK_STREAM_BACKEND`` (see backend.py).
 """
@@ -31,6 +31,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 
+from cowork.turnqueue.redis_client import get_redis
 from cowork.streaming.records import (
     REASON_TO_TYPE,
     TerminalReason,
@@ -212,47 +213,117 @@ class FileStreamBuffer(StreamBuffer):
 # ── redis backend (cloud / multi-instance) — WIP ─────────────────────
 
 
+# Buffers exist for reconnect and replay, not as a record of the turn. The
+# transcript is in Postgres, so an hour past the last write is generous.
+REDIS_BUFFER_TTL_SECONDS = 3600
+
+
+def stream_key(conversation_id: str, turn_id: int) -> str:
+    return f"cowork:stream:{conversation_id}:{int(turn_id)}"
+
+
 class RedisStreamBuffer(StreamBuffer):
-    """WIP — Redis Streams backend for multi-instance cloud.
+    """Redis Streams backend for multi-instance cloud.
 
-    NOT YET IMPLEMENTED. Wired when we move off the single container so a
-    run executed by a separate worker can be tailed from any web replica.
-    The interface is identical to FileStreamBuffer, so the responses
-    handler and HTTP endpoints don't change — only backend.py's factory.
+    One Redis Stream per turn, so a turn streamed into Redis by one replica
+    can be replayed and followed by any other. The interface matches
+    FileStreamBuffer exactly, so the responses handler and the HTTP
+    endpoints don't change, only backend.py's factory.
 
-    Design (Redis Streams map 1:1 onto this interface):
-      key  = f"cowork:stream:{conversation_id}:{turn_id}"
-      append(type, data) -> XADD key '*' seq <n> type <t> data <json>
-                            (the stream entry id doubles as the seq;
-                             use an explicit field too for portability)
-      tail(from_seq)     -> XRANGE key from_seq '+'   (replay) then
-                            XREAD BLOCK 0 STREAMS key <last-id>  (live)
-      close(reason)      -> XADD terminal record + XTRIM MAXLEN / EXPIRE
-      latest_seq         -> XLEN key
-      is_closed          -> last entry type in _TERMINAL_TYPES
-    Cancellation + in-flight status move to a shared run-status key
-    (HSET) and a cancel channel (PUBLISH), since the producer lives in a
-    worker, not the web process. See registry.py for the dispatch side.
+    ``seq`` is an explicit field rather than the Redis entry id: the id is a
+    timestamp, and a count-based seq would jump after XTRIM.
     """
 
-    _WIP = "RedisStreamBuffer is WIP — enabled when cowork moves to multi-instance cloud."
-
-    def __init__(self, *args, **kwargs) -> None:  # noqa: D401
-        raise NotImplementedError(self._WIP)
+    def __init__(self, conversation_id: str, turn_id: int) -> None:
+        self.key = stream_key(conversation_id, turn_id)
+        self._conversation_id = conversation_id
+        self._turn_id = int(turn_id)
+        self._next_seq = 0
+        self._closed = False
+        self._write_lock = asyncio.Lock()
 
     async def append(self, type_: str, data: dict) -> int:
-        raise NotImplementedError(self._WIP)
+        # Serialised: seq is assigned in this process, so two concurrent
+        # appends could otherwise claim the same number.
+        async with self._write_lock:
+            seq = self._next_seq
+            self._next_seq += 1
+            r = get_redis()
+            await r.xadd(self.key, {
+                "seq": str(seq),
+                "ts": now_iso(),
+                "type": type_,
+                "data": json.dumps(data or {}),
+            })
+            await r.expire(self.key, REDIS_BUFFER_TTL_SECONDS)
+            return seq
 
     async def close(self, reason: TerminalReason, extra: dict | None = None) -> None:
-        raise NotImplementedError(self._WIP)
+        if self._closed:
+            return
+        self._closed = True
+        await self.append(REASON_TO_TYPE[reason], {"reason": reason, **(extra or {})})
 
-    def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
-        raise NotImplementedError(self._WIP)
+    _BLOCK_MS = 5000
+
+    @staticmethod
+    def _record(fields: dict) -> TurnRecord:
+        return TurnRecord(
+            seq=int(fields.get("seq", -1)),
+            ts=str(fields.get("ts", "")),
+            type=str(fields.get("type", "")),
+            data=json.loads(fields.get("data") or "{}"),
+        )
+
+    async def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
+        r = get_redis()
+        last_id = "0-0"
+        # Replay. Filtered on the seq field rather than sliced by entry id:
+        # ids are timestamps and carry no relation to from_seq.
+        for entry_id, fields in await r.xrange(self.key):
+            last_id = entry_id
+            rec = self._record(fields)
+            if rec.seq < from_seq:
+                continue
+            yield rec
+            if rec.is_terminal:
+                return
+        # Live. Handed off by entry id, so an append between the XRANGE above
+        # and the first XREAD is picked up rather than skipped.
+        while True:
+            resp = await r.xread({self.key: last_id}, block=self._BLOCK_MS)
+            if not resp:
+                continue
+            for _key, entries in resp:
+                for entry_id, fields in entries:
+                    last_id = entry_id
+                    rec = self._record(fields)
+                    if rec.seq < from_seq:
+                        continue
+                    yield rec
+                    if rec.is_terminal:
+                        return
+
+    async def refresh(self) -> None:
+        """Load latest_seq and is_closed from Redis.
+
+        A replica that did not write this turn has no in-process state, so
+        the /in-flight and /tail endpoints call this before answering.
+        """
+        entries = await get_redis().xrevrange(self.key, count=1)
+        if not entries:
+            self._next_seq = 0
+            self._closed = False
+            return
+        _entry_id, fields = entries[0]
+        rec = self._record(fields)
+        self._next_seq = rec.seq + 1
+        self._closed = rec.is_terminal
 
     @property
     def latest_seq(self) -> int:
-        raise NotImplementedError(self._WIP)
+        return self._next_seq
 
     @property
     def is_closed(self) -> bool:
-        raise NotImplementedError(self._WIP)
+        return self._closed
