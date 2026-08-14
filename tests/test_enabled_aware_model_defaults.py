@@ -128,6 +128,90 @@ def test_provider_switch_onto_minds_paid_keeps_canonical():
     assert s.resolved_planning_model == "sonnet"
 
 
+# ── Wallet-aware aux resolution (ENG-1632) ────────────────────────────
+#
+# The aux roles (coding = completion verifier + scratchpad, router = gating +
+# summarization) are invisible in default mode: a wallet-locked pin there 402s
+# on every turn with no way for the user to see or fix it. Resolution — never
+# the stored row — falls back to a strictly-enabled model. Planning keeps the
+# ENG-598/ENG-1248 behavior: an explicit pick is never silently swapped.
+
+# Whole catalog listed, everything paid locked — the ENG-1632 cohort's map.
+LOCKED_MAP = json.dumps(
+    {"mindshub_air": True, "sonnet": False, "opus": False, "haiku": False, "kimi": False}
+)
+
+
+def _pinned(**kw) -> UserSettings:
+    return _minds(router_provider=Provider.MINDS_CLOUD, **kw)
+
+
+def test_locked_coding_pin_resolves_to_first_enabled():
+    s = _pinned(minds_model_enabled=LOCKED_MAP, coding_model="haiku")
+    assert s.coding_model == "haiku"  # the stored row is never rewritten
+    assert s.resolved_coding_model == "mindshub_air"
+
+
+def test_locked_router_pin_resolves_to_first_enabled():
+    s = _pinned(minds_model_enabled=LOCKED_MAP, router_model="kimi")
+    assert s.router_model == "kimi"
+    assert s.resolved_router_model == "mindshub_air"
+
+
+def test_latest_prefixed_pin_is_probed_bare():
+    # /v1/models ids are always bare; login-era pins carry "latest:". The map
+    # probe must strip it or those pins silently escape the fallback.
+    s = _pinned(minds_model_enabled=LOCKED_MAP, coding_model="latest:haiku")
+    assert s.resolved_coding_model == "mindshub_air"
+
+
+def test_funded_pin_is_kept():
+    s = _pinned(minds_model_enabled=PAID_MAP, coding_model="haiku", router_model="kimi")
+    assert s.resolved_coding_model == "haiku"
+    assert s.resolved_router_model == "kimi"
+
+
+def test_fully_drained_map_keeps_the_pin():
+    # Nothing enabled (drained wallet AND spent allowance) → no fallback
+    # exists; keep the stored value and let anton's verifier deny quietly.
+    all_off = json.dumps(
+        {"mindshub_air": False, "sonnet": False, "haiku": False, "kimi": False}
+    )
+    s = _pinned(minds_model_enabled=all_off, coding_model="haiku")
+    assert s.resolved_coding_model == "haiku"
+
+
+def test_absent_map_keeps_the_pin():
+    s = _pinned(coding_model="haiku")
+    assert s.resolved_coding_model == "haiku"
+
+
+def test_pin_missing_from_map_is_treated_as_available():
+    s = _pinned(
+        minds_model_enabled=json.dumps({"mindshub_air": True}), coding_model="haiku"
+    )
+    assert s.resolved_coding_model == "haiku"
+
+
+def test_planning_pin_is_never_silently_swapped():
+    # Deliberate asymmetry: planning is visible in the picker and has the
+    # pick-it-and-see-"Needs credits" lane (ENG-1248); only the invisible aux
+    # roles fall back.
+    s = _pinned(minds_model_enabled=LOCKED_MAP, planning_model="sonnet")
+    assert s.resolved_planning_model == "sonnet"
+
+
+def test_byok_aux_pin_ignores_the_minds_map():
+    s = UserSettings(
+        planning_provider=Provider.ANTHROPIC,
+        coding_provider=Provider.ANTHROPIC,
+        anthropic_api_key=SecretStr("sk-ant-test"),
+        minds_model_enabled=json.dumps({"claude-haiku-4-5-20251001": False}),
+        coding_model="claude-haiku-4-5-20251001",
+    )
+    assert s.resolved_coding_model == "claude-haiku-4-5-20251001"
+
+
 # ── Endpoint cache write (recommended-models) ─────────────────────────
 
 def _delete_settings(session, *keys: str) -> None:
