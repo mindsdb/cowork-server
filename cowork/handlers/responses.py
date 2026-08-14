@@ -16,7 +16,13 @@ from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.handlers.response_routing import DIRECT_CONTEXT, RouteDecision, decide_route
+from cowork.handlers.response_routing import (
+    DELEGATED_AGENTIC,
+    DIRECT_CONTEXT,
+    RouteDecision,
+    decide_route,
+    ineligible_reason,
+)
 from cowork.streaming import TurnLifecycle, new_buffer, registry
 from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
@@ -210,6 +216,7 @@ class ResponsesHandler:
             return await self._handle_direct_response(
                 request=request,
                 conversation_id=conversation.id,
+                turn_id=turn_id,
                 original_content=original_content,
                 route=route,
             )
@@ -284,24 +291,37 @@ class ResponsesHandler:
     ) -> RouteDecision:
         """Run Cowork's narrow pre-Anton gate with only safe text context."""
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
+        # Ineligible shapes delegate before the history query — no DB work.
+        reason = ineligible_reason(
+            has_non_text_input=has_non_text_input,
+            has_attachments=has_attachments,
+            has_disabled_connections=has_disabled_connections,
+        )
+        if reason:
+            return RouteDecision(route=DELEGATED_AGENTIC, reason=reason)
         history = [
             message.to_openai_message().model_dump()
             for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
             if message.role in {"user", "assistant"}
         ]
         history.append({"role": "user", "content": self._prompt_text(harness_input)})
-        return await decide_route(
-            history=history,
-            has_non_text_input=has_non_text_input,
-            has_attachments=has_attachments,
-            has_disabled_connections=has_disabled_connections,
-        )
+        # The gate resolves settings ambiently (router role + provider key);
+        # without this scope, org-mode loads global rows only and the router
+        # key is never found, so the fast path silently never fires.
+        with use_settings_scope(self.scope):
+            return await decide_route(
+                history=history,
+                has_non_text_input=has_non_text_input,
+                has_attachments=has_attachments,
+                has_disabled_connections=has_disabled_connections,
+            )
 
     async def _handle_direct_response(
         self,
         *,
         request: ResponsesRequest,
         conversation_id: UUID,
+        turn_id: int,
         original_content,
         route: RouteDecision,
     ) -> AsyncGenerator[str, None] | Response:
@@ -325,7 +345,8 @@ class ResponsesHandler:
                 output=[self._build_output(str(user_message.id), route.text)],
             )
 
-        turn_id = len(ConversationService(self.scoped).get_ordered_messages(conversation_id))
+        # turn_id comes from handle() — the same numbering as the delegated
+        # path, so a divergent count can never reopen an earlier turn's buffer.
         buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
         await registry.start(
@@ -344,6 +365,10 @@ class ResponsesHandler:
             lifecycle=lifecycle,
         )
         return sse_from_buffer(buffer, 0)
+
+    @staticmethod
+    def _direct_sse(event: str, payload: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
     async def _produce_direct(
         self,
@@ -366,7 +391,10 @@ class ResponsesHandler:
             created = response.model_dump()
             created["conversation_id"] = str(conv_id)
             created["harness"] = "cowork-direct"
-            await buffer.append("sse", {"sse": f"event: response.created\\ndata: {json.dumps({'type': 'response.created', 'sequence_number': 1, 'response': created})}\\n\\n"})
+            await buffer.append("sse", {"sse": self._direct_sse(
+                "response.created",
+                {"type": "response.created", "sequence_number": 1, "response": created},
+            )})
             delta = {
                 "type": "response.output_text.delta",
                 "sequence_number": 2,
@@ -376,7 +404,7 @@ class ResponsesHandler:
                 "response_route_reason": route.reason,
             }
             events.append(delta)
-            await buffer.append("sse", {"sse": f"event: response.output_text.delta\\ndata: {json.dumps(delta)}\\n\\n"})
+            await buffer.append("sse", {"sse": self._direct_sse("response.output_text.delta", delta)})
             completed_response = Response(
                 id=response.id,
                 created_at=response.created_at,
@@ -386,7 +414,7 @@ class ResponsesHandler:
             ).model_dump()
             completed = {"type": "response.completed", "sequence_number": 3, "response": completed_response}
             events.append({"type": "response.completed"})
-            await buffer.append("sse", {"sse": f"event: response.completed\\ndata: {json.dumps(completed)}\\n\\n"})
+            await buffer.append("sse", {"sse": self._direct_sse("response.completed", completed)})
             if pending_message_id is not None:
                 svc.finalize_pending(conv_id, pending_message_id)
             svc.save_assistant_turn(conv_id, route.text, events, harness="cowork-direct")
