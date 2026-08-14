@@ -16,6 +16,7 @@ from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
+from cowork.handlers.response_routing import DIRECT_CONTEXT, RouteDecision, decide_route
 from cowork.streaming import TurnLifecycle, new_buffer, registry
 from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
@@ -111,10 +112,17 @@ class ResponsesHandler:
         self.principal = principal
         self.scope = scope_from_principal(principal)
         self.scoped = ScopedSession(session, self.scope)
-        # Resolve settings once; reuse the harness name in handle()/the producer.
+        # Resolve the selected harness name now, but initialize Anton lazily only
+        # after Cowork delegates a turn. Direct context responses must never build
+        # the Anton harness.
         self.harness_name = get_user_settings(self.scope).harness
-        self.harness = get_harness(self.harness_name)
+        self.harness = None
         self.last_conversation_id: str | None = None
+
+    def _get_harness(self):
+        if self.harness is None:
+            self.harness = get_harness(self.harness_name)
+        return self.harness
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
@@ -179,6 +187,34 @@ class ResponsesHandler:
             [dc.model_dump() for dc in request.disabled_connections]
             if request.disabled_connections else None
         )
+        route = await self._route_request(
+            conversation_id=conversation.id,
+            harness_input=harness_input,
+            has_attachments=bool(request.attachment_ids),
+            has_disabled_connections=bool(disabled),
+        )
+        trace_metadata = {
+            **trace_metadata,
+            "response_route": route.route,
+            "response_route_reason": route.reason,
+            **({"response_router_provider": route.provider} if route.provider else {}),
+            **({"response_router_model": route.model} if route.model else {}),
+            **({"response_route_fallback": "true"} if route.fallback else {}),
+        }
+        logger.info(
+            "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
+            route.route, route.reason, route.fallback, route.provider, route.model, conversation.id,
+        )
+
+        if route.route == DIRECT_CONTEXT:
+            return await self._handle_direct_response(
+                request=request,
+                conversation_id=conversation.id,
+                original_content=original_content,
+                route=route,
+            )
+
+        harness = self._get_harness()
 
         if request.stream:
             # Detached + resumable. The agent run executes in a background
@@ -208,7 +244,7 @@ class ResponsesHandler:
                 model=request.model,
                 disabled=disabled,
                 harness_name=self.harness_name,
-                harness_id=getattr(self.harness, "id", None),
+                harness_id=getattr(harness, "id", None),
                 buffer=buffer,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
@@ -229,7 +265,7 @@ class ResponsesHandler:
         # so the harness reads history WITHOUT the current turn — otherwise the
         # fresh-query history would replay it AND resend it as the live input.
         with use_settings_scope(self.scope):
-            stream = self.harness.stream_response(
+            stream = harness.stream_response(
                 conversation=conversation,
                 input=harness_input,
                 disabled_connections=disabled,
@@ -237,6 +273,135 @@ class ResponsesHandler:
                 trace_metadata=trace_metadata,
             )
             return await self._collect(stream, conversation.id, request.model, original_content)
+
+    async def _route_request(
+        self,
+        *,
+        conversation_id: UUID,
+        harness_input: list[dict],
+        has_attachments: bool,
+        has_disabled_connections: bool,
+    ) -> RouteDecision:
+        """Run Cowork's narrow pre-Anton gate with only safe text context."""
+        has_non_text_input = any(block.get("type") != "text" for block in harness_input)
+        history = [
+            message.to_openai_message().model_dump()
+            for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
+            if message.role in {"user", "assistant"}
+        ]
+        history.append({"role": "user", "content": self._prompt_text(harness_input)})
+        return await decide_route(
+            history=history,
+            has_non_text_input=has_non_text_input,
+            has_attachments=has_attachments,
+            has_disabled_connections=has_disabled_connections,
+        )
+
+    async def _handle_direct_response(
+        self,
+        *,
+        request: ResponsesRequest,
+        conversation_id: UUID,
+        original_content,
+        route: RouteDecision,
+    ) -> AsyncGenerator[str, None] | Response:
+        """Return the router model's direct answer without initializing Anton."""
+        if not request.stream:
+            user_message = ConversationService(self.scoped).save_user_message(
+                conversation_id, original_content,
+            )
+            events = [{
+                "type": "response.output_text.delta",
+                "delta": route.text,
+                "response_route": route.route,
+                "response_route_reason": route.reason,
+            }, {"type": "response.completed"}]
+            ConversationService(self.scoped).save_assistant_turn(
+                conversation_id, route.text, events, harness="cowork-direct",
+            )
+            return Response(
+                status=ResponseStatus.completed,
+                model=route.model,
+                output=[self._build_output(str(user_message.id), route.text)],
+            )
+
+        turn_id = len(ConversationService(self.scoped).get_ordered_messages(conversation_id))
+        buffer = new_buffer(str(conversation_id), turn_id)
+        lifecycle = TurnLifecycle()
+        await registry.start(
+            conversation_id=str(conversation_id),
+            turn_id=turn_id,
+            buffer=buffer,
+            org_id=self.scoped.scope.org_id,
+            user_id=self.scoped.scope.user_id,
+            producer_coro=self._produce_direct(
+                lifecycle=lifecycle,
+                conv_id=conversation_id,
+                original_content=original_content,
+                route=route,
+                buffer=buffer,
+            ),
+            lifecycle=lifecycle,
+        )
+        return sse_from_buffer(buffer, 0)
+
+    async def _produce_direct(
+        self,
+        *,
+        lifecycle: TurnLifecycle,
+        conv_id: UUID,
+        original_content,
+        route: RouteDecision,
+        buffer,
+    ) -> None:
+        """Persist and emit a direct answer using the normal detached lifecycle."""
+        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
+        pending_message_id: UUID | None = None
+        events: list[dict] = []
+        try:
+            svc = ConversationService(producer_session)
+            pending_message_id = svc.save_user_message(conv_id, original_content, pending=True).id
+            response = Response(status=ResponseStatus.created, model=route.model)
+            item_id = f"msg-{conv_id.hex[:12]}"
+            created = response.model_dump()
+            created["conversation_id"] = str(conv_id)
+            created["harness"] = "cowork-direct"
+            await buffer.append("sse", {"sse": f"event: response.created\\ndata: {json.dumps({'type': 'response.created', 'sequence_number': 1, 'response': created})}\\n\\n"})
+            delta = {
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": item_id,
+                "delta": route.text,
+                "response_route": route.route,
+                "response_route_reason": route.reason,
+            }
+            events.append(delta)
+            await buffer.append("sse", {"sse": f"event: response.output_text.delta\\ndata: {json.dumps(delta)}\\n\\n"})
+            completed_response = Response(
+                id=response.id,
+                created_at=response.created_at,
+                status=ResponseStatus.completed,
+                model=route.model,
+                output=[self._build_output(item_id, route.text)],
+            ).model_dump()
+            completed = {"type": "response.completed", "sequence_number": 3, "response": completed_response}
+            events.append({"type": "response.completed"})
+            await buffer.append("sse", {"sse": f"event: response.completed\\ndata: {json.dumps(completed)}\\n\\n"})
+            if pending_message_id is not None:
+                svc.finalize_pending(conv_id, pending_message_id)
+            svc.save_assistant_turn(conv_id, route.text, events, harness="cowork-direct")
+            await buffer.close("completed")
+        except asyncio.CancelledError:
+            if not lifecycle.discarded and pending_message_id is not None:
+                ConversationService(producer_session).finalize_pending(conv_id, pending_message_id)
+                await buffer.close("cancelled")
+            raise
+        except Exception:
+            logger.exception("[responses] failed to persist direct turn for conversation %s", conv_id)
+            await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            await buffer.close("error")
+        finally:
+            producer_session.close()
 
     def _select_producer(
         self,
@@ -685,7 +850,7 @@ class ResponsesHandler:
                 collected_text.append(data.get("delta", ""))
 
         try:
-            async for _ in self.harness.formatter(stream, model, event_sink):
+            async for _ in self._get_harness().formatter(stream, model, event_sink):
                 pass
         except Exception as exc:
             # Mirror the streaming path: a recognised failure (e.g. an
@@ -721,7 +886,7 @@ class ResponsesHandler:
         events: list[dict],
         tool_rows: list[dict] | None = None,
     ) -> None:
-        harness_id = getattr(self.harness, 'id', None)
+        harness_id = getattr(self._get_harness(), 'id', None)
         ConversationService(self.scoped).save_assistant_turn(
             conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
