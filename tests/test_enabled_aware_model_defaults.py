@@ -166,7 +166,12 @@ def test_latest_prefixed_pin_is_probed_bare():
 
 
 def test_funded_pin_is_kept():
-    s = _pinned(minds_model_enabled=PAID_MAP, coding_model="haiku", router_model="kimi")
+    # The map is written from the full catalogue, so a funded wallet lists the
+    # pinned ids as enabled — both stay put.
+    funded = json.dumps(
+        {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True}
+    )
+    s = _pinned(minds_model_enabled=funded, coding_model="haiku", router_model="kimi")
     assert s.resolved_coding_model == "haiku"
     assert s.resolved_router_model == "kimi"
 
@@ -186,11 +191,18 @@ def test_absent_map_keeps_the_pin():
     assert s.resolved_coding_model == "haiku"
 
 
-def test_pin_missing_from_map_is_treated_as_available():
+def test_pin_absent_from_nonempty_map_is_treated_as_not_served():
+    # The opposite of _enabled_aware_default's absent-means-available rule,
+    # deliberately: that rule probes OUR canonical default (absence = older
+    # gateway), this one probes a USER-STORED id that can be anything. The map
+    # is written from the full /v1/models catalogue, so an id it doesn't carry
+    # is not served and 404s every aux call — the drpconcepcion cohort stored
+    # a Gemini id against minds-cloud, which the map can never mark false.
     s = _pinned(
-        minds_model_enabled=json.dumps({"mindshub_air": True}), coding_model="haiku"
+        minds_model_enabled=json.dumps({"mindshub_air": True}),
+        coding_model="gemini-3.6-flash",
     )
-    assert s.resolved_coding_model == "haiku"
+    assert s.resolved_coding_model == "mindshub_air"
 
 
 def test_planning_pin_is_never_silently_swapped():
