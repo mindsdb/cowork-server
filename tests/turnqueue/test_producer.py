@@ -8,9 +8,9 @@ from cowork.turnqueue import producer as prod
 
 @pytest.fixture(autouse=True)
 def _stub_llm_mint(monkeypatch):
-    """Every produce_remote_turn call now mints a turn key before enqueuing.
+    """Every stream_remote_replies call now mints a turn key before enqueuing.
     Stub it by default so the pre-existing tests (which only exercise the
-    reply-loop/SSE behavior) don't need to know about the llm block; tests
+    reply-loop behavior) don't need to know about the llm block; tests
     that care override this explicitly."""
 
     async def _fake_mint(**kw):
@@ -30,14 +30,14 @@ class FakeRedis:
         return None
 
 
-class RecBuffer:
-    def __init__(self): self.records = []; self.closed = None
-    async def append(self, type_, data): self.records.append((type_, data)); return len(self.records)
-    async def close(self, reason, extra=None): self.closed = reason
-
-
 def _reply(kind, data):
     return {"payload": json.dumps({"correlation_id": "r", "kind": kind, "data": data})}
+
+
+async def _drain(gen):
+    """Exhaust the reply generator, returning its (kind, data) yields.
+    Nothing happens (no mint, no XADD) before the first __anext__."""
+    return [item async for item in gen]
 
 
 @pytest.mark.asyncio
@@ -48,57 +48,47 @@ async def test_job_goes_to_the_conversations_own_stream(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=RecBuffer())
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
+                                            user_id=None, input_text="hi", model="m"))
     assert fake.added[0][0] == "scratchpad:requests:conv-1"
     assert fake.registered == [("scratchpad:requests:queues", "conv-1")]
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_turn_streams_deltas(monkeypatch):
+async def test_stream_remote_replies_yields_deltas_in_order(monkeypatch):
     replies = [("scratchpad:reply:conv-1", _reply("turn_delta", {"text": "he"})),
                ("scratchpad:reply:conv-1", _reply("turn_delta", {"text": "llo"})),
                ("scratchpad:reply:conv-1", _reply("turn_completed", {}))]
     fake = FakeRedis(replies=replies)
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    buf = RecBuffer()
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=buf,
-                                   history=[{"role": "user", "content": "prev"}])
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
+        model="m", history=[{"role": "user", "content": "prev"}]))
     job = json.loads(fake.added[0][1]["payload"])
     assert job["op"] == "anton_turn"
     assert job["params"]["history"] == [{"role": "user", "content": "prev"}]
-    sse = [r[1]["sse"] for r in buf.records]
-    assert "response.created" in sse[0]
-    assert "he" in sse[1] and "response.output_text.delta" in sse[1]
-    assert "llo" in sse[2]
-    assert "response.completed" in sse[3]
-    assert buf.closed == "completed"
+    assert items == [("turn_delta", {"text": "he"}),
+                     ("turn_delta", {"text": "llo"}),
+                     ("turn_completed", {})]
 
 
 @pytest.mark.asyncio
-async def test_turn_failed_renders_as_response_failed(monkeypatch):
-    # A failed turn must stream the same response.failed frame the in-process
-    # path emits (the client renders nothing for a bare completed+error), with
-    # the pod's typed error string mapped to a friendly (code, message).
+async def test_turn_failed_yields_classified_code_and_message(monkeypatch):
+    # A failed turn must end with a turn_failed carrying the same friendly
+    # (code, message) the caller streams as response.failed and persists,
+    # with the pod's typed error string mapped to it.
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply(
         "turn_failed", {"error": "ProviderOverloadedError: Anthropic is momentarily overloaded."}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    buf = RecBuffer()
-    events = []
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=buf,
-                                   on_event=lambda kind, data: events.append((kind, data)))
-    failed = buf.records[-1][1]["sse"]
-    assert "response.failed" in failed
-    assert "provider_overloaded" in failed
-    assert "momentarily overloaded" in failed
-    assert buf.closed == "error"
-    # on_event sees the same classification the frame carried
-    assert events[-1][0] == "turn_failed"
-    assert events[-1][1]["code"] == "provider_overloaded"
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    kind, data = items[-1]
+    assert kind == "turn_failed"
+    assert data["code"] == "provider_overloaded"
+    assert "momentarily overloaded" in data["message"]
+    assert items == [items[-1]]  # terminal is the only yield, then the generator ends
 
 
 @pytest.mark.asyncio
@@ -107,34 +97,34 @@ async def test_unmapped_turn_failure_is_redacted(monkeypatch):
         "turn_failed", {"error": "RuntimeError: secret-internal-detail"}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    buf = RecBuffer()
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=buf)
-    failed = buf.records[-1][1]["sse"]
-    assert "response.failed" in failed
-    assert "anton_error" in failed
-    assert "secret-internal-detail" not in failed  # raw text never reaches the client
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    kind, data = items[-1]
+    assert kind == "turn_failed"
+    assert data["code"] == "anton_error"
+    # The client-facing message never carries the raw text.
+    assert "secret-internal-detail" not in data["message"]
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_turn_history_defaults_empty(monkeypatch):
+async def test_stream_remote_replies_history_defaults_empty(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=RecBuffer())
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
+                                            user_id=None, input_text="hi", model="m"))
     assert json.loads(fake.added[0][1]["payload"])["params"]["history"] == []
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_turn_forwards_skills(monkeypatch):
+async def test_stream_remote_replies_forwards_skills(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     skills = {"csv-summary": {"files": {"SKILL.md": "---\nname: csv-summary\n---\nbody"}}}
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=RecBuffer(),
-                                   skills=skills)
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
+                                            user_id=None, input_text="hi", model="m",
+                                            skills=skills))
     assert json.loads(fake.added[0][1]["payload"])["params"]["skills"] == skills
 
 
@@ -151,9 +141,9 @@ async def test_oversized_request_drops_skills_then_memory(monkeypatch):
 
     big_skills = {"s": {"files": {"SKILL.md": "x" * 5000}}}
     big_memory = {"global": {"rules": "y" * 5000}}
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=RecBuffer(),
-                                   memory=big_memory, skills=big_skills)
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
+                                            user_id=None, input_text="hi", model="m",
+                                            memory=big_memory, skills=big_skills))
     params = json.loads(fake.added[0][1]["payload"])["params"]
     # skills shed first; memory then also shed because it alone still overruns
     assert "skills" not in params
@@ -171,28 +161,28 @@ async def test_request_keeps_memory_when_dropping_skills_suffices(monkeypatch):
 
     big_skills = {"s": {"files": {"SKILL.md": "x" * 5000}}}
     small_memory = {"global": {"rules": "keep me"}}
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=RecBuffer(),
-                                   memory=small_memory, skills=big_skills)
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
+                                            user_id=None, input_text="hi", model="m",
+                                            memory=small_memory, skills=big_skills))
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert "skills" not in params
     assert params["memory"] == small_memory   # shedding skills alone was enough
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_turn_omits_empty_skills(monkeypatch):
+async def test_stream_remote_replies_omits_empty_skills(monkeypatch):
     # Like memory: a skill-less turn keeps the pre-existing payload shape.
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
-                                   input_text="hi", model=None, buffer=RecBuffer(),
-                                   skills={})
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
+                                            user_id=None, input_text="hi", model="m",
+                                            skills={}))
     assert "skills" not in json.loads(fake.added[0][1]["payload"])["params"]
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
+async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     # _reply() hardcodes correlation_id="r" on the reply envelope, so the
@@ -209,10 +199,10 @@ async def test_produce_remote_turn_mints_and_attaches_llm_block(monkeypatch):
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
 
-    await prod.produce_remote_turn(
+    await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
-        model="mindshub_air", buffer=RecBuffer(),
-    )
+        model="mindshub_air",
+    ))
 
     payload = json.loads(fake.added[0][1]["payload"])
     llm = payload["params"]["llm"]
@@ -295,30 +285,26 @@ class SilentRedis:
 
 @pytest.mark.asyncio
 async def test_unresponsive_worker_fails_the_turn_instead_of_spinning(monkeypatch):
-    """With the worker down the reply loop used to `continue` forever: the
-    buffer was never closed, so tail() never returned and the SSE response
-    never ended — which the keepalive now keeps alive indefinitely. The loop
-    must give up and emit the same response.failed frame turn_failed emits."""
+    """With the worker down the reply loop used to `continue` forever: no
+    terminal was ever yielded, so the caller's SSE response never ended. The
+    loop must give up and yield the same classified turn_failed a pod failure
+    yields."""
     fake = SilentRedis()
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0.01")
-    buf = RecBuffer()
-    events = []
 
-    await asyncio.wait_for(prod.produce_remote_turn(
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
-        model=None, buffer=buf, on_event=lambda kind, data: events.append((kind, data)),
-    ), timeout=5)
+        model="m",
+    )), timeout=5)
 
-    failed = buf.records[-1][1]["sse"]
-    assert "response.failed" in failed
-    assert "anton_error" in failed
-    # Closed, so the buffer's tail() ends and the SSE response with it.
-    assert buf.closed == "error"
-    # And persisted as a failure, so a reload shows the error card.
-    assert events[-1][0] == "turn_failed"
-    assert events[-1][1]["code"] == "anton_error"
+    # Terminal yielded, so the generator (and the SSE response with it) ends,
+    # and the caller persists a failure so a reload shows the error card.
+    kind, data = items[-1]
+    assert kind == "turn_failed"
+    assert data["code"] == "anton_error"
+    assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
 
 
 @pytest.mark.asyncio
@@ -355,15 +341,14 @@ async def test_replies_refresh_the_idle_deadline(monkeypatch):
     # longer than any single quiet gap (~0.04s) — so this can only pass if each
     # reply pushes the deadline out, with enough slack for a loaded CI box.
     monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0.15")
-    buf = RecBuffer()
 
-    await asyncio.wait_for(prod.produce_remote_turn(
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
-        model=None, buffer=buf,
-    ), timeout=5)
+        model="m",
+    )), timeout=5)
 
-    assert buf.closed == "completed"
-    assert "response.failed" not in "".join(r[1]["sse"] for r in buf.records)
+    assert items[-1] == ("turn_completed", {})
+    assert all(kind != "turn_failed" for kind, _ in items)
 
 
 @pytest.mark.asyncio
@@ -373,12 +358,52 @@ async def test_idle_bound_can_be_disabled(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0")
-    buf = RecBuffer()
+
+    items = []
+
+    async def consume():
+        async for item in prod.stream_remote_replies(
+                conversation_id="conv-1", org_id=None, user_id=None,
+                input_text="hi", model="m"):
+            items.append(item)
 
     with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(prod.produce_remote_turn(
-            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
-            model=None, buffer=buf,
-        ), timeout=0.2)
+        await asyncio.wait_for(consume(), timeout=0.2)
 
-    assert buf.closed is None
+    assert items == []  # no synthesized terminal — the loop just keeps waiting
+
+
+def test_step_stream_events_tool_end_replays_args():
+    from anton.core.llm.provider import StreamToolUseDelta, StreamToolUseEnd
+
+    events = prod.step_stream_events(
+        {"step": "tool_end", "id": "t1", "args": '{"code": "1+1"}'})
+    assert isinstance(events[0], StreamToolUseDelta)
+    assert events[0].json_delta == '{"code": "1+1"}'
+    assert events[0].id == "t1"
+    assert isinstance(events[1], StreamToolUseEnd)
+    assert events[1].id == "t1"
+
+
+def test_step_stream_events_tool_end_without_args_skips_delta():
+    from anton.core.llm.provider import StreamToolUseEnd
+
+    events = prod.step_stream_events({"step": "tool_end", "id": "t1"})
+    assert len(events) == 1 and isinstance(events[0], StreamToolUseEnd)
+
+
+def test_step_stream_events_round_end_carries_tool_call_truthiness():
+    from anton.core.llm.provider import StreamComplete
+
+    with_calls = prod.step_stream_events(
+        {"step": "round_end", "had_tool_calls": True, "stop_reason": "tool_use"})
+    assert len(with_calls) == 1 and isinstance(with_calls[0], StreamComplete)
+    assert with_calls[0].response.tool_calls
+    assert with_calls[0].response.stop_reason == "tool_use"
+
+    without = prod.step_stream_events({"step": "round_end", "had_tool_calls": False})
+    assert not without[0].response.tool_calls
+
+
+def test_step_stream_events_unknown_step_yields_nothing():
+    assert prod.step_stream_events({"step": "mystery"}) == []

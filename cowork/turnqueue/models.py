@@ -63,6 +63,6 @@ class TurnReply(BaseModel):
     """Mirror of scratchpad-controller ScratchpadReplyPayload (reply cowork consumes)."""
 
     correlation_id: str
-    kind: Literal["progress", "cell", "error", "turn_delta", "turn_memory",
-                  "turn_completed", "turn_failed"]
+    kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
+                  "turn_memory", "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
