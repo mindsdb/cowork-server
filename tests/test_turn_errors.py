@@ -602,22 +602,33 @@ def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
     assert code == te.RATE_LIMITED_CODE
 
 
-def test_body_code_fallback_still_cards_a_wallet_denial():
-    # The same second carrier must keep working for the case that already
-    # works — a header-less wallet denial is out-of-credits, not a rate limit.
-    exc = ConnectionError("Server returned 402")
-    exc.__cause__ = inner = _FakeAPIStatusError(402, {}, url=_minds_gateway_url())
-    inner.body = {"code": "wallet_empty"}  # SDK-unwrapped dialect
-    assert te.friendly_turn_error(exc)[0] == te.TOKEN_LIMIT_CODE
-
-
-def test_unrelated_provider_body_code_is_not_read_as_a_gateway_denial():
-    # The body fallback only honours codes this module defines. A BYOK
-    # provider's own `code` must not be able to conjure a billing verdict.
+@pytest.mark.parametrize("code", ["wallet_empty", "rate_limited", "included_allowance_exhausted"])
+def test_a_third_party_body_cannot_select_a_billing_verdict(code):
+    # ENG-1537 review. The body-`code` carrier must be host-gated exactly like
+    # the bare-status rule. A response body is third-party-controlled on a BYOK
+    # OPENAI_COMPATIBLE provider, so without the gate any endpoint could send
+    # {"code": "wallet_empty"} and put our billing CTA — and the MindsHub top-up
+    # link — in front of a user with no MindsHub balance at all.
+    #
+    # The allowlist alone does NOT prevent this: it constrains which verdict can
+    # be selected, not who may select one. That is why these are the codes we
+    # recognise rather than junk.
     exc = ConnectionError("Server returned 429")
-    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url="https://api.openai.com/v1/x")
-    inner.body = {"error": {"code": "some_openai_thing"}}
-    assert te.friendly_turn_error(exc) is None
+    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url="https://openrouter.ai/api/v1/x")
+    inner.body = {"error": {"code": code}}
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] not in (
+        te.TOKEN_LIMIT_CODE, te.RATE_LIMITED_CODE, te.ALLOWANCE_EXHAUSTED_CODE,
+    ), f"a third-party body selected {result!r}"
+
+
+def test_the_gateways_own_body_code_still_maps():
+    # The gate must not break the carrier it exists to protect: on OUR host the
+    # body code is still honoured when the header didn't survive (ENG-1363).
+    exc = ConnectionError("Server returned 429")
+    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
+    inner.body = {"error": {"code": "rate_limited"}}
+    assert te.friendly_turn_error(exc)[0] == te.RATE_LIMITED_CODE
 
 
 def test_exhausted_rate_limit_wait_keeps_its_code_over_the_bare_status_rule():
@@ -630,9 +641,11 @@ def test_exhausted_rate_limit_wait_keeps_its_code_over_the_bare_status_rule():
         code="rate_limited",
         model="sonnet",
     )
-    exhausted.__cause__ = _FakeAPIStatusError(
-        429, {"X-MindsHub-Reason": "rate_limited"}, url=_minds_gateway_url()
-    )
+    # NO reason header and NO body code: the ONLY thing that can save this from
+    # the bare-status 429 rule is the hoisted code check. The earlier version of
+    # this test passed the header, so it never exercised the hoist it is named
+    # after — deleting the whole block left it green (ENG-1537 review).
+    exhausted.__cause__ = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
     code, _ = te.friendly_turn_error(exhausted)
     assert code == te.RATE_LIMITED_CODE
 
@@ -1033,3 +1046,57 @@ def test_no_return_emits_a_literal_code():
         and isinstance(node.value.elts[0].value, str)
     ]
     assert offenders == []
+
+
+# ── Wiring coverage (ENG-1537 review finding 3) ────────────────────────────
+# Four mutations survived the full suite: the reset_at and retry_after extras
+# in responses.py, the never-throttle exemption, and PHASE_LABELS.
+
+def test_retry_at_is_an_absolute_offset_bearing_instant():
+    # The renderer gates its Retry on this. It cannot use the message's own
+    # created_at — cowork-server serialises that naive and offset-less, so JS
+    # parses it as LOCAL time: west of UTC the button gates for hours, east of
+    # it the gate no-ops, and a TZ=UTC suite sees neither.
+    from datetime import datetime
+
+    got = te.retry_at_instant(30)
+    assert got is not None and got.endswith("Z"), got
+    parsed = datetime.fromisoformat(got.replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None  # the whole point
+    assert te.retry_at_instant(None) is None
+    assert te.retry_at_instant(-5) is None
+
+
+def test_rate_limit_extras_carry_both_the_interval_and_the_instant():
+    payload = te.response_failed_payload(
+        "msg", te.RATE_LIMITED_CODE, retry_after=30.0, retry_at="2026-09-01T00:00:30Z",
+    )
+    assert payload["retry_after"] == 30.0
+    assert payload["retry_at"] == "2026-09-01T00:00:30Z"
+    # Additive: absent for every other failure, so the wire shape is unchanged.
+    plain = te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
+    assert "retry_after" not in plain and "retry_at" not in plain
+
+
+def test_the_rate_limit_notice_is_exempt_from_progress_throttling():
+    # It fires once per wait. Throttled away, a deliberate 90s pause is
+    # indistinguishable from a hang.
+    #
+    # Note this is a REFINEMENT, not the enabler: staging already forwards
+    # phase/message on response.in_progress. The binding constraint is the
+    # renderer, which drops the ad-hoc phase until cowork#648 lands.
+    import inspect
+    from cowork.harnesses.anton_harness import stream_formatter as sf
+
+    src = inspect.getsource(sf)
+    assert "is_rate_limited_notice" in src
+    assert 'phase_str == "rate_limited"' in src
+    assert "or is_rate_limited_notice" in src
+
+
+def test_the_waiting_phase_has_a_human_label():
+    # Without it the renderer shows the raw constant ("rate_limited: waiting
+    # 30s…"), which reads as a leak rather than a status.
+    from cowork.harnesses.anton_harness.stream_formatter import PHASE_LABELS
+
+    assert PHASE_LABELS["rate_limited"] == "Rate limited"

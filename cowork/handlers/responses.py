@@ -44,6 +44,7 @@ from cowork.handlers.turn_errors import (
     allowance_reset_at,
     response_failed_payload,
     retry_after_seconds,
+    retry_at_instant,
     response_failed_sse,
 )
 from cowork.db.scoped import ScopedSession, scope_from_principal
@@ -624,7 +625,12 @@ class ResponsesHandler:
                 # header → no gate, which is honest rather than invented.
                 _after = retry_after_seconds(exc)
                 if _after is not None:
-                    extra = {"retry_after": _after}
+                    # Both: the interval for the copy, and an absolute instant
+                    # for the card's gate. The renderer cannot derive the second
+                    # from the first — it has no trustworthy anchor, because the
+                    # message's own created_at is serialised offset-less and JS
+                    # reads it as local time (ENG-1537 review).
+                    extra = {"retry_after": _after, "retry_at": retry_at_instant(_after)}
             elif code == PROVIDER_OVERLOADED_CODE:
                 # Transient-incident timeout (ENG-673): give the card the failing
                 # model AND the active provider, and flag whether the user is
