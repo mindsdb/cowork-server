@@ -22,6 +22,9 @@ def _stub_llm_mint(monkeypatch):
 class FakeRedis:
     def __init__(self, replies): self.added = []; self.registered = []; self._replies = replies
     async def sadd(self, key, member): self.registered.append((key, member)); return 1
+    async def hset(self, key, mapping=None): return 1
+    async def expire(self, key, seconds): return 1
+    async def delete(self, *keys): return len(keys)
     async def xadd(self, stream, fields): self.added.append((stream, fields)); return "1-0"
     async def xread(self, streams, count=None, block=None):
         if self._replies:
@@ -51,7 +54,10 @@ async def test_job_goes_to_the_conversations_own_stream(monkeypatch):
     await prod.produce_remote_turn(conversation_id="conv-1", org_id=None, user_id=None,
                                    input_text="hi", model=None, buffer=RecBuffer())
     assert fake.added[0][0] == "scratchpad:requests:conv-1"
-    assert fake.registered == [("scratchpad:requests:queues", "conv-1")]
+    # Registered in the controller's queue registry, and in cowork's own turn
+    # index so another replica can find this turn.
+    assert ("scratchpad:requests:queues", "conv-1") in fake.registered
+    assert ("cowork:turns", "conv-1") in fake.registered
 
 
 @pytest.mark.asyncio
@@ -282,6 +288,15 @@ class SilentRedis:
     async def sadd(self, key, member):
         self.registered.append((key, member))
         return 1
+
+    async def hset(self, key, mapping=None):
+        return 1
+
+    async def expire(self, key, seconds):
+        return 1
+
+    async def delete(self, *keys):
+        return len(keys)
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))

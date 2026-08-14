@@ -17,6 +17,7 @@ from cowork.handlers.turn_errors import remote_turn_error, response_failed_sse
 from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
+from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
@@ -115,6 +116,7 @@ async def _fail_unresponsive_worker(*, buffer, on_event, idle_seconds: float,
 async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               user_id: str | None, input_text: str,
                               model: str | None, buffer,
+                              turn_id: int = 0,
                               history: list | None = None,
                               harness_id: str | None = None,
                               memory: dict | None = None,
@@ -125,6 +127,14 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     settings = TurnQueueSettings()
     r = get_redis()
     corr = _new_correlation_id()
+    # Any replica can now find this turn: its turn_id to open the buffer, its
+    # correlation_id to cancel it, its org to authorize the caller.
+    await record_turn(
+        conversation_id, turn_id=turn_id, correlation_id=corr,
+        org_id=org_id, user_id=user_id, client=r,
+    )
+    # A flag left by an earlier turn would cancel this one on its first line.
+    await r.delete(f"cowork:cancel:{corr}")
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
     # No client-picked model → the deployment's resolved default (org mode: the

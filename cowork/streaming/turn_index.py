@@ -40,9 +40,14 @@ async def record_turn(
     correlation_id: str,
     org_id: str | None,
     user_id: str | None,
+    client=None,
 ) -> None:
-    """Note this turn as the conversation's current one, replacing any previous."""
-    r = get_redis()
+    """Note this turn as the conversation's current one, replacing any previous.
+
+    ``client`` lets a caller that already holds a Redis client reuse it, rather
+    than this module reaching for a second one.
+    """
+    r = client or get_redis()
     key = _turn_key(conversation_id)
     await r.delete(key)
     await r.hset(key, mapping={
