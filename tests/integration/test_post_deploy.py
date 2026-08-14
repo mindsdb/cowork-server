@@ -1,9 +1,7 @@
 """Smoke tests against a deployed cowork-server.
 
-These talk to a running deployment over HTTP: cowork-server, Redis, the
-scratchpad controller and a real scratchpad pod. They are the only tests that
-cover the whole chain, and the only ones that can catch a break that lives
-between the services rather than inside one of them.
+These talk to a running deployment over HTTP, so they exercise cowork-server,
+Redis, the scratchpad controller and a real scratchpad pod together.
 
 Skipped unless COWORK_BASE_URL is set, so a normal `pytest` run ignores them.
 
@@ -108,8 +106,7 @@ def _stream_turn(client: httpx.Client, conversation_id: str, prompt: str, *,
 
 
 def test_a_turn_runs_end_to_end(api, conversation_id):
-    """The baseline. If this fails the rest is noise: the job never reached a
-    pod, or the pod's replies never reached the browser."""
+    """A turn posted over HTTP reaches a pod and its replies reach the client."""
     events = _stream_turn(api, conversation_id, QUICK_PROMPT)
 
     assert "response.created" in events
@@ -144,7 +141,7 @@ def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
 
 
 def test_reconnect_works_on_the_other_replica(conversation_id):
-    """The reason the Redis backend exists.
+    """A turn started on one replica can be probed and tailed from another.
 
     Requires COWORK_BASE_URL_B pointing at a different pod, since the load
     balancer may otherwise send both requests to the same one.
@@ -184,11 +181,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id):
 
 
 def test_cancel_ends_the_turn(api, conversation_id):
-    """Cancel used to stop cowork's tail while the pod ran on, spending tokens.
-
-    The turn must reach a terminal state promptly, and a later tail must show
-    it finished rather than still running.
-    """
+    """After POST /cancel, /in-flight reports the turn as finished."""
     with api.stream(
         "POST", "/api/v1/responses/",
         json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
