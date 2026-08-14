@@ -453,7 +453,7 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
     { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=main" },
-    { name = "cryptography", specifier = ">=48.0.0" },
+    { name = "cryptography", specifier = ">=48.0.0,<49" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
     { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=44ddc552f5e054759a6970af8997ea588a9d81c9" },
