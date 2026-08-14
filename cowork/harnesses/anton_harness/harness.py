@@ -99,16 +99,17 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
             "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
             "is itself the final answer the user needs. "
             "Files you create as artifacts appear automatically in the Live Artifacts "
-            "panel beside the chat, where the user previews them and uses the Open and "
-            "Download controls. When a file is ready, tell the user it is in the Live "
-            "Artifacts panel and can be opened or downloaded there — do NOT hand them "
+            "panel beside the chat, where the user previews them and uses the Download "
+            "control (and Open, on desktop). When a file is ready, tell the user it is "
+            "in the Live Artifacts panel and can be downloaded there — do NOT hand them "
             "its location on disk. Never put a file's local path (for example "
             "C:\\Users\\... or /Users/...) into your reply as a markdown link or as "
             "text: such a link does nothing when clicked in chat, and the bare path "
             "only exposes the user's machine layout. Never invent a download URL such "
             "as sandbox:/mnt/data/...; no link of that form exists. If the user says "
             "they cannot find or download the file, point them again at the Live "
-            "Artifacts panel's Open and Download controls — never repeat the path."
+            "Artifacts panel's Download control (and Open, on desktop) — never repeat "
+            "the path."
         )
     setting = (
         "a group chat with multiple participants" if channel.is_group
