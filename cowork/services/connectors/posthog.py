@@ -25,8 +25,8 @@ def resolve_host(host: object, custom_host: object = None) -> str:
     """Validate and normalize the selected cloud or self-hosted PostHog host."""
     selected = str(custom_host if host == "custom" else host or "").strip().rstrip("/")
     parsed = urlparse(selected)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise PostHogDiscoveryError("Choose a valid PostHog host before finding projects.")
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise PostHogDiscoveryError("Choose a valid HTTPS PostHog host before finding projects.")
     return selected
 
 
@@ -37,7 +37,7 @@ async def discover_projects(*, personal_api_key: object, host: object, custom_ho
         raise PostHogDiscoveryError("Enter your PostHog personal API key before finding projects.")
     base_url = resolve_host(host, custom_host)
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
             response = await client.get(
                 f"{base_url}/api/projects/",
                 headers={"Authorization": f"Bearer {api_key}"},

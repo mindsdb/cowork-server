@@ -62,5 +62,5 @@ async def test_hides_posthog_auth_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rejects_invalid_posthog_host():
-    with pytest.raises(PostHogDiscoveryError, match="valid PostHog host"):
+    with pytest.raises(PostHogDiscoveryError, match="valid HTTPS PostHog host"):
         await discover_projects(personal_api_key="secret-key", host="not a URL")
