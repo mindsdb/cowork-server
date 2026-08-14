@@ -191,3 +191,22 @@ def test_effort_dropped_when_wallet_fallback_swaps_the_model(build):
     )
     _client, calls = build(settings)
     assert "reasoning_effort" not in calls["openai"][-1]
+
+
+def test_effort_survives_when_no_model_row_is_stored(build):
+    # Pin for the apply_model_defaults ↔ _effort_for coupling: a user with NO
+    # coding_model row keeps their reasoning effort only because the validator
+    # pre-fills the stored field, making stored == resolved. If the "collapse
+    # the redundant enabled-aware branch" idea from ENG-1632 ever removes that
+    # pre-fill, this goes red instead of every no-row user silently losing
+    # their effort setting.
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("mdb-key"),
+        minds_url="https://api.mindshub.ai",
+        coding_reasoning_effort="high",
+    )
+    assert settings.coding_model is not None  # the validator pre-fill
+    _client, calls = build(settings)
+    assert calls["openai"][-1].get("reasoning_effort") == "high"
