@@ -80,11 +80,18 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
 
 
 def _turn_style_context(channel: ChannelContext | None) -> str:
-    """Lead block of the system-prompt suffix: desktop activity-row guidance
-    for UI turns, support-chat guidance for channel turns.
+    """Lead block of the system-prompt suffix: desktop activity-row + artifact-
+    retrieval guidance for UI turns, support-chat guidance for channel turns.
 
-    The desktop branch must stay byte-identical to the historical literal —
-    the suffix participates in anton's cache-stable prompt prefix.
+    Both branches now name how a finished file reaches the user on THIS surface:
+    the channel branch says "I'm sending the file"; the desktop branch points at
+    the Live Artifacts panel and its Open/Download controls. Without the desktop
+    half, anton fell back to pasting the artifact's absolute local path as a
+    markdown link — inert in chat, and read by users as "the work was not
+    delivered" (ENG-1636).
+
+    The desktop branch participates in anton's cache-stable prompt prefix, so it
+    is asserted byte-for-byte by test_channel_context.py — change both together.
     """
     if channel is None:
         return (
@@ -92,7 +99,18 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
             "as separate structured activity rows. Keep assistant text focused on the "
             "user-facing answer; do not narrate internal work with status phrases like "
             "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-            "is itself the final answer the user needs."
+            "is itself the final answer the user needs. "
+            "Files you create as artifacts appear automatically in the Live Artifacts "
+            "panel beside the chat, where the user previews them and uses the Open and "
+            "Download controls. When a file is ready, tell the user it is in the Live "
+            "Artifacts panel and can be opened or downloaded there — do NOT hand them "
+            "its location on disk. Never put a file's local path (for example "
+            "C:\\Users\\... or /Users/...) into your reply as a markdown link or as "
+            "text: such a link does nothing when clicked in chat, and the bare path "
+            "only exposes the user's machine layout. Never invent a download URL such "
+            "as sandbox:/mnt/data/...; no link of that form exists. If the user says "
+            "they cannot find or download the file, point them again at the Live "
+            "Artifacts panel's Open and Download controls — never repeat the path."
         )
     setting = (
         "a group chat with multiple participants" if channel.is_group

@@ -18,12 +18,33 @@ DESKTOP_LEAD = (
     "as separate structured activity rows. Keep assistant text focused on the "
     "user-facing answer; do not narrate internal work with status phrases like "
     "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-    "is itself the final answer the user needs."
+    "is itself the final answer the user needs. "
+    "Files you create as artifacts appear automatically in the Live Artifacts "
+    "panel beside the chat, where the user previews them and uses the Open and "
+    "Download controls. When a file is ready, tell the user it is in the Live "
+    "Artifacts panel and can be opened or downloaded there — do NOT hand them "
+    "its location on disk. Never put a file's local path (for example "
+    "C:\\Users\\... or /Users/...) into your reply as a markdown link or as "
+    "text: such a link does nothing when clicked in chat, and the bare path "
+    "only exposes the user's machine layout. Never invent a download URL such "
+    "as sandbox:/mnt/data/...; no link of that form exists. If the user says "
+    "they cannot find or download the file, point them again at the Live "
+    "Artifacts panel's Open and Download controls — never repeat the path."
 )
 
 
 def test_desktop_lead_is_byte_stable():
     assert _turn_style_context(None) == DESKTOP_LEAD
+
+
+def test_desktop_lead_names_artifact_retrieval_path():
+    """ENG-1636: the desktop lead must point users at the Live Artifacts panel
+    and forbid the inert-local-path / fabricated-sandbox-link reflex."""
+    text = _turn_style_context(None)
+    assert "Live Artifacts" in text
+    assert "Open and Download controls" in text
+    assert "sandbox:/mnt/data" in text
+    assert "does nothing when clicked" in text
 
 
 def test_channel_variant_swaps_desktop_guidance():
