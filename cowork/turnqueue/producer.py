@@ -15,6 +15,7 @@ import uuid
 
 from cowork.handlers.turn_errors import remote_turn_error, response_failed_sse
 from cowork.services.providers import minds_chat_base_url
+from cowork.streaming import sse_frame as _sse
 from cowork.turnqueue.auth_keys import mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.turnqueue.redis_client import get_redis
@@ -55,10 +56,6 @@ def _fit_request(params: dict, conversation_id: str) -> dict:
 
 def _new_correlation_id() -> str:
     return str(uuid.uuid4())
-
-
-def _sse(event: str, payload: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
 async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
@@ -119,12 +116,15 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
                               harness_id: str | None = None,
                               memory: dict | None = None,
                               skills: dict | None = None,
-                              on_event=None) -> None:
+                              on_event=None,
+                              correlation_id: str | None = None,
+                              llm: dict | None = None) -> None:
     """`on_event(kind, data)` is called per reply (turn_delta/turn_completed/
-    turn_failed) so the caller can collect the turn for persistence."""
+    turn_failed) so the caller can collect the turn for persistence.
+    `correlation_id`/`llm` reuse a turn key the routing gate already minted."""
     settings = TurnQueueSettings()
     r = get_redis()
-    corr = _new_correlation_id()
+    corr = correlation_id or _new_correlation_id()
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
     # No client-picked model → the deployment's resolved default (org mode: the
@@ -136,7 +136,7 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
         scope = TenantScope(org_mode=bool(org_id), org_id=org_id, user_id=user_id)
         model = get_user_settings(scope).resolved_planning_model
 
-    llm_block = await _mint_llm_block(
+    llm_block = llm or await _mint_llm_block(
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
 
