@@ -650,16 +650,19 @@ def artifact_status(raw_path: str) -> dict:
         return dict(blank)
     if artifact is None:
         return dict(blank)
-    folder = artifact if artifact.is_dir() else artifact.parent
+    # Fullstack artifacts keep their primary file in a `static/` subdir, so a
+    # naive `artifact.parent` would land there instead of the artifact root
+    # (where metadata.json + .published.json actually live) — climb via
+    # `_artifact_root_for` like `mount_preview`/`html_artifacts` do.
+    folder = artifact if artifact.is_dir() else _artifact_root_for(artifact)
     card = card_for_folder(folder)
     if card is None:
-        # Loose / legacy file (no metadata.json). When card_for_folder
-        # returns None the resolved path is always a FILE — a dir would
-        # carry metadata.json per resolve_artifact_path's allow_dir contract.
+        # Loose / legacy file (no metadata.json anywhere up to the artifacts
+        # container root).
         card = {
-            "publishedUrl": _published_url_for(artifact.parent, artifact),
+            "publishedUrl": _published_url_for(folder, artifact),
             "modified": False,
-            **_published_access_for(artifact.parent, artifact),
+            **_published_access_for(folder, artifact),
         }
     # One response shape for BOTH branches: explicitly the published /
     # modified / access subset, and NEVER `accessPassword` — that owner-only
