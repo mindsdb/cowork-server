@@ -210,6 +210,7 @@ class ResponsesHandler:
                 harness_name=self.harness_name,
                 harness_id=getattr(self.harness, "id", None),
                 buffer=buffer,
+                turn_id=turn_id,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
             )
@@ -249,6 +250,7 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
@@ -275,6 +277,7 @@ class ResponsesHandler:
                 model=model,
                 harness_id=harness_id,
                 buffer=buffer,
+                turn_id=turn_id,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -350,6 +353,7 @@ class ResponsesHandler:
         model: str | None,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         lifecycle: TurnLifecycle | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: run the turn through the
@@ -421,6 +425,7 @@ class ResponsesHandler:
                 input_text=input_text,
                 model=model,
                 buffer=buffer,
+                turn_id=turn_id,
                 # Producer session, NOT self.scoped: this coroutine is detached
                 # and the request session may be closed by the time it runs.
                 history=self._remote_history(producer_session, conv_id),
@@ -464,6 +469,7 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
