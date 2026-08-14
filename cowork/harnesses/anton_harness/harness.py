@@ -80,18 +80,16 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
 
 
 def _turn_style_context(channel: ChannelContext | None) -> str:
-    """Lead block of the system-prompt suffix: desktop activity-row + artifact-
-    retrieval guidance for UI turns, support-chat guidance for channel turns.
+    """Lead block of the system-prompt suffix: desktop guidance for UI turns,
+    support-chat guidance for channel turns.
 
-    Both branches now name how a finished file reaches the user on THIS surface:
-    the channel branch says "I'm sending the file"; the desktop branch points at
-    the Live Artifacts panel and its Open/Download controls. Without the desktop
-    half, anton fell back to pasting the artifact's absolute local path as a
-    markdown link — inert in chat, and read by users as "the work was not
-    delivered" (ENG-1636).
+    Both branches name how a finished file reaches the user: the channel branch
+    says "I'm sending the file", the desktop branch points at the Live Artifacts
+    panel. Without the desktop half, anton pasted the artifact's local path as a
+    markdown link — inert in chat (ENG-1636).
 
-    The desktop branch participates in anton's cache-stable prompt prefix, so it
-    is asserted byte-for-byte by test_channel_context.py — change both together.
+    The desktop branch is asserted byte-for-byte by test_channel_context.py
+    (cache-stable prompt prefix) — change both together.
     """
     if channel is None:
         return (
