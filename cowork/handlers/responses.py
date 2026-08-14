@@ -6,17 +6,30 @@ import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
-from cowork.common.settings.app_settings import TurnQueueSettings
-from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
+from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
+from cowork.common.settings.user_settings import (
+    Provider,
+    get_user_settings,
+    provider_api_key,
+    use_settings_scope,
+)
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
-from cowork.streaming import TurnLifecycle, new_buffer, registry
+from cowork.handlers.response_routing import (
+    DELEGATED_AGENTIC,
+    DIRECT_CONTEXT,
+    RouteDecision,
+    RouterBinding,
+    decide_route,
+    ineligible_reason,
+)
+from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
     Content,
@@ -111,10 +124,17 @@ class ResponsesHandler:
         self.principal = principal
         self.scope = scope_from_principal(principal)
         self.scoped = ScopedSession(session, self.scope)
-        # Resolve settings once; reuse the harness name in handle()/the producer.
+        # Resolve the selected harness name now, but initialize Anton lazily only
+        # after Cowork delegates a turn. Direct context responses must never build
+        # the Anton harness.
         self.harness_name = get_user_settings(self.scope).harness
-        self.harness = get_harness(self.harness_name)
+        self.harness = None
         self.last_conversation_id: str | None = None
+
+    def _get_harness(self):
+        if self.harness is None:
+            self.harness = get_harness(self.harness_name)
+        return self.harness
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
@@ -179,6 +199,35 @@ class ResponsesHandler:
             [dc.model_dump() for dc in request.disabled_connections]
             if request.disabled_connections else None
         )
+        route, turn_llm = await self._route_request(
+            conversation_id=conversation.id,
+            harness_input=harness_input,
+            has_attachments=bool(request.attachment_ids),
+            has_disabled_connections=bool(disabled),
+        )
+        trace_metadata = {
+            **trace_metadata,
+            "response_route": route.route,
+            "response_route_reason": route.reason,
+            **({"response_router_provider": route.provider} if route.provider else {}),
+            **({"response_router_model": route.model} if route.model else {}),
+            **({"response_route_fallback": "true"} if route.fallback else {}),
+        }
+        logger.info(
+            "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
+            route.route, route.reason, route.fallback, route.provider, route.model, conversation.id,
+        )
+
+        if route.route == DIRECT_CONTEXT:
+            return await self._handle_direct_response(
+                request=request,
+                conversation_id=conversation.id,
+                turn_id=turn_id,
+                original_content=original_content,
+                route=route,
+            )
+
+        harness = self._get_harness()
 
         if request.stream:
             # Detached + resumable. The agent run executes in a background
@@ -208,10 +257,11 @@ class ResponsesHandler:
                 model=request.model,
                 disabled=disabled,
                 harness_name=self.harness_name,
-                harness_id=getattr(self.harness, "id", None),
+                harness_id=getattr(harness, "id", None),
                 buffer=buffer,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
+                turn_llm=turn_llm,
             )
             await registry.start(
                 conversation_id=str(conversation.id),
@@ -229,7 +279,7 @@ class ResponsesHandler:
         # so the harness reads history WITHOUT the current turn — otherwise the
         # fresh-query history would replay it AND resend it as the live input.
         with use_settings_scope(self.scope):
-            stream = self.harness.stream_response(
+            stream = harness.stream_response(
                 conversation=conversation,
                 input=harness_input,
                 disabled_connections=disabled,
@@ -237,6 +287,202 @@ class ResponsesHandler:
                 trace_metadata=trace_metadata,
             )
             return await self._collect(stream, conversation.id, request.model, original_content)
+
+    async def _route_request(
+        self,
+        *,
+        conversation_id: UUID,
+        harness_input: list[dict],
+        has_attachments: bool,
+        has_disabled_connections: bool,
+    ) -> tuple[RouteDecision, dict | None]:
+        """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        Returns the decision plus pre-minted turn credentials
+        (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
+        has_non_text_input = any(block.get("type") != "text" for block in harness_input)
+        # Shape checks first: ineligible turns skip the history query.
+        reason = ineligible_reason(
+            has_non_text_input=has_non_text_input,
+            has_attachments=has_attachments,
+            has_disabled_connections=has_disabled_connections,
+        )
+        if reason:
+            return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
+        try:
+            history = [
+                message.to_openai_message().model_dump()
+                for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
+                if message.role in {"user", "assistant"}
+            ]
+            history.append({"role": "user", "content": self._prompt_text(harness_input)})
+            # The gate resolves the router role + key ambiently; bind the org scope.
+            with use_settings_scope(self.scope):
+                binding, turn_llm = await self._router_binding()
+                decision = await decide_route(
+                    history=history,
+                    has_non_text_input=has_non_text_input,
+                    has_attachments=has_attachments,
+                    has_disabled_connections=has_disabled_connections,
+                    binding=binding,
+                )
+            return decision, turn_llm
+        except Exception:
+            # Any gate-path failure (history query, mint, settings) fails open.
+            logger.exception("[responses] routing gate failed — delegating")
+            return RouteDecision(
+                route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
+            ), None
+
+    async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
+        """Hosted orgs keep no stored Minds key (remote turns mint one), so the
+        gate mints its own per-turn key here and hands it back for the
+        delegated turn to reuse. Everywhere else the stored settings apply."""
+        if TurnQueueSettings().backend != "remote":
+            return None, None
+        settings = get_user_settings(self.scope)
+        if (settings.resolved_router_provider is not Provider.MINDS_CLOUD
+                or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
+            return None, None
+        from anton.core.llm.openai import OpenAIProvider
+        from cowork.turnqueue.producer import _mint_llm_block
+
+        corr = str(uuid4())
+        block = await _mint_llm_block(
+            org_id=self.scoped.scope.org_id,
+            user_id=self.scoped.scope.user_id,
+            correlation_id=corr,
+            settings=TurnQueueSettings(),
+        )
+        provider = OpenAIProvider(
+            api_key=block["api_key"],
+            base_url=block["base_url"],
+            flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
+        )
+        binding = RouterBinding(
+            provider=provider,
+            model=settings.resolved_router_model or MINDS_FREE_MODEL,
+            label=Provider.MINDS_CLOUD.value,
+        )
+        return binding, {"correlation_id": corr, "llm": block}
+
+    async def _handle_direct_response(
+        self,
+        *,
+        request: ResponsesRequest,
+        conversation_id: UUID,
+        turn_id: int,
+        original_content,
+        route: RouteDecision,
+    ) -> AsyncGenerator[str, None] | Response:
+        """Return the router model's direct answer without initializing Anton."""
+        if not request.stream:
+            user_message = ConversationService(self.scoped).save_user_message(
+                conversation_id, original_content,
+            )
+            events = [{
+                "type": "response.output_text.delta",
+                "delta": route.text,
+                "response_route": route.route,
+                "response_route_reason": route.reason,
+            }, {"type": "response.completed"}]
+            ConversationService(self.scoped).save_assistant_turn(
+                conversation_id, route.text, events, harness="cowork-direct",
+            )
+            return Response(
+                status=ResponseStatus.completed,
+                model=route.model,
+                output=[self._build_output(str(user_message.id), route.text)],
+            )
+
+        # turn_id comes from handle(): same numbering as the delegated path.
+        buffer = new_buffer(str(conversation_id), turn_id)
+        lifecycle = TurnLifecycle()
+        await registry.start(
+            conversation_id=str(conversation_id),
+            turn_id=turn_id,
+            buffer=buffer,
+            org_id=self.scoped.scope.org_id,
+            user_id=self.scoped.scope.user_id,
+            producer_coro=self._produce_direct(
+                lifecycle=lifecycle,
+                conv_id=conversation_id,
+                original_content=original_content,
+                route=route,
+                buffer=buffer,
+            ),
+            lifecycle=lifecycle,
+        )
+        return sse_from_buffer(buffer, 0)
+
+    async def _produce_direct(
+        self,
+        *,
+        lifecycle: TurnLifecycle,
+        conv_id: UUID,
+        original_content,
+        route: RouteDecision,
+        buffer,
+    ) -> None:
+        """Persist and emit a direct answer using the normal detached lifecycle.
+
+        The full answer exists up front, so persistence happens before any
+        frame is emitted — the client can never see a completed turn the DB
+        does not have, and no pending row is needed."""
+        producer_session = None
+        try:
+            producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
+            item_id = f"msg-{conv_id.hex[:12]}"
+            delta = {
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": item_id,
+                "delta": route.text,
+                "response_route": route.route,
+                "response_route_reason": route.reason,
+            }
+            svc = ConversationService(producer_session)
+            svc.save_user_message(conv_id, original_content)
+            svc.save_assistant_turn(
+                conv_id, route.text, [delta, {"type": "response.completed"}],
+                harness="cowork-direct",
+            )
+
+            response = Response(status=ResponseStatus.created, model=route.model)
+            # conversation_id/harness sit at the event root, like both
+            # delegated paths — the GUI reads them there.
+            await buffer.append("sse", {"sse": sse_frame("response.created", {
+                "type": "response.created",
+                "sequence_number": 1,
+                "conversation_id": str(conv_id),
+                "harness": "cowork-direct",
+                "response": response.model_dump(),
+            })})
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
+            completed_response = Response(
+                id=response.id,
+                created_at=response.created_at,
+                status=ResponseStatus.completed,
+                model=route.model,
+                output=[self._build_output(item_id, route.text)],
+            ).model_dump()
+            await buffer.append("sse", {"sse": sse_frame("response.completed", {
+                "type": "response.completed", "sequence_number": 3, "response": completed_response,
+            })})
+            await buffer.close("completed")
+        except asyncio.CancelledError:
+            if lifecycle.discarded:
+                # Same reasoning as _produce_remote's discarded branch.
+                logger.info("[responses] discarded direct turn %s — not persisting", conv_id)
+                return
+            await buffer.close("cancelled")
+        except Exception:
+            logger.exception("[responses] direct turn failed for conversation %s", conv_id)
+            await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            await buffer.close("error")
+        finally:
+            if producer_session is not None:
+                producer_session.close()
 
     def _select_producer(
         self,
@@ -252,6 +498,7 @@ class ResponsesHandler:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
+        turn_llm: dict | None = None,
     ):
         """Choose the streaming producer coroutine.
 
@@ -275,6 +522,7 @@ class ResponsesHandler:
                 model=model,
                 harness_id=harness_id,
                 buffer=buffer,
+                turn_llm=turn_llm,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -351,6 +599,7 @@ class ResponsesHandler:
         harness_id: str | None,
         buffer,
         lifecycle: TurnLifecycle | None = None,
+        turn_llm: dict | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: run the turn through the
         queue and persist user + assistant together on terminal (deferred, so
@@ -428,6 +677,8 @@ class ResponsesHandler:
                 memory=self._remote_memory(producer_session, conv_id),
                 skills=self._remote_skills(producer_session, conv_id),
                 on_event=on_event,
+                correlation_id=(turn_llm or {}).get("correlation_id"),
+                llm=(turn_llm or {}).get("llm"),
             )
             persist()
         except asyncio.CancelledError:
@@ -685,7 +936,7 @@ class ResponsesHandler:
                 collected_text.append(data.get("delta", ""))
 
         try:
-            async for _ in self.harness.formatter(stream, model, event_sink):
+            async for _ in self._get_harness().formatter(stream, model, event_sink):
                 pass
         except Exception as exc:
             # Mirror the streaming path: a recognised failure (e.g. an
@@ -721,7 +972,7 @@ class ResponsesHandler:
         events: list[dict],
         tool_rows: list[dict] | None = None,
     ) -> None:
-        harness_id = getattr(self.harness, 'id', None)
+        harness_id = getattr(self._get_harness(), 'id', None)
         ConversationService(self.scoped).save_assistant_turn(
             conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
