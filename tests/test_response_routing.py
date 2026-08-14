@@ -162,3 +162,109 @@ async def test_router_error_fails_open_to_anton(monkeypatch):
     assert decision.route == DELEGATED_AGENTIC
     assert decision.reason == "router_unavailable"
     assert decision.fallback is True
+
+
+@pytest.mark.asyncio
+async def test_slow_gate_times_out_and_fails_open(monkeypatch):
+    import asyncio
+
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="router-model"),
+    )
+    monkeypatch.setattr(routing, "build_llm_client", lambda: object())
+
+    async def hung_gate(llm, *, history):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(routing, "_gate", hung_gate)
+    monkeypatch.setattr(routing, "_GATE_TIMEOUT_SECONDS", 0.01)
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "Hello"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_timeout"
+    assert decision.fallback is True
+
+
+def test_direct_sse_frames_use_real_newlines():
+    frame = ResponsesHandler._direct_sse("response.created", {"type": "response.created"})
+
+    assert frame.startswith("event: response.created\n")
+    assert "\ndata: " in frame
+    assert frame.endswith("\n\n")
+    assert "\\n" not in frame  # regression: literal backslash-n broke SSE parsing
+
+
+def _routing_handler(monkeypatch):
+    import cowork.handlers.responses as responses
+
+    monkeypatch.setattr(
+        responses,
+        "get_user_settings",
+        lambda scope: SimpleNamespace(harness="anton"),
+    )
+    return ResponsesHandler(session=object())
+
+
+@pytest.mark.asyncio
+async def test_route_request_runs_gate_under_org_scope(monkeypatch):
+    import cowork.handlers.responses as responses
+    from cowork.common.settings.user_settings import _current_scope
+    from cowork.handlers.response_routing import RouteDecision
+
+    handler = _routing_handler(monkeypatch)
+    sentinel_scope = object()
+    handler.scope = sentinel_scope
+
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen["scope"] = _current_scope.get()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id=None,
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert seen["scope"] is sentinel_scope
+
+
+@pytest.mark.asyncio
+async def test_ineligible_route_skips_the_history_query(monkeypatch):
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: (_ for _ in ()).throw(AssertionError("must not touch the DB")),
+    )
+
+    decision = await handler._route_request(
+        conversation_id=None,
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=True,
+        has_disabled_connections=False,
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "attachments_present"
