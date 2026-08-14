@@ -6,24 +6,30 @@ import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
-from cowork.common.settings.app_settings import TurnQueueSettings
-from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
+from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
+from cowork.common.settings.user_settings import (
+    Provider,
+    get_user_settings,
+    provider_api_key,
+    use_settings_scope,
+)
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import get_harness
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     RouteDecision,
+    RouterBinding,
     decide_route,
     ineligible_reason,
 )
-from cowork.streaming import TurnLifecycle, new_buffer, registry
+from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.turnqueue.producer import produce_remote_turn
 from cowork.schemas.responses import (
     Content,
@@ -193,7 +199,7 @@ class ResponsesHandler:
             [dc.model_dump() for dc in request.disabled_connections]
             if request.disabled_connections else None
         )
-        route = await self._route_request(
+        route, turn_llm = await self._route_request(
             conversation_id=conversation.id,
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
@@ -255,6 +261,7 @@ class ResponsesHandler:
                 buffer=buffer,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
+                turn_llm=turn_llm,
             )
             await registry.start(
                 conversation_id=str(conversation.id),
@@ -288,33 +295,76 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
-    ) -> RouteDecision:
-        """Run Cowork's narrow pre-Anton gate with only safe text context."""
+    ) -> tuple[RouteDecision, dict | None]:
+        """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        Returns the decision plus pre-minted turn credentials
+        (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
-        # Ineligible shapes delegate before the history query — no DB work.
+        # Shape checks first: ineligible turns skip the history query.
         reason = ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
         )
         if reason:
-            return RouteDecision(route=DELEGATED_AGENTIC, reason=reason)
-        history = [
-            message.to_openai_message().model_dump()
-            for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
-            if message.role in {"user", "assistant"}
-        ]
-        history.append({"role": "user", "content": self._prompt_text(harness_input)})
-        # The gate resolves settings ambiently (router role + provider key);
-        # without this scope, org-mode loads global rows only and the router
-        # key is never found, so the fast path silently never fires.
-        with use_settings_scope(self.scope):
-            return await decide_route(
-                history=history,
-                has_non_text_input=has_non_text_input,
-                has_attachments=has_attachments,
-                has_disabled_connections=has_disabled_connections,
-            )
+            return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
+        try:
+            history = [
+                message.to_openai_message().model_dump()
+                for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
+                if message.role in {"user", "assistant"}
+            ]
+            history.append({"role": "user", "content": self._prompt_text(harness_input)})
+            # The gate resolves the router role + key ambiently; bind the org scope.
+            with use_settings_scope(self.scope):
+                binding, turn_llm = await self._router_binding()
+                decision = await decide_route(
+                    history=history,
+                    has_non_text_input=has_non_text_input,
+                    has_attachments=has_attachments,
+                    has_disabled_connections=has_disabled_connections,
+                    binding=binding,
+                )
+            return decision, turn_llm
+        except Exception:
+            # Any gate-path failure (history query, mint, settings) fails open.
+            logger.exception("[responses] routing gate failed — delegating")
+            return RouteDecision(
+                route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
+            ), None
+
+    async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
+        """Hosted orgs keep no stored Minds key (remote turns mint one), so the
+        gate mints its own per-turn key here and hands it back for the
+        delegated turn to reuse. Everywhere else the stored settings apply."""
+        if TurnQueueSettings().backend != "remote":
+            return None, None
+        settings = get_user_settings(self.scope)
+        if (settings.resolved_router_provider is not Provider.MINDS_CLOUD
+                or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
+            return None, None
+        from anton.core.llm.openai import OpenAIProvider
+        from cowork.turnqueue.producer import _mint_llm_block
+
+        corr = str(uuid4())
+        block = await _mint_llm_block(
+            org_id=self.scoped.scope.org_id,
+            user_id=self.scoped.scope.user_id,
+            correlation_id=corr,
+            settings=TurnQueueSettings(),
+        )
+        provider = OpenAIProvider(
+            api_key=block["api_key"],
+            base_url=block["base_url"],
+            flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
+        )
+        binding = RouterBinding(
+            provider=provider,
+            model=settings.resolved_router_model or MINDS_FREE_MODEL,
+            label=Provider.MINDS_CLOUD.value,
+        )
+        return binding, {"correlation_id": corr, "llm": block}
 
     async def _handle_direct_response(
         self,
@@ -345,8 +395,7 @@ class ResponsesHandler:
                 output=[self._build_output(str(user_message.id), route.text)],
             )
 
-        # turn_id comes from handle() — the same numbering as the delegated
-        # path, so a divergent count can never reopen an earlier turn's buffer.
+        # turn_id comes from handle(): same numbering as the delegated path.
         buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
         await registry.start(
@@ -366,10 +415,6 @@ class ResponsesHandler:
         )
         return sse_from_buffer(buffer, 0)
 
-    @staticmethod
-    def _direct_sse(event: str, payload: dict) -> str:
-        return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
-
     async def _produce_direct(
         self,
         *,
@@ -379,22 +424,15 @@ class ResponsesHandler:
         route: RouteDecision,
         buffer,
     ) -> None:
-        """Persist and emit a direct answer using the normal detached lifecycle."""
-        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
-        pending_message_id: UUID | None = None
-        events: list[dict] = []
+        """Persist and emit a direct answer using the normal detached lifecycle.
+
+        The full answer exists up front, so persistence happens before any
+        frame is emitted — the client can never see a completed turn the DB
+        does not have, and no pending row is needed."""
+        producer_session = None
         try:
-            svc = ConversationService(producer_session)
-            pending_message_id = svc.save_user_message(conv_id, original_content, pending=True).id
-            response = Response(status=ResponseStatus.created, model=route.model)
+            producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
             item_id = f"msg-{conv_id.hex[:12]}"
-            created = response.model_dump()
-            created["conversation_id"] = str(conv_id)
-            created["harness"] = "cowork-direct"
-            await buffer.append("sse", {"sse": self._direct_sse(
-                "response.created",
-                {"type": "response.created", "sequence_number": 1, "response": created},
-            )})
             delta = {
                 "type": "response.output_text.delta",
                 "sequence_number": 2,
@@ -403,8 +441,24 @@ class ResponsesHandler:
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }
-            events.append(delta)
-            await buffer.append("sse", {"sse": self._direct_sse("response.output_text.delta", delta)})
+            svc = ConversationService(producer_session)
+            svc.save_user_message(conv_id, original_content)
+            svc.save_assistant_turn(
+                conv_id, route.text, [delta, {"type": "response.completed"}],
+                harness="cowork-direct",
+            )
+
+            response = Response(status=ResponseStatus.created, model=route.model)
+            # conversation_id/harness sit at the event root, like both
+            # delegated paths — the GUI reads them there.
+            await buffer.append("sse", {"sse": sse_frame("response.created", {
+                "type": "response.created",
+                "sequence_number": 1,
+                "conversation_id": str(conv_id),
+                "harness": "cowork-direct",
+                "response": response.model_dump(),
+            })})
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
             completed_response = Response(
                 id=response.id,
                 created_at=response.created_at,
@@ -412,24 +466,23 @@ class ResponsesHandler:
                 model=route.model,
                 output=[self._build_output(item_id, route.text)],
             ).model_dump()
-            completed = {"type": "response.completed", "sequence_number": 3, "response": completed_response}
-            events.append({"type": "response.completed"})
-            await buffer.append("sse", {"sse": self._direct_sse("response.completed", completed)})
-            if pending_message_id is not None:
-                svc.finalize_pending(conv_id, pending_message_id)
-            svc.save_assistant_turn(conv_id, route.text, events, harness="cowork-direct")
+            await buffer.append("sse", {"sse": sse_frame("response.completed", {
+                "type": "response.completed", "sequence_number": 3, "response": completed_response,
+            })})
             await buffer.close("completed")
         except asyncio.CancelledError:
-            if not lifecycle.discarded and pending_message_id is not None:
-                ConversationService(producer_session).finalize_pending(conv_id, pending_message_id)
-                await buffer.close("cancelled")
-            raise
+            if lifecycle.discarded:
+                # Same reasoning as _produce_remote's discarded branch.
+                logger.info("[responses] discarded direct turn %s — not persisting", conv_id)
+                return
+            await buffer.close("cancelled")
         except Exception:
-            logger.exception("[responses] failed to persist direct turn for conversation %s", conv_id)
+            logger.exception("[responses] direct turn failed for conversation %s", conv_id)
             await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
             await buffer.close("error")
         finally:
-            producer_session.close()
+            if producer_session is not None:
+                producer_session.close()
 
     def _select_producer(
         self,
@@ -445,6 +498,7 @@ class ResponsesHandler:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
+        turn_llm: dict | None = None,
     ):
         """Choose the streaming producer coroutine.
 
@@ -468,6 +522,7 @@ class ResponsesHandler:
                 model=model,
                 harness_id=harness_id,
                 buffer=buffer,
+                turn_llm=turn_llm,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -544,6 +599,7 @@ class ResponsesHandler:
         harness_id: str | None,
         buffer,
         lifecycle: TurnLifecycle | None = None,
+        turn_llm: dict | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: run the turn through the
         queue and persist user + assistant together on terminal (deferred, so
@@ -621,6 +677,8 @@ class ResponsesHandler:
                 memory=self._remote_memory(producer_session, conv_id),
                 skills=self._remote_skills(producer_session, conv_id),
                 on_event=on_event,
+                correlation_id=(turn_llm or {}).get("correlation_id"),
+                llm=(turn_llm or {}).get("llm"),
             )
             persist()
         except asyncio.CancelledError:
