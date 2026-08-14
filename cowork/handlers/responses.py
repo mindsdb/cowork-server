@@ -48,12 +48,17 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_ACCESS_DENIED_CODE,
     MODEL_DISABLED_CODE,
+    ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
+    RATE_LIMITED_CODE,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
     provider_overloaded_info,
+    allowance_reset_at,
     response_failed_payload,
+    retry_after_seconds,
+    retry_at_instant,
     response_failed_sse,
 )
 from cowork.db.scoped import ScopedSession, scope_from_principal
@@ -888,6 +893,34 @@ class ResponsesHandler:
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
+            elif code == ALLOWANCE_EXHAUSTED_CODE:
+                # When the free grant refreshes (ENG-1537). The gate sends it on
+                # this denial and only this one, so the card can offer waiting as
+                # a real alternative to paying instead of only asking for money.
+                _reset = allowance_reset_at(exc)
+                if _reset is not None:
+                    extra = {"reset_at": _reset}
+            elif code == RATE_LIMITED_CODE:
+                # Pass the server's own wait interval so the card can time-gate
+                # its Retry (ENG-1537). An ungated Retry re-sends a large
+                # context into the limiter that just refused it — the same
+                # amplification this fix removed, only user-initiated. Absent
+                # header → no gate, which is honest rather than invented.
+                # Never break the handler — same rule the auth and overloaded
+                # branches state below. Anything raised here skips the
+                # response.failed frame AND buffer.close(), stranding the
+                # client on keepalives with no error (ENG-1537 review round 3).
+                try:
+                    _after = retry_after_seconds(exc)
+                    if _after is not None:
+                        # `retry_at` is the absolute anchor the card gates on —
+                        # the renderer has no trustworthy one of its own, since
+                        # created_at is serialised offset-less and JS reads it
+                        # as local time. `retry_after` rides along for
+                        # non-desktop consumers; no cowork code reads it.
+                        extra = {"retry_after": _after, "retry_at": retry_at_instant(_after)}
+                except Exception:
+                    logger.exception("[responses] could not resolve the retry hint")
             elif code == PROVIDER_OVERLOADED_CODE:
                 # Transient-incident timeout (ENG-673): give the card the failing
                 # model AND the active provider, and flag whether the user is
