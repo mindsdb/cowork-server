@@ -7,6 +7,7 @@ every uncertain or unsupported shape delegates to Anton.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,6 +22,8 @@ DELEGATED_AGENTIC = "delegated_agentic"
 _MAX_HISTORY_MESSAGES = 16
 _MAX_MESSAGE_CHARS = 1_500
 _DIRECT_MAX_TOKENS = 1_024
+# The gate sits ahead of every turn; a slow router must not delay Anton.
+_GATE_TIMEOUT_SECONDS = 2.0
 
 # Kept server-local so the route does not depend on Anton's private execution
 # module. The contract mirrors the existing two-action thalamus gate.
@@ -133,7 +136,9 @@ async def decide_route(
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
             )
-        text = await _gate(build_llm_client(), history=messages)
+        text = await asyncio.wait_for(
+            _gate(build_llm_client(), history=messages), _GATE_TIMEOUT_SECONDS
+        )
         if text is None:
             return RouteDecision(
                 route=DELEGATED_AGENTIC,
@@ -147,6 +152,10 @@ async def decide_route(
             provider=provider.value,
             model=model,
             text=text,
+        )
+    except TimeoutError:
+        return RouteDecision(
+            route=DELEGATED_AGENTIC, reason="router_timeout", fallback=True
         )
     except Exception:
         return RouteDecision(
