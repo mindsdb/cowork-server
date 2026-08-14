@@ -157,3 +157,37 @@ def test_minds_cloud_uses_minds_key_and_derived_base(build):
     kw = calls["openai"][-1]
     assert kw["api_key"] == "mdb-key"  # minds slot, not the OpenAI slot
     assert kw["base_url"] == "https://api.mindshub.ai/v1"
+
+
+# ── Reasoning effort follows the model, not the role (ENG-1632) ────────
+
+def test_effort_travels_when_resolution_keeps_the_stored_model(build):
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("mdb-key"),
+        minds_url="https://api.mindshub.ai",
+        coding_model="haiku",
+        coding_reasoning_effort="high",
+    )
+    _client, calls = build(settings)
+    assert calls["openai"][-1].get("reasoning_effort") == "high"
+
+
+def test_effort_dropped_when_wallet_fallback_swaps_the_model(build):
+    # A wallet-locked coding pin resolves to the first enabled model; the
+    # stored effort was chosen for the pinned model and may not exist on the
+    # substitute — it must not travel (the gateway 400s an unsupported level).
+    import json as _json
+
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("mdb-key"),
+        minds_url="https://api.mindshub.ai",
+        coding_model="haiku",
+        coding_reasoning_effort="high",
+        minds_model_enabled=_json.dumps({"mindshub_air": True, "haiku": False}),
+    )
+    _client, calls = build(settings)
+    assert "reasoning_effort" not in calls["openai"][-1]

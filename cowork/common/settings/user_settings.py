@@ -131,13 +131,16 @@ def _resolved_model(
     user_model: str | None,
     defaults: dict[str, str],
     enabled_map: dict[str, bool] | None = None,
+    *,
+    wallet_aware: bool = False,
 ) -> str | None:
     """Resolve a role's model given the readiness resolver's provider switch.
 
-    The single load-bearing rule, shared by resolved_planning_model and
-    resolved_coding_model so it can't drift between the two:
+    The single load-bearing rule, shared by every resolved_*_model property so
+    it can't drift between the roles:
 
-      - provider NOT switched → keep the user's chosen model.
+      - provider NOT switched → keep the user's chosen model (but see
+        ``wallet_aware`` below).
       - provider switched → use the resolved provider's canonical default
         (availability-adjusted via _enabled_aware_default, so switching an
         account onto minds-cloud never lands on a locked model).
@@ -146,8 +149,42 @@ def _resolved_model(
       - resolved provider has no canonical default (openai-compatible) → None,
         so config_status's model gate reports "select a model" rather than
         silently running a wrong model.
+
+    ``wallet_aware`` (ENG-1632) — the auxiliary roles (coding, router) only.
+    A stored minds-cloud model the availability map marks ``enabled: false``
+    (wallet can't pay / allowance spent) is guaranteed to be denied on every
+    call, and the aux roles are invisible in default mode: the user cannot see
+    or fix the pin, so the verifier 402s every turn and surfaces as a spurious
+    "internal error". When a strictly-enabled model exists in the map, resolve
+    to it instead of the doomed stored value; when nothing is enabled (fully
+    drained account) or the map is absent/degraded, keep the stored value —
+    degraded metadata must never change behavior, and anton's verifier handles
+    the denial quietly. The stored row is never rewritten, so a topped-up
+    wallet (``enabled: true`` on the next settings load) restores the stored
+    model automatically.
+
+    This is a deliberate asymmetry with planning: "an explicit choice is never
+    rewritten" still holds for the planning role, which is visible in the
+    picker and has the pick-it-and-see-"Needs credits" lane (ENG-1248). The
+    aux roles get the silent fallback precisely because no such lane exists
+    for them.
     """
     if resolved_provider == preferred_provider:
+        if (
+            wallet_aware
+            and user_model
+            and resolved_provider == Provider.MINDS_CLOUD
+        ):
+            # Map keys are bare ids (/v1/models never emits the retired
+            # "latest:" prefix), but login-era pins still carry it — strip it
+            # for the probe or those pins silently escape the fallback.
+            bare = user_model.removeprefix("latest:")
+            if (enabled_map or {}).get(bare) is False:
+                fallback = next(
+                    (mid for mid, en in (enabled_map or {}).items() if en), None
+                )
+                if fallback:
+                    return fallback
         return user_model
     return _enabled_aware_default(resolved_provider.value, defaults, enabled_map or {})
 
@@ -665,12 +702,16 @@ class UserSettings(Settings):
 
     @property
     def resolved_coding_model(self) -> str | None:
+        # wallet_aware: the coding role (completion verifier, scratchpad) is
+        # invisible in default mode — a wallet-locked pin here 402s every turn
+        # with no way for the user to see or fix it (ENG-1632).
         return _resolved_model(
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
             CODING_MODEL_DEFAULTS,
             self._minds_enabled_map(),
+            wallet_aware=True,
         )
 
     @property
@@ -679,12 +720,16 @@ class UserSettings(Settings):
 
     @property
     def resolved_router_model(self) -> str | None:
+        # wallet_aware: same rationale as resolved_coding_model — the router
+        # role (respond-vs-delegate gating, history summarization) is invisible
+        # in default mode (ENG-1632).
         return _resolved_model(
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
             ROUTER_MODEL_DEFAULTS,
             self._minds_enabled_map(),
+            wallet_aware=True,
         )
 
     @property
