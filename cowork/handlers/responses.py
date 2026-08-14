@@ -29,8 +29,9 @@ from cowork.handlers.response_routing import (
     decide_route,
     ineligible_reason,
 )
+from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
-from cowork.turnqueue.producer import produce_remote_turn
+from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -67,6 +68,10 @@ from cowork.services.skills import SkillService, build_turn_skills
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class _RemoteTurnFailed(Exception):
+    """Terminal turn_failed reply; payload rides the enclosing scope."""
 
 # Statuses of the `response.ask_user_answered` event, as the harness emits them
 # (cowork/harnesses/anton_harness/stream_formatter.py). "cancelled" is the one
@@ -601,33 +606,57 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
     ) -> None:
-        """Remote-backend counterpart of _produce: run the turn through the
-        queue and persist user + assistant together on terminal (deferred, so
-        _remote_history reads prior turns without the current input)."""
+        """Remote-backend counterpart of _produce: pipe the turn's replies
+        through the same SSE formatter as the in-process path (full step /
+        thinking parity, live and in the persisted events log) and persist
+        user + assistant together on terminal (deferred, so _remote_history
+        reads prior turns without the current input)."""
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
         persisted = False
         pending_message_id: UUID | None = None
+        failure: dict = {}
 
-        def on_event(kind: str, data: dict) -> None:
-            # Mirror the SSE frames the producer streams, so the client
-            # rebuilds the same turn from the events log on reload.
-            if kind == "turn_delta":
-                text = data.get("text", "")
-                collected_text.append(text)
-                collected_events.append({"type": "response.output_text.delta", "delta": text})
-            elif kind == "turn_memory":
-                self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
-            elif kind == "turn_completed":
-                collected_events.append({"type": "response.completed"})
-            elif kind == "turn_failed":
-                # Producer attaches the classified (code, message) it streamed.
-                collected_events.append(response_failed_payload(
-                    data.get("message") or GENERIC_TURN_ERROR_MESSAGE,
-                    data.get("code") or GENERIC_TURN_ERROR_CODE,
-                ))
+        def event_sink(event_type: str, data: dict) -> None:
+            # Same event log the in-process path records, so the client
+            # rebuilds the thinking block + steps identically on reload.
+            # at_ms is stamped at receipt (the pod sends no timestamps), so
+            # replayed durations are approximate under consumer lag.
+            collected_events.append(data)
+            if event_type == "response.output_text.delta":
+                collected_text.append(data.get("delta", ""))
+
+        async def replies_as_stream_events():
+            from anton.core.llm.provider import StreamTextDelta
+
+            async for kind, data in stream_remote_replies(
+                conversation_id=str(conv_id),
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+                input_text=input_text,
+                model=model,
+                # Producer session, NOT self.scoped: this coroutine is detached
+                # and the request session may be closed by the time it runs.
+                history=self._remote_history(producer_session, conv_id),
+                memory=self._remote_memory(producer_session, conv_id),
+                skills=self._remote_skills(producer_session, conv_id),
+                correlation_id=(turn_llm or {}).get("correlation_id"),
+                llm=(turn_llm or {}).get("llm"),
+            ):
+                if kind == "turn_delta":
+                    yield StreamTextDelta(text=data.get("text", ""))
+                elif kind == "turn_step":
+                    for event in step_stream_events(data):
+                        yield event
+                elif kind == "turn_memory":
+                    self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                elif kind == "turn_completed":
+                    return
+                elif kind == "turn_failed":
+                    failure.update(data)
+                    raise _RemoteTurnFailed()
 
         def persist() -> None:
             nonlocal persisted
@@ -663,24 +692,25 @@ class ResponsesHandler:
             pending_message_id = ConversationService(producer_session).save_user_message(
                 conv_id, original_content, pending=True,
             ).id
-            await produce_remote_turn(
-                conversation_id=str(conv_id),
-                org_id=self.scoped.scope.org_id,
-                user_id=self.scoped.scope.user_id,
-                input_text=input_text,
-                model=model,
-                buffer=buffer,
-                # Producer session, NOT self.scoped: this coroutine is detached
-                # and the request session may be closed by the time it runs.
-                history=self._remote_history(producer_session, conv_id),
-                harness_id=harness_id,
-                memory=self._remote_memory(producer_session, conv_id),
-                skills=self._remote_skills(producer_session, conv_id),
-                on_event=on_event,
-                correlation_id=(turn_llm or {}).get("correlation_id"),
-                llm=(turn_llm or {}).get("llm"),
-            )
+            first = True
+            async for sse in format_responses_stream(
+                replies_as_stream_events(), model or "", event_sink,
+            ):
+                if first:
+                    # The formatter's created frame lacks conversation_id +
+                    # harness; inject them like the in-process path does.
+                    sse = self._inject_created(sse, conv_id, harness_id)
+                    first = False
+                await buffer.append("sse", {"sse": sse})
             persist()
+            await buffer.close("completed")
+        except _RemoteTurnFailed:
+            message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
+            code = failure.get("code") or GENERIC_TURN_ERROR_CODE
+            collected_events.append(response_failed_payload(message, code))
+            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            persist()
+            await buffer.close("error")
         except asyncio.CancelledError:
             if lifecycle.discarded:
                 # Same reasoning as _run_turn's discarded branch — see there.
@@ -691,6 +721,8 @@ class ResponsesHandler:
             await buffer.close("cancelled")
         except Exception:
             logger.exception("[responses] remote turn failed for conversation %s", conv_id)
+            collected_events.append(response_failed_payload(
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE))
             await buffer.append("sse", {"sse": response_failed_sse(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
             persist()
