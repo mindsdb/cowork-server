@@ -661,7 +661,20 @@ def friendly_turn_error(
     # would fall through to the bare-status rule and be relabelled
     # out-of-credits — the outcome this hoist exists to prevent (ENG-1537
     # review).
-    if getattr(exc, "code", None) == RATE_LIMITED_CODE:
+    # `not hasattr(exc, "response")` is load-bearing, not defensive noise.
+    # `openai.APIStatusError` populates `.code` FROM THE RESPONSE BODY, and on a
+    # BYOK OPENAI_COMPATIBLE provider that body is third-party-controlled — so
+    # without this an endpoint could both select this verdict and, because
+    # `str(exc)` embeds its body, have its own text rendered as our user-facing
+    # copy (a clickable "click https://evil.example to fix" was executed against
+    # the unguarded version). anton's ProviderOverloadedError carries no
+    # `.response`; every SDK error does. That keeps the version-skew case this
+    # hoist exists for — the duck-type still works when anton's type isn't
+    # importable — while excluding every SDK exception.
+    #
+    # Host-gating instead would ALSO disable the skew case, because anton's
+    # re-raise carries no URL and `_from_minds_gateway(None)` is False.
+    if getattr(exc, "code", None) == RATE_LIMITED_CODE and not hasattr(exc, "response"):
         return RATE_LIMITED_CODE, str(exc) or RATE_LIMITED_USER_MESSAGE
 
     # Precedence per ENG-673: token_limit / the billing-status fallback /

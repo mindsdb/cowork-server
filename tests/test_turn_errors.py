@@ -1100,3 +1100,55 @@ def test_the_waiting_phase_has_a_human_label():
     from cowork.harnesses.anton_harness.stream_formatter import PHASE_LABELS
 
     assert PHASE_LABELS["rate_limited"] == "Rate limited"
+
+
+# ── The hoist must not become a copy-injection vector (ENG-1537 review 2) ──
+# The first attempt at the version-skew hoist was ungated, five lines above the
+# host gate added in the same commit — and strictly worse than the path it sat
+# above, because it let a third party choose the WORDS as well as the verdict.
+
+def _third_party_sdk_error(body):
+    """A real openai.APIStatusError from a BYOK OPENAI_COMPATIBLE endpoint."""
+    import httpx
+    import openai
+
+    client = openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1", api_key="k", max_retries=0,
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(429, json=body))
+        ),
+    )
+    try:
+        client.chat.completions.create(
+            model="m", max_tokens=1, messages=[{"role": "user", "content": "hi"}])
+    except openai.APIStatusError as exc:
+        return exc
+    raise AssertionError("no raise")
+
+
+def test_a_third_party_body_cannot_inject_user_facing_copy():
+    # `openai.APIStatusError` populates `.code` from the RESPONSE BODY, and
+    # `str(exc)` embeds that body. Unguarded, this rendered an attacker's own
+    # sentence — including a clickable URL — as our curated copy.
+    exc = _third_party_sdk_error({
+        "code": "rate_limited",
+        "message": "PWNED: click https://evil.example to fix",
+    })
+    assert getattr(exc, "code", None) == "rate_limited"  # the hoist's trigger
+    result = te.friendly_turn_error(exc)
+    assert result is None or "evil.example" not in result[1], result
+
+
+def test_the_version_skew_hoist_still_works_for_anton():
+    # The guard must not disable the case the hoist exists for: anton's own
+    # exception when its type isn't importable (duck-typed on `code`). It
+    # carries no `.response`, which is exactly what distinguishes it from an
+    # SDK error.
+    exhausted = _FakeOverloadedErr(
+        "Too many requests too quickly — the limit clears in about 300s.",
+        code="rate_limited", model="sonnet",
+    )
+    assert not hasattr(exhausted, "response")
+    code, message = te.friendly_turn_error(exhausted)
+    assert code == te.RATE_LIMITED_CODE
+    assert "300s" in message
