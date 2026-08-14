@@ -532,14 +532,26 @@ def retry_after_seconds(exc: BaseException) -> float | None:
                     and secs not in (float("inf"), float("-inf"))
                     and secs >= 0
                 ):
-                    return secs
+                    # Clamped HERE, at the source, so `retry_after` and
+                    # `retry_at` can never disagree on the wire. Unclamped, a
+                    # hostile or unit-confused header put 999999999999 on the
+                    # payload while `retry_at` was dropped for being out of
+                    # datetime range — two fields describing one wait, one
+                    # absurd and one absent (review: pnewsam). Desktop reads
+                    # only `retry_at`, but the interval exists for non-desktop
+                    # consumers and is reachable through the reason header,
+                    # which is not host-gated.
+                    return min(secs, _MAX_RETRY_AFTER_S)
         cur = cur.__cause__ or cur.__context__
     return None
 
 
-# Largest `Retry-After` we will turn into an instant. Anything beyond a day is
-# either hostile or a unit error (an endpoint emitting epoch-millis), and the
-# consumers clamp far below this regardless.
+# Largest `Retry-After` we will honour, in seconds — applied by BOTH
+# `retry_after_seconds` and `retry_at_instant` so the interval and the instant
+# always describe the same wait. Anything beyond a day is either hostile or a
+# unit error (an endpoint emitting epoch-millis), and every consumer clamps far
+# below it anyway: the desktop card gates at 10 minutes, and anton cards
+# immediately above its own 60s cap.
 _MAX_RETRY_AFTER_S = 86_400.0
 
 

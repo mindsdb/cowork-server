@@ -691,6 +691,21 @@ def test_retry_after_is_read_off_the_chain_for_the_card_gate():
     assert te.retry_after_seconds(_gateway_failure(429, reason="rate_limited")) is None
     assert te.retry_after_seconds(Exception("bare")) is None
 
+    # Clamped at the source so the interval and the instant never disagree on
+    # the wire (review: pnewsam). Unclamped, the payload carried
+    # retry_after=999999999999 while retry_at was dropped as out-of-range —
+    # two fields describing one wait, one absurd and one absent.
+    huge = _gateway_failure(429, reason="rate_limited")
+    huge.__cause__.response.headers["Retry-After"] = "999999999999"
+    assert te.retry_after_seconds(huge) == te._MAX_RETRY_AFTER_S
+    # And the pair it feeds is therefore consistent: both present, both bounded.
+    _a = te.retry_after_seconds(huge)
+    _p = te.response_failed_payload(
+        "m", te.RATE_LIMITED_CODE, retry_after=_a, retry_at=te.retry_at_instant(_a),
+    )
+    assert _p["retry_after"] == te._MAX_RETRY_AFTER_S
+    assert _p["retry_at"] is not None
+
 
 def test_retry_after_rides_the_failed_payload_only_when_present():
     # Additive field: absent unless we actually have a number, so the wire shape
