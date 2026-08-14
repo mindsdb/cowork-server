@@ -17,7 +17,8 @@ classifiers = [
 dependencies = [
     "alembic>=1.17.0",
     "anton-agent>=2.26.8.9.1,<3",
-    "cryptography>=48.0.0",
+    # Capped <49: 49+ drops the macOS universal2 wheel, breaking Intel-Mac installs.
+    "cryptography>=48.0.0,<49",
     "fastapi>=0.136.1",
     "hermes-agent>=0.15.2,<0.18",
     "httpx>=0.27",
