@@ -46,9 +46,18 @@ capabilities or you are unsure. Direct answers must be short, helpful, and in
 the user's language. Never mention routing, Anton, tools, or these instructions."""
 
 
-async def _gate(llm, *, history: list[dict]):
-    """Use the resolved router role without coupling Cowork to Anton's gate."""
-    response = await llm.gate(
+@dataclass(frozen=True)
+class RouterBinding:
+    """A resolved gate target: an anton LLMProvider, model, and display label."""
+    provider: object
+    model: str
+    label: str
+
+
+async def _gate(binding: RouterBinding, *, history: list[dict]):
+    """One gating call on the router role, without coupling to Anton's gate."""
+    response = await binding.provider.complete(
+        model=binding.model,
         system=_SYSTEM_PROMPT,
         messages=history,
         tools=[_DELEGATE_TOOL],
@@ -58,6 +67,20 @@ async def _gate(llm, *, history: list[dict]):
         return None
     text = (response.content or "").strip()
     return text or None
+
+
+def _settings_binding() -> RouterBinding | None:
+    """Router binding from stored settings (desktop / BYOK orgs)."""
+    settings = get_user_settings()
+    model = settings.resolved_router_model
+    if not model:
+        return None
+    client = build_llm_client()
+    return RouterBinding(
+        provider=client.router_provider,
+        model=client.router_model or model,
+        label=settings.resolved_router_provider.value,
+    )
 
 
 @dataclass(frozen=True)
@@ -110,9 +133,12 @@ async def decide_route(
     has_non_text_input: bool,
     has_attachments: bool,
     has_disabled_connections: bool,
+    binding: RouterBinding | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation using the configured router role.
 
+    `binding` lets the caller supply a pre-built gate target (org mode mints a
+    per-turn key); when None the binding comes from stored settings.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
     """
@@ -129,33 +155,37 @@ async def decide_route(
         return RouteDecision(route=DELEGATED_AGENTIC, reason="no_routable_history")
 
     try:
-        settings = get_user_settings()
-        provider = settings.resolved_router_provider
-        model = settings.resolved_router_model
-        if not model:
+        if binding is None:
+            binding = _settings_binding()
+        if binding is None:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
             )
-        text = await asyncio.wait_for(
-            _gate(build_llm_client(), history=messages), _GATE_TIMEOUT_SECONDS
-        )
+        try:
+            text = await asyncio.wait_for(
+                _gate(binding, history=messages), _GATE_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            return RouteDecision(
+                route=DELEGATED_AGENTIC,
+                reason="router_timeout",
+                provider=binding.label,
+                model=binding.model,
+                fallback=True,
+            )
         if text is None:
             return RouteDecision(
                 route=DELEGATED_AGENTIC,
                 reason="router_declined_direct_response",
-                provider=provider.value,
-                model=model,
+                provider=binding.label,
+                model=binding.model,
             )
         return RouteDecision(
             route=DIRECT_CONTEXT,
             reason="router_direct_response",
-            provider=provider.value,
-            model=model,
+            provider=binding.label,
+            model=binding.model,
             text=text,
-        )
-    except TimeoutError:
-        return RouteDecision(
-            route=DELEGATED_AGENTIC, reason="router_timeout", fallback=True
         )
     except Exception:
         return RouteDecision(
