@@ -23,6 +23,7 @@ internals must never leak into the chat, so unmapped failures surface as
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from cowork.common.settings.app_settings import default_minds_url
@@ -42,10 +43,25 @@ IMAGE_FORMAT_CODE = "image_format"
 # with no completion event and no error frame — the SSE connection just closes
 # and the renderer's spinner stops, which reads as "Anton is dead" rather than
 # an out-of-credits message. The desktop renders a card for the `token_limit`
-# code and shows THIS text as the card body (it always outranks the client's
-# fallback copy) with a single Add-credits button (ENG-1169) — so this copy
-# must not instruct actions the card doesn't offer (the old text advertised a
-# "bring your own key" button that no longer exists).
+# code with a single Add-credits button (ENG-1169) — so this copy must not
+# instruct actions the card doesn't offer (the old text advertised a "bring your
+# own key" button that no longer exists).
+#
+# NOTE, corrected 2026-08-13: this comment used to claim the server text
+# "always outranks the client's fallback copy". That is no longer true —
+# ENG-1304 made the desktop card use FIXED client copy for `token_limit` and
+# ignore this string (`ChatView.jsx`), because the gateway's wording predated
+# pay-as-you-go. So editing this message alone changes nothing a desktop user
+# sees; the client must change too. It still reaches non-desktop consumers and
+# is the fallback for a client that doesn't hardcode.
+# This copy is now the EMPTY-WALLET half only. The spent-free-allowance case was
+# split off into ALLOWANCE_EXHAUSTED_CODE below (ENG-1537 step 8, in scope from
+# the start) — an earlier revision of this comment argued for deferring it and
+# is superseded. Because the split introduces a code an older renderer has no
+# branch for, the delivery order matters: the cowork card must reach users
+# BEFORE this server change, or a user who has just spent their free grant
+# falls through to a buttonless alert at the paid-conversion moment. That is a
+# release-ordering constraint, not a merge-ordering one.
 TOKEN_LIMIT_USER_MESSAGE = (
     "You're out of credits. Add credits to keep working."
 )
@@ -54,6 +70,43 @@ TOKEN_LIMIT_USER_MESSAGE = (
 # back-compat with clients already branching on it; it now covers both the
 # empty-wallet and spent-allowance reasons above.
 TOKEN_LIMIT_CODE = "token_limit"
+
+# Curated copy + wire code for a spent FREE monthly allowance (gateway 429
+# `included_allowance_exhausted`). Split from `token_limit` in ENG-1537: both
+# denials used to share the out-of-credits card, but they are different
+# situations. `access.py` in auth decides it, and the logic is exact — this
+# reason fires ONLY for a free-bucket model on an org that has NEVER topped up
+# ("a non-free model always needs the wallet"). So the person seeing this card
+# has not spent money; they have used the monthly grant. Two consequences the
+# copy leans on:
+#   * There is a FREE way forward — the allowance resets, and the gate tells us
+#     when on `X-MindsHub-Reset-At`. Hiding that while asking for money is the
+#     defect.
+#   * Credits genuinely unlock the rest of the catalogue for this user, because
+#     non-free models need a wallet they do not have.
+# The date is interpolated client-side from `reset_at`; this string is the
+# fallback for consumers that don't render the card.
+ALLOWANCE_EXHAUSTED_CODE = "included_allowance_exhausted"
+ALLOWANCE_EXHAUSTED_USER_MESSAGE = (
+    "You've used this month's free tokens. Add credits to keep working now and "
+    "unlock Claude, GPT, Gemini, Kimi, DeepSeek and more."
+)
+
+# Curated copy + wire code for a VELOCITY rate-limit (gateway 429
+# `rate_limited`) — the org exceeded requests/tokens per minute, NOT its credit
+# balance. ENG-1537: this was the fifth and only unmapped gateway reason, so it
+# fell through to the bare-status 429 rule below and rendered as out-of-credits
+# — telling the user to buy something that cannot raise a per-minute ceiling.
+# The gateway is explicit that the two are different (`rate_limited()` in
+# minds/inference/errors.py: "the caller should slow down and retry after
+# retry_after seconds, not wait for an allowance reset or add credits").
+# Copy names the remedy (wait) and rules out the one the user would otherwise
+# assume, because they have just been shown a credits card for this.
+RATE_LIMITED_CODE = "rate_limited"
+RATE_LIMITED_USER_MESSAGE = (
+    "Too many requests too quickly. Wait a moment and continue — "
+    "this isn't a credits problem."
+)
 
 # Curated copy + wire code for a transient billing/auth policy outage — the
 # gateway couldn't reach the service that decides whether a call is paid for
@@ -109,10 +162,17 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 
 # The X-MindsHub-Reason header values the inference gateway sets to name the
 # billing decision precisely. Preferred over status/message heuristics.
+#
+# This is the COMPLETE set the gateway can emit: `denial_error()`
+# (minds/inference/errors.py) maps four gate reasons explicitly and fails closed
+# to `policy_unavailable` for anything else, so no sixth value reaches a client.
+# Verified 2026-08-13 — `rate_limited` was the one missing here (ENG-1537), and
+# its absence is why a velocity limit read as out-of-credits.
 _REASON_WALLET_EMPTY = "wallet_empty"
 _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 _REASON_UNKNOWN_MODEL = "unknown_model"
+_REASON_RATE_LIMITED = "rate_limited"
 
 # Wire-level code for a transient provider incident that didn't clear within
 # anton's retry budget (ENG-673) — the model provider (or an upstream it depends
@@ -393,14 +453,185 @@ def _from_minds_gateway(host: str | None) -> bool:
     return expected is not None and host == expected
 
 
+def _gateway_denial_code(exc: BaseException) -> str | None:
+    """The gateway's body ``code`` from anywhere in the cause chain, if any.
+
+    Fallback discriminator for a lane that delivers the body but loses the
+    ``X-MindsHub-Reason`` header — the failure mode ENG-1363 reports on the
+    Anthropic ``/v1/messages`` door. The gateway sets ``code`` and ``reason`` to
+    the same value, so one substitutes for the other.
+
+    Reads both dialects: the OpenAI SDK peels the ``error`` envelope so ``code``
+    sits at top level, while a proxy may deliver it nested. Returns only values
+    this module knows, so an unrelated provider ``code`` can never be mistaken
+    for a gateway denial (ENG-1537).
+
+    **The caller must host-gate this**, exactly like the bare-status rule below.
+    A response body is third-party-controlled on a BYOK
+    ``OPENAI_COMPATIBLE`` provider, so without the gate any endpoint could send
+    ``{"code": "wallet_empty"}`` and put our billing CTA — and the MindsHub
+    top-up link — in front of a user who has no MindsHub balance at all. The
+    allowlist alone does not prevent that: it constrains WHICH verdict can be
+    selected, not WHO can select one.
+    """
+    known = (
+        _REASON_WALLET_EMPTY,
+        _REASON_ALLOWANCE_EXHAUSTED,
+        _REASON_POLICY_UNAVAILABLE,
+        _REASON_UNKNOWN_MODEL,
+        _REASON_RATE_LIMITED,
+    )
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        body = getattr(cur, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], dict):
+            body = body[0]  # Gemini's single-element-array dialect
+        if isinstance(body, dict):
+            env = body.get("error") if isinstance(body.get("error"), dict) else {}
+            code = body.get("code") or env.get("code")
+            if isinstance(code, str) and code in known:
+                return code
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """The ``Retry-After`` hint from anywhere in the cause chain, in seconds.
+
+    The gateway sends it on every velocity 429 as integer seconds. The renderer
+    needs it to time-gate its Retry button: an ungated retry re-sends a large
+    context into the limiter that just refused it, which is the same
+    amplification loop the fix removed — only user-initiated (ENG-1537).
+
+    Integer-seconds form only. The HTTP-date form is legal but nothing in use
+    emits it, and misreading a date as a number would gate the button for
+    centuries; unparseable, negative and non-finite values are dropped so the
+    caller falls back to an ungated (but honest) card.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        resp = getattr(cur, "response", None)
+        headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
+        if headers is not None:
+            try:
+                raw = headers.get("retry-after") or headers.get("Retry-After")
+            except Exception:
+                raw = None
+            if raw is not None:
+                try:
+                    secs = float(str(raw).strip())
+                except (TypeError, ValueError):
+                    secs = None
+                if (
+                    secs is not None
+                    and secs == secs  # not NaN
+                    and secs not in (float("inf"), float("-inf"))
+                    and secs >= 0
+                ):
+                    # Clamped HERE, at the source, so `retry_after` and
+                    # `retry_at` can never disagree on the wire. Unclamped, a
+                    # hostile or unit-confused header put 999999999999 on the
+                    # payload while `retry_at` was dropped for being out of
+                    # datetime range — two fields describing one wait, one
+                    # absurd and one absent (review: pnewsam). Desktop reads
+                    # only `retry_at`, but the interval exists for non-desktop
+                    # consumers and is reachable through the reason header,
+                    # which is not host-gated.
+                    return min(secs, _MAX_RETRY_AFTER_S)
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+# Largest `Retry-After` we will honour, in seconds — applied by BOTH
+# `retry_after_seconds` and `retry_at_instant` so the interval and the instant
+# always describe the same wait. Anything beyond a day is either hostile or a
+# unit error (an endpoint emitting epoch-millis), and every consumer clamps far
+# below it anyway: the desktop card gates at 10 minutes, and anton cards
+# immediately above its own 60s cap.
+_MAX_RETRY_AFTER_S = 86_400.0
+
+
+def retry_at_instant(retry_after: float | None) -> str | None:
+    """``retry_after`` seconds as an absolute, offset-bearing UTC instant.
+
+    The renderer time-gates its Retry button, and it needs an anchor. It cannot
+    use the message's own ``created_at``: cowork-server serialises that naive
+    and offset-less, so JavaScript parses it as LOCAL time — west of UTC the
+    button gates for hours, east of it the gate silently no-ops. A test suite
+    pinned to ``TZ=UTC`` cannot see either.
+
+    So the anchor is computed here, where the clock and the interval are both
+    known, and sent as an explicit instant. Offset-bearing on purpose: an
+    unqualified ISO string would reintroduce exactly the parsing ambiguity this
+    exists to remove (ENG-1537).
+    """
+    # Bounded before the arithmetic. `timedelta` raises OverflowError past the
+    # datetime range, and this runs INSIDE the terminal error handler — an
+    # unhandled raise there skips `persist()` and `buffer.close("error")`, so
+    # the SSE buffer never terminates and the client spins on keepalives
+    # forever with no failure frame. A hint beyond a day is meaningless anyway:
+    # the renderer clamps its gate to 10 minutes, and anton cards immediately
+    # above its own 60s cap.
+    if retry_after is None or not (0 <= retry_after <= _MAX_RETRY_AFTER_S):
+        return None
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=float(retry_after))
+    ).isoformat().replace("+00:00", "Z")
+
+
+def allowance_reset_at(exc: BaseException) -> str | None:
+    """The ``X-MindsHub-Reset-At`` instant from anywhere in the cause chain.
+
+    The auth gate sets it from the billing window's end on an allowance denial
+    (`inference_authorize.py`, ``reset_at=window.end``) and deliberately leaves
+    it unset on a velocity denial — so its presence is itself a signal.
+
+    Passed through as the opaque ISO string the gate sent; the renderer owns
+    formatting and the "resets next month" fallback, because only it knows the
+    viewer's locale and timezone. Returned as-is rather than parsed here: a
+    server-side parse would have to pick a timezone, and picking the wrong one
+    shifts the date the user reads by a day (ENG-1537).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        resp = getattr(cur, "response", None)
+        headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
+        if headers is not None:
+            try:
+                raw = headers.get("x-mindshub-reset-at") or headers.get("X-MindsHub-Reset-At")
+            except Exception:
+                raw = None
+            if raw:
+                return str(raw)
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
-    Empty wallet and spent free-allowance both mean "out of credits" (the fix is
-    to add credits), so they share the ``token_limit`` out-of-credits card. A
-    policy outage is transient. An unknown model can't be fixed with credits.
+    An empty wallet is "out of credits". A spent free allowance is NOT — that
+    user has never paid, and the grant resets — so it has its own code and copy
+    (ENG-1537). A policy outage is transient. An unknown model can't be fixed
+    with credits.
+
+    A velocity ``rate_limited`` is NOT out of credits and must never share that
+    card: the ceiling is per-minute tokens, so buying credits cannot lift it and
+    the remedy is to wait (ENG-1537). It is listed here rather than left to the
+    bare-status 429 rule below precisely because that rule cannot tell the two
+    429s apart — and the gateway already did.
     """
-    if reason in (_REASON_WALLET_EMPTY, _REASON_ALLOWANCE_EXHAUSTED):
+    if reason == _REASON_RATE_LIMITED:
+        return RATE_LIMITED_CODE, RATE_LIMITED_USER_MESSAGE
+    if reason == _REASON_ALLOWANCE_EXHAUSTED:
+        return ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    if reason == _REASON_WALLET_EMPTY:
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if reason == _REASON_POLICY_UNAVAILABLE:
         return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
@@ -430,6 +661,46 @@ def friendly_turn_error(
         mapped = _map_gateway_reason(reason)
         if mapped is not None:
             return mapped
+
+    # Same decision from the body's `code` when the header didn't survive the
+    # trip (ENG-1363's Anthropic lane strips it). The gateway sets both fields
+    # to the same value, so this is the identical decision from a second
+    # carrier — NOT a heuristic. It must stay above the bare-status rule below:
+    # that rule cannot tell the velocity 429 from the allowance 429, and
+    # guessing "out of credits" for a rate limit is the ENG-1537 defect.
+    denial_code = _gateway_denial_code(exc)
+    if denial_code is not None and _from_minds_gateway(host):
+        mapped = _map_gateway_reason(denial_code)
+        if mapped is not None:
+            return mapped
+
+    # anton exhausted its rate-limit wait budget and re-raised with the code
+    # (ENG-1537). Checked here, above the bare-status rule, because that
+    # exception still carries the original 429 in its cause chain — so without
+    # this the honest "waiting didn't clear it" failure is relabelled
+    # out-of-credits, which is exactly what the wait was added to stop.
+    # Read the code attribute DIRECTLY rather than via provider_overloaded_info:
+    # that helper's version-skew duck-type only accepts
+    # ``code == provider_overloaded``, so under the exact skew its own docstring
+    # exists for (anton's type not importable), an exhausted rate-limit wait
+    # would fall through to the bare-status rule and be relabelled
+    # out-of-credits — the outcome this hoist exists to prevent (ENG-1537
+    # review).
+    # `not hasattr(exc, "response")` is load-bearing, not defensive noise.
+    # `openai.APIStatusError` populates `.code` FROM THE RESPONSE BODY, and on a
+    # BYOK OPENAI_COMPATIBLE provider that body is third-party-controlled — so
+    # without this an endpoint could both select this verdict and, because
+    # `str(exc)` embeds its body, have its own text rendered as our user-facing
+    # copy (a clickable "click https://evil.example to fix" was executed against
+    # the unguarded version). anton's ProviderOverloadedError carries no
+    # `.response`; every SDK error does. That keeps the version-skew case this
+    # hoist exists for — the duck-type still works when anton's type isn't
+    # importable — while excluding every SDK exception.
+    #
+    # Host-gating instead would ALSO disable the skew case, because anton's
+    # re-raise carries no URL and `_from_minds_gateway(None)` is False.
+    if getattr(exc, "code", None) == RATE_LIMITED_CODE and not hasattr(exc, "response"):
+        return RATE_LIMITED_CODE, str(exc) or RATE_LIMITED_USER_MESSAGE
 
     # Precedence per ENG-673: token_limit / the billing-status fallback /
     # provider_auth / the ENG-598 model gate all WIN over provider_overloaded
@@ -504,14 +775,19 @@ def response_failed_payload(
     reconnectable: bool | None = None,
     provider_label: str | None = None,
     model: str | None = None,
+    retry_after: float | None = None,
+    retry_at: str | None = None,
+    reset_at: str | None = None,
 ) -> dict:
     """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
     ``reconnectable`` / ``provider_label`` are included only for the
     ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
     "Open Settings" (BYOK); ``model`` only for the model-403 case so the card
-    can name the locked model ("Sonnet needs credits") — omitted otherwise to
-    keep the shape unchanged for every other failure.
+    can name the locked model ("Sonnet needs credits"); ``retry_after`` only for
+    ``rate_limited`` so the card can time-gate its Retry — omitted otherwise to
+    keep the shape unchanged for every other failure. All additive: an older
+    client ignores fields it doesn't read.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:
@@ -520,6 +796,12 @@ def response_failed_payload(
         payload["provider_label"] = provider_label
     if model is not None:
         payload["model"] = model
+    if retry_after is not None:
+        payload["retry_after"] = retry_after
+    if retry_at is not None:
+        payload["retry_at"] = retry_at
+    if reset_at is not None:
+        payload["reset_at"] = reset_at
     return payload
 
 
@@ -530,14 +812,20 @@ def response_failed_sse(
     reconnectable: bool | None = None,
     provider_label: str | None = None,
     model: str | None = None,
+    retry_after: float | None = None,
+    retry_at: str | None = None,
+    reset_at: str | None = None,
 ) -> str:
     """Build a ``response.failed`` SSE frame (same wire shape the renderer's
-    parser already handles, plus the optional auth/model fields)."""
+    parser already handles, plus the optional auth/model/retry-after fields)."""
     payload = response_failed_payload(
         error,
         code,
         reconnectable=reconnectable,
         provider_label=provider_label,
         model=model,
+        retry_after=retry_after,
+        retry_at=retry_at,
+        reset_at=reset_at,
     )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"
