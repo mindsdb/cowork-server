@@ -23,6 +23,7 @@ from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
@@ -313,7 +314,12 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         )
     except Exception as exc:
         logger.exception("Publishing failed")
-        raise RuntimeError("Publishing failed. Check your Minds credentials and try again.") from exc
+        # Classify the failure instead of always blaming credentials — a
+        # gateway timeout (e.g. a fullstack artifact whose deps take too
+        # long to install remotely, ENG-1547/ENG-1580) or a server-side 5xx
+        # reads very differently to the user than an auth rejection.
+        headline, advice = describe_minds_connection_error(exc)
+        raise RuntimeError(f"Publishing failed. {headline} {advice}") from exc
     finally:
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
