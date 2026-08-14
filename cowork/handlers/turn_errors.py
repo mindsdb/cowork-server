@@ -537,6 +537,12 @@ def retry_after_seconds(exc: BaseException) -> float | None:
     return None
 
 
+# Largest `Retry-After` we will turn into an instant. Anything beyond a day is
+# either hostile or a unit error (an endpoint emitting epoch-millis), and the
+# consumers clamp far below this regardless.
+_MAX_RETRY_AFTER_S = 86_400.0
+
+
 def retry_at_instant(retry_after: float | None) -> str | None:
     """``retry_after`` seconds as an absolute, offset-bearing UTC instant.
 
@@ -551,7 +557,14 @@ def retry_at_instant(retry_after: float | None) -> str | None:
     unqualified ISO string would reintroduce exactly the parsing ambiguity this
     exists to remove (ENG-1537).
     """
-    if retry_after is None or retry_after < 0:
+    # Bounded before the arithmetic. `timedelta` raises OverflowError past the
+    # datetime range, and this runs INSIDE the terminal error handler — an
+    # unhandled raise there skips `persist()` and `buffer.close("error")`, so
+    # the SSE buffer never terminates and the client spins on keepalives
+    # forever with no failure frame. A hint beyond a day is meaningless anyway:
+    # the renderer clamps its gate to 10 minutes, and anton cards immediately
+    # above its own 60s cap.
+    if retry_after is None or not (0 <= retry_after <= _MAX_RETRY_AFTER_S):
         return None
     return (
         datetime.now(timezone.utc) + timedelta(seconds=float(retry_after))

@@ -1059,12 +1059,29 @@ def test_retry_at_is_an_absolute_offset_bearing_instant():
     # it the gate no-ops, and a TZ=UTC suite sees neither.
     from datetime import datetime
 
+    from datetime import timedelta, timezone
+
+    before = datetime.now(timezone.utc)
     got = te.retry_at_instant(30)
+    after = datetime.now(timezone.utc)
     assert got is not None and got.endswith("Z"), got
     parsed = datetime.fromisoformat(got.replace("Z", "+00:00"))
     assert parsed.tzinfo is not None  # the whole point
+
+    # VALUE, not just shape. Format-only assertions let three arithmetic
+    # mutations through the full suite: seconds=0 (the gate never fires at
+    # all), a sign flip (instant in the past, same no-op), and /1000 (a 30s
+    # wait becomes 30ms). Each silently disables the feature this exists for.
+    assert before + timedelta(seconds=30) <= parsed <= after + timedelta(seconds=30)
+
     assert te.retry_at_instant(None) is None
     assert te.retry_at_instant(-5) is None
+    # Bounded before the arithmetic: `timedelta` raises OverflowError past the
+    # datetime range, and this runs inside the terminal error handler, where an
+    # unhandled raise strands the SSE stream with no failure frame.
+    assert te.retry_at_instant(999_999_999_999) is None
+    assert te.retry_at_instant(86_401) is None
+    assert te.retry_at_instant(86_400) is not None
 
 
 def test_rate_limit_extras_carry_both_the_interval_and_the_instant():
@@ -1085,13 +1102,22 @@ def test_the_rate_limit_notice_is_exempt_from_progress_throttling():
     # Note this is a REFINEMENT, not the enabler: staging already forwards
     # phase/message on response.in_progress. The binding constraint is the
     # renderer, which drops the ad-hoc phase until cowork#648 lands.
-    import inspect
-    from cowork.harnesses.anton_harness import stream_formatter as sf
+    # Driven, not grepped. The previous version asserted three source literals,
+    # which all survive `is_rate_limited_notice = phase_str == "rate_limited"
+    # and False` — the exemption dead, the test green.
+    from anton.core.llm.provider import StreamTaskProgress
+    from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
 
-    src = inspect.getsource(sf)
-    assert "is_rate_limited_notice" in src
-    assert 'phase_str == "rate_limited"' in src
-    assert "or is_rate_limited_notice" in src
+    async def _events():
+        # Two progress events inside one PROGRESS_THROTTLE window (0.25s). The
+        # second would be dropped if it were not exempt.
+        yield StreamTaskProgress(phase="analyzing", message="first")
+        yield StreamTaskProgress(phase="rate_limited", message="waiting 30s before continuing")
+
+    frames = asyncio.run(_collect(format_responses_stream(_events(), "anton")))
+    joined = "".join(frames)
+    assert "rate_limited" in joined, "the wait notice was throttled away"
+    assert "waiting 30s before continuing" in joined
 
 
 def test_the_waiting_phase_has_a_human_label():
@@ -1152,3 +1178,35 @@ def test_the_version_skew_hoist_still_works_for_anton():
     code, message = te.friendly_turn_error(exhausted)
     assert code == te.RATE_LIMITED_CODE
     assert "300s" in message
+
+
+async def _collect_async(gen):
+    return [f async for f in gen]
+
+
+def _collect(gen):
+    """Drain an async generator of SSE strings."""
+    return _collect_async(gen)
+
+
+def test_the_failure_handler_survives_a_hostile_retry_after():
+    """ENG-1537 review round 3 — the highest-severity defect of that round.
+
+    `retry_at_instant` raised OverflowError on a large hint, INSIDE the
+    terminal `except Exception` handler, so `persist()` and
+    `buffer.close("error")` never ran: no failure frame, and `sse_from_buffer`
+    kept emitting keepalives forever. The user saw a spinner that never
+    resolved and lost the turn's work.
+
+    The neighbouring auth and provider_overloaded branches already stated the
+    rule ("Never break the handler"); this branch didn't follow it.
+    """
+    # The value that used to raise.
+    assert te.retry_at_instant(999_999_999_999) is None
+    # And the extras assembly must tolerate anything the helper does.
+    payload = te.response_failed_payload(
+        "msg", te.RATE_LIMITED_CODE,
+        retry_after=999_999_999_999, retry_at=te.retry_at_instant(999_999_999_999),
+    )
+    assert payload["code"] == te.RATE_LIMITED_CODE
+    assert "retry_at" not in payload      # dropped, not a crash
