@@ -731,17 +731,36 @@ def build_llm_client():
     except (ValueError, TypeError):
         router_kw = {}
 
+    # A reasoning-effort level is chosen in the Settings UI for a specific
+    # model. When resolution swaps the model out from under the stored choice
+    # (provider switch, or a wallet-locked aux model falling back to an
+    # affordable one — ENG-1632), the stored effort must not travel with it:
+    # the substitute may not advertise that level and the gateway 400s the
+    # call. Same-model resolution keeps the effort.
+    def _effort_for(stored: str | None, resolved: str | None, effort: str | None):
+        return effort if effort and stored == resolved else None
+
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at
     # a keyless provider — the same resolution config_status reports, so the
     # readiness gate never claims "ready" for a client that would then throw.
     return LLMClient(
         planning_provider=_make_provider(
-            settings.resolved_planning_provider, settings.planning_reasoning_effort
+            settings.resolved_planning_provider,
+            _effort_for(
+                settings.planning_model,
+                settings.resolved_planning_model,
+                settings.planning_reasoning_effort,
+            ),
         ),
         planning_model=settings.resolved_planning_model,
         coding_provider=_make_provider(
-            settings.resolved_coding_provider, settings.coding_reasoning_effort
+            settings.resolved_coding_provider,
+            _effort_for(
+                settings.coding_model,
+                settings.resolved_coding_model,
+                settings.coding_reasoning_effort,
+            ),
         ),
         coding_model=settings.resolved_coding_model,
         **router_kw,
