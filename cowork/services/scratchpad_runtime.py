@@ -65,8 +65,12 @@ def _resolve_coding(
     # Normalize to the dash form up front so every return value (and the lookups
     # below) is consistent — anton's scratchpad_boot only understands the dash
     # spellings; the snake form would silently fall through to AnthropicProvider.
-    provider = (coding_provider or us.coding_provider.ui_value).replace("_", "-")
-    model = coding_model or us.coding_model or ""
+    # Resolved, not raw: the raw coding_model can be a wallet-locked pin the
+    # resolution layer deliberately swaps for an affordable model (ENG-1632) —
+    # reading it here would hand the scratchpad the exact model the agent path
+    # refuses to run.
+    provider = (coding_provider or us.resolved_coding_provider.ui_value).replace("_", "-")
+    model = coding_model or us.resolved_coding_model or ""
     enum_provider = UI_TYPE_TO_PROVIDER.get(provider)
 
     # Resolve the API key from the correct dedicated slot (gemini/openai-
