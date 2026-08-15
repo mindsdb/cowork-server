@@ -513,6 +513,14 @@ class UserSettings(Settings):
         title="Memory Enabled",
         description="Enable conversation memory.",
     )
+    coding_mode_enabled: bool = Field(
+        default=False,
+        title="Enable Coding Mode",
+        description=(
+            "Show a per-task harness/model picker and allow launching tasks in "
+            "an external coding CLI (e.g. Claude Code) instead of the in-app chat."
+        ),
+    )
     memory_mode: str = Field(
         default="autopilot",
         title="Memory Mode",
