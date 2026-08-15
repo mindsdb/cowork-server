@@ -177,3 +177,24 @@ def test_explicit_coding_api_key_wins(monkeypatch):
         coding_provider="", coding_model="", coding_api_key="explicit-key", coding_base_url=""
     )
     assert api_key == "explicit-key"
+
+
+def test_wallet_locked_pin_resolves_to_enabled_model(monkeypatch):
+    # ENG-1632: _resolve_coding must read the RESOLVED coding model, so a
+    # wallet-locked pin (enabled: false in the availability map) hands the
+    # scratchpad the same affordable model the agent path runs — not the
+    # exact model the resolution layer refuses to execute.
+    import json
+
+    _patch_user_settings(
+        monkeypatch,
+        coding_provider=Provider.MINDS_CLOUD,
+        coding_model="haiku",
+        minds_api_key=SecretStr("mdb_minds_key"),
+        minds_url="https://api.mindshub.ai",
+        minds_model_enabled=json.dumps({"mindshub_air": True, "haiku": False}),
+    )
+    _provider, model, _api_key, _base = scratchpad_runtime._resolve_coding(
+        coding_provider="", coding_model="", coding_api_key="", coding_base_url=""
+    )
+    assert model == "mindshub_air"
