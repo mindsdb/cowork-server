@@ -107,12 +107,26 @@ def _sources(session, project_id: UUID | None, project_path: str | None):
 
     sources = _sources_for_scan()
     if project_path is not None:
-        wanted = Path(project_path).expanduser().resolve(strict=False)
-        sources = [
-            s for s in sources
-            if s.base.parent.parent.resolve(strict=False) == wanted
-        ]
+        # The client value is normalized as a STRING and never resolved through the
+        # filesystem. Nothing here opens it — it only selects from roots the server
+        # discovered itself, so the result is always a subset of the scan — but
+        # `Path.resolve()` on untrusted input is a filesystem access driven by that
+        # input, which is a path-injection sink whether or not it is reachable
+        # (CodeQL py/path-injection). Comparing against both the raw and the
+        # resolved form of each server-side root keeps symlinked project dirs
+        # matching; those paths are ours, so resolving them is fine.
+        wanted = os.path.normpath(os.path.expanduser(project_path))
+        sources = [s for s in sources if _project_dir_matches(s, wanted)]
     return sources
+
+
+def _project_dir_matches(source, wanted: str) -> bool:
+    project_dir = source.base.parent.parent
+    try:
+        resolved = str(project_dir.resolve(strict=False))
+    except OSError:
+        resolved = ""
+    return wanted in (str(project_dir), resolved)
 
 
 # The two functions below hold the logic; the routes under them are thin adapters.

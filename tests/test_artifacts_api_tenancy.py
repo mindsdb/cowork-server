@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints import artifacts as ep
+from cowork.services import artifacts as ep_artifacts
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
@@ -234,3 +235,56 @@ def test_desktop_only_endpoints_are_reachable_in_local_mode(local_mode):
     from cowork.server import app
 
     assert TestClient(app).get("/api/v1/artifacts/status?path=/nope").status_code != 501
+
+
+# ── desktop project_path filter ────────────────────────────────────────────
+
+async def test_desktop_project_path_narrows_to_that_project(
+    session, tmp_path, local_mode, monkeypatch
+):
+    """The legacy desktop addressing still works.
+
+    The client value is matched as a normalized string, never resolved through the
+    filesystem — untrusted input must not drive a filesystem access even when the
+    result is only compared for equality.
+    """
+    _, mine = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="dash")
+    _project_with_artifact(session, tmp_path, name="other", org_id=None, slug="second")
+    mine_project_dir = mine.parent.parent.parent
+
+    monkeypatch.setattr(
+        ep, "_sources_for_scan",
+        lambda: [
+            ep_artifacts.ProjectArtifacts(
+                base=p / ".anton" / "artifacts", project_id=None, project_name=p.name,
+            )
+            for p in sorted((tmp_path / "local").iterdir())
+        ],
+    )
+
+    cards = ep.artifacts_for_request(
+        ScopedSession(session, LOCAL_SCOPE), project_path=str(mine_project_dir),
+    )
+
+    assert [c["slug"] for c in cards] == ["dash"]
+
+
+async def test_desktop_project_path_that_matches_nothing_yields_nothing(
+    session, tmp_path, local_mode, monkeypatch
+):
+    _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="dash")
+    monkeypatch.setattr(
+        ep, "_sources_for_scan",
+        lambda: [
+            ep_artifacts.ProjectArtifacts(
+                base=(tmp_path / "local" / "mine") / ".anton" / "artifacts",
+                project_id=None, project_name="mine",
+            )
+        ],
+    )
+
+    cards = ep.artifacts_for_request(
+        ScopedSession(session, LOCAL_SCOPE), project_path="/nowhere/at/all",
+    )
+
+    assert cards == []
