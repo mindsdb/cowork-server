@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.migrations import ensure_builtin_skills
 from cowork.schemas.skills import SkillCreateRequest, SkillResponse, SkillUpdateRequest
 from cowork.services.skills import SkillService
 
@@ -14,6 +15,10 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 @router.get("/")
 def list_skills(scope: ScopeDep):
+    # Seeded here for an org that opens this menu before it has ever chatted.
+    # The turn payload seeds too, so whichever comes first wins; see
+    # `build_turn_skills`.
+    ensure_builtin_skills(scope)
     skills = SkillService(scope).list_skills()
     return {"skills": [SkillResponse.serialize(s) for s in skills]}
 

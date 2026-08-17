@@ -1,0 +1,142 @@
+"""Seeding the packaged builtins into a per-org skill store.
+
+A fresh org's store starts empty and there is no org-creation hook, so seeding
+runs lazily on first read. The interesting cases are all about the version
+marker: when it blocks a re-seed, and when it must NOT block one.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.migrations import (
+    BUILTIN_SKILLS_DIR,
+    BUILTIN_SKILLS_MARKER,
+    BUILTIN_SKILLS_VERSION,
+    ensure_builtin_skills,
+)
+from cowork.services.skills import SkillService, build_turn_skills
+
+ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
+
+
+def _org(org: str | None = ORG_A, user: str = "u") -> TenantScope:
+    return TenantScope(org_mode=True, org_id=org, user_id=user)
+
+
+@pytest.fixture()
+def skills_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    get_app_settings.cache_clear()
+    yield tmp_path / "skills"
+    get_app_settings.cache_clear()
+
+
+def _packaged_slugs() -> set[str]:
+    return {p.name for p in BUILTIN_SKILLS_DIR.iterdir()
+            if p.is_dir() and (p / "SKILL.md").exists()}
+
+
+def test_a_fresh_org_gets_the_packaged_builtins(skills_root):
+    assert ensure_builtin_skills(_org()) is True
+    assert {s.name for s in SkillService(_org()).list_skills()} == _packaged_slugs()
+    assert _packaged_slugs()  # the set is non-empty, or this proves nothing
+
+
+def test_seeding_is_per_org(skills_root):
+    ensure_builtin_skills(_org(ORG_A))
+    assert SkillService(_org(ORG_B)).list_skills() == []
+    ensure_builtin_skills(_org(ORG_B))
+    assert {s.name for s in SkillService(_org(ORG_B)).list_skills()} == _packaged_slugs()
+
+
+def test_the_second_call_does_nothing(skills_root):
+    ensure_builtin_skills(_org())
+    assert ensure_builtin_skills(_org()) is False
+
+
+def test_a_deleted_builtin_does_not_come_back(skills_root):
+    """The marker outlives the skills, so a deliberate delete sticks."""
+    ensure_builtin_skills(_org())
+    svc = SkillService(_org())
+    victim = sorted(_packaged_slugs())[0]
+    assert svc.delete_skill(victim) is True
+
+    ensure_builtin_skills(_org())
+    assert victim not in {s.name for s in svc.list_skills()}
+
+
+def test_a_lost_volume_reseeds(skills_root):
+    """The marker lives with the skills, not in the DB. Wiping the store must
+    look like a fresh org — a DB sentinel would survive and leave it empty."""
+    ensure_builtin_skills(_org())
+    import shutil
+
+    shutil.rmtree(skills_root / ORG_A)
+
+    assert ensure_builtin_skills(_org()) is True
+    assert {s.name for s in SkillService(_org()).list_skills()} == _packaged_slugs()
+
+
+def test_a_bumped_version_reseeds(skills_root, monkeypatch):
+    ensure_builtin_skills(_org())
+    marker = skills_root / ORG_A / BUILTIN_SKILLS_MARKER
+    assert marker.read_text().strip() == str(BUILTIN_SKILLS_VERSION)
+
+    monkeypatch.setattr("cowork.migrations.BUILTIN_SKILLS_VERSION", BUILTIN_SKILLS_VERSION + 1)
+    assert ensure_builtin_skills(_org()) is True
+    assert marker.read_text().strip() == str(BUILTIN_SKILLS_VERSION + 1)
+
+
+def test_a_corrupt_marker_is_treated_as_unseeded(skills_root):
+    (skills_root / ORG_A).mkdir(parents=True)
+    (skills_root / ORG_A / BUILTIN_SKILLS_MARKER).write_text("not-a-number")
+    assert ensure_builtin_skills(_org()) is True
+
+
+def test_the_marker_is_invisible_to_readers(skills_root):
+    """It is a plain file in the store's root, so it must not surface as a skill
+    in either read path."""
+    ensure_builtin_skills(_org())
+    assert BUILTIN_SKILLS_MARKER not in {s.name for s in SkillService(_org()).list_skills()}
+    assert BUILTIN_SKILLS_MARKER not in build_turn_skills(_org(), None)
+
+
+def test_local_mode_is_left_alone(skills_root):
+    """Desktop seeds at boot into the unkeyed root; this must not double up."""
+    assert ensure_builtin_skills(LOCAL_SCOPE) is False
+    assert ensure_builtin_skills(None) is False
+    assert not skills_root.exists() or list(skills_root.iterdir()) == []
+
+
+def test_a_missing_org_still_fails_closed(skills_root):
+    """Seeding must not soften the store's fail-closed contract: org mode without
+    an org id raises, exactly as the SkillService construction right after it
+    would. Only filesystem trouble degrades to a no-op."""
+    from cowork.db.scoped import MissingTenantScopeError
+
+    with pytest.raises(MissingTenantScopeError):
+        ensure_builtin_skills(_org(None))
+
+
+def test_a_turn_seeds_on_its_own(skills_root, tmp_path):
+    """An org that has only ever chatted, never opened the skills menu, still
+    gets the builtins into its turn payload."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    payload = build_turn_skills(_org(), str(project))
+    assert _packaged_slugs() & set(payload)
+
+
+def test_an_unwritable_store_does_not_break_reads(skills_root, monkeypatch):
+    def _boom(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr("cowork.migrations._copy_builtin_skills", _boom)
+    assert ensure_builtin_skills(_org()) is False
+    assert build_turn_skills(_org(), None) == {}

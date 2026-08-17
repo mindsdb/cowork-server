@@ -213,13 +213,76 @@ def backfill_minds_url(session: Session) -> bool:
 BUILTIN_SKILLS_DIR = Path(__file__).parent / "skills_builtin"
 BUILTIN_SKILLS_SENTINEL = "_builtin_skills_set"
 BUILTIN_SKILLS_VERSION = 1
+#: Org-mode version marker, a file in the org's own store. See
+#: ``ensure_builtin_skills`` for why this is not a Setting row.
+BUILTIN_SKILLS_MARKER = ".builtins_seeded"
+
+
+def _copy_builtin_skills(store: SkillService) -> int:
+    """Copy packaged builtins into ``store``, skipping slugs it already has.
+
+    Returns how many were copied. Never overwrites, so a skill the user edited
+    or deleted stays as they left it.
+    """
+    if not BUILTIN_SKILLS_DIR.exists():
+        return 0
+    store._ensure_root()
+    copied = 0
+    for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
+        if not src.is_dir() or not (src / SKILL_FILE).exists():
+            continue
+        dest = store._skill_dir(src.name)
+        if dest.exists():
+            continue  # keep the user-editable copy untouched
+        shutil.copytree(src, dest)
+        copied += 1
+    return copied
+
+
+def ensure_builtin_skills(scope) -> bool:
+    """Seed one org's skill store with the packaged builtins, on first use.
+
+    Org mode only: desktop seeds once at boot via ``seed_builtin_skills``, and
+    its store is unkeyed so there is nothing per-tenant to do. There is no
+    org-creation hook to hang this on, so it runs lazily where skills are read.
+
+    The version marker is a FILE in the org's store rather than a Setting row,
+    so marker and skills share fate:
+    - a DB row would outlive a lost volume and leave the org permanently empty,
+      because seeding would believe it had already run
+    - a deliberate deletion of every skill is still respected, since the marker
+      survives it and blocks a re-seed
+
+    Returns True if seeding ran. Fail-soft: a filesystem problem leaves the org
+    unseeded and retries on the next read rather than failing the request.
+    """
+    if scope is None or not scope.org_mode:
+        return False
+    try:
+        store = SkillService(scope)
+        marker = store.root / BUILTIN_SKILLS_MARKER
+        current = 0
+        if marker.is_file():
+            raw = marker.read_text(encoding="utf-8").strip()
+            current = int(raw) if raw.isdigit() else 0
+        if current >= BUILTIN_SKILLS_VERSION:
+            return False
+        copied = _copy_builtin_skills(store)
+        marker.write_text(f"{BUILTIN_SKILLS_VERSION}\n", encoding="utf-8")
+    except OSError:
+        logger.warning("Could not seed builtin skills for org %s",
+                       getattr(scope, "org_id", None), exc_info=True)
+        return False
+    logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)
+    return True
 
 
 def seed_builtin_skills(session: Session) -> bool:
-    """Copy packaged builtin skills into the canonical skills store.
+    """Copy packaged builtin skills into the canonical (unkeyed) skills store.
 
-    Runs only when the stored set version is below ``BUILTIN_SKILLS_VERSION``.
-    Existing folders are never overwritten, so user edits/deletes survive.
+    Desktop path. Runs only when the stored set version is below
+    ``BUILTIN_SKILLS_VERSION``. Org deployments use ``ensure_builtin_skills``,
+    which keys the store per org.
     Returns True if seeding ran (version advanced), False if skipped.
     """
     svc = SettingService(session)
@@ -234,17 +297,7 @@ def seed_builtin_skills(session: Session) -> bool:
         link.unlink()
 
     store = SkillService()
-    copied = 0
-    if BUILTIN_SKILLS_DIR.exists():
-        store._ensure_root()
-        for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
-            if not src.is_dir() or not (src / SKILL_FILE).exists():
-                continue
-            dest = store._skill_dir(src.name)
-            if dest.exists():
-                continue  # keep the user-editable copy untouched
-            shutil.copytree(src, dest)
-            copied += 1
+    copied = _copy_builtin_skills(store)
 
     if copied:
         logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)

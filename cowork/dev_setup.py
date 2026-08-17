@@ -85,8 +85,9 @@ def run_dev_setup() -> None:
     ensure_all_layouts()
 
     # Skill migration + builtin seeding write the unkeyed root via an unscoped
-    # SkillService. Desktop-only: org stores are per-org and API-populated, and
-    # cloud builtins ship in the pod image.
+    # SkillService, so both are desktop-only. An org store is per-org and there
+    # is no org-creation hook at boot, so org deployments seed lazily on first
+    # read instead — see `migrations.ensure_builtin_skills`.
     if get_app_settings().tenancy_mode != "org":
         from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
 
