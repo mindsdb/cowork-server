@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tempfile
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
@@ -36,6 +38,16 @@ from cowork.services.artifacts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class PublisherUnavailable(RuntimeError):
+    """A local publish dependency (anton.publisher, markdown) failed to import.
+
+    Distinct from RuntimeError so the endpoint layer can map it to 503
+    without parsing message text — see the "unavailable" substring sentinel
+    this replaced, which broke once upstream error text could itself contain
+    that word (e.g. an HTTP 503 reason phrase or a timeout advice string).
+    """
 
 
 def _cowork_state_dir() -> Path:
@@ -235,7 +247,7 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     try:
         import markdown
     except Exception as exc:  # pragma: no cover - dependency guard
-        raise RuntimeError("Markdown renderer is unavailable") from exc
+        raise PublisherUnavailable("Markdown renderer is unavailable") from exc
 
     md_text = md_path.read_text(encoding="utf-8", errors="replace")
     body = markdown.markdown(
@@ -267,7 +279,7 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         from anton.core.datasources.data_vault import LocalDataVault
         from anton.publisher import publish
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     published_json = published_dir / ".published.json"
     published_map: dict[str, Any] = {}
@@ -313,7 +325,17 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         )
     except Exception as exc:
         logger.exception("Publishing failed")
-        raise RuntimeError("Publishing failed. Check your Minds credentials and try again.") from exc
+        # Only network/HTTP failures get the "Connection failed" framing — a
+        # gateway timeout (e.g. a fullstack artifact whose deps take too long
+        # to install remotely, ENG-1547/ENG-1580) or a server-side 5xx reads
+        # very differently to the user than an auth rejection, but neither
+        # applies to a local failure (e.g. reading the artifact's files to
+        # zip it) that happened before any request went out. urllib.error
+        # HTTPError is a URLError subclass, so this covers both.
+        if isinstance(exc, urllib.error.URLError):
+            headline, advice = describe_minds_connection_error(exc)
+            raise RuntimeError(f"Publishing failed. {headline} {advice}") from exc
+        raise RuntimeError(f"Publishing failed: {exc}") from exc
     finally:
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
@@ -439,7 +461,7 @@ def unpublish_artifact(raw_path: str) -> dict:
     try:
         from anton.publisher import unpublish
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
@@ -562,7 +584,7 @@ def list_versions(raw_path: str) -> dict:
     try:
         from anton.publisher import list_versions as _list_versions
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     from urllib.error import HTTPError
@@ -618,7 +640,7 @@ def activate_version(raw_path: str, md5: str) -> dict:
     try:
         from anton.publisher import activate_version as _activate_version
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     from urllib.error import HTTPError

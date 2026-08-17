@@ -111,7 +111,7 @@ COWORK_PUBLISH_PROMPT = (
 )
 
 
-async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
+async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     """Server-side equivalent of anton.tools.handle_publish_or_preview.
 
     Mirrors the same `action` semantics:
@@ -200,6 +200,28 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
     # action == 'publish' — delegate to the service (single source of truth for
     # target resolution, fullstack bundling, vault secrets, access, history,
     # and report_id reuse).
+    #
+    # The SideEffectResult envelope (ENG-696) lives in anton; cowork-server and
+    # anton deploy independently, so an older anton without it must not break
+    # publishing. When absent, fall back to the plain `message` string — the
+    # exact pre-envelope return value, so behavior is byte-identical there.
+    try:
+        from anton.core.tools.side_effect import SideEffectResult, now_iso
+    except ImportError:
+        SideEffectResult = None
+
+    def _ok(message: str, **fields):
+        if SideEffectResult is None:
+            return message
+        return SideEffectResult(
+            success=True, message=message, committed_at=now_iso(), **fields
+        ).to_outcome()
+
+    def _fail(message: str, reason: str = ""):
+        if SideEffectResult is None:
+            return message
+        return SideEffectResult.failed(message, reason=reason)
+
     try:
         result = _publish_artifact(abs_path, access=access)
     except ValueError as exc:
@@ -210,21 +232,38 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict) -> str:
         # they already have and block a legitimate retry.
         if "api key" in str(exc).lower():
             logger.info("Cowork publish blocked: %s", exc)
-            return (
+            return _fail(
                 "STOP: No Minds API key configured. Tell the user to set their "
                 "Minds API key in Settings (or in their .env) before publishing. "
-                "Do NOT call this tool again until they confirm the key is set."
+                "Do NOT call this tool again until they confirm the key is set.",
+                reason="missing_api_key",
             )
         logger.info("Cowork publish rejected: %s", exc)
-        return f"PUBLISH FAILED: {exc}"
+        return _fail(f"PUBLISH FAILED: {exc}", reason="ValueError")
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
-        return f"PUBLISH FAILED: {exc}"
+        return _fail(f"PUBLISH FAILED: {exc}", reason=type(exc).__name__)
 
+    inner = result.get("result", {}) if isinstance(result, dict) else {}
     view_url = result.get("url", "") if isinstance(result, dict) else ""
+    report_id = inner.get("report_id") or None
+    md5 = inner.get("md5") or None
     if not view_url:
-        return "Published, but no view URL was returned."
-    return f"Published successfully! View URL: {view_url}"
+        # Committed (the service returned) but the URL is missing — success is
+        # true, external_url stays null so the ambiguity is explicit, not prose.
+        return _ok(
+            "Published, but no view URL was returned.",
+            resource_id=report_id,
+            idempotency_key=report_id,
+            content_hash=(f"md5:{md5}" if md5 else None),
+        )
+    return _ok(
+        f"Published successfully! View URL: {view_url}",
+        resource_id=report_id,
+        external_url=view_url,
+        idempotency_key=report_id,
+        content_hash=(f"md5:{md5}" if md5 else None),
+    )
 
 
 def build_cowork_publish_tool():
@@ -764,13 +803,15 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     try:
         from cowork.services.connectors.persist import set_connection_label
 
-        ok = set_connection_label(engine, name, label)
+        stored = set_connection_label(engine, name, label)
     except Exception as exc:
         logger.exception("Cowork label_connection failed")
         return f"label_connection: could not set label ({exc})"
-    if not ok:
+    if stored is None:
         return f"label_connection: no connection `{engine}/{name}` found."
-    return f"Labeled `{engine}/{name}` as “{label}”."
+    if stored != label:
+        return f"Labeled `{engine}/{name}` as “{stored}” (“{label}” was already taken by another connection)."
+    return f"Labeled `{engine}/{name}` as “{stored}”."
 
 
 def build_cowork_label_connection_tool():

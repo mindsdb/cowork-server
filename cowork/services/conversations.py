@@ -15,7 +15,6 @@ from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
-from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
 
@@ -97,6 +96,12 @@ def _discard_conversation_streams(conversation_id) -> None:
 class ConversationService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
+
+    def _default_project_id(self) -> UUID | None:
+        """The caller's default project. Imported lazily: projects imports this
+        module's models, so a top-level import would cycle."""
+        from cowork.services.projects import ProjectService
+        return ProjectService(self.session).default_project_id()
 
     def _next_seq(self, conversation_id: UUID) -> int:
         """Next per-conversation ordinal: max(seq) + 1, or 0 when empty.
@@ -218,7 +223,7 @@ class ConversationService:
         )
         stmt = self.session.select(Conversation)
         if not all_projects:
-            stmt = stmt.where(Conversation.project_id == (project_id or GENERAL_PROJECT_ID))
+            stmt = stmt.where(Conversation.project_id == (project_id or self._default_project_id()))
         # created_at then id break ties deterministically so equal-activity rows
         # (e.g. two empty conversations) keep a stable order across polls.
         stmt = stmt.order_by(
@@ -260,7 +265,7 @@ class ConversationService:
         # Anchor the parent: the target project must be visible in scope —
         # otherwise org A could link a conversation to org B's project and
         # leak its name/path through serialization.
-        target_project_id = project_id or GENERAL_PROJECT_ID
+        target_project_id = project_id or self._default_project_id()
         if self.session.get(Project, target_project_id) is None:
             raise ValueError("Project not found")
         conversation = Conversation(

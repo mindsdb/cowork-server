@@ -11,6 +11,8 @@ from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_valid
 
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
+    MINDS_FREE_MODEL,
+    role_defaults,
     PLANNING_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
@@ -65,6 +67,22 @@ _PROVIDER_KEY_FIELDS: dict["Provider", str] = {
 # configs keep working with no migration; isolation kicks in once a distinct key
 # is set in the new field.
 _SHARED_KEY_FALLBACK_FIELDS = frozenset({"gemini_api_key", "openai_compatible_api_key"})
+
+
+def _default_provider() -> "Provider":
+    """The provider a fresh install starts on.
+
+    Org mode runs MindsHub exclusively (BYOK in cloud is deferred, and the turn
+    producer hands the pod a minted minds-cloud credential), so a tenant with
+    nothing stored must not default to a BYOK provider it has no key for — that
+    reads as "unconfigured" forever and sends every new org into onboarding.
+    Desktop keeps its anthropic default.
+    """
+    return (
+        Provider.MINDS_CLOUD
+        if get_app_settings().tenancy_mode == "org"
+        else Provider.ANTHROPIC
+    )
 
 
 def provider_api_key(settings: "UserSettings", provider: "Provider"):
@@ -169,14 +187,9 @@ def _resolved_model(
     aux roles get the silent fallback precisely because no such lane exists
     for them.
     """
-    if resolved_provider == preferred_provider:
+    if resolved_provider == preferred_provider and user_model:
         enabled = enabled_map or {}
-        if (
-            wallet_aware
-            and user_model
-            and resolved_provider == Provider.MINDS_CLOUD
-            and enabled
-        ):
+        if wallet_aware and resolved_provider == Provider.MINDS_CLOUD and enabled:
             # Map keys are bare ids (/v1/models never emits the retired
             # "latest:" prefix), but login-era pins still carry it — strip it
             # for the probe or those pins silently escape the fallback.
@@ -206,6 +219,9 @@ def _resolved_model(
                 if fallback:
                     return fallback
         return user_model
+    # No explicit choice (or provider switched): the resolved provider's default,
+    # availability-adjusted. openai-compatible has no default -> None, so the
+    # "select a model" gate still fires for it.
     return _enabled_aware_default(resolved_provider.value, defaults, enabled_map or {})
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
@@ -269,7 +285,8 @@ def _harness_options() -> list[str]:
 # .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
 # token-refresh would re-pin a picker choice from a stale ``latest:`` line.
 #
-# max_tool_rounds / max_continuations are DELIBERATELY absent too, for the
+# max_tool_rounds / max_continuations / max_turn_tokens are DELIBERATELY absent
+# too, for the
 # ENG-739 reason plus a harder failure mode: anton's own CoreSettings accepts
 # any int, so a stale anton-CLI line like ANTON_MAX_TOOL_ROUNDS=1000 in the
 # shared ~/.cowork/.env is valid for the CLI but fails UserSettings' bounds —
@@ -282,6 +299,11 @@ def _harness_options() -> list[str]:
 # re-syncing a stale .env line can never override a choice the user made in
 # the product. When in doubt, leave it out — .env lines still work for the
 # standalone anton CLI.
+#: Lowest non-zero per-turn spend ceiling a user may set (ENG-1286). Mirrored by
+#: `BUDGET_FIELDS.maxTurnTokens.min` in cowork's `settingsTransform.js`; the two
+#: are asserted equal in `tests/test_agent_budget_settings.py`.
+TURN_CEILING_FLOOR = 750_000
+
 SETTING_ENV_ALIASES: dict[str, str] = {
     "anthropic_api_key": "ANTON_ANTHROPIC_API_KEY",
     "openai_api_key": "ANTON_OPENAI_API_KEY",
@@ -363,7 +385,7 @@ class UserSettings(Settings):
         description="Base URL for the MindsHub API.",
     )
     planning_provider: Annotated[Provider, ORG] = Field(
-        default=Provider.ANTHROPIC,
+        default_factory=_default_provider,
         title="Planning Provider",
         description="The provider to use for the reasoning/planning model.",
     )
@@ -373,7 +395,7 @@ class UserSettings(Settings):
         description="The reasoning model used for planning. Defaults to the recommended model for the selected provider.",
     )
     coding_provider: Annotated[Provider, ORG] = Field(
-        default=Provider.ANTHROPIC,
+        default_factory=_default_provider,
         title="Coding Provider",
         description="The provider to use for the coding model.",
     )
@@ -405,7 +427,7 @@ class UserSettings(Settings):
     # coding (scratchpad) model. Falls back to the coding role in anton when
     # unset, so leaving these at defaults is behavior-preserving.
     router_provider: Annotated[Provider, ORG] = Field(
-        default=Provider.ANTHROPIC,
+        default_factory=_default_provider,
         title="Routing & Summarization Provider",
         description="The provider for the routing/summarization model.",
     )
@@ -554,6 +576,55 @@ class UserSettings(Settings):
             "ANTON_MAX_CONTINUATIONS environment variable."
         ),
     )
+    max_turn_tokens: Annotated[int, ORG] = Field(
+        default_factory=lambda: get_app_settings().default_max_turn_tokens,
+        # Plain contiguous range. "No limit" in the UI is the TOP of it
+        # (50_000_000), not a sentinel.
+        #
+        # "No limit" is EFFECTIVELY, not literally, true — and the bound is
+        # closer than it looks. A turn makes about
+        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at THIS
+        # repo's defaults (50 x 6) is ~306 calls, so 50M is reached at ~163k per
+        # call — below the ~190k context a long conversation carries. At the
+        # maxima a user can set (500 x 25) it is ~13,000 calls and ~3.8k per
+        # call. So the step cap does NOT always land first; it merely always has
+        # so far. The largest turn in 30 days of production was 8.26M, because
+        # real turns end and compaction intervenes long before that shape.
+        # Do not restate this as "the ceiling can never fire at max" — an
+        # earlier version of this comment did, using anton's own 25x3 defaults
+        # rather than Cowork's, which put the threshold at 480k per call and
+        # made it look unreachable.
+        #
+        # A 0-means-unlimited sentinel was built
+        # and then removed — it needed a hole in the range, a validator to guard
+        # the hole, and a special case in the client clamp, all to solve
+        # discoverability that the checkbox solves on its own. It also collided
+        # with `max_continuations` next door, where 0 means literally zero.
+        #
+        # The floor is 750_000, not a rounder-looking 100_000. A turn's first
+        # LLM call costs roughly the conversation's context — ~190k on a long
+        # one — so a ceiling smaller than a couple of calls stops the turn
+        # before it has done anything. Measured against anton: 100_000
+        # dispatched ZERO tools and still spent 400_000. anton now guarantees at
+        # least one tool round regardless, so this floor is a usability bound
+        # rather than a safety one: it is the lowest value where a 190k-context
+        # turn still gets several rounds, and it sits just above the p75
+        # external turn (736k), so "the minimum" means "cut me off around the
+        # 75th percentile".
+        ge=TURN_CEILING_FLOOR,
+        le=50_000_000,
+        title="Max Tokens per Task",
+        description=(
+            "The most tokens the agent may spend on one request before it "
+            "pauses and checks in with you. Tokens are the unit your plan's "
+            "monthly allowance is measured in — including tokens re-read from "
+            "cache — so a task that gets stuck can burn a large share of the "
+            "month without finishing. Raise it if you routinely give the agent "
+            "big jobs; lower it to cap what any single request can cost. "
+            "Applies to the Anton agent and, for Cowork sessions, replaces the "
+            "ANTON_MAX_TURN_TOKENS environment variable."
+        ),
+    )
     publish_url: Annotated[str, ORG] = Field(
         default="",
         title="Publish URL",
@@ -671,19 +742,23 @@ class UserSettings(Settings):
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
-                self.planning_provider.value, PLANNING_MODEL_DEFAULTS, enabled_map
+                self.planning_provider.value, role_defaults(PLANNING_MODEL_DEFAULTS), enabled_map
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
-                self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value, role_defaults(CODING_MODEL_DEFAULTS), enabled_map
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value, role_defaults(ROUTER_MODEL_DEFAULTS), enabled_map
             )
         return self
 
     def _has_key(self, p: Provider) -> bool:
+        # Org mode mints a per-turn key, so minds-cloud is usable with nothing
+        # stored; else a fresh org resolves to the pod's ambient ANTHROPIC key.
+        if p is Provider.MINDS_CLOUD and get_app_settings().tenancy_mode == "org":
+            return True
         # provider_api_key applies the gemini/openai-compatible → shared-openai
         # fallback, so a provider configured via EITHER its dedicated slot or the
         # legacy shared slot is correctly seen as keyed. (Raw getattr on the
@@ -732,7 +807,7 @@ class UserSettings(Settings):
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
-            PLANNING_MODEL_DEFAULTS,
+            role_defaults(PLANNING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
@@ -745,7 +820,7 @@ class UserSettings(Settings):
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
-            CODING_MODEL_DEFAULTS,
+            role_defaults(CODING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -763,7 +838,7 @@ class UserSettings(Settings):
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
-            ROUTER_MODEL_DEFAULTS,
+            role_defaults(ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -778,7 +853,8 @@ class UserSettings(Settings):
         ``provider_api_key`` so gemini/openai-compatible still count when relying
         on the shared openai_api_key fallback."""
         p = self.resolved_planning_provider
-        has_key = provider_api_key(self, p) is not None
+        # _has_key treats minds-cloud as keyed in org mode (per-turn mint).
+        has_key = self._has_key(p)
         # Also require resolvable models. build_llm_client builds BOTH roles and
         # hands resolved_planning_model AND resolved_coding_model to the
         # providers; openai-compatible has no canonical default, so either role

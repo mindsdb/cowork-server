@@ -15,6 +15,7 @@ import pytest
 
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
+from cowork.streaming.registry import TurnLifecycle
 
 
 class _FakeScope:
@@ -24,6 +25,14 @@ class _FakeScope:
 
 class _FakeScoped:
     scope = _FakeScope()
+
+
+class _FakeBuffer:
+    async def append(self, *args, **kwargs):
+        pass
+
+    async def close(self, *args, **kwargs):
+        pass
 
 
 def _handler() -> ResponsesHandler:
@@ -131,16 +140,16 @@ async def test_produce_remote_persists_pending_user_then_finalizes_and_saves_ass
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
 
-    async def fake_produce_remote_turn(*, on_event=None, **kwargs):
-        on_event("turn_delta", {"text": "he"})
-        on_event("turn_delta", {"text": "llo"})
-        on_event("turn_completed", {})
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "he"}
+        yield "turn_delta", {"text": "llo"}
+        yield "turn_completed", {}
 
-    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 
     await handler._produce_remote(
         conv_id=uuid4(), input_text="hi", original_content="hi",
-        model="anton", harness_id="anton", buffer=object(),
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
     assert saved["user"] == "hi"
@@ -151,7 +160,11 @@ async def test_produce_remote_persists_pending_user_then_finalizes_and_saves_ass
     assert saved["finalized_id"] == saved["user_id"]
     assert saved["assistant"] == "hello"
     assert saved["harness"] == "anton"
-    assert saved["events"][-1] == {"type": "response.completed"}
+    # Events are the formatter's sink payloads (richer dicts), ending with the
+    # completed response carrying the collected text.
+    completed = saved["events"][-1]
+    assert completed["type"] == "response.completed"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "hello"
 
 
 @pytest.mark.asyncio
@@ -159,17 +172,17 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
 
-    async def fake_produce_remote_turn(*, on_event=None, **kwargs):
-        on_event("turn_delta", {"text": "partial"})
-        # The real producer attaches the classified (code, message) it streamed.
-        on_event("turn_failed", {"error": "RuntimeError: boom",
-                                 "code": "anton_error", "message": "An unexpected error occurred."})
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        # The real producer attaches the classified (code, message) it yields.
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
 
-    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 
     await handler._produce_remote(
         conv_id=uuid4(), input_text="hi", original_content="hi",
-        model="anton", harness_id="anton", buffer=object(),
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
     assert saved["user"] == "hi"
@@ -180,14 +193,6 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
     # Persisted events mirror the streamed response.failed frame.
     assert saved["events"][-1] == {"type": "response.failed", "code": "anton_error",
                                    "error": "An unexpected error occurred."}
-
-
-class _FakeBuffer:
-    async def append(self, *args, **kwargs):
-        pass
-
-    async def close(self, *args, **kwargs):
-        pass
 
 
 @pytest.mark.asyncio
@@ -206,10 +211,11 @@ async def test_produce_remote_pending_persist_failure_does_not_clear_all_pending
         responses_mod.ConversationService, "save_user_message", raising_save_user_message,
     )
 
-    async def fake_produce_remote_turn(*, on_event=None, **kwargs):
+    async def fake_replies(**kwargs):
         raise AssertionError("turn must not run when the user persist failed")
+        yield  # makes this an async generator, like the real producer
 
-    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 
     await handler._produce_remote(
         conv_id=uuid4(), input_text="hi", original_content="hi",
@@ -231,10 +237,10 @@ def test_inprocess_backend_selected_by_default(monkeypatch, backend_env):
 
     called = {}
 
-    def fake_produce_remote_turn(**kwargs):
+    def fake_replies(**kwargs):
         raise AssertionError("remote producer must not run for the inprocess backend")
 
-    monkeypatch.setattr(responses_mod, "produce_remote_turn", fake_produce_remote_turn)
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 
     handler = _handler()
 
@@ -249,5 +255,121 @@ def test_inprocess_backend_selected_by_default(monkeypatch, backend_env):
 
     assert result == "inprocess-sentinel"
     # Verbatim pass-through - none of _produce's existing args are dropped
-    # or reordered by the new selection branch.
+    # or reordered by the new selection branch. `lifecycle` rides along on top:
+    # the selector supplies one when the caller did not, so a directly-called
+    # producer still has a discard flag to read.
+    assert isinstance(called.pop("lifecycle"), TurnLifecycle)
     assert called == kwargs
+
+
+@pytest.mark.asyncio
+async def test_discarded_remote_turn_persists_nothing(monkeypatch):
+    """A turn delete cancels the producer (registry.discard) after truncating
+    history — the remote path must drop the turn instead of writing rows into a
+    conversation that no longer has room for them, and must not close (i.e.
+    recreate) the buffer file the delete just removed."""
+    import asyncio
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    class _ClosableBuffer:
+        def __init__(self):
+            self.closed = None
+
+        async def append(self, *args, **kwargs):
+            pass
+
+        async def close(self, reason, extra=None):
+            self.closed = reason
+
+    started = asyncio.Event()
+
+    async def fake_replies(**kwargs):
+        started.set()
+        await asyncio.sleep(3600)
+        yield  # never reached; makes this an async generator
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    lifecycle = TurnLifecycle()
+    buffer = _ClosableBuffer()
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer, lifecycle=lifecycle,
+    ))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    lifecycle.discarded = True
+    task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert "assistant" not in saved and "finalized" not in saved
+    assert buffer.closed is None
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
+    """Full remote pipeline: turn_step replies come out as the same
+    response.in_progress thought frames the desktop formatter emits, the
+    created frame carries the injected conversation_id/harness, rounds are
+    separated by a paragraph break, and the steps land in the persisted
+    events log for replay."""
+    import json
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+    handler._remote_skills = lambda session, conv_id: None
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "t1",
+                            "args": '{"name":"cell","one_line_description":"Adds","code":"1+1"}'}
+        yield "turn_delta", {"text": "Preamble."}
+        yield "turn_step", {"step": "round_end", "stop_reason": "end_turn",
+                            "had_tool_calls": False}
+        yield "turn_delta", {"text": "The answer."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    conv_id = uuid4()
+    await handler._produce_remote(
+        conv_id=conv_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+
+    def payload(frame):
+        return json.loads(frame.split("data: ", 1)[1])
+
+    assert frames[0].startswith("event: response.created\n")
+    created = payload(frames[0])
+    assert created["conversation_id"] == str(conv_id)
+    assert created["harness"] == "anton"
+
+    roles = [payload(f)["thought_role"] for f in frames
+             if f.startswith("event: response.in_progress")]
+    assert "thought.scratchpad.start" in roles
+    assert "thought.scratchpad.end" in roles
+
+    deltas = [payload(f)["delta"] for f in frames
+              if f.startswith("event: response.output_text.delta")]
+    assert deltas[0] == "Preamble."
+    assert deltas[1] == "\n\nThe answer."  # round break, not glued text
+
+    assert frames[-1] == "CLOSE:completed"
+    completed = payload(frames[-2])
+    assert completed["response"]["output"][0]["content"][0]["text"] == "Preamble.\n\nThe answer."
+
+    assert saved["assistant"] == "Preamble.\n\nThe answer."
+    assert any(e.get("thought_role") == "thought.scratchpad.start" for e in saved["events"])

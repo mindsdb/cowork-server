@@ -160,8 +160,9 @@ def _empty_listing() -> MindsModelListing:
     return MindsModelListing(None, {}, {}, {}, {}, {})
 
 
-# Cache value: (timestamp, listing). listing.ids is None on failure.
-_minds_models_cache: dict[str, tuple[float, MindsModelListing]] = {}
+# Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
+# (the `enabled` map is wallet-specific) and None for a single-user/BYOK fetch.
+_minds_models_cache: dict[tuple[str, str | None], tuple[float, MindsModelListing]] = {}
 
 
 # Substrings that identify an embeddings model by id, used only for endpoints
@@ -188,7 +189,7 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
 
 
 async def fetch_minds_models(
-    minds_url: str, api_key: str, *, force_refresh: bool = False
+    minds_url: str, api_key: str, *, force_refresh: bool = False, tenant_key: str | None = None
 ) -> MindsModelListing:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
@@ -221,9 +222,10 @@ async def fetch_minds_models(
     if not minds_url or not api_key:
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
+    cache_key = (base, tenant_key)
 
     now = time.monotonic()
-    cached = _minds_models_cache.get(base)
+    cached = _minds_models_cache.get(cache_key)
     if cached:
         ts, val = cached
         ttl = _MINDS_MODELS_TTL if val.ids else _MINDS_MODELS_FAIL_TTL
@@ -233,7 +235,7 @@ async def fetch_minds_models(
             return val
 
     def _remember(val: MindsModelListing) -> MindsModelListing:
-        _minds_models_cache[base] = (time.monotonic(), val)
+        _minds_models_cache[cache_key] = (time.monotonic(), val)
         return val
 
     try:
@@ -332,6 +334,25 @@ async def fetch_minds_models(
     return _remember(
         MindsModelListing((ids or None), efforts, enabled, labels, providers, families)
     )
+
+
+async def fetch_org_model_catalog(
+    *, org_id: str, bearer_token: str, refresh: bool = False
+) -> MindsModelListing:
+    """MindsHub catalog for an org, cached per org.
+
+    Uses the OPERATOR endpoint (env/namespace-derived), never a tenant-settable
+    URL, and the caller's own bearer — so a member's JWT can't be forwarded to an
+    admin-chosen host. `org_id` is required; the `enabled` map is wallet-specific.
+    """
+    if not org_id:
+        raise ValueError("org catalog requires an organization id")
+    from cowork.common.settings.app_settings import (
+        TurnQueueSettings,
+        default_turn_minds_api_host,
+    )
+    url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
+    return await fetch_minds_models(url, bearer_token, force_refresh=refresh, tenant_key=org_id)
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -640,8 +661,20 @@ def build_llm_client():
         if role == Provider.MINDS_CLOUD:
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
+            # The MindsHub gateway executes web_search / web_fetch server-side
+            # over its chat.completions passthrough:
+            # - the flavor must be set, or OpenAIProvider defaults to generic,
+            #   reports no native web tools, and anton falls back to a
+            #   web_search that needs an Exa/Brave key Cowork never asks for;
+            # - state it outright rather than deriving it from the base URL —
+            #   this branch already knows the endpoint is MindsHub, and a
+            #   self-hosted gateway not spelling "mindshub.ai" would otherwise
+            #   fall through to generic and lose search entirely.
             return OpenAIProvider(
-                api_key=key.get_secret_value(), base_url=base, **effort_kw
+                api_key=key.get_secret_value(),
+                base_url=base,
+                flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
+                **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             if key is None:
@@ -665,6 +698,17 @@ def build_llm_client():
             raise ValueError(f"{role.label} API key is not configured")
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
+        #
+        # Direct OpenAI deliberately keeps the default (generic) flavor. The
+        # flavor that would enable OpenAI's native web tools, FLAVOR_OPENAI,
+        # also switches the whole transport from chat.completions to the
+        # Responses API, whose path in anton does not yet:
+        # - report truncation (no `response.incomplete` handler, so
+        #   stop_reason and token usage stay unset and truncation recovery
+        #   never fires),
+        # - forward images returned inside a tool_result,
+        # - attach Langfuse trace headers.
+        # Native web search here waits on those gaps being closed in anton.
         if cls is OpenAIProvider:
             return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
