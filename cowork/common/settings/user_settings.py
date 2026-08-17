@@ -321,6 +321,7 @@ SETTING_ENV_ALIASES: dict[str, str] = {
     "proactive_dashboards": "ANTON_PROACTIVE_DASHBOARDS",
     "act_first": "ANTON_ACT_FIRST",
     "publish_url": "ANTON_PUBLISH_URL",
+    "artifact_autopublish_enabled": "ANTON_ARTIFACT_AUTOPUBLISH",
 }
 
 # Inverse view (ANTON_* .env var → DB setting key) for .env-first callers, i.e.
@@ -629,6 +630,20 @@ class UserSettings(Settings):
         default="",
         title="Publish URL",
         description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
+    )
+    artifact_autopublish_enabled: Annotated[bool, ORG] = Field(
+        default=False,
+        title="Auto-publish artifacts",
+        description=(
+            "In org deployments, publish every artifact the agent creates or changes "
+            "to the viewer automatically, restricted to the author's organization. "
+            "Off by default: it uploads user content — and, for fullstack artifacts, "
+            "datasource secrets from a vault that is not scoped per organization — "
+            "without an explicit user action. ORG-scoped on purpose, so it can be "
+            "enabled for one organization at a time; the ANTON_ARTIFACT_AUTOPUBLISH "
+            "env alias is process-global and would turn it on for every tenant of a "
+            "deployment."
+        ),
     )
     openai_base_url: Annotated[str, ORG] = Field(
         default="",
