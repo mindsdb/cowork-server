@@ -1303,3 +1303,71 @@ def test_responses_emits_model_for_every_model_unavailable_code():
         payload = te.response_failed_payload("msg", code, model="deepseek-v4-flash")
         assert payload["model"] == "deepseek-v4-flash"
         assert payload["code"] == code
+
+
+# ── The header carrier is origin-checked too (ENG-1686) ────────────────────
+# ENG-1537 gated the body-`code` carrier and left its header twin unconditional,
+# on the assumption that "only the gateway sets X-MindsHub-Reason". That is true
+# of every honest provider and not enforceable against a hostile one: on a BYOK
+# OPENAI_COMPATIBLE endpoint the whole response is third-party controlled.
+
+@pytest.mark.parametrize("reason,forbidden_code", [
+    ("wallet_empty", "token_limit"),
+    ("included_allowance_exhausted", "included_allowance_exhausted"),
+    ("rate_limited", "rate_limited"),
+    ("policy_unavailable", "policy_unavailable"),
+])
+def test_a_third_party_header_cannot_select_a_billing_verdict(reason, forbidden_code):
+    # Mirror of test_a_third_party_body_cannot_select_a_billing_verdict, over
+    # the carrier that was left open. Parametrised across every reason the
+    # gateway defines, so adding a sixth cannot quietly reopen one lane.
+    exc = _failure(402, reason=reason, url="https://openrouter.ai/api/v1/chat/completions")
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != forbidden_code, (
+        f"a third-party header selected {result!r}"
+    )
+
+
+def test_the_gateways_own_header_still_maps():
+    # The gate must not break the carrier it exists to protect.
+    code, _ = te.friendly_turn_error(_gateway_failure(402, reason="wallet_empty"))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_an_unknown_origin_still_maps_and_is_not_remote_reachable():
+    # The deliberate residual. `_origin_is_known_third_party` is three-valued so
+    # an unknown origin stays trusted, which is what keeps
+    # test_reason_header_maps_even_without_request_url passing unedited.
+    #
+    # Safe because a remote server cannot produce it: a real SDK error always
+    # carries its request, so `host` resolves for every genuine HTTP response.
+    # The only route to host=None is a response with no request attached, whose
+    # `.url` raises RuntimeError — our own plumbing, never the peer's choice.
+    # Asserted here rather than left as prose, since it is the entire argument
+    # for the narrow gate.
+    import httpx
+    import openai
+
+    def _handler(request):
+        return httpx.Response(402, json={}, headers={"X-MindsHub-Reason": "wallet_empty"})
+
+    client = openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1", api_key="k", max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(_handler)),
+    )
+    try:
+        client.chat.completions.create(
+            model="m", max_tokens=1, messages=[{"role": "user", "content": "hi"}])
+    except openai.APIStatusError as exc:
+        # A REAL third-party error resolves its host, so it is gated — it can
+        # never fall into the trusted unknown-origin residual.
+        assert te._http_error_context(exc)[2] == "openrouter.ai"
+        assert te._origin_is_known_third_party("openrouter.ai") is True
+    else:  # pragma: no cover
+        raise AssertionError("the SDK did not raise")
+
+    # And the residual itself is only constructible locally.
+    detached = httpx.Response(402, json={}, headers={"X-MindsHub-Reason": "wallet_empty"})
+    with pytest.raises(RuntimeError):
+        _ = detached.url
+    assert te._origin_is_known_third_party(None) is False

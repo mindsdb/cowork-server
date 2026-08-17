@@ -640,6 +640,28 @@ def allowance_reset_at(exc: BaseException) -> str | None:
     return None
 
 
+def _origin_is_known_third_party(host: str | None) -> bool:
+    """Whether the failing request provably went somewhere that is NOT our gateway.
+
+    Deliberately three-valued, unlike ``_from_minds_gateway``: this answers
+    "do we KNOW it was someone else", so an unknown origin (``host is None``)
+    is not treated as third-party.
+
+    That distinction is the whole reason the header carrier could be gated at
+    all. A flat ``not _from_minds_gateway(host)`` also rejects the
+    unknown-origin case, which breaks
+    ``test_reason_header_maps_even_without_request_url`` — a deliberate test
+    asserting the header still maps when the response carries no URL.
+
+    Leaving unknown-origin trusted is safe, and checked (ENG-1686): a real SDK
+    error always carries its request, so ``host`` resolves for every genuine
+    HTTP response. The only way to reach ``host is None`` is a response with no
+    request attached, whose ``.url`` raises ``RuntimeError`` — our own client
+    plumbing, never something a remote server can choose.
+    """
+    return host is not None and not _from_minds_gateway(host)
+
+
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
@@ -683,8 +705,19 @@ def friendly_turn_error(
 
     # The gateway's explicit reason header wins — it names the billing decision
     # exactly, so we never have to guess from a status code or message text.
-    # Unconditional on origin: only the gateway sets X-MindsHub-Reason.
-    if reason is not None:
+    #
+    # Origin-checked (ENG-1686). This used to read "unconditional on origin:
+    # only the gateway sets X-MindsHub-Reason", which is an assumption about
+    # well-behaved upstreams rather than something enforced: on a BYOK
+    # OPENAI_COMPATIBLE provider the response is entirely third-party
+    # controlled, so any endpoint could set the header and choose which billing
+    # card the user sees — including the out-of-credits CTA for a wallet that
+    # is fine. The body-`code` twin below is gated for exactly this reason and
+    # the argument is carrier-agnostic.
+    #
+    # Skipped rather than returned-None on purpose: a spoofed header should
+    # lose its authority, not suppress the rest of the ladder.
+    if reason is not None and not _origin_is_known_third_party(host):
         mapped = _map_gateway_reason(reason)
         if mapped is not None:
             # ...except for unknown_model, where anton's typed error is strictly
@@ -709,6 +742,11 @@ def friendly_turn_error(
     # that rule cannot tell the velocity 429 from the allowance 429, and
     # guessing "out of credits" for a rate limit is the ENG-1537 defect.
     denial_code = _gateway_denial_code(exc)
+    # NOTE: strict here (provably-gateway), unlike the header above. The header
+    # needs the looser three-valued check because an existing test requires an
+    # unknown origin to still map; the body carrier has no such constraint, so
+    # it stays as tight as it can be. Don't "unify" these without re-reading
+    # test_reason_header_maps_even_without_request_url.
     if denial_code is not None and _from_minds_gateway(host):
         mapped = _map_gateway_reason(denial_code)
         if mapped is not None:
