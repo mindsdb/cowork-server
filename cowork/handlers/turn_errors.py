@@ -653,11 +653,20 @@ def _origin_is_known_third_party(host: str | None) -> bool:
     ``test_reason_header_maps_even_without_request_url`` — a deliberate test
     asserting the header still maps when the response carries no URL.
 
-    Leaving unknown-origin trusted is safe, and checked (ENG-1686): a real SDK
+    Leaving unknown-origin trusted is safe, and checked (ENG-1686). A real SDK
     error always carries its request, so ``host`` resolves for every genuine
-    HTTP response. The only way to reach ``host is None`` is a response with no
-    request attached, whose ``.url`` raises ``RuntimeError`` — our own client
-    plumbing, never something a remote server can choose.
+    HTTP response. There are exactly two routes to ``host is None``, and a
+    remote server can choose neither:
+
+    1. a response with no request attached — its ``.url`` raises
+       ``RuntimeError``, which is our own client plumbing, not the peer's;
+    2. an exception carrying ``headers`` with **no response object at all**
+       (``_http_error_context`` falls back to ``getattr(cur, "headers", None)``,
+       and ``_response_url_host`` names this case too). Nothing in anton or
+       cowork-server raises such an exception today, so the lane is unreachable
+       rather than merely unlikely — but a future client that attaches headers
+       directly to an error would reopen it silently, which is why it is named
+       here rather than left to be rediscovered.
     """
     return host is not None and not _from_minds_gateway(host)
 
