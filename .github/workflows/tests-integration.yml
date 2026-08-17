@@ -1,0 +1,117 @@
+name: Integration Tests
+
+# Runs against a deployment that has just gone up, so it covers the paths that
+# only exist between the services: cowork-server, Redis, scratchpad-controller
+# and a real scratchpad pod.
+on:
+  workflow_call:
+    inputs:
+      deploy-env:
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  integration-tests:
+    # Needs cluster access: the second-replica test port-forwards to individual
+    # pods, since the load balancer is free to send both requests to the same one.
+    runs-on: mdb-dev
+    environment:
+      name: ${{ inputs.deploy-env }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.2"
+          cache-local-path: "/home/runner/_work/_tool/uv-local-cache"
+          prune-cache: false
+          python-version: '3.12'
+      - name: Install dependencies
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PRIVATE_ACCESS_TOKEN }}
+        run: |
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "$GITHUB_TOKEN" > ~/.netrc
+          chmod 600 ~/.netrc
+          uv sync --locked --group dev
+
+      # Where to point the tests, and where to get an identity.
+      #
+      # PR envs: the hosts follow the namespace, and auth's /dev/mint-test-user/
+      # is mounted there (it exists only where auth's `ephemeral` setting is on),
+      # so no secret is needed and each run gets a fresh throwaway tenant.
+      #
+      # dev/staging/prod: the dev route is deliberately not mounted, so identity
+      # comes from auth's internal provisioning endpoint, authenticated with the
+      # dedicated secret held in this environment. It provisions the fixed
+      # `cowork` suite: one @emailsink.dev tenant reused across runs.
+      - name: Resolve the target and the identity source
+        env:
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+          GH_COWORK_URL: ${{ vars.MDB_ENV_URL }}
+          GH_AUTH_URL: ${{ vars.MDB_AUTH_URL }}
+        run: |
+          set -euo pipefail
+          if [[ "$DEPLOY_ENV" == pr-* ]]; then
+            {
+              echo "COWORK_BASE_URL=https://${DEPLOY_ENV}.dev.mindshub.ai"
+              echo "TEST_USER_MINT_URL=https://auth-${DEPLOY_ENV}.dev.mindshub.ai/dev/mint-test-user/"
+            } >> "$GITHUB_ENV"
+          else
+            if [[ -z "$GH_COWORK_URL" || -z "$GH_AUTH_URL" ]]; then
+              echo "::error::MDB_ENV_URL and MDB_AUTH_URL must be set on the ${DEPLOY_ENV} environment"
+              exit 1
+            fi
+            {
+              echo "COWORK_BASE_URL=${GH_COWORK_URL}"
+              echo "TEST_USER_PROVISION_URL=${GH_AUTH_URL}/v1/internal/test-users/"
+            } >> "$GITHUB_ENV"
+          fi
+
+      # Two pods to prove a reconnect crosses replicas. Skipped rather than
+      # failed when there is only one: a single-replica environment is a valid
+      # deployment, it just cannot demonstrate this.
+      - name: Port-forward a second replica
+        env:
+          DEPLOY_ENV: ${{ inputs.deploy-env }}
+        run: |
+          set -euo pipefail
+          # PR envs and permanent envs both deploy into a namespace named
+          # after the env.
+          ns="$DEPLOY_ENV"
+          # Selected by name rather than by label: the chart comes from an
+          # external `deployment` dependency, so its label scheme is not ours to
+          # rely on. Deployment pods are always <deployment>-<hash>-<suffix>.
+          mapfile -t pods < <(
+            kubectl get pods -n "$ns" --field-selector=status.phase=Running \
+              -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+              | grep '^cowork-server-' || true
+          )
+          if [[ "${#pods[@]}" -lt 2 ]]; then
+            echo "Only ${#pods[@]} cowork-server pod(s) in $ns; the cross-replica test will skip."
+            exit 0
+          fi
+          # 9010 is the port uvicorn binds (see the chart's args).
+          kubectl port-forward -n "$ns" "pod/${pods[0]}" 8081:9010 >/dev/null 2>&1 &
+          kubectl port-forward -n "$ns" "pod/${pods[1]}" 8082:9010 >/dev/null 2>&1 &
+          health=/api/v1/health/
+          for _ in $(seq 1 30); do
+            if curl -sf "http://localhost:8081${health}" >/dev/null \
+               && curl -sf "http://localhost:8082${health}" >/dev/null; then
+              {
+                echo "COWORK_BASE_URL=http://localhost:8081"
+                echo "COWORK_BASE_URL_B=http://localhost:8082"
+              } >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::warning::port-forwards did not come up; the cross-replica test will skip."
+
+      - name: Run integration tests
+        env:
+          TEST_USER_PROVISION_SECRET: ${{ secrets.TEST_USER_PROVISION_SECRET }}
+        run: make test/integration
