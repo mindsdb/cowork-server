@@ -57,7 +57,10 @@ jobs:
           set -euo pipefail
           if [[ "$DEPLOY_ENV" == pr-* ]]; then
             {
-              echo "COWORK_BASE_URL=https://${DEPLOY_ENV}.dev.mindshub.ai"
+              # cowork-server's own host. ${DEPLOY_ENV}.dev.mindshub.ai without
+              # the prefix is the frontend, which answers every path with the
+              # SPA: GETs 200 HTML, POSTs 405.
+              echo "COWORK_BASE_URL=https://cowork-${DEPLOY_ENV}.dev.mindshub.ai"
               echo "TEST_USER_MINT_URL=https://auth-${DEPLOY_ENV}.dev.mindshub.ai/dev/mint-test-user/"
             } >> "$GITHUB_ENV"
           else
@@ -76,10 +79,13 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
 
-      # Two pods to prove a reconnect crosses replicas. Skipped rather than
-      # failed when there is only one: a single-replica environment is a valid
-      # deployment, it just cannot demonstrate this.
-      - name: Port-forward a second replica
+      # Only the cross-replica test needs these. The ingress pins a client to
+      # one pod by cookie, so both halves of that test would otherwise land on
+      # the same replica. Everything else goes through the ingress, which is
+      # also what authenticates the Bearer key.
+      #
+      # One pod is a valid deployment, so that test skips rather than fails.
+      - name: Port-forward two pods for the cross-replica test
         env:
           DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
@@ -99,15 +105,17 @@ jobs:
             echo "Only ${#pods[@]} cowork-server pod(s) in $ns; the cross-replica test will skip."
             exit 0
           fi
-          # 9010 is the port uvicorn binds (see the chart's args).
+          # 9010 is the port uvicorn binds (see the chart's args). Reached
+          # directly, so no ingress and no injected identity: the test sends the
+          # identity headers itself.
+          health=/api/v1/health/
           kubectl port-forward -n "$ns" "pod/${pods[0]}" 8081:9010 >/dev/null 2>&1 &
           kubectl port-forward -n "$ns" "pod/${pods[1]}" 8082:9010 >/dev/null 2>&1 &
-          health=/api/v1/health/
           for _ in $(seq 1 30); do
             if curl -sf "http://localhost:8081${health}" >/dev/null \
                && curl -sf "http://localhost:8082${health}" >/dev/null; then
               {
-                echo "COWORK_BASE_URL=http://localhost:8081"
+                echo "COWORK_BASE_URL_A=http://localhost:8081"
                 echo "COWORK_BASE_URL_B=http://localhost:8082"
               } >> "$GITHUB_ENV"
               exit 0

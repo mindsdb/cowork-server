@@ -21,12 +21,17 @@ carries the user_id and organization_id these tests send as headers.
     TEST_USER_MINT_URL=https://auth-pr-123.dev.mindshub.ai/dev/mint-test-user/ \\
     uv run pytest tests/integration/test_post_deploy.py -v
 
-Reconnect-across-replicas needs to reach individual pods rather than the
-service, since the load balancer may send both requests to the same one:
+Requests go through the ingress, which authenticates the Bearer key against
+auth and injects the identity headers itself. Sending those headers from here
+would achieve nothing: the ingress overwrites them from its auth subrequest.
 
-    kubectl port-forward pod/cowork-server-aaa 8081:8000
-    kubectl port-forward pod/cowork-server-bbb 8082:8000
-    COWORK_BASE_URL=http://localhost:8081 COWORK_BASE_URL_B=http://localhost:8082 ...
+The cross-replica test is the exception. The ingress pins a client to one pod
+(cookie affinity), so it talks to two pods directly, which means no ingress and
+therefore no injected identity: those two clients send the headers themselves.
+
+    kubectl port-forward pod/cowork-server-aaa 8081:9010
+    kubectl port-forward pod/cowork-server-bbb 8082:9010
+    COWORK_BASE_URL_A=http://localhost:8081 COWORK_BASE_URL_B=http://localhost:8082 ...
 """
 
 from __future__ import annotations
@@ -73,8 +78,8 @@ def _provision_identity() -> dict[str, str]:
 
     Three sources, in order:
 
-    1. COWORK_TEST_USER_ID + COWORK_TEST_ORG_ID, for running by hand against an
-       environment where you already have a tenant.
+    1. COWORK_TEST_API_KEY + COWORK_TEST_USER_ID + COWORK_TEST_ORG_ID, for
+       running by hand against an environment where you already have a tenant.
     2. TEST_USER_MINT_URL, auth's /dev/mint-test-user/. Mounted only in
        ephemeral PR envs, needs no secret, mints a fresh user per call.
     3. TEST_USER_PROVISION_URL + TEST_USER_PROVISION_SECRET, auth's internal
@@ -82,10 +87,12 @@ def _provision_identity() -> dict[str, str]:
        Provisions the fixed `cowork` suite: one @emailsink.dev tenant, reused
        across runs, with a fresh key each time.
     """
+    api_key = os.environ.get("COWORK_TEST_API_KEY")
     user_id = os.environ.get("COWORK_TEST_USER_ID")
     org_id = os.environ.get("COWORK_TEST_ORG_ID")
-    if user_id and org_id:
+    if api_key and user_id and org_id:
         return {
+            "api_key": api_key,
             "user_id": user_id,
             "organization_id": org_id,
             "email": os.environ.get("COWORK_TEST_USER_EMAIL", "postdeploy@example.com"),
@@ -103,8 +110,9 @@ def _provision_identity() -> dict[str, str]:
         secret = os.environ.get("TEST_USER_PROVISION_SECRET")
         if not (provision_url and secret):
             pytest.skip(
-                "no identity source: set COWORK_TEST_USER_ID + COWORK_TEST_ORG_ID, "
-                "or TEST_USER_MINT_URL, or TEST_USER_PROVISION_URL + TEST_USER_PROVISION_SECRET"
+                "no identity source: set COWORK_TEST_API_KEY + COWORK_TEST_USER_ID + "
+                "COWORK_TEST_ORG_ID, or TEST_USER_MINT_URL, or TEST_USER_PROVISION_URL "
+                "+ TEST_USER_PROVISION_SECRET"
             )
         resp = httpx.post(
             provision_url,
@@ -134,20 +142,25 @@ def identity() -> dict[str, str]:
 
 
 def _headers(identity: dict[str, str]) -> dict[str, str]:
-    """Identity headers the gateway normally injects (see cowork/principal.py).
+    """What the ingress wants: a key it can authenticate against auth.
 
-    Sent by hand here because these tests bypass the gateway. The ids must be
-    UUIDs or TrustedHeaderMiddleware rejects them.
+    It then injects X-User-Id / X-Organization-Id itself from that subrequest,
+    so sending them here would be overwritten anyway.
     """
-    headers = {
+    return {"Authorization": f"Bearer {identity['api_key']}"}
+
+
+def _direct_headers(identity: dict[str, str]) -> dict[str, str]:
+    """What a pod wants when the ingress is not in the path.
+
+    Nothing has injected identity, so TrustedHeaderMiddleware reads these. The
+    ids must be UUIDs or it rejects them.
+    """
+    return {
         "X-Organization-Id": identity["organization_id"],
         "X-User-Id": identity["user_id"],
         "X-User-Email": identity.get("email", "postdeploy@example.com"),
     }
-    token = os.environ.get("COWORK_AUTH_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
 
 
 @pytest.fixture
@@ -158,7 +171,9 @@ def api(identity):
 
 @pytest.fixture
 def conversation_id():
-    return f"postdeploy-{uuid.uuid4()}"
+    """A UUID, because a non-UUID id is replaced by a canonical one and every
+    later call would then be asking about a conversation that does not exist."""
+    return str(uuid.uuid4())
 
 
 def _sse_events(text: str) -> list[str]:
@@ -224,15 +239,18 @@ def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
 def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     """A turn started on one replica can be probed and tailed from another.
 
-    Requires COWORK_BASE_URL_B pointing at a different pod, since the load
-    balancer may otherwise send both requests to the same one.
+    Talks to two pods directly rather than through the ingress, which pins a
+    client to one pod by cookie, so both halves would otherwise land on the
+    same replica and prove nothing. No ingress means no injected identity, so
+    these two clients send the headers themselves.
     """
+    url_a = os.environ.get("COWORK_BASE_URL_A")
     url_b = os.environ.get("COWORK_BASE_URL_B")
-    if not url_b:
-        pytest.skip("COWORK_BASE_URL_B not set; needs a second replica to be meaningful")
+    if not (url_a and url_b):
+        pytest.skip("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
 
-    headers = _headers(identity)
-    with httpx.Client(base_url=_base_url(), headers=headers, timeout=30.0) as replica_a:
+    headers = _direct_headers(identity)
+    with httpx.Client(base_url=url_a.rstrip("/"), headers=headers, timeout=30.0) as replica_a:
         with replica_a.stream(
             "POST", "/api/v1/responses/",
             json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
