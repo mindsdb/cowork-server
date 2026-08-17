@@ -211,7 +211,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
@@ -254,6 +254,86 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
         s = get_open_session()
         ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
         s.close()
+
+
+# --- ENG-1683: a scheduled run in org mode has no request, so it derives a
+# service principal from the schedule row — creating the conversation under the
+# owning org (rather than fail-closed) and handing the turn that principal so
+# the remote backend can mint the org's key headlessly.
+
+def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.db.session import get_open_session
+    from cowork.models.conversation import Conversation
+    from cowork.scheduler import execute_schedule
+    from cowork.services.schedules import ScheduleService
+
+    org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    user_id = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+
+    captured: dict = {}
+
+    class FakeHandler:
+        def __init__(self, session, principal=None):
+            captured["principal"] = principal
+
+        async def handle(self, request):
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    org_scope = TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
+    session = get_open_session()
+    scoped = ScopedSession(session, org_scope)
+    project = Project(name="p-org", path="/tmp/p-org")
+    scoped.add(project)
+    scoped.commit()
+    scoped.refresh(project)
+    schedule = ScheduleService(scoped).create_schedule(
+        title="org daily",
+        prompt="do it",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        project_id=project.id,
+    )
+    schedule_id = schedule.id
+    # The request that created the schedule stamped its identity on the row.
+    assert schedule.org_id == org_id and schedule.created_by == user_id
+    session.close()
+
+    try:
+        # Cron path (conversation_id=None) — this used to fail closed in org mode.
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+
+        principal = captured["principal"]
+        assert principal is not None, "the turn must receive a service principal"
+        assert principal.org_id == org_id
+        assert principal.user_id == user_id
+
+        # The conversation was created under the owning org, not as an invisible
+        # NULL-org row (the failure the old fail-closed guard prevented).
+        s = get_open_session()
+        convs = ScopedSession(s, org_scope)
+        rows = convs.exec(convs.select(Conversation)).all()
+        assert any(c.org_id == org_id for c in rows)
+        s.close()
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, org_scope)).delete_schedule(schedule_id)
+        s.close()
+        get_app_settings.cache_clear()
 
 
 # --- ENG-688: how the run actually ended comes from the stream buffer's
@@ -348,7 +428,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
@@ -463,7 +543,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
