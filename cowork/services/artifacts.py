@@ -525,7 +525,7 @@ def _unpublish_folder(folder: Path) -> None:
         return
 
     # Local import to avoid a circular dependency: publish imports artifacts.
-    from cowork.services.publish import unpublish_artifact
+    from cowork.services.publish import desktop_publish_context, unpublish_artifact
 
     for name, entry in published_map.items():
         if not isinstance(entry, dict):
@@ -542,7 +542,10 @@ def _unpublish_folder(folder: Path) -> None:
         # for a missing file can't be unpublished this way, so skip it.
         if not (folder / name).is_file():
             continue
-        unpublish_artifact(str(folder / name))
+        target, base, api_key, publish_url = desktop_publish_context(str(folder / name))
+        unpublish_artifact(
+            target, artifacts_base=base, api_key=api_key, publish_url=publish_url,
+        )
 
 
 def delete_artifact(raw_path: str) -> None:
