@@ -376,20 +376,27 @@ class AntonHarness:
         # with its own session id and doesn't tag artifacts with the cowork
         # conversation_id, so we diff the project's artifacts dir around the run
         # (see services.task_objects.finalize_turn_artifacts).
+        from cowork.services.artifact_autopublish import autopublish_project_artifacts
         from cowork.services.task_objects import (
-            finalize_turn_artifacts,
+            cards_for_slugs,
             finalize_turn_skill_drafts,
-            snapshot_artifact_slugs,
+            index_turn_artifacts,
+            snapshot_artifact_state,
             snapshot_skill_drafts,
             snapshot_stray_skills,
         )
         project_path = Path(conversation.project.path)
         artifacts_base = project_path / ".anton" / "artifacts"
-        before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Names AND content mtimes: a name diff only reveals artifacts the turn
+        # CREATED, and the reconciler must also see the ones it EDITED.
+        before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
+        # Same reason: the card carries the project name to the client, and reading
+        # the relation after the turn could hit an expired session.
+        conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -399,6 +406,9 @@ class AntonHarness:
         before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
         skill_drafts: list[dict] = []
+        new_slugs: list[str] = []
+        touched_slugs: set[str] = set()
+        turn_scope = None
         turn_rows: list[dict] | None = None
         session = None
         seed_info: dict | None = None
@@ -460,13 +470,35 @@ class AntonHarness:
                         "[anton_harness] failed to persist history compaction for conversation %s",
                         conv_id,
                     )
-            # One dir diff → index the new artifacts AND build their cards.
-            # Runs on every exit (success, error, cancel) so an artifact is
-            # always indexed; cards are yielded just below on normal completion.
-            cards = finalize_turn_artifacts(conversation, conv_id, conv_project_id, artifacts_base, before_slugs)
+            # One dir diff → index the new artifacts and work out what this turn
+            # touched. Runs on every exit (success, error, cancel), so an artifact
+            # is always indexed. Synchronous by design: an `await` here would be
+            # skipped on cancellation, so anything awaited would silently not run.
+            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
+                conversation, conv_id, conv_project_id, artifacts_base,
+                before_slugs, before_mtimes,
+            )
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,
             )
+        # Autopublish and cards live in the normal-completion path, matching what
+        # cards already did: on Stop/cancel neither runs, and the next turn in this
+        # project heals it (if there is one — an abandoned conversation never does).
+        # Inline, so the card carries its published URL rather than appearing
+        # without one and needing a later refresh.
+        republished = await autopublish_project_artifacts(
+            artifacts_base, turn_scope, touched=set(touched_slugs),
+        )
+        # Cards only for what THIS turn produced or touched. `republished` also
+        # contains phase-2 self-heal publishes — old artifacts from earlier
+        # conversations — and the stream reducer dedupes only within one message,
+        # so including them would attach last week's artifacts to this answer.
+        carded = set(new_slugs) | (republished & touched_slugs)
+        cards = cards_for_slugs(
+            artifacts_base, sorted(carded),
+            project_id=str(conv_project_id) if conv_project_id else None,
+            project_name=conv_project_name,
+        )
         for card in cards:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
