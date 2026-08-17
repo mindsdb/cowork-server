@@ -5,8 +5,20 @@ Redis, the scratchpad controller and a real scratchpad pod together.
 
 Skipped unless COWORK_BASE_URL is set, so a normal `pytest` run ignores them.
 
+The identity comes from auth, which provisions throwaway test users for CI.
+Permanent envs (dev/staging/prod) POST to its internal endpoint with the
+provisioning secret; PR envs POST to /dev/mint-test-user/, which is mounted
+only where `ephemeral` is on and needs no secret. Either way the response
+carries the user_id and organization_id these tests send as headers.
+
     COWORK_BASE_URL=https://cowork.staging.example.com \\
-    COWORK_TEST_ORG_ID=<uuid> COWORK_TEST_USER_ID=<uuid> \\
+    TEST_USER_PROVISION_URL=https://auth.staging.example.com/v1/internal/test-users/ \\
+    TEST_USER_PROVISION_SECRET=... \\
+    uv run pytest tests/integration/test_post_deploy.py -v
+
+    # PR env
+    COWORK_BASE_URL=https://cowork-server-pr-123.dev.mindshub.ai \\
+    TEST_USER_MINT_URL=https://auth-pr-123.dev.mindshub.ai/dev/mint-test-user/ \\
     uv run pytest tests/integration/test_post_deploy.py -v
 
 Reconnect-across-replicas needs to reach individual pods rather than the
@@ -40,6 +52,14 @@ QUICK_PROMPT = "Reply with exactly the word: pong"
 TURN_TIMEOUT_S = 180.0
 CANCEL_VISIBLE_S = 45.0
 
+# The auth hosts sit behind Cloudflare, whose bot rules 403 a default httpx or
+# requests User-Agent ("error code: 1010"). The block is signature-based, so a
+# browser string is enough. Same workaround as mindshub_inference/tests/env.py.
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
 
 def _base_url() -> str:
     url = os.environ.get("COWORK_BASE_URL")
@@ -48,20 +68,81 @@ def _base_url() -> str:
     return url.rstrip("/")
 
 
-def _headers() -> dict[str, str]:
+def _provision_identity() -> dict[str, str]:
+    """A user_id, organization_id and email for a throwaway tenant.
+
+    Three sources, in order:
+
+    1. COWORK_TEST_USER_ID + COWORK_TEST_ORG_ID, for running by hand against an
+       environment where you already have a tenant.
+    2. TEST_USER_MINT_URL, auth's /dev/mint-test-user/. Mounted only in
+       ephemeral PR envs, needs no secret, mints a fresh user per call.
+    3. TEST_USER_PROVISION_URL + TEST_USER_PROVISION_SECRET, auth's internal
+       endpoint. Used for dev/staging/prod, where the dev route is not mounted.
+       Provisions the fixed `cowork` suite: one @emailsink.dev tenant, reused
+       across runs, with a fresh key each time.
+    """
+    user_id = os.environ.get("COWORK_TEST_USER_ID")
+    org_id = os.environ.get("COWORK_TEST_ORG_ID")
+    if user_id and org_id:
+        return {
+            "user_id": user_id,
+            "organization_id": org_id,
+            "email": os.environ.get("COWORK_TEST_USER_EMAIL", "postdeploy@example.com"),
+        }
+
+    mint_url = os.environ.get("TEST_USER_MINT_URL")
+    if mint_url:
+        resp = httpx.post(
+            mint_url, json={}, headers={"User-Agent": BROWSER_UA}, timeout=60.0)
+        if resp.status_code != 201:
+            pytest.fail(f"minting a PR-env test user failed: {resp.status_code} {resp.text}")
+        user = resp.json()
+    else:
+        provision_url = os.environ.get("TEST_USER_PROVISION_URL")
+        secret = os.environ.get("TEST_USER_PROVISION_SECRET")
+        if not (provision_url and secret):
+            pytest.skip(
+                "no identity source: set COWORK_TEST_USER_ID + COWORK_TEST_ORG_ID, "
+                "or TEST_USER_MINT_URL, or TEST_USER_PROVISION_URL + TEST_USER_PROVISION_SECRET"
+            )
+        resp = httpx.post(
+            provision_url,
+            json={"suite": "cowork"},
+            headers={"X-Internal-Auth": secret, "User-Agent": BROWSER_UA},
+            timeout=60.0,
+        )
+        if resp.status_code != 201:
+            pytest.fail(f"provisioning the cowork test user failed: {resp.status_code} {resp.text}")
+        users = resp.json()["users"]
+        if not users:
+            pytest.fail(f"the cowork suite provisioned no users: {resp.text}")
+        user = users[0]
+
+    if not user.get("organization_id"):
+        pytest.fail(
+            f"auth returned no organization_id for {user.get('email')}; "
+            "the personal org is provisioned on first login and could not be resolved"
+        )
+    return user
+
+
+@pytest.fixture(scope="session")
+def identity() -> dict[str, str]:
+    """Provisioned once per run: minting is a Keycloak round trip per call."""
+    return _provision_identity()
+
+
+def _headers(identity: dict[str, str]) -> dict[str, str]:
     """Identity headers the gateway normally injects (see cowork/principal.py).
 
-    Sent by hand here because these tests bypass the gateway. Both must be
+    Sent by hand here because these tests bypass the gateway. The ids must be
     UUIDs or TrustedHeaderMiddleware rejects them.
     """
-    org_id = os.environ.get("COWORK_TEST_ORG_ID")
-    user_id = os.environ.get("COWORK_TEST_USER_ID")
-    if not (org_id and user_id):
-        pytest.skip("COWORK_TEST_ORG_ID and COWORK_TEST_USER_ID are required")
     headers = {
-        "X-Organization-Id": org_id,
-        "X-User-Id": user_id,
-        "X-User-Email": os.environ.get("COWORK_TEST_USER_EMAIL", "postdeploy@example.com"),
+        "X-Organization-Id": identity["organization_id"],
+        "X-User-Id": identity["user_id"],
+        "X-User-Email": identity.get("email", "postdeploy@example.com"),
     }
     token = os.environ.get("COWORK_AUTH_TOKEN")
     if token:
@@ -70,8 +151,8 @@ def _headers() -> dict[str, str]:
 
 
 @pytest.fixture
-def api():
-    with httpx.Client(base_url=_base_url(), headers=_headers(), timeout=30.0) as client:
+def api(identity):
+    with httpx.Client(base_url=_base_url(), headers=_headers(identity), timeout=30.0) as client:
         yield client
 
 
@@ -140,7 +221,7 @@ def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
     assert "response.created" in replayed, replayed
 
 
-def test_reconnect_works_on_the_other_replica(conversation_id):
+def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     """A turn started on one replica can be probed and tailed from another.
 
     Requires COWORK_BASE_URL_B pointing at a different pod, since the load
@@ -150,7 +231,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id):
     if not url_b:
         pytest.skip("COWORK_BASE_URL_B not set; needs a second replica to be meaningful")
 
-    headers = _headers()
+    headers = _headers(identity)
     with httpx.Client(base_url=_base_url(), headers=headers, timeout=30.0) as replica_a:
         with replica_a.stream(
             "POST", "/api/v1/responses/",

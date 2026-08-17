@@ -1,10 +1,11 @@
 #!make
-.PHONY: help test test/unit test/unit/coverage coverage/html
+.PHONY: help test test/unit test/integration test/unit/coverage coverage/html
 
 .DEFAULT_GOAL := help
 
 PYTEST := uv run python -m pytest
-TESTS := tests/
+TESTS := tests/ --ignore=tests/integration
+INTEGRATION_TESTS := tests/integration
 
 help: ## Display this help message
 	@echo "Usage: make [target]"
@@ -12,6 +13,7 @@ help: ## Display this help message
 	@echo "Available targets:"
 	@echo "  \033[36mtest/unit\033[0m              Run unit tests"
 	@echo "  \033[36mtest\033[0m                   Run unit tests (alias)"
+	@echo "  \033[36mtest/integration\033[0m       Run integration + post-deploy tests"
 	@echo "  \033[36mtest/unit/coverage\033[0m     Run unit tests with coverage"
 	@echo "  \033[36mcoverage/html\033[0m          Generate HTML coverage report"
 
@@ -19,6 +21,9 @@ test/unit: ## Run unit tests
 	$(PYTEST) $(TESTS)
 
 test: test/unit ## Run unit tests (alias)
+
+test/integration: ## Run integration + post-deploy tests (skip themselves without a target)
+	$(PYTEST) -v $(INTEGRATION_TESTS)
 
 test/unit/coverage: ## Run unit tests with coverage
 	$(PYTEST) --cov=cowork $(TESTS)
