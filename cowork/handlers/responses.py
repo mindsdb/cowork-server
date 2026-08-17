@@ -46,8 +46,7 @@ from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
-    MODEL_ACCESS_DENIED_CODE,
-    MODEL_DISABLED_CODE,
+    MODEL_UNAVAILABLE_CODES,
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
@@ -886,10 +885,15 @@ class ResponsesHandler:
                     extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
-            elif code in (MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE):
-                # Model-403: tell the client WHICH model was rejected so the card
-                # can name it ("Sonnet isn't included in your plan"). No
-                # provider_label — the ModelUnavailableCard doesn't render it, and
+            elif code in MODEL_UNAVAILABLE_CODES:
+                # The model was rejected (legacy 403 gate, or a 404 for a model
+                # the provider can't serve): tell the client WHICH model so the
+                # card can name it ("Sonnet isn't included in your plan",
+                # "deepseek-v4-flash isn't a model on this provider"). Naming it
+                # is the whole point for model_not_found — the id is usually one
+                # the user typed or pasted, and seeing it is what makes the
+                # mistake obvious (ENG-1358). No provider_label — the
+                # ModelUnavailableCard doesn't render it, and
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
