@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from cowork.services.publish import (
     PublisherUnavailable,
     activate_version as _activate_version,
+    desktop_publish_context as _desktop_context,
     list_publishable,
     list_versions as _list_versions,
     publish_artifact as _publish,
@@ -60,7 +61,15 @@ async def list_publishable_endpoint():
 @router.post("/")
 async def publish_artifact(req: _PublishBody):
     try:
-        return _publish(req.path, req.password, access=req.access.model_dump() if req.access else None)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path)
+        return _publish(
+            artifact,
+            artifacts_base=artifacts_base,
+            api_key=api_key,
+            publish_url=publish_url,
+            password=req.password,
+            access=req.access.model_dump() if req.access else None,
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -88,7 +97,11 @@ async def update_artifact(req: _UpdateBody):
 @router.delete("/")
 async def unpublish_artifact(path: str = Query(..., description="Absolute path to the published HTML artifact")):
     try:
-        return _unpublish(path)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(path)
+        return _unpublish(
+            artifact, artifacts_base=artifacts_base,
+            api_key=api_key, publish_url=publish_url,
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
