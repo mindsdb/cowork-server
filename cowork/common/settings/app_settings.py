@@ -505,13 +505,14 @@ class AppSettings(Settings):
         ),
     )
     identity_enforce: Literal["audit", "enforce"] = Field(
-        default="audit",
+        default="enforce",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
-            "Org-mode identity enforcement. 'audit' (default): requests without "
-            "identity headers are logged and allowed through. 'enforce': they "
-            "are rejected with 401. Flip to 'enforce' once the audit log shows "
-            "all legitimate identity-less callers are handled."
+            "Org-mode identity enforcement. 'enforce' (default): requests without "
+            "identity headers are rejected with 401. 'audit': they are logged and "
+            "allowed through instead — an explicit opt-out for local debugging "
+            "against org mode, not a rollout stage; every real deployment sets "
+            "'enforce' in its Helm values regardless of this default."
         ),
     )
     owner: str = Field(

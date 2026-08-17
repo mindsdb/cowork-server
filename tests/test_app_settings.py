@@ -144,8 +144,16 @@ def test_hermes_available_in_local_mode(monkeypatch):
         get_app_settings.cache_clear()
 
 
-def test_app_settings_identity_enforce_defaults_to_audit(monkeypatch):
+def test_app_settings_identity_enforce_defaults_to_enforce(monkeypatch):
     monkeypatch.delenv("COWORK_IDENTITY_ENFORCE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.identity_enforce == "enforce"
+
+
+def test_app_settings_identity_enforce_can_opt_into_audit(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
 
     settings = AppSettings(_env_file=None)
 
