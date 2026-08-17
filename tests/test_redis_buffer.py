@@ -136,4 +136,83 @@ async def test_refresh_on_a_stream_that_does_not_exist(fake_redis):
     reader = RedisStreamBuffer(conversation_id="never-ran", turn_id=1)
     await reader.refresh()
     assert reader.latest_seq == 0
-    assert reader.is_closed is False
+    # Closed, not open: see test_refresh_treats_a_missing_stream_as_closed.
+    assert reader.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_treats_a_missing_stream_as_closed(fake_redis):
+    """A truncated conversation has its buffers deleted while the turn index
+    entry lives on. Reporting the turn as open would have /in-flight answer
+    "running, seq 0" for a turn nobody is writing."""
+    reader = RedisStreamBuffer(conversation_id="gone", turn_id=1)
+    await reader.refresh()
+
+    assert reader.is_closed is True
+    assert reader.latest_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_tail_ends_a_turn_whose_writer_died(fake_redis, monkeypatch):
+    """No terminal record is coming if the replica writing it is gone, so every
+    reader would wait here forever."""
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 50)
+    writer = RedisStreamBuffer(conversation_id="orphan", turn_id=1)
+    await writer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+
+    reader = RedisStreamBuffer(conversation_id="orphan", turn_id=1)
+    seen = [rec async for rec in reader.tail(from_seq=0)]
+
+    assert seen[-1].is_terminal
+    assert seen[-1].type == "Interrupted"
+    # And it is on the stream, so a second reader stops too rather than
+    # waiting out the timeout again.
+    entries = await fake_redis.xrange(stream_key("orphan", 1))
+    assert [f["type"] for _id, f in entries] == ["sse", "Interrupted"]
+
+
+@pytest.mark.asyncio
+async def test_two_readers_of_a_dead_turn_write_one_terminal(fake_redis, monkeypatch):
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 50)
+    writer = RedisStreamBuffer(conversation_id="orphan2", turn_id=1)
+    await writer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+
+    first = RedisStreamBuffer(conversation_id="orphan2", turn_id=1)
+    second = RedisStreamBuffer(conversation_id="orphan2", turn_id=1)
+    await asyncio.gather(
+        _drain(first.tail(from_seq=0)),
+        _drain(second.tail(from_seq=0)),
+    )
+
+    entries = await fake_redis.xrange(stream_key("orphan2", 1))
+    terminals = [f for _id, f in entries if f["type"] == "Interrupted"]
+    assert len(terminals) == 1, entries
+
+
+async def _drain(agen):
+    return [rec async for rec in agen]
+
+
+@pytest.mark.asyncio
+async def test_a_live_turn_is_not_ended_by_a_quiet_stretch(fake_redis, monkeypatch):
+    """A long tool call legitimately produces nothing for minutes."""
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 3600)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 50)
+    writer = RedisStreamBuffer(conversation_id="alive", turn_id=1)
+    await writer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+
+    reader = RedisStreamBuffer(conversation_id="alive", turn_id=1)
+    seen = []
+
+    async def read():
+        async for rec in reader.tail(from_seq=0):
+            seen.append(rec)
+
+    task = asyncio.create_task(read())
+    await asyncio.sleep(0.05)
+    await writer.close("completed")
+    await asyncio.wait_for(task, timeout=5)
+
+    assert [r.type for r in seen] == ["sse", "Done"]

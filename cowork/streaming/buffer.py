@@ -217,6 +217,11 @@ class FileStreamBuffer(StreamBuffer):
 # transcript is in Postgres, so an hour past the last write is generous.
 REDIS_BUFFER_TTL_SECONDS = 3600
 
+# How long a live tail waits with no new record before it decides the turn is
+# not coming back. Generous: a long tool call legitimately produces nothing for
+# minutes, and the cost of being wrong is ending a turn the user was watching.
+REDIS_TAIL_IDLE_TIMEOUT_SECONDS = 300
+
 
 def stream_key(conversation_id: str, turn_id: int) -> str:
     return f"cowork:stream:{conversation_id}:{int(turn_id)}"
@@ -290,10 +295,22 @@ class RedisStreamBuffer(StreamBuffer):
                 return
         # Live. Handed off by entry id, so an append between the XRANGE above
         # and the first XREAD is picked up rather than skipped.
+        idle_ms = 0
         while True:
             resp = await r.xread({self.key: last_id}, block=self._BLOCK_MS)
             if not resp:
+                idle_ms += self._BLOCK_MS
+                if idle_ms >= REDIS_TAIL_IDLE_TIMEOUT_SECONDS * 1000:
+                    # Nothing is writing this turn. The producer replica died
+                    # mid-turn, so no terminal record is ever coming and every
+                    # reader would wait here forever. Write one, so this reader
+                    # and any other stop, and the client sees a failed turn
+                    # rather than a spinner.
+                    async for rec in self._terminate_as_orphan():
+                        yield rec
+                    return
                 continue
+            idle_ms = 0
             for _key, entries in resp:
                 for entry_id, fields in entries:
                     last_id = entry_id
@@ -312,13 +329,41 @@ class RedisStreamBuffer(StreamBuffer):
         """
         entries = await get_redis().xrevrange(self.key, count=1)
         if not entries:
+            # No stream: either it expired, or the conversation was truncated and
+            # its buffers deleted. Reporting it as open would have /in-flight
+            # answer "running, seq 0" for a turn nobody is writing.
             self._next_seq = 0
-            self._closed = False
+            self._closed = True
             return
         _entry_id, fields = entries[0]
         rec = self._record(fields)
         self._next_seq = rec.seq + 1
         self._closed = rec.is_terminal
+
+    async def _terminate_as_orphan(self) -> AsyncIterator[TurnRecord]:
+        """Close an abandoned turn, and yield the terminal record.
+
+        Written by whichever reader notices, since the replica that owned the
+        turn is the one that is gone. Idempotent by construction: the write is
+        conditional on the stream still having no terminal record, so a second
+        reader arriving at the same moment replays this one rather than adding
+        another.
+        """
+        logger.warning(
+            "Turn buffer %s went quiet for %ss with no terminal record; ending it",
+            self.key, REDIS_TAIL_IDLE_TIMEOUT_SECONDS,
+        )
+        r = get_redis()
+        entries = await r.xrevrange(self.key, count=1)
+        if entries and self._record(entries[0][1]).is_terminal:
+            yield self._record(entries[0][1])
+            return
+        self._next_seq = (self._record(entries[0][1]).seq + 1) if entries else 0
+        self._closed = False   # so close() writes rather than returning early
+        await self.close("interrupted", {"error": "the worker running this turn stopped responding"})
+        latest = await r.xrevrange(self.key, count=1)
+        if latest:
+            yield self._record(latest[0][1])
 
     @property
     def latest_seq(self) -> int:

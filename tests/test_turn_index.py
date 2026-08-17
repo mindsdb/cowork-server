@@ -73,3 +73,36 @@ async def test_list_returns_every_recorded_turn(fake_redis):
     turns = {t["conversation_id"]: t for t in await turn_index.list_turns()}
     assert set(turns) == {"c1", "c2"}
     assert turns["c2"]["org_id"] == "o2"
+
+
+def test_discard_conversation_forgets_the_turn(monkeypatch, tmp_path):
+    """Truncating a conversation deletes its buffers. Leaving the index entry
+    behind would have /in-flight keep naming a turn with nothing behind it."""
+    import fakeredis
+    from fakeredis import FakeServer
+
+    from cowork.streaming import backend as backend_mod
+    from cowork.streaming import discard_conversation
+
+    server = FakeServer()
+    sync_client = fakeredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(turn_index, "get_sync_redis", lambda: sync_client)
+    monkeypatch.setattr(backend_mod, "get_sync_redis", lambda: sync_client)
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+
+    sync_client.hset("cowork:turn:c1", mapping={"turn_id": "1", "correlation_id": "corr-1"})
+    sync_client.sadd("cowork:turns", "c1")
+
+    discard_conversation("c1")
+
+    assert sync_client.exists("cowork:turn:c1") == 0
+    assert sync_client.sismember("cowork:turns", "c1") == 0
+
+
+def test_forget_sync_survives_a_redis_that_is_down(monkeypatch):
+    """Conversation delete is best effort and must not fail on this."""
+    def boom():
+        raise ConnectionError("redis down")
+    monkeypatch.setattr(turn_index, "get_sync_redis", boom)
+
+    turn_index.forget_turn_sync("c1")
