@@ -247,6 +247,13 @@ def _content_mtime(folder: Path) -> int:
         return 0
 
 
+# Public alias: task_objects and the autopublish reconciler need this exact
+# basis for their "changed since publish" gate. Keeping one implementation means
+# the gate, the `modified` badge, and the card's cache-bust token can never
+# disagree.
+content_mtime = _content_mtime
+
+
 def _published_url_for(folder: Path, primary: Path | None) -> str:
     if primary is None:
         return ""
@@ -578,13 +585,24 @@ def reveal_in_file_manager(path: Path) -> None:
 
 # ─── Public API ───────────────────────────────────────────────────
 
-def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
+def card_for_folder(
+    folder: Path,
+    idx: int = 0,
+    *,
+    project_id: str | None = None,
+    project_name: str = "",
+) -> dict | None:
     """The artifact card for a single folder, or ``None`` if its metadata is
     unreadable. This is the canonical card shape — used both by the artifacts
     list and by the inline chat cards (see services.task_objects), so the two
     can never disagree about how an artifact is named, typed, or opened.
 
-    `idx` only selects a background gradient (cosmetic)."""
+    `idx` only selects a background gradient (cosmetic).
+
+    `project_id`/`project_name` identify the owning project. The client needs
+    them to address an artifact by project + slug: in an org deployment the
+    artifacts list spans every project of the organization, so a card cannot be
+    tied to a project by inspecting its path."""
     meta = _load_metadata(folder)
     if meta is None:
         return None
@@ -604,7 +622,9 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
     # Max mtime across the artifact's content files — a precise
     # "content changed" signal for the renderer's preview viewer to
     # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
-    content_mtime = _content_mtime(folder)
+    # Named `mtime_seconds` so it does not shadow the module-level
+    # `content_mtime` alias other services import.
+    mtime_seconds = _content_mtime(folder)
 
     return {
         "id": meta.get("id") or folder.name,
@@ -614,16 +634,18 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
         "type": artifact_type,
         "kind": kind,
         "ext": primary_ext,
-        "updated": _human_mtime(content_mtime),
-        "mtime": content_mtime,
+        "updated": _human_mtime(mtime_seconds),
+        "mtime": mtime_seconds,
         "live": is_live,
         "bg": BG_CYCLE[idx % len(BG_CYCLE)],
         "fileCount": len(files),
         "folder": str(folder),
         "path": primary_path,
         "primary": meta.get("primary") or None,
+        "projectId": project_id,
+        "projectName": project_name,
         "publishedUrl": _published_url_for(folder, primary),
-        "modified": _is_modified(folder, primary, content_mtime),
+        "modified": _is_modified(folder, primary, mtime_seconds),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
         # is the plaintext, returned only to the owner's own session.
         **_published_access_for(folder, primary),

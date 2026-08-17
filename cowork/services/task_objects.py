@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import UUID
 
 
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
@@ -214,76 +214,187 @@ def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     }
 
 
-def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts_base, before: set[str]) -> list[dict]:
-    """End-of-turn artifact handling, from a SINGLE artifacts-dir diff.
+def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
+    """Pre-turn snapshot: folder names PLUS each one's content mtime.
 
-    For every artifact folder that appeared during the turn this:
-      • indexes it as owned by this conversation (so it relocates with the
-        task and shows in the artifacts panel), and
-      • builds its inline-chat card payload.
+    Names alone only reveal artifacts the turn CREATED. The autopublish
+    reconciler also needs the ones it EDITED, and those are invisible to a name
+    diff, so the snapshot carries `content_mtime` per slug and the diff compares
+    both.
 
-    Because both come from the same diff and the same per-folder card builder
-    that the artifacts list uses (`services.artifacts.card_for_folder`), the
-    inline cards, the artifacts panel, and the move/index can never disagree
-    about what a turn produced or how an artifact opens.
-
-    Returns the card payloads (``[]`` when nothing new). Best-effort: indexing
-    and card-building are each guarded, so neither can break a turn.
+    Granularity is whole seconds (`content_mtime` truncates), so an artifact
+    edited within the same second as this snapshot is not reported as touched and
+    falls through to the reconciler's self-heal phase instead — published, just a
+    turn later.
     """
-    after = snapshot_artifact_slugs(artifacts_base)
-    new = sorted(after - set(before or ()))
-    if not new:
-        return []
+    from cowork.services.artifacts import content_mtime
 
-    # conversation_id/project_id are captured by the caller while the row is
-    # unambiguously attached (not read here, to avoid depending on the session
-    # still being live/unexpired in this end-of-turn path). Scope recovery
-    # DOES need the live session, so it stays here (agent-agnostic boundary):
-    # re-wrap with the ORIGINAL scope the conversation was loaded under, never
-    # one derived from the row. No session (detached/fake) → None → local
-    # behavior in local mode, logged-and-skipped in org mode (fail-safe).
+    base = Path(artifacts_base)
+    slugs = snapshot_artifact_slugs(base)
+    mtimes: dict[str, int] = {}
+    for slug in slugs:
+        try:
+            mtimes[slug] = content_mtime(base / slug)
+        except OSError:
+            mtimes[slug] = 0
+    return slugs, mtimes
+
+
+def _recover_turn_scope(conversation) -> TenantScope | None:
+    """The tenant scope for post-turn work, or None when there is none.
+
+    Primary source is the scope the conversation's session was wrapped with —
+    the ORIGINAL authorization context, never one derived from row data.
+    Fallback is the ambient scope bound at the turn boundary
+    (`use_settings_scope` in handlers.responses), which survives a detached or
+    expired session. Returning None is the fail-safe: callers skip their work
+    rather than inventing a tenant.
+    """
     from sqlalchemy.orm import object_session
+
     try:
         _sess = object_session(conversation)
     except Exception:
         _sess = None
     scope = scope_of_session(_sess) if _sess is not None else None
+    if scope is not None:
+        return scope
+    try:
+        from cowork.common.settings.user_settings import current_settings_scope
 
+        return current_settings_scope()
+    except Exception:
+        return None
+
+
+def _index_new_slugs(conversation_id, project_id, slugs: list[str], scope: TenantScope | None) -> None:
+    """Attribute freshly appeared artifacts to this conversation. Best-effort."""
     try:
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.db.session import get_engine, get_session_factory
 
         if scope is None:
-            # Never invent a scope: local mode passes through; org mode
-            # without the caller's scope skips indexing (best-effort path).
+            # Never invent a scope: local mode passes through; org mode without
+            # the caller's scope skips indexing (fail-safe).
             if get_app_settings().tenancy_mode == "org":
                 logger.warning(
                     "artifact indexing skipped: no tenant scope provided in org mode (conversation %s)",
                     conversation_id,
                 )
-                raise RuntimeError("no tenant scope for artifact indexing")
+                return
             scope = LOCAL_SCOPE
         factory = get_session_factory(get_engine(get_app_settings().database.uri))
         with factory() as session:
             svc = TaskObjectService(ScopedSession(session, scope))
-            for slug in new:
+            for slug in slugs:
                 svc.index_artifact(conversation_id, project_id, slug)
     except Exception:
         logger.warning("Could not index artifacts created this turn", exc_info=True)
 
+
+def index_turn_artifacts(
+    conversation,
+    conversation_id,
+    project_id,
+    artifacts_base,
+    before: set[str],
+    before_mtimes: dict[str, int],
+) -> tuple[list[str], set[str], TenantScope | None]:
+    """End-of-turn artifact bookkeeping from a SINGLE artifacts-dir diff.
+
+    Returns (new_slugs, touched_slugs, scope):
+      • new_slugs — folders that appeared during the turn; each is indexed as
+        owned by this conversation so it relocates with the task and shows in
+        the artifacts panel;
+      • touched_slugs — new_slugs plus every pre-existing slug whose content
+        mtime grew, i.e. what this turn actually wrote. The autopublish
+        reconciler publishes these first;
+      • scope — the tenant scope for post-turn work (see _recover_turn_scope).
+
+    conversation_id/project_id are captured by the caller while the row is
+    unambiguously attached (not read here, to avoid depending on the session
+    still being live/unexpired in this end-of-turn path).
+
+    Never raises. This runs in a turn's `finally`, so an exception here would
+    replace the turn's real outcome; on any internal failure it degrades to
+    ([], set(), None) and the next turn picks the work up.
+    """
+    try:
+        from cowork.services.artifacts import content_mtime
+
+        base = Path(artifacts_base)
+        after = snapshot_artifact_slugs(base)
+        new = sorted(after - set(before or ()))
+        touched = set(new)
+        for slug in after:
+            previous = (before_mtimes or {}).get(slug)
+            if previous is None:
+                continue  # appeared this turn — already in `new`
+            try:
+                if content_mtime(base / slug) > previous:
+                    touched.add(slug)
+            except OSError:
+                continue
+        scope = _recover_turn_scope(conversation)
+        if new:
+            _index_new_slugs(conversation_id, project_id, new, scope)
+        return new, touched, scope
+    except Exception:
+        logger.warning("index_turn_artifacts failed", exc_info=True)
+        return [], set(), None
+
+
+def cards_for_slugs(
+    artifacts_base,
+    slugs: list[str],
+    *,
+    project_id: str | None = None,
+    project_name: str = "",
+) -> list[dict]:
+    """Inline-chat card payloads for the given slugs, order preserved.
+
+    Uses the same per-folder card builder as the artifacts list
+    (`services.artifacts.card_for_folder`), so inline cards and the panel can
+    never disagree about what a turn produced or how an artifact opens.
+
+    `project_id`/`project_name` are passed through to the card because that is
+    how the client addresses an artifact in org mode (project + slug); a card
+    without them would fall back to the path-based endpoints, which org mode
+    fails closed. Best-effort per slug: an unreadable artifact is skipped.
+    """
     from cowork.services.artifacts import card_for_folder
 
     base = Path(artifacts_base)
     cards: list[dict] = []
-    for slug in new:
+    for slug in slugs:
         try:
-            card = card_for_folder(base / slug)
+            card = card_for_folder(
+                base / slug, len(cards),
+                project_id=project_id, project_name=project_name,
+            )
         except Exception:
             logger.warning("Could not build inline card for artifact %r", slug, exc_info=True)
             continue
         if card is not None:
             cards.append(card)
     return cards
+
+
+def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts_base, before: set[str]) -> list[dict]:
+    """Index this turn's new artifacts and return their cards.
+
+    Kept as the pre-split entry point for harnesses that do not participate in
+    autopublish (hermes_harness sets `supports_org_mode = False`). Callers that
+    need `touched` or the tenant scope use `index_turn_artifacts` directly.
+
+    `before_mtimes` is empty here on purpose: without a pre-turn mtime snapshot
+    `touched` degenerates to "the new slugs", which is all this entry point's
+    callers need — they do not publish.
+    """
+    new, _touched, _scope = index_turn_artifacts(
+        conversation, conversation_id, project_id, artifacts_base, before, {},
+    )
+    return cards_for_slugs(artifacts_base, new)
 
 
 # ── skill-draft attribution ────────────────────────────────────────────────
