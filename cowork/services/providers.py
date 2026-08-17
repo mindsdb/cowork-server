@@ -355,6 +355,167 @@ async def fetch_org_model_catalog(
     return await fetch_minds_models(url, bearer_token, force_refresh=refresh, tenant_key=org_id)
 
 
+# ── Model-value validation on write (ENG-1358) ───────────────────────
+#
+# WRITER INVENTORY — every path that can put a model id into the settings DB.
+# Recorded here because the ENG-597 lesson is that a check added to one writer is
+# defeated by the writer nobody enumerated; if you add a writer, it belongs on
+# this list and behind this gate.
+#
+#   GATED (both call `_reject_unservable_models` in api/v1/endpoints/settings.py):
+#     1. PUT /api/v1/settings/{key}   → SettingService.upsert_setting
+#     2. PUT /api/v1/settings/        → SettingService.save_all
+#   Every product surface that writes a model does so OVER HTTP, so it travels
+#   one of those two (see the scope limit on _reject_unservable_models — the
+#   in-process service methods are not gated):
+#     - the Settings model picker (cowork SettingsView.jsx) — values already come
+#       from the live catalog, so it was never the leak. Note it saves provider +
+#       credential + model in ONE bulk PUT, which is why the gate must resolve
+#       against pending state;
+#     - desktop onboarding's `syncModelsToDb` (cowork syncSettings.ts), which
+#       replays `ANTON_*_MODEL` lines from .env VERBATIM — unvalidated until now,
+#       and the most plausible origin of the ENG-1358 report;
+#     - mindsdb/cowork-enterprise `scripts/docker-entrypoint.py`
+#       (`sync_settings_when_healthy`) — the container's own Python writer, NOT
+#       the Electron `syncSettings.ts`, which ships unused there. It PUTs both
+#       models from `ANTON_*_MODEL` on first boot and swallows failures;
+#     - cowork_evals `src/eval_service/provisioning/cowork_admin.py`
+#       (`apply_runtime_settings`),
+#       which raises on any >=400 — every shipped run spec pins a `latest:` alias,
+#       hence the legacy-prefix allowance in model_value_rejection;
+#     - cowork-kinaxis-preview's divergent inline `syncOnboardingModels`;
+#     - anything hand-rolled (curl, scripts, a console surface).
+#
+#   NOT GATED, because they cannot carry a model key at all — the ENG-739
+#   carve-out keeps planning/coding/router models out of `SETTING_ENV_ALIASES`,
+#   so a bulk .env sync can never re-pin a picker choice:
+#     3. POST /api/v1/settings/raw    → SettingService.bulk_upsert
+#     4. cowork/migrations.py (first-boot .env→DB seed)
+#     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
+#   Two more write settings but only their own fixed key: channels.py
+#   (`channels_harness`) and the `minds_model_enabled` refresh in settings.py.
+#
+#   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
+#   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its
+#   equivalent bug).
+
+#: The settings whose VALUE names a model id. `UserSettings` types these as bare
+#: `str | None`, so the settings API validates the key and the type and nothing
+#: else — an id no provider can serve saves cleanly and only fails much later, at
+#: turn time. Router model is included: same field shape, same failure.
+MODEL_VALUE_SETTINGS = frozenset({"planning_model", "coding_model", "router_model"})
+
+
+#: Deprecated-but-live alias namespace. MindsHub aliases are bare (``sonnet``),
+#: but the gateway still RESOLVES a ``latest:`` prefix (app_settings.py:23), and
+#: minds-auth.ts deliberately preserves such a pin as a user choice. `/v1/models`
+#: is a listing, not the servable set, so a strict membership test would 400 an
+#: id prod serves today — including every shipped cowork_evals run spec.
+#: Stripping the prefix and re-testing keeps `latest:nonsense` rejected, which a
+#: bare "starts with latest:" allowance would not.
+_LEGACY_MODEL_PREFIX = "latest:"
+
+
+async def model_value_rejection(
+    settings: UserSettings,
+    key: str,
+    value: str,
+    *,
+    org_id: str | None = None,
+    bearer_token: str = "",
+) -> str | None:
+    """Why ``value`` is not a servable model for ``key``, or None to allow it.
+
+    ENG-1358: a model id that MindsHub cannot serve could be written into
+    `planning_model` / `coding_model` and nothing caught it — not on write, not
+    by the (deliberately model-blind) connection test, and at turn time only as
+    a 404. This is the write-time check.
+
+    ``settings`` must be the state the write PRODUCES (``load_pending``), not the
+    stored one — see that method.
+
+    In org (hosted) tenancy no MindsHub key is stored at all (a per-turn key is
+    minted, ``user_settings._has_key``), so the catalog comes from the operator
+    endpoint keyed by ``org_id`` + the caller's own bearer, exactly as
+    ``recommended_models`` does. Without those the org path has no evidence and
+    allows the write.
+
+    **Soft-fail is the whole contract.** This returns None — allow the write —
+    for every case except "we hold a real catalog and this id is definitively
+    not in it":
+
+    - not a model-valued setting, or an empty value (clearing the pin);
+    - the target provider isn't MindsHub (a BYOK/custom endpoint has its own
+      catalog, and Anthropic publishes no `/v1/models` at all);
+    - no credentials to fetch a catalog with — onboarding writes a model before
+      they exist, and blocking that would deadlock a fresh install;
+    - the catalog fetch failed, timed out, or came back empty.
+
+    An offline or degraded MindsHub must never stop someone changing settings,
+    so every failure mode above resolves to "allow". The fetch is the cached one
+    the picker already uses (TTL + negative TTL), so the common case costs no
+    network call, and a MindsHub outage costs one timeout, once.
+
+    Never put the API key — or the raw catalog — in the returned string: it is
+    surfaced to the client as a 400 body.
+    """
+    if key not in MODEL_VALUE_SETTINGS or not value or not value.strip():
+        return None
+
+    # Which provider will actually serve this model. Only MindsHub has a catalog
+    # we can check; anything else is the user's own endpoint.
+    provider_attr = {
+        "planning_model": "resolved_planning_provider",
+        "coding_model": "resolved_coding_provider",
+        "router_model": "resolved_router_provider",
+    }[key]
+    try:
+        from cowork.common.settings.user_settings import Provider
+
+        if getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
+            return None
+        stored_key = settings.minds_api_key
+        api_key = stored_key.get_secret_value() if stored_key is not None else ""
+    except Exception:
+        # Settings shapes vary across versions/scopes; a resolution failure is
+        # not grounds to block a write.
+        logger.debug("model validation: could not resolve provider for %s", key, exc_info=True)
+        return None
+
+    try:
+        if org_id and bearer_token:
+            listing = await fetch_org_model_catalog(
+                org_id=org_id, bearer_token=bearer_token
+            )
+        elif api_key and settings.minds_url:
+            listing = await fetch_minds_models(settings.minds_url, api_key)
+        else:
+            return None
+    except Exception:
+        # The fetchers swallow their own errors, but never let an unexpected one
+        # turn into a failed settings save.
+        logger.warning("model validation: catalog fetch failed for %s — allowing write", key)
+        return None
+
+    # ids is None on any failure and the list is empty for a gateway that serves
+    # no chat models; in both cases we hold no evidence, so we allow.
+    if not listing.ids:
+        return None
+    if value in listing.ids:
+        return None
+    if value.startswith(_LEGACY_MODEL_PREFIX) and (
+        value[len(_LEGACY_MODEL_PREFIX):] in listing.ids
+    ):
+        return None
+
+    # Definitive: a real catalog that does not contain this id.
+    known = ", ".join(sorted(listing.ids)[:5])
+    return (
+        f"'{value}' is not a model this provider offers. "
+        f"Pick one from the model list in Settings (for example: {known})."
+    )
+
+
 # ── Config readiness ─────────────────────────────────────────────────
 
 
@@ -731,17 +892,36 @@ def build_llm_client():
     except (ValueError, TypeError):
         router_kw = {}
 
+    # A reasoning-effort level is chosen in the Settings UI for a specific
+    # model. When resolution swaps the model out from under the stored choice
+    # (provider switch, or a wallet-locked aux model falling back to an
+    # affordable one — ENG-1632), the stored effort must not travel with it:
+    # the substitute may not advertise that level and the gateway 400s the
+    # call. Same-model resolution keeps the effort.
+    def _effort_for(stored: str | None, resolved: str | None, effort: str | None):
+        return effort if effort and stored == resolved else None
+
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at
     # a keyless provider — the same resolution config_status reports, so the
     # readiness gate never claims "ready" for a client that would then throw.
     return LLMClient(
         planning_provider=_make_provider(
-            settings.resolved_planning_provider, settings.planning_reasoning_effort
+            settings.resolved_planning_provider,
+            _effort_for(
+                settings.planning_model,
+                settings.resolved_planning_model,
+                settings.planning_reasoning_effort,
+            ),
         ),
         planning_model=settings.resolved_planning_model,
         coding_provider=_make_provider(
-            settings.resolved_coding_provider, settings.coding_reasoning_effort
+            settings.resolved_coding_provider,
+            _effort_for(
+                settings.coding_model,
+                settings.resolved_coding_model,
+                settings.coding_reasoning_effort,
+            ),
         ),
         coding_model=settings.resolved_coding_model,
         **router_kw,
