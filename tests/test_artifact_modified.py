@@ -68,14 +68,14 @@ def test_compute_publish_md5_matches_zip_md5(tmp_path: Path):
     # Reference md5: exactly what the lambda stores — md5 of the zip bytes
     # anton produces for the primary file.
     expected = hashlib.md5(_zip_html(root / "index.html")).hexdigest()
-    with _patch_scan(tmp_path):
-        got = publish_mod.compute_publish_md5(str(root))
+    got = publish_mod.compute_publish_md5(root, artifacts_base=tmp_path)
     assert got == expected
 
 
 def test_compute_publish_md5_unresolvable_returns_none(tmp_path: Path):
-    # No _patch_scan -> resolve_artifact_path raises -> None (can't tell).
-    got = publish_mod.compute_publish_md5(str(tmp_path / "nope"))
+    # A folder that isn't an artifact -> the target resolver raises -> None
+    # ("can't tell"), so no caller ever flags it as modified on a guess.
+    got = publish_mod.compute_publish_md5(tmp_path / "nope", artifacts_base=tmp_path)
     assert got is None
 
 

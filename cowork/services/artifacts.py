@@ -298,7 +298,10 @@ def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool
     # circular import (mirrors _unpublish_folder below).
     from cowork.services.publish import compute_publish_md5
 
-    current_md5 = compute_publish_md5(str(folder))
+    # `folder.parent` IS the artifacts root: artifacts always live at
+    # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
+    # mode, where the module-level FS scan finds no roots at all.
+    current_md5 = compute_publish_md5(folder, artifacts_base=folder.parent)
     if current_md5 is None:
         return False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):
