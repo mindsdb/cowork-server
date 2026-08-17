@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import get_redis, get_sync_redis
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,21 @@ async def forget_turn(conversation_id: str) -> None:
     r = get_redis()
     await r.delete(_turn_key(conversation_id))
     await r.srem(_TURNS_SET, conversation_id)
+
+
+def forget_turn_sync(conversation_id: str) -> None:
+    """Blocking ``forget_turn``, for callers with no event loop.
+
+    Conversation delete runs in a threadpool thread (the endpoint is a sync
+    ``def``), and leaving the entry behind would have /in-flight keep naming a
+    turn whose buffers were just deleted.
+    """
+    try:
+        r = get_sync_redis()
+        r.delete(_turn_key(conversation_id))
+        r.srem(_TURNS_SET, conversation_id)
+    except Exception:
+        logger.warning("Could not forget the turn index entry for %s", conversation_id, exc_info=True)
 
 
 async def list_turns() -> list[dict]:

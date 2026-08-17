@@ -127,12 +127,6 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     settings = TurnQueueSettings()
     r = get_redis()
     corr = _new_correlation_id()
-    # Any replica can now find this turn: its turn_id to open the buffer, its
-    # correlation_id to cancel it, its org to authorize the caller.
-    await record_turn(
-        conversation_id, turn_id=turn_id, correlation_id=corr,
-        org_id=org_id, user_id=user_id, client=r,
-    )
     # A flag left by an earlier turn would cancel this one on its first line.
     await r.delete(f"cowork:cancel:{corr}")
     reply_stream = f"scratchpad:reply:{conversation_id}"
@@ -178,6 +172,16 @@ async def produce_remote_turn(*, conversation_id: str, org_id: str | None,
     if harness_id:
         created["harness"] = harness_id
     await buffer.append("sse", {"sse": _sse("response.created", created)})
+    # After the first append, never before: a reader treats a missing stream as
+    # a finished turn, so an index entry pointing at a stream that does not
+    # exist yet would read as already over.
+    #
+    # What it buys: any replica can find this turn, its turn_id to open the
+    # buffer, its correlation_id to cancel it, its org to authorize the caller.
+    await record_turn(
+        conversation_id, turn_id=turn_id, correlation_id=corr,
+        org_id=org_id, user_id=user_id, client=r,
+    )
 
     last_id = "0-0"
     idle_timeout = settings.reply_idle_timeout_seconds
