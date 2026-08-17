@@ -63,6 +63,9 @@ class TurnReply(BaseModel):
     """Mirror of scratchpad-controller ScratchpadReplyPayload (reply cowork consumes)."""
 
     correlation_id: str
+    # Must accept every kind the controller can publish: the reply loop validates
+    # each entry unguarded, so a missing kind fails the turn rather than being
+    # ignored. Kinds this build does nothing with are dropped further down.
     kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
-                  "turn_memory", "turn_completed", "turn_failed"]
+                  "turn_memory", "turn_skill", "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
