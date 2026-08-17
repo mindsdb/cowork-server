@@ -102,18 +102,25 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _resolve_publish_target(artifact: Path) -> tuple[Path, Path, str, bool]:
+def _resolve_publish_target(
+    artifact: Path, container_dirs: list[Path] | None = None
+) -> tuple[Path, Path, str, bool]:
     """Decide what to publish + where `.published.json` lives + its key.
 
     Thin wrapper over the single source of truth in anton
     (`anton.publish_access.resolve_publish_target`); cowork supplies its own
-    container dirs (`_scan_artifact_dirs()`) so the metadata-climb is bounded
-    to the registered `.anton/artifacts/` roots. Keeping this wrapper preserves
-    the existing cowork call sites and signature.
+    container dirs so the metadata-climb is bounded to `.anton/artifacts/` roots.
+
+    `container_dirs` MUST be passed on the org path: the default
+    (`_scan_artifact_dirs()`) only sees the desktop layout, because org projects
+    live one level deeper under `<root>/<org_id>/`, and it would return nothing
+    there. Omitting it keeps the desktop behavior unchanged.
 
     Returns (publish_target, published_dir, published_key, is_fullstack).
     """
-    return _anton_resolve_publish_target(artifact, _scan_artifact_dirs())
+    return _anton_resolve_publish_target(
+        artifact, container_dirs if container_dirs is not None else _scan_artifact_dirs()
+    )
 
 
 def _resolve_publish_endpoint(settings) -> tuple[str, str]:
@@ -390,8 +397,8 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
     }
 
 
-def compute_publish_md5(raw_path: str) -> str | None:
-    """Recompute the md5 of the publish bundle for an artifact path.
+def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
+    """Recompute the md5 of the publish bundle for an artifact.
 
     Matches the `last_md5` the lambda stores at publish time (md5 of the zip
     bytes `anton.publisher` produces). Mirrors `publish_artifact`'s source
@@ -399,12 +406,19 @@ def compute_publish_md5(raw_path: str) -> str | None:
     static publishes the single primary file; fullstack publishes the
     artifact directory.
 
+    `artifact` is the folder (or the single legacy loose file) and
+    `artifacts_base` is its container root — both supplied by the caller, so this
+    works identically on desktop and on the org layout the module-level FS scan
+    cannot see. Without that, the "changed since publish" gate would silently
+    never fire in an org deployment.
+
     Returns None when the artifact can't be resolved or bundled — the caller
     treats None as "can't tell" and does not flag the artifact as modified.
     """
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
-        publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(artifact)
+        publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(
+            artifact, container_dirs=[artifacts_base]
+        )
     except Exception:
         return None
     if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
