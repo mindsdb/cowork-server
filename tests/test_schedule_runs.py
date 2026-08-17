@@ -211,7 +211,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
@@ -348,7 +348,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
@@ -463,7 +463,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
@@ -490,6 +490,93 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s = get_open_session()
         ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
         s.close()
+
+
+def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch):
+    """A schedule's own org_id/created_by — stamped when a real user created it
+    through the request-scoped path — is what fires the turn in org mode. No
+    live request principal exists at cron time, so the schedule row is the only
+    source of identity."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import TenantScope
+    from cowork.models.conversation import Conversation
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.principal import Principal
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+
+    org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    created_by = "u-schedule-owner"
+
+    # SYSTEM_SCOPE never auto-stamps or filters, so it can plant rows with an
+    # explicit org_id/created_by exactly as if a real org-mode user created
+    # them. The project must actually belong to the org — an org-scoped
+    # conversation create can't anchor onto the local/desktop default project.
+    session = get_open_session()
+    project = Project(name="org project", path="/org-project", org_id=org_id)
+    ScopedSession(session, SYSTEM_SCOPE).add(project)
+    session.commit()
+    session.refresh(project)
+
+    schedule = Schedule(
+        title="org schedule",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        project_id=project.id,
+        org_id=org_id,
+        created_by=created_by,
+    )
+    ScopedSession(session, SYSTEM_SCOPE).add(schedule)
+    session.commit()
+    session.refresh(schedule)
+    schedule_id = schedule.id
+    session.close()
+
+    seen: dict = {}
+
+    class FakeHandler:
+        def __init__(self, session, principal=None):
+            seen["principal"] = principal
+
+        async def handle(self, request):
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+
+        assert seen["principal"] == Principal(user_id=created_by, org_id=org_id)
+
+        check = get_open_session()
+        org_scope = TenantScope(org_mode=True, org_id=org_id, user_id=created_by)
+        run = ScheduleRunService(ScopedSession(check, org_scope)).list_runs(schedule_id)[0]
+        conversation = ScopedSession(check, org_scope).get(Conversation, run.conversation_id)
+        assert conversation is not None
+        assert conversation.org_id == org_id
+        check.close()
+    finally:
+        s = get_open_session()
+        scoped_s = ScopedSession(s, SYSTEM_SCOPE)
+        ScheduleService(scoped_s).delete_schedule(schedule_id)
+        project_row = scoped_s.get(Project, project.id)
+        if project_row is not None:
+            scoped_s.delete(project_row)
+            s.commit()
+        s.close()
+        monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+        get_app_settings.cache_clear()
 
 
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.

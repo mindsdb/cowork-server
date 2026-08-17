@@ -71,18 +71,41 @@ def get_tenant_scope(request: Request) -> TenantScope:
 
 
 def scope_for_background_context() -> TenantScope:
-    """Scope for code with no request principal (scheduler, channels).
+    """Scope for code with no request principal and no owning row to derive one
+    from (channels: an inbound webhook has no per-org routing yet, so there is
+    nothing to build a service principal out of).
 
-    Local mode → LOCAL_SCOPE (today's behavior). Org mode → fail closed:
-    background work needs a service principal (deferred to the service-identity
-    ticket), and org mode must never silently write unscoped rows that users
-    can't see. Fail loud instead of creating invisible data.
+    Local mode → LOCAL_SCOPE (today's behavior). Org mode → fail closed: this
+    caller has no service principal available (channels are 501-gated in org
+    mode for the same reason), and org mode must never silently write unscoped
+    rows that users can't see. Fail loud instead of creating invisible data.
+    See `service_principal_for` for callers that DO have an owning row.
     """
     if get_app_settings().tenancy_mode != "org":
         return LOCAL_SCOPE
     raise MissingTenantScopeError(
         "background conversation creation requires a service principal (not yet implemented in org mode)"
     )
+
+
+def service_principal_for(org_id: str | None, user_id: str | None) -> Principal | None:
+    """Principal for a background job driven by a stored row's own org_id/created_by
+    (e.g. a fired Schedule) — there is no inbound request or gateway header to build
+    one from, but the row already carries who owns it from when it was created
+    through the normal request-scoped path.
+
+    Local mode → None (nothing to scope). Org mode → Principal from the row's own
+    identity, or fail closed if the row predates org stamping (a legacy/local row
+    with no org_id or created_by) — same "fail loud, never invisible" rule as
+    `scope_for_background_context`.
+    """
+    if get_app_settings().tenancy_mode != "org":
+        return None
+    if not org_id or not user_id:
+        raise MissingTenantScopeError(
+            "background job's row has no org_id/created_by to build a service principal from"
+        )
+    return Principal(user_id=user_id, org_id=org_id)
 
 
 def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:

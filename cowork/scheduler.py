@@ -113,14 +113,18 @@ async def execute_schedule(
     final_status: RunStatus | None = None
     try:
         schedule = schedule_service.get_schedule(schedule_id)
+        # No live request principal exists at cron/manual-run time; the schedule's
+        # own org_id/created_by (stamped when a real user created it) is who this
+        # run acts as. Fails closed in org mode if the schedule predates stamping.
+        from cowork.db.scoped import service_principal_for
+        principal = service_principal_for(schedule.org_id, schedule.created_by)
 
         if conversation_id is None:
             # Conversation not pre-created by the caller (e.g. cron tick).
-            from cowork.db.scoped import scope_for_background_context
+            from cowork.db.scoped import scope_from_principal, unsafe_unscoped_session
             from cowork.services.conversations import ConversationService
-            # Fail-closed check: org mode raises until service principals land.
-            scope_for_background_context()
-            conversation = ConversationService(session).create_conversation(
+            conv_session = ScopedSession(unsafe_unscoped_session(session), scope_from_principal(principal))
+            conversation = ConversationService(conv_session).create_conversation(
                 topic=schedule.title,
                 project_id=schedule.project_id,
             )
@@ -148,7 +152,9 @@ async def execute_schedule(
             # ResponsesHandler takes a RAW session (it wraps its own scope from
             # the principal); hand it the underlying session, not our scoped one.
             from cowork.db.scoped import unsafe_unscoped_session
-            stream = await ResponsesHandler(unsafe_unscoped_session(session)).handle(request)
+            stream = await ResponsesHandler(
+                unsafe_unscoped_session(session), principal=principal
+            ).handle(request)
             async for _ in stream:
                 pass
 
