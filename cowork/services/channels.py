@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sqlmodel import Session, select
+
 from cowork.channels.plugin import ChannelPlugin
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
@@ -26,6 +28,24 @@ def _cred_key(channel_type: str, field: str) -> str:
 
 class UnknownChannelError(Exception):
     """Raised when a channel_type has no registered plugin (→ 404 at the edge)."""
+
+
+def resolve_installation_by_external_account(
+    session: Session, channel_type: str, external_account_id: str
+) -> ChannelInstallation | None:
+    """Which installation claims this platform account (Slack team_id, Discord
+    guild_id, ...), looked up BEFORE any org scope exists — an inbound webhook
+    has none yet; this lookup is what establishes one. Takes a raw Session, on
+    purpose: a ScopedSession would need a scope we don't have until this
+    returns. None means no installation claims this account at all; a
+    returned row with org_id=None means the local/desktop installation
+    matched — the caller decides what to do with either case."""
+    return session.exec(
+        select(ChannelInstallation).where(
+            ChannelInstallation.channel_type == channel_type,
+            ChannelInstallation.external_account_id == external_account_id,
+        )
+    ).first()
 
 
 class ChannelConfigService:
@@ -96,6 +116,20 @@ class ChannelConfigService:
         self._ensure_installation(plugin)
         self.session.commit()
         return self._config_dto(plugin)
+
+    def set_external_account_id(self, channel_type: str, external_account_id: str) -> None:
+        """Stamp the pre-scope webhook-routing key onto this org's installation
+        (creating it if this is the first thing configured). Raises IntegrityError
+        if another org already claimed this platform account — the unique index
+        is the actual guarantee; this call just surfaces the same failure a
+        credential write already would."""
+        plugin = self._require_plugin(channel_type)
+        self._org_id()  # fail closed before touching anything, same as set_config
+        self._ensure_installation(plugin)
+        install = self._fetch_installation(channel_type)
+        install.external_account_id = external_account_id
+        self.session.add(install)
+        self.session.commit()
 
     def delete_config(self, channel_type: str) -> bool:
         plugin = self._require_plugin(channel_type)
@@ -177,11 +211,8 @@ class ChannelConfigService:
         return scope.org_id
 
     def _fetch_setting(self, key: str) -> Setting | None:
-        # Settings is a deferred table (SettingService owns its own routing);
-        # channel creds don't go through SettingService (its keys are fixed
-        # UserSettings fields, these are dynamic per channel_type/field), but
-        # they use the same scope columns: NULL for local mode, "org" + org_id
-        # for org mode. Never a "user" row — org-wide, per _org_id above.
+        # Not routed through SettingService (its keys are fixed UserSettings
+        # fields; these are dynamic) but uses the same scope columns, org-wide.
         org_id = self._org_id()
         stmt = self.session.select(Setting).where(Setting.key == key)
         if org_id is None:

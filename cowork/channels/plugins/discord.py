@@ -63,6 +63,20 @@ def extract_media(data: dict) -> list[Attachment]:
         attachment.discord_url = raw.get("url")
         media.append(attachment)
     return media
+
+
+def extract_application_id(body: bytes, headers: Mapping[str, str]) -> str | None:
+    """Unverified lookup key for which org's public_key to verify against.
+    application_id (the bot itself), not guild_id — DM-context interactions
+    have no guild_id, but application_id is always present."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    app_id = data.get("application_id") if isinstance(data, dict) else None
+    return app_id if isinstance(app_id, str) and app_id else None
+
+
 _INTERACTION_PING = 1
 _INTERACTION_APPLICATION_COMMAND = 2
 
@@ -421,4 +435,5 @@ plugin = ChannelPlugin(
         supports_direct_credentials=True,
         supports_custom_ack=True,
     ),
+    extract_routing_key=extract_application_id,
 )

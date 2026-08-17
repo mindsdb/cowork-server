@@ -197,7 +197,7 @@ def test_rich_turn_appends_conversation_link(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = FakeAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     chat_id, delivered = adapter.delivered[0]
@@ -233,7 +233,7 @@ def test_channel_turn_persists_tool_rows_and_hides_history_event(monkeypatch):
     ))[0]
 
     adapters = LiveAdapterRegistry(registry)
-    adapters._cache["telegram"] = FakeAdapter()
+    adapters._cache[("telegram", None)] = FakeAdapter()
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     s = get_open_session()
@@ -274,7 +274,7 @@ def test_typing_indicator_runs_during_turn(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = TypingAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     # Indicator refreshed while the turn ran, on the right chat, then stopped.
@@ -382,7 +382,7 @@ def test_inbound_media_becomes_harness_blocks(monkeypatch, tmp_path):
     ))[0]
 
     adapters = LiveAdapterRegistry(registry)
-    adapters._cache["telegram"] = MediaAdapter()
+    adapters._cache[("telegram", None)] = MediaAdapter()
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     blocks = harness.inputs[0]
@@ -480,7 +480,7 @@ def test_turn_artifacts_delivered(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = ArtifactAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     # Text reply (with link) lands first, then exactly the fresh artifact.
@@ -684,7 +684,7 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
     load_first_party_plugins(registry)
     bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s"})
     adapters = LiveAdapterRegistry(registry)
-    adapters._cache["telegram"] = FakeAdapter()
+    adapters._cache[("telegram", None)] = FakeAdapter()
     runtime = AntonChannelRuntime(adapters)
 
     def turn(chat_id, update_id):
@@ -834,7 +834,7 @@ def test_new_command_starts_fresh_conversation(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = FakeAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     runtime = AntonChannelRuntime(adapters)
 
     asyncio.run(runtime.handle("telegram", event(100, "hi")))
@@ -980,7 +980,7 @@ def test_telegram_group_mention_only_flow(monkeypatch):
     bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
     adapters = LiveAdapterRegistry(registry)
     adapter = FakeAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     runtime = AntonChannelRuntime(adapters)
 
     async def inbound(body):

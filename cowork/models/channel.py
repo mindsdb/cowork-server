@@ -32,6 +32,16 @@ class ChannelInstallation(BaseSQLModel, table=True):
             sqlite_where=sa.text("org_id IS NOT NULL"),
             postgresql_where=sa.text("org_id IS NOT NULL"),
         ),
+        # Pre-scope webhook-routing key (Slack team_id, etc.), looked up before
+        # any org exists — unique on its own, not per-org. NULL until discovered.
+        sa.Index(
+            "uq_channel_installations_external_account",
+            "channel_type",
+            "external_account_id",
+            unique=True,
+            sqlite_where=sa.text("external_account_id IS NOT NULL"),
+            postgresql_where=sa.text("external_account_id IS NOT NULL"),
+        ),
     )
 
     channel_type: str = Field(description="Stable adapter name: telegram | slack | discord | whatsapp")
@@ -42,6 +52,13 @@ class ChannelInstallation(BaseSQLModel, table=True):
         description="Last known adapter state: disconnected | active | error",
     )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
+    external_account_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Platform account id used to route an inbound webhook to its "
+        "installation before any org scope exists (Slack team_id, Discord guild_id, "
+        "WhatsApp phone_number_id, ...); NULL until setup discovers it",
+    )
 
 
 class ChannelBinding(BaseSQLModel, table=True):

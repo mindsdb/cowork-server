@@ -9,7 +9,7 @@ from typing import Any, Protocol
 from fastapi import APIRouter, Request, Response
 
 from cowork.channels.plugin import ChannelPlugin
-from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
+from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.services.channel_events import ChannelEventService
 
@@ -65,8 +65,33 @@ class WebhookBridge(Protocol):
 
 
 BridgeResolver = Callable[[str], "WebhookBridge | None"]
+# (channel_type, routing_key) -> (bridge, org_id), or None if nothing claims
+# that routing key. org_id is the org the bridge belongs to.
+OrgBridgeResolver = Callable[[str, str], Awaitable["tuple[WebhookBridge, str | None] | None"]]
 InboundSink = Callable[[str, Any], Awaitable[None]]
 Scheduler = Callable[[Coroutine[Any, Any, None]], None]
+
+
+async def resolve_bridge(
+    *,
+    channel_type: str,
+    plugin: ChannelPlugin,
+    body: bytes,
+    headers: Mapping[str, str],
+    resolver: BridgeResolver,
+    org_resolver: OrgBridgeResolver | None,
+) -> tuple["WebhookBridge | None", str | None]:
+    """Bridge to use for this inbound request, and the org it belongs to (None
+    for the plain/local resolver path). Falls back to `resolver(channel_type)`
+    whenever the plugin has no extractor, the extractor finds nothing, or the
+    key doesn't resolve — so non-participating plugins are untouched."""
+    if plugin.extract_routing_key is not None and org_resolver is not None:
+        routing_key = plugin.extract_routing_key(body, headers)
+        if routing_key is not None:
+            resolved = await org_resolver(channel_type, routing_key)
+            if resolved is not None:
+                return resolved
+    return resolver(channel_type), None
 
 
 _background_tasks: set[asyncio.Task[Any]] = set()
@@ -96,21 +121,22 @@ def build_channel_webhook_router(
     resolver: BridgeResolver,
     sink: InboundSink,
     scheduler: Scheduler = _default_scheduler,
+    org_resolver: OrgBridgeResolver | None = None,
 ) -> APIRouter:
     """Build an APIRouter exposing every webhook a plugin declares.
     """
     router = APIRouter()
     for webhook in plugin.webhooks:
         _add_webhook_route(
-            router, plugin.channel_type, webhook.path, webhook.name, list(webhook.methods),
-            resolver=resolver, sink=sink, scheduler=scheduler,
+            router, plugin, webhook.path, webhook.name, list(webhook.methods),
+            resolver=resolver, sink=sink, scheduler=scheduler, org_resolver=org_resolver,
         )
     return router
 
 
 def _add_webhook_route(
     router: APIRouter,
-    channel_type: str,
+    plugin: ChannelPlugin,
     path: str,
     route_name: str | None,
     methods: list[str],
@@ -118,9 +144,21 @@ def _add_webhook_route(
     resolver: BridgeResolver,
     sink: InboundSink,
     scheduler: Scheduler,
+    org_resolver: OrgBridgeResolver | None,
 ) -> None:
+    channel_type = plugin.channel_type
+
     async def handler(request: Request) -> Response:
-        bridge = resolver(channel_type)
+        # Read the body before resolving: a plugin with extract_routing_key
+        # needs it to pick which org's bridge this inbound belongs to.
+        body = await request.body()
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        query = dict(request.query_params)
+
+        bridge, org_id = await resolve_bridge(
+            channel_type=channel_type, plugin=plugin, body=body, headers=headers,
+            resolver=resolver, org_resolver=org_resolver,
+        )
         if bridge is None:
             # Inbound arrived but no live adapter is registered: the channel
             # isn't active (setup/reload not run, or credentials incomplete).
@@ -132,10 +170,7 @@ def _add_webhook_route(
             )
             return Response(status_code=204)
 
-        body = await request.body()
         log.info("channel %s: webhook received (%d bytes)", channel_type, len(body))
-        headers = {k.lower(): v for k, v in request.headers.items()}
-        query = dict(request.query_params)
 
         handshake = bridge.try_handshake(
             method=request.method, body=body, headers=headers, query=query,
@@ -163,7 +198,7 @@ def _add_webhook_route(
             return Response("could not parse webhook payload", status_code=400)
 
         log.info("channel %s: parsed %d inbound event(s)", channel_type, len(events))
-        intake_events(channel_type, bridge, events, sink=sink, scheduler=scheduler)
+        intake_events(channel_type, bridge, events, sink=sink, scheduler=scheduler, org_id=org_id)
         return _success_ack(bridge, events)
 
     router.add_api_route(
@@ -193,6 +228,7 @@ def intake_events(
     *,
     sink: InboundSink,
     scheduler: Scheduler | None = None,
+    org_id: str | None = None,
 ) -> None:
     """De-dup, record, and schedule each parsed event for background sink
     processing. Shared by both ingress paths — webhook routes and server-side
@@ -203,9 +239,10 @@ def intake_events(
     sched = scheduler or _default_scheduler
     session = get_open_session()
     try:
-        # SYSTEM_SCOPE: the event log dedupes per installation, not per org
-        # (see services/channel_events.py).
-        channel_log = ChannelEventService(ScopedSession(session, SYSTEM_SCOPE))
+        # Dedupe is per installation: SYSTEM_SCOPE when no org was resolved
+        # (local/desktop's one installation), the resolved org's scope otherwise.
+        scope = SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+        channel_log = ChannelEventService(ScopedSession(session, scope))
         for event in events:
             key = bridge.dedupe_key(event)
             if channel_log.is_duplicate_inbound(channel_type, key):
@@ -216,17 +253,20 @@ def intake_events(
                 log.info("channel %s dropping duplicate inbound (insert race) key=%s", channel_type, key)
                 continue
             log.info("channel %s: accepted inbound key=%s; dispatching to runtime", channel_type, key)
-            sched(_process_event(channel_type, event, event_id, sink))
+            sched(_process_event(channel_type, event, event_id, sink, org_id=org_id))
     finally:
         session.close()
 
 
-async def _process_event(channel_type: str, event: Any, event_id: Any, sink: InboundSink) -> None:
+async def _process_event(
+    channel_type: str, event: Any, event_id: Any, sink: InboundSink, *, org_id: str | None = None
+) -> None:
     """Route one event to the sink and record the outcome. Opens its own session
     since it runs after the request's session is closed."""
     session = get_open_session()
     try:
-        channel_log = ChannelEventService(ScopedSession(session, SYSTEM_SCOPE))
+        scope = SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+        channel_log = ChannelEventService(ScopedSession(session, scope))
         try:
             await sink(channel_type, event)
             channel_log.set_status(event_id, "routed")

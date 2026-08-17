@@ -16,7 +16,7 @@ from uuid import UUID
 from anton.core.dispatch import OutboundMessage
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, scope_for_background_context
+from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import ChannelContext, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
@@ -134,27 +134,44 @@ class _KeyedLocks:
 
 
 class LiveAdapterRegistry:
-    """Process-wide cache of live channel adapters keyed by ``channel_type``.
-    """
+    """Process-wide cache of live channel adapters, keyed by (channel_type,
+    org_id). org_id=None is the local/desktop installation — today's single-
+    instance-per-channel-type behavior verbatim; an org lookup never sees it."""
 
     def __init__(self, registry: PluginRegistry | None = None) -> None:
         self._registry = registry if registry is not None else get_registry()
-        self._cache: dict[str, Any] = {}
+        self._cache: dict[tuple[str, str | None], Any] = {}
 
-    def get(self, channel_type: str) -> Any | None:
-        """Live adapter for a channel, or None if not configured/active."""
-        return self._cache.get(channel_type)
+    def get(self, channel_type: str, org_id: str | None = None) -> Any | None:
+        """Live adapter for a channel/org, or None if not configured/active."""
+        return self._cache.get((channel_type, org_id))
 
-    async def refresh(self, channel_type: str, *, session: ScopedSession | None = None) -> bool:
+    async def get_or_refresh(
+        self, channel_type: str, org_id: str | None, *, session: ScopedSession | None = None
+    ) -> Any | None:
+        """Cache hit → return it, no session touched. Miss (first webhook for
+        an org this replica hasn't loaded yet) → refresh, then return the
+        result either way. Used by the webhook path, which has no prior
+        chance to have called refresh for an org it just resolved."""
+        cached = self.get(channel_type, org_id)
+        if cached is not None:
+            return cached
+        await self.refresh(channel_type, org_id, session=session)
+        return self.get(channel_type, org_id)
+
+    async def refresh(
+        self, channel_type: str, org_id: str | None = None, *, session: ScopedSession | None = None
+    ) -> bool:
 
         plugin = self._registry.get(channel_type)
         if plugin is None:
-            self._cache.pop(channel_type, None)
+            self._cache.pop((channel_type, org_id), None)
             return False
         own_session = session is None
-        # Boot/background refresh reads deployment-level channel credentials
-        # (settings; scoping deferred) — SYSTEM_SCOPE like the scheduler loop.
-        s = session or ScopedSession(get_open_session(), SYSTEM_SCOPE)
+        # No caller-supplied session: SYSTEM_SCOPE for local mode's one
+        # installation, a real org scope otherwise — never the other way.
+        scope = SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+        s = session or ScopedSession(get_open_session(), scope)
         try:
             creds = ChannelConfigService(s, registry=self._registry).load_credentials(channel_type)
         finally:
@@ -163,24 +180,27 @@ class LiveAdapterRegistry:
         try:
             adapter = await plugin.factory(creds)
         except Exception:
-            log.exception("failed building live adapter for channel %s", channel_type)
+            log.exception("failed building live adapter for channel %s (org=%s)", channel_type, org_id)
             adapter = None
         if adapter is None:
-            self._cache.pop(channel_type, None)
+            self._cache.pop((channel_type, org_id), None)
             return False
-        self._cache[channel_type] = adapter
+        self._cache[(channel_type, org_id)] = adapter
         return True
 
     async def refresh_all(self) -> list[str]:
+        """Local-mode boot bootstrap: one adapter per plugin, org_id=None. Org
+        installations refresh lazily on first webhook — see the resolver in
+        webhooks.py — since channels aren't reachable in org mode yet anyway."""
         active: list[str] = []
         for plugin in self._registry.all():
             if await self.refresh(plugin.channel_type):
                 active.append(plugin.channel_type)
         return active
 
-    async def remove(self, channel_type: str) -> None:
+    async def remove(self, channel_type: str, org_id: str | None = None) -> None:
 
-        adapter = self._cache.pop(channel_type, None)
+        adapter = self._cache.pop((channel_type, org_id), None)
         if adapter is not None:
             try:
                 await adapter.shutdown()

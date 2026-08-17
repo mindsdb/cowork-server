@@ -251,12 +251,32 @@ def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
         load_first_party_plugins()
     adapters = LiveAdapterRegistry()
     runtime = AntonChannelRuntime(adapters)
+
+    async def _resolve_org_bridge(channel_type: str, routing_key: str):
+        # Unverified routing key -> which installation claims it -> that
+        # installation's own bridge (built/cached lazily on first use).
+        from cowork.db.session import get_open_session
+        from cowork.services.channels import resolve_installation_by_external_account
+
+        session = get_open_session()
+        try:
+            install = resolve_installation_by_external_account(session, channel_type, routing_key)
+        finally:
+            session.close()
+        if install is None:
+            return None
+        bridge = await adapters.get_or_refresh(channel_type, install.org_id)
+        return (bridge, install.org_id) if bridge is not None else None
+
     if local_mode:
         for plugin in get_registry().all():
             if not plugin.webhooks:
                 continue
             app.include_router(
-                build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
+                build_channel_webhook_router(
+                    plugin, resolver=adapters.get, sink=runtime.handle,
+                    org_resolver=_resolve_org_bridge,
+                ),
                 prefix="/api/v1/channels",
             )
             # Mirrors the route path built in webhooks._add_webhook_route:

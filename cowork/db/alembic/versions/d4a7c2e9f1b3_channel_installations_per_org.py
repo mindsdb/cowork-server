@@ -34,9 +34,8 @@ def upgrade() -> None:
     """Upgrade schema."""
     bind = op.get_bind()
 
-    # channel_installations: drop the flat unique constraint (SQLite needs a
-    # batch rebuild to drop a named constraint; Postgres drops it directly),
-    # add the local/org partial-index split.
+    # Drop the flat unique constraint (SQLite needs a batch rebuild for a
+    # named constraint; Postgres drops it directly), add the partial-index split.
     if bind.dialect.name == "sqlite":
         with op.batch_alter_table("channel_installations", schema=None) as batch:
             batch.drop_constraint("uq_channel_installations_type", type_="unique")

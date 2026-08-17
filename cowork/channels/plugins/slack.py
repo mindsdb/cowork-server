@@ -58,6 +58,17 @@ def extract_media(event: dict) -> list[Attachment]:
     return media
 
 
+def extract_team_id(body: bytes, headers: Mapping[str, str]) -> str | None:
+    """Unverified lookup key for which org's signing_secret to verify
+    against — never trusted for anything beyond that lookup."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    team_id = data.get("team_id") if isinstance(data, dict) else None
+    return team_id if isinstance(team_id, str) and team_id else None
+
+
 class SlackBridge:
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
@@ -354,4 +365,5 @@ plugin = ChannelPlugin(
         supports_direct_credentials=True,
         supports_custom_ack=False,
     ),
+    extract_routing_key=extract_team_id,
 )

@@ -99,3 +99,7 @@ class ChannelPlugin:
     connector_spec: dict[str, Any] | None = field(default=None)
     lifecycle: ChannelLifecycle | None = field(default=None)
     capabilities: ChannelCapabilities = field(default_factory=ChannelCapabilities)
+    # Pulls a pre-scope routing key (Slack team_id, ...) from an unverified
+    # inbound body/headers, for platforms that carry one. None (most plugins
+    # today) means: no per-org webhook routing, the plain resolver decides.
+    extract_routing_key: Callable[[bytes, Mapping[str, str]], str | None] | None = None

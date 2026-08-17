@@ -52,6 +52,7 @@ class ChannelInstallationResponse(BaseModel):
     display_name: str
     enabled: bool
     status: InstallationStatus
+    external_account_id: str | None = None
     created_at: datetime | None = None
     modified_at: datetime | None = None
 
