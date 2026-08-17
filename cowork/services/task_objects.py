@@ -422,6 +422,55 @@ def _skill_draft_payload(folder: Path) -> dict | None:
     }
 
 
+def remote_skill_draft_payload(entry: dict) -> dict | None:
+    """Card payload for a draft a remote pod reported, or None to drop it.
+
+    The pod sends `{"slug", "files": {name: text}}`. This materializes it into a
+    throwaway folder and reuses `_skill_draft_payload`, so a remote card is
+    byte-identical to the desktop one instead of a second parser drifting from it.
+
+    This is the trust boundary — the pod's payload is untrusted wire data:
+    - the slug must be a valid skill name, or it could name any folder
+    - filenames must be plain basenames, since `a/../../b` would escape the temp
+      dir and let a turn write anywhere the server process can
+    A bad entry is dropped and logged; one draft must never fail the turn.
+    """
+    import tempfile
+
+    from anton.core.tools.skill_format import SKILL_FILE, validate_name
+
+    slug = entry.get("slug") if isinstance(entry, dict) else None
+    files = entry.get("files") if isinstance(entry, dict) else None
+    if not isinstance(slug, str) or not isinstance(files, dict):
+        logger.warning("Remote skill draft: malformed entry, dropping it")
+        return None
+    try:
+        validate_name(slug)
+    except ValueError:
+        logger.warning("Remote skill draft: invalid slug %r, dropping it", slug)
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="cowork-remote-draft-") as tmp:
+            folder = Path(tmp) / slug
+            folder.mkdir()
+            for name, text in files.items():
+                if not isinstance(name, str) or not isinstance(text, str):
+                    continue
+                if name != Path(name).name or name in (".", ".."):
+                    logger.warning("Remote skill draft %r: dropping unsafe filename %r", slug, name)
+                    continue
+                (folder / name).write_text(text, encoding="utf-8")
+            payload = _skill_draft_payload(folder)
+    except (OSError, ValueError):
+        logger.warning("Remote skill draft %r: could not build a card", slug, exc_info=True)
+        return None
+    # Covers every reason the shared builder rejects a folder — missing or
+    # unparseable SKILL.md — without restating its preconditions here.
+    if payload is None:
+        logger.warning("Remote skill draft %r: no usable %s, dropping it", slug, SKILL_FILE)
+    return payload
+
+
 def _seed_draft_from_store(folder: Path, slug: str) -> None:
     """Copy a saved skill's SKILL.md + sibling files into an empty draft folder.
 

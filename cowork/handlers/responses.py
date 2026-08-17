@@ -29,7 +29,7 @@ from cowork.handlers.response_routing import (
     decide_route,
     ineligible_reason,
 )
-from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.schemas.responses import (
@@ -68,6 +68,7 @@ from cowork.services.files import FileService
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
 from cowork.services.skills import SkillService, build_turn_skills
+from cowork.services.task_objects import remote_skill_draft_payload
 
 
 import logging
@@ -657,6 +658,15 @@ class ResponsesHandler:
                         yield event
                 elif kind == "turn_memory":
                     self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                elif kind == "turn_skill":
+                    # Not persisted like memory: a draft is the user's decision.
+                    # Yielding SkillCreated puts it through the same formatter the
+                    # in-process path uses, so the card renders — and replays off
+                    # the events log — identically to a desktop one.
+                    for entry in data.get("entries") or []:
+                        payload = remote_skill_draft_payload(entry)
+                        if payload is not None:
+                            yield SkillCreated(payload)
                 elif kind == "turn_completed":
                     return
                 elif kind == "turn_failed":

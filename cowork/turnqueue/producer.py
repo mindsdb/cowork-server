@@ -241,7 +241,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         "Remote turn failed conversation=%s correlation_id=%s error=%s",
                         conversation_id, corr, data.get("error"),
                     )
-                if kind in ("turn_delta", "turn_step", "turn_memory",
+                if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
                             "turn_completed", "turn_failed"):
                     yield kind, data
                 if kind in ("turn_completed", "turn_failed"):

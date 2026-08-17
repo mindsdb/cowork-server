@@ -407,3 +407,19 @@ def test_step_stream_events_round_end_carries_tool_call_truthiness():
 
 def test_step_stream_events_unknown_step_yields_nothing():
     assert prod.step_stream_events({"step": "mystery"}) == []
+
+
+@pytest.mark.asyncio
+async def test_turn_skill_reaches_the_caller(monkeypatch):
+    """The kind filter is a whitelist: a kind missing from it is dropped
+    silently, so a skill draft would vanish between the pod and the card."""
+    draft = {"slug": "my-skill", "files": {"SKILL.md": "body"}}
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_skill", {"entries": [draft]})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    assert items == [("turn_skill", {"entries": [draft]}), ("turn_completed", {})]
