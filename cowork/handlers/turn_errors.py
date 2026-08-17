@@ -117,11 +117,29 @@ POLICY_UNAVAILABLE_USER_MESSAGE = (
     "Billing is temporarily unavailable. Please retry in a moment."
 )
 
-# Curated copy + wire code for an unknown/removed model (gateway 404
-# `unknown_model`). Adding credits can't fix it, so the copy steers to Settings
-# rather than to the out-of-credits card.
-UNKNOWN_MODEL_CODE = "unknown_model"
-UNKNOWN_MODEL_USER_MESSAGE = (
+# Wire code + fallback copy for a model the provider can't serve — the gateway's
+# 404 (`X-MindsHub-Reason: unknown_model`, body `code: model_not_found`), a BYOK
+# OpenAI 404 carrying the same body code, or the equivalent from Gemini/Anthropic.
+# Adding credits can't fix it, so this steers to Settings rather than to the
+# out-of-credits card.
+#
+# The code mirrors the OpenAI-dialect `error.code` that every one of those
+# providers emits (and that anton's `classify_404` keys on), so one name travels
+# the whole path — gateway → anton → here → the renderer's card. It renames the
+# server-invented `unknown_model` wire code (ENG-1282 gave that one a card, so
+# the rename moves in lockstep with ChatView.jsx and the inventory test below).
+#
+# The rename is not cosmetic: under the old name this code could only ever be
+# produced by the reason-header branch, whose copy is generic. anton's typed
+# ModelUnavailableError — the one that NAMES the model — carries code
+# `model_not_found`, so it could never match `MODEL_UNAVAILABLE_CODES` and the
+# model id never reached the card. One shared name is what closes ENG-1358.
+#
+# The copy is only a fallback. anton's ModelUnavailableError carries curated text
+# that NAMES the rejected model, and `friendly_turn_error` prefers it — this is
+# for a version-skewed anton that sends the reason header without the typed error.
+MODEL_NOT_FOUND_CODE = "model_not_found"
+MODEL_NOT_FOUND_USER_MESSAGE = (
     "That model isn't available. Switch to another model in Settings."
 )
 
@@ -150,7 +168,16 @@ AUTH_ERROR_CODE = "provider_auth"
 # nothing is lost in translation, and the renderer keys its card on them.
 MODEL_ACCESS_DENIED_CODE = "model_access_denied"
 MODEL_DISABLED_CODE = "model_disabled"
-_MODEL_UNAVAILABLE_CODES = frozenset({MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE})
+# Every code that means "the turn died on the MODEL, and picking another one is
+# the remedy" — the two legacy 403s plus the live 404. They share a renderer
+# card; only its copy differs. model_not_found is the one that still occurs.
+# Public: responses.py branches on this to decide whether the failure frame
+# carries `model`. Shared rather than re-listed there, so the two can't drift —
+# and so a merge conflict in that elif-chain has no tuple members to silently
+# drop (the ENG-1358 re-review's rebase hazard).
+MODEL_UNAVAILABLE_CODES = frozenset(
+    {MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE, MODEL_NOT_FOUND_CODE}
+)
 
 # Fallback copy if the exception somehow carries no usable message — anton
 # normally supplies curated, user-facing copy which we pass through verbatim.
@@ -268,7 +295,7 @@ def model_unavailable_info(exc: Exception) -> tuple[str, str] | None:
     except Exception:
         pass
     code = getattr(exc, "code", None)
-    if isinstance(code, str) and code in _MODEL_UNAVAILABLE_CODES:
+    if isinstance(code, str) and code in MODEL_UNAVAILABLE_CODES:
         return code, str(getattr(exc, "model", "") or "")
     return None
 
@@ -636,7 +663,7 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     if reason == _REASON_POLICY_UNAVAILABLE:
         return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
     if reason == _REASON_UNKNOWN_MODEL:
-        return UNKNOWN_MODEL_CODE, UNKNOWN_MODEL_USER_MESSAGE
+        return MODEL_NOT_FOUND_CODE, MODEL_NOT_FOUND_USER_MESSAGE
     return None
 
 
@@ -660,6 +687,19 @@ def friendly_turn_error(
     if reason is not None:
         mapped = _map_gateway_reason(reason)
         if mapped is not None:
+            # ...except for unknown_model, where anton's typed error is strictly
+            # better than the header: `classify_404` already resolved this to a
+            # ModelUnavailableError whose copy NAMES the rejected model ("The
+            # model 'deepseek-v4-flash' isn't available: …"), while the header
+            # only says *that* a model was rejected. Returning the header copy
+            # here threw the model id away and left the user with nothing to act
+            # on — ENG-1358. The billing reasons have no such typed counterpart,
+            # so they still short-circuit.
+            if mapped[0] == MODEL_NOT_FOUND_CODE:
+                if model_info is _UNSET:
+                    model_info = model_unavailable_info(exc)
+                if model_info is not None:
+                    return MODEL_NOT_FOUND_CODE, str(exc) or mapped[1]
             return mapped
 
     # Same decision from the body's `code` when the header didn't survive the
@@ -762,7 +802,24 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     if type_name == "ProviderOverloadedError":
         return PROVIDER_OVERLOADED_CODE, message or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
     if type_name == "ModelUnavailableError":
-        return MODEL_ACCESS_DENIED_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
+        # _scrub sends "Type: message" — the structured `code` doesn't survive,
+        # so 403-gate and 404-not-found are indistinguishable here. Default to
+        # the CONSERVATIVE one: model_not_found steers to Settings and promises
+        # nothing, while model_access_denied renders a "Top up balance" button
+        # that is simply wrong for a model that doesn't exist — and since the
+        # current gateway no longer emits the 403 codes at all, not-found is
+        # also the likelier case.
+        #
+        # The message is returned for the SSE `error` field and the DB sidecar,
+        # not for the card: both model cards render their own literal copy and
+        # never read `m.content` (ChatView.jsx). So the choice of code decides
+        # everything the user sees, which is why it errs conservative.
+        #
+        # Known gap, not fixed here: this path also can't supply `model` —
+        # producer.py emits response_failed_sse without it, so a remote/hosted
+        # turn still shows the UNNAMED copy. Naming it needs anton to carry the
+        # code+model through _scrub's wire format (tracked separately).
+        return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if type_name == "ConnectionError" and "api key" in message.lower():
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE

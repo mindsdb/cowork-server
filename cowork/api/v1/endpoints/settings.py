@@ -30,9 +30,11 @@ from cowork.schemas.settings import (
     SettingUpsertRequest,
 )
 from cowork.services.providers import (
+    MODEL_VALUE_SETTINGS,
     check_config_status,
     fetch_minds_models,
     fetch_org_model_catalog,
+    model_value_rejection,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -79,9 +81,76 @@ def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]
     return SettingService(session, scope).list_settings()
 
 
+def _bearer_token(request: Request | None) -> str:
+    """The caller's own bearer, for the org catalog fetch. Mirrors
+    ``recommended_models``: never the stored key or the tenant-settable
+    ``minds_url``, or a member's JWT could be forwarded to an admin-chosen
+    host."""
+    if request is None:
+        return ""
+    header = request.headers.get("Authorization", "")
+    return header[7:].strip() if header.lower().startswith("bearer ") else ""
+
+
+async def _reject_unservable_models(
+    session: Session,
+    scope: TenantScope,
+    updates: dict[str, Any],
+    request: Request | None = None,
+) -> None:
+    """400 on a model value the configured provider's live catalog doesn't list.
+
+    Applied to both HTTP settings writers (ENG-1358). Every model write in the
+    product travels over one of them — the Settings picker, the desktop
+    onboarding's ``syncModelsToDb``, cowork-enterprise's container entrypoint,
+    and a hand-rolled ``PUT /settings/planning_model`` alike — which is the
+    point: the ENG-597 lesson is that a check added to one writer is defeated by
+    the writer nobody enumerated. The two API paths that DON'T come here (the
+    .env→DB seed in ``migrations`` and ``POST /settings/raw``) deliberately
+    exclude model keys already (ENG-739), so they can't carry one in.
+
+    Scope limit, stated because the inventory above reads broader than it is:
+    this is an HTTP-layer check. ``SettingService.upsert_setting`` / ``save_all``
+    / ``bulk_upsert`` called IN-PROCESS bypass it. No in-process caller writes a
+    model key today (``channels.py`` writes ``channels_harness``,
+    ``recommended_models`` writes ``minds_model_enabled``); moving the check down
+    would need those sync methods to become async.
+
+    Resolution uses ``load_pending`` — the state the write PRODUCES, not the one
+    it replaces. See that method for why the pre-write DB is the wrong question.
+
+    Soft-fail lives in ``model_value_rejection``: anything short of a real
+    catalog that definitively lacks the id allows the write.
+    """
+    candidates = {
+        k: v
+        for k, v in (updates or {}).items()
+        if k in MODEL_VALUE_SETTINGS and isinstance(v, str) and v not in ("", "***")
+    }
+    if not candidates:
+        return
+    settings = SettingService(session, scope).load_pending(updates)
+    for key, value in candidates.items():
+        rejection = await model_value_rejection(
+            settings,
+            key,
+            value,
+            org_id=scope.org_id if scope and scope.org_mode else None,
+            bearer_token=_bearer_token(request),
+        )
+        if rejection:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=rejection
+            )
+
+
 @router.put("/")
-def bulk_upsert_settings(
-    body: SettingsBulkUpsertRequest, session: SessionDep, scope: ScopeDep, principal: PrincipalDep
+async def bulk_upsert_settings(
+    body: SettingsBulkUpsertRequest,
+    session: SessionDep,
+    scope: ScopeDep,
+    principal: PrincipalDep,
+    request: Request = None,
 ):
     """Upsert many settings in one transaction (all-or-nothing).
 
@@ -92,6 +161,9 @@ def bulk_upsert_settings(
     # Skipped values (None/"***") are never written — don't let them trip the gate.
     live_keys = [k for k, v in (body.values or {}).items() if v is not None and v != "***"]
     _require_org_admin_for(live_keys, scope, principal)
+    # Before anything is staged, so a bad model id 400s with nothing written —
+    # same all-or-nothing contract as the field validation below.
+    await _reject_unservable_models(session, scope, body.values or {}, request)
     try:
         updated = SettingService(session, scope).save_all(body.values)
     except ValueError as e:
@@ -100,14 +172,16 @@ def bulk_upsert_settings(
 
 
 @router.put("/{key}", response_model=SettingResponse)
-def upsert_setting(
+async def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
     session: SessionDep,
     scope: ScopeDep,
     principal: PrincipalDep,
+    request: Request = None,
 ) -> SettingResponse:
     _require_org_admin_for([key], scope, principal)
+    await _reject_unservable_models(session, scope, {key: body.value}, request)
     try:
         return SettingService(session, scope).upsert_setting(key, body.value)
     except ValueError as e:
