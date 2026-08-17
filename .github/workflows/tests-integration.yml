@@ -44,15 +44,15 @@ jobs:
       # is mounted there (it exists only where auth's `ephemeral` setting is on),
       # so no secret is needed and each run gets a fresh throwaway tenant.
       #
-      # dev/staging/prod: the dev route is deliberately not mounted, so identity
-      # comes from auth's internal provisioning endpoint, authenticated with the
-      # dedicated secret held in this environment. It provisions the fixed
-      # `cowork` suite: one @emailsink.dev tenant reused across runs.
+      # dev/staging/prod: the dev route is deliberately not mounted there, so
+      # identity comes from auth's internal provisioning endpoint with the
+      # dedicated secret. It provisions the fixed `cowork` suite: one
+      # @emailsink.dev tenant reused across runs. The hostnames come from a
+      # committed env file rather than GitHub Environment variables, so a change
+      # is a reviewable diff (same as mindshub_inference).
       - name: Resolve the target and the identity source
         env:
           DEPLOY_ENV: ${{ inputs.deploy-env }}
-          GH_COWORK_URL: ${{ vars.MDB_ENV_URL }}
-          GH_AUTH_URL: ${{ vars.MDB_AUTH_URL }}
         run: |
           set -euo pipefail
           if [[ "$DEPLOY_ENV" == pr-* ]]; then
@@ -61,13 +61,18 @@ jobs:
               echo "TEST_USER_MINT_URL=https://auth-${DEPLOY_ENV}.dev.mindshub.ai/dev/mint-test-user/"
             } >> "$GITHUB_ENV"
           else
-            if [[ -z "$GH_COWORK_URL" || -z "$GH_AUTH_URL" ]]; then
-              echo "::error::MDB_ENV_URL and MDB_AUTH_URL must be set on the ${DEPLOY_ENV} environment"
+            env_file="tests/integration/envs/.env.${DEPLOY_ENV}"
+            if [ ! -f "$env_file" ]; then
+              echo "::error::Missing $env_file for deploy-env '$DEPLOY_ENV'"
               exit 1
             fi
+            set -a
+            # shellcheck source=/dev/null
+            . "$env_file"
+            set +a
             {
-              echo "COWORK_BASE_URL=${GH_COWORK_URL}"
-              echo "TEST_USER_PROVISION_URL=${GH_AUTH_URL}/v1/internal/test-users/"
+              echo "COWORK_BASE_URL=${COWORK_BASE_URL}"
+              echo "TEST_USER_PROVISION_URL=${COWORK_AUTH_BASE_URL}/v1/internal/test-users/"
             } >> "$GITHUB_ENV"
           fi
 
