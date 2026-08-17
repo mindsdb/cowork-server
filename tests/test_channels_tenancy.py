@@ -363,3 +363,41 @@ async def test_get_or_refresh_returns_none_for_unregistered_channel_type(engine)
     registry = LiveAdapterRegistry(_live_fake_registry())
     adapter = await registry.get_or_refresh("discord", ORG_B, session=_scoped(engine, _org(ORG_B)))
     assert adapter is None
+
+
+# --- LiveAdapterRegistry.resolve_org_bridge: the real org_resolver server.py wires in ---
+
+async def test_resolve_org_bridge_finds_the_right_orgs_bridge(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
+    _config_svc(engine, _org(ORG_A)).set_external_account_id("slack", "T-A")
+
+    resolved = await registry.resolve_org_bridge("slack", "T-A", session=Session(engine))
+
+    assert resolved is not None
+    bridge, org_id = resolved
+    assert org_id == ORG_A
+    assert bridge.creds == {"signing_secret": "org-a-secret"}
+    assert registry.get("slack", ORG_A) is bridge  # cached for next time
+
+
+async def test_resolve_org_bridge_returns_none_for_unknown_routing_key(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    resolved = await registry.resolve_org_bridge("slack", "T-nope", session=Session(engine))
+    assert resolved is None
+
+
+async def test_resolve_org_bridge_resolves_the_local_installation_too(engine):
+    # A local/desktop install can have external_account_id set too — nothing
+    # about resolution is org-mode-specific, and it must not crash on org_id=None.
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, LOCAL_SCOPE).set_config("slack", {"signing_secret": "desktop-secret"})
+    _config_svc(engine, LOCAL_SCOPE).set_external_account_id("slack", "T-local")
+
+    resolved = await registry.resolve_org_bridge("slack", "T-local", session=Session(engine))
+
+    assert resolved is not None
+    bridge, org_id = resolved
+    assert org_id is None
+    assert bridge.creds == {"signing_secret": "desktop-secret"}
+    assert registry.get("slack") is bridge  # same cache slot as the local bootstrap

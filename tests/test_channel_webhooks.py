@@ -5,14 +5,24 @@ installation — so plugins that don't participate (today: everyone but Slack)
 are completely unaffected."""
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import time
+
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlmodel import select
 
 from cowork.channels.plugin import ChannelPlugin, CredentialSchema
-from cowork.channels.webhooks import intake_events, resolve_bridge
-from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.channels.registry import PluginRegistry
+from cowork.channels.runtime import LiveAdapterRegistry
+from cowork.channels.webhooks import build_channel_webhook_router, intake_events, resolve_bridge
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.services.channel_events import ChannelEventService
+from cowork.services.channels import ChannelConfigService
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -236,3 +246,76 @@ def test_discord_plugin_declares_the_extractor():
     from cowork.channels.plugins.discord import extract_application_id, plugin
 
     assert plugin.extract_routing_key is extract_application_id
+
+
+# --- End-to-end: local mode's real wiring, exactly as _install_channels builds it ---
+
+def _signed_slack_headers(body: bytes, signing_secret: str) -> dict:
+    ts = str(int(time.time()))
+    base = f"v0:{ts}:".encode("utf-8") + body
+    sig = "v0=" + hmac.new(signing_secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
+    return {"x-slack-request-timestamp": ts, "x-slack-signature": sig}
+
+
+async def test_local_mode_webhook_falls_through_to_local_bridge_end_to_end():
+    """The claim from the design conversation, proven rather than reasoned
+    through: in local mode, a real inbound webhook whose team_id matches
+    nothing (true today — nothing sets external_account_id on a local
+    install) still resolves and verifies correctly, via the same plain-
+    resolver path as before this feature existed. Uses the real Slack
+    plugin, the real registry, and the real resolve_org_bridge — the actual
+    production wiring _install_channels builds, not a stand-in for it."""
+    from cowork.channels.plugins.slack import plugin as slack_plugin
+
+    registry = PluginRegistry()
+    registry.register(slack_plugin)
+
+    signing_secret = "test-signing-secret"
+    session = get_open_session()
+    try:
+        ChannelConfigService(ScopedSession(session, LOCAL_SCOPE), registry=registry).set_config(
+            "slack", {"bot_token": "xoxb-test", "signing_secret": signing_secret},
+        )
+    finally:
+        session.close()
+
+    try:
+        adapters = LiveAdapterRegistry(registry)
+        assert await adapters.refresh_all() == ["slack"]  # mirrors the real lifespan bootstrap
+
+        delivered = []
+
+        async def sink(channel_type, event):
+            delivered.append((channel_type, event))
+
+        app = FastAPI()
+        app.include_router(
+            build_channel_webhook_router(
+                slack_plugin, resolver=adapters.get, sink=sink,
+                org_resolver=adapters.resolve_org_bridge,
+            )
+        )
+        client = TestClient(app)
+
+        body = json.dumps({
+            "type": "event_callback",
+            "team_id": "T-UNMATCHED",  # nothing sets external_account_id on a local install
+            "event_id": "Ev0001",
+            "event": {
+                "type": "message", "channel": "C1", "user": "U1", "text": "hello",
+                "ts": "1700000000.000000",
+            },
+        }).encode()
+
+        response = client.post("/slack/events", content=body, headers=_signed_slack_headers(body, signing_secret))
+
+        assert response.status_code == 200
+        assert len(delivered) == 1
+        assert delivered[0][0] == "slack"
+    finally:
+        session = get_open_session()
+        try:
+            ChannelConfigService(ScopedSession(session, LOCAL_SCOPE), registry=registry).delete_config("slack")
+        finally:
+            session.close()
+        _delete_channel_events("slack:event:Ev0001")

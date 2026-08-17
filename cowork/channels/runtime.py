@@ -16,7 +16,7 @@ from uuid import UUID
 from anton.core.dispatch import OutboundMessage
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context
+from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import ChannelContext, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
@@ -27,7 +27,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.artifacts import list_artifacts
 from cowork.services.channel_bindings import ChannelBindingService
-from cowork.services.channels import ChannelConfigService
+from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.skills import SkillService
@@ -158,6 +158,28 @@ class LiveAdapterRegistry:
             return cached
         await self.refresh(channel_type, org_id, session=session)
         return self.get(channel_type, org_id)
+
+    async def resolve_org_bridge(
+        self, channel_type: str, routing_key: str, *, session: Any | None = None
+    ) -> tuple[Any, str | None] | None:
+        """What the webhook path's org_resolver actually calls: unverified
+        routing key -> which installation claims it -> that installation's own
+        bridge. None means nothing claims this key. session is a raw Session,
+        for tests — production always opens its own."""
+        own_session = session is None
+        raw = session or get_open_session()
+        try:
+            install = resolve_installation_by_external_account(raw, channel_type, routing_key)
+            if install is None:
+                return None
+            scope = TenantScope(org_mode=True, org_id=install.org_id) if install.org_id else LOCAL_SCOPE
+            bridge = await self.get_or_refresh(
+                channel_type, install.org_id, session=ScopedSession(raw, scope)
+            )
+            return (bridge, install.org_id) if bridge is not None else None
+        finally:
+            if own_session:
+                raw.close()
 
     async def refresh(
         self, channel_type: str, org_id: str | None = None, *, session: ScopedSession | None = None
