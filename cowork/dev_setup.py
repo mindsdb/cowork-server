@@ -51,7 +51,9 @@ def run_dev_setup() -> None:
         if session.get(Project, GENERAL_PROJECT_ID) is None:
             project_root = Path(settings.project.root_dir)
             general_path = project_root / GENERAL_PROJECT
-            general_path.mkdir(parents=True, exist_ok=True)
+            # Dir only on desktop: org mode never adopts this NULL-org row.
+            if settings.tenancy_mode != "org":
+                general_path.mkdir(parents=True, exist_ok=True)
             session.add(
                 Project(
                     id=GENERAL_PROJECT_ID,
@@ -73,16 +75,19 @@ def run_dev_setup() -> None:
         # affected users already passed it).
         backfill_minds_url(session)
 
-    # Migrate harness-local memory into ~/.cowork/memory, then wire runtime symlinks.
+    # Migrate harness-local memory into ~/.cowork/memory, then wire runtime
+    # symlinks. Desktop-only: both write the unkeyed root; org-mode memory is
+    # org-first under the shared root and created on demand.
     import cowork.harnesses  # noqa: F401 — registers memory adapters
 
-    from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
-    from cowork.harnesses.memory.runtime import ensure_all_layouts
+    if settings.tenancy_mode != "org":
+        from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
+        from cowork.harnesses.memory.runtime import ensure_all_layouts
 
-    with SQLSession(engine) as session:
-        migrate_harness_memory_to_shared(session)
+        with SQLSession(engine) as session:
+            migrate_harness_memory_to_shared(session)
 
-    ensure_all_layouts()
+        ensure_all_layouts()
 
     # Skill migration + builtin seeding write the unkeyed root via an unscoped
     # SkillService. Desktop-only: org stores are per-org and API-populated, and

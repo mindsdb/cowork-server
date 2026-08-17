@@ -51,17 +51,16 @@ def shared_root(tmp_path, monkeypatch):
 
 
 def test_storage_root_local_is_base(shared_root):
-    assert scoped_storage_root(Path("/x"), None) == Path("/x")
-    assert scoped_storage_root(Path("/x"), LOCAL_SCOPE) == Path("/x")
+    assert scoped_storage_root(Path("/x"), None, store="x") == Path("/x")
+    assert scoped_storage_root(Path("/x"), LOCAL_SCOPE, store="x") == Path("/x")
 
 
 def test_storage_root_org_is_org_first_and_fail_closed(shared_root):
-    # org-first: <shared>/<org>/<store>, store defaulting to base.name
-    assert scoped_storage_root(Path("/x"), _org(ORG_A)) == shared_root / ORG_A / "x"
+    # org-first: <shared>/<org>/<store>; base never names the org dir
     assert (scoped_storage_root(Path("/renamed"), _org(ORG_A), store="skills")
             == shared_root / ORG_A / "skills")
     with pytest.raises(MissingTenantScopeError):
-        scoped_storage_root(Path("/x"), _org(None))
+        scoped_storage_root(Path("/x"), _org(None), store="x")
 
 
 @pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "a\\b"])
@@ -71,24 +70,18 @@ def test_storage_root_rejects_degenerate_store_segments(shared_root, bad):
         scoped_storage_root(Path("/x"), _org(ORG_A), store=bad)
 
 
-def test_storage_root_rejects_empty_default_segment(shared_root):
-    # store=None falls back to base.name; Path("/") has name == "".
-    with pytest.raises(ValueError, match="store segment"):
-        scoped_storage_root(Path("/"), _org(ORG_A))
-
-
 def test_user_storage_root_keys_org_and_user(shared_root):
-    assert scoped_user_storage_root(Path("/x"), None) == Path("/x")          # desktop
-    assert scoped_user_storage_root(Path("/x"), LOCAL_SCOPE) == Path("/x")
-    assert (scoped_user_storage_root(Path("/x"), _org(ORG_A, "alice"))
+    assert scoped_user_storage_root(Path("/x"), None, store="x") == Path("/x")   # desktop
+    assert scoped_user_storage_root(Path("/x"), LOCAL_SCOPE, store="x") == Path("/x")
+    assert (scoped_user_storage_root(Path("/x"), _org(ORG_A, "alice"), store="x")
             == shared_root / ORG_A / "x" / "users" / "alice")
 
 
 def test_user_storage_root_fails_closed_without_either_id(shared_root):
     with pytest.raises(MissingTenantScopeError):
-        scoped_user_storage_root(Path("/x"), _org(None))                     # no org
+        scoped_user_storage_root(Path("/x"), _org(None), store="x")              # no org
     with pytest.raises(MissingTenantScopeError):
-        scoped_user_storage_root(Path("/x"), _org(ORG_A, user=None))         # no user
+        scoped_user_storage_root(Path("/x"), _org(ORG_A, user=None), store="x")  # no user
 
 
 # skills
