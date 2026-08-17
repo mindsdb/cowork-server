@@ -479,6 +479,7 @@ def test_unpublish_folder_skips_soft_deleted(tmp_path: Path):
     # The keyed file must exist on disk so the only reason to skip is the flag.
     (root / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
     called = []
-    with patch.object(publish_mod, "unpublish_artifact", lambda p: called.append(p)):
-        _unpublish_folder(root)
+    with patch.object(publish_mod, "unpublish_artifact", lambda p, **kw: called.append(p)):
+        _unpublish_folder(root, artifacts_base=tmp_path, api_key="k",
+                          publish_url="https://4nton.ai")
     assert called == []

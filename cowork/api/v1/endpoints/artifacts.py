@@ -20,6 +20,7 @@ from sqlmodel import Session
 
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
+from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
 from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 from cowork.services.artifacts import (
     _project_artifacts_base,
@@ -67,7 +68,16 @@ def _html_with_layer(target: Path):
 
 @router.get("/")
 async def list_artifacts(project_path: str | None = Query(default=None)):
-    return _list_artifacts(project_path)
+    # Desktop shape only; the org-mode surface (project_id + ScopedSession) lands
+    # with the rest of the tenant-scoped endpoints.
+    sources = _sources_for_scan()
+    if project_path is not None:
+        wanted = Path(project_path).expanduser().resolve(strict=False)
+        sources = [
+            s for s in sources
+            if s.base.parent.parent.resolve(strict=False) == wanted
+        ]
+    return _list_artifacts(sources)
 
 
 @router.get("/status")
@@ -283,7 +293,20 @@ async def proxy(token: str, rel_path: str, request: Request):
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT)
 def delete_artifact_endpoint(path: str = Query(...)):
     try:
-        _delete_artifact(path)
+        from cowork.services.publish import (
+            desktop_artifact_and_base,
+            desktop_publish_credential,
+        )
+
+        artifact, artifacts_base = desktop_artifact_and_base(path)
+        # Credential resolved after the path so an unresolvable artifact still
+        # reports 404 rather than "configure your API key". Only needed at all
+        # because delete unpublishes first.
+        api_key, publish_url = desktop_publish_credential()
+        _delete_artifact(
+            artifact, artifacts_base=artifacts_base,
+            api_key=api_key, publish_url=publish_url,
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
