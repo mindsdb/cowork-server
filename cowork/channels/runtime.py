@@ -30,7 +30,6 @@ from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
-from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.skills import SkillService
 
 log = logging.getLogger(__name__)
@@ -204,11 +203,20 @@ class AntonChannelRuntime:
         self,
         adapters: LiveAdapterRegistry,
         *,
-        default_project_id: UUID = GENERAL_PROJECT_ID,
+        default_project_id: UUID | None = None,
     ) -> None:
         self._adapters = adapters
+        # None = resolve per scope. A fixed id only resolves for the seeded
+        # desktop row; each org has its own, so pinning one here would 404 the
+        # day channels are enabled in cloud (they are 501-gated today).
         self._default_project_id = default_project_id
         self._locks = _KeyedLocks()
+
+    def _resolve_default_project_id(self, scoped: ScopedSession) -> UUID | None:
+        if self._default_project_id is not None:
+            return self._default_project_id
+        from cowork.services.projects import ProjectService
+        return ProjectService(scoped).default_project_id()
 
     @staticmethod
     def _lock_key(channel_type: str, event: Any) -> str:
@@ -287,7 +295,7 @@ class AntonChannelRuntime:
     async def _start_fresh(self, scoped: ScopedSession, channel_type: str, binding: ChannelBinding, event: Any) -> None:
         """Handle /new: detach the pinned conversation and confirm deterministically instead of running a turn."""
         ChannelBindingService(scoped).detach_conversation(binding)
-        project = scoped.get(Project, binding.anton_project_id or self._default_project_id)
+        project = scoped.get(Project, binding.anton_project_id or self._resolve_default_project_id(scoped))
         name = project.name if project else "general"
         log.info("channel %s: /new detached conversation for binding %s", channel_type, binding.id)
         await self._deliver(
@@ -313,7 +321,7 @@ class AntonChannelRuntime:
             external_group_id=group_id,
             external_thread_id=thread_id,
             external_thread_key=thread_key,
-            anton_project_id=self._default_project_id,
+            anton_project_id=self._resolve_default_project_id(scoped),
             trigger_rule="mention_only" if event.message.is_group else "always",
         )
         scoped.add(binding)
@@ -346,7 +354,7 @@ class AntonChannelRuntime:
         topic = f"{binding.channel_type}: {binding.display_name or binding.external_group_id}"[:80]
         conversation = ConversationService(scoped).create_conversation(
             topic=topic,
-            project_id=binding.anton_project_id or self._default_project_id,
+            project_id=binding.anton_project_id or self._resolve_default_project_id(scoped),
         )
         binding.anton_conversation_id = conversation.id
         scoped.add(binding)

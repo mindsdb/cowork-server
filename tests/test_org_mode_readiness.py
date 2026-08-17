@@ -1,0 +1,120 @@
+"""Readiness in org mode, where no provider key is stored by design.
+
+Cloud mints a short-lived per-turn credential (turnqueue/auth_keys) and hands it
+to the pod, so a cloud tenant has nothing in ``minds_api_key`` and never should.
+Gating ``config_ready`` on a stored key therefore reported every cloud org as
+unconfigured, which sent it to onboarding — and onboarding's only way forward is
+writing ``planning_provider``/``coding_provider``, which are admin-owned, so a
+non-admin member got a 403 and could never reach the app.
+"""
+
+import pytest
+
+from cowork.common.settings import user_settings as us
+from cowork.common.settings.user_settings import Provider, UserSettings
+
+
+# UserSettings reads bare env vars (ANTHROPIC_API_KEY, …) and the .env chain, so
+# a developer's exported key would otherwise make a provider look configured and
+# win the readiness resolver — passing locally, failing in CI, or vice versa.
+_KEY_ENV = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "MINDS_API_KEY",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "PLANNING_PROVIDER",
+    "CODING_PROVIDER",
+)
+
+
+def _mode(monkeypatch, mode: str) -> None:
+    """Set tenancy_mode via the real settings (env + cache clear), so every
+    module's get_app_settings() agrees — user_settings, app_settings.role_defaults,
+    and providers all read the same source."""
+    for name in _KEY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("COWORK_TENANCY_MODE", mode)
+    us.get_app_settings.cache_clear()
+
+
+def _settings(**kw) -> UserSettings:
+    """No .env chain: the file would reintroduce the keys _mode just cleared."""
+    return UserSettings(_env_file=None, **kw)
+
+
+@pytest.fixture
+def org_mode(monkeypatch):
+    _mode(monkeypatch, "org")
+    yield
+    us.get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def local_mode(monkeypatch):
+    _mode(monkeypatch, "local")
+    yield
+    us.get_app_settings.cache_clear()
+
+
+class TestOrgModeDefaults:
+    def test_org_mode_defaults_to_minds_cloud(self, org_mode):
+        s = _settings()
+        assert s.planning_provider is Provider.MINDS_CLOUD
+        assert s.coding_provider is Provider.MINDS_CLOUD
+        assert s.router_provider is Provider.MINDS_CLOUD
+
+    def test_desktop_still_defaults_to_anthropic(self, local_mode):
+        s = _settings()
+        assert s.planning_provider is Provider.ANTHROPIC
+        assert s.coding_provider is Provider.ANTHROPIC
+
+
+class TestOrgModeReadiness:
+    def test_ready_with_nothing_stored(self, org_mode):
+        """The case that stranded every cloud org on the onboarding screen."""
+        cs = _settings().config_status
+
+        assert cs["config_ready"] is True
+        assert cs["config_error"] is None
+        assert cs["provider"] == Provider.MINDS_CLOUD.value
+
+    def test_models_resolve_to_the_minds_defaults(self, org_mode):
+        s = _settings()
+
+        # Readiness must imply build_llm_client can actually run: both roles
+        # resolve, or the turn throws despite reading as ready.
+        assert s.resolved_planning_model == "mindshub_air"
+        assert s.resolved_coding_model == "mindshub_air"
+
+    def test_desktop_with_nothing_stored_is_still_unconfigured(self, local_mode):
+        """The bypass is org-mode only — desktop must keep asking for a key."""
+        cs = _settings().config_status
+
+        assert cs["config_ready"] is False
+        assert "API key" in cs["config_error"]
+
+    def test_byok_without_a_key_falls_back_to_minds_in_org_mode(self, org_mode):
+        """BYOK in cloud is deferred: an org that selected a BYOK provider but
+        stored no key falls back to the managed MindsHub provider (ready) rather
+        than blocking — minds-cloud is always keyed in org mode (per-turn mint)."""
+        cs = _settings(
+            planning_provider=Provider.ANTHROPIC,
+            coding_provider=Provider.ANTHROPIC,
+        ).config_status
+
+        assert cs["config_ready"] is True
+        assert cs["provider"] == Provider.MINDS_CLOUD.value
+
+
+def test_ambient_provider_keys_do_not_override_minds(monkeypatch, org_mode):
+    """The live bug: the pod carries ANTHROPIC_API_KEY/OPENAI_API_KEY in its env,
+    so the resolver picked Anthropic and the UI showed it instead of MindsHub.
+    Org mode must resolve to MindsHub regardless of ambient provider keys."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai-ambient")
+    cs = UserSettings().config_status  # reads the ambient env, like the pod
+
+    assert cs["provider"] == Provider.MINDS_CLOUD.value
+    assert cs["model"] == "mindshub_air"
+    assert cs["config_ready"] is True

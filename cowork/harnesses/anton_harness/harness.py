@@ -7,6 +7,7 @@ import tempfile
 
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
@@ -17,7 +18,87 @@ from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
+
+
+#: Settings copied from the Cowork DB onto anton's own settings object, in
+#: order. The last three are non-nullable ints with defaults — unlike the
+#: entries above them, ``db_val`` is never None, so they ALWAYS override anton's
+#: own 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
+#: ``max_turn_tokens`` is the per-turn spend ceiling (ENG-1286); it overlays the
+#: SAME value anton defaults to rather than a looser one, because the
+#: distribution that sized it was measured on this traffic.
+_OVERLAID_SETTINGS: tuple[str, ...] = (
+    "planning_provider", "planning_model",
+    "coding_provider", "coding_model",
+    "memory_enabled", "memory_mode",
+    "episodic_memory", "proactive_dashboards", "act_first",
+    "max_tool_rounds", "max_continuations", "max_turn_tokens",
+)
+
+
+def _overlay_user_settings(anton_settings, user) -> list[str]:
+    """Copy the Cowork DB's settings onto anton's settings object.
+
+    Extracted from ``_build_chat_session`` so it can be tested against a REAL
+    ``AntonSettings``. It previously lived inline, and the only test of it
+    re-implemented this loop in the test body — so dropping a key from the tuple
+    (silently disabling a user-facing setting) or removing the skew guard below
+    (a total agent outage) both shipped green.
+
+    Returns the attrs actually applied, so a caller or test can assert on it.
+
+    **The skew guard is the load-bearing part.** anton is pinned as a git dep on
+    ``branch = "main"`` (see ``[tool.uv.sources]``), so cowork-server can ship a
+    setting whose field has only reached anton's ``staging`` — it arrives on
+    main at the weekly release, not when the anton PR merges. pydantic raises
+    ``ValueError: "AntonSettings" object has no field "x"`` on setattr of an
+    unknown field, and this runs on EVERY session build, so an unguarded overlay
+    turns a one-week ordering gap into a total agent outage rather than a
+    missing setting.
+    """
+    applied: list[str] = []
+    for attr in _OVERLAID_SETTINGS:
+        db_val = getattr(user, attr, None)
+        if db_val is None:
+            continue
+        if not hasattr(anton_settings, attr):
+            logger.warning(
+                "anton settings has no field %r — skipping overlay; the pinned "
+                "anton predates this setting (harmless: anton falls back to its "
+                "own default until the next release)", attr,
+            )
+            continue
+        # Provider enum -> string value for AntonSettings. The DB enum uses
+        # snake_case (openai_compatible, minds_cloud) but AntonSettings /
+        # LLMClient expect kebab-case (openai-compatible, minds-cloud).
+        if hasattr(db_val, "value"):
+            db_val = db_val.value.replace("_", "-")
+        setattr(anton_settings, attr, db_val)
+        applied.append(attr)
+    return applied
+
 settings = AntonHarnessSettings()
+
+
+def build_elicitor(conversation_id: str):
+    """The question strategy for this conversation, or None when disabled.
+
+    Returning None is the kill switch: anton only registers `ask_user` when
+    an elicitor supports "choice", so the model reverts to asking in plain
+    text with no silent-failure window. This holds only as long as the
+    ChatSessionConfig built from this value is not also given a `console`:
+    with elicitor=None and a console present, anton constructs its own
+    CLIElicitor (which does support "choice"), silently reopening the
+    switch. See tests/test_ask_user_flag.py for the guard.
+    """
+    if not get_app_settings().ask_user_enabled:
+        return None
+    from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
+    from cowork.streaming.answers import broker
+
+    # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
+    # place the number lives, so this call site does not restate it.
+    return CoworkElicitor(conversation_id, broker)
 
 
 _REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"
@@ -145,9 +226,27 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     )
 
 
+# How a file the agent cannot reach gets to it. Stated on EVERY turn, not
+# just turns that have attachments — the project context above tells the agent
+# what it may not access and used to say nothing about how access is granted,
+# so an agent asked to work on an unattached file had no legitimate move left.
+# It cannot ask for a path (forbidden two lines above, and by the file-access
+# policy), it cannot guess (forbidden by select_path's prompt), and the picker
+# cannot render in cowork — which is how one session ended up inventing the
+# user's sales data and reporting a forecast from it (ENG-1357).
+_ATTACHMENT_AFFORDANCE = (
+    " Files reach you in exactly two ways: they are already in the project "
+    "directory above, or the user attaches them to this conversation. If the "
+    "user refers to a file you cannot find in either place, ask them to attach "
+    "it to the conversation — that is how they grant you access. Do not ask "
+    "them to type or paste a filesystem path; you are not permitted to read "
+    "files that are neither in the project nor attached."
+)
+
+
 def _conversation_attachment_context(conversation) -> str:
-    """Prompt fragment listing the absolute paths of every file attached to
-    this conversation.
+    """Prompt fragment telling the agent which files are attached to this
+    conversation, and how the user can attach more.
 
     Uploads are stored under the files dir (``.cowork/files/<uuid>/<name>``),
     which is OUTSIDE the project workspace. An agent that only scans the
@@ -155,9 +254,17 @@ def _conversation_attachment_context(conversation) -> str:
     files were uploaded (the Cyberdeck bug). Handing it the exact paths lets
     it read them on demand on any turn — not just the turn they arrived on.
 
-    Returns "" when there are no attachments or they can't be resolved
-    (e.g. the conversation is detached from its session), so the caller can
-    append it unconditionally.
+    Never returns "": every turn carries ``_ATTACHMENT_AFFORDANCE`` so the
+    agent always knows attaching is the route to a file it cannot reach
+    (ENG-1357). Two distinct outcomes, and the distinction is load-bearing:
+
+    * **Known-empty** (no rows, or none still on disk) — say so, and name
+      attachment as the remedy.
+    * **Unknown** (detached session, no tenant scope, org mismatch, or a
+      swallowed exception) — emit the affordance ALONE. Asserting "no files
+      are attached" here would turn a failure to look into a confident false
+      negative, which is the Cyberdeck bug in the other direction: the user
+      attached a file and the agent flatly denies it exists.
     """
     try:
         from sqlalchemy.orm import object_session
@@ -167,7 +274,7 @@ def _conversation_attachment_context(conversation) -> str:
 
         db_session = object_session(conversation)
         if db_session is None:
-            return ""
+            return _ATTACHMENT_AFFORDANCE
         # Re-wrap with the ORIGINAL scope the conversation was loaded under —
         # never derived from the row itself. No recorded scope in org mode is
         # an invariant violation: log it and list nothing.
@@ -178,14 +285,14 @@ def _conversation_attachment_context(conversation) -> str:
                     "attachments: session carries no tenant scope in org mode — "
                     "listing skipped (conversation %s)", conversation.id,
                 )
-                return ""
+                return _ATTACHMENT_AFFORDANCE
             scope = LOCAL_SCOPE
         if scope.org_mode and conversation.org_id != scope.org_id:
             logger.warning(
                 "attachments: conversation %s org %r does not match scope org %r — listing skipped",
                 conversation.id, conversation.org_id, scope.org_id,
             )
-            return ""
+            return _ATTACHMENT_AFFORDANCE
         rows = FileService(ScopedSession(db_session, scope)).list_file_rows(
             purpose=attachment_purpose(str(conversation.id))
         )
@@ -209,7 +316,10 @@ def _conversation_attachment_context(conversation) -> str:
                     exc_info=True,
                 )
         if not attached:
-            return ""
+            return (
+                " No files are currently attached to this conversation."
+                + _ATTACHMENT_AFFORDANCE
+            )
         return (
             " The user has attached the following files to THIS conversation. "
             "They live OUTSIDE the project directory, so a project-only scan will "
@@ -237,7 +347,7 @@ def _conversation_attachment_context(conversation) -> str:
             conv_id,
             exc_info=True,
         )
-        return ""
+        return _ATTACHMENT_AFFORDANCE
 
 
 @register
@@ -528,26 +638,7 @@ class AntonHarness:
         anton_settings.skills_root = project_skills_dir
 
         user = get_user_settings()
-        for attr in (
-            "planning_provider", "planning_model",
-            "coding_provider", "coding_model",
-            "memory_enabled", "memory_mode",
-            "episodic_memory", "proactive_dashboards", "act_first",
-            # Non-nullable ints with defaults — unlike the entries above,
-            # db_val is never None here, so these ALWAYS override anton's own
-            # 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
-            "max_tool_rounds", "max_continuations",
-        ):
-            db_val = getattr(user, attr, None)
-            if db_val is None:
-                continue
-            # Provider enum -> string value for AntonSettings.
-            # The DB enum uses snake_case (openai_compatible, minds_cloud)
-            # but AntonSettings / LLMClient expect kebab-case
-            # (openai-compatible, minds-cloud).
-            if hasattr(db_val, "value"):
-                db_val = db_val.value.replace("_", "-")
-            setattr(anton_settings, attr, db_val)
+        _overlay_user_settings(anton_settings, user)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -606,11 +697,11 @@ class AntonHarness:
 
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import current_settings_scope
-        from cowork.db.scoped import scoped_storage_root
+        from cowork.db.scoped import scoped_user_storage_root
 
-        # Org-keyed via the turn's ambient scope — the in-process harness must
-        # read/write the same per-org memory the /memory API serves.
-        global_memory_dir = scoped_storage_root(
+        # Per-(org, user) via the turn's ambient scope — the in-process harness
+        # must read/write the same global-scope memory the /memory API serves.
+        global_memory_dir = scoped_user_storage_root(
             Path(get_app_settings().memory.root_dir).expanduser(), current_settings_scope()
         )
         global_memory_dir.mkdir(parents=True, exist_ok=True)
@@ -843,6 +934,7 @@ class AntonHarness:
             initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),
+            elicitor=build_elicitor(str(conversation.id)),
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,

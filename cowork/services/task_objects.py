@@ -432,21 +432,39 @@ def _seed_draft_from_store(folder: Path, slug: str) -> None:
 
     ponytail: copies top-level files only (skills are flat text) — mirrors
     `_skill_draft_payload`, which also skips subdirs.
+
+    `slug` is agent-supplied: validate it, and key the store by the turn's
+    ambient scope. Org mode with no scope bound seeds nothing rather than
+    reading the unkeyed root.
     """
-    from anton.core.tools.skill_format import SKILL_FILE
+    from anton.core.tools.skill_format import SKILL_FILE, validate_name
 
     try:
         from cowork.common.settings.app_settings import get_app_settings
+        from cowork.common.settings.user_settings import current_settings_scope
+        from cowork.db.scoped import scoped_storage_root
 
-        src = Path(get_app_settings().skill.root_dir) / slug
+        validate_name(slug)
+        settings = get_app_settings()
+        scope = current_settings_scope()
+        if settings.tenancy_mode == "org" and (scope is None or not scope.org_mode):
+            return
+        src = scoped_storage_root(Path(settings.skill.root_dir), scope) / slug
     except Exception:
         return
-    if not (src / SKILL_FILE).is_file():
+    # Skip symlinks (dir and children): the store is org-shared, so a link could
+    # dereference into another org's files (copy2/is_file follow symlinks).
+    if src.is_symlink() or not (src / SKILL_FILE).is_file():
         return
+    src_resolved = src.resolve()
     try:
         for child in src.iterdir():
-            if child.is_file():
-                shutil.copy2(child, folder / child.name)
+            if child.is_symlink() or not child.is_file():
+                continue
+            if child.resolve().parent != src_resolved:
+                logger.warning("Skill draft seed %r: skipping out-of-tree file %r", slug, child.name)
+                continue
+            shutil.copy2(child, folder / child.name)
     except OSError:
         logger.warning("Could not seed skill draft %r from store", slug, exc_info=True)
 

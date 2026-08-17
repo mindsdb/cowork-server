@@ -77,7 +77,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the MySQL user above. Stored encrypted locally."
+            "description": "Password for the MySQL user above. Stored locally with restricted file permissions."
           },
           {
             "name": "use_ssl",

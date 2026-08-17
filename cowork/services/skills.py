@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import logging
 import os
 import shutil
 import tempfile
@@ -28,6 +30,113 @@ from cowork.models.skill import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+# Per-file cap (matches the skill-draft cap): filters mispackaged data blobs and
+# stops one bad skill from bloating the payload. The aggregate request size is
+# bounded downstream by the producer's _fit_request against the real stdin cap.
+_TURN_SKILL_FILE_MAX = 200_000
+
+
+def _wire_len(text: str) -> int:
+    """Bytes `text` occupies on the wire. The controller uses ensure_ascii JSON,
+    so counting chars would under-count non-ASCII ~6x against the byte cap."""
+    return len(json.dumps(text))
+
+
+def _skill_wire_files(skill_dir: Path, root: Path) -> dict[str, str] | None:
+    """One skill directory as ``{posix relpath: text}`` for the wire, or None
+    to drop it (no parseable/fitting SKILL.md).
+
+    Text files only; ``stats.json`` (private sidecar), hidden files, and
+    symlinks are excluded. Containment is checked against ``root``, not
+    ``skill_dir`` — resolving against a symlinked skill_dir would resolve to
+    its foreign target and find everything "inside" it.
+    """
+    files: dict[str, str] = {}
+    root_resolved = root.resolve()
+    for child in sorted(skill_dir.rglob("*")):
+        if not child.is_file() or child.is_symlink():
+            continue
+        try:
+            # rglob not following dir symlinks is just a stdlib default; ensure
+            # no child resolves into another org's store.
+            child.resolve().relative_to(root_resolved)
+        except (OSError, ValueError):
+            logger.warning("turn skills: skipping out-of-tree path %r in %r",
+                           str(child), skill_dir.name)
+            continue
+        rel = child.relative_to(skill_dir).as_posix()
+        if rel == "stats.json" or any(p.startswith(".") for p in rel.split("/")):
+            continue
+        try:
+            text = child.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            logger.warning("turn skills: skipping unreadable or non-text file %r in %r",
+                           rel, skill_dir.name)
+            continue
+        if _wire_len(text) > _TURN_SKILL_FILE_MAX:
+            if rel == SKILL_FILE:
+                logger.warning("turn skills: dropping %r (SKILL.md over %d wire bytes)",
+                               skill_dir.name, _TURN_SKILL_FILE_MAX)
+                return None
+            logger.warning("turn skills: skipping oversized file %r in %r (%d wire bytes)",
+                           rel, skill_dir.name, _wire_len(text))
+            continue
+        files[rel] = text
+    if SKILL_FILE not in files:
+        return None
+    return files
+
+
+def build_turn_skills(scope: TenantScope | None, project_path: str | None = None) -> dict[str, dict]:
+    """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``.
+
+    Org-keyed through the passed `scope` (the producer binds no ambient scope).
+    Selection mirrors skill_links: enabled skills whose ``metadata.projects`` is
+    empty or names this project's folder.
+
+    Slug and files both come from the DIRECTORY, not frontmatter ``name`` — the
+    two can drift on a hand-edited store, and resolving by frontmatter could
+    ship another (e.g. disabled) skill's files. Every drop is logged.
+    """
+    svc = SkillService(scope)
+    project_name = Path(project_path).name if project_path else None
+
+    out: dict[str, dict] = {}
+    if not svc.root.exists():
+        return out
+    root = svc.root
+    for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        slug = skill_dir.name
+        if skill_dir.is_symlink():
+            # is_dir() follows the link, so a symlinked dir could point into
+            # another org's store — reject it.
+            logger.warning("turn skills: dropping %r (symlinked skill directory)", slug)
+            continue
+        if not (skill_dir / SKILL_FILE).exists():
+            continue
+        try:
+            validate_name(slug)
+        except ValueError:
+            logger.warning("turn skills: dropping %r (directory name is not a valid slug)", slug)
+            continue
+        skill = _skill_from_dir(skill_dir)
+        if skill is None:
+            logger.warning("turn skills: dropping %r (unparseable SKILL.md)", slug)
+            continue
+        if not skill.enabled:
+            continue
+        if skill.projects and (project_name is None or project_name not in skill.projects):
+            continue
+        files = _skill_wire_files(skill_dir, root)
+        if files is None:
+            logger.warning("turn skills: dropping %r (no SKILL.md within size bounds)", slug)
+            continue
+        out[slug] = {"files": files}
+    return out
+
+
 def _skill_from_dir(skill_dir: Path) -> Skill | None:
     """Read a ``SKILL.md`` folder into a ``Skill``.
     """
@@ -46,11 +155,15 @@ class SkillService:
     shared root unchanged."""
 
     def __init__(self, scope: TenantScope | None = None) -> None:
-        self.root = scoped_storage_root(Path(get_app_settings().skill.root_dir), scope)
-        # Project symlink distribution is desktop-only: skill_links resolves
-        # from the unkeyed root and scans all project dirs, so it must not run
-        # in org mode.
-        self._link_projects = scope is None or not scope.org_mode
+        settings = get_app_settings()
+        self.root = scoped_storage_root(Path(settings.skill.root_dir), scope)
+        # Symlink distribution is desktop-only (skill_links resolves the unkeyed
+        # root and scans all project dirs). Keyed on deployment mode, not just
+        # scope — an unscoped service (migration, seeding) must not fan symlinks
+        # out of the unkeyed root in org mode either.
+        self._link_projects = settings.tenancy_mode != "org" and (
+            scope is None or not scope.org_mode
+        )
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _skill_dir(self, slug: str) -> Path:

@@ -1,0 +1,28 @@
+# CODEOWNERS
+#
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-customizations/customizing-your-repository/about-code-owners
+# Order matters: later patterns override earlier ones for the same path.
+#
+# GitHub reads this file from the PR's BASE branch, so a change here starts
+# applying to the next PR opened against that branch, not to the one adding it.
+
+# Infrastructure Team
+#
+# `.github/` gates itself, so the ownership rules cannot be removed without the
+# team that owns them seeing it.
+.github             @mindsdb/devops
+.github/CODEOWNERS  @mindsdb/devops
+
+# Every push to `staging` and `main` publishes a wheel to PyPI, and installed
+# desktop apps pull from that stream on their own. A bad change on these paths
+# reaches machines we do not control and cannot roll back the way a server
+# deploy can be rolled back: the remedy is yanking a release, after the fact.
+Dockerfile          @mindsdb/devops
+Makefile            @mindsdb/devops
+deployment          @mindsdb/devops
+
+# Schema migrations. The sidecar refuses to boot against a database that is
+# ahead of its code, so a migration that ships early strands every install that
+# has not yet updated, and the recovery is manual.
+alembic.ini         @mindsdb/devops
+cowork/db/alembic   @mindsdb/devops

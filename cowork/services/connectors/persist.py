@@ -10,6 +10,8 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+from anton.utils.datasources import default_user_label, ensure_unique_user_label
+
 from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.services.connectors.identity import (
     derive_connection_name,
@@ -33,6 +35,7 @@ def persist_connection(
     credentials: dict,
     *,
     label: str | None = None,
+    user_label: str | None = None,
     vault=None,
 ) -> str:
     """Persist a connection and return the slug used.
@@ -46,6 +49,12 @@ def persist_connection(
     ``label`` / ``_label`` field in ``credentials`` — is stored as the non-secret
     ``_label`` so it can name the connection without changing its identity/slug.
     An existing label is preserved when a later save doesn't set one.
+
+    ``user_label`` — passed explicitly or as a ``user_label`` / ``_user_label``
+    field in ``credentials`` — is the newer, globally-unique, de-duplicated
+    replacement for ``label``; stored as ``_user_label`` and carried forward
+    the same way. A brand-new connection that doesn't set one gets a computed
+    default (the engine id, de-duplicated).
     """
     if vault is None:
         vault = _default_vault()
@@ -54,11 +63,14 @@ def persist_connection(
     label = str(
         label or cred.pop("label", "") or cred.pop("_label", "") or ""
     ).strip()
+    user_label = str(
+        user_label or cred.pop("user_label", "") or cred.pop("_user_label", "") or ""
+    ).strip()
 
     base_slug = (
         (name or "").strip()
         or derive_connection_name(connector_id, method, cred)
-        or f"{connector_id}-{uuid.uuid4().hex[:6]}"
+        or f"{connector_id}-{uuid.uuid4().hex[:8]}"
     )
     # Locked for the same reason ConnectionsService's merge_picked_files/
     # remove_picked_file/patch_token are: this is a read-modify-write against
@@ -90,6 +102,28 @@ def persist_connection(
             label = str((existing or {}).get("fields", {}).get("_label", "")).strip()
         if label:
             payload["_label"] = label
+        if not user_label:
+            user_label = str((existing or {}).get("fields", {}).get("_user_label", "")).strip()
+        if not user_label and existing is None:
+            # Genuinely new connection — nothing existed at this slug before
+            # this save, nothing explicit was passed, nothing to carry
+            # forward. Compute the same default anton's CLI prompt would show
+            # (engine id, de-duplicated); otherwise a connection created via
+            # cowork without an explicit label ends up with none at all,
+            # while every anton-created connection always gets one.
+            #
+            # Checked against `existing is None`, not `is_edit` — `is_edit`
+            # is only true when the request carried a GUI modify-flow
+            # keep-sentinel; a same-account re-save that reaches this
+            # function some other way (no sentinel) still resolves to the
+            # pre-existing record via `resolve_unique_slug()`'s
+            # `is_same_account()` check, and `existing` correctly reflects
+            # that (non-None) even though `is_edit` would be False.
+            user_label = default_user_label(vault, connector_id)
+        if user_label:
+            payload["_user_label"] = ensure_unique_user_label(
+                vault, user_label, exclude=(connector_id, slug)
+            )
         existing_picked_files = (existing or {}).get("fields", {}).get("_picked_files")
         if existing_picked_files:
             payload.setdefault("_picked_files", existing_picked_files)
@@ -97,19 +131,25 @@ def persist_connection(
         return slug
 
 
-def set_connection_label(engine: str, name: str, label: str, *, vault=None) -> bool:
-    """Set the human label on an existing connection in place. Returns False if
-    the connection doesn't exist. Used by the agent's learn-and-persist flow
-    (e.g. after the user confirms which address is "Support") — updates only the
-    non-secret ``_label`` and leaves the identity/slug and secrets untouched.
+def set_connection_label(engine: str, name: str, label: str, *, vault=None) -> str | None:
+    """Set the human label on an existing connection in place. Returns the
+    stored value (post-deduplication — may differ from the requested `label`),
+    or None if the connection doesn't exist or `label` is blank. Used by the
+    agent's learn-and-persist flow (e.g. after the user confirms which address
+    is "Support") — updates only the non-secret ``_user_label`` and leaves the
+    identity/slug and secrets untouched.
     """
+    clean_label = str(label or "").strip()
+    if not clean_label:
+        return None
     if vault is None:
         vault = _default_vault()
     with lock_for(engine, name):
         record = vault.read_record(engine, name)
         if record is None:
-            return False
+            return None
         fields = dict(record.get("fields") or {})
-        fields["_label"] = str(label or "").strip()
+        stored = ensure_unique_user_label(vault, clean_label, exclude=(engine, name))
+        fields["_user_label"] = stored
         vault.save(engine, name, fields, secure_keys=record.get("secure_keys"))
-        return True
+        return stored

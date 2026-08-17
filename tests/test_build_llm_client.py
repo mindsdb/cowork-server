@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import SecretStr
 
+from anton.core.llm.openai import OpenAIProvider as _RealOpenAIProvider
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.services.providers import GEMINI_BASE_URL
 
@@ -40,7 +41,18 @@ def build(monkeypatch):
 
     # build_llm_client imports these inside the function, so patching the module
     # attribute is picked up at call time.
-    monkeypatch.setattr("anton.core.llm.openai.OpenAIProvider", _capture("openai"))
+    _fake_openai = _capture("openai")
+    # _make_provider calls OpenAIProvider.resolve_web_flavor(...) (ENG-1359),
+    # whose body references the FLAVOR_* constants via the module-global name
+    # `OpenAIProvider` — which this monkeypatch just repointed at `_fake_openai`.
+    # So the fake needs both the real staticmethod and the real constants it reads.
+    _fake_openai.resolve_web_flavor = _RealOpenAIProvider.resolve_web_flavor
+    _fake_openai.FLAVOR_OPENAI = _RealOpenAIProvider.FLAVOR_OPENAI
+    _fake_openai.FLAVOR_MINDS_PASSTHROUGH = _RealOpenAIProvider.FLAVOR_MINDS_PASSTHROUGH
+    _fake_openai.FLAVOR_OPENAI_COMPATIBLE_GENERIC = (
+        _RealOpenAIProvider.FLAVOR_OPENAI_COMPATIBLE_GENERIC
+    )
+    monkeypatch.setattr("anton.core.llm.openai.OpenAIProvider", _fake_openai)
     monkeypatch.setattr(
         "anton.core.llm.anthropic.AnthropicProvider", _capture("anthropic")
     )

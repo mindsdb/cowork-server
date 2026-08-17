@@ -86,14 +86,27 @@ def scope_for_background_context() -> TenantScope:
 
 
 def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
-    """Org-keyed root for filesystem stores: ``base`` in local mode,
-    ``base/<org_id>`` in org mode, fail-closed without an org. org_id is a
-    normalized UUID (TrustedHeaderMiddleware), so it's path-safe."""
+    """Org-keyed root for filesystem stores shared by the whole org: ``base`` in
+    local mode, ``base/<org_id>`` in org mode, fail-closed without an org. org_id
+    is a normalized UUID (TrustedHeaderMiddleware), so it's path-safe."""
     if scope is None or not scope.org_mode:
         return base
     if not scope.org_id:
         raise MissingTenantScopeError("filesystem store requires an organization in scope")
     return base / scope.org_id
+
+
+def scoped_user_storage_root(base: Path, scope: TenantScope | None) -> Path:
+    """``base/<org_id>/users/<user_id>``, for stores that are one person's rather
+    than the org's. ``base`` in local mode (one user per machine); org mode
+    fail-closes without BOTH ids, since silently sharing one person's store across
+    an org is a correctness bug, not a lenient default (ADR-0002)."""
+    org_root = scoped_storage_root(base, scope)
+    if scope is None or not scope.org_mode:
+        return org_root
+    if not scope.user_id:
+        raise MissingTenantScopeError("per-user filesystem store requires a user in scope")
+    return org_root / "users" / scope.user_id
 
 
 def scope_of_session(session: Session) -> TenantScope | None:

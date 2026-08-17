@@ -59,6 +59,21 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 # while openai-compatible is the explicitly selected provider; on a *switch* to
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
+# The one model MindsHub's free monthly allowance covers; every other alias
+# bills the wallet. Org mode (managed, free-first) defaults to it so a tenant
+# with no wallet balance isn't 402'd on its first turn. Desktop keeps the
+# premium canonical defaults below.
+MINDS_FREE_MODEL = "mindshub_air"
+
+
+def role_defaults(base: dict[str, str]) -> dict[str, str]:
+    """Model defaults for the current deployment: org mode overrides the
+    minds-cloud default to the free-bucket model (no wallet balance yet);
+    desktop keeps the premium canonical maps below."""
+    if get_app_settings().tenancy_mode == "org":
+        return {**base, "minds_cloud": MINDS_FREE_MODEL}
+    return base
+
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.5",
@@ -143,6 +158,25 @@ def default_minds_api_host() -> str:
 def default_minds_url() -> str:
     """Environment-aware MindsHub API URL (with /v1 path)."""
     return f"{default_minds_api_host()}/v1"
+
+
+def default_turn_minds_api_host() -> str:
+    """MindsHub API host for the POD's turn — this deployment's OWN inference.
+
+    Per-PR envs are the one case ``default_minds_api_host`` gets wrong: they all
+    run ENV=development, so it yields dev's host, but each has its own inference
+    AND its own auth database — a key minted here is unknown to dev's auth (401).
+    Their namespace carries the slug, so derive from that (downward API, not a
+    Host header: a crafted Host would send the pod, and the minted key, to an
+    attacker's endpoint).
+
+    Everything else — dev, staging, prod, desktop — keeps the ENV-slug host,
+    which is already correct (notably prod, which has no slug at all).
+    """
+    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
+    if ns.startswith("pr-"):
+        return f"https://api-{ns}.dev.mindshub.ai"
+    return default_minds_api_host()
 
 
 def default_publish_url() -> str:
@@ -310,8 +344,24 @@ class TurnQueueSettings(Settings):
     )
     jobs_stream: str = Field(
         default="scratchpad:requests",
-        description="Redis stream key turn jobs are queued on when backend is 'remote'.",
+        description=(
+            "Key prefix for turn job streams when backend is 'remote'. Each conversation "
+            "gets its own stream at '{prefix}:{conversation_id}', and '{prefix}:queues' is "
+            "the set of conversations that have one. The controller locks a conversation "
+            "before reading its stream, so a job for a busy pod is never delivered and "
+            "never blocks another conversation."
+        ),
     )
+    reply_idle_timeout_seconds: float = Field(
+        default=600.0,
+        description=(
+            "Fail a remote turn after this many seconds with no reply for it on the reply "
+            "stream (worker down, crashed, or wedged). Generous on purpose: the reply "
+            "protocol has no heartbeat, so a long tool run legitimately produces no reply "
+            "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
+            "which means an unresponsive worker leaves the turn spinning forever."
+        ),
+    )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
         default="",
         description="Base URL of the auth service's internal API, used to mint per-turn MindsHub keys.",
@@ -427,6 +477,19 @@ class AppSettings(Settings):
             "from which a per-request principal is built."
         ),
     )
+    ask_user_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
+        description=(
+            "Whether the agent may ask interactive multiple-choice questions "
+            "(the `ask_user` tool). Off by default because the renderer must "
+            "ship first: the frontend and this server are versioned "
+            "independently, and a client that does not know the "
+            "`response.ask_user` event drops it silently, leaving the agent "
+            "apparently hung until the question times out. Turn on only after "
+            "the frontend is rolled out."
+        ),
+    )
     install_channel_override: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_INSTALL_CHANNEL"),
@@ -534,6 +597,23 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_CONTINUATIONS"),
         description="Default for the per-user 'Max Auto-Continues' agent budget.",
     )  # COWORK_DEFAULT_MAX_CONTINUATIONS
+    # Unlike the two above, this one does NOT deliberately run looser than
+    # anton's own default — it matches it (ENG-1286's 1,250,000). The measured
+    # per-turn distribution that set that number came from Cowork traffic, so
+    # it already reflects these looser round budgets; raising it here would
+    # loosen a ceiling against the very population it was sized on.
+    default_max_turn_tokens: int = Field(
+        default=1_250_000,
+        # Deployment-level default. Kept at ge=750_000 rather than mirroring
+        # UserSettings' "0 = unlimited": an operator turning the guard off for a
+        # whole org silently is exactly the outcome the per-user sentinel exists
+        # to make deliberate. An operator who really wants that sets a huge
+        # number, which is at least visible in the value.
+        ge=750_000,
+        le=50_000_000,
+        validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),
+        description="Default for the per-user 'Max Tokens per Task' agent budget.",
+    )  # COWORK_DEFAULT_MAX_TURN_TOKENS
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
