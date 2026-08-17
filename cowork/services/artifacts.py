@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -27,6 +28,24 @@ from urllib.parse import quote
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProjectArtifacts:
+    """One project's artifacts root plus the identity the client sees.
+
+    Callers resolve this (see services.artifact_roots) and hand it in; the
+    service never discovers roots on its own, because discovery cannot tell
+    which tenant is asking.
+    """
+
+    base: Path
+    project_id: str | None
+    project_name: str
+
+
+def _is_org_mode() -> bool:
+    return get_app_settings().tenancy_mode == "org"
 
 # In-memory registry: deterministic token → parent dir of an artifact.
 # Used for both static (HTML asset) and proxy (fullstack backend) mounts;
@@ -254,6 +273,13 @@ def _content_mtime(folder: Path) -> int:
 content_mtime = _content_mtime
 
 
+def load_published_map(folder: Path) -> dict:
+    """The `.published.json` record for an artifact folder, `{}` when absent or
+    unreadable. Public because the autopublish reconciler needs the same view of
+    publish state that the card builder uses."""
+    return _load_published_map(folder)
+
+
 def _published_url_for(folder: Path, primary: Path | None) -> str:
     if primary is None:
         return ""
@@ -392,7 +418,14 @@ def _project_artifacts_base(project_name: str) -> Path | None:
 def serve_url_for(path: str | Path) -> str:
     """Origin-relative `/api/v1/artifacts/serve/...` URL for a file under a
     project's `.anton/artifacts` tree. Returns "" when the path isn't
-    inside such a tree."""
+    inside such a tree.
+
+    Always "" in org mode: there the server does not serve artifact content at
+    all. The only route to content is the published URL, which carries an access
+    check — so there is no local URL to build.
+    """
+    if _is_org_mode():
+        return ""
     try:
         p = Path(path).resolve(strict=False)
     except (OSError, ValueError):
@@ -512,7 +545,9 @@ def _fullstack_types() -> frozenset[str]:
         return frozenset()
 
 
-def _unpublish_folder(folder: Path) -> None:
+def _unpublish_folder(
+    folder: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+) -> None:
     """Unpublish every published file in an artifact folder.
 
     Reads `.published.json` and unpublishes each recorded file from the
@@ -525,7 +560,7 @@ def _unpublish_folder(folder: Path) -> None:
         return
 
     # Local import to avoid a circular dependency: publish imports artifacts.
-    from cowork.services.publish import desktop_publish_context, unpublish_artifact
+    from cowork.services.publish import unpublish_artifact
 
     for name, entry in published_map.items():
         if not isinstance(entry, dict):
@@ -538,46 +573,51 @@ def _unpublish_folder(folder: Path) -> None:
             continue
         if not (entry.get("report_id") or entry.get("last_md5")):
             continue
-        # The path-based unpublish needs the file present; a stale record
-        # for a missing file can't be unpublished this way, so skip it.
         if not (folder / name).is_file():
+            # The path-based unpublish needs the file present, so this record
+            # cannot be cleared upstream — and once the folder is gone there is
+            # nothing left pointing at the remote copy. No metrics backend
+            # exists here, so this log line is the metric; keep the prefix.
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=primary_missing",
+                entry.get("report_id") or entry.get("last_md5"),
+                entry.get("url", ""),
+            )
             continue
-        target, base, api_key, publish_url = desktop_publish_context(str(folder / name))
         unpublish_artifact(
-            target, artifacts_base=base, api_key=api_key, publish_url=publish_url,
+            folder / name, artifacts_base=artifacts_base,
+            api_key=api_key, publish_url=publish_url,
         )
 
 
-def delete_artifact(raw_path: str) -> None:
+def delete_artifact(
+    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+) -> None:
     """Permanently delete an artifact folder from disk.
 
-    If the artifact has published files, they are unpublished from the
-    remote first. If any unpublish fails, the artifact is left on disk
-    and the error propagates to the caller.
+    Published files are unpublished first; if any unpublish fails the artifact is
+    left on disk and the error propagates. Containment is checked against the
+    caller-supplied root — the only thing that ties the request to a tenant.
     """
-    target = resolve_artifact_path(raw_path)
-    if target is None:
-        raise ValueError("Invalid artifact path")
-
-    if target.is_dir() and (target / "metadata.json").exists():
-        folder = target
-    elif target.is_file():
-        folder = target.parent
+    if artifact.is_dir() and (artifact / "metadata.json").exists():
+        folder = artifact
+    elif artifact.is_file():
+        folder = artifact.parent
         if not (folder / "metadata.json").exists():
             raise ValueError("Not a valid artifact folder")
     else:
         raise FileNotFoundError("Artifact not found")
 
-    for art_root in _scan_artifact_dirs():
-        try:
-            folder.relative_to(art_root.resolve())
-        except ValueError:
-            continue
-        # Unpublish before deleting; if this raises, the artifact stays.
-        _unpublish_folder(folder)
-        shutil.rmtree(folder)
-        return
-    raise FileNotFoundError("Artifact is not in a known artifacts directory")
+    try:
+        folder.resolve().relative_to(Path(artifacts_base).resolve())
+    except (ValueError, OSError):
+        raise FileNotFoundError("Artifact is not in a known artifacts directory")
+
+    # Unpublish before deleting; if this raises, the artifact stays.
+    _unpublish_folder(
+        folder, artifacts_base=artifacts_base, api_key=api_key, publish_url=publish_url,
+    )
+    shutil.rmtree(folder)
 
 
 def reveal_in_file_manager(path: Path) -> None:
@@ -632,7 +672,7 @@ def card_for_folder(
     # `content_mtime` alias other services import.
     mtime_seconds = _content_mtime(folder)
 
-    return {
+    card = {
         "id": meta.get("id") or folder.name,
         "slug": meta.get("slug") or folder.name,
         "title": meta.get("name") or folder.name,
@@ -645,6 +685,11 @@ def card_for_folder(
         "live": is_live,
         "bg": BG_CYCLE[idx % len(BG_CYCLE)],
         "fileCount": len(files),
+        # `folder`/`path` stay in the payload even in org mode: the renderer uses
+        # `path` as an opaque state key (the in-flight `busyPaths` set, live-row
+        # matching, title fallbacks), and it is no secret — a client of its own
+        # organization already knows `<root>/<org_id>`. Isolation comes from
+        # `projectId` plus the server-side scope, not from hiding the path.
         "folder": str(folder),
         "path": primary_path,
         "primary": meta.get("primary") or None,
@@ -657,6 +702,16 @@ def card_for_folder(
         **_published_access_for(folder, primary),
         "serveUrl": serve_url_for(primary_path),
     }
+    if _is_org_mode():
+        # Dropped at the single card builder so inline chat cards are covered
+        # too: they call this function as well, and a filter applied only at the
+        # list endpoint would still hand the plaintext password to the chat.
+        # Access in org mode is always restricted-to-org, so neither field has a
+        # consumer there. `accessMode` stays — ArtifactStatus draws its badge
+        # from it.
+        card.pop("accessPassword", None)
+        card.pop("accessEmails", None)
+    return card
 
 
 def artifact_status(raw_path: str) -> dict:
@@ -707,18 +762,37 @@ def artifact_status(raw_path: str) -> dict:
     }
 
 
-def list_artifacts(project_path: str | None = None) -> list[dict]:
-    """Every artifact across all projects, newest first."""
+def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
+    """Every artifact under the given roots, newest first, capped at 80.
+
+    Roots come from the caller (see services.artifact_roots) — this function
+    never discovers them, because a filesystem scan cannot tell which tenant is
+    asking. The 80-item cap is pre-existing but matters more in org mode, where
+    `sources` spans every project of the organization instead of one tree.
+    """
     cards: list[dict] = []
-    for folder in _iter_artifact_folders(project_path):
-        card = card_for_folder(folder, len(cards))
-        if card is None:
+    for source in sources:
+        base = Path(source.base)
+        if not base.is_dir():
             continue
         try:
-            card["_sortTs"] = (folder / "metadata.json").stat().st_mtime
+            children = sorted(base.iterdir())
         except OSError:
-            card["_sortTs"] = 0.0
-        cards.append(card)
+            continue
+        for folder in children:
+            if not folder.is_dir() or not (folder / "metadata.json").is_file():
+                continue
+            card = card_for_folder(
+                folder, len(cards),
+                project_id=source.project_id, project_name=source.project_name,
+            )
+            if card is None:
+                continue
+            try:
+                card["_sortTs"] = (folder / "metadata.json").stat().st_mtime
+            except OSError:
+                card["_sortTs"] = 0.0
+            cards.append(card)
 
     cards.sort(key=lambda c: c["_sortTs"], reverse=True)
     for c in cards:
