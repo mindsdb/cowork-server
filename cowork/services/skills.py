@@ -100,6 +100,16 @@ def build_turn_skills(scope: TenantScope | None, project_path: str | None = None
     two can drift on a hand-edited store, and resolving by frontmatter could
     ship another (e.g. disabled) skill's files. Every drop is logged.
     """
+    # Function-local: migrations imports this module, so a top-level import
+    # would be circular.
+    from cowork.migrations import ensure_builtin_skills
+
+    # A fresh org's store starts empty and there is no org-creation hook, so the
+    # builtins are seeded on first read. Seeded here for an org that chats before
+    # it ever opens the skills menu; the menu seeds too, so whichever comes first
+    # wins. No-op after that, and in local mode.
+    ensure_builtin_skills(scope)
+
     svc = SkillService(scope)
     project_name = Path(project_path).name if project_path else None
 
