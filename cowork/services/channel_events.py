@@ -1,11 +1,12 @@
 """Channel event log — inbound/outbound audit + inbound de-duplication.
 
-ChannelEvent has no org_id: dedupe by (channel_type, dedupe_key) is safe only
-because channel_type maps to exactly one installation per database (enforced
-by UNIQUE(channel_installations.channel_type); provider event ids are unique
-per chat/account, not globally). If per-org installations ever relax that
-constraint, this table needs an installation anchor in the same migration —
-test_channels_tenancy pins the invariant.
+Installations are org-wide now, so ChannelEvent carries org_id as its
+installation anchor: dedupe by (channel_type, dedupe_key) alone would let one
+org's redelivered event collide with another's. No scoping logic lives here
+on purpose — ChannelEvent is a normal org-scoped model (not in
+_TENANCY_DEFERRED_TABLES), so ScopedSession's generic auto-stamp/auto-filter
+already does it: `.add()` stamps org_id, `.select()`/`.exec()` filter by it.
+See tests/test_channels_tenancy.py for the cross-org dedupe coverage.
 """
 from __future__ import annotations
 

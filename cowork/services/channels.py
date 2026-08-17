@@ -3,7 +3,7 @@ from __future__ import annotations
 from cowork.channels.plugin import ChannelPlugin
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession
 from cowork.models.channel import ChannelInstallation
 from cowork.models.setting import Setting
 from cowork.schemas.channels import (
@@ -163,27 +163,55 @@ class ChannelConfigService:
             for name in required
         )
 
+    def _org_id(self) -> str | None:
+        """Org-wide, not per-member: one installation's credentials serve the
+        whole org, matching how provider credentials are already scoped
+        (SettingService). Fails closed rather than falling back to a global
+        row — a channel credential belonging to no specific org must never be
+        readable or writable once org mode is on."""
+        scope = self.session.scope
+        if not scope.org_mode:
+            return None
+        if not scope.org_id:
+            raise MissingTenantScopeError("channel config requires an organization in scope")
+        return scope.org_id
+
     def _fetch_setting(self, key: str) -> Setting | None:
-        # Channel creds are global (key-only) rows here, bypassing SettingService
-        # scope routing — safe only because channels are 501-gated in org mode.
-        return self.session.exec(
-            self.session.select(Setting).where(Setting.key == key)
-        ).first()
+        # Settings is a deferred table (SettingService owns its own routing);
+        # channel creds don't go through SettingService (its keys are fixed
+        # UserSettings fields, these are dynamic per channel_type/field), but
+        # they use the same scope columns: NULL for local mode, "org" + org_id
+        # for org mode. Never a "user" row — org-wide, per _org_id above.
+        org_id = self._org_id()
+        stmt = self.session.select(Setting).where(Setting.key == key)
+        if org_id is None:
+            stmt = stmt.where(Setting.scope.is_(None))
+        else:
+            stmt = stmt.where(Setting.scope == "org", Setting.org_id == org_id)
+        return self.session.exec(stmt).first()
 
     def _upsert_setting(self, key: str, value: str) -> None:
         row = self._fetch_setting(key)
         if row is None:
-            row = Setting(key=key, value=value)
+            org_id = self._org_id()
+            if org_id is None:
+                row = Setting(key=key, value=value)
+            else:
+                row = Setting(key=key, value=value, scope="org", org_id=org_id)
         else:
             row.value = value
         self.session.add(row)
 
     def _fetch_installation(self, channel_type: str) -> ChannelInstallation | None:
-        return self.session.exec(
-            self.session.select(ChannelInstallation).where(
-                ChannelInstallation.channel_type == channel_type
-            )
-        ).first()
+        org_id = self._org_id()
+        stmt = self.session.select(ChannelInstallation).where(
+            ChannelInstallation.channel_type == channel_type
+        )
+        stmt = stmt.where(
+            ChannelInstallation.org_id.is_(None) if org_id is None
+            else ChannelInstallation.org_id == org_id
+        )
+        return self.session.exec(stmt).first()
 
     def _ensure_installation(self, plugin: ChannelPlugin) -> None:
         """Create the installation row on first config write. Enable/status are
@@ -193,5 +221,6 @@ class ChannelConfigService:
                 ChannelInstallation(
                     channel_type=plugin.channel_type,
                     display_name=plugin.display_name,
+                    org_id=self._org_id(),
                 )
             )
