@@ -137,3 +137,44 @@ async def test_cancel_404s_for_a_finished_turn(client, fake_redis):
 
     assert resp.status_code == 404
     assert await fake_redis.exists("cowork:cancel:corr-7") == 0
+
+
+@pytest.mark.asyncio
+async def test_a_just_enqueued_turn_reads_as_running(client, fake_redis):
+    """The index entry is written when the job is enqueued; the first record
+    only lands once the pod answers. An empty stream in between means "not
+    started yet", not "finished"."""
+    await turn_index.record_turn(
+        "c8", turn_id=1, correlation_id="corr-8", org_id=None, user_id=None)
+
+    body = client.get("/api/v1/responses/in-flight?conversation_id=c8").json()
+
+    assert body["in_flight"] is True
+    assert body["latest_seq"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_old_entry_with_no_stream_reads_as_finished(client, fake_redis):
+    """Past the grace period an empty stream is a truncated conversation, whose
+    buffers were deleted while the index entry lived on."""
+    await turn_index.record_turn(
+        "c9", turn_id=1, correlation_id="corr-9", org_id=None, user_id=None)
+    await fake_redis.hset("cowork:turn:c9", "started_at", "1")   # 1970
+
+    body = client.get("/api/v1/responses/in-flight?conversation_id=c9").json()
+
+    assert body["in_flight"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_works_on_a_turn_that_has_not_spoken_yet(client, fake_redis):
+    """Stop must work while the pod is still starting, which is exactly when a
+    user is most likely to press it."""
+    await turn_index.record_turn(
+        "c10", turn_id=1, correlation_id="corr-10", org_id=None, user_id=None)
+
+    body = client.post(
+        "/api/v1/responses/cancel", json={"conversation_id": "c10"}).json()
+
+    assert body["cancelled"] is True
+    assert await fake_redis.exists("cowork:cancel:corr-10") == 1

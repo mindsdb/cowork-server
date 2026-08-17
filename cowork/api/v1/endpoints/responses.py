@@ -7,7 +7,8 @@ does NOT stop the run — the client reconnects via GET /responses/tail
 with a `from_seq` cursor and resumes from where it left off. Only an
 explicit POST /responses/cancel halts the producer.
 """
-from typing import Annotated
+import time
+from typing import Annotated, NamedTuple
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -80,9 +81,22 @@ def _org_matches(org_id: str | None, scope: TenantScope) -> bool:
     return org_id == scope.org_id
 
 
+class SharedTurn(NamedTuple):
+    """A turn read from Redis, and whether it is still going.
+
+    ``in_flight`` is not simply ``not buffer.is_closed``: an empty stream reads
+    as closed, which is right for a truncated conversation and wrong for a turn
+    enqueued moments ago.
+    """
+
+    index: dict
+    buffer: RedisStreamBuffer
+    in_flight: bool
+
+
 async def _shared_turn(
     conversation_id: str | None, scope: TenantScope
-) -> tuple[dict, RedisStreamBuffer] | None:
+) -> SharedTurn | None:
     """The conversation's current turn read from Redis, or None.
 
     Used when this replica has no local handle, which on the Redis backend
@@ -98,7 +112,25 @@ async def _shared_turn(
         return None
     buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
     await buf.refresh()
-    return turn, buf
+    # The index entry is written when the job is enqueued; the first record only
+    # lands once the pod answers. Until the grace period is up, an empty stream
+    # means "not started yet" rather than "over".
+    starting = buf.latest_seq == 0 and _just_started(turn)
+    return SharedTurn(index=turn, buffer=buf, in_flight=(not buf.is_closed) or starting)
+
+
+def _just_started(turn: dict) -> bool:
+    """Whether the turn was recorded too recently for an empty stream to mean
+    anything. Enqueue to first record covers pod startup, so this is generous."""
+    try:
+        return (time.time() - float(turn.get("started_at") or 0)) < TURN_START_GRACE_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+# Enqueue to first record: the controller has to lock the conversation, find or
+# create a pod (up to two minutes), and get the first event out of it.
+TURN_START_GRACE_SECONDS = 180
 
 
 async def _request_cancel(correlation_id: str) -> None:
@@ -203,14 +235,13 @@ async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
         found = await _shared_turn(conversation_id, scope)
         if found is None:
             return {"in_flight": False, "has_buffer": False, "latest_seq": 0, "turn_id": None}
-        turn, buf = found
         # Liveness comes from the buffer's terminal record, not from a process:
         # the replica running this turn may not be the one answering.
         return {
-            "in_flight": not buf.is_closed,
+            "in_flight": found.in_flight,
             "has_buffer": True,
-            "latest_seq": buf.latest_seq,
-            "turn_id": int(turn["turn_id"]),
+            "latest_seq": found.buffer.latest_seq,
+            "turn_id": int(found.index["turn_id"]),
         }
     return {
         "in_flight": handle.is_running,
@@ -250,10 +281,9 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
         return {"cancelled": cancelled, "conversation_id": req.conversation_id}
 
     found = await _shared_turn(req.conversation_id, scope)
-    if found is None or found[1].is_closed:
+    if found is None or not found.in_flight:
         return JSONResponse(status_code=404, content={"status": "not_found"})
-    turn, _buf = found
-    await _request_cancel(turn["correlation_id"])
+    await _request_cancel(found.index["correlation_id"])
     return {"cancelled": True, "conversation_id": req.conversation_id}
 
 
@@ -353,9 +383,8 @@ async def tail_response(
         found = await _shared_turn(conversation_id, scope)
         if found is None:
             return JSONResponse(status_code=404, content={"status": "not_found"})
-        _turn, buf = found
         return StreamingResponse(
-            sse_from_buffer(buf, from_seq),
+            sse_from_buffer(found.buffer, from_seq),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )

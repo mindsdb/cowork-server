@@ -8,6 +8,7 @@ resume from where it left off while the server keeps working.
 from cowork.streaming.backend import get_backend, get_streams_dir, new_buffer
 from cowork.streaming.buffer import StreamBuffer
 from cowork.streaming.records import TerminalReason, TurnRecord
+from cowork.streaming.sse import sse_frame
 from cowork.streaming.registry import (
     RunHandle,
     RunRegistry,
@@ -28,4 +29,5 @@ __all__ = [
     "new_buffer",
     "get_backend",
     "get_streams_dir",
+    "sse_frame",
 ]
