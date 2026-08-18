@@ -41,16 +41,23 @@ jobs:
     uses: ./.github/workflows/tests-unit.yml
 
   build-deploy:
-    # The container image and the prod Helm rollout. Independent of the release
-    # chain on purpose: a scan finding should not hold up the wheel the desktop
-    # installs from, and a failed publish should not hide a broken image. Both
-    # land in this one run tree, and `notify` covers both. Mirrors the same job
-    # in `publish-staging.yml`.
+    # The container image. Independent of the release chain on purpose: a scan
+    # finding should not hold up the wheel the desktop installs from, and a
+    # failed publish should not hide a broken image. Both land in this one run
+    # tree, and `notify` covers both. Mirrors the same job in
+    # `publish-staging.yml`.
     permissions:
       contents: read
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: production
+      # The image still builds and pushes; only the Helm rollout is off.
+      # cowork-server has never been deployed to prod: the rollout has run once,
+      # failed, and turned this pipeline red on every push to main since. The
+      # namespace has no cowork-server release and no scratchpad-controller, so
+      # a rollout there would deploy half a system that cannot run a turn.
+      # Flip back on in the same change that actually launches prod.
+      deploy-enabled: false
     secrets: inherit
 
   release:
