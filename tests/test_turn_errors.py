@@ -1316,6 +1316,11 @@ def test_responses_emits_model_for_every_model_unavailable_code():
     ("included_allowance_exhausted", "included_allowance_exhausted"),
     ("rate_limited", "rate_limited"),
     ("policy_unavailable", "policy_unavailable"),
+    # The fifth. Not a billing verdict, but a third party should not get to
+    # pick our model card either, and the gate already refuses it — this pins
+    # the behaviour so the "every reason" claim below is literally true
+    # (review: pnewsam).
+    ("unknown_model", "model_not_found"),
 ])
 def test_a_third_party_header_cannot_select_a_billing_verdict(reason, forbidden_code):
     # Mirror of test_a_third_party_body_cannot_select_a_billing_verdict, over
@@ -1334,10 +1339,12 @@ def test_the_gateways_own_header_still_maps():
     assert code == te.TOKEN_LIMIT_CODE
 
 
-def test_an_unknown_origin_still_maps_and_is_not_remote_reachable():
+def test_the_unknown_origin_residual_is_not_remote_reachable():
     # The deliberate residual. `_origin_is_known_third_party` is three-valued so
-    # an unknown origin stays trusted, which is what keeps
-    # test_reason_header_maps_even_without_request_url passing unedited.
+    # an unknown origin stays trusted; that the unknown origin still MAPS is
+    # asserted by test_reason_header_maps_even_without_request_url, not here —
+    # this test only shows the residual cannot be reached by a remote (review:
+    # pnewsam noted the old name claimed the mapping too).
     #
     # Safe because a remote server cannot produce it: a real SDK error always
     # carries its request, so `host` resolves for every genuine HTTP response.
