@@ -8,6 +8,7 @@ same logic without needing to stand up the full app.
 from pathlib import Path
 
 from cowork.api.v1.endpoints.connectors.connections import save_connection_direct
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.schemas.connectors import DirectSaveRequest
 
 
@@ -23,5 +24,8 @@ class TestSaveConnectionDirectReturnsUserLabel:
             name="",
             values={"email": "a@b.com", "app_password": "x", "user_label": "Support"},
         )
-        result = save_connection_direct(body)
+        # LOCAL_SCOPE, not None: the endpoint now takes the request's scope so
+        # the vault is org-keyed, and an unscoped call fails closed on an org
+        # deployment. A desktop scope keeps the vault path unchanged.
+        result = save_connection_direct(body, LOCAL_SCOPE)
         assert result["user_label"] == "Support"

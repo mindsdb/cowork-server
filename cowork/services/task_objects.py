@@ -449,7 +449,7 @@ def _seed_draft_from_store(folder: Path, slug: str) -> None:
         scope = current_settings_scope()
         if settings.tenancy_mode == "org" and (scope is None or not scope.org_mode):
             return
-        src = scoped_storage_root(Path(settings.skill.root_dir), scope) / slug
+        src = scoped_storage_root(Path(settings.skill.root_dir), scope, store="skills") / slug
     except Exception:
         return
     # Skip symlinks (dir and children): the store is org-shared, so a link could

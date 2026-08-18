@@ -207,7 +207,9 @@ class ProjectService:
         the same project name collided, and the second create hit an existing
         dir — a cross-org existence oracle.
         """
-        return scoped_storage_root(Path(get_app_settings().project.root_dir), self.session.scope)
+        return scoped_storage_root(
+            Path(get_app_settings().project.root_dir), self.session.scope, store="projects"
+        )
 
     def _project_path(self, name: str) -> Path:
         # Containment guard: a project dir is always a direct child of the
@@ -418,9 +420,25 @@ class ProjectService:
                     "delete_project: failed to delete conversation %s; skipping", cid,
                     exc_info=True,
                 )
+        # rmtree only a path re-derived from the sanitized name inside the
+        # org-keyed root (same rebuild-and-compare as ensure_dir_exists). The
+        # stored string can be stale (pre-org-keying) or tampered, and deleting
+        # it verbatim would rmtree an arbitrary directory. A mismatched dir is
+        # left behind instead — an orphaned directory beats a wrong-target rm.
         path = Path(project.path)
+        try:
+            safe = self._project_path(project.name)
+        except ValueError:
+            safe = None
         if path.exists():
-            shutil.rmtree(path)
+            if safe is not None and safe.resolve() == path.resolve():
+                shutil.rmtree(path)
+            else:
+                logger.warning(
+                    "delete_project: stored path %s does not match the derived "
+                    "project path; leaving the directory in place",
+                    project.path,
+                )
         was_active = project.is_active
         self.session.delete(project)
         self.session.commit()
