@@ -84,6 +84,7 @@ hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev =
 [dependency-groups]
 dev = [
     "alembic>=1.18.4",
+    "fakeredis>=2.37.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=7.1.0",
@@ -92,3 +93,7 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs a real Redis; skips itself when none is reachable",
+    "postdeploy: runs against a deployed cowork-server; skips unless COWORK_BASE_URL is set",
+]
