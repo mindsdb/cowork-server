@@ -348,3 +348,29 @@ def test_delete_by_purpose_never_rmtrees_an_escaped_legacy_path(engine, tmp_path
     svc.session.commit()
     unlink_file_dirs(dirs)  # the caller unlinks after committing
     assert (victim / "keep.txt").exists()  # untouched
+
+
+def test_delete_warns_when_stored_path_diverges_from_scoped_target(engine, tmp_path, caplog):
+    # A row from before the org-keyed layout: the stored path doesn't live
+    # under the scoped delete target, so the rmtree below finds nothing there.
+    # The row still gets deleted (same as any legacy-path case, see the escape
+    # tests above), but the drift must be logged so it's an observable leak,
+    # not a silent permanent one.
+    svc = _svc(engine, _scope(ORG_A))
+    legacy_dir = tmp_path / "legacy-files" / "old-uuid"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "report.csv").write_text("a,b\n1,2\n")
+    f = File(filename="report.csv", content_type="text/csv", size=8,
+             purpose="assistants", path=str(legacy_dir / "report.csv"))
+    svc.session.add(f)
+    svc.session.commit()
+    svc.session.refresh(f)
+    file_id = f.id
+
+    with caplog.at_level("WARNING"):
+        assert svc.delete_file(file_id) is True
+
+    assert str(file_id) in caplog.text
+    assert str(legacy_dir / "report.csv") in caplog.text
+    assert (legacy_dir / "report.csv").exists()  # untouched: nothing outside the scoped root was removed
+    assert svc.session.get(File, file_id) is None  # the row is still gone
