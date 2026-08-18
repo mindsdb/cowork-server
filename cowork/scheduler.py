@@ -99,18 +99,16 @@ def _handle_missed_runs(session) -> None:
 
 
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:
-    """Service principal for a scheduled run's conversation + turn.
+    """Service principal for a scheduled run, derived from the schedule row.
 
-    A scheduled run has no HTTP request, so no gateway-injected principal. The
-    owning identity is instead read off the schedule row, stamped at create
-    time by the request that created it: ``org_id`` scopes the turn's data and
-    the per-tenant key the remote backend mints; ``created_by`` attributes the
-    rows it writes.
+    A scheduled run has no HTTP request and so no gateway-injected principal, so
+    the owning identity comes from the row itself: ``org_id`` scopes the turn's
+    data and the per-tenant key the remote backend mints, and ``created_by``
+    attributes the rows it writes.
 
-    Local mode (the desktop sidecar) has no tenant context — return None, which
-    keeps today's unscoped behavior. Org mode requires both ids; a NULL is
-    corrupt data, and silently writing rows the owning user can't see is the
-    exact failure the old fail-closed guard existed to prevent, so fail loud.
+    Local mode has no tenant context, so return None (unscoped). Org mode
+    requires both ids; a NULL is corrupt data that would write rows the owner
+    can't see, so fail loud instead.
     """
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.scoped import MissingTenantScopeError
@@ -151,24 +149,21 @@ async def execute_schedule(
         try:
             principal = _principal_for_schedule(schedule)
         except MissingTenantScopeError:
-            # The row can never resolve an identity (corrupt: NULL org in org
-            # mode), so it can never run. Disable it so the cron loop stops
-            # re-firing this same failure every poll — an unadvanced next_run_at
-            # keeps the slot due, and the hard raise below skips
-            # _advance_next_run_at. The raise routes through the outer handler,
-            # which logs the stack and records last_error + a failed run.
+            # A corrupt row (NULL org in org mode) can never resolve an
+            # identity, so it can never run. Disable it, else the unadvanced
+            # next_run_at keeps the slot due and every poll re-fires the same
+            # failure. The re-raise records the run as failed.
             schedule.enabled = False
             session.add(schedule)
             session.commit()
             raise
 
         if conversation_id is None:
-            # Conversation not pre-created by the caller (e.g. cron tick).
-            # Create it under the schedule's OWN scope so org mode stamps the
-            # owning org_id. The scheduler's SYSTEM_SCOPE is deliberately
-            # unscoped (it scans every org), so creating through `session`
-            # would write an invisible NULL-org row — the exact failure the
-            # old scope_for_background_context() fail-closed guard prevented.
+            # Conversation not pre-created by the caller (e.g. cron tick). Create
+            # it under the schedule's OWN scope so org mode stamps the owning
+            # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
+            # scans every org), so creating through `session` would write an
+            # invisible NULL-org row.
             from cowork.db.scoped import (
                 ScopedSession,
                 scope_from_principal,

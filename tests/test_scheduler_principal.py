@@ -1,9 +1,9 @@
-"""Service-principal resolution for scheduled runs (ENG-1683).
+"""Service-principal resolution for scheduled runs.
 
-A scheduled run has no HTTP request, so it can't get a gateway-injected
-principal. `_principal_for_schedule` derives one from the schedule row instead,
-so the turn (and the remote backend's per-tenant key mint) can run in org mode
-with nothing in flight. Local mode stays unscoped — today's desktop behavior.
+A scheduled run has no HTTP request and so no gateway-injected principal, so
+`_principal_for_schedule` derives one from the schedule row instead — letting
+the turn (and the remote backend's per-tenant key mint) run in org mode with
+nothing in flight. Local mode stays unscoped.
 """
 from __future__ import annotations
 
@@ -65,8 +65,7 @@ def test_org_mode_builds_principal_from_the_row(monkeypatch):
 )
 def test_org_mode_fails_loud_on_missing_identity(monkeypatch, org_id, created_by):
     # A NULL id on an org-mode row is corrupt data: running anyway would write
-    # rows the owning user can never see, the exact failure the fail-closed
-    # guard existed to prevent. Fail loud instead.
+    # rows the owning user can never see. Fail loud instead.
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     with pytest.raises(MissingTenantScopeError):
