@@ -148,3 +148,23 @@ def test_an_unwritable_store_does_not_break_reads(skills_root, monkeypatch):
     monkeypatch.setattr("cowork.migrations._copy_builtin_skills", _boom)
     assert ensure_builtin_skills(_org()) is False
     assert build_turn_skills(_org(), None) == {}
+
+
+def test_a_poisoned_slug_does_not_break_the_org(skills_root, tmp_path):
+    """The agent writes into its own org's tree on shared storage, so it can
+    plant `skills/<builtin-slug>` as a symlink pointing out of the store. That
+    one builtin is skipped; letting it propagate would 500 every skills read and
+    every turn for the org — a tenant must not be able to do that to itself."""
+    escaped = tmp_path / "escaped"
+    store = _store()
+    store.mkdir(parents=True, exist_ok=True)
+    victim = sorted(_packaged_slugs())[0]
+    (store / victim).symlink_to(escaped, target_is_directory=True)
+
+    ensure_builtin_skills(_org())
+
+    assert not escaped.exists()                       # no write through the link
+    names = {s.name for s in SkillService(_org()).list_skills()}
+    assert victim not in names
+    assert names == _packaged_slugs() - {victim}      # the rest still seeded
+    assert build_turn_skills(_org(), None)            # and turns still work

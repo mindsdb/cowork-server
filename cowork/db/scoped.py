@@ -19,7 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
-from uuid import UUID
 
 from fastapi import Depends, Request
 from sqlalchemy import event
