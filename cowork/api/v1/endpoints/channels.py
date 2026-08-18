@@ -42,34 +42,27 @@ router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-def _require_local_channels() -> None:
-    """Channel credentials, adapters, and the harness setting are
-    deployment-global (settings-backed, one installation per channel type).
-    Until installations are org-owned, org mode must not expose them — any
-    tenant could read/delete another's credentials or drive the shared
-    adapter. The runtime side already fails closed; this closes the config
-    side."""
-    if get_app_settings().tenancy_mode == "org":
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="channels are not available in org deployments yet",
-        )
-
-
 def _live_adapters(request: Request):
     return getattr(request.app.state, "channel_adapters", None)
 
 
 async def _reconcile_ingress(request: Request, channel_type: str) -> None:
     """Start/stop background ingress (Gateway stream or tunnel-free poll) after a
-    change to the channel's live adapter (config/setup/teardown/reload)."""
+    change to the channel's live adapter (config/setup/teardown/reload).
+
+    Org mode stays a no-op: IngressManager keys its one running task per
+    channel_type, not per org, so a second org configuring the same channel
+    would silently starve the first's connection. Deferred like Telegram/
+    WhatsApp until ingress itself is made per-org.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return
     manager = getattr(request.app.state, "channel_ingress", None)
     await sync_channel_ingress(manager, _live_adapters(request), channel_type)
 
 
 @router.get("/status", response_model=ChannelStatusResponse)
 def channel_status(scoped: ScopedSessionDep) -> ChannelStatusResponse:
-    _require_local_channels()  # `configured` reflects the global credentials
     return ChannelConfigService(scoped).status()
 
 
@@ -84,14 +77,13 @@ def list_installations(scoped: ScopedSessionDep) -> list[ChannelInstallationResp
 
 
 @router.get("/agent", response_model=ChannelAgentResponse)
-def get_channel_agent() -> ChannelAgentResponse:
+def get_channel_agent(scoped: ScopedSessionDep) -> ChannelAgentResponse:
     """The harness that serves channel conversations. Distinct from the desktop
     harness setting and applied to new conversations (existing ones stay pinned
     to whatever first served them)."""
     from cowork.common.settings.user_settings import get_user_settings
 
-    _require_local_channels()  # the harness setting is deployment-global
-    current = (get_user_settings().channels_harness or "").strip() or "anton"
+    current = (get_user_settings(scoped.scope).channels_harness or "").strip() or "anton"
     return ChannelAgentResponse(harness=current, options=available_harness_ids())
 
 
@@ -99,12 +91,11 @@ def get_channel_agent() -> ChannelAgentResponse:
 def set_channel_agent(
     body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep
 ) -> ChannelAgentResponse:
-    # Channel config is local-only (_require_local_channels → 501 in org mode),
-    # so an unscoped SettingService writing the global row is correct here.
+    # channels_harness is ORG-marked, so SettingService routes this write to
+    # the caller's own org row — two orgs never share or overwrite each other's.
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 
-    _require_local_channels()
     options = available_harness_ids()
     harness = (body.harness or "").strip()
     if harness not in options:
@@ -112,8 +103,8 @@ def set_channel_agent(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"unknown harness '{harness}'. Available: {', '.join(options) or 'none'}",
         )
-    previous = (get_user_settings().channels_harness or "").strip()
-    SettingService(session).upsert_setting("channels_harness", harness)
+    previous = (get_user_settings(scoped.scope).channels_harness or "").strip()
+    SettingService(session, scoped.scope).upsert_setting("channels_harness", harness)
 
     # Changing the agent re-points existing chats: detach their conversations
     # so the next message starts fresh under the new agent (existing pins are
@@ -126,7 +117,6 @@ def set_channel_agent(
 
 @router.get("/{channel_type}/config", response_model=ChannelConfigResponse)
 def get_config(channel_type: str, scoped: ScopedSessionDep) -> ChannelConfigResponse:
-    _require_local_channels()
     try:
         return ChannelConfigService(scoped).get_config(channel_type)
     except UnknownChannelError:
@@ -140,7 +130,6 @@ async def set_config(
     request: Request,
     scoped: ScopedSessionDep,
 ) -> ChannelConfigResponse:
-    _require_local_channels()
     try:
         result = ChannelConfigService(scoped).set_config(channel_type, body.values)
     except UnknownChannelError:
@@ -157,7 +146,6 @@ async def set_config(
 
 @router.delete("/{channel_type}/config", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_config(channel_type: str, request: Request, scoped: ScopedSessionDep) -> None:
-    _require_local_channels()
     try:
         deleted = ChannelConfigService(scoped).delete_config(channel_type)
     except UnknownChannelError:
@@ -177,7 +165,6 @@ async def delete_config(channel_type: str, request: Request, scoped: ScopedSessi
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
 async def reload_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
-    _require_local_channels()
     try:
         ChannelConfigService(scoped).get_config(channel_type)
     except UnknownChannelError:
@@ -222,7 +209,6 @@ def delete_binding(binding_id: UUID, scoped: ScopedSessionDep) -> None:
 
 
 def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecycleService:
-    _require_local_channels()
     adapters = _live_adapters(request)
     if adapters is None:
         raise HTTPException(

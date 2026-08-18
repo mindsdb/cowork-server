@@ -750,7 +750,7 @@ def test_channel_agent_endpoint_validates_and_persists():
         resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session, scoped)
         assert resp.harness == "hermes"
         assert "anton" in resp.options and "hermes" in resp.options
-        assert get_channel_agent().harness == "hermes"
+        assert get_channel_agent(scoped).harness == "hermes"
         assert get_user_settings().channels_harness == "hermes"
     finally:
         session.close()

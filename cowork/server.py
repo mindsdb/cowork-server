@@ -31,9 +31,10 @@ logger = setup_logging()
 async def _start_channels(app: FastAPI) -> None:
     """Build live adapters from stored credentials and start ingress.
 
-    Org mode: channels are local-mode only — no adapters, no provider
-    connections, no ingress (the config endpoints 501 and webhook routes are
-    not mounted, see _install_channels)."""
+    Local mode only: adapters/ingress are boot-time and singleton, built from
+    the one deployment-global installation. Org mode resolves adapters
+    per-request instead (LiveAdapterRegistry.resolve_org_bridge), since
+    credentials are per-org and there is no single set to preload at boot."""
     if get_app_settings().tenancy_mode == "org":
         return
     await app.state.channel_adapters.refresh_all()
@@ -260,38 +261,37 @@ def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
     Every mounted webhook path is recorded in ``webhook_paths`` so the bearer
     auth layer exempts it — these endpoints are called by external platforms
     that authenticate with their own signature, not the Cowork token.
+
+    Mounted in both local and org mode: org mode resolves the org per-request
+    from the payload (LiveAdapterRegistry.resolve_org_bridge) rather than
+    from one boot-time adapter, so there's no global set of credentials to
+    preload here the way local mode's lifespan startup does (_start_channels).
     """
     from cowork.channels.ingress import IngressManager
     from cowork.channels.registry import get_registry, load_first_party_plugins
     from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
     from cowork.channels.webhooks import build_channel_webhook_router
 
-    # Org mode: channels are local-mode only — mount no auth-exempt webhook
-    # routes and load no plugins. The empty registry/manager keep the
-    # lifespan start/stop paths inert.
-    local_mode = get_app_settings().tenancy_mode != "org"
-    if local_mode:
-        load_first_party_plugins()
+    load_first_party_plugins()
     adapters = LiveAdapterRegistry()
     runtime = AntonChannelRuntime(adapters)
 
-    if local_mode:
-        for plugin in get_registry().all():
-            if not plugin.webhooks:
-                continue
-            app.include_router(
-                build_channel_webhook_router(
-                    plugin, resolver=adapters.get, sink=runtime.handle,
-                    org_resolver=adapters.resolve_org_bridge,
-                ),
-                prefix="/api/v1/channels",
-            )
-            # Mirrors the route path built in webhooks._add_webhook_route:
-            # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
-            webhook_paths.update(
-                f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
-                for webhook in plugin.webhooks
-            )
+    for plugin in get_registry().all():
+        if not plugin.webhooks:
+            continue
+        app.include_router(
+            build_channel_webhook_router(
+                plugin, resolver=adapters.get, sink=runtime.handle,
+                org_resolver=adapters.resolve_org_bridge,
+            ),
+            prefix="/api/v1/channels",
+        )
+        # Mirrors the route path built in webhooks._add_webhook_route:
+        # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
+        webhook_paths.update(
+            f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
+            for webhook in plugin.webhooks
+        )
     app.state.channel_adapters = adapters
     app.state.channel_runtime = runtime
     app.state.channel_ingress = IngressManager(sink=runtime.handle)
