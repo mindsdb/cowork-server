@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed.
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -373,3 +374,133 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
 
     assert saved["assistant"] == "Preamble.\n\nThe answer."
     assert any(e.get("thought_role") == "thought.scratchpad.start" for e in saved["events"])
+
+
+# ─── artifacts written by the worker during a remote turn ──────────────────
+#
+# On an org deployment the in-process harness refuses to run, so this producer
+# is the ONLY one that indexes, publishes and cards artifacts. The pod writes
+# them into the same shared tree cowork-server reads, which is what lets the
+# before/after diff work from here at all.
+
+def _artifact(folder, slug, *, body="<html>report</html>"):
+    target = folder / slug
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "report.html").write_text(body)
+    (target / "metadata.json").write_text(
+        json.dumps({"slug": slug, "type": "html-app", "title": slug})
+    )
+    return target
+
+
+def _conversation_at(project_dir):
+    project = SimpleNamespace(path=str(project_dir), name=project_dir.name, id=uuid4())
+    return SimpleNamespace(project=project, project_id=project.id)
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tmp_path):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    published = {}
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        published["base"] = base
+        published["touched"] = set(touched)
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "done"}
+        # The worker writes into the shared tree mid-turn.
+        _artifact(artifacts_base, "sales-report")
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    # The diff saw the new folder and handed it to the reconciler...
+    assert published["base"] == artifacts_base
+    assert published["touched"] == {"sales-report"}
+    # ...and the card reached the stream, so the artifact shows up on the answer
+    # rather than only after the next artifacts-list fetch.
+    cards = [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+    assert len(cards) == 1
+    assert cards[0]["artifact"]["slug"] == "sales-report"
+    assert cards[0]["artifact"]["projectName"] == "proj"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path):
+    """A failed turn still INDEXES what the worker wrote (the finally), but must
+    not publish or card it — matching the in-process path, where the next turn in
+    the project reconciles instead."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    # Patched on the source module, not on responses_mod: the producer imports
+    # these names inside the generator, at call time.
+    from cowork.services import task_objects
+
+    indexed = {}
+
+    def spy_index(*args, **kwargs):
+        indexed["ran"] = True
+        return [], set(), None
+
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", spy_index)
+
+    async def fake_autopublish(*args, **kwargs):
+        raise AssertionError("a failed turn must not publish")
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+
+    async def fake_replies(**kwargs):
+        _artifact(artifacts_base, "half-written")
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "failed"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed.get("ran") is True
+    assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]

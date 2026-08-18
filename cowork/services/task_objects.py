@@ -397,6 +397,46 @@ def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts
     return cards_for_slugs(artifacts_base, new)
 
 
+async def publish_and_card_turn_artifacts(
+    artifacts_base,
+    *,
+    new_slugs: list[str],
+    touched_slugs: set[str],
+    scope,
+    project_id: str | None = None,
+    project_name: str = "",
+) -> list[dict]:
+    """Reconcile publishes for this turn, then build the cards to emit.
+
+    The second half of the end-of-turn artifact flow; `index_turn_artifacts` is
+    the first half and produces the three arguments. They are separate because
+    only this half may await: indexing has to run in a turn's `finally` (so an
+    artifact is recorded even on error or Stop), and an `await` there is skipped
+    on cancellation.
+
+    Shared by both producers. The in-process harness reaches it through
+    `AntonHarness.stream_response`; on an org deployment that harness refuses to
+    run at all and the turn happens on the remote worker, so
+    `handlers.responses._produce_remote` calls this against the same shared
+    artifacts tree the worker wrote to.
+
+    Cards cover what THIS turn produced or touched. `republished` also carries
+    phase-two self-heal publishes — older artifacts from earlier conversations —
+    and the stream reducer dedupes only within one message, so including them
+    would attach last week's artifacts to this answer.
+    """
+    from cowork.services.artifact_autopublish import autopublish_project_artifacts
+
+    republished = await autopublish_project_artifacts(
+        artifacts_base, scope, touched=set(touched_slugs),
+    )
+    carded = set(new_slugs) | (republished & set(touched_slugs))
+    return cards_for_slugs(
+        artifacts_base, sorted(carded),
+        project_id=project_id, project_name=project_name,
+    )
+
+
 # ── skill-draft attribution ────────────────────────────────────────────────
 # A skill the agent builds for the user (via the `skill-creator` skill) must NOT
 # auto-persist to the skills store and must NOT surface as an artifact — the

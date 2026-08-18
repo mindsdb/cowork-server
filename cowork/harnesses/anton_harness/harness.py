@@ -437,11 +437,10 @@ class AntonHarness:
         # with its own session id and doesn't tag artifacts with the cowork
         # conversation_id, so we diff the project's artifacts dir around the run
         # (see services.task_objects.finalize_turn_artifacts).
-        from cowork.services.artifact_autopublish import autopublish_project_artifacts
         from cowork.services.task_objects import (
-            cards_for_slugs,
             finalize_turn_skill_drafts,
             index_turn_artifacts,
+            publish_and_card_turn_artifacts,
             snapshot_artifact_state,
             snapshot_skill_drafts,
             snapshot_stray_skills,
@@ -547,16 +546,11 @@ class AntonHarness:
         # project heals it (if there is one — an abandoned conversation never does).
         # Inline, so the card carries its published URL rather than appearing
         # without one and needing a later refresh.
-        republished = await autopublish_project_artifacts(
-            artifacts_base, turn_scope, touched=set(touched_slugs),
-        )
-        # Cards only for what THIS turn produced or touched. `republished` also
-        # contains phase-2 self-heal publishes — old artifacts from earlier
-        # conversations — and the stream reducer dedupes only within one message,
-        # so including them would attach last week's artifacts to this answer.
-        carded = set(new_slugs) | (republished & touched_slugs)
-        cards = cards_for_slugs(
-            artifacts_base, sorted(carded),
+        cards = await publish_and_card_turn_artifacts(
+            artifacts_base,
+            new_slugs=new_slugs,
+            touched_slugs=touched_slugs,
+            scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
         )

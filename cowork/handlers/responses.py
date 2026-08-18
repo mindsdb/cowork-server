@@ -598,6 +598,38 @@ class ResponsesHandler:
             return {}
 
     @staticmethod
+    def _remote_artifacts_context(session: ScopedSession, conv_id: UUID):
+        """`(conversation, artifacts_base, project_id, project_name)` for the
+        remote turn's end-of-turn artifact bookkeeping, or None if unavailable.
+
+        The pod writes artifacts into `<project>/.anton/artifacts/` on the shared
+        mount, so cowork-server reads the same directory the worker just wrote —
+        this is the whole reason the in-process flow transplants onto the remote
+        path unchanged. `conversation` comes back attached to `session` because
+        `index_turn_artifacts` recovers the tenant scope from the session the row
+        is bound to; the ids and the project name are read here, while it is
+        unambiguously attached, rather than after the turn.
+
+        None on any failure: no artifact card and no autopublish is a recoverable
+        outcome (the next turn in this project reconciles), a failed turn is not.
+        """
+        from pathlib import Path
+
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
+            return (
+                conversation,
+                artifacts_base,
+                str(conversation.project_id) if conversation.project_id else None,
+                conversation.project.name,
+            )
+        except Exception:
+            logger.exception(
+                "[responses] failed to resolve artifacts context for conversation %s", conv_id)
+            return None
+
+    @staticmethod
     def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
         """This org's memory slots for the pod. A read error degrades to a turn
         without memory rather than failing the turn."""
@@ -685,35 +717,81 @@ class ResponsesHandler:
 
         async def replies_as_stream_events():
             from anton.core.llm.provider import StreamTextDelta
+            from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
+            from cowork.services.task_objects import (
+                index_turn_artifacts,
+                publish_and_card_turn_artifacts,
+                snapshot_artifact_state,
+            )
 
-            async for kind, data in stream_remote_replies(
-                conversation_id=str(conv_id),
-                org_id=self.scoped.scope.org_id,
-                user_id=self.scoped.scope.user_id,
-                input_text=input_text,
-                model=model,
-                turn_id=turn_id,
-                # Producer session, NOT self.scoped: this coroutine is detached
-                # and the request session may be closed by the time it runs.
-                history=self._remote_history(producer_session, conv_id),
-                # Skills and memory are NOT sent: the pod reads them off the
-                # shared mount. Only the org-relative project path travels.
-                **self._remote_workspace(producer_session, conv_id),
-                correlation_id=(turn_llm or {}).get("correlation_id"),
-                llm=(turn_llm or {}).get("llm"),
-            ):
-                if kind == "turn_delta":
-                    yield StreamTextDelta(text=data.get("text", ""))
-                elif kind == "turn_step":
-                    for event in step_stream_events(data):
-                        yield event
-                elif kind == "turn_memory":
-                    self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
-                elif kind == "turn_completed":
-                    return
-                elif kind == "turn_failed":
-                    failure.update(data)
-                    raise _RemoteTurnFailed()
+            # The worker writes artifacts into the shared tree while this turn
+            # runs, so cowork-server does the same before/after diff it does for
+            # an in-process turn. Snapshotting here rather than in the caller is
+            # what makes it a genuine "before": stream_remote_replies below only
+            # enqueues the job once this generator is first iterated.
+            artifacts = self._remote_artifacts_context(producer_session, conv_id)
+            before_slugs, before_mtimes = (
+                snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
+            )
+            new_slugs: list[str] = []
+            touched_slugs: set[str] = set()
+            turn_scope = None
+
+            try:
+                async for kind, data in stream_remote_replies(
+                    conversation_id=str(conv_id),
+                    org_id=self.scoped.scope.org_id,
+                    user_id=self.scoped.scope.user_id,
+                    input_text=input_text,
+                    model=model,
+                    turn_id=turn_id,
+                    # Producer session, NOT self.scoped: this coroutine is detached
+                    # and the request session may be closed by the time it runs.
+                    history=self._remote_history(producer_session, conv_id),
+                    # Skills and memory are NOT sent: the pod reads them off the
+                    # shared mount. Only the org-relative project path travels.
+                    **self._remote_workspace(producer_session, conv_id),
+                    correlation_id=(turn_llm or {}).get("correlation_id"),
+                    llm=(turn_llm or {}).get("llm"),
+                ):
+                    if kind == "turn_delta":
+                        yield StreamTextDelta(text=data.get("text", ""))
+                    elif kind == "turn_step":
+                        for event in step_stream_events(data):
+                            yield event
+                    elif kind == "turn_memory":
+                        self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                    elif kind == "turn_completed":
+                        # `break`, not `return`: the publish/card block below the
+                        # try must still run on a clean finish.
+                        break
+                    elif kind == "turn_failed":
+                        failure.update(data)
+                        raise _RemoteTurnFailed()
+            finally:
+                # Mirrors the in-process harness: indexing runs on EVERY exit so
+                # an artifact the worker wrote is recorded even when the turn
+                # failed or was stopped, and it is synchronous because an await
+                # in a generator's finally is skipped on cancellation.
+                if artifacts is not None:
+                    new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
+                        artifacts[0], conv_id, artifacts[2], artifacts[1],
+                        before_slugs, before_mtimes,
+                    )
+
+            # Clean completion only — a raise inside the try skips this, matching
+            # the in-process path where Stop/error produce no cards and the next
+            # turn in the project heals the publish.
+            if artifacts is not None:
+                for card in await publish_and_card_turn_artifacts(
+                    artifacts[1],
+                    new_slugs=new_slugs,
+                    touched_slugs=touched_slugs,
+                    scope=turn_scope,
+                    project_id=artifacts[2],
+                    project_name=artifacts[3],
+                ):
+                    yield ArtifactCreated(card)
 
         def persist() -> None:
             nonlocal persisted
