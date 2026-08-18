@@ -6,7 +6,7 @@ setting one env var. These tests pin that contract.
 """
 from pathlib import Path
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import (
     AppSettings,
     OAuthSettings,
@@ -58,6 +58,7 @@ def test_prod_build_still_reads_legacy_anton_env(monkeypatch):
 _PER_RESOURCE_OVERRIDES = [
     "DATABASE_URI",
     "MASTER_KEY_PATH",
+    "STATE_PATH",
     "COWORK_PROJECTS_DIR",
     "PROJECTS_ROOT_DIR",
     "COWORK_FILES_DIR",
@@ -103,6 +104,78 @@ def test_explicit_database_uri_still_overrides_cowork_home(monkeypatch, tmp_path
     get_app_settings.cache_clear()
 
     assert AppSettings(_env_file=None).database.uri == "sqlite:////tmp/explicit.db"
+
+    get_app_settings.cache_clear()
+
+
+def test_explicit_state_path_still_overrides_cowork_home(monkeypatch, tmp_path):
+    # OAuthSettings.state_path has no validation_alias, so pydantic-settings
+    # falls back to the bare uppercased field name: STATE_PATH, not a
+    # COWORK_-prefixed name (same pattern as MASTER_KEY_PATH). The cowork-server
+    # Helm values file relies on this exact name to keep OAuth state off the
+    # shared EFS tree; this pins it so a future validation_alias addition
+    # can't silently change the env var cloud config depends on.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("STATE_PATH", "/home/app/oauth_state.json")
+
+    assert OAuthSettings(_env_file=None).state_path == "/home/app/oauth_state.json"
+
+
+# pod_local_only, the mechanism that keeps scratch/deployment-local state
+# (connector-probe credential files, publish's state.json, the anton
+# harness's temp data-vault dir) off the shared COWORK_HOME tree in org mode,
+# since none of the three carry an org_id segment for scoped_storage_root to
+# key on.
+def test_pod_local_only_is_a_noop_in_local_mode(monkeypatch, tmp_path):
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    get_app_settings.cache_clear()
+
+    local_path = tmp_path / "cowork" / "tmp"
+    assert pod_local_only(local_path, "tmp") == local_path
+
+    get_app_settings.cache_clear()
+
+
+def test_pod_local_only_relocates_off_cowork_home_in_org_mode(monkeypatch, tmp_path):
+    home = tmp_path / "cowork-shared"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.delenv("COWORK_POD_SCRATCH_DIR", raising=False)
+    get_app_settings.cache_clear()
+
+    resolved = pod_local_only(home / "tmp", "tmp")
+
+    assert home not in resolved.parents
+    assert resolved != home / "tmp"
+
+    get_app_settings.cache_clear()
+
+
+def test_pod_local_only_org_mode_defaults_under_system_temp_dir(monkeypatch, tmp_path):
+    import tempfile
+
+    home = tmp_path / "cowork-shared"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.delenv("COWORK_POD_SCRATCH_DIR", raising=False)
+    get_app_settings.cache_clear()
+
+    resolved = pod_local_only(home / "tmp", "tmp")
+
+    assert resolved == Path(tempfile.gettempdir()) / "cowork" / "tmp"
+
+    get_app_settings.cache_clear()
+
+
+def test_pod_local_only_honors_explicit_scratch_dir_override(monkeypatch, tmp_path):
+    home = tmp_path / "cowork-shared"
+    scratch = tmp_path / "pod-scratch"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_POD_SCRATCH_DIR", str(scratch))
+    get_app_settings.cache_clear()
+
+    assert pod_local_only(home / "tmp", "tmp") == scratch / "tmp"
 
     get_app_settings.cache_clear()
 

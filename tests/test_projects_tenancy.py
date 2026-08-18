@@ -28,6 +28,10 @@ def _scope(org: str, user: str = "user-1") -> TenantScope:
 @pytest.fixture()
 def db(tmp_path, monkeypatch):
     """Isolated engine + projects root, seeded with the GENERAL row (NULL org)."""
+    # Org mode roots at cowork_home() regardless of COWORK_PROJECTS_DIR (see
+    # scoped_storage_root), so it must be pinned here too or org-scoped tests
+    # fall through to the real ~/.cowork.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     from cowork.common.settings.app_settings import get_app_settings

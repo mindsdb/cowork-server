@@ -90,8 +90,22 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
     fail-closed without an org. Org-first so each org is one mountable/GC-able
     subtree. org_id is a normalized UUID (TrustedHeaderMiddleware), so it's
     path-safe. ``store`` is required — deriving it from ``base`` would let a
-    *_DIR env override silently rename an org's store."""
-    if scope is None or not scope.org_mode:
+    *_DIR env override silently rename an org's store.
+
+    ``scope=None`` fail-closes on an org deployment. It cannot mean "no
+    tenancy" there: ``base`` is the shared root every organization can read, so
+    returning it verbatim hands a caller that merely forgot to thread its scope
+    a path outside any org's subtree. That is how the persisted connector vault
+    ended up unpartitioned. A missing scope in org mode is a bug at the call
+    site, and this is where it surfaces."""
+    if scope is None:
+        if get_app_settings().tenancy_mode == "org":
+            raise MissingTenantScopeError(
+                f"filesystem store {store!r} requires a TenantScope on an org deployment; "
+                "the caller must thread one through rather than defaulting to the shared root"
+            )
+        return base
+    if not scope.org_mode:
         return base
     if not scope.org_id:
         raise MissingTenantScopeError("filesystem store requires an organization in scope")

@@ -4,6 +4,16 @@
 # source `cowork-db` externally.
 ephemeral: false
 
+# Shared EFS tree, mounted read-write with noexec, backing the cowork-shared
+# PVC that COWORK_HOME and the volumeMounts below point at unconditionally.
+# Enabled here, not per-overlay, because dev, staging and prod all need it;
+# none of them ever set this false. Set enabled: false only for a desktop or
+# bare-chart install that has no filesystem and no COWORK_HOME to satisfy.
+sharedStorage:
+  enabled: true
+  storageClassName: efs-cowork-env
+  size: 1Gi
+
 # Default values for deployment, this is necessary because we're using a unified helm subchart
 deployment:
   # This is the name of the deployment, this is used in a _lot_ of places in the helm charts so lets just specify it
@@ -105,6 +115,22 @@ deployment:
   service:
     targetPort: 9010
 
+  # Must match the access point's posixUser (uid/gid 1000), or every org tree
+  # is unreadable. The image pins the same ids.
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  volumes:
+    - name: cowork-shared
+      persistentVolumeClaim:
+        claimName: cowork-shared
+
+  volumeMounts:
+    - name: cowork-shared
+      mountPath: /mnt/cowork-shared
+
   globalEnvs:
 
     # ====================================
@@ -123,6 +149,20 @@ deployment:
     # from which a per-request principal is built.
     - name: COWORK_TENANCY_MODE
       value: "org"
+
+    # All cowork state moves onto the shared tree so the agent's pod can read
+    # and write the same files. noexec is set on the PV's mountOptions.
+    - name: COWORK_HOME
+      value: "/mnt/cowork-shared"
+
+    # Stays off the shared tree: it is this deployment's own state, not any
+    # org's, and the shared root is where org directories live. Note the env
+    # var is STATE_PATH, not a COWORK_-prefixed name: OAuthSettings.state_path
+    # has no validation_alias in cowork/common/settings/app_settings.py, so
+    # pydantic-settings falls back to the bare uppercased field name (same
+    # pattern as MASTER_KEY_PATH below).
+    - name: STATE_PATH
+      value: "/home/app/oauth_state.json"
 
     # DB settings for sqlalchemy. cowork-server defaults to SQLite; cloud points
     # at Postgres via this secret (see also the db-migrate initContainer).
