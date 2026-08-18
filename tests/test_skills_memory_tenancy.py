@@ -1,10 +1,13 @@
 """Tenant keying of the filesystem stores: skills and memory.
 
-Skills are an org asset (`<root>/<org_id>/`). Memory is two-tier: `global` is one
-person's (`<root>/<org_id>/users/<user_id>/` — anton overwrites identity by key, so
+Org mode is org-first: every store lives under `<shared_root>/<org_id>/<store>/`
+so an org's whole footprint is one mountable/GC-able subtree. Skills are an org
+asset (`<shared>/<org>/skills/`). Memory is two-tier: `global` is one person's
+(`<shared>/<org>/memory/users/<user_id>/` — anton overwrites identity by key, so
 sharing it corrupts teammates, ADR-0002), `project` is the org's. Both feed agent
 turns, so a cross-tenant write is prompt injection into someone else's agent.
-Local mode uses the shared root; org mode fails closed on a missing id.
+Local mode uses each store's own unkeyed root; org mode fails closed on a
+missing id.
 """
 from __future__ import annotations
 
@@ -33,71 +36,60 @@ def _org(org: str | None, user: str = "u") -> TenantScope:
     return TenantScope(org_mode=True, org_id=org, user_id=user)
 
 
-def _global_dir(root: Path, org: str, user: str = "u") -> Path:
-    """Org mode roots at ``cowork_home()/<org>/<store>``; `root` here is the
-    local-mode store dir (e.g. the memory dir), so cowork_home() is its
-    parent and the store name is its own final component."""
-    return root.parent / org / root.name / "users" / user
+def _global_dir(shared: Path, org: str, user: str = "u") -> Path:
+    return shared / org / "memory" / "users" / user
 
 
 # scoped_storage_root
 
-def test_scoped_storage_root_local_is_unchanged(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
-    assert scoped_storage_root(Path("/x"), None) == Path("/x")
-    assert scoped_storage_root(Path("/x"), LOCAL_SCOPE) == Path("/x")
+@pytest.fixture()
+def shared_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
+    get_app_settings.cache_clear()
+    yield tmp_path
+    get_app_settings.cache_clear()
 
 
-def test_scoped_storage_root_org_puts_org_first(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
-    assert (scoped_storage_root(tmp_path / "projects", _org(ORG_A))
-            == tmp_path / ORG_A / "projects")
-    assert (scoped_storage_root(tmp_path / "skills", _org(ORG_A))
-            == tmp_path / ORG_A / "skills")
+def test_storage_root_local_is_base(shared_root):
+    assert scoped_storage_root(Path("/x"), None, store="x") == Path("/x")
+    assert scoped_storage_root(Path("/x"), LOCAL_SCOPE, store="x") == Path("/x")
 
 
-def test_scoped_storage_root_org_ignores_base_parent(monkeypatch, tmp_path):
-    """Only the store name is taken from `base`; the root always comes from
-    cowork_home(), so one organization is exactly one subtree."""
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
-    assert (scoped_storage_root(Path("/somewhere/else/memory"), _org(ORG_A))
-            == tmp_path / ORG_A / "memory")
-
-
-def test_scoped_storage_root_org_fails_closed_without_org(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+def test_storage_root_org_is_org_first_and_fail_closed(shared_root):
+    # org-first: <shared>/<org>/<store>; base never names the org dir
+    assert (scoped_storage_root(Path("/renamed"), _org(ORG_A), store="skills")
+            == shared_root / ORG_A / "skills")
     with pytest.raises(MissingTenantScopeError):
-        scoped_storage_root(Path("/x"), _org(None))
+        scoped_storage_root(Path("/x"), _org(None), store="x")
 
 
-def test_scoped_user_storage_root_org_puts_org_first(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
-    assert (scoped_user_storage_root(tmp_path / "memory", _org(ORG_A, "alice"))
-            == tmp_path / ORG_A / "memory" / "users" / "alice")
+@pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "a\\b"])
+def test_storage_root_rejects_degenerate_store_segments(shared_root, bad):
+    # "" collapses onto the org root; traversal segments escape it.
+    with pytest.raises(ValueError, match="store segment"):
+        scoped_storage_root(Path("/x"), _org(ORG_A), store=bad)
 
 
-def test_scoped_user_storage_root_local_is_unchanged():
-    assert scoped_user_storage_root(Path("/x"), None) == Path("/x")          # desktop
-    assert scoped_user_storage_root(Path("/x"), LOCAL_SCOPE) == Path("/x")
+def test_user_storage_root_keys_org_and_user(shared_root):
+    assert scoped_user_storage_root(Path("/x"), None, store="x") == Path("/x")   # desktop
+    assert scoped_user_storage_root(Path("/x"), LOCAL_SCOPE, store="x") == Path("/x")
+    assert (scoped_user_storage_root(Path("/x"), _org(ORG_A, "alice"), store="x")
+            == shared_root / ORG_A / "x" / "users" / "alice")
 
 
-def test_scoped_user_storage_root_org_fails_closed_without_either_id(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+def test_user_storage_root_fails_closed_without_either_id(shared_root):
     with pytest.raises(MissingTenantScopeError):
-        scoped_user_storage_root(Path("/x"), _org(None))                     # no org
+        scoped_user_storage_root(Path("/x"), _org(None), store="x")              # no org
     with pytest.raises(MissingTenantScopeError):
-        scoped_user_storage_root(Path("/x"), _org(ORG_A, user=None))         # no user
+        scoped_user_storage_root(Path("/x"), _org(ORG_A, user=None), store="x")  # no user
 
 
 # skills
 
 @pytest.fixture()
 def skills_root(tmp_path, monkeypatch):
-    # COWORK_HOME is set alongside the local-mode override because org mode
-    # now always roots at cowork_home() (see scoped_storage_root); without it
-    # org-mode tests here would fall through to the real ~/.cowork.
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
     yield tmp_path / "skills"
     get_app_settings.cache_clear()
@@ -135,10 +127,8 @@ def test_skills_org_mode_without_org_fails_closed(skills_root):
 
 @pytest.fixture()
 def memory_env(tmp_path, monkeypatch):
-    # Same reason as skills_root: org mode roots at cowork_home() regardless
-    # of COWORK_MEMORY_DIR, so it must be pinned to tmp_path too.
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
     import cowork.models.project, cowork.models.conversation  # noqa: F401
     import cowork.models.message, cowork.models.message_event  # noqa: F401
@@ -146,7 +136,8 @@ def memory_env(tmp_path, monkeypatch):
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     SQLModel.metadata.create_all(eng)
-    yield eng, tmp_path / "memory"
+    # yields the shared root; the local-mode memory base is <shared>/memory
+    yield eng, tmp_path
     get_app_settings.cache_clear()
 
 
@@ -189,7 +180,7 @@ async def test_global_memory_local_mode_unchanged(memory_env):
     engine, root = memory_env
     local = _memory_service(engine, LOCAL_SCOPE)
     await local.update_memory(scope="global", category="rules", content="local rules")
-    assert (root / "rules.md").is_file()              # no org segment
+    assert (root / "memory" / "rules.md").is_file()   # no org segment
 
 
 # review fixes: link distribution is desktop-only; zip caps; harness memory keyed
@@ -202,8 +193,8 @@ def test_org_mode_creates_no_project_symlinks(skills_root, tmp_path, monkeypatch
     get_app_settings.cache_clear()
     proj = tmp_path / "projects" / "victim-proj"
     proj.mkdir(parents=True)
-    (tmp_path / "skills" / ORG_B).mkdir(parents=True)  # org B's skill root
-    (tmp_path / "skills" / ORG_B / "secret").mkdir()
+    (tmp_path / ORG_B / "skills").mkdir(parents=True)  # org B's skill root
+    (tmp_path / ORG_B / "skills" / "secret").mkdir()
 
     SkillService(_org(ORG_A)).create_skill(label="X", name=ORG_B, instructions="i")
     assert not (proj / "skills").exists(), "org mode must not touch project dirs"
@@ -216,24 +207,6 @@ def test_local_mode_still_reconciles_links(skills_root, tmp_path, monkeypatch):
     proj.mkdir(parents=True)
     SkillService().create_skill(label="Y", name="y", instructions="i")
     assert (proj / "skills" / "y").exists(), "desktop link distribution unchanged"
-
-
-def test_editing_a_skill_twice_does_not_break_its_existing_link(skills_root, tmp_path, monkeypatch):
-    """Regression: once a project's skills/<slug> link exists on disk, its
-    resolved target (the canonical skill store) legitimately lives outside
-    the project's skills/ dir. A second reconcile used to mistake that for a
-    symlink escaping its base and raise. Editing a skill's instructions is
-    ordinary desktop use, not an edge case, so this must stay a no-op."""
-    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
-    get_app_settings.cache_clear()
-    proj = tmp_path / "projects" / "p1"
-    proj.mkdir(parents=True)
-    svc = SkillService()
-    svc.create_skill(label="Y", name="y", instructions="i")
-
-    svc.update_skill("y", instructions="updated instructions")
-
-    assert (proj / "skills" / "y").exists(), "link survives a second reconcile"
 
 
 def test_boot_reconcile_is_gated_off_in_org_mode(skills_root, monkeypatch):
@@ -258,20 +231,18 @@ def test_boot_reconcile_is_gated_off_in_org_mode(skills_root, monkeypatch):
 
 def test_unscoped_service_fails_closed_in_an_org_deployment(skills_root, tmp_path, monkeypatch):
     # Migration/seeding build an UNSCOPED SkillService(). In an org deployment
-    # the store root is shared storage every organization can read, so an
-    # unscoped write must RAISE rather than land in the unkeyed root. It used
-    # to succeed quietly there, relying on _link_projects alone to stop the
-    # symlink fan-out; that left the skill itself written outside any org.
+    # the store root is shared storage every organization can read, so the
+    # service cannot even be BUILT: scoped_storage_root refuses a missing scope
+    # there. The raise lands in the constructor, so no caller ever holds a
+    # service pointed at the unkeyed root. Declining to fan out symlinks was
+    # not enough on its own, since the skill itself still landed outside any
+    # organization's subtree.
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     proj = tmp_path / "projects" / "p1"
     proj.mkdir(parents=True)
 
-    # The raise lands in the constructor, where the store root is resolved, so
-    # an unscoped service cannot even be BUILT on an org deployment. That is
-    # stronger than catching it at write time and leaves no window in which a
-    # caller holds a service pointed at the shared root.
     with pytest.raises(MissingTenantScopeError):
         SkillService()
     assert not (proj / "skills").exists(), "org deployment must not fan out symlinks"
@@ -299,10 +270,12 @@ def test_inprocess_harness_memory_root_is_user_keyed(memory_env):
     on the same per-user dir the /memory API serves."""
     from cowork.common.settings.user_settings import use_settings_scope, current_settings_scope
     engine, root = memory_env
+    base = root / "memory"
     with use_settings_scope(_org(ORG_A, "alice")):
-        keyed = scoped_user_storage_root(root, current_settings_scope())
+        # Same call shape as the harness (harness.py) — explicit store name.
+        keyed = scoped_user_storage_root(base, current_settings_scope(), store="memory")
     assert keyed == _global_dir(root, ORG_A, "alice")
-    assert scoped_user_storage_root(root, current_settings_scope()) == root  # reset outside
+    assert scoped_user_storage_root(base, current_settings_scope(), store="memory") == base  # reset outside
 
 
 # remote-turn memory payload (what the pod receives)

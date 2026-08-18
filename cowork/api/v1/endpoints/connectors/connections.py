@@ -54,7 +54,7 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
         values["auth_type"] = "oauth"
     from pathlib import Path
     from anton.core.datasources.data_vault import LocalDataVault
-    vault = LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope))
+    vault = LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
     try:
         slug = persist_connection(body.connector_id, body.method, body.name, values, vault=vault)
     except Exception:

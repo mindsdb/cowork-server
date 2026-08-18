@@ -33,6 +33,7 @@ def db(tmp_path, monkeypatch):
     # fall through to the real ~/.cowork.
     monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     from cowork.common.settings.app_settings import get_app_settings
     get_app_settings.cache_clear()
 

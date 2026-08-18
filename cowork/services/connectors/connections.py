@@ -31,7 +31,7 @@ class ConnectionsService:
     def _vault(self):
         from pathlib import Path
         from anton.core.datasources.data_vault import LocalDataVault
-        return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), self.scope))
+        return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), self.scope, store="data-vault"))
 
     def _read_record(self, vault, engine: str, name: str) -> dict | None:
         """Full on-disk record via read_record() when the vault supports

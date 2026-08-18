@@ -186,6 +186,17 @@ def create_app() -> FastAPI:
             "auth: org tenancy mode — principal middleware enabled (%s)",
             settings.identity_enforce,
         )
+        # No explicit shared root → org data sits on the ephemeral pod FS.
+        # Warn, don't fail: dev deployments predate the mount. model_fields_set
+        # covers env and dotenv sources alike.
+        if "shared_root" not in settings.storage.model_fields_set:
+            logger.warning(
+                "storage: org mode without COWORK_SHARED_DIR — org-keyed stores "
+                "fall back to %s (ephemeral in cloud; data is lost on redeploy)",
+                settings.storage.shared_root,
+            )
+        else:
+            logger.info("storage: org-keyed shared root at %s", settings.storage.shared_root)
 
     if settings.require_auth:
         # The token is mirrored into cowork_home()/.env so a desktop user can
