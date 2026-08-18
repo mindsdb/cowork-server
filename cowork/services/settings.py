@@ -1,6 +1,7 @@
 import json
 import logging
 from enum import Enum
+from typing import Any
 
 from cryptography.fernet import InvalidToken
 from pydantic import SecretStr, ValidationError
@@ -158,7 +159,12 @@ class SettingService:
             raise ValueError(f"Unknown setting: '{key}'")
 
     @staticmethod
-    def _load(rows: list[Setting]) -> UserSettings:
+    def _raw_data(rows: list[Setting]) -> dict[str, str]:
+        """Decrypted field → value map for ``rows``, before model validation.
+
+        Split out of ``_load`` so ``load_pending`` can overlay in-flight values
+        on the same footing as stored ones (both plaintext at this point).
+        """
         data: dict[str, str] = {}
         for row in rows:
             if row.key not in UserSettings.model_fields:
@@ -181,7 +187,11 @@ class SettingService:
                 data[row.key] = decrypted
             else:
                 data[row.key] = row.value
-        return UserSettings(**data)
+        return data
+
+    @staticmethod
+    def _load(rows: list[Setting]) -> UserSettings:
+        return UserSettings(**SettingService._raw_data(rows))
 
     @staticmethod
     def _is_set(key: str, settings: UserSettings, set_keys: set[str]) -> bool:
@@ -216,6 +226,34 @@ class SettingService:
 
     def load(self) -> UserSettings:
         return self._load(self._fetch_all_rows())
+
+    def load_pending(self, updates: dict[str, Any]) -> UserSettings:
+        """Settings as they WILL be once ``updates`` is written.
+
+        A validator that reads the stored state answers a question about the
+        PREVIOUS config, which is wrong whenever a request changes more than one
+        related key at once — and the Settings form always does: it ships
+        provider + credential + model in a single bulk PUT, and no UI path saves
+        a provider without its model. Resolving against the pre-write DB there
+        checked the new model against the OLD provider's catalog, which both
+        rejected legitimate provider switches and skipped the check entirely on
+        the switch INTO MindsHub (ENG-1358 review).
+
+        Skips the write-diff sentinels (``None`` / ``***``) exactly as the
+        writers do, and treats a blank credential as unset, matching ``_load``.
+        Read-only: nothing here touches the session.
+        """
+        data = self._raw_data(self._fetch_all_rows())
+        for key, value in (updates or {}).items():
+            if key not in UserSettings.model_fields:
+                continue
+            if value is None or value == "***":
+                continue
+            if UserSettings.field_is_sensitive(key) and not value:
+                data.pop(key, None)  # clearing a key = unset, not empty-string
+                continue
+            data[key] = value
+        return UserSettings(**data)
 
     def list_settings(self) -> list[SettingResponse]:
         rows = self._fetch_all_rows()

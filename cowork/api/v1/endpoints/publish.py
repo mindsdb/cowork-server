@@ -6,8 +6,10 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+
+from cowork.db.scoped import TenantScope, get_tenant_scope
 
 from cowork.services.publish import (
     PublisherUnavailable,
@@ -58,9 +60,13 @@ async def list_publishable_endpoint():
 
 
 @router.post("/")
-async def publish_artifact(req: _PublishBody):
+async def publish_artifact(req: _PublishBody, scope: TenantScope = Depends(get_tenant_scope)):
     try:
-        return _publish(req.path, req.password, access=req.access.model_dump() if req.access else None)
+        # The publisher resolves datasource secrets from the connector vault,
+        # which is org-keyed; without the scope it would look in the shared root.
+        return _publish(req.path, req.password,
+                        access=req.access.model_dump() if req.access else None,
+                        scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:

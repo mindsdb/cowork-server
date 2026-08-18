@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
+
+from cowork.db.scoped import TenantScope, get_tenant_scope
 
 from cowork.api.v1.endpoints.guards import require_local
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -42,8 +44,8 @@ def get_oauth_credentials(engine: str, request: Request):
 
 
 @router.get("/catalogue")
-def oauth_catalogue():
-    return {"items": oauth_service.get_catalogue(ConnectorSettings(), OAuthSettings())}
+def oauth_catalogue(scope: TenantScope = Depends(get_tenant_scope)):
+    return {"items": oauth_service.get_catalogue(ConnectorSettings(), OAuthSettings(), scope=scope)}
 
 
 @router.get("/status")

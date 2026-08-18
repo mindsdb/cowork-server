@@ -12,9 +12,8 @@ from uuid import UUID
 
 from sqlmodel import Session
 
-from cowork.common.settings.app_settings import get_app_settings
 from cowork.schemas.responses import Role
-from cowork.services.connectors.persist import persist_connection
+from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
@@ -160,8 +159,7 @@ class ProbeHandler:
             # Missing conversation context is fine: a temp workspace is created below.
             if spec is None:
                 try:
-                    from anton.core.datasources.data_vault import LocalDataVault
-                    vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+                    vault = vault_for_scope(self.session.scope)
                     slug = persist_connection(
                         connector_id, method, name, credentials,
                         label=connection_label, user_label=connection_user_label, vault=vault,
@@ -322,8 +320,7 @@ class ProbeHandler:
             saved_user_label: str | None = None
             if final_outcome.status == "success":
                 try:
-                    from anton.core.datasources.data_vault import LocalDataVault
-                    vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+                    vault = vault_for_scope(self.session.scope)
                     slug = persist_connection(
                         connector_id, method, name, credentials,
                         label=connection_label, user_label=connection_user_label, vault=vault,

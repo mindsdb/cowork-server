@@ -1,0 +1,22 @@
+{{/*
+Per-namespace EFS access point. The driver creates /<namespace> on the cowork
+filesystem and roots the access point there, so dev, staging, prod and every
+per-PR namespace get their own tree with no per-environment Terraform.
+
+Worker pods mount a SECOND access point one level deeper, rooted at
+/<namespace>/<org_id>. The controller's efs-cowork-org StorageClass sets
+basePath to this namespace; the two must agree.
+*/}}
+{{- if .Values.sharedStorage.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cowork-shared
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: {{ .Values.sharedStorage.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.sharedStorage.size }}
+{{- end }}

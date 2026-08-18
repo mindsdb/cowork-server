@@ -22,6 +22,7 @@ from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 from cowork.services.artifacts import (
+    ExecutionRefused,
     _project_artifacts_base,
     artifact_status as _artifact_status,
     delete_artifact as _delete_artifact,
@@ -106,7 +107,21 @@ async def export_artifact_endpoint(req: _ExportBody):
     from fastapi.concurrency import run_in_threadpool
 
     from cowork.services.artifact_export import ExportError, export_artifact
+    from cowork.services.artifacts import _org_mode
 
+    fmt = (req.format or "").lower().lstrip(".")
+    if fmt in ("pdf", "docx") and _org_mode():
+        # Both converters resolve URIs referenced in the source HTML to embed
+        # them in the output: xhtml2pdf fetches <img>/<link>/@import for PDF;
+        # htmldocx's image handling calls urllib.request.urlopen for docx. The
+        # source HTML is artifact content from the shared filesystem, written
+        # by any org's agent, so this is an SSRF and local-file-read primitive
+        # (including other orgs' trees) into a file the requester downloads.
+        # Plain HTML export does no such resolution, so it stays available.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="PDF and Word export are not available on this deployment. Export to HTML instead.",
+        )
     try:
         source = resolve_artifact_path(req.path)
     except FileNotFoundError as e:
@@ -200,6 +215,10 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
 
 @router.post("/open")
 async def open_artifact(req: _PathBody):
+    from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
+    # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
+    if _org_mode():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     try:
         artifact = resolve_artifact_path(req.path)
     except FileNotFoundError as e:
@@ -260,6 +279,13 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
         reveal_in_file_manager(target)
+    except ExecutionRefused as exc:
+        # reveal_in_file_manager's own _org_mode() refusal (services/artifacts.py) is a
+        # deployment policy, not a failure to reveal the file: surface it as 403 with its
+        # detail, matching open_artifact, instead of falling into the generic 500 below.
+        # Caught by its own type rather than as RuntimeError, so a genuine RuntimeError
+        # from the platform call underneath is still reported as the 500 it is.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Could not reveal artifact") from exc
     return {"status": "ok", "path": str(target)}

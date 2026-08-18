@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
+from cowork.common.chat_session import in_process_agent_allowed
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -46,8 +47,7 @@ from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
-    MODEL_ACCESS_DENIED_CODE,
-    MODEL_DISABLED_CODE,
+    MODEL_UNAVAILABLE_CODES,
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
@@ -276,6 +276,7 @@ class ResponsesHandler:
                 harness_name=self.harness_name,
                 harness_id=getattr(harness, "id", None),
                 buffer=buffer,
+                turn_id=turn_id,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
                 turn_llm=turn_llm,
@@ -292,6 +293,24 @@ class ResponsesHandler:
             return sse_from_buffer(buffer, 0)
 
         # Non-streaming (legacy/rare): run synchronously within the request.
+        # There is nowhere to run it in org mode. Only the streaming branch
+        # above has a remote producer (_select_producer dispatches the turn to
+        # a worker); this branch drives the harness in this process, and
+        # AntonHarness.stream_response refuses in org mode because doing so
+        # would execute agent-written code here. Without this check that
+        # refusal surfaces as an unhandled RuntimeError from _collect and the
+        # client sees an opaque 500. 501 with a concrete instruction instead,
+        # matching how endpoints/channels.py reports "configured off in org
+        # deployments". `stream` defaults to False in ResponsesRequest, so a
+        # client can land here by simply omitting the field.
+        if not in_process_agent_allowed():
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "This deployment only serves streaming turns. "
+                    'Retry the request with "stream": true.'
+                ),
+            )
         # The user message is persisted by _collect after the turn (deferred),
         # so the harness reads history WITHOUT the current turn — otherwise the
         # fresh-query history would replay it AND resend it as the live input.
@@ -515,6 +534,7 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
@@ -542,6 +562,7 @@ class ResponsesHandler:
                 model=model,
                 harness_id=harness_id,
                 buffer=buffer,
+                turn_id=turn_id,
                 turn_llm=turn_llm,
             )
         return self._produce(
@@ -557,6 +578,34 @@ class ResponsesHandler:
             trace_tags=trace_tags,
             trace_metadata=trace_metadata,
         )
+
+    @staticmethod
+    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
+        """The conversation's project as a path relative to the org root.
+
+        Absolute paths must not cross the wire: cowork-server sees the shared
+        tree at ``<root>/<org_id>`` and the pod mounts its own org's access
+        point at ``<root>``, so an absolute path built here names nothing
+        inside the pod. Both sides join their own root to this.
+
+        A lookup failure degrades to the org's default project rather than
+        failing the turn, matching how memory and skills used to degrade.
+        """
+        from pathlib import Path
+
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.scoped import scoped_storage_root
+
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            org_root = scoped_storage_root(
+                Path(get_app_settings().project.root_dir), session.scope, store="projects"
+            ).parent
+            rel = Path(conversation.project.path).relative_to(org_root).as_posix()
+            return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}
+        except Exception:
+            logger.exception("[responses] failed to resolve workspace for conversation %s", conv_id)
+            return {}
 
     @staticmethod
     def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
@@ -618,6 +667,7 @@ class ResponsesHandler:
         model: str | None,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
     ) -> None:
@@ -652,11 +702,13 @@ class ResponsesHandler:
                 user_id=self.scoped.scope.user_id,
                 input_text=input_text,
                 model=model,
+                turn_id=turn_id,
                 # Producer session, NOT self.scoped: this coroutine is detached
                 # and the request session may be closed by the time it runs.
                 history=self._remote_history(producer_session, conv_id),
-                memory=self._remote_memory(producer_session, conv_id),
-                skills=self._remote_skills(producer_session, conv_id),
+                # Skills and memory are NOT sent: the pod reads them off the
+                # shared mount. Only the org-relative project path travels.
+                **self._remote_workspace(producer_session, conv_id),
                 correlation_id=(turn_llm or {}).get("correlation_id"),
                 llm=(turn_llm or {}).get("llm"),
             ):
@@ -762,6 +814,7 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
@@ -896,10 +949,15 @@ class ResponsesHandler:
                     extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
-            elif code in (MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE):
-                # Model-403: tell the client WHICH model was rejected so the card
-                # can name it ("Sonnet isn't included in your plan"). No
-                # provider_label — the ModelUnavailableCard doesn't render it, and
+            elif code in MODEL_UNAVAILABLE_CODES:
+                # The model was rejected (legacy 403 gate, or a 404 for a model
+                # the provider can't serve): tell the client WHICH model so the
+                # card can name it ("Sonnet isn't included in your plan",
+                # "deepseek-v4-flash isn't a model on this provider"). Naming it
+                # is the whole point for model_not_found — the id is usually one
+                # the user typed or pasted, and seeing it is what makes the
+                # mistake obvious (ENG-1358). No provider_label — the
+                # ModelUnavailableCard doesn't render it, and
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}

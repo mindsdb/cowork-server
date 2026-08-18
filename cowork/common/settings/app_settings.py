@@ -1,4 +1,5 @@
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -242,7 +243,11 @@ class ProjectSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "projects"),
         validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECTS_ROOT_DIR"),
-        description="Root directory where project folders are stored",
+        description=(
+            "Root directory where project folders are stored. In org mode, only "
+            "this path's final component is kept; the parent directory is always "
+            "COWORK_HOME, so one organization stays one subtree there."
+        ),
     )  # PROJECT_ROOT_DIR or COWORK_PROJECTS_DIR or PROJECTS_ROOT_DIR
 
 
@@ -254,11 +259,27 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class StorageSettings(Settings):
+    # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
+    # mountable subtree per org). Local mode never reads this; in org mode the
+    # per-store *_DIR overrides are inert.
+    shared_root: str = Field(
+        default_factory=lambda: str(cowork_home()),
+        validation_alias=AliasChoices("COWORK_SHARED_DIR", "STORAGE_SHARED_ROOT"),
+        description="Root of the org-keyed shared storage tree (org mode only)",
+    )
+
+
 class SkillSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "skills"),
         validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
-        description="Root directory where agentskills.io-format skill folders are stored",
+        description=(
+            "Root directory where agentskills.io-format skill folders are stored. "
+            "In org mode, only this path's final component is kept; the parent "
+            "directory is always COWORK_HOME, so one organization stays one "
+            "subtree there."
+        ),
     )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
 
 
@@ -314,7 +335,11 @@ class MemorySettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "memory"),
         validation_alias=AliasChoices("COWORK_MEMORY_DIR", "MEMORY_ROOT_DIR"),
-        description="Root directory for all memory files",
+        description=(
+            "Root directory for all memory files. In org mode, only this path's "
+            "final component is kept; the parent directory is always COWORK_HOME, "
+            "so one organization stays one subtree there."
+        ),
     )
 
 
@@ -477,6 +502,21 @@ class AppSettings(Settings):
             "from which a per-request principal is built."
         ),
     )
+    pod_scratch_dir: str = Field(
+        default_factory=lambda: str(Path(tempfile.gettempdir()) / "cowork"),
+        validation_alias=AliasChoices("COWORK_POD_SCRATCH_DIR"),
+        description=(
+            "Org mode only (see cowork.common.paths.pod_local_only): root for "
+            "scratch and deployment-local state that carries no org_id segment "
+            "and so must never sit on the shared COWORK_HOME tree. Covers the "
+            "connector probe's plaintext credential env files, publish's "
+            "state.json, and the anton harness's temporary data-vault "
+            "directory. Local mode never reads this field; those stores keep "
+            "resolving under COWORK_HOME exactly as before. Defaults to the "
+            "container's own temp directory, which is never the shared EFS "
+            "mount and is gone on pod restart."
+        ),
+    )
     ask_user_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
@@ -618,6 +658,7 @@ class AppSettings(Settings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
+    storage: StorageSettings = Field(default_factory=StorageSettings)  # STORAGE_*
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
