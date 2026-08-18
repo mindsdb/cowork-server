@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from anton.utils.datasources import default_user_label, ensure_unique_user_label
 
@@ -21,11 +22,18 @@ from cowork.services.connectors.identity import (
 )
 from cowork.services.connectors.vault_lock import lock_for
 
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
-def _default_vault():
+
+def _default_vault(scope: "TenantScope | None" = None):
     from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.db.scoped import scoped_storage_root
 
-    return LocalDataVault(Path(ConnectorSettings().vault_dir))
+    # Org mode keys the persisted vault per org, same as scoped_storage_root's
+    # other callers (SkillService, FileService); local mode (scope=None or
+    # scope.org_mode False) returns vault_dir unchanged.
+    return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope))
 
 
 def persist_connection(
@@ -37,6 +45,7 @@ def persist_connection(
     label: str | None = None,
     user_label: str | None = None,
     vault=None,
+    scope: "TenantScope | None" = None,
 ) -> str:
     """Persist a connection and return the slug used.
 
