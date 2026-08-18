@@ -20,6 +20,8 @@ os.environ["COWORK_PROJECTS_DIR"] = str(TMP / "projects")
 # File bytes too — without this, any test using FileService writes into the
 # developer's real ~/.cowork/files/ and orphans dirs there.
 os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
+# Without this, org-scoped tests write into the developer's real ~/.cowork/.
+os.environ["COWORK_SHARED_DIR"] = str(TMP / "shared")
 os.environ["ENV"] = "test"
 
 import pytest

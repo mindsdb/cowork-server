@@ -254,6 +254,17 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class StorageSettings(Settings):
+    # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
+    # mountable subtree per org). Local mode never reads this; in org mode the
+    # per-store *_DIR overrides are inert.
+    shared_root: str = Field(
+        default_factory=lambda: str(cowork_home()),
+        validation_alias=AliasChoices("COWORK_SHARED_DIR", "STORAGE_SHARED_ROOT"),
+        description="Root of the org-keyed shared storage tree (org mode only)",
+    )
+
+
 class SkillSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "skills"),
@@ -618,6 +629,7 @@ class AppSettings(Settings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
+    storage: StorageSettings = Field(default_factory=StorageSettings)  # STORAGE_*
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*

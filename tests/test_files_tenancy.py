@@ -34,6 +34,7 @@ def _scope(org: str, user: str = "user-1") -> TenantScope:
 @pytest.fixture()
 def engine(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_FILES_DIR", str(tmp_path / "files"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
     import cowork.models.message, cowork.models.message_event  # noqa: F401  mappers
     eng = create_engine(
@@ -107,14 +108,13 @@ def test_local_scope_sees_everything(engine):
 
 def test_upload_fail_closed_writes_no_bytes(engine, tmp_path):
     from cowork.db.scoped import MissingTenantScopeError
-    files_root = Path(get_app_settings().file.root_dir)
-    before = set(files_root.iterdir()) if files_root.exists() else set()
+    # Watch the whole isolated tree — a leak could land in either layout.
+    before = set(tmp_path.rglob("*"))
     # org mode without an org in scope (audit gap) must fail BEFORE disk I/O
     svc = _svc(engine, TenantScope(org_mode=True, org_id=None))
     with pytest.raises(MissingTenantScopeError):
         _mkfile(svc)
-    after = set(files_root.iterdir()) if files_root.exists() else set()
-    assert before == after, "no orphaned bytes on scope failure"
+    assert set(tmp_path.rglob("*")) == before, "no orphaned bytes on scope failure"
 
 
 def test_compat_upload_scope_failure_is_401_not_500(monkeypatch):
@@ -269,7 +269,8 @@ async def test_upload_filename_cannot_escape_root(engine, tmp_path, name):
     svc = _svc(engine, _scope(ORG_A))
     res = await svc.create_file(_upload(name), purpose="assistants")
     stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
-    assert (tmp_path / "files").resolve() in stored.parents  # contained
+    # org-first layout: bytes contained under <shared>/<org>/files
+    assert (tmp_path / ORG_A / "files").resolve() in stored.parents
     assert stored.name in ("pwned", "upload")                # basename or fallback
     assert not (tmp_path / "etc").exists()
 
@@ -305,3 +306,84 @@ def test_delete_by_purpose_never_rmtrees_an_escaped_legacy_path(engine, tmp_path
     svc.session.commit()
     unlink_file_dirs(dirs)  # the caller unlinks after committing
     assert (victim / "keep.txt").exists()  # untouched
+
+
+# ── org-first files layout ───────────────────────────────────────────────────
+
+def test_files_land_in_separate_org_subtrees(engine, tmp_path):
+    # Disk-level separation, not just row filtering.
+    row_a = _mkfile(_svc(engine, _scope(ORG_A)))
+    row_b = _mkfile(_svc(engine, _scope(ORG_B)))
+    assert Path(row_a.path) == tmp_path / ORG_A / "files" / str(row_a.id) / "report.csv"
+    assert Path(row_b.path) == tmp_path / ORG_B / "files" / str(row_b.id) / "report.csv"
+
+
+def test_same_org_delete_removes_bytes(engine):
+    # Write and delete must resolve the same root, or bytes silently orphan.
+    svc = _svc(engine, _scope(ORG_A))
+    row = _mkfile(svc)
+    path = Path(row.path)
+    assert path.exists()
+    assert svc.delete_file(row.id) is True
+    assert not path.parent.exists()
+
+
+def test_local_mode_delete_removes_bytes(engine, tmp_path):
+    svc = _svc(engine, LOCAL_SCOPE)
+    row = _mkfile(svc)
+    path = Path(row.path)
+    assert (tmp_path / "files").resolve() in path.resolve().parents  # unkeyed base
+    assert svc.delete_file(row.id) is True
+    assert not path.parent.exists()
+
+
+def test_delete_by_purpose_removes_bytes_under_current_root(engine):
+    # Staged dirs must be the real on-disk dirs.
+    from cowork.services.files import unlink_file_dirs
+    svc = _svc(engine, _scope(ORG_A))
+    purpose = attachment_purpose(str(uuid4()))
+    rows = [_mkfile(svc, purpose=purpose) for _ in range(2)]
+    paths = [Path(r.path) for r in rows]
+    assert all(p.exists() for p in paths)
+
+    dirs = svc.delete_by_purpose(purpose)
+    svc.session.commit()
+    unlink_file_dirs(dirs)
+    assert all(not p.parent.exists() for p in paths)
+
+
+def test_delete_unlinks_stored_dir_after_root_move(engine, tmp_path, monkeypatch):
+    # If the root moves between write and delete, the stored dir must still go.
+    svc = _svc(engine, _scope(ORG_A))
+    row = _mkfile(svc)
+    old_path = Path(row.path)
+    assert old_path.exists()
+
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "moved-root"))
+    get_app_settings.cache_clear()
+    try:
+        assert svc.delete_file(row.id) is True
+        assert not old_path.parent.exists(), "bytes at the old root must not orphan"
+    finally:
+        get_app_settings.cache_clear()
+
+
+def test_delete_after_root_move_still_ignores_escaped_paths(engine, tmp_path, monkeypatch):
+    # Stored dir only counts when its resolved parent is named <file.id>.
+    svc = _svc(engine, _scope(ORG_A))
+    victim = tmp_path / "victim-moved"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("x")
+    f = File(filename="x", content_type="text/plain", size=1,
+             purpose="assistants", path=str(victim / "x"))
+    svc.session.add(f)
+    svc.session.commit()
+    svc.session.refresh(f)
+
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "moved-root2"))
+    get_app_settings.cache_clear()
+    try:
+        assert svc.delete_file(f.id) is True
+        assert (victim / "keep.txt").exists()  # untouched
+    finally:
+        get_app_settings.cache_clear()

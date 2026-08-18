@@ -104,6 +104,9 @@ def _human_mtime(ts: float) -> str:
 
 
 def _projects_root() -> Path:
+    # Unkeyed: in org mode this dir is empty (projects live org-first under the
+    # shared root), so the in-app artifact API sees nothing there. Tracked in
+    # next.md §1 (artifacts org-scoping).
     return Path(get_app_settings().project.root_dir)
 
 
