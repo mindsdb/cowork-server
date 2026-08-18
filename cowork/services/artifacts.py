@@ -28,6 +28,23 @@ from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
 
+
+def _cloud_mode() -> bool:
+    """True on the multi-tenant deployment.
+
+    In cloud, artifact files live on shared EFS and are written by any org's
+    agent. Executing them, or handing them to the desktop's file manager, would
+    run untrusted code inside cowork-server. `noexec` on the mount does not stop
+    this: it blocks `./script`, not `python script.py`.
+    """
+    return get_app_settings().tenancy_mode == "org"
+
+
+_NO_EXEC_DETAIL = (
+    "Live artifact backends are not available on this deployment. "
+    "Open the published version instead."
+)
+
 # In-memory registry: deterministic token → parent dir of an artifact.
 # Used for both static (HTML asset) and proxy (fullstack backend) mounts;
 # `kind` field on the preview-mount response payload discriminates.
@@ -568,6 +585,8 @@ def delete_artifact(raw_path: str) -> None:
 
 
 def reveal_in_file_manager(path: Path) -> None:
+    if _cloud_mode():
+        raise RuntimeError(_NO_EXEC_DETAIL)
     if sys.platform == "darwin":
         subprocess.run(["open", "-R", str(path)], check=False)
     elif sys.platform == "win32":
@@ -909,7 +928,12 @@ async def _ensure_backend_running(
         input when the helper had to allocate a fresh free port.
       - `running=False` → backend is down and we couldn't start it;
         `detail` carries the reason; `port` echoes the input port.
+
+    In cloud this always refuses; see `_cloud_mode`.
     """
+    if _cloud_mode():
+        return False, _NO_EXEC_DETAIL, 0
+
     slug = artifact_dir.name
     if _probe_port(port):
         return True, "already_running", port
