@@ -504,6 +504,31 @@ class AntonHarness:
             yield TurnHistory(turn_rows)
 
     @staticmethod
+    def _stamp_message(m) -> dict:
+        """Embed a USER message's created_at as a `[YYYY-MM-DD HH:MM] ` prefix
+        so the agent always knows WHEN something was said (even resuming a
+        conversation days/weeks later). Absolute stamps are fixed per
+        message, so the history prefix stays byte-stable across turns
+        (cache-safe).
+
+        User-only, matching anton's own live-turn stamping
+        (core_agent/anton/core/session.py's _stamp_user_content). An earlier
+        version stamped assistant replies too, which meant Anton's own prior
+        replies came back to it prefixed with a timestamp in its replayed
+        history, and it would imitate that visible convention in new
+        output — most visible on short turns like "hi"/"who are you?" with
+        little else to anchor generation.
+
+        Extracted (not an inline closure) so this can be unit-tested
+        directly against fake messages, same reasoning as _seed_history.
+        """
+        om = m.to_openai_message().model_dump()
+        ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+        if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
+            om["content"] = f"[{ts}] {om['content']}"
+        return om
+
+    @staticmethod
     def _seed_history(ordered_messages: list, history_summary: str | None, cutoff_id, stamp) -> tuple[list[dict], dict]:
         """Build initial_history as [summary] + [messages after cutoff] when
         the saved compaction is still valid, else full history.
@@ -918,17 +943,6 @@ class AntonHarness:
         cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
-        # Per-message timestamps: embed each message's created_at so the agent
-        # always knows WHEN something was said (even resuming a conversation
-        # days/weeks later). Absolute stamps are fixed per message, so the
-        # history prefix stays byte-stable across turns (cache-safe).
-        def _stamped(m):
-            om = m.to_openai_message().model_dump()
-            ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
-            if ts and isinstance(om.get("content"), str) and om["content"]:
-                om["content"] = f"[{ts}] {om['content']}"
-            return om
-
         replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
         # Replay [summary] + [messages after cutoff] instead of full history
         # when a saved compaction is still valid (ENG-664). Disabled → plain
@@ -938,10 +952,10 @@ class AntonHarness:
                 replayable,
                 conversation.history_summary,
                 conversation.history_summary_cutoff_id,
-                _stamped,
+                self._stamp_message,
             )
         else:
-            initial_history = [_stamped(m) for m in replayable]
+            initial_history = [self._stamp_message(m) for m in replayable]
             seed_info = None
 
         config = ChatSessionConfig(

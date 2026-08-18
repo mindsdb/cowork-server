@@ -47,15 +47,6 @@ N_TURNS = 30
 _BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def _stamped(m):
-    """Mirrors AntonHarness._build_chat_session's `_stamped` closure."""
-    om = m.to_openai_message().model_dump()
-    ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
-    if ts and isinstance(om.get("content"), str) and om["content"]:
-        om["content"] = f"[{ts}] {om['content']}"
-    return om
-
-
 def _mock_llm():
     # Mirrors anton's tests/conftest.py::make_mock_llm — ChatSession.__init__
     # reads coding_provider/planning_provider synchronously, which a bare
@@ -104,7 +95,7 @@ async def _run_conversation(svc, *, compaction_enabled: bool):
         replayable = [m for m in svc.get_ordered_messages(conv.id) if m.role in {"user", "assistant"}]
         summary = conv.history_summary if compaction_enabled else None
         initial_history, seed_info = AntonHarness._seed_history(
-            replayable, summary, conv.history_summary_cutoff_id, _stamped,
+            replayable, summary, conv.history_summary_cutoff_id, AntonHarness._stamp_message,
         )
         chars_per_turn.append(len(json.dumps(initial_history)))
 
