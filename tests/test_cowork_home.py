@@ -58,6 +58,7 @@ def test_prod_build_still_reads_legacy_anton_env(monkeypatch):
 _PER_RESOURCE_OVERRIDES = [
     "DATABASE_URI",
     "MASTER_KEY_PATH",
+    "STATE_PATH",
     "COWORK_PROJECTS_DIR",
     "PROJECTS_ROOT_DIR",
     "COWORK_FILES_DIR",
@@ -105,6 +106,19 @@ def test_explicit_database_uri_still_overrides_cowork_home(monkeypatch, tmp_path
     assert AppSettings(_env_file=None).database.uri == "sqlite:////tmp/explicit.db"
 
     get_app_settings.cache_clear()
+
+
+def test_explicit_state_path_still_overrides_cowork_home(monkeypatch, tmp_path):
+    # OAuthSettings.state_path has no validation_alias, so pydantic-settings
+    # falls back to the bare uppercased field name: STATE_PATH, not a
+    # COWORK_-prefixed name (same pattern as MASTER_KEY_PATH). The cowork-server
+    # Helm values file relies on this exact name to keep OAuth state off the
+    # shared EFS tree; this pins it so a future validation_alias addition
+    # can't silently change the env var cloud config depends on.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("STATE_PATH", "/home/app/oauth_state.json")
+
+    assert OAuthSettings(_env_file=None).state_path == "/home/app/oauth_state.json"
 
 
 def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):
