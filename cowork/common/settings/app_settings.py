@@ -516,7 +516,7 @@ class AppSettings(Settings):
         ),
     )
     identity_enforce: Literal["audit", "enforce"] = Field(
-        default="enforce",
+        default="audit",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
             "Org-mode identity enforcement. 'enforce' (default): requests without "
