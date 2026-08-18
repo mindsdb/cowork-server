@@ -114,17 +114,17 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
 # ── reconciliation ────────────────────────────────────────────────────────
 
 
-def _is_enabled() -> bool:
+def _is_enabled(scope) -> bool:
     from cowork.common.settings.user_settings import get_user_settings
 
-    return bool(getattr(get_user_settings(), "artifact_autopublish_enabled", False))
+    return bool(getattr(get_user_settings(scope), "artifact_autopublish_enabled", False))
 
 
-def _publish_url() -> str:
+def _publish_url(scope) -> str:
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.publish import _resolve_publish_endpoint
 
-    publish_url, _unused_key = _resolve_publish_endpoint(get_user_settings())
+    publish_url, _unused_key = _resolve_publish_endpoint(get_user_settings(scope))
     return publish_url
 
 
@@ -244,13 +244,22 @@ async def autopublish_project_artifacts(
 
     Never raises — a lost publication is recoverable on the next turn, a lost reply
     is not. The one exception is CancelledError, which propagates.
+
+    Every settings read goes through `scope` explicitly rather than the ambient
+    `use_settings_scope` binding. The remote-turn producer that drives this on an
+    org deployment (handlers/responses.py `_produce_remote`) is a DETACHED task
+    with no ambient scope bound, and an unscoped `get_user_settings()` silently
+    resolves LOCAL_SCOPE — which would read the global row for the org-scoped
+    enable flag and the wrong provider for the publish URL.
     """
-    if not _is_enabled():
-        return set()
+    # Scope guards first: the enable flag is an org setting, so reading it is
+    # only meaningful once we know we have an org scope to read it for.
     if scope is None or not getattr(scope, "org_mode", False):
         return set()
     if not scope.org_id or not scope.user_id:
         _record("skipped", reason="no_scope_identity")
+        return set()
+    if not _is_enabled(scope):
         return set()
 
     base = Path(artifacts_base)
@@ -258,7 +267,7 @@ async def autopublish_project_artifacts(
     phase_one = [s for s in all_slugs if s in touched]
     phase_two = [s for s in all_slugs if s not in touched]
 
-    publish_url = _publish_url()
+    publish_url = _publish_url(scope)
     key = PublishKey(scope.user_id, scope.org_id, min_ttl_s=timeout_s + 60.0)
     started = time.monotonic()
     published: set[str] = set()

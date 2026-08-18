@@ -36,12 +36,12 @@ def base(tmp_path):
 
 @pytest.fixture
 def enabled(monkeypatch):
-    monkeypatch.setattr(ap, "_is_enabled", lambda: True)
+    monkeypatch.setattr(ap, "_is_enabled", lambda scope: True)
 
 
 @pytest.fixture
 def publish_url(monkeypatch):
-    monkeypatch.setattr(ap, "_publish_url", lambda: "https://api.staging.mindshub.ai")
+    monkeypatch.setattr(ap, "_publish_url", lambda scope: "https://api.staging.mindshub.ai")
 
 
 @pytest.fixture
@@ -88,7 +88,7 @@ pytestmark = pytest.mark.usefixtures("publish_url")
 # ── guards ────────────────────────────────────────────────────────────────
 
 async def test_disabled_setting_publishes_nothing(base, key, published, monkeypatch):
-    monkeypatch.setattr(ap, "_is_enabled", lambda: False)
+    monkeypatch.setattr(ap, "_is_enabled", lambda scope: False)
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
@@ -127,6 +127,39 @@ async def test_scope_without_user_id_publishes_nothing(base, enabled, key, publi
 
     assert out == set()
     assert published == []
+
+
+async def test_settings_are_read_with_the_passed_scope_not_the_ambient_one(
+    base, key, published, monkeypatch,
+):
+    """Both settings reads must pass `scope` explicitly.
+
+    The org producer that drives this (`_produce_remote`) is a detached task with
+    no `use_settings_scope` binding, and `get_user_settings()` with no argument
+    falls back to LOCAL_SCOPE rather than failing. The enable flag is org-scoped
+    and the publish URL comes from the org's provider, so an ambient read would
+    silently consult the global row and the wrong endpoint — publishing nothing,
+    or publishing to the wrong place, with no error anywhere.
+    """
+    from cowork.common.settings import user_settings as us
+
+    seen = []
+
+    class _Settings:
+        artifact_autopublish_enabled = True
+
+    def fake_get_user_settings(scope=None):
+        seen.append(scope)
+        return _Settings()
+
+    monkeypatch.setattr(us, "get_user_settings", fake_get_user_settings)
+    monkeypatch.setattr(ap, "_publish_url", lambda scope: "https://api.staging.mindshub.ai")
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+
+    assert seen and all(s is ORG_SCOPE for s in seen)
 
 
 # ── the happy path ────────────────────────────────────────────────────────
