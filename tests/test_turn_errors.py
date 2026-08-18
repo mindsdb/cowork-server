@@ -213,6 +213,97 @@ def test_collect_raises_500_generic_for_unmapped_error():
     assert "secret-token" not in err.value.detail
 
 
+# ── Internal server / version-skew errors (ENG-1412) ──────────────
+#
+# A bug in cowork-server, or an anton↔cowork-server API/version skew, crashes
+# session build with a bare structural Python error (the ENG-1412 TypeError from
+# ToolDef(..., unlock_skill=…) against a stale anton; David Fraser's second case,
+# a NameError from a binding rc7 left dangling). friendly_turn_error can't map it
+# (it's not a provider failure), so it fell through to the opaque "An unexpected
+# error occurred." with the real cause buried in the server log. These pin that
+# the class is now recognised and surfaced actionably — while an arbitrary
+# Exception (which may embed provider text/secrets) stays fully redacted.
+
+_ENG_1412_TYPEERROR = TypeError(
+    "ToolDef.__init__() got an unexpected keyword argument 'unlock_skill'"
+)
+
+
+def test_is_internal_server_error_detects_structural_types():
+    assert te.is_internal_server_error(_ENG_1412_TYPEERROR) is True
+    assert te.is_internal_server_error(NameError("name 'user' is not defined")) is True
+    assert te.is_internal_server_error(AttributeError("no attribute 'x'")) is True
+    assert te.is_internal_server_error(ModuleNotFoundError("No module named 'z'")) is True
+    # A provider/runtime failure — or anything whose message we can't trust — is
+    # NOT this class and must stay redacted.
+    assert te.is_internal_server_error(RuntimeError("secret internals")) is False
+    assert te.is_internal_server_error(ValueError("bad value")) is False
+    assert te.is_internal_server_error(Exception("boom")) is False
+
+
+def test_internal_error_message_names_the_failure_actionably():
+    msg = te.internal_error_message(_ENG_1412_TYPEERROR)
+    assert msg != te.GENERIC_TURN_ERROR_MESSAGE
+    # Names the concrete failure the user can report (the ENG-1412 gap).
+    assert "TypeError" in msg
+    assert "unlock_skill" in msg
+    # Frames it as a server-side bug and points at the update that fixes it.
+    assert "bug on our side" in msg
+    assert "updating" in msg.lower()
+
+
+def test_internal_error_message_redacts_non_structural_errors():
+    # A provider Exception carrying a secret must never reach the user.
+    assert (
+        te.internal_error_message(Exception("psycopg2: password 'hunter2'"))
+        == te.GENERIC_TURN_ERROR_MESSAGE
+    )
+    assert "hunter2" not in te.internal_error_message(Exception("password 'hunter2'"))
+
+
+def test_internal_error_detail_is_single_line_and_bounded():
+    msg = te.internal_error_message(NameError("boom\nwith\nnewlines " + "x" * 500))
+    # Collapsed to a single line and capped, so a pathological message can't
+    # blow up the failure alert.
+    assert "\n" not in msg.split("report this: ", 1)[1]
+    detail = msg.split("report this: ", 1)[1]
+    assert len(detail) <= te._INTERNAL_DETAIL_MAX
+
+
+async def test_stream_surfaces_internal_error_instead_of_dead_end():
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(_ENG_1412_TYPEERROR)
+    )
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    # Reuses the generic wire code (no renderer card/branch needed) but with an
+    # actionable message rather than the bare dead-end.
+    assert payload["code"] == te.GENERIC_TURN_ERROR_CODE
+    assert payload["error"] != te.GENERIC_TURN_ERROR_MESSAGE
+    assert "unlock_skill" in payload["error"]
+
+
+def test_collect_raises_500_with_internal_detail_for_structural_error():
+    handler = _handler_with_raising_formatter(_ENG_1412_TYPEERROR)
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
+    assert err.value.status_code == 500
+    assert err.value.detail != te.GENERIC_TURN_ERROR_MESSAGE
+    assert "unlock_skill" in err.value.detail
+
+
+def test_remote_error_internal_type_is_surfaced():
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+
+    code, msg = remote_turn_error(
+        "TypeError: ToolDef.__init__() got an unexpected keyword argument 'unlock_skill'"
+    )
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg != te.GENERIC_TURN_ERROR_MESSAGE
+    assert "unlock_skill" in msg
+
+
 # ── Token-limit (quota) detection / mapping ───────────────────────
 #
 # When an account's included-token allowance is spent, anton raises
