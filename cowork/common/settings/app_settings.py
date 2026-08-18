@@ -242,7 +242,11 @@ class ProjectSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "projects"),
         validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECTS_ROOT_DIR"),
-        description="Root directory where project folders are stored",
+        description=(
+            "Root directory where project folders are stored. In org mode, only "
+            "this path's final component is kept; the parent directory is always "
+            "COWORK_HOME, so one organization stays one subtree there."
+        ),
     )  # PROJECT_ROOT_DIR or COWORK_PROJECTS_DIR or PROJECTS_ROOT_DIR
 
 
@@ -258,7 +262,12 @@ class SkillSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "skills"),
         validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
-        description="Root directory where agentskills.io-format skill folders are stored",
+        description=(
+            "Root directory where agentskills.io-format skill folders are stored. "
+            "In org mode, only this path's final component is kept; the parent "
+            "directory is always COWORK_HOME, so one organization stays one "
+            "subtree there."
+        ),
     )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
 
 
@@ -314,7 +323,11 @@ class MemorySettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "memory"),
         validation_alias=AliasChoices("COWORK_MEMORY_DIR", "MEMORY_ROOT_DIR"),
-        description="Root directory for all memory files",
+        description=(
+            "Root directory for all memory files. In org mode, only this path's "
+            "final component is kept; the parent directory is always COWORK_HOME, "
+            "so one organization stays one subtree there."
+        ),
     )
 
 

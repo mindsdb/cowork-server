@@ -97,6 +97,12 @@ def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
     organization exactly one subtree, which is what an EFS access point can be
     rooted at. Fail-closed without an org. org_id is a normalized UUID
     (TrustedHeaderMiddleware), so it is path-safe.
+
+    An operator who points a store's ``COWORK_*_DIR`` at a custom parent
+    directory (e.g. ``COWORK_SKILLS_DIR=/custom/path/skills``) will see that
+    parent silently dropped in org mode: only the ``skills`` component
+    survives, nested under ``COWORK_HOME`` instead. This is deliberate, not a
+    bug to route around.
     """
     if scope is None or not scope.org_mode:
         return base
