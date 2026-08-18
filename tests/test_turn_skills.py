@@ -25,6 +25,10 @@ def _org(org: str | None, user: str = "u") -> TenantScope:
 
 @pytest.fixture()
 def skills_root(tmp_path, monkeypatch):
+    # Org mode roots at cowork_home() regardless of COWORK_SKILLS_DIR (see
+    # scoped_storage_root), so it must be pinned here too or org-scoped tests
+    # fall through to the real ~/.cowork.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
     get_app_settings.cache_clear()
     yield tmp_path / "skills"

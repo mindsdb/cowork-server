@@ -148,9 +148,13 @@ def test_seed_in_org_mode_reads_the_orgs_own_root(tmp_path: Path, monkeypatch):
     from cowork.db.scoped import TenantScope
 
     org = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    # Org mode roots at cowork_home()/<org>/<store>, org first, so the
+    # org-keyed entry lives under the home dir, not under the store itself.
+    home = tmp_path / "home"
+    monkeypatch.setenv("COWORK_HOME", str(home))
     store = tmp_path / "store"
-    _write_skill(store / org / "my-skill")           # org-keyed store entry
-    _write_skill(store / "my-skill", body="UNKEYED — must not be read\n")
+    _write_skill(home / org / "store" / "my-skill")  # org-keyed store entry
+    _write_skill(store / "my-skill", body="UNKEYED - must not be read\n")
     _point_org_store_at(monkeypatch, store)
 
     with use_settings_scope(TenantScope(org_mode=True, org_id=org, user_id="u")):

@@ -25,6 +25,7 @@ from sqlalchemy import event
 from sqlalchemy.sql import Select
 from sqlmodel import Session, select
 
+from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_session
 from cowork.principal import Principal, get_principal
@@ -86,14 +87,22 @@ def scope_for_background_context() -> TenantScope:
 
 
 def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
-    """Org-keyed root for filesystem stores shared by the whole org: ``base`` in
-    local mode, ``base/<org_id>`` in org mode, fail-closed without an org. org_id
-    is a normalized UUID (TrustedHeaderMiddleware), so it's path-safe."""
+    """Root for a filesystem store shared by the whole org.
+
+    Local mode returns ``base`` verbatim, so a desktop install keeps
+    ``~/.cowork/projects`` and any ``COWORK_*__ROOT_DIR`` override intact.
+
+    Org mode pivots the org to the FRONT: ``cowork_home()/<org_id>/<store>``,
+    where ``<store>`` is ``base``'s final component. Org-first is what makes one
+    organization exactly one subtree, which is what an EFS access point can be
+    rooted at. Fail-closed without an org. org_id is a normalized UUID
+    (TrustedHeaderMiddleware), so it is path-safe.
+    """
     if scope is None or not scope.org_mode:
         return base
     if not scope.org_id:
         raise MissingTenantScopeError("filesystem store requires an organization in scope")
-    return base / scope.org_id
+    return cowork_home() / scope.org_id / base.name
 
 
 def scoped_user_storage_root(base: Path, scope: TenantScope | None) -> Path:
