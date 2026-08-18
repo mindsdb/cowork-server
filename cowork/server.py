@@ -188,6 +188,18 @@ def create_app() -> FastAPI:
         )
 
     if settings.require_auth:
+        # The token is mirrored into cowork_home()/.env so a desktop user can
+        # read it back. On an org deployment cowork_home() is shared storage
+        # that every organization's agent pod can read and write, so mirroring
+        # a bearer token there would publish it to every tenant and let any of
+        # them overwrite it. Inert today only because require_auth defaults off
+        # and no values file sets it; guarded so turning it on is not a trap.
+        if settings.tenancy_mode == "org":
+            raise RuntimeError(
+                "COWORK_REQUIRE_AUTH is not supported in org tenancy mode: the bearer token "
+                "would be mirrored into shared storage readable by every organization. "
+                "Org deployments authenticate at the ingress instead."
+            )
         env_path = cowork_home() / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)
         sync_auth_token(env_path, token)

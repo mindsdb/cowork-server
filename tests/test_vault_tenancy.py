@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from cowork.common.settings.app_settings import get_app_settings
+import cowork.server as cowork_server
 from cowork.db.scoped import MissingTenantScopeError, TenantScope, scoped_storage_root
 
 ORG_A = "11111111-1111-4111-8111-111111111111"
@@ -54,3 +55,34 @@ def test_two_orgs_never_share_a_vault_directory(org_deployment):
     a = scoped_storage_root(org_deployment / "data-vault", TenantScope(org_mode=True, org_id=ORG_A, user_id="u"))
     b = scoped_storage_root(org_deployment / "data-vault", TenantScope(org_mode=True, org_id=other, user_id="u"))
     assert a != b
+
+
+def test_single_tenant_harness_is_refused_in_org_mode(org_deployment):
+    """available_harness_ids() only hides it from the picker. The harness is an
+    org-scoped user setting, so a stored row naming one still reached get_harness
+    and ran it against unscoped shared-storage paths."""
+    from cowork.harnesses.base import get_harness
+
+    with pytest.raises(ValueError, match="does not support multi-tenant"):
+        get_harness("hermes")
+
+
+def test_single_tenant_harness_still_loads_on_desktop(local_deployment):
+    from cowork.harnesses.base import _registry, get_harness
+
+    if "hermes" not in _registry:
+        pytest.skip("hermes harness not installed in this environment")
+    assert get_harness("hermes") is not None
+
+
+def test_bearer_token_mirror_is_refused_in_org_mode(org_deployment, monkeypatch):
+    """The token is mirrored into cowork_home()/.env, which on an org deployment
+    is shared storage every organization can read and overwrite."""
+    # Imported at module scope on purpose: cowork.server builds an app at
+    # import time, so importing it here would raise before pytest.raises saw
+    # the call and the test would pass for the wrong reason.
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    get_app_settings.cache_clear()
+
+    with pytest.raises(RuntimeError, match="not supported in org tenancy mode"):
+        cowork_server.create_app()
