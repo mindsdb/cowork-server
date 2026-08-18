@@ -26,6 +26,7 @@ def _org(org: str | None, user: str = "u") -> TenantScope:
 @pytest.fixture()
 def skills_root(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
     yield tmp_path / "skills"
     get_app_settings.cache_clear()

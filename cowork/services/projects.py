@@ -207,7 +207,9 @@ class ProjectService:
         the same project name collided, and the second create hit an existing
         dir — a cross-org existence oracle.
         """
-        return scoped_storage_root(Path(get_app_settings().project.root_dir), self.session.scope)
+        return scoped_storage_root(
+            Path(get_app_settings().project.root_dir), self.session.scope, store="projects"
+        )
 
     def _project_path(self, name: str) -> Path:
         # Containment guard: a project dir is always a direct child of the
