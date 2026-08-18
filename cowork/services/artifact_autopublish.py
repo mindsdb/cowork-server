@@ -181,7 +181,7 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDeci
 
 
 async def _publish_one(
-    artifacts_base: Path, slug: str, api_key: str, publish_url: str, timeout_s: float
+    artifacts_base: Path, slug: str, api_key: str, publish_url: str, timeout_s: float, scope
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises."""
     folder = Path(artifacts_base) / slug
@@ -194,6 +194,12 @@ async def _publish_one(
                 api_key=api_key,
                 publish_url=publish_url,
                 access=dict(AUTOPUBLISH_ACCESS),
+                # Required, not optional, on this path: the publisher reads
+                # datasource secrets from the org-keyed connector vault, and
+                # `vault_for_scope(None)` raises on an org deployment rather
+                # than falling back to the shared namespace root. We only ever
+                # get here with an org scope in hand (see the caller's guard).
+                scope=scope,
             ),
             timeout=timeout_s,
         )
@@ -288,7 +294,7 @@ async def autopublish_project_artifacts(
                     release(base, slug)
                     _record("no_key", slug=slug)
                     return published
-                if await _publish_one(base, slug, api_key, publish_url, min(timeout_s, remaining)):
+                if await _publish_one(base, slug, api_key, publish_url, min(timeout_s, remaining), scope):
                     published.add(slug)
     except asyncio.CancelledError:
         raise

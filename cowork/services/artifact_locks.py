@@ -14,13 +14,17 @@ out: `asyncio.to_thread` is not cancellable, so that upload is still running, an
 releasing would let a second publisher into the same slug. A TTL is what prevents
 a permanently stuck lock in that case.
 
-Today cowork-server runs a single replica (deployment/cowork-server/values.yaml
-pins `replicaCount: 1` because the turn record buffer and the in-flight turn
-registry are process-local), so cross-process contention is not yet possible and
-an asyncio.Lock would suffice. The file lock is used anyway because that pin is
-explicitly temporary and because the TTL semantics above are needed regardless.
-On a shared network filesystem (EFS / RWX PVC) `O_CREAT|O_EXCL` is best-effort;
-the real defence against duplicates is reusing `report_id` from `.published.json`.
+A file lock rather than an asyncio.Lock because contention is genuinely
+cross-process: `deployment/cowork-server/values.yaml` now runs `replicaCount: 2`
+(the turn record buffer and the in-flight turn registry moved to Redis, so the
+old single-replica pin is gone), and every replica mounts the same artifacts
+tree. An in-process lock would only serialize one pod against itself.
+
+On a shared network filesystem (EFS / RWX PVC) `O_CREAT|O_EXCL` is best-effort,
+so two replicas can still both enter the same slug. That is tolerated: the real
+defence against a duplicate published artifact is reusing `report_id` from
+`.published.json`, which makes a second publish overwrite the same report rather
+than mint a second URL.
 """
 from __future__ import annotations
 

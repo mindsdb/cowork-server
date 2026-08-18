@@ -69,8 +69,9 @@ def published(monkeypatch):
     """Record publish calls and write a plausible .published.json."""
     calls = []
 
-    def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None, access=None):
-        calls.append({"folder": artifact, "api_key": api_key, "access": access})
+    def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
+                     access=None, scope=None):
+        calls.append({"folder": artifact, "api_key": api_key, "access": access, "scope": scope})
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
                            "last_md5": "m", "published_mtime": 9_999_999_999},
@@ -141,6 +142,21 @@ async def test_new_artifact_is_published_restricted_to_the_org(base, enabled, ke
     # with no emails to `public`, i.e. world-readable.
     assert published[0]["access"] == {"mode": "restricted", "emails": [], "org_allowed": True}
     assert published[0]["api_key"] == "turnkey-1"
+
+
+async def test_scope_is_threaded_into_the_publisher(base, enabled, key, published):
+    """The publisher resolves datasource secrets through `vault_for_scope`, which
+    RAISES on an org deployment when the scope is missing rather than falling
+    back to the shared namespace root. Dropping this kwarg would therefore fail
+    every org publish, not silently read the wrong vault — but the reconciler
+    swallows publish exceptions by design, so the failure would show up only as
+    artifacts that never appear. Assert the wiring here instead."""
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+
+    assert published[0]["scope"] is ORG_SCOPE
 
 
 async def test_key_is_revoked_after_reconciliation(base, enabled, key, published):

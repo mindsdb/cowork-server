@@ -10,6 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from cowork.api.v1.endpoints.guards import require_local_tenancy
+from cowork.db.scoped import TenantScope, get_tenant_scope
+
 from cowork.services.publish import (
     PublisherUnavailable,
     activate_version as _activate_version,
@@ -63,9 +65,15 @@ async def list_publishable_endpoint():
 
 
 @router.post("/")
-async def publish_artifact(req: _PublishBody):
+async def publish_artifact(req: _PublishBody, scope: TenantScope = Depends(get_tenant_scope)):
     try:
         artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path)
+        # The publisher resolves datasource secrets from the connector vault,
+        # which is org-keyed; without the scope it would look in the shared root.
+        # This router is local-only (see `require_local_tenancy` above), so the
+        # scope is always a local one here and `vault_for_scope` returns the
+        # unkeyed vault — threading it anyway keeps one resolution path for
+        # every publish call site rather than a desktop-only exception.
         return _publish(
             artifact,
             artifacts_base=artifacts_base,
@@ -73,6 +81,7 @@ async def publish_artifact(req: _PublishBody):
             publish_url=publish_url,
             password=req.password,
             access=req.access.model_dump() if req.access else None,
+            scope=scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
