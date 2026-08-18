@@ -240,11 +240,7 @@ def _copy_builtin_skills(store: SkillService) -> int:
             continue
         if dest.exists():
             continue  # keep the user-editable copy untouched
-        # Copied file by file, each destination re-checked for containment with
-        # safe_join, rather than handing the whole subtree to shutil.copytree.
-        # The org segment of `dest` comes from the request principal, so every
-        # write below is an explicitly bounded one — and the boundedness is
-        # visible locally instead of resting on validation two modules away.
+        # Copied file by file, each destination re-checked for containment with safe_join
         for child in sorted(p for p in src.rglob("*") if p.is_file()):
             target = safe_join(dest, *child.relative_to(src).parts)
             target.parent.mkdir(parents=True, exist_ok=True)
