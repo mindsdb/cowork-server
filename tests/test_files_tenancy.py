@@ -33,6 +33,10 @@ def _scope(org: str, user: str = "user-1") -> TenantScope:
 
 @pytest.fixture()
 def engine(tmp_path, monkeypatch):
+    # Org mode roots at cowork_home() regardless of COWORK_FILES_DIR (see
+    # scoped_storage_root), so it must be pinned here too or org-scoped tests
+    # fall through to the real ~/.cowork.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_FILES_DIR", str(tmp_path / "files"))
     get_app_settings.cache_clear()
     import cowork.models.message, cowork.models.message_event  # noqa: F401  mappers
@@ -115,6 +119,44 @@ def test_upload_fail_closed_writes_no_bytes(engine, tmp_path):
         _mkfile(svc)
     after = set(files_root.iterdir()) if files_root.exists() else set()
     assert before == after, "no orphaned bytes on scope failure"
+
+
+# ── _root_dir: org-first layout, so a worker mounting <env>/<org_id> can see
+# uploaded attachments at all (today's flat <root>/files/<uuid>/ is a sibling
+# of the org directories, invisible to any pod's mount) ─────────────────────
+
+def test_org_mode_places_file_under_org_keyed_files_root(engine, tmp_path):
+    row = _mkfile(_svc(engine, _scope(ORG_A)))
+    stored = Path(row.path)
+    org_files_root = tmp_path / ORG_A / "files"
+    assert stored.parent.parent == org_files_root
+    assert stored.parent.name == str(row.id)
+
+
+def test_local_mode_path_is_unchanged(engine, tmp_path):
+    row = _mkfile(_svc(engine, LOCAL_SCOPE))
+    stored = Path(row.path)
+    assert stored.parent.parent == tmp_path / "files"
+    assert stored.parent.name == str(row.id)
+
+
+def test_root_dir_fails_closed_without_org_in_scope(engine):
+    from cowork.db.scoped import MissingTenantScopeError
+    svc = _svc(engine, TenantScope(org_mode=True, org_id=None))
+    with pytest.raises(MissingTenantScopeError):
+        svc._root_dir()
+
+
+def test_org_mode_delete_removes_bytes_from_disk(engine):
+    a = _svc(engine, _scope(ORG_A))
+    row = _mkfile(a)
+    path = Path(row.path)
+    assert path.exists()
+
+    assert a.delete_file(row.id) is True
+
+    assert not path.exists()
+    assert not path.parent.exists()  # the per-file dir goes with it
 
 
 def test_compat_upload_scope_failure_is_401_not_500(monkeypatch):
@@ -269,7 +311,8 @@ async def test_upload_filename_cannot_escape_root(engine, tmp_path, name):
     svc = _svc(engine, _scope(ORG_A))
     res = await svc.create_file(_upload(name), purpose="assistants")
     stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
-    assert (tmp_path / "files").resolve() in stored.parents  # contained
+    # Containment root is this org's keyed files dir, not the unscoped one.
+    assert (tmp_path / ORG_A / "files").resolve() in stored.parents  # contained
     assert stored.name in ("pwned", "upload")                # basename or fallback
     assert not (tmp_path / "etc").exists()
 
