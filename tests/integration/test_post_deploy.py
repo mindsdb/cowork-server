@@ -186,9 +186,16 @@ def _sse_events(text: str) -> list[str]:
 
 
 def _stream_turn(client: httpx.Client, conversation_id: str, prompt: str, *,
-                 read_timeout: float = TURN_TIMEOUT_S) -> list[str]:
-    """POST a turn and drain its SSE response, returning the event names."""
+                 read_timeout: float = TURN_TIMEOUT_S, failures: list[str] | None = None) -> list[str]:
+    """POST a turn and drain its SSE response, returning the event names.
+
+    Pass ``failures`` to also collect the reason from any ``response.failed`` /
+    ``error`` event (its ``data:`` line carries ``code`` + ``message``) — a bare
+    "did not complete" is unactionable in CI, and the reason is what says whether
+    the pod never mounted, the worker timed out, or the model was unavailable.
+    """
     events: list[str] = []
+    current: str | None = None
     with client.stream(
         "POST", "/api/v1/responses/",
         json={"input": prompt, "conversation": conversation_id, "stream": True},
@@ -197,16 +204,27 @@ def _stream_turn(client: httpx.Client, conversation_id: str, prompt: str, *,
         assert resp.status_code == 200, resp.read()[:500]
         for line in resp.iter_lines():
             if line.startswith("event:"):
-                events.append(line.removeprefix("event:").strip())
+                current = line.removeprefix("event:").strip()
+                events.append(current)
+            elif line.startswith("data:") and failures is not None and current in ("response.failed", "error"):
+                raw = line.removeprefix("data:").strip()
+                try:
+                    payload = json.loads(raw)
+                    failures.append(f"code={payload.get('code')!r} message={payload.get('message')!r}")
+                except (ValueError, AttributeError):
+                    failures.append(raw[:300])
     return events
 
 
 def test_a_turn_runs_end_to_end(api, conversation_id):
     """A turn posted over HTTP reaches a pod and its replies reach the client."""
-    events = _stream_turn(api, conversation_id, QUICK_PROMPT)
+    failures: list[str] = []
+    events = _stream_turn(api, conversation_id, QUICK_PROMPT, failures=failures)
 
     assert "response.created" in events
-    assert "response.completed" in events, f"turn did not complete: {events}"
+    assert "response.completed" in events, (
+        f"turn did not complete: events={events} failure={failures}"
+    )
 
 
 def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
