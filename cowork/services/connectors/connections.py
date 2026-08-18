@@ -5,6 +5,7 @@ import json
 from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.common.settings.app_settings import ConnectorSettings
+from cowork.db.scoped import TenantScope, scoped_storage_root
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
@@ -15,11 +16,22 @@ from cowork.services.connectors.vault_lock import discard_lock, lock_for
 
 
 class ConnectionsService:
+    """Reads/writes the persisted connector vault (saved credentials).
+
+    Org mode keys the vault per org (``<vault_dir>/<org_id>``), the same as
+    ``SkillService``; local mode uses the shared root unchanged. ``scope``
+    must be supplied by the caller (a request's ``TenantScope``, not
+    recovered from anywhere else). The module-level ``service`` singleton
+    below is LOCAL-MODE ONLY and must never be used to serve an org request.
+    """
+
+    def __init__(self, scope: TenantScope | None = None) -> None:
+        self.scope = scope
 
     def _vault(self):
         from pathlib import Path
         from anton.core.datasources.data_vault import LocalDataVault
-        return LocalDataVault(Path(ConnectorSettings().vault_dir))
+        return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), self.scope))
 
     def _read_record(self, vault, engine: str, name: str) -> dict | None:
         """Full on-disk record via read_record() when the vault supports
@@ -256,4 +268,8 @@ class ConnectionsService:
         return deleted
 
 
+# LOCAL-MODE-ONLY convenience singleton (unscoped, so scoped_storage_root
+# returns the vault_dir unchanged). Desktop callers may keep using this. Any
+# org-mode caller must construct its own ConnectionsService(scope) instead;
+# using this singleton in org mode would read/write the unkeyed vault root.
 service = ConnectionsService()
