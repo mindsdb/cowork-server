@@ -20,8 +20,12 @@ from urllib.parse import urlparse
 from pydantic import SecretStr
 
 from cowork.common.paths import cowork_home, pod_local_only
+# Imported for its side effect on the module namespace as well as its use:
+# tests monkeypatch `publish.get_app_settings`, so removing it because a
+# linter sees no local call breaks them. noqa keeps that from recurring.
+from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
@@ -265,7 +269,8 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
-def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None) -> dict:
+def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None,
+                     scope=None) -> dict:
     settings = get_user_settings()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
@@ -280,7 +285,6 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
     try:
-        from anton.core.datasources.data_vault import LocalDataVault
         from anton.publisher import publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
@@ -325,7 +329,9 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             # (`~/.cowork/data-vault`), not anton's default
             # (`~/.anton/data_vault`) — otherwise secrets are missed and
             # the published artifact has no DB connection in the cloud.
-            vault=LocalDataVault(Path(get_app_settings().connector.vault_dir)),
+            # Org-keyed: the persisted vault is per organization, and an
+            # unscoped lookup would resolve to the shared namespace root.
+            vault=vault_for_scope(scope),
         )
     except Exception as exc:
         logger.exception("Publishing failed")
