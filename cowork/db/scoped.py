@@ -103,8 +103,22 @@ def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
     parent silently dropped in org mode: only the ``skills`` component
     survives, nested under ``COWORK_HOME`` instead. This is deliberate, not a
     bug to route around.
+
+    ``scope=None`` fail-closes on an org deployment. It cannot mean "no
+    tenancy" there: on shared storage ``base`` is the namespace root that every
+    organization can read, so returning it verbatim would hand a caller that
+    merely forgot to thread its scope a path outside any org's subtree. That is
+    how the persisted connector vault ended up unpartitioned. A caller with no
+    scope in org mode is a bug at the call site, and this is where it surfaces.
     """
-    if scope is None or not scope.org_mode:
+    if scope is None:
+        if get_app_settings().tenancy_mode == "org":
+            raise MissingTenantScopeError(
+                f"filesystem store {base.name!r} requires a TenantScope on an org deployment; "
+                "the caller must thread one through rather than defaulting to the shared root"
+            )
+        return base
+    if not scope.org_mode:
         return base
     if not scope.org_id:
         raise MissingTenantScopeError("filesystem store requires an organization in scope")
