@@ -39,8 +39,8 @@ FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd
 # Helm. A real home dir matters, not just a UID — cowork/common/paths.py
 # defaults all app state (db, uploads, memory, connector vault) under
 # Path.home()/".cowork", so the user needs a writable HOME for that to work.
-RUN groupadd --system --gid 1000 app \
-    && useradd --system --uid 1000 --gid 1000 --create-home --home-dir /home/app --shell /usr/sbin/nologin app
+RUN groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid 1000 --create-home --home-dir /home/app --shell /usr/sbin/nologin app
 
 WORKDIR /app
 
