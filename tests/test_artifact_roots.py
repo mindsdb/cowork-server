@@ -43,9 +43,9 @@ def _project(session, tmp_path, *, name: str, org_id: str | None) -> Project:
 
 @pytest.fixture
 def org_mode(monkeypatch):
-    # `_is_org_mode` is imported into artifact_roots as a module-level name, so
+    # `_org_mode` is imported into artifact_roots as a module-level name, so
     # patching it there is what the resolver actually reads.
-    monkeypatch.setattr("cowork.services.artifact_roots._is_org_mode", lambda: True)
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: True)
 
 
 def test_source_for_project_points_at_the_project_artifacts_dir(session, tmp_path, org_mode):
@@ -83,7 +83,7 @@ def test_sources_for_scope_covers_only_own_org(session, tmp_path, org_mode):
 def test_source_for_project_works_in_desktop_mode_too(session, tmp_path, monkeypatch):
     """Desktop resolves by id as well — that is what keeps slug-addressed delete
     from acting on whichever project sorts first."""
-    monkeypatch.setattr("cowork.services.artifact_roots._is_org_mode", lambda: False)
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
     row = _project(session, tmp_path, name="solo", org_id=None)
     scoped = ScopedSession(session, LOCAL_SCOPE)
 
@@ -96,7 +96,7 @@ def test_source_for_project_works_in_desktop_mode_too(session, tmp_path, monkeyp
 def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monkeypatch):
     """Local mode must keep listing exactly what it listed before — the scan,
     not a DB read (a desktop install has no org rows to scope by)."""
-    monkeypatch.setattr("cowork.services.artifact_roots._is_org_mode", lambda: False)
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
     called = []
     monkeypatch.setattr(
         "cowork.services.artifact_roots.artifacts_sources_for_scan",

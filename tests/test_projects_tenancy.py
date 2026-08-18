@@ -28,7 +28,12 @@ def _scope(org: str, user: str = "user-1") -> TenantScope:
 @pytest.fixture()
 def db(tmp_path, monkeypatch):
     """Isolated engine + projects root, seeded with the GENERAL row (NULL org)."""
+    # Org mode roots at cowork_home() regardless of COWORK_PROJECTS_DIR (see
+    # scoped_storage_root), so it must be pinned here too or org-scoped tests
+    # fall through to the real ~/.cowork.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     from cowork.common.settings.app_settings import get_app_settings
     get_app_settings.cache_clear()
 
@@ -97,7 +102,7 @@ def test_project_paths_cannot_escape_the_root(db, tmp_path, evil):
     # The created dir must sit directly under this ORG's projects root (the root
     # is org-keyed, like the skills/memory stores), not wherever the (sanitized)
     # name happened to point.
-    projects_root = (tmp_path / "projects" / str(ORG_A)).resolve()
+    projects_root = (tmp_path / str(ORG_A) / "projects").resolve()
     assert Path(project.path).resolve().parent == projects_root
     assert "/" not in project.name and ".." != project.name
 
@@ -211,7 +216,7 @@ def test_general_repoints_a_legacy_unkeyed_path_with_no_content(db, tmp_path):
     general = a.ensure_general_for_scope()
 
     assert general is not None
-    assert Path(general.path).parent == (tmp_path / "projects" / str(ORG_A))
+    assert Path(general.path).parent == (tmp_path / str(ORG_A) / "projects")
     assert Path(general.path).is_dir()
 
 
@@ -356,7 +361,7 @@ def test_repoints_off_an_empty_legacy_directory(db, tmp_path):
     general = _svc(db, _scope(ORG_A)).ensure_general_for_scope()
 
     assert general is not None
-    assert Path(general.path).parent == (tmp_path / "projects" / str(ORG_A))
+    assert Path(general.path).parent == (tmp_path / str(ORG_A) / "projects")
 
 
 def test_any_project_recovers_a_missing_directory(db):
@@ -381,7 +386,7 @@ def test_rename_works_when_the_org_root_does_not_exist_yet(db, tmp_path):
     raw.add(Project(name="legacy-proj", path=str(legacy), is_active=False, org_id=ORG_A))
     raw.commit()
     a = _svc(db, _scope(ORG_A))
-    assert not (tmp_path / "projects" / str(ORG_A)).exists()  # org root absent
+    assert not (tmp_path / str(ORG_A) / "projects").exists()  # org root absent
 
     renamed = a.update_project(a.get_project_by_name("legacy-proj").id, name="renamed")
 

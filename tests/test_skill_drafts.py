@@ -125,10 +125,15 @@ def test_stage_skill_draft_rejects_empty_name(tmp_path: Path):
 
 def _point_org_store_at(monkeypatch, root: Path) -> None:
     import cowork.common.settings.app_settings as app_settings
+    import cowork.db.scoped as scoped_mod
 
     skill = type("S", (), {"root_dir": str(root)})()
-    settings = type("Cfg", (), {"skill": skill, "tenancy_mode": "org"})()
+    storage = type("St", (), {"shared_root": str(root)})()
+    settings = type("Cfg", (), {"skill": skill, "storage": storage, "tenancy_mode": "org"})()
     monkeypatch.setattr(app_settings, "get_app_settings", lambda: settings)
+    # scoped.py binds get_app_settings at import; patch its binding too so the
+    # org-first path resolution reads the same stub.
+    monkeypatch.setattr(scoped_mod, "get_app_settings", lambda: settings)
 
 
 def test_seed_in_org_mode_without_scope_fails_closed(tmp_path: Path, monkeypatch):
@@ -149,7 +154,8 @@ def test_seed_in_org_mode_reads_the_orgs_own_root(tmp_path: Path, monkeypatch):
 
     org = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
     store = tmp_path / "store"
-    _write_skill(store / org / "my-skill")           # org-keyed store entry
+    # org-first layout: <shared>/<org>/skills/<slug> (shared_root == store here)
+    _write_skill(store / org / "skills" / "my-skill")
     _write_skill(store / "my-skill", body="UNKEYED — must not be read\n")
     _point_org_store_at(monkeypatch, store)
 

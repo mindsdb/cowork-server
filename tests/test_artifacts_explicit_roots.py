@@ -78,7 +78,7 @@ def test_list_artifacts_skips_a_missing_root(tmp_path):
 def test_serve_url_is_empty_in_org_mode(source, monkeypatch):
     folder = _make_artifact(source.base, "dash", files={"index.html": "<html></html>"},
                             meta={"slug": "dash", "type": "html-app"})
-    monkeypatch.setattr(a, "_is_org_mode", lambda: True)
+    monkeypatch.setattr(a, "_org_mode", lambda: True)
 
     card = a.card_for_folder(folder, project_id="p-1", project_name="Proj")
 
@@ -94,7 +94,7 @@ def test_serve_url_still_built_in_desktop_mode(tmp_path, monkeypatch):
     base = projects_root / "served-proj" / ".anton" / "artifacts"
     folder = _make_artifact(base, "dash", files={"index.html": "<html></html>"},
                             meta={"slug": "dash", "type": "html-app"})
-    monkeypatch.setattr(a, "_is_org_mode", lambda: False)
+    monkeypatch.setattr(a, "_org_mode", lambda: False)
 
     assert a.serve_url_for(folder / "index.html").startswith("/api/v1/artifacts/serve/")
 
@@ -109,7 +109,7 @@ def test_owner_side_access_fields_are_absent_in_org_mode(source, monkeypatch):
                        "mode": "password", "access_password": "s3cret",
                        "requires_password": True, "emails": ["x@example.com"]},
     }))
-    monkeypatch.setattr(a, "_is_org_mode", lambda: True)
+    monkeypatch.setattr(a, "_org_mode", lambda: True)
 
     card = a.card_for_folder(folder, project_id="p-1", project_name="Proj")
 
@@ -126,7 +126,7 @@ def test_owner_side_access_fields_remain_in_desktop_mode(source, monkeypatch):
                        "mode": "password", "access_password": "s3cret",
                        "requires_password": True},
     }))
-    monkeypatch.setattr(a, "_is_org_mode", lambda: False)
+    monkeypatch.setattr(a, "_org_mode", lambda: False)
 
     card = a.card_for_folder(folder)
 

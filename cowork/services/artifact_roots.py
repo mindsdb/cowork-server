@@ -21,7 +21,7 @@ from uuid import UUID
 from cowork.db.scoped import ScopedSession
 from cowork.services.artifacts import (
     ProjectArtifacts,
-    _is_org_mode,
+    _org_mode,
     _scan_artifact_dirs,
 )
 
@@ -47,7 +47,7 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
     project filter. In local mode this falls back to the filesystem scan so the
     desktop list is unchanged.
     """
-    if not _is_org_mode():
+    if not _org_mode():
         return artifacts_sources_for_scan()
 
     from cowork.services.projects import ProjectService

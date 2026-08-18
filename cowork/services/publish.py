@@ -14,14 +14,18 @@ import tempfile
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from pydantic import SecretStr
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
+# Imported for its side effect on the module namespace as well as its use:
+# tests monkeypatch `publish.get_app_settings`, so removing it because a
+# linter sees no local call breaks them. noqa keeps that from recurring.
+from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
@@ -36,6 +40,12 @@ from cowork.services.artifacts import (
     html_artifacts,
     resolve_artifact_path,
 )
+
+# Type-only, matching connectors/persist.py: cowork.db.scoped drags in the
+# session factory and the FastAPI dependency graph, and this module is imported
+# from the harness turn path where that is dead weight.
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +66,12 @@ def _cowork_state_dir() -> Path:
         path = Path(base).expanduser()
     else:
         # Consolidated under the cowork data root (was ~/.anton/cowork); the
-        # desktop app migrates the existing state.json on first run.
-        path = cowork_home()
+        # desktop app migrates the existing state.json on first run. Org mode
+        # relocates this off shared EFS storage via pod_local_only (see its
+        # docstring): state.json holds publish_history below, which carries
+        # no org_id segment, so left on cowork_home() every organization
+        # would read every other organization's publish history.
+        path = pod_local_only(cowork_home(), "publish")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -340,6 +354,7 @@ def publish_artifact(
     publish_url: str,
     password: str | None = None,
     access: dict | None = None,
+    scope: TenantScope | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -353,6 +368,13 @@ def publish_artifact(
     per-reconciliation turn key. That distinction is load-bearing - the upload
     lambda takes `owner_keycloak_id` from the token and folds md5(user_id)[:9]
     into the URL, so the key decides who owns the published artifact.
+
+    `scope` selects the connector vault the publisher reads datasource secrets
+    from; it is org-keyed, so an unscoped lookup would resolve to the shared
+    namespace root. Optional because the loose-file and Markdown paths carry no
+    datasources at all, and because `vault_for_scope` fail-closes on an org
+    deployment when it is missing - a caller that forgets it gets an error, not
+    another org's secrets.
     """
     if not api_key:
         raise ValueError("Publishing requires an API key")
@@ -364,7 +386,6 @@ def publish_artifact(
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
     try:
-        from anton.core.datasources.data_vault import LocalDataVault
         from anton.publisher import publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
@@ -409,7 +430,9 @@ def publish_artifact(
             # (`~/.cowork/data-vault`), not anton's default
             # (`~/.anton/data_vault`) — otherwise secrets are missed and
             # the published artifact has no DB connection in the cloud.
-            vault=LocalDataVault(Path(get_app_settings().connector.vault_dir)),
+            # Org-keyed: the persisted vault is per organization, and an
+            # unscoped lookup would resolve to the shared namespace root.
+            vault=vault_for_scope(scope),
         )
     except Exception as exc:
         logger.exception("Publishing failed")
