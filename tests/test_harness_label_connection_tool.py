@@ -14,7 +14,7 @@ class TestLabelConnectionToolReportsActualValue:
         vault = LocalDataVault(Path(tmp_path) / "vault")
         vault.save("gmail", "acct1", {"email": "a@b.com", "_user_label": "Support"})
         vault.save("gmail", "acct2", {"email": "c@d.com"})
-        monkeypatch.setattr("cowork.services.connectors.persist._default_vault", lambda: vault)
+        monkeypatch.setattr("cowork.services.connectors.persist.vault_for_scope", lambda _scope=None: vault)
         result = await _cowork_label_connection(
             MagicMock(), {"engine": "gmail", "name": "acct2", "label": "Support"}
         )
@@ -23,7 +23,7 @@ class TestLabelConnectionToolReportsActualValue:
     @pytest.mark.asyncio
     async def test_reports_not_found(self, tmp_path, monkeypatch):
         vault = LocalDataVault(Path(tmp_path) / "vault")
-        monkeypatch.setattr("cowork.services.connectors.persist._default_vault", lambda: vault)
+        monkeypatch.setattr("cowork.services.connectors.persist.vault_for_scope", lambda _scope=None: vault)
         result = await _cowork_label_connection(
             MagicMock(), {"engine": "gmail", "name": "missing", "label": "Support"}
         )

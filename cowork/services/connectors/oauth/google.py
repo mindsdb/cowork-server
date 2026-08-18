@@ -125,6 +125,19 @@ _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
 }
 
 
+def _vault_for(connector_settings: ConnectorSettings, scope):
+    """The org's persisted connector vault.
+
+    Keyed per organization in org mode, the same as every other filesystem
+    store. Without the scope this resolved to the shared namespace root, so
+    one organization's OAuth tokens were read from, and revoked out of, a
+    directory holding every organization's.
+    """
+    from cowork.db.scoped import scoped_storage_root
+
+    return LocalDataVault(scoped_storage_root(Path(connector_settings.vault_dir), scope))
+
+
 class OAuthService:
     def _resolve_credentials(self, service: str, settings: OAuthSettings) -> tuple[str, str]:
         id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
@@ -356,7 +369,8 @@ class OAuthService:
             success=True,
         )
 
-    def revoke(self, engine: str, name: str, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings | None = None) -> None:
+    def revoke(self, engine: str, name: str, connector_settings: ConnectorSettings,
+               oauth_settings: OAuthSettings | None = None, *, scope=None) -> None:
         if engine not in _ENGINE_TO_SERVICE:
             return
         custom_revoke = _REVOKE_HANDLERS.get(engine)
@@ -365,7 +379,7 @@ class OAuthService:
             _log.debug("Revoke not supported for %s/%s — skipping, local cleanup only", engine, name)
             return
         try:
-            fields = LocalDataVault(Path(connector_settings.vault_dir)).load(engine, name) or {}
+            fields = _vault_for(connector_settings, scope).load(engine, name) or {}
         except Exception:
             return
         if fields.get("auth_type") != "oauth":
@@ -402,9 +416,10 @@ class OAuthService:
         except Exception as exc:
             _log.warning("Could not revoke OAuth token for %s/%s: %s", engine, name, exc)
 
-    def get_catalogue(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings) -> list[dict]:
+    def get_catalogue(self, connector_settings: ConnectorSettings, oauth_settings: OAuthSettings,
+                      *, scope=None) -> list[dict]:
         try:
-            vault = LocalDataVault(Path(connector_settings.vault_dir))
+            vault = _vault_for(connector_settings, scope)
             all_connections = vault.list_connections() or []
         except Exception as exc:
             _log.warning("Could not load vault for catalogue: %s", exc)

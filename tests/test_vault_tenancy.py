@@ -86,3 +86,35 @@ def test_bearer_token_mirror_is_refused_in_org_mode(org_deployment, monkeypatch)
 
     with pytest.raises(RuntimeError, match="not supported in org tenancy mode"):
         cowork_server.create_app()
+
+
+def test_persisted_vault_is_org_keyed(org_deployment, monkeypatch):
+    """The saved-credential vault, not the probe's transient copy. Two orgs
+    must never resolve to the same directory."""
+    monkeypatch.setenv("COWORK_CONNECTOR__VAULT_DIR", str(org_deployment / "data-vault"))
+    get_app_settings.cache_clear()
+    from cowork.services.connectors.persist import vault_for_scope
+
+    other = "22222222-2222-4222-8222-222222222222"
+    a = vault_for_scope(TenantScope(org_mode=True, org_id=ORG_A, user_id="u"))
+    b = vault_for_scope(TenantScope(org_mode=True, org_id=other, user_id="u"))
+
+    assert Path(a._dir) != Path(b._dir)
+    assert ORG_A in str(a._dir)
+
+
+def test_persisted_vault_refuses_an_unscoped_save_in_org_mode(org_deployment):
+    """An unscoped call used to resolve to the shared namespace root, which is
+    where every organization's credentials ended up in one directory."""
+    from cowork.services.connectors.persist import vault_for_scope
+
+    with pytest.raises(MissingTenantScopeError):
+        vault_for_scope(None)
+
+
+def test_persisted_vault_is_unchanged_on_desktop(local_deployment, monkeypatch):
+    monkeypatch.setenv("COWORK_CONNECTOR__VAULT_DIR", str(local_deployment / "data-vault"))
+    get_app_settings.cache_clear()
+    from cowork.services.connectors.persist import vault_for_scope
+
+    assert Path(vault_for_scope(None)._dir) == local_deployment / "data-vault"
