@@ -256,18 +256,24 @@ def test_boot_reconcile_is_gated_off_in_org_mode(skills_root, monkeypatch):
     assert len(calls) == 1, "desktop boot distribution unchanged"
 
 
-def test_unscoped_service_does_not_link_in_org_deployment(skills_root, tmp_path, monkeypatch):
-    # Migration/seeding build an UNSCOPED SkillService(); in an org deployment
-    # that must still never fan symlinks out of the unkeyed root. Keyed on
-    # deployment mode, not just the passed scope.
+def test_unscoped_service_fails_closed_in_an_org_deployment(skills_root, tmp_path, monkeypatch):
+    # Migration/seeding build an UNSCOPED SkillService(). In an org deployment
+    # the store root is shared storage every organization can read, so an
+    # unscoped write must RAISE rather than land in the unkeyed root. It used
+    # to succeed quietly there, relying on _link_projects alone to stop the
+    # symlink fan-out; that left the skill itself written outside any org.
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     proj = tmp_path / "projects" / "p1"
     proj.mkdir(parents=True)
 
-    assert SkillService()._link_projects is False
-    SkillService().create_skill(label="Y", name="y", instructions="i")
+    # The raise lands in the constructor, where the store root is resolved, so
+    # an unscoped service cannot even be BUILT on an org deployment. That is
+    # stronger than catching it at write time and leaves no window in which a
+    # caller holds a service pointed at the shared root.
+    with pytest.raises(MissingTenantScopeError):
+        SkillService()
     assert not (proj / "skills").exists(), "org deployment must not fan out symlinks"
 
 
