@@ -26,7 +26,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
 from cowork.common.http_client import get_proxy_client
-from cowork.services.artifacts import get_preview_mount
+from cowork.services.artifacts import _NO_EXEC_DETAIL, _org_mode, get_preview_mount
 from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,22 @@ async def proxy_artifact_request(
     the artifact's HTML loaded. It's joined onto the backend's root.
     """
     cors = _cors_headers(request)
+
+    # Org mode has no artifact backends, and this forwarder is the only place
+    # every proxied request passes: the /proxy/{token}/{rel_path} route needs
+    # nothing but a token that exists, and mount_preview mints tokens on BOTH
+    # of its branches. Refusing only on the proxy branch (as the first version
+    # of this guard did) leaves a live chain: an artifact whose metadata.json
+    # has no `port` takes the static branch and gets a token, the org's own
+    # agent then writes {"port": 6379} into that same agent-writable file, and
+    # _read_backend_port below picks it up on the next request, at which point
+    # this function forwards the caller's method, path, query, headers and body
+    # to 127.0.0.1:6379 inside the pod. That is an SSRF pivot onto the server's
+    # own loopback surface, whether or not cowork-server ever launched
+    # anything. Checked before the OPTIONS short-circuit so no part of the
+    # proxy answers usefully in org mode.
+    if _org_mode():
+        return PlainTextResponse(_NO_EXEC_DETAIL, status_code=403, headers=cors)
 
     # Short-circuit preflight so artifact backends don't need to
     # implement OPTIONS themselves.

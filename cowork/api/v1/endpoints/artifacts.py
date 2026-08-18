@@ -22,6 +22,7 @@ from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 from cowork.services.artifacts import (
+    ExecutionRefused,
     _project_artifacts_base,
     artifact_status as _artifact_status,
     delete_artifact as _delete_artifact,
@@ -278,10 +279,12 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
         reveal_in_file_manager(target)
-    except RuntimeError as exc:
+    except ExecutionRefused as exc:
         # reveal_in_file_manager's own _org_mode() refusal (services/artifacts.py) is a
         # deployment policy, not a failure to reveal the file: surface it as 403 with its
         # detail, matching open_artifact, instead of falling into the generic 500 below.
+        # Caught by its own type rather than as RuntimeError, so a genuine RuntimeError
+        # from the platform call underneath is still reported as the 500 it is.
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Could not reveal artifact") from exc

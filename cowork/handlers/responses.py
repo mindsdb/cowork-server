@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
+from cowork.common.chat_session import in_process_agent_allowed
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -285,6 +286,24 @@ class ResponsesHandler:
             return sse_from_buffer(buffer, 0)
 
         # Non-streaming (legacy/rare): run synchronously within the request.
+        # There is nowhere to run it in org mode. Only the streaming branch
+        # above has a remote producer (_select_producer dispatches the turn to
+        # a worker); this branch drives the harness in this process, and
+        # AntonHarness.stream_response refuses in org mode because doing so
+        # would execute agent-written code here. Without this check that
+        # refusal surfaces as an unhandled RuntimeError from _collect and the
+        # client sees an opaque 500. 501 with a concrete instruction instead,
+        # matching how endpoints/channels.py reports "configured off in org
+        # deployments". `stream` defaults to False in ResponsesRequest, so a
+        # client can land here by simply omitting the field.
+        if not in_process_agent_allowed():
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "This deployment only serves streaming turns. "
+                    'Retry the request with "stream": true.'
+                ),
+            )
         # The user message is persisted by _collect after the turn (deferred),
         # so the harness reads history WITHOUT the current turn — otherwise the
         # fresh-query history would replay it AND resend it as the live input.
