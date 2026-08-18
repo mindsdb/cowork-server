@@ -57,6 +57,16 @@ process with `cwd` in the workspace. Two independent constructors of it were
 found in review, one of them unguarded, so the single allowlisted construction
 is `cowork/common/chat_session.py::build_chat_session`, which refuses in org
 mode; every other caller must route through it.
+
+`LocalScratchpadRuntime` is banned as a constructor for the same reason:
+it is the subprocess executor the `ChatSession` ban exists to keep out. Its
+one construction, in `cowork/services/scratchpad_runtime.py::_make_runtime`,
+is unguarded itself, but every path to it runs through
+`artifacts.py::_launch_backend_locked`, which is only reached after the
+caller's `_org_mode()` check. That indirection makes it a hole in the
+mechanism rather than a live one: a new, closer caller added later would
+spawn it unguarded with this test still green, which is exactly what listing
+it here as a named site prevents.
 """
 
 import ast
@@ -72,7 +82,7 @@ BANNED_ATTRS = {
     "posix_spawn", "posix_spawnp", "fork", "forkpty",
 }
 BANNED_NAMES = {"eval", "exec", "compile"}
-BANNED_CONSTRUCTORS = {"ChatSession"}
+BANNED_CONSTRUCTORS = {"ChatSession", "LocalScratchpadRuntime"}
 BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 
 #: (relative path, enclosing function/method or "<module>", labeled call,
@@ -97,6 +107,10 @@ ALLOWLIST = (
      "open_artifact endpoint"),
     ("common/chat_session.py", "build_chat_session", "ChatSession",
      "the one sanctioned ChatSession construction, refuses in org mode"),
+    ("services/scratchpad_runtime.py", "_make_runtime", "LocalScratchpadRuntime",
+     "reachable only through _launch_backend_locked, guarded by its caller's "
+     "_org_mode() check; not itself guarded, so it must stay a named, "
+     "single-entry site rather than an unlisted local import"),
 )
 
 

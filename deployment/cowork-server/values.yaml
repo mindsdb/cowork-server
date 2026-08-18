@@ -4,8 +4,11 @@
 # source `cowork-db` externally.
 ephemeral: false
 
-# Shared EFS tree, mounted read-write with noexec. Off by default so a desktop
-# or bare-chart install needs no filesystem.
+# Shared EFS tree, mounted read-write with noexec, backing the cowork-shared
+# PVC that COWORK_HOME and the volumeMounts below point at unconditionally.
+# Enabled here, not per-overlay, because dev, staging and prod all need it;
+# none of them ever set this false. Set enabled: false only for a desktop or
+# bare-chart install that has no filesystem and no COWORK_HOME to satisfy.
 sharedStorage:
   enabled: true
   storageClassName: efs-cowork-env
