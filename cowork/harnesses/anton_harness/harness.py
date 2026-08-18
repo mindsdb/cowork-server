@@ -77,6 +77,33 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
         applied.append(attr)
     return applied
 
+
+def _apply_workspace_env_if_safe(workspace) -> bool:
+    """Load `<project>/.anton/.env` into this process's environment, unless
+    org mode. Returns whether it applied.
+
+    `workspace` is an `anton.workspace.Workspace`; left unannotated since that
+    type is only ever imported locally in `_build_chat_session`, not at
+    module scope.
+
+    Extracted from `_build_chat_session` so the guard is testable without
+    constructing a full ChatSession.
+
+    `Workspace.apply_env_to_process` (anton's workspace.py) loads every key
+    from that file that isn't already set into THIS PROCESS's os.environ,
+    not a child process's, cowork-server's own, for the rest of its life. In
+    org mode that .env lives on shared EFS and any org's agent can write it;
+    a PYTHONPATH or LD_PRELOAD entry there would turn the next subprocess
+    this pod spawns into arbitrary code execution, and the mutation outlives
+    this turn, reaching every later request from every tenant this pod
+    serves.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return False
+    workspace.apply_env_to_process()
+    return True
+
+
 settings = AntonHarnessSettings()
 
 
@@ -371,6 +398,26 @@ class AntonHarness:
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
     ) -> AsyncIterator[str]:
+        if get_app_settings().tenancy_mode == "org":
+            # Org-mode turns must run on the remote worker, never in this
+            # process: _build_chat_session below hands the LLM a `scratchpad`
+            # tool (anton/core/session.py) that spawns a per-named-venv
+            # subprocess and pipes agent-written Python into it, exactly the
+            # code execution this whole EFS-hardening task exists to keep out
+            # of cowork-server. The remote-turn producer normally routes
+            # streaming requests to the worker over Redis (see
+            # handlers/responses.py's _select_producer), but three callers
+            # reach this method directly, bypassing that gate entirely: the
+            # legacy non-streaming branch in handlers/responses.py.handle
+            # (ResponsesRequest.stream defaults to False, and any client can
+            # leave it unset), _produce/_run_turn's in-process fallback
+            # whenever COWORK_TURN_BACKEND isn't "remote", and the
+            # channel-ingress runtime (cowork/channels/runtime.py). This
+            # refusal is the single point that closes all three.
+            raise RuntimeError(
+                "Turns must run on the remote worker in this deployment; "
+                "in-process execution is disabled."
+            )
         temp_vault_dir: Path | None = None
         # Attribute + surface any artifact created during this turn. Anton runs
         # with its own session id and doesn't tag artifacts with the cowork
@@ -670,7 +717,7 @@ class AntonHarness:
 
         workspace = Workspace(base)
         workspace.initialize()
-        workspace.apply_env_to_process()
+        _apply_workspace_env_if_safe(workspace)
 
         anton_dir = base / ".anton"
 

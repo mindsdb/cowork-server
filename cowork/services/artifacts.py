@@ -29,13 +29,13 @@ from cowork.common.settings.app_settings import get_app_settings
 logger = logging.getLogger(__name__)
 
 
-def _cloud_mode() -> bool:
+def _org_mode() -> bool:
     """True on the multi-tenant deployment.
 
-    In cloud, artifact files live on shared EFS and are written by any org's
-    agent. Executing them, or handing them to the desktop's file manager, would
-    run untrusted code inside cowork-server. `noexec` on the mount does not stop
-    this: it blocks `./script`, not `python script.py`.
+    In org mode, artifact files live on shared EFS and are written by any
+    org's agent. Executing them, or handing them to the desktop's file
+    manager, would run untrusted code inside cowork-server. `noexec` on the
+    mount does not stop this: it blocks `./script`, not `python script.py`.
     """
     return get_app_settings().tenancy_mode == "org"
 
@@ -585,7 +585,9 @@ def delete_artifact(raw_path: str) -> None:
 
 
 def reveal_in_file_manager(path: Path) -> None:
-    if _cloud_mode():
+    """Open the OS file manager on `path`. In org mode this always refuses;
+    see `_org_mode`."""
+    if _org_mode():
         raise RuntimeError(_NO_EXEC_DETAIL)
     if sys.platform == "darwin":
         subprocess.run(["open", "-R", str(path)], check=False)
@@ -764,12 +766,24 @@ async def mount_preview(path: Path) -> dict:
             backend_port = None
 
     if backend_port is not None:
-        # Proxy mode. Register the artifact root (where metadata.json +
-        # the live port live) so the proxy endpoint reads a current port
-        # by token, then auto-launch the backend if dead. Returns without
-        # `proxyUrl` — the route layer fills it in using the incoming
-        # Request URL so the absolute URL matches whatever host/scheme
-        # the client used to reach us.
+        # Proxy mode. In org mode this must refuse before registering
+        # anything: the token minted below maps into _PREVIEW_MOUNTS, and
+        # cowork.services.preview_proxy re-reads `port` from this artifact's
+        # own (agent-writable) metadata.json on every proxied request, then
+        # issues an httpx call to 127.0.0.1:<port> carrying the caller's
+        # method, path, query, headers and body. _ensure_backend_running
+        # already refuses to launch a backend here (see `_org_mode`), but
+        # that alone does not stop the registration: any org's agent could
+        # still point `port` at an unrelated loopback listener inside this
+        # pod and use the mount as an SSRF pivot, backend running or not.
+        if _org_mode():
+            raise ValueError(_NO_EXEC_DETAIL)
+        # Register the artifact root (where metadata.json and the live port
+        # live) so the proxy endpoint reads a current port by token, then
+        # auto-launch the backend if dead. Returns without `proxyUrl`; the
+        # route layer fills it in using the incoming Request URL so the
+        # absolute URL matches whatever host/scheme the client used to
+        # reach us.
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
         running, launch_detail, current_port = await _ensure_backend_running(
@@ -929,9 +943,9 @@ async def _ensure_backend_running(
       - `running=False` → backend is down and we couldn't start it;
         `detail` carries the reason; `port` echoes the input port.
 
-    In cloud this always refuses; see `_cloud_mode`.
+    In org mode this always refuses; see `_org_mode`.
     """
-    if _cloud_mode():
+    if _org_mode():
         return False, _NO_EXEC_DETAIL, 0
 
     slug = artifact_dir.name
