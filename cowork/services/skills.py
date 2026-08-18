@@ -161,12 +161,12 @@ def _skill_from_dir(skill_dir: Path) -> Skill | None:
 class SkillService:
     """File-backed skill store using the agentskills.io ``SKILL.md`` format.
 
-    Org mode keys the store per org (``<root>/<org_id>``); local mode uses the
-    shared root unchanged."""
+    Org mode keys the store per org (``<shared_root>/<org_id>/skills``); local
+    mode uses the shared root unchanged."""
 
     def __init__(self, scope: TenantScope | None = None) -> None:
         settings = get_app_settings()
-        self.root = scoped_storage_root(Path(settings.skill.root_dir), scope)
+        self.root = scoped_storage_root(Path(settings.skill.root_dir), scope, store="skills")
         # Symlink distribution is desktop-only (skill_links resolves the unkeyed
         # root and scans all project dirs). Keyed on deployment mode, not just
         # scope — an unscoped service (migration, seeding) must not fan symlinks
