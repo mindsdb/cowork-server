@@ -118,3 +118,27 @@ def test_ambient_provider_keys_do_not_override_minds(monkeypatch, org_mode):
     assert cs["provider"] == Provider.MINDS_CLOUD.value
     assert cs["model"] == "mindshub_air"
     assert cs["config_ready"] is True
+
+
+class TestUserSettingsIgnoresProcessEnvInOrgMode:
+    """A shared cloud server injects provider secrets as process env vars
+    (ANTHROPIC_API_KEY, ...). Per-user UserSettings must not read them in org
+    mode, or every tenant sees another config's keys as connected and the
+    Agent-Models UI resolves to a BYOK provider (staging bug). Desktop/local
+    keeps env reading so the standalone CLI / .env-first flow still work.
+    """
+
+    def test_org_mode_ignores_bare_provider_env(self, monkeypatch, org_mode):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-leak")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-oai-leak")
+        s = UserSettings(_env_file=None)
+        assert s.anthropic_api_key is None
+        assert s.openai_api_key is None
+        # Default provider stays MindsHub, not the leaked BYOK key.
+        assert s.planning_provider == Provider.MINDS_CLOUD
+
+    def test_local_mode_still_reads_provider_env(self, monkeypatch, local_mode):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-local")
+        s = UserSettings(_env_file=None)
+        assert s.anthropic_api_key is not None
+        assert s.anthropic_api_key.get_secret_value() == "sk-ant-local"
