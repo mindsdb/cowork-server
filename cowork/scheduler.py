@@ -143,12 +143,6 @@ async def execute_schedule(
     final_status: RunStatus | None = None
     try:
         schedule = schedule_service.get_schedule(schedule_id)
-        # No live request principal exists at cron/manual-run time; the schedule's
-        # own org_id/created_by (stamped when a real user created it) is who this
-        # run acts as. Fails closed in org mode if the schedule predates stamping.
-        from cowork.db.scoped import service_principal_for
-        principal = service_principal_for(schedule.org_id, schedule.created_by)
-
         # A scheduled run has no request, so it derives its tenant identity from
         # the schedule row (see _principal_for_schedule). None in local mode.
         try:
@@ -164,20 +158,18 @@ async def execute_schedule(
             raise
 
         if conversation_id is None:
-            # Conversation not pre-created by the caller (e.g. cron tick).
-            from cowork.db.scoped import scope_from_principal, unsafe_unscoped_session
-            from cowork.services.conversations import ConversationService
-            conv_session = ScopedSession(unsafe_unscoped_session(session), scope_from_principal(principal))
-            # Conversation not pre-created by the caller (e.g. cron tick). Create
-            # it under the schedule's OWN scope so org mode stamps the owning
-            # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
-            # scans every org), so creating through `session` would write an
-            # invisible NULL-org row.
             from cowork.db.scoped import (
                 ScopedSession,
                 scope_from_principal,
                 unsafe_unscoped_session,
             )
+            from cowork.services.conversations import ConversationService
+
+            # Conversation not pre-created by the caller (e.g. cron tick). Create
+            # it under the schedule's OWN scope so org mode stamps the owning
+            # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
+            # scans every org), so creating through `session` would write an
+            # invisible NULL-org row.
             conv_session = ScopedSession(
                 unsafe_unscoped_session(session), scope_from_principal(principal)
             )
