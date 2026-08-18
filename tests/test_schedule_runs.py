@@ -256,10 +256,10 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
         s.close()
 
 
-# --- ENG-1683: a scheduled run in org mode has no request, so it derives a
-# service principal from the schedule row — creating the conversation under the
-# owning org (rather than fail-closed) and handing the turn that principal so
-# the remote backend can mint the org's key headlessly.
+# A scheduled run in org mode has no request, so it derives a service principal
+# from the schedule row: the conversation is created under the owning org and
+# the turn receives that principal so the remote backend can mint the org's key
+# headlessly.
 
 def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
     import asyncio
@@ -314,7 +314,7 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
     session.close()
 
     try:
-        # Cron path (conversation_id=None) — this used to fail closed in org mode.
+        # Cron path (conversation_id=None).
         asyncio.run(execute_schedule(schedule_id, is_manual=False))
 
         principal = captured["principal"]
@@ -323,7 +323,7 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
         assert principal.user_id == user_id
 
         # The conversation was created under the owning org, not as an invisible
-        # NULL-org row (the failure the old fail-closed guard prevented).
+        # NULL-org row.
         s = get_open_session()
         convs = ScopedSession(s, org_scope)
         rows = convs.exec(convs.select(Conversation)).all()
@@ -336,10 +336,8 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
         get_app_settings.cache_clear()
 
 
-# --- ENG-1683: a corrupt org-mode row (NULL org_id) can never resolve an
-# identity, so it can never run. It must be disabled — not left due and
-# re-fired every poll — otherwise the cron loop spins on the same failure
-# forever, one failed run per tick.
+# A corrupt org-mode row (NULL org_id) can never resolve an identity, so it can
+# never run. It must be disabled, not left due and re-fired every poll.
 
 def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatch):
     import asyncio
@@ -380,7 +378,7 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
     session.close()
 
     # Corrupt the row: NULL the org on a raw session so the scoped before-flush
-    # listener doesn't re-stamp it. This is the pre-migration / bad-data shape.
+    # listener doesn't re-stamp it.
     raw = get_open_session()
     row = raw.get(Schedule, schedule_id)
     row.org_id = None
@@ -389,8 +387,7 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
     raw.close()
 
     try:
-        # A hung loop would keep firing this; one call is enough to observe the
-        # disable + a recorded failed run.
+        # One call is enough to observe the disable and the recorded failed run.
         asyncio.run(execute_schedule(schedule_id, is_manual=False))
 
         s = get_open_session()
