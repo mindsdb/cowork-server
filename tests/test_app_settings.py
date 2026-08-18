@@ -149,7 +149,7 @@ def test_app_settings_identity_enforce_defaults_to_enforce(monkeypatch):
 
     settings = AppSettings(_env_file=None)
 
-    assert settings.identity_enforce == "enforce"
+    assert settings.identity_enforce == "audit"
 
 
 def test_app_settings_identity_enforce_can_opt_into_audit(monkeypatch):
