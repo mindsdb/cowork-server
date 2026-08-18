@@ -168,24 +168,33 @@ def _resolved_model(
         so config_status's model gate reports "select a model" rather than
         silently running a wrong model.
 
-    ``wallet_aware`` (ENG-1632) — the auxiliary roles (coding, router) only.
-    A stored minds-cloud model the availability map marks ``enabled: false``
-    (wallet can't pay / allowance spent) is guaranteed to be denied on every
-    call, and the aux roles are invisible in default mode: the user cannot see
-    or fix the pin, so the verifier 402s every turn and surfaces as a spurious
-    "internal error". When a strictly-enabled model exists in the map, resolve
-    to it instead of the doomed stored value; when nothing is enabled (fully
-    drained account) or the map is absent/degraded, keep the stored value —
-    degraded metadata must never change behavior, and anton's verifier handles
-    the denial quietly. The stored row is never rewritten, so a topped-up
-    wallet (``enabled: true`` on the next settings load) restores the stored
-    model automatically.
+    ``wallet_aware`` (ENG-1632, now all three roles). A stored minds-cloud
+    model the availability map marks ``enabled: false`` is guaranteed to be
+    denied on every call — either because the wallet can't pay / allowance is
+    spent, OR because the id isn't a MindsHub model at all (absent from a
+    non-empty map counts as unavailable; see the probe note below). When a
+    strictly-enabled model exists in the map, resolve to it instead of the
+    doomed stored value; when nothing is enabled (fully drained account) or
+    the map is absent/degraded, keep the stored value — degraded metadata
+    must never change behavior. The stored row is never rewritten, so a
+    topped-up wallet (``enabled: true`` on the next settings load) restores
+    the stored model automatically.
 
-    This is a deliberate asymmetry with planning: "an explicit choice is never
-    rewritten" still holds for the planning role, which is visible in the
-    picker and has the pick-it-and-see-"Needs credits" lane (ENG-1248). The
-    aux roles get the silent fallback precisely because no such lane exists
-    for them.
+    Originally auxiliary-roles-only (coding, router): they're invisible in
+    default mode, so a stuck pin 402s every turn with no way for the user to
+    see or fix it, surfacing as a spurious "internal error". Planning was
+    deliberately exempted at the time — "an explicit choice is never
+    rewritten" holds because planning is visible in the picker and has the
+    pick-it-and-see-"Needs credits" lane (ENG-1248) — but that reasoning
+    assumed the stored id was chosen for the CURRENT provider. MindsHub SSO
+    sign-in breaks that assumption: it rewrites planning_provider to
+    minds_cloud without touching the paired planning_model, so a pre-sign-in
+    BYOK pick (e.g. an Anthropic id) survives untouched and 404s the gateway
+    on every turn — never reaching the picker's "Needs credits" lane at all,
+    since that lane is for a real MindsHub model the wallet can't currently
+    afford, not a foreign id. Planning now gets the same fallback; the
+    "Needs credits" lane is unaffected — it's a separate, still-visible
+    per-model tag (``modelEnabled``) on the picker, not this resolution path.
     """
     if resolved_provider == preferred_provider and user_model:
         enabled = enabled_map or {}
@@ -822,12 +831,27 @@ class UserSettings(Settings):
 
     @property
     def resolved_planning_model(self) -> str | None:
+        # wallet_aware (ENG-1632 follow-up): the docstring on _resolved_model
+        # originally kept planning exempt from this because a bad pick is
+        # "visible in the picker" — the user can see it and fix it. That
+        # holds for a genuinely unaffordable MindsHub model (the ENG-1248
+        # "Needs credits" lane still surfaces those separately, unaffected by
+        # this flag). It does NOT hold for a model that isn't a MindsHub
+        # model at all: MindsHub SSO sign-in rewrites planning_provider to
+        # minds_cloud without touching the paired planning_model, so a BYOK
+        # pick from before sign-in (e.g. an Anthropic id) survives untouched
+        # and gets sent straight to the gateway on the next turn, which
+        # 404s ("That model isn't available") on every single message
+        # instead of surfacing anywhere the user would see it first. Falling
+        # back to an actually-available MindsHub model — same self-healing
+        # coding/router already get — beats a hard failure on every turn.
         return _resolved_model(
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
             role_defaults(PLANNING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
+            wallet_aware=True,
         )
 
     @property
