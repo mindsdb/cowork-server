@@ -34,30 +34,55 @@ def _org(org: str | None, user: str = "u") -> TenantScope:
 
 
 def _global_dir(root: Path, org: str, user: str = "u") -> Path:
-    return root / org / "users" / user
+    """Org mode roots at ``cowork_home()/<org>/<store>``; `root` here is the
+    local-mode store dir (e.g. the memory dir), so cowork_home() is its
+    parent and the store name is its own final component."""
+    return root.parent / org / root.name / "users" / user
 
 
 # scoped_storage_root
 
-def test_storage_root_local_is_base():
+def test_scoped_storage_root_local_is_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     assert scoped_storage_root(Path("/x"), None) == Path("/x")
     assert scoped_storage_root(Path("/x"), LOCAL_SCOPE) == Path("/x")
 
 
-def test_storage_root_org_keyed_and_fail_closed():
-    assert scoped_storage_root(Path("/x"), _org(ORG_A)) == Path("/x") / ORG_A
+def test_scoped_storage_root_org_puts_org_first(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    assert (scoped_storage_root(tmp_path / "projects", _org(ORG_A))
+            == tmp_path / ORG_A / "projects")
+    assert (scoped_storage_root(tmp_path / "skills", _org(ORG_A))
+            == tmp_path / ORG_A / "skills")
+
+
+def test_scoped_storage_root_org_ignores_base_parent(monkeypatch, tmp_path):
+    """Only the store name is taken from `base`; the root always comes from
+    cowork_home(), so one organization is exactly one subtree."""
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    assert (scoped_storage_root(Path("/somewhere/else/memory"), _org(ORG_A))
+            == tmp_path / ORG_A / "memory")
+
+
+def test_scoped_storage_root_org_fails_closed_without_org(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     with pytest.raises(MissingTenantScopeError):
         scoped_storage_root(Path("/x"), _org(None))
 
 
-def test_user_storage_root_keys_org_and_user():
+def test_scoped_user_storage_root_org_puts_org_first(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    assert (scoped_user_storage_root(tmp_path / "memory", _org(ORG_A, "alice"))
+            == tmp_path / ORG_A / "memory" / "users" / "alice")
+
+
+def test_scoped_user_storage_root_local_is_unchanged():
     assert scoped_user_storage_root(Path("/x"), None) == Path("/x")          # desktop
     assert scoped_user_storage_root(Path("/x"), LOCAL_SCOPE) == Path("/x")
-    assert (scoped_user_storage_root(Path("/x"), _org(ORG_A, "alice"))
-            == Path("/x") / ORG_A / "users" / "alice")
 
 
-def test_user_storage_root_fails_closed_without_either_id():
+def test_scoped_user_storage_root_org_fails_closed_without_either_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     with pytest.raises(MissingTenantScopeError):
         scoped_user_storage_root(Path("/x"), _org(None))                     # no org
     with pytest.raises(MissingTenantScopeError):
@@ -68,6 +93,10 @@ def test_user_storage_root_fails_closed_without_either_id():
 
 @pytest.fixture()
 def skills_root(tmp_path, monkeypatch):
+    # COWORK_HOME is set alongside the local-mode override because org mode
+    # now always roots at cowork_home() (see scoped_storage_root); without it
+    # org-mode tests here would fall through to the real ~/.cowork.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
     get_app_settings.cache_clear()
     yield tmp_path / "skills"
@@ -106,6 +135,9 @@ def test_skills_org_mode_without_org_fails_closed(skills_root):
 
 @pytest.fixture()
 def memory_env(tmp_path, monkeypatch):
+    # Same reason as skills_root: org mode roots at cowork_home() regardless
+    # of COWORK_MEMORY_DIR, so it must be pinned to tmp_path too.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     get_app_settings.cache_clear()
     import cowork.models.project, cowork.models.conversation  # noqa: F401
