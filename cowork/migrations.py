@@ -277,6 +277,13 @@ def ensure_builtin_skills(scope) -> bool:
             current = int(raw) if raw.isdigit() else 0
         if current >= BUILTIN_SKILLS_VERSION:
             return False
+        if not BUILTIN_SKILLS_DIR.exists():
+            # Nothing to seed from — a packaging fault, not a seeded org. Writing
+            # the marker here would record "done" against an empty store, and the
+            # org would stay empty forever once the image is fixed.
+            logger.warning("Builtin skills are missing from this build (%s); not marking %s seeded",
+                           BUILTIN_SKILLS_DIR, store.root)
+            return False
         copied = _copy_builtin_skills(store)
         marker.write_text(f"{BUILTIN_SKILLS_VERSION}\n", encoding="utf-8")
     except OSError:
