@@ -698,6 +698,12 @@ class AntonHarness:
         project_skills_dir.mkdir(parents=True, exist_ok=True)
         anton_settings.skills_root = project_skills_dir
 
+        # Host skills: read-only, they back
+        # the deferred tool bundles (e.g. `connect-datasource` unlocks the
+        # interactive connection tools). Path relative to this module.
+        host_skills_dir = Path(__file__).parent / "skills"
+        anton_settings.skills_extra_roots = [host_skills_dir]
+
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
 
