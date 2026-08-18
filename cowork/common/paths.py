@@ -58,3 +58,30 @@ def safe_join(base: Path | str, *parts: str) -> Path:
         raise ValueError(f"path {target!r} resolves outside base directory {base_norm!r}")
 
     return Path(target)
+
+
+def safe_join_lexical(base: Path | str, *parts: str) -> Path:
+    """Join user-controlled *parts* onto *base*, checking the string only.
+
+    Same lexical check as :func:`safe_join` (normpath plus a whole-component
+    ``commonpath`` comparison), but it stops there: it does NOT call
+    ``os.path.realpath`` and does NOT reject a result that a symlink would
+    resolve outside *base*. It gives no protection against reading through a
+    symlink that escapes *base*; use :func:`safe_join` for that, and for
+    every path this process is about to read.
+
+    This exists for the one legitimate case where a resolved-outside-base
+    result is correct, not a bug: computing the location of a symlink this
+    process is about to create or remove, where the whole point is that the
+    link's target lives outside its own directory. ``skill_links.py`` fans a
+    canonical skill out to per-project ``skills/<slug>`` symlinks; each
+    project's link legitimately resolves to the shared skill store, a sibling
+    of the projects root, not a path under it. Passing that computation
+    through :func:`safe_join` would resolve the existing symlink on every call
+    after the first and raise, even though nothing is being read through it.
+    """
+    base_norm = os.path.normpath(str(base))
+    target = os.path.normpath(os.path.join(base_norm, *parts))
+    if os.path.commonpath([base_norm, target]) != base_norm:
+        raise ValueError(f"path {target!r} escapes base directory {base_norm!r}")
+    return Path(target)

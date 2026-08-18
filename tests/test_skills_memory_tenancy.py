@@ -218,6 +218,24 @@ def test_local_mode_still_reconciles_links(skills_root, tmp_path, monkeypatch):
     assert (proj / "skills" / "y").exists(), "desktop link distribution unchanged"
 
 
+def test_editing_a_skill_twice_does_not_break_its_existing_link(skills_root, tmp_path, monkeypatch):
+    """Regression: once a project's skills/<slug> link exists on disk, its
+    resolved target (the canonical skill store) legitimately lives outside
+    the project's skills/ dir. A second reconcile used to mistake that for a
+    symlink escaping its base and raise. Editing a skill's instructions is
+    ordinary desktop use, not an edge case, so this must stay a no-op."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    proj = tmp_path / "projects" / "p1"
+    proj.mkdir(parents=True)
+    svc = SkillService()
+    svc.create_skill(label="Y", name="y", instructions="i")
+
+    svc.update_skill("y", instructions="updated instructions")
+
+    assert (proj / "skills" / "y").exists(), "link survives a second reconcile"
+
+
 def test_boot_reconcile_is_gated_off_in_org_mode(skills_root, monkeypatch):
     # dev_setup's boot fan-out reads the UNKEYED root and scans every project
     # dir — the same hole that got symlink distribution disabled in org mode.
