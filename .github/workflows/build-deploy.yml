@@ -44,6 +44,13 @@ on:
         description: "Run the per-PR environment rollout and its access comment"
         type: boolean
         default: false
+      deploy-enabled:
+        description: >-
+          Run the Helm rollout for a long-lived environment. Defaults on, so
+          staging is unaffected; a caller sets it false for an environment that
+          has nothing deployed yet, where a rollout can only fail.
+        type: boolean
+        default: true
 
     outputs:
       pr-env-deployed:
@@ -116,7 +123,10 @@ jobs:
     needs: [build, scan]
     # Only the two long-lived environments have a cluster to deploy to. A
     # `development` build is either a PR (handled by `deploy-pr-env`) or nothing.
-    if: inputs.build-environment == 'staging' || inputs.build-environment == 'production'
+    # `deploy-enabled` gates it further: having a cluster is not the same as
+    # having something deployed in it, and a rollout into an environment that
+    # was never stood up fails every run without saying anything useful.
+    if: inputs.deploy-enabled && (inputs.build-environment == 'staging' || inputs.build-environment == 'production')
     env:
       # `build-environment` names the image flavour (production); the Helm chart,
       # namespace and Slack message name the environment (prod). One is not the
