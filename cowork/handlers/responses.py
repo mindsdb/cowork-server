@@ -53,6 +53,7 @@ from cowork.handlers.turn_errors import (
     RATE_LIMITED_CODE,
     auth_error_detail,
     friendly_turn_error,
+    internal_error_message,
     model_unavailable_info,
     provider_overloaded_info,
     allowance_reset_at,
@@ -919,7 +920,13 @@ class ResponsesHandler:
                 code, message = friendly
                 logger.info("[responses] user-facing turn error: %s", exc)
             else:
-                code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+                # Unmapped by friendly_turn_error. An internal structural error
+                # (our bug / an anton↔cowork-server skew) still gets an
+                # actionable, named message instead of the bare dead-end
+                # (ENG-1412); a provider failure stays fully redacted. The full
+                # traceback is still logged below either way.
+                code = GENERIC_TURN_ERROR_CODE
+                message = internal_error_message(exc)
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
@@ -1072,7 +1079,10 @@ class ResponsesHandler:
                 logger.info("[responses] user-facing turn error: %s", exc)
                 raise HTTPException(status_code=400, detail=message)
             logger.exception("[responses] turn failed")
-            raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
+            # Internal structural errors (our bug / anton skew) surface an
+            # actionable, named 500 instead of the bare generic; a provider
+            # failure stays fully redacted (ENG-1412).
+            raise HTTPException(status_code=500, detail=internal_error_message(exc))
 
         assistant_text = "".join(collected_text)
         # Persist the user message now — after the harness has read history for

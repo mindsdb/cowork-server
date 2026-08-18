@@ -223,6 +223,88 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
+# Builtin exception types that mean "cowork-server's own code, or its pairing
+# with anton, is broken" — a programming defect or a cross-repo API/version
+# skew, NOT a provider/network failure. anton wraps every provider failure in
+# ConnectionError / APIStatusError / TokenLimitExceeded (all handled above), so
+# a BARE one of these reaching the turn handler is our bug, not the model's:
+#   * TypeError  — a call/signature mismatch, e.g. cowork-server passing
+#     ToolDef(..., unlock_skill=…) to an anton that predates the kwarg (ENG-1412).
+#   * NameError (incl. its UnboundLocalError subclass) — a removed/renamed
+#     binding still referenced, e.g. rc7's `user` left dangling by
+#     cowork-server#301 (ENG-1412, David Fraser's second case).
+#   * AttributeError — a moved/renamed attribute across the anton boundary.
+#   * ImportError (incl. ModuleNotFoundError) — a symbol that no longer exists
+#     in the paired anton.
+# Their messages are interpreter-generated ("unexpected keyword argument
+# 'unlock_skill'", "name 'user' is not defined") and carry no provider response
+# body or credential — so, unlike an arbitrary Exception, the detail is safe to
+# show and is the one actionable thing a user can report. Everything else stays
+# fully redacted under GENERIC_TURN_ERROR_MESSAGE.
+_INTERNAL_SERVER_ERROR_TYPES = (TypeError, NameError, AttributeError, ImportError)
+
+# The same class named by scrubbed type-name prefix, for the remote-pod path
+# (remote_turn_error) where only "Type: message" strings survive _scrub. Lists
+# the subclasses explicitly since a string prefix carries no inheritance.
+_INTERNAL_SERVER_ERROR_TYPE_NAMES = frozenset(
+    {
+        "TypeError",
+        "NameError",
+        "UnboundLocalError",
+        "AttributeError",
+        "ImportError",
+        "ModuleNotFoundError",
+    }
+)
+
+# Longest exception detail we append to the user message. Bounds a pathological
+# message; the diagnostic value is in the first line anyway.
+_INTERNAL_DETAIL_MAX = 300
+
+# Actionable copy for the internal-error class. It names the failure as a
+# server-side bug (so the user doesn't blame their own prompt), points at the
+# update that usually resolves it (fixes both an anton↔cowork-server skew and an
+# ordinary rc code defect), and surfaces a concrete detail to report — the gap
+# ENG-1412 is about: the real TypeError/NameError was buried in
+# cowork-server.log and the user saw only the bare generic dead-end. Still
+# emitted under the generic ``anton_error`` code, so no renderer card/branch is
+# needed — the fallback danger alert renders this string verbatim.
+INTERNAL_SERVER_ERROR_MESSAGE = (
+    "The chat service hit an internal error and couldn't complete this turn. "
+    "This is a bug on our side, not a problem with your message — updating to "
+    "the latest version usually fixes it. If it keeps happening, report this: "
+    "{detail}"
+)
+
+
+def is_internal_server_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a bare structural Python error that signals a
+    cowork-server bug or an anton↔cowork-server API/version skew, rather than a
+    provider/network failure. See ``_INTERNAL_SERVER_ERROR_TYPES``."""
+    return isinstance(exc, _INTERNAL_SERVER_ERROR_TYPES)
+
+
+def _bound_detail(summary: str) -> str:
+    """Collapse ``summary`` to a single line and cap it at ``_INTERNAL_DETAIL_MAX``."""
+    summary = " ".join(summary.split())
+    if len(summary) > _INTERNAL_DETAIL_MAX:
+        summary = summary[: _INTERNAL_DETAIL_MAX - 1].rstrip() + "…"
+    return summary
+
+
+def internal_error_message(exc: BaseException) -> str:
+    """User-facing copy for a turn ``friendly_turn_error`` didn't map.
+
+    An internal structural error (our bug / version skew) gets the actionable
+    ``INTERNAL_SERVER_ERROR_MESSAGE`` naming the concrete failure; every other
+    unmapped failure stays fully redacted, so provider internals never leak.
+    """
+    if is_internal_server_error(exc):
+        return INTERNAL_SERVER_ERROR_MESSAGE.format(
+            detail=_bound_detail(f"{type(exc).__name__}: {exc}")
+        )
+    return GENERIC_TURN_ERROR_MESSAGE
+
 
 def is_image_format_error(exc: Exception) -> bool:
     """Detect the Anthropic 400 raised when an image reaches the model as
@@ -869,6 +951,13 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if type_name == "ConnectionError" and "api key" in message.lower():
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
+    # A structural error from the pod — the same internal-bug/skew class the
+    # in-process path surfaces (ENG-1412). Keyed on the scrubbed type-name
+    # prefix; anton's _scrub already sanitised the message. Named types only, so
+    # an arbitrary RuntimeError stays redacted.
+    if type_name in _INTERNAL_SERVER_ERROR_TYPE_NAMES:
+        detail = _bound_detail(f"{type_name}: {message}" if message else type_name)
+        return GENERIC_TURN_ERROR_CODE, INTERNAL_SERVER_ERROR_MESSAGE.format(detail=detail)
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
 
