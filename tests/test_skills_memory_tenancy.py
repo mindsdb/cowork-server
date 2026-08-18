@@ -229,18 +229,22 @@ def test_boot_reconcile_is_gated_off_in_org_mode(skills_root, monkeypatch):
     assert len(calls) == 1, "desktop boot distribution unchanged"
 
 
-def test_unscoped_service_does_not_link_in_org_deployment(skills_root, tmp_path, monkeypatch):
-    # Migration/seeding build an UNSCOPED SkillService(); in an org deployment
-    # that must still never fan symlinks out of the unkeyed root. Keyed on
-    # deployment mode, not just the passed scope.
+def test_unscoped_service_fails_closed_in_an_org_deployment(skills_root, tmp_path, monkeypatch):
+    # Migration/seeding build an UNSCOPED SkillService(). In an org deployment
+    # the store root is shared storage every organization can read, so the
+    # service cannot even be BUILT: scoped_storage_root refuses a missing scope
+    # there. The raise lands in the constructor, so no caller ever holds a
+    # service pointed at the unkeyed root. Declining to fan out symlinks was
+    # not enough on its own, since the skill itself still landed outside any
+    # organization's subtree.
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     proj = tmp_path / "projects" / "p1"
     proj.mkdir(parents=True)
 
-    assert SkillService()._link_projects is False
-    SkillService().create_skill(label="Y", name="y", instructions="i")
+    with pytest.raises(MissingTenantScopeError):
+        SkillService()
     assert not (proj / "skills").exists(), "org deployment must not fan out symlinks"
 
 

@@ -11,13 +11,18 @@ import tempfile
 from pathlib import Path
 
 TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
-# Force isolation (assignment, not setdefault — never touch a real DB).
+# Force isolation (assignment, not setdefault, never touch a real DB).
 os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
 os.environ["MASTER_KEY_PATH"] = str(TMP / "master.key")
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
+# Org mode roots every filesystem store at cowork_home() (see
+# scoped_storage_root), not just at the per-store COWORK_*_DIR override below,
+# so this has to be set too, or any test that runs in org mode writes into
+# the developer's real ~/.cowork/<org_id>/ and orphans dirs there.
+os.environ["COWORK_HOME"] = str(TMP)
 os.environ["COWORK_PROJECTS_DIR"] = str(TMP / "projects")
-# File bytes too — without this, any test using FileService writes into the
+# File bytes too - without this, any test using FileService writes into the
 # developer's real ~/.cowork/files/ and orphans dirs there.
 os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
 # Without this, org-scoped tests write into the developer's real ~/.cowork/.

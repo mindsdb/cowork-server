@@ -36,21 +36,28 @@ def _request_wire_size(params: dict) -> int:
 
 
 def _fit_request(params: dict, conversation_id: str) -> dict:
-    """Shed optional add-ons until the request fits the pod's stdin cap.
+    """Warn when the request line will not fit the pod's stdin cap.
 
-    skills then memory: both are re-sent every turn and degrade gracefully
-    (pod falls back to builtins / no memory). History is the floor we can't
-    shed here.
+    This used to shed ``skills`` then ``memory``, which were re-sent every turn
+    and degraded gracefully. Both now live on the shared mount and never enter
+    the payload, so there is nothing optional left to drop: what remains is
+    input, model, llm and history, and none of them can be silently discarded
+    without changing the turn's meaning.
+
+    So this no longer trims, it reports. An oversized line is a real problem
+    (the pod's readline will truncate it) and history is the only thing that
+    grows unboundedly, so the fix belongs in history windowing upstream, not in
+    a silent drop here.
     """
     budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
-    for field in ("skills", "memory"):
-        if _request_wire_size(params) <= budget:
-            break
-        if params.pop(field, None) is not None:
-            logger.warning(
-                "[producer] dropped %s from turn %s: request line over %d-byte cap",
-                field, conversation_id, budget,
-            )
+    size = _request_wire_size(params)
+    if size > budget:
+        logger.warning(
+            "[producer] turn %s request line is %d bytes, over the %d-byte cap; "
+            "nothing is sheddable now that skills and memory read off the shared mount, "
+            "so this needs history windowing upstream",
+            conversation_id, size, budget,
+        )
     return params
 
 
@@ -151,8 +158,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 model: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
-                                memory: dict | None = None,
-                                skills: dict | None = None,
+                                project_id: str | None = None,
+                                workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
                                 llm: dict | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
@@ -182,13 +189,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
 
-    params = {"input": input_text, "workspace_path": "/workspace",
+    # Org-relative, never absolute. cowork-server sees the shared tree at
+    # <root>/<org_id> while the pod mounts its own org's access point AT
+    # <root>, so the two sit at different depths and an absolute path from
+    # here is wrong inside the pod. Each side joins its own root.
+    #
+    # Skills and memory are no longer shipped: the pod reads them off the same
+    # mount, which also removes most of what _fit_request exists to trim.
+    params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "model": model, "history": history or [], "llm": llm_block}
-    # Omitted when empty: a memory-less turn keeps the pre-existing payload shape.
-    if memory:
-        params["memory"] = memory
-    if skills:
-        params["skills"] = skills
     params = _fit_request(params, conversation_id)
 
     job = TurnJob(
@@ -198,6 +207,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         reply_stream=reply_stream,
         organization_id=org_id,
         user_id=user_id,
+        project_id=project_id,
         params=params,
     )
     # Registry first: a conversation whose stream exists but isn't registered would

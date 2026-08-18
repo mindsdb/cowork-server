@@ -1,4 +1,5 @@
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -242,7 +243,11 @@ class ProjectSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "projects"),
         validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECTS_ROOT_DIR"),
-        description="Root directory where project folders are stored",
+        description=(
+            "Root directory where project folders are stored. In org mode, only "
+            "this path's final component is kept; the parent directory is always "
+            "COWORK_HOME, so one organization stays one subtree there."
+        ),
     )  # PROJECT_ROOT_DIR or COWORK_PROJECTS_DIR or PROJECTS_ROOT_DIR
 
 
@@ -269,7 +274,12 @@ class SkillSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "skills"),
         validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
-        description="Root directory where agentskills.io-format skill folders are stored",
+        description=(
+            "Root directory where agentskills.io-format skill folders are stored. "
+            "In org mode, only this path's final component is kept; the parent "
+            "directory is always COWORK_HOME, so one organization stays one "
+            "subtree there."
+        ),
     )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
 
 
@@ -325,7 +335,11 @@ class MemorySettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "memory"),
         validation_alias=AliasChoices("COWORK_MEMORY_DIR", "MEMORY_ROOT_DIR"),
-        description="Root directory for all memory files",
+        description=(
+            "Root directory for all memory files. In org mode, only this path's "
+            "final component is kept; the parent directory is always COWORK_HOME, "
+            "so one organization stays one subtree there."
+        ),
     )
 
 
@@ -486,6 +500,21 @@ class AppSettings(Settings):
             "multi-tenant cloud deployment behind the auth gateway — requests "
             "carry trusted identity headers (X-User-Id / X-Organization-Id) "
             "from which a per-request principal is built."
+        ),
+    )
+    pod_scratch_dir: str = Field(
+        default_factory=lambda: str(Path(tempfile.gettempdir()) / "cowork"),
+        validation_alias=AliasChoices("COWORK_POD_SCRATCH_DIR"),
+        description=(
+            "Org mode only (see cowork.common.paths.pod_local_only): root for "
+            "scratch and deployment-local state that carries no org_id segment "
+            "and so must never sit on the shared COWORK_HOME tree. Covers the "
+            "connector probe's plaintext credential env files, publish's "
+            "state.json, and the anton harness's temporary data-vault "
+            "directory. Local mode never reads this field; those stores keep "
+            "resolving under COWORK_HOME exactly as before. Defaults to the "
+            "container's own temp directory, which is never the shared EFS "
+            "mount and is gone on pod restart."
         ),
     )
     ask_user_enabled: bool = Field(
