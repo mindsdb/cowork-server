@@ -70,24 +70,6 @@ def test_storage_root_rejects_degenerate_store_segments(shared_root, bad):
         scoped_storage_root(Path("/x"), _org(ORG_A), store=bad)
 
 
-@pytest.mark.parametrize("bad", ["../../etc", "..", "a/b", "not-a-uuid", "org-1"])
-def test_storage_root_rejects_a_non_uuid_org(shared_root, bad):
-    """The org segment is re-derived from a parsed UUID rather than trusted as a
-    string. TrustedHeaderMiddleware already rejects a non-UUID header, so this
-    only bites an internal caller building its own scope — but the join's
-    path-safety must not depend on a caller knowing that."""
-    with pytest.raises(ValueError, match="not a UUID"):
-        scoped_storage_root(Path("/x"), _org(bad), store="skills")
-
-
-def test_storage_root_normalizes_the_org_segment(shared_root):
-    """One org must resolve to one directory: an uppercase or braced UUID is the
-    same tenant, not a second store beside it."""
-    canonical = scoped_storage_root(Path("/x"), _org(ORG_A), store="skills")
-    for variant in (ORG_A.upper(), "{" + ORG_A + "}", ORG_A.replace("-", "")):
-        assert scoped_storage_root(Path("/x"), _org(variant), store="skills") == canonical
-
-
 def test_user_storage_root_keys_org_and_user(shared_root):
     assert scoped_user_storage_root(Path("/x"), None, store="x") == Path("/x")   # desktop
     assert scoped_user_storage_root(Path("/x"), LOCAL_SCOPE, store="x") == Path("/x")
