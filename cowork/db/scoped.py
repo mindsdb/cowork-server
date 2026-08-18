@@ -108,28 +108,35 @@ def service_principal_for(org_id: str | None, user_id: str | None) -> Principal 
     return Principal(user_id=user_id, org_id=org_id)
 
 
-def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
-    """Org-keyed root for filesystem stores shared by the whole org: ``base`` in
-    local mode, ``base/<org_id>`` in org mode, fail-closed without an org. org_id
-    is a normalized UUID (TrustedHeaderMiddleware), so it's path-safe."""
+def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
+    """``base`` in local mode, ``<shared_root>/<org_id>/<store>`` in org mode,
+    fail-closed without an org. Org-first so each org is one mountable/GC-able
+    subtree. org_id is a normalized UUID (TrustedHeaderMiddleware), so it's
+    path-safe. ``store`` is required — deriving it from ``base`` would let a
+    *_DIR env override silently rename an org's store."""
     if scope is None or not scope.org_mode:
         return base
     if not scope.org_id:
         raise MissingTenantScopeError("filesystem store requires an organization in scope")
-    return base / scope.org_id
+    # "" is silently dropped by pathlib (store collapses onto the org root);
+    # "."/".."/separators would escape it.
+    if not store or store in (".", "..") or "/" in store or "\\" in store:
+        raise ValueError(f"invalid storage store segment: {store!r}")
+    shared = Path(get_app_settings().storage.shared_root)
+    return shared / scope.org_id / store
 
 
-def scoped_user_storage_root(base: Path, scope: TenantScope | None) -> Path:
-    """``base/<org_id>/users/<user_id>``, for stores that are one person's rather
-    than the org's. ``base`` in local mode (one user per machine); org mode
-    fail-closes without BOTH ids, since silently sharing one person's store across
-    an org is a correctness bug, not a lenient default (ADR-0002)."""
-    org_root = scoped_storage_root(base, scope)
+def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
+    """``<shared_root>/<org_id>/<store>/users/<user_id>``, for stores that are one
+    person's rather than the org's. ``base`` in local mode (one user per machine);
+    org mode fail-closes without BOTH ids, since silently sharing one person's
+    store across an org is a correctness bug, not a lenient default (ADR-0002).
+    Id checks run before any settings resolution."""
     if scope is None or not scope.org_mode:
-        return org_root
+        return base
     if not scope.user_id:
         raise MissingTenantScopeError("per-user filesystem store requires a user in scope")
-    return org_root / "users" / scope.user_id
+    return scoped_storage_root(base, scope, store=store) / "users" / scope.user_id
 
 
 def scope_of_session(session: Session) -> TenantScope | None:

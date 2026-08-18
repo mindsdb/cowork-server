@@ -702,7 +702,9 @@ class AntonHarness:
         # Per-(org, user) via the turn's ambient scope — the in-process harness
         # must read/write the same global-scope memory the /memory API serves.
         global_memory_dir = scoped_user_storage_root(
-            Path(get_app_settings().memory.root_dir).expanduser(), current_settings_scope()
+            Path(get_app_settings().memory.root_dir).expanduser(),
+            current_settings_scope(),
+            store="memory",
         )
         global_memory_dir.mkdir(parents=True, exist_ok=True)
         cortex = Cortex(

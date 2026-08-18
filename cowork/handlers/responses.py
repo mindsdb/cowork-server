@@ -46,8 +46,7 @@ from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
-    MODEL_ACCESS_DENIED_CODE,
-    MODEL_DISABLED_CODE,
+    MODEL_UNAVAILABLE_CODES,
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
@@ -269,6 +268,7 @@ class ResponsesHandler:
                 harness_name=self.harness_name,
                 harness_id=getattr(harness, "id", None),
                 buffer=buffer,
+                turn_id=turn_id,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
                 turn_llm=turn_llm,
@@ -505,6 +505,7 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
@@ -532,6 +533,7 @@ class ResponsesHandler:
                 model=model,
                 harness_id=harness_id,
                 buffer=buffer,
+                turn_id=turn_id,
                 turn_llm=turn_llm,
             )
         return self._produce(
@@ -608,6 +610,7 @@ class ResponsesHandler:
         model: str | None,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
     ) -> None:
@@ -642,6 +645,7 @@ class ResponsesHandler:
                 user_id=self.scoped.scope.user_id,
                 input_text=input_text,
                 model=model,
+                turn_id=turn_id,
                 # Producer session, NOT self.scoped: this coroutine is detached
                 # and the request session may be closed by the time it runs.
                 history=self._remote_history(producer_session, conv_id),
@@ -752,6 +756,7 @@ class ResponsesHandler:
         harness_name: str,
         harness_id: str | None,
         buffer,
+        turn_id: int = 0,
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
@@ -886,10 +891,15 @@ class ResponsesHandler:
                     extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
-            elif code in (MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE):
-                # Model-403: tell the client WHICH model was rejected so the card
-                # can name it ("Sonnet isn't included in your plan"). No
-                # provider_label — the ModelUnavailableCard doesn't render it, and
+            elif code in MODEL_UNAVAILABLE_CODES:
+                # The model was rejected (legacy 403 gate, or a 404 for a model
+                # the provider can't serve): tell the client WHICH model so the
+                # card can name it ("Sonnet isn't included in your plan",
+                # "deepseek-v4-flash isn't a model on this provider"). Naming it
+                # is the whole point for model_not_found — the id is usually one
+                # the user typed or pasted, and seeing it is what makes the
+                # mistake obvious (ENG-1358). No provider_label — the
+                # ModelUnavailableCard doesn't render it, and
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
