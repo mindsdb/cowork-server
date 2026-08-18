@@ -10,7 +10,12 @@ import pytest
 
 from cowork.common.settings.app_settings import get_app_settings
 import cowork.server as cowork_server
-from cowork.db.scoped import MissingTenantScopeError, TenantScope, scoped_storage_root
+from cowork.db.scoped import (
+    MissingTenantScopeError,
+    TenantScope,
+    scoped_storage_root,
+    scoped_user_storage_root,
+)
 
 ORG_A = "11111111-1111-4111-8111-111111111111"
 
@@ -44,6 +49,25 @@ def test_no_scope_fails_closed_on_an_org_deployment(org_deployment):
 def test_no_scope_is_still_the_bare_path_on_a_desktop_install(local_deployment):
     """Desktop passes None everywhere and must be completely unaffected."""
     assert scoped_storage_root(local_deployment / "data-vault", None, store="data-vault") == local_deployment / "data-vault"
+
+
+def test_per_user_store_fails_closed_without_a_scope_on_an_org_deployment(org_deployment):
+    """The per-user variant must fail closed for the same reason the org one does.
+
+    Its live caller is the in-process harness memory root, which passes
+    ``current_settings_scope()``. That ambient scope is None outside a bound
+    turn, so returning ``base`` would put every organization's global agent
+    memory in one directory on shared storage.
+    """
+    with pytest.raises(MissingTenantScopeError):
+        scoped_user_storage_root(org_deployment / "memory", None, store="memory")
+
+
+def test_per_user_store_is_still_the_bare_path_on_a_desktop_install(local_deployment):
+    assert (
+        scoped_user_storage_root(local_deployment / "memory", None, store="memory")
+        == local_deployment / "memory"
+    )
 
 
 def test_org_scope_keys_the_vault_per_org(org_deployment):
