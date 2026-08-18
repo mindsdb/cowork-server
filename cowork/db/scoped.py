@@ -114,13 +114,8 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
     # "."/".."/separators would escape it.
     if not store or store in (".", "..") or "/" in store or "\\" in store:
         raise ValueError(f"invalid storage store segment: {store!r}")
-    # Re-derive the segment from a parsed UUID instead of trusting the string.
-    try:
-        org_segment = str(UUID(str(scope.org_id)))
-    except ValueError as exc:
-        raise ValueError(f"organization id is not a UUID: {scope.org_id!r}") from exc
     shared = Path(get_app_settings().storage.shared_root)
-    return shared / org_segment / store
+    return shared / scope.org_id / store
 
 
 def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
