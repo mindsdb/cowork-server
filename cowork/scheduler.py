@@ -24,6 +24,16 @@ _scheduler_task: asyncio.Task | None = None
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
 
+# A one-off whose slot has just passed is still due this poll and must be run,
+# not disabled — the poll runs `_handle_missed_runs` before `_due_schedules`,
+# so disabling on any overdue amount kills the task before it can fire (the
+# task then shows as "Paused" and never runs; ENG-1675). Only a one-off overdue
+# by more than this catch-up window — the app was offline when its slot passed —
+# is disabled without running, so a long-stale task doesn't fire unexpectedly on
+# the next launch. Mirrors the recurring branch, which lets a single overdue slot
+# (missed == 1) run rather than fast-forwarding past it.
+_ONCE_CATCHUP_WINDOW_SECONDS = 60 * 60
+
 # Freshness guard (ENG-688): if a successful run — typically a manual
 # "run now" — finished this recently before a due cron slot, the slot is
 # skipped instead of executed, so both runs don't publish the same output
@@ -68,9 +78,13 @@ def _handle_missed_runs(session) -> None:
             continue
 
         if schedule.cadence == Cadence.once:
-            # A one-off that was never executed — disable it without running
-            schedule.enabled = False
-            session.add(schedule)
+            # A due one-off is left enabled so `_due_schedules` executes it on
+            # this same tick. Only disable it without running when it is overdue
+            # beyond the catch-up window — the app was offline when its slot
+            # passed — so a long-stale one-off doesn't fire on the next launch.
+            if (now - next_run).total_seconds() > _ONCE_CATCHUP_WINDOW_SECONDS:
+                schedule.enabled = False
+                session.add(schedule)
             continue
 
         if schedule.cadence not in _RECURRING_CADENCES:
