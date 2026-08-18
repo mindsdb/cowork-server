@@ -19,11 +19,24 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from cowork.common.chat_session import build_chat_session
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
 
 logger = logging.getLogger(__name__)
 
-_PROBE_TMP_DIR = cowork_home() / "tmp"
+
+def _probe_tmp_dir() -> Path:
+    """Where the plaintext credential env file is staged for the probe's
+    subprocess to source.
+
+    Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
+    EFS storage by pod_local_only (see its docstring), because this directory
+    carries no org_id segment: left on cowork_home() it would put credentials
+    for every organization's probe requests in the same shared, readable
+    location. A function (not a module-level constant) so the org-mode check
+    runs per call instead of freezing whatever tenancy_mode was in effect the
+    first time this module was imported.
+    """
+    return pod_local_only(cowork_home() / "tmp", "tmp")
 
 
 @dataclass
@@ -183,10 +196,17 @@ class CredentialProbe:
             )
             lines.append(f'{var}="{escaped}"')
 
-        _PROBE_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_dir = _probe_tmp_dir()
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         filename = f"cowork-vault-{uuid.uuid4().hex[:16]}.env"
-        path = _PROBE_TMP_DIR / filename
+        path = tmp_dir / filename
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # write_text leaves the file at the process umask (world-readable
+        # under a typical 022 umask) for a file holding plaintext connector
+        # credentials. Locked to owner-only so nothing else on the pod (or,
+        # before this fix, another organization's request on the shared EFS
+        # mount) can read it during the window before cleanup unlinks it.
+        os.chmod(path, 0o600)
         return str(path), var_names
 
     def _build_prompt(self, env_path: str, var_names: list[str]) -> str:
@@ -433,7 +453,10 @@ class CredentialProbe:
             try:
                 os.unlink(env_path)
             except Exception:
-                pass
+                # Silently swallowing this would leave a plaintext credentials
+                # file sitting on disk with nothing in the logs to explain why
+                # cleanup never ran. Warn (not debug) so an operator sees it.
+                logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
             yield ("verdict", self._outcome)
             return
 
@@ -515,7 +538,10 @@ class CredentialProbe:
             try:
                 os.unlink(env_path)
             except Exception:
-                logger.debug("Could not delete probe env file %s", env_path, exc_info=True)
+                # Same reasoning as the other unlink above: a leftover
+                # plaintext credentials file is worth an operator's attention,
+                # not a debug line nobody has turned on.
+                logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
 
         if self._outcome.status == "unresolved":
             self._outcome.status = "failure"

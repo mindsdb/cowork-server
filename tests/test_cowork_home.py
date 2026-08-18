@@ -6,7 +6,7 @@ setting one env var. These tests pin that contract.
 """
 from pathlib import Path
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import (
     AppSettings,
     OAuthSettings,
@@ -119,6 +119,65 @@ def test_explicit_state_path_still_overrides_cowork_home(monkeypatch, tmp_path):
     monkeypatch.setenv("STATE_PATH", "/home/app/oauth_state.json")
 
     assert OAuthSettings(_env_file=None).state_path == "/home/app/oauth_state.json"
+
+
+# pod_local_only, the mechanism that keeps scratch/deployment-local state
+# (connector-probe credential files, publish's state.json, the anton
+# harness's temp data-vault dir) off the shared COWORK_HOME tree in org mode,
+# since none of the three carry an org_id segment for scoped_storage_root to
+# key on.
+def test_pod_local_only_is_a_noop_in_local_mode(monkeypatch, tmp_path):
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    get_app_settings.cache_clear()
+
+    local_path = tmp_path / "cowork" / "tmp"
+    assert pod_local_only(local_path, "tmp") == local_path
+
+    get_app_settings.cache_clear()
+
+
+def test_pod_local_only_relocates_off_cowork_home_in_org_mode(monkeypatch, tmp_path):
+    home = tmp_path / "cowork-shared"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.delenv("COWORK_POD_SCRATCH_DIR", raising=False)
+    get_app_settings.cache_clear()
+
+    resolved = pod_local_only(home / "tmp", "tmp")
+
+    assert home not in resolved.parents
+    assert resolved != home / "tmp"
+
+    get_app_settings.cache_clear()
+
+
+def test_pod_local_only_org_mode_defaults_under_system_temp_dir(monkeypatch, tmp_path):
+    import tempfile
+
+    home = tmp_path / "cowork-shared"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.delenv("COWORK_POD_SCRATCH_DIR", raising=False)
+    get_app_settings.cache_clear()
+
+    resolved = pod_local_only(home / "tmp", "tmp")
+
+    assert resolved == Path(tempfile.gettempdir()) / "cowork" / "tmp"
+
+    get_app_settings.cache_clear()
+
+
+def test_pod_local_only_honors_explicit_scratch_dir_override(monkeypatch, tmp_path):
+    home = tmp_path / "cowork-shared"
+    scratch = tmp_path / "pod-scratch"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_POD_SCRATCH_DIR", str(scratch))
+    get_app_settings.cache_clear()
+
+    assert pod_local_only(home / "tmp", "tmp") == scratch / "tmp"
+
+    get_app_settings.cache_clear()
 
 
 def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):

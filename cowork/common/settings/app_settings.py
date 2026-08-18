@@ -1,4 +1,5 @@
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -488,6 +489,21 @@ class AppSettings(Settings):
             "multi-tenant cloud deployment behind the auth gateway — requests "
             "carry trusted identity headers (X-User-Id / X-Organization-Id) "
             "from which a per-request principal is built."
+        ),
+    )
+    pod_scratch_dir: str = Field(
+        default_factory=lambda: str(Path(tempfile.gettempdir()) / "cowork"),
+        validation_alias=AliasChoices("COWORK_POD_SCRATCH_DIR"),
+        description=(
+            "Org mode only (see cowork.common.paths.pod_local_only): root for "
+            "scratch and deployment-local state that carries no org_id segment "
+            "and so must never sit on the shared COWORK_HOME tree. Covers the "
+            "connector probe's plaintext credential env files, publish's "
+            "state.json, and the anton harness's temporary data-vault "
+            "directory. Local mode never reads this field; those stores keep "
+            "resolving under COWORK_HOME exactly as before. Defaults to the "
+            "container's own temp directory, which is never the shared EFS "
+            "mount and is gone on pod restart."
         ),
     )
     ask_user_enabled: bool = Field(
