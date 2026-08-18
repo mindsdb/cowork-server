@@ -374,6 +374,10 @@ class ConversationService:
         session_project_path = (
             conversation.project.path if conversation.project is not None else None
         )
+        # Its buffers and turn-index entry outlive the rows otherwise: on the
+        # Redis backend /in-flight keeps naming a turn whose conversation is
+        # gone, and a reused turn_id would replay a deleted turn's answer.
+        _discard_conversation_streams(conversation_id)
         self.session.delete(conversation)
         self.session.commit()
         unlink_file_dirs(attachment_dirs)

@@ -350,6 +350,17 @@ class UserSettings(Settings):
     # global, application-level config and live in app_settings
     # (RECOMMENDED_MODELS / RECOMMENDED_PAIR / *_MODEL_DEFAULTS).
 
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        # Only local reads process env; a shared server's injected provider
+        # secrets would otherwise leak into every tenant's settings. Fail closed:
+        # anything not local is DB-only.
+        if get_app_settings().tenancy_mode == "local":
+            return (init_settings, env_settings, dotenv_settings, file_secret_settings)
+        return (init_settings,)
+
     # ── Provider / model settings ──
 
     anthropic_api_key: SecretStr | None = Field(

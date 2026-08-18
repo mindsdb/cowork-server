@@ -191,8 +191,11 @@ Environment variables fall into two namespaces:
 |----------|---------|-------------|
 | `COWORK_LISTEN_PORT` | `26866` | Server port |
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
-| `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root |
-| `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root |
+| `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
+| `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
+| `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
+| `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
+| `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
 
 **Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:

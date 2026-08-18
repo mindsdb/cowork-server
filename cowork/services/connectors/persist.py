@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from anton.utils.datasources import default_user_label, ensure_unique_user_label
 
@@ -21,11 +22,20 @@ from cowork.services.connectors.identity import (
 )
 from cowork.services.connectors.vault_lock import lock_for
 
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
-def _default_vault():
+
+def vault_for_scope(scope: "TenantScope | None" = None):
     from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.db.scoped import scoped_storage_root
 
-    return LocalDataVault(Path(ConnectorSettings().vault_dir))
+    # Org mode keys the persisted vault per org, the same as SkillService and
+    # FileService. Desktop passes no scope and gets vault_dir unchanged; on an
+    # org deployment a missing scope RAISES rather than falling back, because
+    # the fallback path is the shared namespace root and saved credentials
+    # must never land there.
+    return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
 
 
 def persist_connection(
@@ -37,6 +47,7 @@ def persist_connection(
     label: str | None = None,
     user_label: str | None = None,
     vault=None,
+    scope: "TenantScope | None" = None,
 ) -> str:
     """Persist a connection and return the slug used.
 
@@ -57,7 +68,7 @@ def persist_connection(
     default (the engine id, de-duplicated).
     """
     if vault is None:
-        vault = _default_vault()
+        vault = vault_for_scope(scope)
 
     cred = dict(credentials)
     label = str(
@@ -131,7 +142,8 @@ def persist_connection(
         return slug
 
 
-def set_connection_label(engine: str, name: str, label: str, *, vault=None) -> str | None:
+def set_connection_label(engine: str, name: str, label: str, *, vault=None,
+                         scope: "TenantScope | None" = None) -> str | None:
     """Set the human label on an existing connection in place. Returns the
     stored value (post-deduplication — may differ from the requested `label`),
     or None if the connection doesn't exist or `label` is blank. Used by the
@@ -143,7 +155,7 @@ def set_connection_label(engine: str, name: str, label: str, *, vault=None) -> s
     if not clean_label:
         return None
     if vault is None:
-        vault = _default_vault()
+        vault = vault_for_scope(scope)
     with lock_for(engine, name):
         record = vault.read_record(engine, name)
         if record is None:

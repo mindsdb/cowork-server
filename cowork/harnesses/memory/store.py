@@ -49,6 +49,7 @@ class GlobalMemoryStore(MemoryStore):
 
     Per-(org, user) in org mode, not per-org: anton overwrites identity by key, so
     a shared tier would let one member's turn replace another's (ADR-0002).
+    In org mode an explicit ``root`` is inert — org-first resolution wins.
     """
 
     def __init__(self, root: Path | None = None, scope: TenantScope | None = None) -> None:
@@ -57,7 +58,7 @@ class GlobalMemoryStore(MemoryStore):
             if root is not None
             else Path(get_app_settings().memory.root_dir).expanduser()
         )
-        super().__init__(scoped_user_storage_root(base, scope))
+        super().__init__(scoped_user_storage_root(base, scope, store="memory"))
 
     def list_slots(self) -> list[MemorySlot]:
         return list(SLOT_REGISTRY.keys())
