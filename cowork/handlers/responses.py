@@ -21,7 +21,7 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
 )
 from cowork.db.session import get_open_session
-from cowork.harnesses.base import get_harness
+from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
@@ -148,6 +148,18 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+
+        # A per-conversation harness pick (Coding Mode's composer pill)
+        # overrides the account default for THIS call only — mirrors the
+        # per-conversation model override below. Ignored (not raised) when it
+        # doesn't name a currently-registered/available harness: a stale
+        # client cache (e.g. Hermes got uninstalled since the picker last
+        # loaded) must never fail the turn, it just falls back to the
+        # account default. self.harness stays None either way — still lazy,
+        # only self.harness_name (which harness _get_harness() will build)
+        # changes here.
+        if request.harness and request.harness in available_harness_ids():
+            self.harness_name = request.harness
 
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a

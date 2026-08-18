@@ -541,6 +541,28 @@ class UserSettings(Settings):
             "an external coding CLI (e.g. Claude Code) instead of the in-app chat."
         ),
     )
+    # Which harnesses appear as options in the per-task harness picker
+    # (Coding Mode's composer pill). All default true — an account that never
+    # visits this setting sees every harness it's otherwise eligible for.
+    # `claude-code` isn't a cowork.harnesses.base-registered harness (it runs
+    # the `claude` CLI entirely client-side in the Electron app, never
+    # through this server), so it has no `available_harness_ids()` entry to
+    # validate against — this flag is the only server-side notion of it.
+    harness_anton_enabled: bool = Field(
+        default=True,
+        title="Enable Anton in the Harness Picker",
+        description="Offer Anton as a per-task harness choice in Coding Mode.",
+    )
+    harness_hermes_enabled: bool = Field(
+        default=True,
+        title="Enable Hermes in the Harness Picker",
+        description="Offer Hermes as a per-task harness choice in Coding Mode.",
+    )
+    harness_claude_code_enabled: bool = Field(
+        default=True,
+        title="Enable Claude Code in the Harness Picker",
+        description="Offer Claude Code as a per-task harness choice in Coding Mode.",
+    )
     memory_mode: str = Field(
         default="autopilot",
         title="Memory Mode",
