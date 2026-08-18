@@ -31,10 +31,18 @@ def _org(org: str | None = ORG_A, user: str = "u") -> TenantScope:
 
 @pytest.fixture()
 def skills_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
     yield tmp_path / "skills"
     get_app_settings.cache_clear()
+
+
+def _store(org: str = ORG_A) -> Path:
+    """Where this org's skills actually live. Asked of the service rather than
+    built by hand, so these tests survive the next move of the org layout."""
+    return SkillService(_org(org)).root
 
 
 def _packaged_slugs() -> set[str]:
@@ -77,7 +85,7 @@ def test_a_lost_volume_reseeds(skills_root):
     ensure_builtin_skills(_org())
     import shutil
 
-    shutil.rmtree(skills_root / ORG_A)
+    shutil.rmtree(_store())
 
     assert ensure_builtin_skills(_org()) is True
     assert {s.name for s in SkillService(_org()).list_skills()} == _packaged_slugs()
@@ -85,7 +93,7 @@ def test_a_lost_volume_reseeds(skills_root):
 
 def test_a_bumped_version_reseeds(skills_root, monkeypatch):
     ensure_builtin_skills(_org())
-    marker = skills_root / ORG_A / BUILTIN_SKILLS_MARKER
+    marker = _store() / BUILTIN_SKILLS_MARKER
     assert marker.read_text().strip() == str(BUILTIN_SKILLS_VERSION)
 
     monkeypatch.setattr("cowork.migrations.BUILTIN_SKILLS_VERSION", BUILTIN_SKILLS_VERSION + 1)
@@ -94,8 +102,8 @@ def test_a_bumped_version_reseeds(skills_root, monkeypatch):
 
 
 def test_a_corrupt_marker_is_treated_as_unseeded(skills_root):
-    (skills_root / ORG_A).mkdir(parents=True)
-    (skills_root / ORG_A / BUILTIN_SKILLS_MARKER).write_text("not-a-number")
+    _store().mkdir(parents=True)
+    (_store() / BUILTIN_SKILLS_MARKER).write_text("not-a-number")
     assert ensure_builtin_skills(_org()) is True
 
 
