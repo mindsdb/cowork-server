@@ -25,7 +25,6 @@ from sqlalchemy import event
 from sqlalchemy.sql import Select
 from sqlmodel import Session, select
 
-from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_session
 from cowork.principal import Principal, get_principal
@@ -86,35 +85,23 @@ def scope_for_background_context() -> TenantScope:
     )
 
 
-def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
-    """Root for a filesystem store shared by the whole org.
-
-    Local mode returns ``base`` verbatim, so a desktop install keeps
-    ``~/.cowork/projects`` and any ``COWORK_*__ROOT_DIR`` override intact.
-
-    Org mode pivots the org to the FRONT: ``cowork_home()/<org_id>/<store>``,
-    where ``<store>`` is ``base``'s final component. Org-first is what makes one
-    organization exactly one subtree, which is what an EFS access point can be
-    rooted at. Fail-closed without an org. org_id is a normalized UUID
-    (TrustedHeaderMiddleware), so it is path-safe.
-
-    An operator who points a store's ``COWORK_*_DIR`` at a custom parent
-    directory (e.g. ``COWORK_SKILLS_DIR=/custom/path/skills``) will see that
-    parent silently dropped in org mode: only the ``skills`` component
-    survives, nested under ``COWORK_HOME`` instead. This is deliberate, not a
-    bug to route around.
+def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
+    """``base`` in local mode, ``<shared_root>/<org_id>/<store>`` in org mode,
+    fail-closed without an org. Org-first so each org is one mountable/GC-able
+    subtree. org_id is a normalized UUID (TrustedHeaderMiddleware), so it's
+    path-safe. ``store`` is required — deriving it from ``base`` would let a
+    *_DIR env override silently rename an org's store.
 
     ``scope=None`` fail-closes on an org deployment. It cannot mean "no
-    tenancy" there: on shared storage ``base`` is the namespace root that every
-    organization can read, so returning it verbatim would hand a caller that
-    merely forgot to thread its scope a path outside any org's subtree. That is
-    how the persisted connector vault ended up unpartitioned. A caller with no
-    scope in org mode is a bug at the call site, and this is where it surfaces.
-    """
+    tenancy" there: ``base`` is the shared root every organization can read, so
+    returning it verbatim hands a caller that merely forgot to thread its scope
+    a path outside any org's subtree. That is how the persisted connector vault
+    ended up unpartitioned. A missing scope in org mode is a bug at the call
+    site, and this is where it surfaces."""
     if scope is None:
         if get_app_settings().tenancy_mode == "org":
             raise MissingTenantScopeError(
-                f"filesystem store {base.name!r} requires a TenantScope on an org deployment; "
+                f"filesystem store {store!r} requires a TenantScope on an org deployment; "
                 "the caller must thread one through rather than defaulting to the shared root"
             )
         return base
@@ -122,20 +109,25 @@ def scoped_storage_root(base: Path, scope: TenantScope | None) -> Path:
         return base
     if not scope.org_id:
         raise MissingTenantScopeError("filesystem store requires an organization in scope")
-    return cowork_home() / scope.org_id / base.name
+    # "" is silently dropped by pathlib (store collapses onto the org root);
+    # "."/".."/separators would escape it.
+    if not store or store in (".", "..") or "/" in store or "\\" in store:
+        raise ValueError(f"invalid storage store segment: {store!r}")
+    shared = Path(get_app_settings().storage.shared_root)
+    return shared / scope.org_id / store
 
 
-def scoped_user_storage_root(base: Path, scope: TenantScope | None) -> Path:
-    """``base/<org_id>/users/<user_id>``, for stores that are one person's rather
-    than the org's. ``base`` in local mode (one user per machine); org mode
-    fail-closes without BOTH ids, since silently sharing one person's store across
-    an org is a correctness bug, not a lenient default (ADR-0002)."""
-    org_root = scoped_storage_root(base, scope)
+def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
+    """``<shared_root>/<org_id>/<store>/users/<user_id>``, for stores that are one
+    person's rather than the org's. ``base`` in local mode (one user per machine);
+    org mode fail-closes without BOTH ids, since silently sharing one person's
+    store across an org is a correctness bug, not a lenient default (ADR-0002).
+    Id checks run before any settings resolution."""
     if scope is None or not scope.org_mode:
-        return org_root
+        return base
     if not scope.user_id:
         raise MissingTenantScopeError("per-user filesystem store requires a user in scope")
-    return org_root / "users" / scope.user_id
+    return scoped_storage_root(base, scope, store=store) / "users" / scope.user_id
 
 
 def scope_of_session(session: Session) -> TenantScope | None:

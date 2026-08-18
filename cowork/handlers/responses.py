@@ -589,7 +589,7 @@ class ResponsesHandler:
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
             org_root = scoped_storage_root(
-                Path(get_app_settings().project.root_dir), session.scope
+                Path(get_app_settings().project.root_dir), session.scope, store="projects"
             ).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
             return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}

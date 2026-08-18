@@ -135,7 +135,7 @@ def _vault_for(connector_settings: ConnectorSettings, scope):
     """
     from cowork.db.scoped import scoped_storage_root
 
-    return LocalDataVault(scoped_storage_root(Path(connector_settings.vault_dir), scope))
+    return LocalDataVault(scoped_storage_root(Path(connector_settings.vault_dir), scope, store="data-vault"))
 
 
 class OAuthService:

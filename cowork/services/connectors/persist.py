@@ -35,7 +35,7 @@ def vault_for_scope(scope: "TenantScope | None" = None):
     # org deployment a missing scope RAISES rather than falling back, because
     # the fallback path is the shared namespace root and saved credentials
     # must never land there.
-    return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope))
+    return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
 
 
 def persist_connection(

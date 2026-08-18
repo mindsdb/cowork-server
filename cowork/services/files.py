@@ -50,15 +50,10 @@ class FileService:
         self.session = session
 
     def _root_dir(self) -> Path:
-        """Files root, org-keyed in org mode (same helper as skills/projects).
-
-        Without the org segment every upload landed in one flat
-        ``<root>/files/<uuid>/`` directory, a SIBLING of the org directories
-        rather than inside one. A worker pod mounts only its own
-        ``<env>/<org_id>``, so it could never see an uploaded attachment at
-        all, and that is the primary use case this whole feature exists for.
-        """
-        return scoped_storage_root(Path(get_app_settings().file.root_dir), self.session.scope)
+        """Local base on desktop, ``<shared>/<org>/files`` in org mode."""
+        return scoped_storage_root(
+            Path(get_app_settings().file.root_dir), self.session.scope, store="files"
+        )
 
     def _to_response(self, file: File) -> FileResponse:
         return FileResponse(
@@ -168,44 +163,28 @@ class FileService:
             raise ValueError("File not found")
         return file
 
-    def _warn_if_stored_path_diverges(self, file: File, expected_dir: Path) -> None:
-        """Log when a row's stored `path` doesn't live under the directory the
-        scoped delete below is about to rmtree.
-
-        The delete always targets `expected_dir` (built from the file id, never
-        the stored path), so a tampered path can't turn into an
-        arbitrary-directory delete (see
-        `test_delete_never_rmtrees_an_escaped_legacy_path`, which must keep
-        passing unmodified). That's correct, but it means a row written under
-        the pre-org-keyed flat layout points somewhere `expected_dir` was never
-        created, so `unlink_file_dirs` finds nothing there, the row still gets
-        deleted, and the caller is told the delete succeeded while the real
-        bytes are orphaned on disk forever. This does not delete the stored
-        path instead (same hole the test above guards against). It only makes
-        the drift observable so an operator can grep for it and clean up by
-        hand.
-        """
-        if not file.path:
-            return
-        stored_dir = Path(file.path).parent
-        if stored_dir != expected_dir:
-            logger.warning(
-                "file %s: stored path %s is not under the scoped delete target "
-                "%s; bytes at the stored location will not be removed",
-                file.id, file.path, expected_dir,
-            )
+    def _doomed_dirs(self, file: File) -> list[Path]:
+        """Dirs to unlink on delete: the id-derived dir under the current root,
+        plus the stored path's parent (bytes live there if the root moved) —
+        but only when the resolved parent is literally named ``<file.id>``, so
+        an escaped legacy path can never aim rmtree at an arbitrary dir."""
+        dirs = [self._root_dir() / str(file.id)]
+        try:
+            stored = Path(file.path).parent.resolve()
+            if stored.name == str(file.id) and stored != dirs[0].resolve():
+                dirs.append(stored)
+        except (ValueError, OSError):
+            pass
+        return dirs
 
     def delete_file(self, file_id: UUID) -> bool:
         file = self.session.get(File, file_id)
         if file is None:
             return False
-        # Dir from the file id, not the stored path: a legacy row could hold an
-        # escaped path, and rmtree-ing its parent would delete an arbitrary dir.
-        file_dir = self._root_dir() / str(file.id)
-        self._warn_if_stored_path_diverges(file, file_dir)
+        doomed = self._doomed_dirs(file)
         self.session.delete(file)
         self.session.commit()
-        unlink_file_dirs([file_dir])
+        unlink_file_dirs(doomed)
         return True
 
     def delete_by_purpose(self, purpose: str) -> list[Path]:
@@ -213,7 +192,7 @@ class FileService:
         dirs to unlink once the caller commits.
 
         Cleans up a conversation's attachments when the conversation (or its
-        project) is deleted, otherwise the rows + bytes orphan forever
+        project) is deleted — otherwise the rows + bytes orphan forever
         (ENG-701). Follows the stage-only convention of
         `TaskObjectService.delete_for_conversation`: the caller owns the commit,
         so the attachment-row delete lands in the SAME transaction as the
@@ -222,12 +201,8 @@ class FileService:
         `unlink_file_dirs` AFTER committing.
         """
         rows = list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
-        # Dir from the file id, not the stored path (see delete_file): a legacy
-        # row could hold an escaped path, and rmtree-ing its parent would delete
-        # an arbitrary directory.
-        dirs = [self._root_dir() / str(f.id) for f in rows]
-        for f, d in zip(rows, dirs):
-            self._warn_if_stored_path_diverges(f, d)
+        # Same validated candidates as delete_file (_doomed_dirs).
+        dirs = [d for f in rows for d in self._doomed_dirs(f)]
         for f in rows:
             self.session.delete(f)
         return dirs
