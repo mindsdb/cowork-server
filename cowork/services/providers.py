@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -13,7 +14,10 @@ import httpx
 from cowork.common.settings.app_settings import default_minds_api_host
 
 if TYPE_CHECKING:
+    from sqlmodel import Session
+
     from cowork.common.settings.user_settings import UserSettings
+    from cowork.db.scoped import TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +359,99 @@ async def fetch_org_model_catalog(
     return await fetch_minds_models(url, bearer_token, force_refresh=refresh, tenant_key=org_id)
 
 
+def persist_enabled_model_map(
+    session: "Session",
+    scope: "TenantScope",
+    listing: MindsModelListing,
+    current_json: str | None,
+) -> bool:
+    """Persist the model→enabled availability map from a `/v1/models` listing,
+    with the guards default-model resolution depends on. Shared by the
+    `/settings/recommended-models` refresh and the turn-path cold-start warm
+    (`warm_org_enabled_model_map`) so the invariants live in ONE place, not two
+    copies that can drift. Returns True iff a write happened.
+
+    Every guard is load-bearing — the failure each prevents:
+
+      - Guard on the `enabled` MAP, not the id list: a gateway that returns ids
+        without `enabled` flags yields a non-empty listing but ``enabled == {}``,
+        and writing ``{}`` would WIPE a previously-good map — re-locking the
+        canonical default, the exact free-tier denial this exists to prevent.
+      - Persist ORDER-PRESERVING JSON — never sort_keys. The first-enabled
+        fallback (``_enabled_aware_default``) iterates the map in insertion
+        order, relying on /v1/models listing the free/baseline model first; an
+        alphabetized map could silently promote the wrong model. The compare is
+        order-sensitive too, so a gateway re-ranking (same set, new baseline
+        first) also counts as a change and refreshes the map.
+      - Write only on a real change: callers hit this on every boot / settings
+        open / cold turn, and ``upsert_setting`` commits a row, so an
+        unconditional write churns every UserSettings reader.
+
+    upsert_setting is intentionally ungated by any org-admin check: the value is
+    system-derived (MindsHub, via the admin-set key/URL), so a member can trigger
+    the refresh but can't steer what's stored — and gating it would leave the
+    map stale for everyone but an admin.
+    """
+    from cowork.services.settings import SettingService
+
+    live_enabled = listing.enabled
+    if not live_enabled:
+        return False
+    desired = json.dumps(live_enabled)
+    try:
+        stored = json.dumps(json.loads(current_json or "{}"))
+    except (ValueError, TypeError):
+        stored = "{}"
+    if desired == stored:
+        return False
+    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+    return True
+
+
+async def warm_org_enabled_model_map(
+    session: "Session",
+    scope: "TenantScope",
+    *,
+    bearer_token: str | None,
+) -> bool:
+    """Cold-start warm of an org's availability map from the caller's bearer.
+
+    The ``minds_model_enabled`` map is written only when the client calls
+    `/settings/recommended-models`, which on web boot is fire-and-forget and is
+    not serialized before the first `POST /responses`. A brand-new org that sends
+    its first message before that fetch lands resolves the *planning* model
+    against an EMPTY map, so ``_enabled_aware_default`` hands out the canonical
+    (paid) default and the turn is denied on an empty wallet (ENG-748). Calling
+    this at the turn boundary while the map is still empty closes that race at
+    the one point guaranteed to run before resolution.
+
+    Org mode only: it uses the operator catalog plus the caller's own bearer,
+    never a stored key (hosted orgs keep none). No-ops once the map is populated,
+    so a warm org only pays one settings load. Fail-open — any fetch failure
+    leaves the map as-is, so a slow/unreachable MindsHub is never worse than
+    today. Returns True iff a fresh map was persisted.
+    """
+    from cowork.services.settings import SettingService
+
+    if not scope.org_mode or not scope.org_id or not bearer_token:
+        return False
+    s = SettingService(session, scope).load()
+    try:
+        already_warm = bool(json.loads(s.minds_model_enabled or "{}"))
+    except (ValueError, TypeError):
+        already_warm = False  # corrupt stored value counts as empty → re-warm
+    if already_warm:
+        return False
+    try:
+        listing = await fetch_org_model_catalog(
+            org_id=scope.org_id, bearer_token=bearer_token
+        )
+    except Exception:
+        logger.debug("enabled-map cold-start warm failed (non-fatal)", exc_info=True)
+        return False
+    return persist_enabled_model_map(session, scope, listing, s.minds_model_enabled)
+
+
 # ── Model-value validation on write (ENG-1358) ───────────────────────
 #
 # WRITER INVENTORY — every path that can put a model id into the settings DB.
@@ -393,7 +490,11 @@ async def fetch_org_model_catalog(
 #     4. cowork/migrations.py (first-boot .env→DB seed)
 #     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
 #   Two more write settings but only their own fixed key: channels.py
-#   (`channels_harness`) and the `minds_model_enabled` refresh in settings.py.
+#   (`channels_harness`) and the `minds_model_enabled` availability-map refresh,
+#   which now lives in `persist_enabled_model_map` (this module) and is invoked
+#   from two places — the `/settings/recommended-models` endpoint and the
+#   turn-path cold-start warm (`warm_org_enabled_model_map`, ENG-748). Neither
+#   writes a MODEL_VALUE_SETTINGS key, so both stay outside this gate.
 #
 #   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
 #   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its

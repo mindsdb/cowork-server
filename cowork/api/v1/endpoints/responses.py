@@ -10,7 +10,7 @@ explicit POST /responses/cancel halts the producer.
 import time
 from typing import Annotated, NamedTuple
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StringConstraints
 from sqlmodel import Session
@@ -171,13 +171,24 @@ async def options_handler():
     )
 
 
+def _bearer_from_request(request: Request) -> str | None:
+    """The caller's raw bearer, or None. In org mode this is the Keycloak token
+    the ingress forwards; the turn-path cold-start warm (ENG-748) reaches the
+    org catalog with it, exactly as /settings/recommended-models does."""
+    header = request.headers.get("Authorization", "")
+    return header[7:].strip() or None if header.lower().startswith("bearer ") else None
+
+
 @router.post("/")
 async def responses(
     responses_request: ResponsesRequest,
+    request: Request,
     session: SessionDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    handler = ResponsesHandler(session, principal=principal)
+    handler = ResponsesHandler(
+        session, principal=principal, bearer_token=_bearer_from_request(request)
+    )
     result = await handler.handle(responses_request)
     if responses_request.stream:
         # `result` is sse_from_buffer(buffer, 0); the producer is already

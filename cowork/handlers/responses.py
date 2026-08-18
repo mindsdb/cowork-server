@@ -63,6 +63,7 @@ from cowork.handlers.turn_errors import (
 )
 from cowork.db.scoped import ScopedSession, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.services.providers import warm_org_enabled_model_map
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.memory import apply_turn_memory, build_turn_memory
@@ -129,9 +130,17 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
 
 
 class ResponsesHandler:
-    def __init__(self, session: Session, principal: Principal | None = None) -> None:
+    def __init__(
+        self,
+        session: Session,
+        principal: Principal | None = None,
+        bearer_token: str | None = None,
+    ) -> None:
         self.session = session
         self.principal = principal
+        # Caller's bearer, only for the org cold-start availability warm
+        # (ENG-748); the turn itself authenticates by principal / minted key.
+        self.bearer_token = bearer_token
         self.scope = scope_from_principal(principal)
         self.scoped = ScopedSession(session, self.scope)
         # Resolve the selected harness name now, but initialize Anton lazily only
@@ -148,6 +157,20 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+
+        # ENG-748: a brand-new org can send its first message before the web
+        # client's fire-and-forget /recommended-models fetch has warmed the
+        # availability map. Resolving the planning model against an empty map
+        # hands out the canonical (paid) default and denies an empty wallet on
+        # the very first turn. Warm it here — the one point guaranteed to run
+        # before resolution — while it's still empty and the caller's bearer can
+        # reach the catalog. No-ops for a warm org (one settings load) and for
+        # local mode; fail-open, so a slow MindsHub never blocks the turn beyond
+        # the fetch's own 6s cap.
+        if self.scope.org_mode and self.bearer_token:
+            await warm_org_enabled_model_map(
+                self.session, self.scope, bearer_token=self.bearer_token
+            )
 
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a

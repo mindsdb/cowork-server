@@ -35,6 +35,7 @@ from cowork.services.providers import (
     fetch_minds_models,
     fetch_org_model_catalog,
     model_value_rejection,
+    persist_enabled_model_map,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -427,35 +428,12 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # Cache the availability map so model-default resolution
             # (UserSettings._minds_enabled_map) can avoid locked models without
             # a network call in the turn path. Adding credits re-enables the
-            # canonical defaults on the next settings load.
-            #
-            # Guard on `live_enabled` (the map we actually write), NOT `live`
-            # (the id list): a gateway that returns ids without `enabled` flags
-            # yields `live` non-empty but `live_enabled == {}`, and writing {}
-            # would wipe a previously-good map — re-locking the canonical
-            # default, i.e. the exact bug this PR fixes. And only write on a real
-            # change: this endpoint is hit on every boot/settings-open, and
-            # upsert_setting commits a row + invalidates the settings cache, so
-            # an unconditional write churns every UserSettings reader.
-            if live_enabled:
-                # Persist ORDER-PRESERVING JSON — never sort_keys. The
-                # first-enabled default fallback (_enabled_aware_default)
-                # iterates the map in insertion order, relying on /v1/models
-                # listing the free/baseline model first; an alphabetized map
-                # could silently promote the wrong model. The compare is
-                # order-sensitive too, so a gateway re-ranking (same set, new
-                # baseline first) also counts as a change and refreshes the map.
-                desired = json.dumps(live_enabled)
-                try:
-                    stored = json.dumps(json.loads(s.minds_model_enabled or "{}"))
-                except (ValueError, TypeError):
-                    stored = "{}"
-                if desired != stored:
-                    # Intentionally ungated by _require_org_admin_for: the value
-                    # is system-derived (MindsHub, via admin-set key/URL), so a
-                    # member can trigger this refresh but can't steer what's
-                    # stored — and gating it would leave the map stale.
-                    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+            # canonical defaults on the next settings load. The guards this
+            # depends on — never clobber a good map with {}, order-preserving
+            # JSON, change-only write, ungated upsert — live in
+            # persist_enabled_model_map, shared with the turn-path cold-start
+            # warm (ENG-748) so they can't drift between the two writers.
+            persist_enabled_model_map(session, scope, listing, s.minds_model_enabled)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
