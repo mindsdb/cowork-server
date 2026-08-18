@@ -32,8 +32,11 @@ def get_oauth_credentials(engine: str, request: Request):
     id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service_id]
     settings = OAuthSettings()
     client_id = getattr(settings, id_attr, "")
-    client_secret = getattr(settings, secret_attr, "")
-    if not client_id or not client_secret:
+    # `secret_attr` is `None` for public, PKCE-only providers (PostHog) — no
+    # client_secret exists, so an empty string here means "correctly has
+    # none", not "not configured".
+    client_secret = getattr(settings, secret_attr, "") if secret_attr else ""
+    if not client_id or (secret_attr and not client_secret):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"OAuth credentials not configured for {engine!r}.")
     response = {"client_id": client_id, "client_secret": client_secret}
     if OAUTH_SERVICES[service_id].uses_picker and settings.google_picker_api_key:

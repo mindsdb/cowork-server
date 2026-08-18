@@ -26,7 +26,7 @@ import logging as _logging
 
 _log = _logging.getLogger("cowork.oauth")
 
-_SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
+_SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "google-drive":     ("google_drive_client_id",     "google_drive_client_secret"),
     "google-calendar":  ("google_calendar_client_id",  "google_calendar_client_secret"),
     "gmail":            ("gmail_client_id",             "gmail_client_secret"),
@@ -34,6 +34,9 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
     "google-analytics": ("google_analytics_client_id",  "google_analytics_client_secret"),
     "linear":           ("linear_client_id",            "linear_client_secret"),
     "github":           ("github_client_id",            "github_client_secret"),
+    # `None` secret attr = no client_secret exists for this provider (a
+    # public, PKCE-only OAuth client) — not merely "not configured yet".
+    "posthog":          ("posthog_client_id",           None),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -58,6 +61,24 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     )
     viewer = (result.get("data") or {}).get("viewer") or {}
     return {"email": viewer.get("email", ""), "name": viewer.get("name", "")}
+
+
+def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
+    """PostHog's own user object — email plus optional first/last name.
+    Queried against the US Cloud API host; PostHog's OAuth authorize/token
+    endpoints are region-agnostic (`oauth.posthog.com`), but we haven't yet
+    confirmed a token issued that way is accepted against every regional
+    API host, so this may need adjusting once tested against a real
+    EU-hosted account."""
+    result = _json_request(
+        "https://us.posthog.com/api/users/@me/",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    email = str(result.get("email") or "").strip()
+    first_name = str(result.get("first_name") or "").strip()
+    last_name = str(result.get("last_name") or "").strip()
+    name = " ".join(part for part in (first_name, last_name) if part)
+    return {"email": email, "name": name or email}
 
 
 def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
@@ -91,6 +112,7 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "google_analytics_4": _fetch_userinfo_google,
     "linear": _fetch_userinfo_linear,
     "github": _fetch_userinfo_github,
+    "posthog": _fetch_userinfo_posthog,
 }
 
 
@@ -117,11 +139,29 @@ def _revoke_github(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_posthog(token: str, client_id: str, client_secret: str) -> None:
+    """PostHog is a public client — there's no client_secret to authenticate
+    the revoke call with (unlike GitHub's Basic-auth grant-revoke above), so
+    per RFC 7009 a public client just identifies itself with `client_id` in
+    the form body alongside the token. `client_secret` is accepted for a
+    uniform call signature with the other `_REVOKE_HANDLERS` entries but
+    unused."""
+    request = Request(
+        "https://oauth.posthog.com/oauth/revoke/",
+        data=urlencode({"token": token, "client_id": client_id}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
 # engine → custom revoke function, for providers whose revoke call doesn't
 # fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
 # Checked before the generic path in revoke() below.
 _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
+    "posthog": _revoke_posthog,
 }
 
 
@@ -129,8 +169,10 @@ class OAuthService:
     def _resolve_credentials(self, service: str, settings: OAuthSettings) -> tuple[str, str]:
         id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
         client_id = getattr(settings, id_attr)
-        client_secret = getattr(settings, secret_attr)
-        if not client_id or not client_secret:
+        # `secret_attr` is `None` for public, PKCE-only providers (PostHog) —
+        # no client_secret exists to look up, and none is required.
+        client_secret = getattr(settings, secret_attr) if secret_attr else ""
+        if not client_id or (secret_attr and not client_secret):
             raise HTTPException(status_code=400, detail=f"OAuth credentials not configured for {service}.")
         return client_id, client_secret
 
@@ -418,8 +460,8 @@ class OAuthService:
             engine = cfg.engine
             id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service_id]
             cid = getattr(oauth_settings, id_attr, "")
-            csecret = getattr(oauth_settings, secret_attr, "")
-            ready = bool(cid and csecret)
+            csecret = getattr(oauth_settings, secret_attr, "") if secret_attr else ""
+            ready = bool(cid and (csecret or not secret_attr))
             config_error = "" if ready else f"OAuth credentials not configured for {service_id}."
 
             connections = []
@@ -475,10 +517,13 @@ class OAuthService:
             data={
                 "code": code,
                 "client_id": client_id,
-                "client_secret": client_secret,
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
                 "code_verifier": verifier,
+                # Omitted entirely for public clients (PostHog) rather than
+                # sent as an empty string — PKCE alone authenticates the
+                # exchange for those providers.
+                **({"client_secret": client_secret} if client_secret else {}),
             },
         )
 
