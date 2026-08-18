@@ -1,6 +1,6 @@
 import pytest
 
-from cowork.common.paths import safe_join
+from cowork.common.paths import safe_join, safe_join_lexical
 
 
 def test_rejects_symlink_pointing_outside_base(tmp_path):
@@ -68,3 +68,24 @@ def test_base_and_sibling_prefix_are_unrelated(tmp_path):
     (tmp_path / "base-other").mkdir()
     with pytest.raises(ValueError):
         safe_join(base, "..", "base-other", "f.txt")
+
+
+def test_safe_join_lexical_still_rejects_dotdot(tmp_path):
+    """The weaker join keeps the lexical guard; it is not a free-for-all."""
+    base = tmp_path / "base"
+    base.mkdir()
+    with pytest.raises(ValueError):
+        safe_join_lexical(base, "..", "elsewhere")
+
+
+def test_safe_join_lexical_does_not_resolve_symlinks(tmp_path):
+    """The one property that distinguishes it from safe_join: a symlink whose
+    target legitimately lives outside base (skill_links.py's per-project
+    skill link) is not rejected, because nothing is read through it here."""
+    base = tmp_path / "base"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    (base / "link").symlink_to(outside)
+
+    assert safe_join_lexical(base, "link") == base / "link"
