@@ -168,3 +168,22 @@ def test_a_poisoned_slug_does_not_break_the_org(skills_root, tmp_path):
     assert victim not in names
     assert names == _packaged_slugs() - {victim}      # the rest still seeded
     assert build_turn_skills(_org(), None)            # and turns still work
+
+
+def test_a_build_without_the_packaged_skills_is_not_marked_seeded(skills_root, monkeypatch):
+    """Nothing to seed from is a packaging fault, not a seeded org. Marking it
+    done would leave the org empty forever once the image is fixed."""
+    import cowork.migrations as migrations_mod
+
+    packaged = migrations_mod.BUILTIN_SKILLS_DIR
+    monkeypatch.setattr(migrations_mod, "BUILTIN_SKILLS_DIR", Path("/nonexistent"))
+    _store().mkdir(parents=True, exist_ok=True)     # store exists, just unseeded
+
+    assert ensure_builtin_skills(_org()) is False
+    assert not (_store() / BUILTIN_SKILLS_MARKER).exists()
+
+    # A later build that ships them seeds normally. Restored narrowly rather than
+    # with monkeypatch.undo(), which would also revert the fixture's env vars.
+    monkeypatch.setattr(migrations_mod, "BUILTIN_SKILLS_DIR", packaged)
+    assert ensure_builtin_skills(_org()) is True
+    assert {s.name for s in SkillService(_org()).list_skills()} == _packaged_slugs()
