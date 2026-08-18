@@ -231,7 +231,18 @@ def _copy_builtin_skills(store: SkillService) -> int:
     for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
         if not src.is_dir() or not (src / SKILL_FILE).exists():
             continue
-        dest = store._skill_dir(src.name)
+        try:
+            dest = store._skill_dir(src.name)
+        except ValueError:
+            # The slug resolves outside the store — the agent writes into its
+            # own org's tree on shared storage, so it can plant
+            # `skills/<builtin-slug>` as a symlink pointing out of it. Skip that
+            # one builtin: letting this propagate would 500 every skills read
+            # and every turn for the org, which a tenant must not be able to do
+            # to itself.
+            logger.warning("Skipping builtin %r: its slug does not resolve inside %s",
+                           src.name, store.root, exc_info=True)
+            continue
         if dest.exists():
             continue  # keep the user-editable copy untouched
         # Copied file by file, each destination re-checked for containment with
