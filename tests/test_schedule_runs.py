@@ -492,6 +492,57 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s.close()
 
 
+# --- ENG-1675: a due one-off must RUN on the tick its slot passes, not get
+# disabled ("Paused") by the missed-run sweep before `_due_schedules` sees it.
+
+def _once_schedule(session: Session, next_run_at: datetime) -> Schedule:
+    schedule = Schedule(
+        title="One-off report",
+        prompt="Reply OK",
+        cadence="once",
+        next_run_at=next_run_at,
+        model="default",
+        project_id=GENERAL_PROJECT_ID,
+    )
+    session.add(schedule)
+    session.commit()
+    session.refresh(schedule)
+    return schedule
+
+
+def test_missed_runs_leaves_just_due_once_enabled_to_run():
+    from cowork.scheduler import _due_schedules, _handle_missed_runs
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    # Slot passed 30s ago — the normal case where the app is open and the
+    # scheduled time just arrived. It must stay enabled and be run.
+    schedule = _once_schedule(session, now - timedelta(seconds=30))
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    _handle_missed_runs(scoped)
+
+    session.refresh(schedule)
+    assert schedule.enabled is True
+    assert [s.id for s in _due_schedules(scoped, now)] == [schedule.id]
+
+
+def test_missed_runs_disables_stale_once_overdue_beyond_window():
+    from cowork.scheduler import _due_schedules, _handle_missed_runs
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    # Slot passed hours ago (app was offline) — do not fire it late.
+    schedule = _once_schedule(session, now - timedelta(hours=2))
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    _handle_missed_runs(scoped)
+
+    session.refresh(schedule)
+    assert schedule.enabled is False
+    assert _due_schedules(scoped, now) == []
+
+
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
 
 def test_reap_orphaned_runs_marks_running_as_failed():
