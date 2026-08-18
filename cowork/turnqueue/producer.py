@@ -17,6 +17,7 @@ from cowork.handlers.turn_errors import remote_turn_error
 from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
+from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
@@ -148,6 +149,7 @@ def step_stream_events(data: dict) -> list:
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
+                                turn_id: int = 0,
                                 history: list | None = None,
                                 memory: dict | None = None,
                                 skills: dict | None = None,
@@ -163,6 +165,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     settings = TurnQueueSettings()
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
+    # A flag left by an earlier turn would cancel this one on its first line.
+    await r.delete(f"cowork:cancel:{corr}")
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
     # No client-picked model → the deployment's resolved default (org mode: the
@@ -200,6 +204,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
     await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
     await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
+    # Any replica can now find this turn: its turn_id to open the buffer, its
+    # correlation_id to cancel it, its org to authorize the caller. Recorded
+    # here rather than after the first buffer record, because this generator
+    # does not own the buffer; _shared_turn covers the gap between the two.
+    await record_turn(
+        conversation_id, turn_id=turn_id, correlation_id=corr,
+        org_id=org_id, user_id=user_id, client=r,
+    )
 
     last_id = "0-0"
     idle_timeout = settings.reply_idle_timeout_seconds
