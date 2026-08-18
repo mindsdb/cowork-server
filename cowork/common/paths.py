@@ -13,6 +13,7 @@ silently leak across builds and defeat the isolation.
 """
 
 import os
+import tempfile
 from pathlib import Path
 
 _DEFAULT_HOME = Path.home() / ".cowork"
@@ -30,14 +31,90 @@ def cowork_home() -> Path:
     return Path(raw).expanduser() if raw else _DEFAULT_HOME
 
 
+def pod_local_only(local_path: Path, name: str) -> Path:
+    """Relocate *local_path* off shared storage in org mode; a no-op otherwise.
+
+    *local_path* is whatever a caller already computes for local (desktop)
+    mode, normally something under ``cowork_home()``. In local mode this
+    function returns it untouched, so desktop behaviour is exactly what it
+    was before this function existed.
+
+    In org mode, ``cowork_home()`` is EFS (``COWORK_HOME=/mnt/cowork-shared``),
+    shared byte-for-byte across every replica and every organization. Three
+    callers write under it with no org_id segment to key on: the connector
+    probe's plaintext credential env files, publish's state.json (which holds
+    publish_history), and the anton harness's temporary data-vault directory.
+    Anything they write under ``cowork_home()`` therefore lands at the shared
+    namespace root, readable by any organization's request, and, unlike the
+    old ephemeral container disk, survives a pod restart.
+    ``scoped_storage_root`` cannot fix this: it pivots on an org_id, and none
+    of these three carry one, nor should they, since none of them are
+    organization data.
+
+    Org mode substitutes ``<pod_scratch_dir>/<name>`` instead, ignoring
+    *local_path* entirely. ``pod_scratch_dir`` (see AppSettings) defaults to
+    the container's own ``tempfile.gettempdir()``, which this plan never
+    mounts shared storage onto, so it is always one pod's own disk and dies
+    with the container the same way ``cowork_home()`` did before COWORK_HOME
+    pointed at EFS.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    settings = get_app_settings()
+    if settings.tenancy_mode != "org":
+        return local_path
+    return Path(settings.pod_scratch_dir) / name
+
+
 def safe_join(base: Path | str, *parts: str) -> Path:
     """Join user-controlled *parts* onto *base*, guaranteeing containment.
 
-    Normalizes the result and rejects (``ValueError``) anything that lands
-    outside *base* — a ``..`` segment, an absolute component that resets the
-    join, or a name carrying a path separator. Comparison is on whole path
-    components (``os.path.commonpath``), not a string prefix, so ``base`` and a
-    sibling like ``<base>-other`` are correctly treated as unrelated.
+    Two checks, both required:
+
+    1. Lexical. Normalizes the result and rejects anything landing outside
+       *base* (a ``..`` segment, an absolute component resetting the join, a
+       name carrying a separator). Comparison is on whole path components, so
+       *base* and a sibling like ``<base>-other`` are correctly unrelated.
+
+    2. Symbolic. Resolves symlinks and re-checks. On shared storage the agent
+       writes into its own org's tree but cowork-server reads every org's, so a
+       link like ``<org_A>/x -> ../../<org_B>`` is a cross-tenant read if we
+       only check the string. ``os.path.realpath`` on a path that does not exist
+       yet resolves the existing prefix and leaves the rest literal, so callers
+       that join before creating still work.
+    """
+    base_norm = os.path.normpath(str(base))
+    target = os.path.normpath(os.path.join(base_norm, *parts))
+    if os.path.commonpath([base_norm, target]) != base_norm:
+        raise ValueError(f"path {target!r} escapes base directory {base_norm!r}")
+
+    base_real = os.path.realpath(base_norm)
+    target_real = os.path.realpath(target)
+    if os.path.commonpath([base_real, target_real]) != base_real:
+        raise ValueError(f"path {target!r} resolves outside base directory {base_norm!r}")
+
+    return Path(target)
+
+
+def safe_join_lexical(base: Path | str, *parts: str) -> Path:
+    """Join user-controlled *parts* onto *base*, checking the string only.
+
+    Same lexical check as :func:`safe_join` (normpath plus a whole-component
+    ``commonpath`` comparison), but it stops there: it does NOT call
+    ``os.path.realpath`` and does NOT reject a result that a symlink would
+    resolve outside *base*. It gives no protection against reading through a
+    symlink that escapes *base*; use :func:`safe_join` for that, and for
+    every path this process is about to read.
+
+    This exists for the one legitimate case where a resolved-outside-base
+    result is correct, not a bug: computing the location of a symlink this
+    process is about to create or remove, where the whole point is that the
+    link's target lives outside its own directory. ``skill_links.py`` fans a
+    canonical skill out to per-project ``skills/<slug>`` symlinks; each
+    project's link legitimately resolves to the shared skill store, a sibling
+    of the projects root, not a path under it. Passing that computation
+    through :func:`safe_join` would resolve the existing symlink on every call
+    after the first and raise, even though nothing is being read through it.
     """
     base_norm = os.path.normpath(str(base))
     target = os.path.normpath(os.path.join(base_norm, *parts))

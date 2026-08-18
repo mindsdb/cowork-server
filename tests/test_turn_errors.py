@@ -530,12 +530,198 @@ def test_reason_header_wallet_empty_maps_to_out_of_credits():
     assert message == te.TOKEN_LIMIT_USER_MESSAGE
 
 
-def test_reason_header_allowance_exhausted_maps_to_out_of_credits():
+def test_spent_free_allowance_is_its_own_card_not_out_of_credits():
+    # ENG-1537. These used to share the credits card, but they are different
+    # situations: `access.py` only issues this reason for a free-bucket model on
+    # an org that has NEVER topped up, so the user has not spent money — they
+    # used the monthly grant, which resets. Telling them "you're out of credits"
+    # both misdescribes it and hides the free way forward.
     code, message = te.friendly_turn_error(
         _gateway_failure(429, reason="included_allowance_exhausted")
     )
+    assert code == te.ALLOWANCE_EXHAUSTED_CODE
+    assert code != te.TOKEN_LIMIT_CODE
+    assert message == te.ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    # Still an actionable path to keep working — ENG-1169's requirement holds
+    # even though the code changed.
+    assert "add credits" in message.lower()
+
+
+def test_empty_wallet_keeps_the_out_of_credits_card():
+    # The other half of the split must be untouched: a drained wallet really is
+    # "out of credits" and keeps its existing card.
+    code, message = te.friendly_turn_error(_gateway_failure(402, reason="wallet_empty"))
     assert code == te.TOKEN_LIMIT_CODE
     assert message == te.TOKEN_LIMIT_USER_MESSAGE
+
+
+def test_allowance_reset_at_is_read_off_the_chain():
+    # The gate sends this on the allowance denial and NOT on a velocity one, so
+    # the card can name when the grant refreshes instead of only asking for money.
+    exc = _gateway_failure(429, reason="included_allowance_exhausted")
+    exc.__cause__.response.headers["X-MindsHub-Reset-At"] = "2026-09-01T00:00:00Z"
+    assert te.allowance_reset_at(exc) == "2026-09-01T00:00:00Z"
+    # Absent → the renderer falls back to "resets next month"; never invented here.
+    assert te.allowance_reset_at(_gateway_failure(429, reason="included_allowance_exhausted")) is None
+    assert te.allowance_reset_at(Exception("bare")) is None
+
+
+def test_reset_at_rides_the_failed_payload_only_when_present():
+    with_reset = te.response_failed_payload(
+        "msg", te.ALLOWANCE_EXHAUSTED_CODE, reset_at="2026-09-01T00:00:00Z"
+    )
+    assert with_reset["reset_at"] == "2026-09-01T00:00:00Z"
+    assert "reset_at" not in te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
+
+
+# ── The two 429 flavours must never share a card (ENG-1537) ────────
+
+
+def test_velocity_rate_limit_is_not_out_of_credits():
+    # THE defect. `rate_limited` was the one gateway reason this module didn't
+    # know, so it fell to the bare-status 429 rule and rendered as
+    # "You're out of credits. Add credits to keep working." — advertising a
+    # purchase that cannot lift a per-minute token ceiling.
+    code, message = te.friendly_turn_error(_gateway_failure(429, reason="rate_limited"))
+    assert code == te.RATE_LIMITED_CODE
+    assert message == te.RATE_LIMITED_USER_MESSAGE
+    assert code != te.TOKEN_LIMIT_CODE
+    # The copy must not send the user to billing, in either direction.
+    assert "add credits" not in message.lower()
+
+
+def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
+    # ENG-1363: the Anthropic /v1/messages lane strips X-MindsHub-* headers.
+    # The gateway sets `code` and `reason` to the same value, so the body is a
+    # second carrier for the identical decision — without it, that lane would
+    # fall to the bare-status rule and show the credits card again.
+    exc = ConnectionError("Server returned 429")
+    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
+    inner.body = {"error": {"code": "rate_limited", "message": "Rate limit exceeded"}}
+    code, _ = te.friendly_turn_error(exc)
+    assert code == te.RATE_LIMITED_CODE
+
+
+@pytest.mark.parametrize("code", ["wallet_empty", "rate_limited", "included_allowance_exhausted"])
+def test_a_third_party_body_cannot_select_a_billing_verdict(code):
+    # ENG-1537 review. The body-`code` carrier must be host-gated exactly like
+    # the bare-status rule. A response body is third-party-controlled on a BYOK
+    # OPENAI_COMPATIBLE provider, so without the gate any endpoint could send
+    # {"code": "wallet_empty"} and put our billing CTA — and the MindsHub top-up
+    # link — in front of a user with no MindsHub balance at all.
+    #
+    # The allowlist alone does NOT prevent this: it constrains which verdict can
+    # be selected, not who may select one. That is why these are the codes we
+    # recognise rather than junk.
+    exc = ConnectionError("Server returned 429")
+    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url="https://openrouter.ai/api/v1/x")
+    inner.body = {"error": {"code": code}}
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] not in (
+        te.TOKEN_LIMIT_CODE, te.RATE_LIMITED_CODE, te.ALLOWANCE_EXHAUSTED_CODE,
+    ), f"a third-party body selected {result!r}"
+
+
+def test_the_gateways_own_body_code_still_maps():
+    # The gate must not break the carrier it exists to protect: on OUR host the
+    # body code is still honoured when the header didn't survive (ENG-1363).
+    exc = ConnectionError("Server returned 429")
+    exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
+    inner.body = {"error": {"code": "rate_limited"}}
+    assert te.friendly_turn_error(exc)[0] == te.RATE_LIMITED_CODE
+
+
+def test_exhausted_rate_limit_wait_keeps_its_code_over_the_bare_status_rule():
+    # ENG-1537: when anton's wait budget runs out it re-raises with
+    # code="rate_limited", but the ORIGINAL 429 is still in the cause chain —
+    # so the bare-status rule would relabel the honest "waiting didn't clear
+    # it" failure as out-of-credits, undoing the whole point of the wait.
+    exhausted = _FakeOverloadedErr(
+        "Too many requests too quickly — the rate limit didn't clear in time.",
+        code="rate_limited",
+        model="sonnet",
+    )
+    # NO reason header and NO body code: the ONLY thing that can save this from
+    # the bare-status 429 rule is the hoisted code check. The earlier version of
+    # this test passed the header, so it never exercised the hoist it is named
+    # after — deleting the whole block left it green (ENG-1537 review).
+    exhausted.__cause__ = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
+    code, _ = te.friendly_turn_error(exhausted)
+    assert code == te.RATE_LIMITED_CODE
+
+
+def test_a_real_provider_incident_still_maps_to_provider_overloaded():
+    # The rate-limit early check must not swallow the incident case it sits in
+    # front of.
+    incident = _FakeOverloadedErr(
+        "Anthropic is experiencing an incident and didn't recover in time.",
+        code="provider_overloaded",
+        model="sonnet",
+    )
+    assert te.friendly_turn_error(incident)[0] == te.PROVIDER_OVERLOADED_CODE
+
+
+@pytest.mark.parametrize("status,reason,expected", [
+    (402, "wallet_empty", "token_limit"),
+    (429, "included_allowance_exhausted", "included_allowance_exhausted"),
+])
+def test_billing_denials_still_card_immediately(status, reason, expected):
+    # ENG-1169 regression guard, in the other direction. These share the 429
+    # status (and 402) with the velocity limit but are permanent for the
+    # identical request — the allowance resets monthly — so they must keep
+    # going straight to the credits card and must never be routed to a wait.
+    code, message = te.friendly_turn_error(_gateway_failure(status, reason=reason))
+    assert code == expected
+    # Whichever card it is, it must offer the user a way to keep working.
+    assert "credits" in message.lower()
+
+
+def test_retry_after_is_read_off_the_chain_for_the_card_gate():
+    # ENG-1537: the renderer needs the server's own interval to time-gate its
+    # Retry. Integer seconds only — a date form would gate the button for
+    # centuries, so it is dropped in favour of no gate.
+    exc = _gateway_failure(429, reason="rate_limited")
+    exc.__cause__.response.headers["Retry-After"] = "30"
+    assert te.retry_after_seconds(exc) == 30.0
+
+    dated = _gateway_failure(429, reason="rate_limited")
+    dated.__cause__.response.headers["Retry-After"] = "Wed, 21 Oct 2026 07:28:00 GMT"
+    assert te.retry_after_seconds(dated) is None
+
+    assert te.retry_after_seconds(_gateway_failure(429, reason="rate_limited")) is None
+    assert te.retry_after_seconds(Exception("bare")) is None
+
+    # Clamped at the source so the interval and the instant never disagree on
+    # the wire (review: pnewsam). Unclamped, the payload carried
+    # retry_after=999999999999 while retry_at was dropped as out-of-range —
+    # two fields describing one wait, one absurd and one absent.
+    huge = _gateway_failure(429, reason="rate_limited")
+    huge.__cause__.response.headers["Retry-After"] = "999999999999"
+    assert te.retry_after_seconds(huge) == te._MAX_RETRY_AFTER_S
+    # And the pair it feeds is therefore consistent: both present, both bounded.
+    _a = te.retry_after_seconds(huge)
+    _p = te.response_failed_payload(
+        "m", te.RATE_LIMITED_CODE, retry_after=_a, retry_at=te.retry_at_instant(_a),
+    )
+    assert _p["retry_after"] == te._MAX_RETRY_AFTER_S
+    assert _p["retry_at"] is not None
+
+
+def test_retry_after_rides_the_failed_payload_only_when_present():
+    # Additive field: absent unless we actually have a number, so the wire shape
+    # is unchanged for every other failure and older clients are unaffected.
+    with_hint = te.response_failed_payload("msg", te.RATE_LIMITED_CODE, retry_after=30.0)
+    assert with_hint["retry_after"] == 30.0
+    assert "retry_after" not in te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
+
+
+def test_reasonless_gateway_429_still_cards_as_credits():
+    # A gateway old enough to omit the header only ever meant "allowance" by a
+    # 429, so the legacy assumption is preserved for a 429 carrying neither a
+    # reason nor a body code. Narrowing this instead would have stripped the
+    # credits card from a real allowance exhaustion.
+    code, _ = te.friendly_turn_error(_gateway_failure(429))
+    assert code == te.TOKEN_LIMIT_CODE
 
 
 def test_reason_header_policy_unavailable_is_transient_not_out_of_credits():
@@ -547,8 +733,54 @@ def test_reason_header_policy_unavailable_is_transient_not_out_of_credits():
 
 def test_reason_header_unknown_model_steers_to_settings_not_credits():
     code, message = te.friendly_turn_error(_gateway_failure(404, reason="unknown_model"))
-    assert code == te.UNKNOWN_MODEL_CODE
-    assert message == te.UNKNOWN_MODEL_USER_MESSAGE
+    assert code == te.MODEL_NOT_FOUND_CODE
+    assert code != te.TOKEN_LIMIT_CODE
+    assert message == te.MODEL_NOT_FOUND_USER_MESSAGE
+
+
+def test_unknown_model_prefers_antons_model_naming_copy_over_the_header():
+    """ENG-1358: the gateway 404 carries BOTH the reason header and anton's typed
+    ModelUnavailableError. The header's copy is generic ("That model isn't
+    available"); anton's names the offending id. The user can only act on the
+    latter, so it must win — returning the header copy is what left ENG-1358's
+    user with three dead turns and no idea which model was wrong.
+    """
+    exc = _FakeModelErr(
+        "The model 'deepseek-v4-flash' isn't available: The model "
+        "'deepseek-v4-flash' does not exist or you do not have access to it. "
+        "Switch models in Settings.",
+        "model_not_found",
+        "deepseek-v4-flash",
+    )
+    exc.__cause__ = _gateway_failure(404, reason="unknown_model")
+
+    code, message = te.friendly_turn_error(exc)
+    assert code == te.MODEL_NOT_FOUND_CODE
+    assert "deepseek-v4-flash" in message
+    assert message != te.MODEL_NOT_FOUND_USER_MESSAGE
+
+
+def test_model_not_found_is_a_model_unavailable_code():
+    """The renderer keys one card on this set; model_not_found must be in it or
+    the 404 falls through to a plain text line with no action (ENG-1358)."""
+    exc = _FakeModelErr(
+        "The model 'x' isn't available. Switch models in Settings.",
+        "model_not_found",
+        "x",
+    )
+    assert te.model_unavailable_info(exc) == ("model_not_found", "x")
+
+
+def test_remote_model_unavailable_does_not_promise_credits_will_fix_it():
+    """The remote wire loses the structured code, so a 404 and a legacy 403 look
+    identical. Defaulting to model_access_denied would render a "Top up balance"
+    button for a model that simply doesn't exist."""
+    code, message = te.remote_turn_error(
+        "ModelUnavailableError: The model 'deepseek-v4-flash' isn't available. "
+        "Switch models in Settings."
+    )
+    assert code == te.MODEL_NOT_FOUND_CODE
+    assert "deepseek-v4-flash" in message
 
 
 def test_bare_402_status_maps_to_out_of_credits_without_header():
@@ -835,12 +1067,19 @@ def test_wire_code_inventory_matches_the_renderer_contract():
     assert codes == {
         "token_limit",
         "policy_unavailable",
-        "unknown_model",
+        "model_not_found",
         "provider_auth",
         "model_access_denied",
         "model_disabled",
         "provider_overloaded",
         "image_format",
+        # ENG-1537. This tripwire did its job: adding the constant failed this
+        # test before the renderer branch existed, which is exactly the gap
+        # ENG-1282 built it to catch. The matching branch lands in
+        # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
+        "rate_limited",
+        # ENG-1537 — the spent free allowance, split off the credits card.
+        "included_allowance_exhausted",
         "anton_error",
     }
 
@@ -868,3 +1107,274 @@ def test_no_return_emits_a_literal_code():
         and isinstance(node.value.elts[0].value, str)
     ]
     assert offenders == []
+
+
+# ── Wiring coverage (ENG-1537 review finding 3) ────────────────────────────
+# Four mutations survived the full suite: the reset_at and retry_after extras
+# in responses.py, the never-throttle exemption, and PHASE_LABELS.
+
+def test_retry_at_is_an_absolute_offset_bearing_instant():
+    # The renderer gates its Retry on this. It cannot use the message's own
+    # created_at — cowork-server serialises that naive and offset-less, so JS
+    # parses it as LOCAL time: west of UTC the button gates for hours, east of
+    # it the gate no-ops, and a TZ=UTC suite sees neither.
+    from datetime import datetime
+
+    from datetime import timedelta, timezone
+
+    before = datetime.now(timezone.utc)
+    got = te.retry_at_instant(30)
+    after = datetime.now(timezone.utc)
+    assert got is not None and got.endswith("Z"), got
+    parsed = datetime.fromisoformat(got.replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None  # the whole point
+
+    # VALUE, not just shape. Format-only assertions let three arithmetic
+    # mutations through the full suite: seconds=0 (the gate never fires at
+    # all), a sign flip (instant in the past, same no-op), and /1000 (a 30s
+    # wait becomes 30ms). Each silently disables the feature this exists for.
+    assert before + timedelta(seconds=30) <= parsed <= after + timedelta(seconds=30)
+
+    assert te.retry_at_instant(None) is None
+    assert te.retry_at_instant(-5) is None
+    # Bounded before the arithmetic: `timedelta` raises OverflowError past the
+    # datetime range, and this runs inside the terminal error handler, where an
+    # unhandled raise strands the SSE stream with no failure frame.
+    assert te.retry_at_instant(999_999_999_999) is None
+    assert te.retry_at_instant(86_401) is None
+    assert te.retry_at_instant(86_400) is not None
+
+
+def test_rate_limit_extras_carry_both_the_interval_and_the_instant():
+    payload = te.response_failed_payload(
+        "msg", te.RATE_LIMITED_CODE, retry_after=30.0, retry_at="2026-09-01T00:00:30Z",
+    )
+    assert payload["retry_after"] == 30.0
+    assert payload["retry_at"] == "2026-09-01T00:00:30Z"
+    # Additive: absent for every other failure, so the wire shape is unchanged.
+    plain = te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
+    assert "retry_after" not in plain and "retry_at" not in plain
+
+
+def test_the_rate_limit_notice_is_exempt_from_progress_throttling():
+    # It fires once per wait. Throttled away, a deliberate 90s pause is
+    # indistinguishable from a hang.
+    #
+    # Note this is a REFINEMENT, not the enabler: staging already forwards
+    # phase/message on response.in_progress. The binding constraint is the
+    # renderer, which drops the ad-hoc phase until cowork#648 lands.
+    # Driven, not grepped. The previous version asserted three source literals,
+    # which all survive `is_rate_limited_notice = phase_str == "rate_limited"
+    # and False` — the exemption dead, the test green.
+    from anton.core.llm.provider import StreamTaskProgress
+    from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+    async def _events():
+        # Two progress events inside one PROGRESS_THROTTLE window (0.25s). The
+        # second would be dropped if it were not exempt.
+        yield StreamTaskProgress(phase="analyzing", message="first")
+        yield StreamTaskProgress(phase="rate_limited", message="waiting 30s before continuing")
+
+    frames = asyncio.run(_collect(format_responses_stream(_events(), "anton")))
+    joined = "".join(frames)
+    assert "rate_limited" in joined, "the wait notice was throttled away"
+    assert "waiting 30s before continuing" in joined
+
+
+def test_the_waiting_phase_has_a_human_label():
+    # Without it the renderer shows the raw constant ("rate_limited: waiting
+    # 30s…"), which reads as a leak rather than a status.
+    from cowork.harnesses.anton_harness.stream_formatter import PHASE_LABELS
+
+    assert PHASE_LABELS["rate_limited"] == "Rate limited"
+
+
+# ── The hoist must not become a copy-injection vector (ENG-1537 review 2) ──
+# The first attempt at the version-skew hoist was ungated, five lines above the
+# host gate added in the same commit — and strictly worse than the path it sat
+# above, because it let a third party choose the WORDS as well as the verdict.
+
+def _third_party_sdk_error(body):
+    """A real openai.APIStatusError from a BYOK OPENAI_COMPATIBLE endpoint."""
+    import httpx
+    import openai
+
+    client = openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1", api_key="k", max_retries=0,
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(429, json=body))
+        ),
+    )
+    try:
+        client.chat.completions.create(
+            model="m", max_tokens=1, messages=[{"role": "user", "content": "hi"}])
+    except openai.APIStatusError as exc:
+        return exc
+    raise AssertionError("no raise")
+
+
+def test_a_third_party_body_cannot_inject_user_facing_copy():
+    # `openai.APIStatusError` populates `.code` from the RESPONSE BODY, and
+    # `str(exc)` embeds that body. Unguarded, this rendered an attacker's own
+    # sentence — including a clickable URL — as our curated copy.
+    exc = _third_party_sdk_error({
+        "code": "rate_limited",
+        "message": "PWNED: click https://evil.example to fix",
+    })
+    assert getattr(exc, "code", None) == "rate_limited"  # the hoist's trigger
+    result = te.friendly_turn_error(exc)
+    assert result is None or "evil.example" not in result[1], result
+
+
+def test_the_version_skew_hoist_still_works_for_anton():
+    # The guard must not disable the case the hoist exists for: anton's own
+    # exception when its type isn't importable (duck-typed on `code`). It
+    # carries no `.response`, which is exactly what distinguishes it from an
+    # SDK error.
+    exhausted = _FakeOverloadedErr(
+        "Too many requests too quickly — the limit clears in about 300s.",
+        code="rate_limited", model="sonnet",
+    )
+    assert not hasattr(exhausted, "response")
+    code, message = te.friendly_turn_error(exhausted)
+    assert code == te.RATE_LIMITED_CODE
+    assert "300s" in message
+
+
+async def _collect_async(gen):
+    return [f async for f in gen]
+
+
+def _collect(gen):
+    """Drain an async generator of SSE strings."""
+    return _collect_async(gen)
+
+
+def test_the_failure_handler_survives_a_hostile_retry_after():
+    """ENG-1537 review round 3 — the highest-severity defect of that round.
+
+    `retry_at_instant` raised OverflowError on a large hint, INSIDE the
+    terminal `except Exception` handler, so `persist()` and
+    `buffer.close("error")` never ran: no failure frame, and `sse_from_buffer`
+    kept emitting keepalives forever. The user saw a spinner that never
+    resolved and lost the turn's work.
+
+    The neighbouring auth and provider_overloaded branches already stated the
+    rule ("Never break the handler"); this branch didn't follow it.
+    """
+    # The value that used to raise.
+    assert te.retry_at_instant(999_999_999_999) is None
+    # And the extras assembly must tolerate anything the helper does.
+    payload = te.response_failed_payload(
+        "msg", te.RATE_LIMITED_CODE,
+        retry_after=999_999_999_999, retry_at=te.retry_at_instant(999_999_999_999),
+    )
+    assert payload["code"] == te.RATE_LIMITED_CODE
+    assert "retry_at" not in payload      # dropped, not a crash
+# ── The wire `model` for model_not_found (ENG-1358 re-review) ────────
+
+
+def test_model_not_found_is_in_the_set_responses_uses_to_emit_model():
+    """responses.py attaches `model` to the failure frame for exactly these
+    codes. Naming the id IS the fix — if model_not_found drops out of this set
+    the card silently falls back to its unnamed copy, which is the defect the
+    ticket exists to close, and nothing else in the suite notices.
+
+    Shared as a set rather than re-listed inline in responses.py so a merge
+    conflict in that elif-chain has no tuple members to drop."""
+    assert te.MODEL_NOT_FOUND_CODE in te.MODEL_UNAVAILABLE_CODES
+    assert te.MODEL_ACCESS_DENIED_CODE in te.MODEL_UNAVAILABLE_CODES
+    assert te.MODEL_DISABLED_CODE in te.MODEL_UNAVAILABLE_CODES
+
+
+def test_responses_emits_model_for_every_model_unavailable_code():
+    """Guards the branch itself: the handler must reach the model-emitting arm
+    via the shared set, not a hand-maintained tuple."""
+    import inspect
+
+    from cowork.handlers import responses as rp
+
+    src = inspect.getsource(rp)
+    assert "elif code in MODEL_UNAVAILABLE_CODES:" in src, (
+        "responses.py must branch on the shared set — an inline tuple here is "
+        "what let a rebase silently drop model_not_found"
+    )
+    for code in te.MODEL_UNAVAILABLE_CODES:
+        payload = te.response_failed_payload("msg", code, model="deepseek-v4-flash")
+        assert payload["model"] == "deepseek-v4-flash"
+        assert payload["code"] == code
+
+
+# ── The header carrier is origin-checked too (ENG-1686) ────────────────────
+# ENG-1537 gated the body-`code` carrier and left its header twin unconditional,
+# on the assumption that "only the gateway sets X-MindsHub-Reason". That is true
+# of every honest provider and not enforceable against a hostile one: on a BYOK
+# OPENAI_COMPATIBLE endpoint the whole response is third-party controlled.
+
+@pytest.mark.parametrize("reason,forbidden_code", [
+    ("wallet_empty", "token_limit"),
+    ("included_allowance_exhausted", "included_allowance_exhausted"),
+    ("rate_limited", "rate_limited"),
+    ("policy_unavailable", "policy_unavailable"),
+    # The fifth. Not a billing verdict, but a third party should not get to
+    # pick our model card either, and the gate already refuses it — this pins
+    # the behaviour so the "every reason" claim below is literally true
+    # (review: pnewsam).
+    ("unknown_model", "model_not_found"),
+])
+def test_a_third_party_header_cannot_select_a_billing_verdict(reason, forbidden_code):
+    # Mirror of test_a_third_party_body_cannot_select_a_billing_verdict, over
+    # the carrier that was left open. Parametrised across every reason the
+    # gateway defines, so adding a sixth cannot quietly reopen one lane.
+    exc = _failure(402, reason=reason, url="https://openrouter.ai/api/v1/chat/completions")
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != forbidden_code, (
+        f"a third-party header selected {result!r}"
+    )
+
+
+def test_the_gateways_own_header_still_maps():
+    # The gate must not break the carrier it exists to protect.
+    code, _ = te.friendly_turn_error(_gateway_failure(402, reason="wallet_empty"))
+    assert code == te.TOKEN_LIMIT_CODE
+
+
+def test_the_unknown_origin_residual_is_not_remote_reachable():
+    # The deliberate residual. `_origin_is_known_third_party` is three-valued so
+    # an unknown origin stays trusted; that the unknown origin still MAPS is
+    # asserted by test_reason_header_maps_even_without_request_url, not here —
+    # this test only shows the residual cannot be reached by a remote (review:
+    # pnewsam noted the old name claimed the mapping too).
+    #
+    # Safe because a remote server cannot produce it: a real SDK error always
+    # carries its request, so `host` resolves for every genuine HTTP response.
+    # The only route to host=None is a response with no request attached, whose
+    # `.url` raises RuntimeError — our own plumbing, never the peer's choice.
+    # Asserted here rather than left as prose, since it is the entire argument
+    # for the narrow gate.
+    import httpx
+    import openai
+
+    def _handler(request):
+        return httpx.Response(402, json={}, headers={"X-MindsHub-Reason": "wallet_empty"})
+
+    client = openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1", api_key="k", max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(_handler)),
+    )
+    try:
+        client.chat.completions.create(
+            model="m", max_tokens=1, messages=[{"role": "user", "content": "hi"}])
+    except openai.APIStatusError as exc:
+        # A REAL third-party error resolves its host, so it is gated — it can
+        # never fall into the trusted unknown-origin residual.
+        assert te._http_error_context(exc)[2] == "openrouter.ai"
+        assert te._origin_is_known_third_party("openrouter.ai") is True
+    else:  # pragma: no cover
+        raise AssertionError("the SDK did not raise")
+
+    # And the residual itself is only constructible locally.
+    detached = httpx.Response(402, json={}, headers={"X-MindsHub-Reason": "wallet_empty"})
+    with pytest.raises(RuntimeError):
+        _ = detached.url
+    assert te._origin_is_known_third_party(None) is False

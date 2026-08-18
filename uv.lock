@@ -143,8 +143,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.8.9.1"
-source = { git = "https://github.com/mindsdb/anton.git?branch=main#fdaa2f1d993c062a60daf846b9d1441799977826" }
+version = "2.26.8.18.1rc2"
+source = { git = "https://github.com/mindsdb/anton.git?branch=staging#598039243803b5e4b1958199b846e10e0818fd44" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -444,6 +444,7 @@ channels = [
 [package.dev-dependencies]
 dev = [
     { name = "alembic" },
+    { name = "fakeredis" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -453,8 +454,8 @@ dev = [
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=main" },
-    { name = "cryptography", specifier = ">=48.0.0" },
+    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=staging" },
+    { name = "cryptography", specifier = ">=48.0.0,<49" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
     { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=44ddc552f5e054759a6970af8997ea588a9d81c9" },
@@ -479,6 +480,7 @@ provides-extras = ["channels"]
 [package.metadata.requires-dev]
 dev = [
     { name = "alembic", specifier = ">=1.18.4" },
+    { name = "fakeredis", specifier = ">=2.37.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=0.25.0" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
@@ -587,6 +589,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e0/4d/f332313098c1de1b2d2ff91cf2674415cc7cddab2ca1b01ae29774bd5fdf/docstring_parser-0.18.0.tar.gz", hash = "sha256:292510982205c12b1248696f44959db3cdd1740237a968ea1e2e7a900eeb2015", size = 29341, upload-time = "2026-04-14T04:09:19.867Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/5f/ed01f9a3cdffbd5a008556fc7b2a08ddb1cc6ace7effa7340604b1d16699/docstring_parser-0.18.0-py3-none-any.whl", hash = "sha256:b3fcbed555c47d8479be0796ef7e19c2670d428d72e96da63f3a40122860374b", size = 22484, upload-time = "2026-04-14T04:09:18.638Z" },
+]
+
+[[package]]
+name = "fakeredis"
+version = "2.37.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "redis" },
+    { name = "sortedcontainers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cb/34/73256495885f68b125b6a95f6a8448e103adf34825746ab8905db52183a0/fakeredis-2.37.0.tar.gz", hash = "sha256:7461f124dcba04a80691d72270b3d1d5cd100ef14dc068c76db825940f3ed799", size = 236339, upload-time = "2026-07-22T20:04:53.753Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/e2/964e6ef372770dd7c32f9738b50ff4924f1d3cccd665b568680e4bcb0167/fakeredis-2.37.0-py3-none-any.whl", hash = "sha256:657a2a695a1123be0c13f98db409371497bd94c29d260dd76a9fc7ce1a633745", size = 151526, upload-time = "2026-07-22T20:04:51.979Z" },
 ]
 
 [[package]]
@@ -1181,7 +1196,7 @@ name = "portalocker"
 version = "3.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pywin32" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5e/77/65b857a69ed876e1951e88aaba60f5ce6120c33703f7cb61a3c894b8c1b6/portalocker-3.2.0.tar.gz", hash = "sha256:1f3002956a54a8c3730586c5c77bf18fae4149e07eaf1c29fc3faf4d5a3f89ac", size = 95644, upload-time = "2025-06-14T13:20:40.03Z" }
 wheels = [
@@ -1850,6 +1865,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f8/5c/48a7d9495be3d1c651198fd99dbb6ce190e2274d0f28b9051307bdec6b85/socksio-1.0.0.tar.gz", hash = "sha256:f88beb3da5b5c38b9890469de67d0cb0f9d494b78b106ca1845f96c10b91c4ac", size = 19055, upload-time = "2020-04-17T15:50:34.664Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/37/c3/6eeb6034408dac0fa653d126c9204ade96b819c936e136c5e8a6897eee9c/socksio-1.0.0-py3-none-any.whl", hash = "sha256:95dc1f15f9b34e8d7b16f06d74b8ccf48f609af32ab33c608d08761c5dcbb1f3", size = 12763, upload-time = "2020-04-17T15:50:31.878Z" },
+]
+
+[[package]]
+name = "sortedcontainers"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f23394729afe52f3bf7adec04bf9ed2c820b39e19299111/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88", size = 30594, upload-time = "2021-05-16T22:03:42.897Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
 ]
 
 [[package]]

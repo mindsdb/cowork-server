@@ -6,10 +6,13 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
+from cowork.db.scoped import TenantScope, get_tenant_scope
+
 from cowork.services.publish import (
+    PublisherUnavailable,
     activate_version as _activate_version,
     list_publishable,
     list_versions as _list_versions,
@@ -57,18 +60,21 @@ async def list_publishable_endpoint():
 
 
 @router.post("/")
-async def publish_artifact(req: _PublishBody):
+async def publish_artifact(req: _PublishBody, scope: TenantScope = Depends(get_tenant_scope)):
     try:
-        return _publish(req.path, req.password, access=req.access.model_dump() if req.access else None)
+        # The publisher resolves datasource secrets from the connector vault,
+        # which is org-keyed; without the scope it would look in the shared root.
+        return _publish(req.path, req.password,
+                        access=req.access.model_dump() if req.access else None,
+                        scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PublisherUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
-        detail = str(e)
-        if "unavailable" in detail.lower():
-            raise HTTPException(status_code=503, detail=detail)
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/update")
@@ -79,11 +85,10 @@ async def update_artifact(req: _UpdateBody):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PublisherUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
-        detail = str(e)
-        if "unavailable" in detail.lower():
-            raise HTTPException(status_code=503, detail=detail)
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.delete("/")
@@ -94,11 +99,10 @@ async def unpublish_artifact(path: str = Query(..., description="Absolute path t
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PublisherUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
-        detail = str(e)
-        if "unavailable" in detail.lower():
-            raise HTTPException(status_code=503, detail=detail)
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.get("/versions")
@@ -111,11 +115,10 @@ async def list_versions_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PublisherUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
-        detail = str(e)
-        if "unavailable" in detail.lower():
-            raise HTTPException(status_code=503, detail=detail)
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/activate")
@@ -126,8 +129,7 @@ async def activate_version_endpoint(req: _ActivateBody):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PublisherUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
-        detail = str(e)
-        if "unavailable" in detail.lower():
-            raise HTTPException(status_code=503, detail=detail)
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=502, detail=str(e))

@@ -69,12 +69,12 @@ def test_save_all_skips_masked_and_none():
         session.close()
 
 
-def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
+async def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
     session = get_open_session()
     try:
         _cleanup(session, "tone", "planning_provider")
         with pytest.raises(HTTPException) as exc:
-            bulk_upsert_settings(
+            await bulk_upsert_settings(
                 SettingsBulkUpsertRequest(
                     values={"tone": "casual", "planning_provider": "nope"}
                 ),
@@ -117,13 +117,13 @@ async def test_test_providers_does_not_persist(monkeypatch):
         session.close()
 
 
-def test_bulk_upsert_skips_none_values():
+async def test_bulk_upsert_skips_none_values():
     # `None` is a skip sentinel alongside "***" (the client's write-diff sends
     # it for untouched fields) — it must validate, not 422, and write nothing.
     session = get_open_session()
     try:
         _cleanup(session, "greeting", "tone")
-        result = bulk_upsert_settings(
+        result = await bulk_upsert_settings(
             SettingsBulkUpsertRequest(values={"greeting": None, "tone": "formal"}),
             session,
             LOCAL_SCOPE,

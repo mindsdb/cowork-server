@@ -250,7 +250,11 @@ def discard_conversation(conversation_id: str) -> None:
     and marking it discarded (see its docstring) before these files go away.
     """
     from cowork.streaming.backend import remove_conversation_buffers
+    from cowork.streaming.turn_index import forget_turn_sync
 
     cid = str(conversation_id)
     registry.discard(cid)
     remove_conversation_buffers(cid)
+    # The index outlives the buffers by an hour otherwise, so /in-flight would
+    # keep naming a turn whose buffer has just been deleted.
+    forget_turn_sync(cid)

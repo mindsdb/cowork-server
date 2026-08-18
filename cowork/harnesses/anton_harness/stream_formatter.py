@@ -71,6 +71,11 @@ PHASE_LABELS = {
     "connect_datasource": "Connecting",
     "interactive": "Interactive",
     "context": "Context",
+    # ENG-1537: anton is deliberately idle, waiting out a velocity rate-limit
+    # before resuming the same step. Without a label the renderer would show the
+    # raw phase ("rate_limited: waiting 30s…"), which reads like a leaked
+    # constant. The turn is still alive — this is not a failure state.
+    "rate_limited": "Rate limited",
 }
 
 PROGRESS_THROTTLE = 0.25  # seconds
@@ -317,6 +322,12 @@ async def format_responses_stream(
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
             is_scratchpad_phase = phase_str in ("scratchpad_start", "scratchpad_done")
+            # ENG-1537: the rate-limit notice must never be throttled away. It
+            # fires once per wait and is the ONLY thing distinguishing a
+            # deliberate 90s pause from a hang — drop it and a correct fix gets
+            # reported as a freeze. One event per wait, so exempting it can't
+            # flood the stream.
+            is_rate_limited_notice = phase_str == "rate_limited"
             is_tool_progress = phase_str == "tool_progress"
             is_tool_done = phase_str == "tool_done" and event.id in progress_tool_ids
 
@@ -340,7 +351,12 @@ async def format_responses_stream(
                 # scratchpad_done isn't — it's the ONLY event that closes a
                 # tool-progress step, and it's yielded right after the last
                 # tool_progress (well within one PROGRESS_THROTTLE window).
-                never_throttle = is_scratchpad_phase or is_tool_done or is_first_progress_for_id
+                never_throttle = (
+                    is_scratchpad_phase
+                    or is_tool_done
+                    or is_first_progress_for_id
+                    or is_rate_limited_notice
+                )
                 now = time.time()
                 should_emit = never_throttle or (now - last_progress >= PROGRESS_THROTTLE)
 

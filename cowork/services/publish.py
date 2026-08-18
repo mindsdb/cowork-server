@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tempfile
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,11 +19,16 @@ from urllib.parse import urlparse
 
 from pydantic import SecretStr
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
+# Imported for its side effect on the module namespace as well as its use:
+# tests monkeypatch `publish.get_app_settings`, so removing it because a
+# linter sees no local call breaks them. noqa keeps that from recurring.
+from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
@@ -38,14 +44,28 @@ from cowork.services.artifacts import (
 logger = logging.getLogger(__name__)
 
 
+class PublisherUnavailable(RuntimeError):
+    """A local publish dependency (anton.publisher, markdown) failed to import.
+
+    Distinct from RuntimeError so the endpoint layer can map it to 503
+    without parsing message text — see the "unavailable" substring sentinel
+    this replaced, which broke once upstream error text could itself contain
+    that word (e.g. an HTTP 503 reason phrase or a timeout advice string).
+    """
+
+
 def _cowork_state_dir() -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
         path = Path(base).expanduser()
     else:
         # Consolidated under the cowork data root (was ~/.anton/cowork); the
-        # desktop app migrates the existing state.json on first run.
-        path = cowork_home()
+        # desktop app migrates the existing state.json on first run. Org mode
+        # relocates this off shared EFS storage via pod_local_only (see its
+        # docstring): state.json holds publish_history below, which carries
+        # no org_id segment, so left on cowork_home() every organization
+        # would read every other organization's publish history.
+        path = pod_local_only(cowork_home(), "publish")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -235,7 +255,7 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     try:
         import markdown
     except Exception as exc:  # pragma: no cover - dependency guard
-        raise RuntimeError("Markdown renderer is unavailable") from exc
+        raise PublisherUnavailable("Markdown renderer is unavailable") from exc
 
     md_text = md_path.read_text(encoding="utf-8", errors="replace")
     body = markdown.markdown(
@@ -249,7 +269,8 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
-def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None) -> dict:
+def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None,
+                     scope=None) -> dict:
     settings = get_user_settings()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
@@ -264,10 +285,9 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
     try:
-        from anton.core.datasources.data_vault import LocalDataVault
         from anton.publisher import publish
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     published_json = published_dir / ".published.json"
     published_map: dict[str, Any] = {}
@@ -309,11 +329,23 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             # (`~/.cowork/data-vault`), not anton's default
             # (`~/.anton/data_vault`) — otherwise secrets are missed and
             # the published artifact has no DB connection in the cloud.
-            vault=LocalDataVault(Path(get_app_settings().connector.vault_dir)),
+            # Org-keyed: the persisted vault is per organization, and an
+            # unscoped lookup would resolve to the shared namespace root.
+            vault=vault_for_scope(scope),
         )
     except Exception as exc:
         logger.exception("Publishing failed")
-        raise RuntimeError("Publishing failed. Check your Minds credentials and try again.") from exc
+        # Only network/HTTP failures get the "Connection failed" framing — a
+        # gateway timeout (e.g. a fullstack artifact whose deps take too long
+        # to install remotely, ENG-1547/ENG-1580) or a server-side 5xx reads
+        # very differently to the user than an auth rejection, but neither
+        # applies to a local failure (e.g. reading the artifact's files to
+        # zip it) that happened before any request went out. urllib.error
+        # HTTPError is a URLError subclass, so this covers both.
+        if isinstance(exc, urllib.error.URLError):
+            headline, advice = describe_minds_connection_error(exc)
+            raise RuntimeError(f"Publishing failed. {headline} {advice}") from exc
+        raise RuntimeError(f"Publishing failed: {exc}") from exc
     finally:
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
@@ -439,7 +471,7 @@ def unpublish_artifact(raw_path: str) -> dict:
     try:
         from anton.publisher import unpublish
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     try:
@@ -562,7 +594,7 @@ def list_versions(raw_path: str) -> dict:
     try:
         from anton.publisher import list_versions as _list_versions
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     from urllib.error import HTTPError
@@ -618,7 +650,7 @@ def activate_version(raw_path: str, md5: str) -> dict:
     try:
         from anton.publisher import activate_version as _activate_version
     except Exception as exc:
-        raise RuntimeError("Anton publisher is unavailable") from exc
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
     from urllib.error import HTTPError

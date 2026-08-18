@@ -253,8 +253,141 @@ def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "https://4nton.ai/a/uuid-1" in out
+    assert "https://4nton.ai/a/uuid-1" in getattr(out, "content", out)
     assert captured["path"].endswith("static/index.html")
+
+
+def test_tool_publish_falls_back_to_string_on_old_anton(tmp_path: Path):
+    # An anton without the SideEffectResult envelope (ENG-696) must still
+    # publish — the tool returns the plain pre-envelope string. Setting the
+    # module to None in sys.modules makes the `from ... import` raise ImportError.
+    import sys
+
+    root = _make_fullstack(tmp_path)
+    with patch.object(tools_mod, "_publish_artifact",
+                      lambda p, access=None: {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}), \
+         patch.dict(sys.modules, {"anton.core.tools.side_effect": None}):
+        out = _run(tools_mod._cowork_publish_or_preview(
+            _FakeSession(tmp_path),
+            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
+        ))
+    assert isinstance(out, str)
+    assert out == "Published successfully! View URL: https://4nton.ai/a/uuid-1"
+
+
+# --- envelope path (ENG-696) -----------------------------------------------
+# CI resolves anton from a pinned sha that predates `side_effect.py`, so the
+# handler always takes the ImportError fallback and the envelope branch would
+# never execute. Inject a stub module that mirrors anton's contract, so these
+# pin cowork-server's own field mapping regardless of which anton is installed.
+
+
+def _side_effect_stub():
+    import types
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class _Outcome:
+        content: str
+        ok: bool | None = None
+        reason: str = field(default="")
+
+    @dataclass
+    class _Result:
+        success: bool
+        message: str
+        resource_id: str | None = None
+        external_url: str | None = None
+        idempotency_key: str | None = None
+        committed_at: str | None = None
+        content_hash: str | None = None
+        details: dict | None = None
+
+        def to_outcome(self, reason=""):
+            payload = {
+                "success": self.success, "message": self.message,
+                "resource_id": self.resource_id, "external_url": self.external_url,
+                "idempotency_key": self.idempotency_key, "committed_at": self.committed_at,
+                "content_hash": self.content_hash, "details": self.details,
+            }
+            return _Outcome(json.dumps(payload), ok=self.success, reason=reason)
+
+        @classmethod
+        def failed(cls, message, reason=""):
+            return cls(success=False, message=message).to_outcome(reason=reason)
+
+    stub = types.ModuleType("anton.core.tools.side_effect")
+    stub.SideEffectResult = _Result
+    stub.now_iso = lambda: "2026-08-11T00:00:00+00:00"
+    return stub
+
+
+def test_tool_publish_returns_envelope_on_new_anton(tmp_path: Path):
+    import sys
+
+    root = _make_fullstack(tmp_path)
+    # The nested {"result": {...}} shape is where report_id/md5 actually live.
+    published = {"status": "ok", "url": "https://4nton.ai/a/uuid-1",
+                 "result": {"report_id": "rep-1", "md5": "deadbeef"}}
+    with patch.dict(sys.modules, {"anton.core.tools.side_effect": _side_effect_stub()}), \
+         patch.object(tools_mod, "_publish_artifact", lambda p, access=None: published):
+        out = _run(tools_mod._cowork_publish_or_preview(
+            _FakeSession(tmp_path),
+            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
+        ))
+    assert out.ok is True
+    payload = json.loads(out.content)
+    assert payload["success"] is True
+    assert payload["resource_id"] == "rep-1"
+    assert payload["idempotency_key"] == "rep-1"
+    assert payload["external_url"] == "https://4nton.ai/a/uuid-1"
+    assert payload["content_hash"] == "md5:deadbeef"
+    assert payload["committed_at"]
+
+
+def test_tool_publish_envelope_failure_is_ok_false(tmp_path: Path):
+    # An inverted verdict here would silently disarm the ENG-1276 circuit
+    # breaker (session.py: `is_error = not ok`), so pin ok=False + the reason.
+    import sys
+
+    root = _make_fullstack(tmp_path)
+
+    def _raise(raw_path, access=None):
+        raise ValueError("Configure your Minds API key in Settings before publishing")
+
+    with patch.dict(sys.modules, {"anton.core.tools.side_effect": _side_effect_stub()}), \
+         patch.object(tools_mod, "_publish_artifact", _raise):
+        out = _run(tools_mod._cowork_publish_or_preview(
+            _FakeSession(tmp_path),
+            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
+        ))
+    assert out.ok is False
+    assert out.reason == "missing_api_key"
+    payload = json.loads(out.content)
+    assert payload["success"] is False
+    # Nothing committed on a failure — no spurious timestamp or identity.
+    assert payload["committed_at"] is None
+    assert payload["resource_id"] is None
+
+
+def test_tool_publish_envelope_without_view_url_still_commits(tmp_path: Path):
+    import sys
+
+    root = _make_fullstack(tmp_path)
+    with patch.dict(sys.modules, {"anton.core.tools.side_effect": _side_effect_stub()}), \
+         patch.object(tools_mod, "_publish_artifact",
+                      lambda p, access=None: {"status": "ok", "url": "",
+                                              "result": {"report_id": "rep-2"}}):
+        out = _run(tools_mod._cowork_publish_or_preview(
+            _FakeSession(tmp_path),
+            {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
+        ))
+    assert out.ok is True
+    payload = json.loads(out.content)
+    assert payload["resource_id"] == "rep-2"
+    # URL genuinely unknown → explicit null rather than a fabricated link.
+    assert payload["external_url"] is None
+    assert payload["committed_at"]
 
 
 def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
@@ -268,7 +401,7 @@ def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "STOP" in out and "API key" in out
+    assert "STOP" in getattr(out, "content", out) and "API key" in getattr(out, "content", out)
 
 
 def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: Path):
@@ -283,9 +416,10 @@ def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: P
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
         ))
-    assert "STOP" not in out
-    assert "PUBLISH FAILED" in out
-    assert "Only HTML and Markdown" in out
+    text = getattr(out, "content", out)
+    assert "STOP" not in text
+    assert "PUBLISH FAILED" in text
+    assert "Only HTML and Markdown" in text
 
 
 # ---------------------------------------------------------------------------

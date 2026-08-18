@@ -5,8 +5,9 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
@@ -18,6 +19,105 @@ from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
+
+
+def _vault_scratch_dir() -> Path:
+    """Where the temporary filtered data-vault directory is staged when a
+    turn disables one or more connections (see ``_build_chat_session``).
+
+    Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
+    EFS storage by pod_local_only (see its docstring), because this directory
+    carries no org_id segment: left on cowork_home() it would put every
+    organization's temporary vault contents under the same shared, readable
+    location.
+    """
+    return pod_local_only(cowork_home() / "tmp", "tmp")
+
+
+#: Settings copied from the Cowork DB onto anton's own settings object, in
+#: order. The last three are non-nullable ints with defaults — unlike the
+#: entries above them, ``db_val`` is never None, so they ALWAYS override anton's
+#: own 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
+#: ``max_turn_tokens`` is the per-turn spend ceiling (ENG-1286); it overlays the
+#: SAME value anton defaults to rather than a looser one, because the
+#: distribution that sized it was measured on this traffic.
+_OVERLAID_SETTINGS: tuple[str, ...] = (
+    "planning_provider", "planning_model",
+    "coding_provider", "coding_model",
+    "memory_enabled", "memory_mode",
+    "episodic_memory", "proactive_dashboards", "act_first",
+    "max_tool_rounds", "max_continuations", "max_turn_tokens",
+)
+
+
+def _overlay_user_settings(anton_settings, user) -> list[str]:
+    """Copy the Cowork DB's settings onto anton's settings object.
+
+    Extracted from ``_build_chat_session`` so it can be tested against a REAL
+    ``AntonSettings``. It previously lived inline, and the only test of it
+    re-implemented this loop in the test body — so dropping a key from the tuple
+    (silently disabling a user-facing setting) or removing the skew guard below
+    (a total agent outage) both shipped green.
+
+    Returns the attrs actually applied, so a caller or test can assert on it.
+
+    **The skew guard is the load-bearing part.** anton is pinned as a git dep on
+    ``branch = "main"`` (see ``[tool.uv.sources]``), so cowork-server can ship a
+    setting whose field has only reached anton's ``staging`` — it arrives on
+    main at the weekly release, not when the anton PR merges. pydantic raises
+    ``ValueError: "AntonSettings" object has no field "x"`` on setattr of an
+    unknown field, and this runs on EVERY session build, so an unguarded overlay
+    turns a one-week ordering gap into a total agent outage rather than a
+    missing setting.
+    """
+    applied: list[str] = []
+    for attr in _OVERLAID_SETTINGS:
+        db_val = getattr(user, attr, None)
+        if db_val is None:
+            continue
+        if not hasattr(anton_settings, attr):
+            logger.warning(
+                "anton settings has no field %r — skipping overlay; the pinned "
+                "anton predates this setting (harmless: anton falls back to its "
+                "own default until the next release)", attr,
+            )
+            continue
+        # Provider enum -> string value for AntonSettings. The DB enum uses
+        # snake_case (openai_compatible, minds_cloud) but AntonSettings /
+        # LLMClient expect kebab-case (openai-compatible, minds-cloud).
+        if hasattr(db_val, "value"):
+            db_val = db_val.value.replace("_", "-")
+        setattr(anton_settings, attr, db_val)
+        applied.append(attr)
+    return applied
+
+
+def _apply_workspace_env_if_safe(workspace) -> bool:
+    """Load `<project>/.anton/.env` into this process's environment, unless
+    org mode. Returns whether it applied.
+
+    `workspace` is an `anton.workspace.Workspace`; left unannotated since that
+    type is only ever imported locally in `_build_chat_session`, not at
+    module scope.
+
+    Extracted from `_build_chat_session` so the guard is testable without
+    constructing a full ChatSession.
+
+    `Workspace.apply_env_to_process` (anton's workspace.py) loads every key
+    from that file that isn't already set into THIS PROCESS's os.environ,
+    not a child process's, cowork-server's own, for the rest of its life. In
+    org mode that .env lives on shared EFS and any org's agent can write it;
+    a PYTHONPATH or LD_PRELOAD entry there would turn the next subprocess
+    this pod spawns into arbitrary code execution, and the mutation outlives
+    this turn, reaching every later request from every tenant this pod
+    serves.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return False
+    workspace.apply_env_to_process()
+    return True
+
+
 settings = AntonHarnessSettings()
 
 
@@ -102,11 +202,16 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
 
 
 def _turn_style_context(channel: ChannelContext | None) -> str:
-    """Lead block of the system-prompt suffix: desktop activity-row guidance
-    for UI turns, support-chat guidance for channel turns.
+    """Lead block of the system-prompt suffix: desktop guidance for UI turns,
+    support-chat guidance for channel turns.
 
-    The desktop branch must stay byte-identical to the historical literal —
-    the suffix participates in anton's cache-stable prompt prefix.
+    Both branches name how a finished file reaches the user: the channel branch
+    says "I'm sending the file", the desktop branch points at the Live Artifacts
+    panel. Without the desktop half, anton pasted the artifact's local path as a
+    markdown link — inert in chat (ENG-1636).
+
+    The desktop branch is asserted byte-for-byte by test_channel_context.py
+    (cache-stable prompt prefix) — change both together.
     """
     if channel is None:
         return (
@@ -114,7 +219,19 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
             "as separate structured activity rows. Keep assistant text focused on the "
             "user-facing answer; do not narrate internal work with status phrases like "
             "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-            "is itself the final answer the user needs."
+            "is itself the final answer the user needs. "
+            "Files you create as artifacts appear automatically in the Live Artifacts "
+            "panel beside the chat, where the user previews them and uses the Download "
+            "control (and Open, on desktop). When a file is ready, tell the user it is "
+            "in the Live Artifacts panel and can be downloaded there — do NOT hand them "
+            "its location on disk. Never put a file's local path (for example "
+            "C:\\Users\\... or /Users/...) into your reply as a markdown link or as "
+            "text: such a link does nothing when clicked in chat, and the bare path "
+            "only exposes the user's machine layout. Never invent a download URL such "
+            "as sandbox:/mnt/data/...; no link of that form exists. If the user says "
+            "they cannot find or download the file, point them again at the Live "
+            "Artifacts panel's Download control (and Open, on desktop) — never repeat "
+            "the path."
         )
     setting = (
         "a group chat with multiple participants" if channel.is_group
@@ -295,6 +412,26 @@ class AntonHarness:
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
     ) -> AsyncIterator[str]:
+        if get_app_settings().tenancy_mode == "org":
+            # Org-mode turns must run on the remote worker, never in this
+            # process: _build_chat_session below hands the LLM a `scratchpad`
+            # tool (anton/core/session.py) that spawns a per-named-venv
+            # subprocess and pipes agent-written Python into it, exactly the
+            # code execution this whole EFS-hardening task exists to keep out
+            # of cowork-server. The remote-turn producer normally routes
+            # streaming requests to the worker over Redis (see
+            # handlers/responses.py's _select_producer), but three callers
+            # reach this method directly, bypassing that gate entirely: the
+            # legacy non-streaming branch in handlers/responses.py.handle
+            # (ResponsesRequest.stream defaults to False, and any client can
+            # leave it unset), _produce/_run_turn's in-process fallback
+            # whenever COWORK_TURN_BACKEND isn't "remote", and the
+            # channel-ingress runtime (cowork/channels/runtime.py). This
+            # refusal is the single point that closes all three.
+            raise RuntimeError(
+                "Turns must run on the remote worker in this deployment; "
+                "in-process execution is disabled."
+            )
         temp_vault_dir: Path | None = None
         # Attribute + surface any artifact created during this turn. Anton runs
         # with its own session id and doesn't tag artifacts with the cowork
@@ -516,7 +653,7 @@ class AntonHarness:
         from anton.core.memory.cortex import Cortex
         # from anton.core.memory.episodes import EpisodicMemory
         from anton.core.memory.hippocampus import Hippocampus
-        from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
+        from anton.core.session import ChatSessionConfig, SystemPromptContext
         # from anton.memory.history_store import HistoryStore
         from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
@@ -568,26 +705,7 @@ class AntonHarness:
         anton_settings.skills_extra_roots = [host_skills_dir]
 
         user = get_user_settings()
-        for attr in (
-            "planning_provider", "planning_model",
-            "coding_provider", "coding_model",
-            "memory_enabled", "memory_mode",
-            "episodic_memory", "proactive_dashboards", "act_first",
-            # Non-nullable ints with defaults — unlike the entries above,
-            # db_val is never None here, so these ALWAYS override anton's own
-            # 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
-            "max_tool_rounds", "max_continuations",
-        ):
-            db_val = getattr(user, attr, None)
-            if db_val is None:
-                continue
-            # Provider enum -> string value for AntonSettings.
-            # The DB enum uses snake_case (openai_compatible, minds_cloud)
-            # but AntonSettings / LLMClient expect kebab-case
-            # (openai-compatible, minds-cloud).
-            if hasattr(db_val, "value"):
-                db_val = db_val.value.replace("_", "-")
-            setattr(anton_settings, attr, db_val)
+        _overlay_user_settings(anton_settings, user)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -619,7 +737,7 @@ class AntonHarness:
 
         workspace = Workspace(base)
         workspace.initialize()
-        workspace.apply_env_to_process()
+        _apply_workspace_env_if_safe(workspace)
 
         anton_dir = base / ".anton"
 
@@ -651,7 +769,9 @@ class AntonHarness:
         # Per-(org, user) via the turn's ambient scope — the in-process harness
         # must read/write the same global-scope memory the /memory API serves.
         global_memory_dir = scoped_user_storage_root(
-            Path(get_app_settings().memory.root_dir).expanduser(), current_settings_scope()
+            Path(get_app_settings().memory.root_dir).expanduser(),
+            current_settings_scope(),
+            store="memory",
         )
         global_memory_dir.mkdir(parents=True, exist_ok=True)
         cortex = Cortex(
@@ -731,7 +851,7 @@ class AntonHarness:
         if LocalDataVault is not None:
             source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
             if disabled_connections:
-                _tmp_base = cowork_home() / "tmp"
+                _tmp_base = _vault_scratch_dir()
                 _tmp_base.mkdir(parents=True, exist_ok=True)
                 temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
@@ -905,7 +1025,14 @@ class AntonHarness:
             ],
             cells=cells
         )
-        return ChatSession(config), temp_vault_dir, seed_info
+        # Not `ChatSession(config)` directly: every construction of anton's
+        # executor inside cowork-server goes through build_chat_session, which
+        # refuses in org mode. stream_response already refuses earlier on this
+        # path, so this is the second of two gates rather than the only one,
+        # but keeping the construction uniform is what lets the static test
+        # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
+        # call under cowork/ as a new, unreviewed execution site.
+        return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
     def _build_llm_client():

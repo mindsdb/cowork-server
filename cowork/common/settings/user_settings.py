@@ -149,13 +149,16 @@ def _resolved_model(
     user_model: str | None,
     defaults: dict[str, str],
     enabled_map: dict[str, bool] | None = None,
+    *,
+    wallet_aware: bool = False,
 ) -> str | None:
     """Resolve a role's model given the readiness resolver's provider switch.
 
-    The single load-bearing rule, shared by resolved_planning_model and
-    resolved_coding_model so it can't drift between the two:
+    The single load-bearing rule, shared by every resolved_*_model property so
+    it can't drift between the roles:
 
-      - provider NOT switched → keep the user's chosen model.
+      - provider NOT switched → keep the user's chosen model (but see
+        ``wallet_aware`` below).
       - provider switched → use the resolved provider's canonical default
         (availability-adjusted via _enabled_aware_default, so switching an
         account onto minds-cloud never lands on a locked model).
@@ -164,8 +167,57 @@ def _resolved_model(
       - resolved provider has no canonical default (openai-compatible) → None,
         so config_status's model gate reports "select a model" rather than
         silently running a wrong model.
+
+    ``wallet_aware`` (ENG-1632) — the auxiliary roles (coding, router) only.
+    A stored minds-cloud model the availability map marks ``enabled: false``
+    (wallet can't pay / allowance spent) is guaranteed to be denied on every
+    call, and the aux roles are invisible in default mode: the user cannot see
+    or fix the pin, so the verifier 402s every turn and surfaces as a spurious
+    "internal error". When a strictly-enabled model exists in the map, resolve
+    to it instead of the doomed stored value; when nothing is enabled (fully
+    drained account) or the map is absent/degraded, keep the stored value —
+    degraded metadata must never change behavior, and anton's verifier handles
+    the denial quietly. The stored row is never rewritten, so a topped-up
+    wallet (``enabled: true`` on the next settings load) restores the stored
+    model automatically.
+
+    This is a deliberate asymmetry with planning: "an explicit choice is never
+    rewritten" still holds for the planning role, which is visible in the
+    picker and has the pick-it-and-see-"Needs credits" lane (ENG-1248). The
+    aux roles get the silent fallback precisely because no such lane exists
+    for them.
     """
     if resolved_provider == preferred_provider and user_model:
+        enabled = enabled_map or {}
+        if wallet_aware and resolved_provider == Provider.MINDS_CLOUD and enabled:
+            # Map keys are bare ids (/v1/models never emits the retired
+            # "latest:" prefix), but login-era pins still carry it — strip it
+            # for the probe or those pins silently escape the fallback.
+            #
+            # ABSENT from a non-empty map counts as unavailable, unlike
+            # _enabled_aware_default's absent-means-available rule. The two
+            # look inconsistent but probe different things: that rule probes
+            # OUR canonical default (a guaranteed-served id — absence there
+            # means an older gateway), this one probes a USER-STORED id that
+            # can be anything (the drpconcepcion cohort stored a Gemini id
+            # against minds-cloud and 404'd every aux call — an id the map
+            # can never mark false because the gateway doesn't serve it).
+            # The map is written from the full /v1/models catalogue, so
+            # absence genuinely means "not served"; the non-empty guard keeps
+            # the degraded-metadata rule intact.
+            bare = user_model.removeprefix("latest:")
+            if not enabled.get(bare, False):
+                # First enabled entry in map order. The real guarantee here is
+                # NOT "the gateway lists the free model first" (it doesn't —
+                # verified against prod, haiku leads the catalogue): it is
+                # that enablement tracks affordability, so on a locked wallet
+                # only free-bucket models are enabled and the first enabled
+                # entry is affordable by construction. Embedding rows never
+                # reach this map — filtered at construction in
+                # fetch_minds_models (_is_embedding_row).
+                fallback = next((mid for mid, en in enabled.items() if en), None)
+                if fallback:
+                    return fallback
         return user_model
     # No explicit choice (or provider switched): the resolved provider's default,
     # availability-adjusted. openai-compatible has no default -> None, so the
@@ -233,7 +285,8 @@ def _harness_options() -> list[str]:
 # .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
 # token-refresh would re-pin a picker choice from a stale ``latest:`` line.
 #
-# max_tool_rounds / max_continuations are DELIBERATELY absent too, for the
+# max_tool_rounds / max_continuations / max_turn_tokens are DELIBERATELY absent
+# too, for the
 # ENG-739 reason plus a harder failure mode: anton's own CoreSettings accepts
 # any int, so a stale anton-CLI line like ANTON_MAX_TOOL_ROUNDS=1000 in the
 # shared ~/.cowork/.env is valid for the CLI but fails UserSettings' bounds —
@@ -246,6 +299,11 @@ def _harness_options() -> list[str]:
 # re-syncing a stale .env line can never override a choice the user made in
 # the product. When in doubt, leave it out — .env lines still work for the
 # standalone anton CLI.
+#: Lowest non-zero per-turn spend ceiling a user may set (ENG-1286). Mirrored by
+#: `BUDGET_FIELDS.maxTurnTokens.min` in cowork's `settingsTransform.js`; the two
+#: are asserted equal in `tests/test_agent_budget_settings.py`.
+TURN_CEILING_FLOOR = 750_000
+
 SETTING_ENV_ALIASES: dict[str, str] = {
     "anthropic_api_key": "ANTON_ANTHROPIC_API_KEY",
     "openai_api_key": "ANTON_OPENAI_API_KEY",
@@ -291,6 +349,17 @@ class UserSettings(Settings):
     # The recommended-model catalog and per-provider model defaults are
     # global, application-level config and live in app_settings
     # (RECOMMENDED_MODELS / RECOMMENDED_PAIR / *_MODEL_DEFAULTS).
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        # Only local reads process env; a shared server's injected provider
+        # secrets would otherwise leak into every tenant's settings. Fail closed:
+        # anything not local is DB-only.
+        if get_app_settings().tenancy_mode == "local":
+            return (init_settings, env_settings, dotenv_settings, file_secret_settings)
+        return (init_settings,)
 
     # ── Provider / model settings ──
 
@@ -518,6 +587,55 @@ class UserSettings(Settings):
             "ANTON_MAX_CONTINUATIONS environment variable."
         ),
     )
+    max_turn_tokens: Annotated[int, ORG] = Field(
+        default_factory=lambda: get_app_settings().default_max_turn_tokens,
+        # Plain contiguous range. "No limit" in the UI is the TOP of it
+        # (50_000_000), not a sentinel.
+        #
+        # "No limit" is EFFECTIVELY, not literally, true — and the bound is
+        # closer than it looks. A turn makes about
+        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at THIS
+        # repo's defaults (50 x 6) is ~306 calls, so 50M is reached at ~163k per
+        # call — below the ~190k context a long conversation carries. At the
+        # maxima a user can set (500 x 25) it is ~13,000 calls and ~3.8k per
+        # call. So the step cap does NOT always land first; it merely always has
+        # so far. The largest turn in 30 days of production was 8.26M, because
+        # real turns end and compaction intervenes long before that shape.
+        # Do not restate this as "the ceiling can never fire at max" — an
+        # earlier version of this comment did, using anton's own 25x3 defaults
+        # rather than Cowork's, which put the threshold at 480k per call and
+        # made it look unreachable.
+        #
+        # A 0-means-unlimited sentinel was built
+        # and then removed — it needed a hole in the range, a validator to guard
+        # the hole, and a special case in the client clamp, all to solve
+        # discoverability that the checkbox solves on its own. It also collided
+        # with `max_continuations` next door, where 0 means literally zero.
+        #
+        # The floor is 750_000, not a rounder-looking 100_000. A turn's first
+        # LLM call costs roughly the conversation's context — ~190k on a long
+        # one — so a ceiling smaller than a couple of calls stops the turn
+        # before it has done anything. Measured against anton: 100_000
+        # dispatched ZERO tools and still spent 400_000. anton now guarantees at
+        # least one tool round regardless, so this floor is a usability bound
+        # rather than a safety one: it is the lowest value where a 190k-context
+        # turn still gets several rounds, and it sits just above the p75
+        # external turn (736k), so "the minimum" means "cut me off around the
+        # 75th percentile".
+        ge=TURN_CEILING_FLOOR,
+        le=50_000_000,
+        title="Max Tokens per Task",
+        description=(
+            "The most tokens the agent may spend on one request before it "
+            "pauses and checks in with you. Tokens are the unit your plan's "
+            "monthly allowance is measured in — including tokens re-read from "
+            "cache — so a task that gets stuck can burn a large share of the "
+            "month without finishing. Raise it if you routinely give the agent "
+            "big jobs; lower it to cap what any single request can cost. "
+            "Applies to the Anton agent and, for Cowork sessions, replaces the "
+            "ANTON_MAX_TURN_TOKENS environment variable."
+        ),
+    )
     publish_url: Annotated[str, ORG] = Field(
         default="",
         title="Publish URL",
@@ -616,6 +734,22 @@ class UserSettings(Settings):
         # explicit choice is never rewritten, and since nothing persists the
         # value assigned here, adding credits flips the default back to the
         # canonical model on the next settings load.
+        #
+        # NOT collapsed into the wallet-aware branch of _resolved_model
+        # (ENG-1632), although the two apply the same helper: this validator
+        # MUTATES the stored fields at construction time, and downstream
+        # consumers depend on that pre-fill — e.g. build_llm_client's effort
+        # guard compares the stored model to the resolved one, and a user with
+        # no coding_model row only keeps their reasoning effort because this
+        # fill makes the two equal. Removing the fill here would silently
+        # strip effort for every no-row user (pinned by
+        # test_effort_survives_when_no_model_row_is_stored).
+        #
+        # Known wart, deliberately preserved as-is: the ROUTER default below
+        # derives from coding_provider while resolved_router_model resolves
+        # against router_provider — split-provider configs disagree between
+        # the two. Tracked on ENG-1632 as a follow-up; changing it here would
+        # alter resolution for existing split configs.
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
@@ -690,12 +824,16 @@ class UserSettings(Settings):
 
     @property
     def resolved_coding_model(self) -> str | None:
+        # wallet_aware: the coding role (completion verifier, scratchpad) is
+        # invisible in default mode — a wallet-locked pin here 402s every turn
+        # with no way for the user to see or fix it (ENG-1632).
         return _resolved_model(
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
             role_defaults(CODING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
+            wallet_aware=True,
         )
 
     @property
@@ -704,12 +842,16 @@ class UserSettings(Settings):
 
     @property
     def resolved_router_model(self) -> str | None:
+        # wallet_aware: same rationale as resolved_coding_model — the router
+        # role (respond-vs-delegate gating, history summarization) is invisible
+        # in default mode (ENG-1632).
         return _resolved_model(
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
             role_defaults(ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
+            wallet_aware=True,
         )
 
     @property
