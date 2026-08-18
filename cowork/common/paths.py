@@ -13,6 +13,7 @@ silently leak across builds and defeat the isolation.
 """
 
 import os
+import tempfile
 from pathlib import Path
 
 _DEFAULT_HOME = Path.home() / ".cowork"
@@ -28,6 +29,41 @@ def cowork_home() -> Path:
     """
     raw = os.environ.get("COWORK_HOME")
     return Path(raw).expanduser() if raw else _DEFAULT_HOME
+
+
+def pod_local_only(local_path: Path, name: str) -> Path:
+    """Relocate *local_path* off shared storage in org mode; a no-op otherwise.
+
+    *local_path* is whatever a caller already computes for local (desktop)
+    mode, normally something under ``cowork_home()``. In local mode this
+    function returns it untouched, so desktop behaviour is exactly what it
+    was before this function existed.
+
+    In org mode, ``cowork_home()`` is EFS (``COWORK_HOME=/mnt/cowork-shared``),
+    shared byte-for-byte across every replica and every organization. Three
+    callers write under it with no org_id segment to key on: the connector
+    probe's plaintext credential env files, publish's state.json (which holds
+    publish_history), and the anton harness's temporary data-vault directory.
+    Anything they write under ``cowork_home()`` therefore lands at the shared
+    namespace root, readable by any organization's request, and, unlike the
+    old ephemeral container disk, survives a pod restart.
+    ``scoped_storage_root`` cannot fix this: it pivots on an org_id, and none
+    of these three carry one, nor should they, since none of them are
+    organization data.
+
+    Org mode substitutes ``<pod_scratch_dir>/<name>`` instead, ignoring
+    *local_path* entirely. ``pod_scratch_dir`` (see AppSettings) defaults to
+    the container's own ``tempfile.gettempdir()``, which this plan never
+    mounts shared storage onto, so it is always one pod's own disk and dies
+    with the container the same way ``cowork_home()`` did before COWORK_HOME
+    pointed at EFS.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    settings = get_app_settings()
+    if settings.tenancy_mode != "org":
+        return local_path
+    return Path(settings.pod_scratch_dir) / name
 
 
 def safe_join(base: Path | str, *parts: str) -> Path:

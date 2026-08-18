@@ -7,7 +7,7 @@ import tempfile
 
 from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
@@ -19,6 +19,19 @@ from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
+
+
+def _vault_scratch_dir() -> Path:
+    """Where the temporary filtered data-vault directory is staged when a
+    turn disables one or more connections (see ``_build_chat_session``).
+
+    Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
+    EFS storage by pod_local_only (see its docstring), because this directory
+    carries no org_id segment: left on cowork_home() it would put every
+    organization's temporary vault contents under the same shared, readable
+    location.
+    """
+    return pod_local_only(cowork_home() / "tmp", "tmp")
 
 
 #: Settings copied from the Cowork DB onto anton's own settings object, in
@@ -830,7 +843,7 @@ class AntonHarness:
         if LocalDataVault is not None:
             source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
             if disabled_connections:
-                _tmp_base = cowork_home() / "tmp"
+                _tmp_base = _vault_scratch_dir()
                 _tmp_base.mkdir(parents=True, exist_ok=True)
                 temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)

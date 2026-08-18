@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 from pydantic import SecretStr
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.providers import publish_url_for_endpoint
@@ -56,8 +56,12 @@ def _cowork_state_dir() -> Path:
         path = Path(base).expanduser()
     else:
         # Consolidated under the cowork data root (was ~/.anton/cowork); the
-        # desktop app migrates the existing state.json on first run.
-        path = cowork_home()
+        # desktop app migrates the existing state.json on first run. Org mode
+        # relocates this off shared EFS storage via pod_local_only (see its
+        # docstring): state.json holds publish_history below, which carries
+        # no org_id segment, so left on cowork_home() every organization
+        # would read every other organization's publish history.
+        path = pod_local_only(cowork_home(), "publish")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
