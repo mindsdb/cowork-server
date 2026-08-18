@@ -134,7 +134,7 @@ async def execute_schedule(
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
-    from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+    from cowork.db.scoped import MissingTenantScopeError, ScopedSession, SYSTEM_SCOPE
     session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
     run_service = ScheduleRunService(session)
     schedule_service = ScheduleService(session)
@@ -148,7 +148,19 @@ async def execute_schedule(
 
         # A scheduled run has no request, so it derives its tenant identity from
         # the schedule row (see _principal_for_schedule). None in local mode.
-        principal = _principal_for_schedule(schedule)
+        try:
+            principal = _principal_for_schedule(schedule)
+        except MissingTenantScopeError:
+            # The row can never resolve an identity (corrupt: NULL org in org
+            # mode), so it can never run. Disable it so the cron loop stops
+            # re-firing this same failure every poll — an unadvanced next_run_at
+            # keeps the slot due, and the hard raise below skips
+            # _advance_next_run_at. The raise routes through the outer handler,
+            # which logs the stack and records last_error + a failed run.
+            schedule.enabled = False
+            session.add(schedule)
+            session.commit()
+            raise
 
         if conversation_id is None:
             # Conversation not pre-created by the caller (e.g. cron tick).
