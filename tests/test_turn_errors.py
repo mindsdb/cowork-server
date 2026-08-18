@@ -80,7 +80,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
         raise exc
 
     async def _stream_response(
-        *, conversation, input, disabled_connections=None,
+        *, conversation, input, model=None, disabled_connections=None,
         trace_tags=None, trace_metadata=None,
     ):
         if False:

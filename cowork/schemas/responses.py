@@ -134,9 +134,12 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Project ID for a new conversation",
     )
-    # In OpenAI's Responses API, the model is required.
-    # However, we currently do not allow this to be specified at the time of making the request,
-    # via the Cowork UI. Instead, the model is retrieved from the user provided settings.
+    # In OpenAI's Responses API, the model is required; here it is optional.
+    # When set (the composer's per-conversation model pick), it overrides the
+    # account-wide planning/coding/router model settings for this turn only
+    # (see AntonHarness._apply_model_override) and is persisted onto the new
+    # conversation's Conversation.model so a reopened task remembers the pick.
+    # When omitted, the account-wide user settings govern as before.
     model: str | None = Field(
         default=None,
         description="Model name for the chat completion request"

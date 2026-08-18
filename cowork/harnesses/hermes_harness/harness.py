@@ -114,7 +114,10 @@ class HermesHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        # Accepted for HarnessProvider compatibility; Hermes does not support
+        # a per-conversation model override, so this hint is intentionally
+        # ignored.
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Accepted for HarnessProvider compatibility; Hermes does not emit
         # Langfuse traces, so these observability hints are intentionally

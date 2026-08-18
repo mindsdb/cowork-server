@@ -77,6 +77,32 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
         applied.append(attr)
     return applied
 
+
+def _apply_model_override(anton_settings, model: str | None) -> list[str]:
+    """A per-conversation model pick (the composer's dropdown) overrides
+    planning/coding/router for THIS call only — the account-wide
+    planning_model/coding_model/router_model settings applied by
+    ``_overlay_user_settings`` above are left untouched for every other
+    conversation. Provider is deliberately NOT overridden: the composer's
+    model list is itself scoped to whichever provider is already configured,
+    so the existing planning/coding/router providers stay correct for the
+    picked model.
+
+    No-op (returns []) when ``model`` is falsy, so the account-wide defaults
+    keep governing conversations with no per-conversation pick.
+
+    Same hasattr skew guard as ``_overlay_user_settings`` — see its docstring.
+    """
+    if not model:
+        return []
+    applied: list[str] = []
+    for attr in ("planning_model", "coding_model", "router_model"):
+        if hasattr(anton_settings, attr):
+            setattr(anton_settings, attr, model)
+            applied.append(attr)
+    return applied
+
+
 settings = AntonHarnessSettings()
 
 
@@ -361,7 +387,9 @@ class AntonHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        # Per-conversation model pick (the composer's dropdown) — overrides
+        # planning/coding/router for this call only; see _build_chat_session.
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Observability pass-through (see ResponsesRequest / HarnessProvider):
         # forwarded to Anton's per-turn TraceContext so they land on the
@@ -405,6 +433,7 @@ class AntonHarness:
         try:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
+                model=model,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
@@ -581,7 +610,7 @@ class AntonHarness:
     async def _build_chat_session(
         self,
         conversation: Conversation,
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
     ):
@@ -667,6 +696,8 @@ class AntonHarness:
         router_model = getattr(user, "router_model", None)
         if router_model is not None and hasattr(anton_settings, "router_model"):
             anton_settings.router_model = router_model
+
+        _apply_model_override(anton_settings, model)
 
         workspace = Workspace(base)
         workspace.initialize()
