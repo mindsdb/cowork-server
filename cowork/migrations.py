@@ -32,7 +32,7 @@ from sqlmodel import Session, select
 from pydantic import ValidationError
 
 from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, safe_join
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import (
     ENV_ALIAS_TO_SETTING,
@@ -234,7 +234,15 @@ def _copy_builtin_skills(store: SkillService) -> int:
         dest = store._skill_dir(src.name)
         if dest.exists():
             continue  # keep the user-editable copy untouched
-        shutil.copytree(src, dest)
+        # Copied file by file, each destination re-checked for containment with
+        # safe_join, rather than handing the whole subtree to shutil.copytree.
+        # The org segment of `dest` comes from the request principal, so every
+        # write below is an explicitly bounded one — and the boundedness is
+        # visible locally instead of resting on validation two modules away.
+        for child in sorted(p for p in src.rglob("*") if p.is_file()):
+            target = safe_join(dest, *child.relative_to(src).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(child, target)
         copied += 1
     return copied
 
