@@ -45,6 +45,20 @@ _NO_EXEC_DETAIL = (
     "Open the published version instead."
 )
 
+
+class ExecutionRefused(RuntimeError):
+    """Raised instead of running something, because `_org_mode()` is true.
+
+    A distinct type, not a bare RuntimeError, so callers can tell a deployment
+    policy apart from a genuine failure. The /artifacts/reveal endpoint maps
+    this to 403; any other RuntimeError out of `reveal_in_file_manager` (a
+    broken `open`, a platform call that blew up) still has to read as a 500,
+    or a real fault would be reported to the client as "not available on this
+    deployment" and never looked at again. Subclasses RuntimeError so existing
+    `except RuntimeError` callers keep catching the refusal.
+    """
+
+
 # In-memory registry: deterministic token → parent dir of an artifact.
 # Used for both static (HTML asset) and proxy (fullstack backend) mounts;
 # `kind` field on the preview-mount response payload discriminates.
@@ -588,7 +602,7 @@ def reveal_in_file_manager(path: Path) -> None:
     """Open the OS file manager on `path`. In org mode this always refuses;
     see `_org_mode`."""
     if _org_mode():
-        raise RuntimeError(_NO_EXEC_DETAIL)
+        raise ExecutionRefused(_NO_EXEC_DETAIL)
     if sys.platform == "darwin":
         subprocess.run(["open", "-R", str(path)], check=False)
     elif sys.platform == "win32":

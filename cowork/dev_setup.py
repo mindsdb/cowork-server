@@ -66,7 +66,16 @@ def run_dev_setup() -> None:
     from cowork.migrations import backfill_minds_url, migrate_env_to_db
 
     with SQLSession(engine) as session:
-        migrate_env_to_db(session)
+        # Desktop-only, for the same reason as the skills migration below.
+        # migrate_env_to_db reads cowork_home()/".env" (cowork/migrations.py's
+        # _ENV_PATH) and upserts what it finds through an unscoped
+        # SettingService, i.e. into global rows no org owns. In org mode
+        # COWORK_HOME is /mnt/cowork-shared (deployment values.yaml), so that
+        # path is the ROOT of the shared tree every organization's agent
+        # writes into: a dropped .env there would seed this deployment's
+        # provider keys and endpoints at the next boot, for every tenant.
+        if get_app_settings().tenancy_mode != "org":
+            migrate_env_to_db(session)
         # Rewrite the legacy MindsHub host (mdb.ai -> api.mindshub.ai) for
         # users who configured MindsHub before the default flipped. Idempotent;
         # runs every boot (not gated by the env-migration sentinel, since

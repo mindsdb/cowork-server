@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
@@ -639,7 +640,7 @@ class AntonHarness:
         from anton.core.memory.cortex import Cortex
         # from anton.core.memory.episodes import EpisodicMemory
         from anton.core.memory.hippocampus import Hippocampus
-        from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
+        from anton.core.session import ChatSessionConfig, SystemPromptContext
         # from anton.memory.history_store import HistoryStore
         from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
@@ -1003,7 +1004,14 @@ class AntonHarness:
             ],
             cells=cells
         )
-        return ChatSession(config), temp_vault_dir, seed_info
+        # Not `ChatSession(config)` directly: every construction of anton's
+        # executor inside cowork-server goes through build_chat_session, which
+        # refuses in org mode. stream_response already refuses earlier on this
+        # path, so this is the second of two gates rather than the only one,
+        # but keeping the construction uniform is what lets the static test
+        # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
+        # call under cowork/ as a new, unreviewed execution site.
+        return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
     def _build_llm_client():

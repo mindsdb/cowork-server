@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from cowork.common.chat_session import build_chat_session
 from cowork.common.paths import cowork_home
 
 logger = logging.getLogger(__name__)
@@ -265,7 +266,7 @@ class CredentialProbe:
     # ── Main entry point ─────────────────────────────────────────────
 
     async def run(self) -> AsyncIterator[tuple[str, Any]]:
-        from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
+        from anton.core.session import ChatSessionConfig, SystemPromptContext
         from anton.core.llm.provider import (
             StreamTextDelta, StreamToolResult,
             StreamToolUseStart, StreamToolUseEnd, StreamToolUseDelta, StreamComplete,
@@ -416,7 +417,15 @@ class CredentialProbe:
         )
 
         try:
-            probe_session = ChatSession(config)
+            # Not `ChatSession(config)` directly: the probe drives its own
+            # prompt through a session that still carries anton's unconditional
+            # `scratchpad` tool on the local subprocess runtime, with `cwd` set
+            # to this org's project directory on shared EFS. build_chat_session
+            # is the single place that refuses in org mode; see its docstring.
+            # The refusal lands in the `except` below and comes back as an
+            # ordinary probe failure verdict, so the client gets a readable
+            # message instead of a 500.
+            probe_session = build_chat_session(config)
         except Exception as exc:
             logger.exception("Could not build probe session")
             self._outcome.status = "failure"
