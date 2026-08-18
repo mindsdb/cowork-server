@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from cowork.common.datetime_utils import ensure_utc
@@ -12,6 +13,9 @@ from cowork.schedule_timing import count_missed_occurrences, next_future_occurre
 from cowork.schemas.schedules import Cadence, RunStatus
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 from cowork.streaming.registry import registry
+
+if TYPE_CHECKING:
+    from cowork.principal import Principal
 
 logger = get_logger(__name__)
 
@@ -94,6 +98,32 @@ def _handle_missed_runs(session) -> None:
     session.commit()
 
 
+def _principal_for_schedule(schedule: Schedule) -> Principal | None:
+    """Service principal for a scheduled run, derived from the schedule row.
+
+    A scheduled run has no HTTP request and so no gateway-injected principal, so
+    the owning identity comes from the row itself: ``org_id`` scopes the turn's
+    data and the per-tenant key the remote backend mints, and ``created_by``
+    attributes the rows it writes.
+
+    Local mode has no tenant context, so return None (unscoped). Org mode
+    requires both ids; a NULL is corrupt data that would write rows the owner
+    can't see, so fail loud instead.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import MissingTenantScopeError
+    from cowork.principal import Principal
+
+    if get_app_settings().tenancy_mode != "org":
+        return None
+    if not schedule.org_id or not schedule.created_by:
+        raise MissingTenantScopeError(
+            f"schedule {schedule.id} is missing org_id/created_by; "
+            "cannot resolve a service principal to run it in org mode"
+        )
+    return Principal(user_id=schedule.created_by, org_id=schedule.org_id)
+
+
 async def execute_schedule(
     schedule_id: UUID,
     is_manual: bool = False,
@@ -102,7 +132,7 @@ async def execute_schedule(
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
-    from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+    from cowork.db.scoped import MissingTenantScopeError, ScopedSession, SYSTEM_SCOPE
     session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
     run_service = ScheduleRunService(session)
     schedule_service = ScheduleService(session)
@@ -119,11 +149,38 @@ async def execute_schedule(
         from cowork.db.scoped import service_principal_for
         principal = service_principal_for(schedule.org_id, schedule.created_by)
 
+        # A scheduled run has no request, so it derives its tenant identity from
+        # the schedule row (see _principal_for_schedule). None in local mode.
+        try:
+            principal = _principal_for_schedule(schedule)
+        except MissingTenantScopeError:
+            # A corrupt row (NULL org in org mode) can never resolve an
+            # identity, so it can never run. Disable it, else the unadvanced
+            # next_run_at keeps the slot due and every poll re-fires the same
+            # failure. The re-raise records the run as failed.
+            schedule.enabled = False
+            session.add(schedule)
+            session.commit()
+            raise
+
         if conversation_id is None:
             # Conversation not pre-created by the caller (e.g. cron tick).
             from cowork.db.scoped import scope_from_principal, unsafe_unscoped_session
             from cowork.services.conversations import ConversationService
             conv_session = ScopedSession(unsafe_unscoped_session(session), scope_from_principal(principal))
+            # Conversation not pre-created by the caller (e.g. cron tick). Create
+            # it under the schedule's OWN scope so org mode stamps the owning
+            # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
+            # scans every org), so creating through `session` would write an
+            # invisible NULL-org row.
+            from cowork.db.scoped import (
+                ScopedSession,
+                scope_from_principal,
+                unsafe_unscoped_session,
+            )
+            conv_session = ScopedSession(
+                unsafe_unscoped_session(session), scope_from_principal(principal)
+            )
             conversation = ConversationService(conv_session).create_conversation(
                 topic=schedule.title,
                 project_id=schedule.project_id,
@@ -151,6 +208,9 @@ async def execute_schedule(
         async def _drain_run() -> None:
             # ResponsesHandler takes a RAW session (it wraps its own scope from
             # the principal); hand it the underlying session, not our scoped one.
+            # The schedule-derived principal is what lets the turn (and the
+            # remote backend's per-tenant key mint) run in org mode with no
+            # request in flight.
             from cowork.db.scoped import unsafe_unscoped_session
             stream = await ResponsesHandler(
                 unsafe_unscoped_session(session), principal=principal
