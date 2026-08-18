@@ -25,6 +25,7 @@ USER_B = "22222222-2222-4222-8222-222222222222"
 
 A = {"X-User-Id": USER_A, "X-Organization-Id": ORG_A}
 B = {"X-User-Id": USER_B, "X-Organization-Id": ORG_B}
+A_ADMIN = {**A, "X-User-Roles": "manage-organization"}
 
 
 @pytest.fixture(scope="module")
@@ -96,7 +97,7 @@ def test_channel_config_get_available_in_org_mode(client):
 
 def test_channel_config_put_and_get_are_org_scoped(client):
     put = client.put(
-        "/api/v1/channels/slack/config", headers=A,
+        "/api/v1/channels/slack/config", headers=A_ADMIN,
         json={"values": {"bot_token": "xoxb-a", "signing_secret": "secret-a"}},
     )
     assert put.status_code == 200, put.text
@@ -108,7 +109,7 @@ def test_channel_config_put_and_get_are_org_scoped(client):
         mine = client.get("/api/v1/channels/slack/config", headers=A)
         assert mine.json()["configured"] is True
     finally:
-        client.delete("/api/v1/channels/slack/config", headers=A)
+        client.delete("/api/v1/channels/slack/config", headers=A_ADMIN)
 
 
 # --- channels without a per-org routing-key extractor (Telegram, WhatsApp)
@@ -133,7 +134,7 @@ def test_telegram_config_get_stays_open_in_org_mode(client):
 
 def test_telegram_config_put_is_gated_in_org_mode(client):
     res = client.put(
-        "/api/v1/channels/telegram/config", headers=A,
+        "/api/v1/channels/telegram/config", headers=A_ADMIN,
         json={"values": {"bot_token": "T:tok"}},
     )
     assert res.status_code == 501
@@ -141,7 +142,7 @@ def test_telegram_config_put_is_gated_in_org_mode(client):
 
 
 def test_telegram_reload_is_gated_in_org_mode(client):
-    res = client.post("/api/v1/channels/telegram/reload", headers=A)
+    res = client.post("/api/v1/channels/telegram/reload", headers=A_ADMIN)
     assert res.status_code == 501
     assert "not yet available in org deployments" in res.json()["detail"]
 
@@ -149,7 +150,7 @@ def test_telegram_reload_is_gated_in_org_mode(client):
 def test_telegram_setup_is_gated_in_org_mode(client):
     # Telegram DOES implement setup/teardown (unlike Slack/Discord) — this
     # must be the readiness gate, not LifecycleNotImplementedError's 501.
-    res = client.post("/api/v1/channels/telegram/setup", headers=A)
+    res = client.post("/api/v1/channels/telegram/setup", headers=A_ADMIN)
     assert res.status_code == 501
     assert "not yet available in org deployments" in res.json()["detail"]
 
@@ -157,7 +158,7 @@ def test_telegram_setup_is_gated_in_org_mode(client):
 def test_channel_setup_available_in_org_mode(client):
     # Slack has no setup/teardown lifecycle at all, so this still 501s — but
     # for THAT reason, not the tenancy gate ("not available in org deployments").
-    res = client.post("/api/v1/channels/slack/setup", headers=A)
+    res = client.post("/api/v1/channels/slack/setup", headers=A_ADMIN)
     assert res.status_code == 501
     assert "not implemented" in res.json()["detail"]
 
@@ -168,7 +169,7 @@ def test_channel_agent_endpoints_available_in_org_mode(client):
     res = client.get("/api/v1/channels/agent", headers=A)
     assert res.status_code == 200
 
-    put = client.put("/api/v1/channels/agent", headers=A, json={"harness": "anton"})
+    put = client.put("/api/v1/channels/agent", headers=A_ADMIN, json={"harness": "anton"})
     assert put.status_code == 200, put.text
 
 
@@ -179,6 +180,7 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.db.scoped import ScopedSession, TenantScope
     from cowork.db.session import get_open_session
+    from cowork.principal import Principal
     from cowork.schemas.channels import ChannelAgentUpdateRequest
     from cowork.services.settings import SettingService
 
@@ -189,9 +191,10 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
     session = get_open_session()
     scope_a = TenantScope(org_mode=True, org_id=ORG_A)
     scoped_a = ScopedSession(session, scope_a)
+    admin = Principal(user_id=USER_A, org_id=ORG_A, roles=frozenset({"manage-organization"}))
     try:
         result = channels_ep.set_channel_agent(
-            ChannelAgentUpdateRequest(harness="hermes"), session, scoped_a
+            ChannelAgentUpdateRequest(harness="hermes"), session, scoped_a, admin
         )
         assert result.harness == "hermes"
         assert get_user_settings(TenantScope(org_mode=True, org_id=ORG_A)).channels_harness == "hermes"
@@ -217,10 +220,66 @@ def test_channel_config_put_does_not_start_ingress_in_org_mode(client, monkeypat
     monkeypatch.setattr(channels_ep, "sync_channel_ingress", spy)
     try:
         res = client.put(
-            "/api/v1/channels/discord/config", headers=A,
+            "/api/v1/channels/discord/config", headers=A_ADMIN,
             json={"values": {"bot_token": "discord-bot-token"}},
         )
         assert res.status_code == 200, res.text
         assert called == []
     finally:
-        client.delete("/api/v1/channels/discord/config", headers=A)
+        client.delete("/api/v1/channels/discord/config", headers=A_ADMIN)
+
+
+# --- configuring channels (credentials, lifecycle, the shared channel agent)
+# is admin-owned in org mode, same rule settings.py already applies to org
+# settings writes — bindings (chat routing) stay open to any org member -----
+
+def test_set_config_requires_org_admin(client):
+    res = client.put(
+        "/api/v1/channels/slack/config", headers=A,
+        json={"values": {"bot_token": "xoxb-a"}},
+    )
+    assert res.status_code == 403
+    assert "org admin" in res.json()["detail"]
+
+
+def test_delete_config_requires_org_admin(client):
+    client.put(
+        "/api/v1/channels/slack/config", headers=A_ADMIN,
+        json={"values": {"bot_token": "xoxb-a"}},
+    )
+    try:
+        res = client.delete("/api/v1/channels/slack/config", headers=A)
+        assert res.status_code == 403
+        assert "org admin" in res.json()["detail"]
+    finally:
+        client.delete("/api/v1/channels/slack/config", headers=A_ADMIN)
+
+
+def test_reload_requires_org_admin(client):
+    res = client.post("/api/v1/channels/slack/reload", headers=A)
+    assert res.status_code == 403
+    assert "org admin" in res.json()["detail"]
+
+
+def test_setup_and_teardown_require_org_admin_before_the_readiness_check(client):
+    # Telegram is also not org-ready (501) — the admin check must still win,
+    # proving it runs first rather than only mattering for ready channels.
+    setup = client.post("/api/v1/channels/telegram/setup", headers=A)
+    assert setup.status_code == 403
+    assert "org admin" in setup.json()["detail"]
+
+    teardown = client.post("/api/v1/channels/telegram/teardown", headers=A)
+    assert teardown.status_code == 403
+    assert "org admin" in teardown.json()["detail"]
+
+
+def test_set_channel_agent_requires_org_admin(client):
+    res = client.put("/api/v1/channels/agent", headers=A, json={"harness": "anton"})
+    assert res.status_code == 403
+    assert "org admin" in res.json()["detail"]
+
+
+def test_bindings_do_not_require_org_admin(client):
+    # Chat-routing assignment, not channel configuration — any org member.
+    res = client.get("/api/v1/channels/bindings", headers=A)
+    assert res.status_code == 200

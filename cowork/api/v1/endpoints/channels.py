@@ -34,16 +34,31 @@ from cowork.services.channel_lifecycle import (
     LifecycleNotImplementedError,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import TenantScope
+from cowork.principal import Principal, can_manage_org, get_principal
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
 from cowork.harnesses.base import available_harness_ids
 
 router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
+PrincipalDep = Annotated[Principal | None, Depends(get_principal)]
 
 
 def _live_adapters(request: Request):
     return getattr(request.app.state, "channel_adapters", None)
+
+
+def _require_org_admin(scope: TenantScope, principal: Principal | None) -> None:
+    """Configuring channels — credentials, lifecycle, or the shared channel
+    agent — is admin-owned in org mode, the same rule settings.py's
+    _require_org_admin_for applies to org settings writes. Checked before any
+    other gate (readiness, unknown-channel, ...): who may act comes first."""
+    if scope.org_mode and not can_manage_org(principal):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="configuring channels requires an org admin",
+        )
 
 
 def _require_org_ready(channel_type: str) -> None:
@@ -104,13 +119,15 @@ def get_channel_agent(scoped: ScopedSessionDep) -> ChannelAgentResponse:
 
 @router.put("/agent", response_model=ChannelAgentResponse)
 def set_channel_agent(
-    body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep
+    body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep,
+    principal: PrincipalDep,
 ) -> ChannelAgentResponse:
     # channels_harness is ORG-marked, so SettingService routes this write to
     # the caller's own org row — two orgs never share or overwrite each other's.
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 
+    _require_org_admin(scoped.scope, principal)
     options = available_harness_ids()
     harness = (body.harness or "").strip()
     if harness not in options:
@@ -144,7 +161,9 @@ async def set_config(
     body: ChannelConfigUpdateRequest,
     request: Request,
     scoped: ScopedSessionDep,
+    principal: PrincipalDep,
 ) -> ChannelConfigResponse:
+    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     try:
         result = ChannelConfigService(scoped).set_config(channel_type, body.values)
@@ -161,7 +180,10 @@ async def set_config(
 
 
 @router.delete("/{channel_type}/config", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_config(channel_type: str, request: Request, scoped: ScopedSessionDep) -> None:
+async def delete_config(
+    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+) -> None:
+    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     try:
         deleted = ChannelConfigService(scoped).delete_config(channel_type)
@@ -180,8 +202,11 @@ async def delete_config(channel_type: str, request: Request, scoped: ScopedSessi
 
 
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
-async def reload_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelReloadResponse:
+async def reload_channel(
+    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
+    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     try:
         ChannelConfigService(scoped).get_config(channel_type)
@@ -237,7 +262,10 @@ def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecy
 
 
 @router.post("/{channel_type}/setup", response_model=ChannelLifecycleResponse)
-async def setup_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelLifecycleResponse:
+async def setup_channel(
+    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+) -> ChannelLifecycleResponse:
+    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:
@@ -256,7 +284,10 @@ async def setup_channel(channel_type: str, request: Request, scoped: ScopedSessi
 
 
 @router.post("/{channel_type}/teardown", response_model=ChannelLifecycleResponse)
-async def teardown_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelLifecycleResponse:
+async def teardown_channel(
+    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+) -> ChannelLifecycleResponse:
+    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:
