@@ -144,6 +144,18 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Model name for the chat completion request"
     )
+    # The composer's per-task harness pick (Coding Mode). Overrides the
+    # account-wide `harness` setting for THIS conversation only — mirrors
+    # `model` above. Silently ignored (falls back to the account default) if
+    # it doesn't name a harness this account currently has registered/
+    # available (see ResponsesHandler.handle); an invalid transient value
+    # (e.g. a stale client cache after Hermes gets uninstalled) must never
+    # fail the turn. Persisted onto the new conversation's Conversation.harness
+    # so a reopened task remembers the pick, same as `model`.
+    harness: str | None = Field(
+        default=None,
+        description="Harness name for this conversation, overriding the account default",
+    )
     stream: bool | None = Field(
         default=False,
         description="Whether the chat completion request is streaming or not",
