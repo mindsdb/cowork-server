@@ -123,68 +123,33 @@ async def test_stream_remote_replies_history_defaults_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_remote_replies_forwards_skills(monkeypatch):
-    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
-    monkeypatch.setattr(prod, "get_redis", lambda: fake)
-    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    skills = {"csv-summary": {"files": {"SKILL.md": "---\nname: csv-summary\n---\nbody"}}}
-    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
-                                            user_id=None, input_text="hi", model="m",
-                                            skills=skills))
-    assert json.loads(fake.added[0][1]["payload"])["params"]["skills"] == skills
-
-
-@pytest.mark.asyncio
-async def test_oversized_request_drops_skills_then_memory(monkeypatch):
-    # A valid memory + skills combination can exceed the pod's stdin cap. Rather
-    # than let the request line truncate into unparseable JSON, the producer
-    # sheds skills first, then memory, so the turn still runs.
+async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch):
+    # _fit_request used to shed skills then memory. Both now live on the shared
+    # EFS mount and never enter the payload, so what remains (input, model, llm,
+    # history) cannot be dropped without changing the turn's meaning. An
+    # oversized line must therefore be reported, not silently truncated by the
+    # pod's readline, and the real fix is history windowing upstream.
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "_MAX_REQUEST_BYTES", 4096)
     monkeypatch.setattr(prod, "_REQUEST_BYTES_MARGIN", 0)
 
-    big_skills = {"s": {"files": {"SKILL.md": "x" * 5000}}}
-    big_memory = {"global": {"rules": "y" * 5000}}
+    # The logger is captured directly rather than via caplog: another test in
+    # the suite reconfigures logging, and caplog then silently records nothing,
+    # which would make this pass for the wrong reason.
+    warnings: list[str] = []
+    monkeypatch.setattr(prod.logger, "warning",
+                        lambda msg, *args, **kw: warnings.append(msg % args if args else msg))
+
+    huge_history = [{"role": "user", "content": "x" * 5000}]
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
                                             user_id=None, input_text="hi", model="m",
-                                            memory=big_memory, skills=big_skills))
+                                            history=huge_history))
+
+    assert any("over the 4096-byte cap" in w for w in warnings), warnings
     params = json.loads(fake.added[0][1]["payload"])["params"]
-    # skills shed first; memory then also shed because it alone still overruns
-    assert "skills" not in params
-    assert "memory" not in params
-    assert prod._request_wire_size(params) <= 4096
-
-
-@pytest.mark.asyncio
-async def test_request_keeps_memory_when_dropping_skills_suffices(monkeypatch):
-    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
-    monkeypatch.setattr(prod, "get_redis", lambda: fake)
-    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    monkeypatch.setattr(prod, "_MAX_REQUEST_BYTES", 4096)
-    monkeypatch.setattr(prod, "_REQUEST_BYTES_MARGIN", 0)
-
-    big_skills = {"s": {"files": {"SKILL.md": "x" * 5000}}}
-    small_memory = {"global": {"rules": "keep me"}}
-    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
-                                            user_id=None, input_text="hi", model="m",
-                                            memory=small_memory, skills=big_skills))
-    params = json.loads(fake.added[0][1]["payload"])["params"]
-    assert "skills" not in params
-    assert params["memory"] == small_memory   # shedding skills alone was enough
-
-
-@pytest.mark.asyncio
-async def test_stream_remote_replies_omits_empty_skills(monkeypatch):
-    # Like memory: a skill-less turn keeps the pre-existing payload shape.
-    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
-    monkeypatch.setattr(prod, "get_redis", lambda: fake)
-    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
-                                            user_id=None, input_text="hi", model="m",
-                                            skills={}))
-    assert "skills" not in json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["history"] == huge_history, "history must not be silently dropped"
 
 
 @pytest.mark.asyncio

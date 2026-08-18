@@ -570,6 +570,34 @@ class ResponsesHandler:
         )
 
     @staticmethod
+    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
+        """The conversation's project as a path relative to the org root.
+
+        Absolute paths must not cross the wire: cowork-server sees the shared
+        tree at ``<root>/<org_id>`` and the pod mounts its own org's access
+        point at ``<root>``, so an absolute path built here names nothing
+        inside the pod. Both sides join their own root to this.
+
+        A lookup failure degrades to the org's default project rather than
+        failing the turn, matching how memory and skills used to degrade.
+        """
+        from pathlib import Path
+
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.scoped import scoped_storage_root
+
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            org_root = scoped_storage_root(
+                Path(get_app_settings().project.root_dir), session.scope
+            ).parent
+            rel = Path(conversation.project.path).relative_to(org_root).as_posix()
+            return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}
+        except Exception:
+            logger.exception("[responses] failed to resolve workspace for conversation %s", conv_id)
+            return {}
+
+    @staticmethod
     def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
         """This org's memory slots for the pod. A read error degrades to a turn
         without memory rather than failing the turn."""
@@ -668,8 +696,9 @@ class ResponsesHandler:
                 # Producer session, NOT self.scoped: this coroutine is detached
                 # and the request session may be closed by the time it runs.
                 history=self._remote_history(producer_session, conv_id),
-                memory=self._remote_memory(producer_session, conv_id),
-                skills=self._remote_skills(producer_session, conv_id),
+                # Skills and memory are NOT sent: the pod reads them off the
+                # shared mount. Only the org-relative project path travels.
+                **self._remote_workspace(producer_session, conv_id),
                 correlation_id=(turn_llm or {}).get("correlation_id"),
                 llm=(turn_llm or {}).get("llm"),
             ):
