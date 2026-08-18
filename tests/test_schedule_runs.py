@@ -336,6 +336,89 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
         get_app_settings.cache_clear()
 
 
+# --- ENG-1683: a corrupt org-mode row (NULL org_id) can never resolve an
+# identity, so it can never run. It must be disabled — not left due and
+# re-fired every poll — otherwise the cron loop spins on the same failure
+# forever, one failed run per tick.
+
+def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatch):
+    import asyncio
+
+    from sqlmodel import select
+
+    from cowork.common.datetime_utils import ensure_utc
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.db.session import get_open_session
+    from cowork.models.schedule import ScheduleRun
+    from cowork.scheduler import execute_schedule
+    from cowork.services.schedules import ScheduleService
+
+    org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    user_id = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
+    original_next_run = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+
+    org_scope = TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
+    session = get_open_session()
+    scoped = ScopedSession(session, org_scope)
+    project = Project(name="p-corrupt", path="/tmp/p-corrupt")
+    scoped.add(project)
+    scoped.commit()
+    scoped.refresh(project)
+    schedule = ScheduleService(scoped).create_schedule(
+        title="corrupt daily",
+        prompt="do it",
+        cadence="daily",
+        next_run_at=original_next_run,
+        model="default",
+        project_id=project.id,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    # Corrupt the row: NULL the org on a raw session so the scoped before-flush
+    # listener doesn't re-stamp it. This is the pre-migration / bad-data shape.
+    raw = get_open_session()
+    row = raw.get(Schedule, schedule_id)
+    row.org_id = None
+    raw.add(row)
+    raw.commit()
+    raw.close()
+
+    try:
+        # A hung loop would keep firing this; one call is enough to observe the
+        # disable + a recorded failed run.
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+
+        s = get_open_session()
+        after = s.get(Schedule, schedule_id)
+        assert after.enabled is False, "corrupt row must be disabled, not left due"
+        # Not advanced — disabling is what stops the re-fire, not a moved slot.
+        assert ensure_utc(after.next_run_at) == original_next_run
+        runs = s.exec(
+            select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
+        ).all()
+        assert runs, "the attempt must still record a run"
+        assert all(r.status == RunStatus.failed for r in runs)
+        s.close()
+    finally:
+        s = get_open_session()
+        # org_id is NULL now, so clean up on a raw session.
+        for r in s.exec(
+            select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
+        ).all():
+            s.delete(r)
+        dead = s.get(Schedule, schedule_id)
+        if dead is not None:
+            s.delete(dead)
+        s.commit()
+        s.close()
+        get_app_settings.cache_clear()
+
+
 # --- ENG-688: how the run actually ended comes from the stream buffer's
 # terminal record. The producer runs detached and swallows its own
 # cancellation (task.cancelled() stays False), so the terminal record is the
