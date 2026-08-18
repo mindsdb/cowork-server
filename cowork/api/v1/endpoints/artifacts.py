@@ -200,6 +200,9 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
 
 @router.post("/open")
 async def open_artifact(req: _PathBody):
+    from cowork.services.artifacts import _cloud_mode, _NO_EXEC_DETAIL
+    if _cloud_mode():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     try:
         artifact = resolve_artifact_path(req.path)
     except FileNotFoundError as e:
