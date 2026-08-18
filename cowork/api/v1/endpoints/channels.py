@@ -46,6 +46,21 @@ def _live_adapters(request: Request):
     return getattr(request.app.state, "channel_adapters", None)
 
 
+def _require_org_ready(channel_type: str) -> None:
+    """Blocks the mutating config/lifecycle actions for a channel with no
+    per-org routing key (Telegram, WhatsApp) in org mode — see
+    services.channels.is_org_ready. GET/list stay open; they're read-only."""
+    from cowork.channels.registry import get_registry
+    from cowork.services.channels import is_org_ready
+
+    plugin = get_registry().get(channel_type)
+    if plugin is not None and not is_org_ready(plugin):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=f"channel {channel_type} is not yet available in org deployments",
+        )
+
+
 async def _reconcile_ingress(request: Request, channel_type: str) -> None:
     """Start/stop background ingress (Gateway stream or tunnel-free poll) after a
     change to the channel's live adapter (config/setup/teardown/reload).
@@ -130,6 +145,7 @@ async def set_config(
     request: Request,
     scoped: ScopedSessionDep,
 ) -> ChannelConfigResponse:
+    _require_org_ready(channel_type)
     try:
         result = ChannelConfigService(scoped).set_config(channel_type, body.values)
     except UnknownChannelError:
@@ -146,6 +162,7 @@ async def set_config(
 
 @router.delete("/{channel_type}/config", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_config(channel_type: str, request: Request, scoped: ScopedSessionDep) -> None:
+    _require_org_ready(channel_type)
     try:
         deleted = ChannelConfigService(scoped).delete_config(channel_type)
     except UnknownChannelError:
@@ -165,6 +182,7 @@ async def delete_config(channel_type: str, request: Request, scoped: ScopedSessi
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
 async def reload_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
+    _require_org_ready(channel_type)
     try:
         ChannelConfigService(scoped).get_config(channel_type)
     except UnknownChannelError:
@@ -220,6 +238,7 @@ def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecy
 
 @router.post("/{channel_type}/setup", response_model=ChannelLifecycleResponse)
 async def setup_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelLifecycleResponse:
+    _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:
         result = await svc.setup(channel_type)
@@ -238,6 +257,7 @@ async def setup_channel(channel_type: str, request: Request, scoped: ScopedSessi
 
 @router.post("/{channel_type}/teardown", response_model=ChannelLifecycleResponse)
 async def teardown_channel(channel_type: str, request: Request, scoped: ScopedSessionDep) -> ChannelLifecycleResponse:
+    _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:
         result = await svc.teardown(channel_type)

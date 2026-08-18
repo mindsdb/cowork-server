@@ -5,6 +5,7 @@ from sqlmodel import Session, select
 from cowork.channels.plugin import ChannelPlugin
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import MissingTenantScopeError, ScopedSession
 from cowork.models.channel import ChannelInstallation
 from cowork.models.setting import Setting
@@ -28,6 +29,18 @@ def _cred_key(channel_type: str, field: str) -> str:
 
 class UnknownChannelError(Exception):
     """Raised when a channel_type has no registered plugin (→ 404 at the edge)."""
+
+
+def is_org_ready(plugin: ChannelPlugin) -> bool:
+    """Whether org-mode tenants can safely configure this channel.
+
+    Always true in local mode — one tenant, nothing to resolve. In org mode,
+    true iff the plugin has a per-org routing-key extractor (Slack, Discord
+    today): without one, an inbound webhook can never resolve to an org, so
+    configuring it would silently never deliver."""
+    if get_app_settings().tenancy_mode != "org":
+        return True
+    return plugin.extract_routing_key is not None
 
 
 def resolve_installation_by_external_account(
@@ -169,6 +182,7 @@ class ChannelConfigService:
             capabilities=PluginCapabilities.model_validate(
                 plugin.capabilities, from_attributes=True
             ),
+            org_ready=is_org_ready(plugin),
         )
 
     def _config_dto(self, plugin: ChannelPlugin) -> ChannelConfigResponse:

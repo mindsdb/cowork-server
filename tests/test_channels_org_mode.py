@@ -111,6 +111,49 @@ def test_channel_config_put_and_get_are_org_scoped(client):
         client.delete("/api/v1/channels/slack/config", headers=A)
 
 
+# --- channels without a per-org routing-key extractor (Telegram, WhatsApp)
+# stay locked out of mutation in org mode — configuring them would silently
+# never deliver, since nothing resolves their webhook to an org yet ---------
+
+def test_plugins_endpoint_flags_org_readiness_per_channel(client):
+    res = client.get("/api/v1/channels/plugins", headers=A)
+    by_type = {p["channel_type"]: p for p in res.json()}
+    assert by_type["slack"]["org_ready"] is True
+    assert by_type["discord"]["org_ready"] is True
+    assert by_type["telegram"]["org_ready"] is False
+    assert by_type["whatsapp"]["org_ready"] is False
+
+
+def test_telegram_config_get_stays_open_in_org_mode(client):
+    # Read-only, harmless either way — only mutation is gated.
+    res = client.get("/api/v1/channels/telegram/config", headers=A)
+    assert res.status_code == 200
+    assert res.json()["configured"] is False
+
+
+def test_telegram_config_put_is_gated_in_org_mode(client):
+    res = client.put(
+        "/api/v1/channels/telegram/config", headers=A,
+        json={"values": {"bot_token": "T:tok"}},
+    )
+    assert res.status_code == 501
+    assert "not yet available in org deployments" in res.json()["detail"]
+
+
+def test_telegram_reload_is_gated_in_org_mode(client):
+    res = client.post("/api/v1/channels/telegram/reload", headers=A)
+    assert res.status_code == 501
+    assert "not yet available in org deployments" in res.json()["detail"]
+
+
+def test_telegram_setup_is_gated_in_org_mode(client):
+    # Telegram DOES implement setup/teardown (unlike Slack/Discord) — this
+    # must be the readiness gate, not LifecycleNotImplementedError's 501.
+    res = client.post("/api/v1/channels/telegram/setup", headers=A)
+    assert res.status_code == 501
+    assert "not yet available in org deployments" in res.json()["detail"]
+
+
 def test_channel_setup_available_in_org_mode(client):
     # Slack has no setup/teardown lifecycle at all, so this still 501s — but
     # for THAT reason, not the tenancy gate ("not available in org deployments").
