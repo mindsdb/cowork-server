@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import UploadFile
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, scoped_storage_root
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 
@@ -50,7 +50,15 @@ class FileService:
         self.session = session
 
     def _root_dir(self) -> Path:
-        return Path(get_app_settings().file.root_dir)
+        """Files root, org-keyed in org mode (same helper as skills/projects).
+
+        Without the org segment every upload landed in one flat
+        ``<root>/files/<uuid>/`` directory, a SIBLING of the org directories
+        rather than inside one. A worker pod mounts only its own
+        ``<env>/<org_id>``, so it could never see an uploaded attachment at
+        all, and that is the primary use case this whole feature exists for.
+        """
+        return scoped_storage_root(Path(get_app_settings().file.root_dir), self.session.scope)
 
     def _to_response(self, file: File) -> FileResponse:
         return FileResponse(
