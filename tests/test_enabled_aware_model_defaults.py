@@ -128,13 +128,18 @@ def test_provider_switch_onto_minds_paid_keeps_canonical():
     assert s.resolved_planning_model == "sonnet"
 
 
-# ── Wallet-aware aux resolution (ENG-1632) ────────────────────────────
+# ── Wallet-aware resolution, all three roles (ENG-1632, ENG-1632 follow-up) ──
 #
-# The aux roles (coding = completion verifier + scratchpad, router = gating +
-# summarization) are invisible in default mode: a wallet-locked pin there 402s
-# on every turn with no way for the user to see or fix it. Resolution — never
-# the stored row — falls back to a strictly-enabled model. Planning keeps the
-# ENG-598/ENG-1248 behavior: an explicit pick is never silently swapped.
+# Originally aux-roles-only (coding = completion verifier + scratchpad,
+# router = gating + summarization): they're invisible in default mode, so a
+# wallet-locked pin there 402s on every turn with no way for the user to see
+# or fix it. Resolution — never the stored row — falls back to a
+# strictly-enabled model. Planning was later given the same fallback: a
+# MindsHub sign-in rewrites planning_provider without touching the paired
+# planning_model, so a pre-sign-in BYOK pick survives and 404s every turn,
+# never reaching the picker's ENG-1248 "Needs credits" lane at all (that
+# lane is for a real, currently-unaffordable MindsHub model — a separate,
+# still-visible per-model tag, unaffected by this fallback).
 
 # Whole catalog listed, everything paid locked — the ENG-1632 cohort's map.
 LOCKED_MAP = json.dumps(
@@ -158,6 +163,31 @@ def test_locked_router_pin_resolves_to_first_enabled():
     assert s.resolved_router_model == "mindshub_air"
 
 
+def test_locked_planning_pin_resolves_to_first_enabled():
+    # ENG-1632 follow-up: planning now gets the same self-healing fallback
+    # as coding/router. MindsHub SSO sign-in rewrites planning_provider to
+    # minds_cloud without touching the paired planning_model, so a stale
+    # pick from a prior provider would otherwise 404 the gateway on every
+    # single turn — never reaching the picker's "Needs credits" lane at all.
+    s = _pinned(minds_model_enabled=LOCKED_MAP, planning_model="sonnet")
+    assert s.planning_model == "sonnet"  # the stored row is never rewritten
+    assert s.resolved_planning_model == "mindshub_air"
+
+
+def test_stale_byok_planning_pin_survives_a_provider_switch_onto_minds():
+    # The exact reported bug: signed out with e.g. Anthropic configured for
+    # planning (a real, non-MindsHub id), then MindsHub sign-in flips
+    # planning_provider to minds_cloud without touching planning_model. The
+    # foreign id can never appear in the MindsHub enabled map (it isn't a
+    # MindsHub model), so it must fall back rather than 404 every turn.
+    s = _pinned(
+        minds_model_enabled=json.dumps({"mindshub_air": True}),
+        planning_model="claude-opus-4-8",
+    )
+    assert s.planning_model == "claude-opus-4-8"
+    assert s.resolved_planning_model == "mindshub_air"
+
+
 def test_latest_prefixed_pin_is_probed_bare():
     # /v1/models ids are always bare; login-era pins carry "latest:". The map
     # probe must strip it or those pins silently escape the fallback.
@@ -167,11 +197,14 @@ def test_latest_prefixed_pin_is_probed_bare():
 
 def test_funded_pin_is_kept():
     # The map is written from the full catalogue, so a funded wallet lists the
-    # pinned ids as enabled — both stay put.
+    # pinned ids as enabled — all three roles stay put.
     funded = json.dumps(
         {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True}
     )
-    s = _pinned(minds_model_enabled=funded, coding_model="haiku", router_model="kimi")
+    s = _pinned(
+        minds_model_enabled=funded, planning_model="sonnet", coding_model="haiku", router_model="kimi",
+    )
+    assert s.resolved_planning_model == "sonnet"
     assert s.resolved_coding_model == "haiku"
     assert s.resolved_router_model == "kimi"
 
@@ -205,14 +238,6 @@ def test_pin_absent_from_nonempty_map_is_treated_as_not_served():
     assert s.resolved_coding_model == "mindshub_air"
 
 
-def test_planning_pin_is_never_silently_swapped():
-    # Deliberate asymmetry: planning is visible in the picker and has the
-    # pick-it-and-see-"Needs credits" lane (ENG-1248); only the invisible aux
-    # roles fall back.
-    s = _pinned(minds_model_enabled=LOCKED_MAP, planning_model="sonnet")
-    assert s.resolved_planning_model == "sonnet"
-
-
 def test_byok_aux_pin_ignores_the_minds_map():
     s = UserSettings(
         planning_provider=Provider.ANTHROPIC,
@@ -220,8 +245,13 @@ def test_byok_aux_pin_ignores_the_minds_map():
         anthropic_api_key=SecretStr("sk-ant-test"),
         minds_model_enabled=json.dumps({"claude-haiku-4-5-20251001": False}),
         coding_model="claude-haiku-4-5-20251001",
+        planning_model="claude-haiku-4-5-20251001",
     )
+    # wallet_aware only ever probes when the RESOLVED provider is
+    # minds-cloud — a real BYOK provider's pick is never second-guessed
+    # against MindsHub's map, planning included.
     assert s.resolved_coding_model == "claude-haiku-4-5-20251001"
+    assert s.resolved_planning_model == "claude-haiku-4-5-20251001"
 
 
 # ── Endpoint cache write (recommended-models) ─────────────────────────
