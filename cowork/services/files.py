@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import UploadFile
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, scoped_storage_root
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 
@@ -50,7 +50,10 @@ class FileService:
         self.session = session
 
     def _root_dir(self) -> Path:
-        return Path(get_app_settings().file.root_dir)
+        """Local base on desktop, ``<shared>/<org>/files`` in org mode."""
+        return scoped_storage_root(
+            Path(get_app_settings().file.root_dir), self.session.scope, store="files"
+        )
 
     def _to_response(self, file: File) -> FileResponse:
         return FileResponse(
@@ -160,16 +163,28 @@ class FileService:
             raise ValueError("File not found")
         return file
 
+    def _doomed_dirs(self, file: File) -> list[Path]:
+        """Dirs to unlink on delete: the id-derived dir under the current root,
+        plus the stored path's parent (bytes live there if the root moved) —
+        but only when the resolved parent is literally named ``<file.id>``, so
+        an escaped legacy path can never aim rmtree at an arbitrary dir."""
+        dirs = [self._root_dir() / str(file.id)]
+        try:
+            stored = Path(file.path).parent.resolve()
+            if stored.name == str(file.id) and stored != dirs[0].resolve():
+                dirs.append(stored)
+        except (ValueError, OSError):
+            pass
+        return dirs
+
     def delete_file(self, file_id: UUID) -> bool:
         file = self.session.get(File, file_id)
         if file is None:
             return False
-        # Dir from the file id, not the stored path — a legacy row could hold an
-        # escaped path, and rmtree-ing its parent would delete an arbitrary dir.
-        file_dir = self._root_dir() / str(file.id)
+        doomed = self._doomed_dirs(file)
         self.session.delete(file)
         self.session.commit()
-        unlink_file_dirs([file_dir])
+        unlink_file_dirs(doomed)
         return True
 
     def delete_by_purpose(self, purpose: str) -> list[Path]:
@@ -186,10 +201,8 @@ class FileService:
         `unlink_file_dirs` AFTER committing.
         """
         rows = list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
-        # Dir from the file id, not the stored path (see delete_file): a legacy
-        # row could hold an escaped path, and rmtree-ing its parent would delete
-        # an arbitrary directory.
-        dirs = [self._root_dir() / str(f.id) for f in rows]
+        # Same validated candidates as delete_file (_doomed_dirs).
+        dirs = [d for f in rows for d in self._doomed_dirs(f)]
         for f in rows:
             self.session.delete(f)
         return dirs

@@ -7,7 +7,8 @@ does NOT stop the run — the client reconnects via GET /responses/tail
 with a `from_seq` cursor and resumes from where it left off. Only an
 explicit POST /responses/cancel halts the producer.
 """
-from typing import Annotated
+import time
+from typing import Annotated, NamedTuple
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -27,6 +28,10 @@ from cowork.principal import Principal, get_principal
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import RunHandle, registry
 from cowork.streaming.answers import SubmitResult, broker
+from cowork.streaming.backend import get_backend
+from cowork.streaming.buffer import RedisStreamBuffer
+from cowork.streaming.turn_index import get_turn, list_turns
+from cowork.turnqueue.redis_client import get_redis
 
 
 logger = setup_logging()
@@ -62,9 +67,87 @@ def _authorized_handle(
     """
     if handle is None:
         return None
+    return handle if _org_matches(handle.org_id, scope) else None
+
+
+def _org_matches(org_id: str | None, scope: TenantScope) -> bool:
+    """Whether the caller's scope may touch a turn owned by ``org_id``.
+
+    Shared by the local-handle check above and the Redis turn index, so the two
+    cannot drift into disagreeing about who may cancel whose turn.
+    """
     if not scope.org_mode:
-        return handle
-    return handle if handle.org_id == scope.org_id else None
+        return True   # today's single-user behavior
+    return org_id == scope.org_id
+
+
+class SharedTurn(NamedTuple):
+    """A turn read from Redis, and whether it is still going.
+
+    ``in_flight`` is not simply ``not buffer.is_closed``: an empty stream reads
+    as closed, which is right for a truncated conversation and wrong for a turn
+    enqueued moments ago.
+    """
+
+    index: dict
+    buffer: RedisStreamBuffer
+    in_flight: bool
+
+
+async def _shared_turn(
+    conversation_id: str | None, scope: TenantScope
+) -> SharedTurn | None:
+    """The conversation's current turn read from Redis, or None.
+
+    Used when this replica has no local handle, which on the Redis backend
+    means only that some other replica started the turn. There is nothing to
+    route: the buffer is readable from here. Returns None for an unknown
+    conversation and for one owned by another org, so a foreign id is
+    indistinguishable from a missing one.
+    """
+    if not conversation_id or get_backend() != "redis":
+        return None
+    turn = await get_turn(conversation_id)
+    if turn is None or not _org_matches(turn.get("org_id") or None, scope):
+        return None
+    buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
+    await buf.refresh()
+    # The index entry is written when the job is enqueued; the first record only
+    # lands once the pod answers. Until the grace period is up, an empty stream
+    # means "not started yet" rather than "over".
+    starting = buf.latest_seq == 0 and _just_started(turn)
+    return SharedTurn(index=turn, buffer=buf, in_flight=(not buf.is_closed) or starting)
+
+
+def _just_started(turn: dict) -> bool:
+    """Whether the turn was recorded too recently for an empty stream to mean
+    anything. Enqueue to first record covers pod startup, so this is generous."""
+    try:
+        return (time.time() - float(turn.get("started_at") or 0)) < TURN_START_GRACE_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+# Enqueue to first record: the controller has to lock the conversation, find or
+# create a pod (up to two minutes), and get the first event out of it.
+TURN_START_GRACE_SECONDS = 180
+
+
+async def _request_cancel(correlation_id: str) -> None:
+    """Ask whoever is running this turn to stop.
+
+    The controller checks this key while it streams. Writing it rather than
+    messaging a replica is what makes cancel work regardless of which replica
+    the request landed on.
+    """
+    await get_redis().set(
+        f"cowork:cancel:{correlation_id}", "1", ex=CANCEL_FLAG_TTL_SECONDS
+    )
+
+
+# Long enough for a controller mid-turn to notice, short enough that a stale
+# flag cannot cancel a later turn that reuses the id.
+CANCEL_FLAG_TTL_SECONDS = 300
 
 # no-store (not just no-cache): a chat stream can carry secrets the model
 # echoed (e.g. a raw API key embedded in generated scratchpad code), so it
@@ -105,18 +188,36 @@ async def responses(
 
 @router.get("/in-flight-list")
 async def in_flight_list(scope: TenantScopeDep):
-    """Conversations whose producer task is currently running. Cheap
-    in-memory lookup — the renderer uses it to sync stream state across
-    clients/boots. Scoped to the caller's org so it can't enumerate another
-    org's live conversation ids."""
+    """Conversations with a turn running. The renderer uses it to sync stream
+    state across clients/boots. Scoped to the caller's org so it can't
+    enumerate another org's live conversation ids.
+
+    Local handles first, then the Redis index for turns other replicas
+    started. On the file backend the index is empty and this is the old
+    in-memory lookup.
+    """
     _require_streaming_scope(scope)
-    return {
-        "in_flight": [
-            {"conversation_id": h.conversation_id, "turn_id": h.turn_id, "latest_seq": h.buffer.latest_seq}
-            for h in registry.in_flight()
-            if _authorized_handle(h, scope) is not None
-        ],
-    }
+    out = [
+        {"conversation_id": h.conversation_id, "turn_id": h.turn_id, "latest_seq": h.buffer.latest_seq}
+        for h in registry.in_flight()
+        if _authorized_handle(h, scope) is not None
+    ]
+    if get_backend() == "redis":
+        seen = {row["conversation_id"] for row in out}
+        for turn in await list_turns():
+            cid = turn["conversation_id"]
+            if cid in seen or not _org_matches(turn.get("org_id") or None, scope):
+                continue
+            buf = RedisStreamBuffer(conversation_id=cid, turn_id=int(turn["turn_id"]))
+            await buf.refresh()
+            if buf.is_closed:
+                continue   # finished; only the replay buffer is left
+            out.append({
+                "conversation_id": cid,
+                "turn_id": int(turn["turn_id"]),
+                "latest_seq": buf.latest_seq,
+            })
+    return {"in_flight": out}
 
 
 @router.get("/in-flight")
@@ -131,7 +232,17 @@ async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
     handle = registry.get(conversation_id) if conversation_id else None
     handle = _authorized_handle(handle, scope)
     if handle is None:
-        return {"in_flight": False, "has_buffer": False, "latest_seq": 0, "turn_id": None}
+        found = await _shared_turn(conversation_id, scope)
+        if found is None:
+            return {"in_flight": False, "has_buffer": False, "latest_seq": 0, "turn_id": None}
+        # Liveness comes from the buffer's terminal record, not from a process:
+        # the replica running this turn may not be the one answering.
+        return {
+            "in_flight": found.in_flight,
+            "has_buffer": True,
+            "latest_seq": found.buffer.latest_seq,
+            "turn_id": int(found.index["turn_id"]),
+        }
     return {
         "in_flight": handle.is_running,
         "has_buffer": True,
@@ -153,13 +264,27 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     so a foreign-org id is indistinguishable from an unknown one (no existence
     leak) and can never cancel another org's run. The client treats 404 as
     "already done."
+
+    On the remote backend the work is in a scratchpad pod, so cancelling the
+    local producer only stops our tail: the pod would run to completion,
+    spending tokens, with nobody listening. The flag is what reaches it, and
+    because it is a Redis key rather than a message, it works whichever replica
+    this request landed on.
     """
     _require_streaming_scope(scope)
     handle = _authorized_handle(registry.get(req.conversation_id), scope)
-    if handle is None:
+    if handle is not None:
+        turn = await get_turn(req.conversation_id) if get_backend() == "redis" else None
+        if turn is not None:
+            await _request_cancel(turn["correlation_id"])
+        cancelled = await handle.cancel()
+        return {"cancelled": cancelled, "conversation_id": req.conversation_id}
+
+    found = await _shared_turn(req.conversation_id, scope)
+    if found is None or not found.in_flight:
         return JSONResponse(status_code=404, content={"status": "not_found"})
-    cancelled = await handle.cancel()
-    return {"cancelled": cancelled, "conversation_id": req.conversation_id}
+    await _request_cancel(found.index["correlation_id"])
+    return {"cancelled": True, "conversation_id": req.conversation_id}
 
 
 # Bounds on the answer body. Not a security boundary — one server process per
@@ -253,7 +378,16 @@ async def tail_response(
     _require_streaming_scope(scope)
     handle = _authorized_handle(registry.get(conversation_id), scope)
     if handle is None:
-        return JSONResponse(status_code=404, content={"status": "not_found"})
+        # No local handle only means another replica started this turn; its
+        # buffer is readable from here.
+        found = await _shared_turn(conversation_id, scope)
+        if found is None:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        return StreamingResponse(
+            sse_from_buffer(found.buffer, from_seq),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
     return StreamingResponse(
         sse_from_buffer(handle.buffer, from_seq),
         media_type="text/event-stream",

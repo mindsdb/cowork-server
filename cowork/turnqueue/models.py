@@ -39,6 +39,10 @@ class TurnJob(BaseModel):
     reply_stream: str
     organization_id: str | None = None
     user_id: str | None = None
+    #: Project the turn runs in. The pod joins the params' org-relative
+    #: workspace path under its own mount root to reach
+    #: ``projects/<name>/conversations/<conversation_id>/``.
+    project_id: str | None = None
     #: How long the turn may run, in milliseconds. A duration, NOT an epoch
     #: timestamp: the controller reads it as a relative budget, so an epoch value
     #: would mean a ~57 year deadline and no timeout at all.

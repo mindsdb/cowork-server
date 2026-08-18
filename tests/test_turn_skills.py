@@ -26,12 +26,14 @@ def _org(org: str | None, user: str = "u") -> TenantScope:
 @pytest.fixture()
 def skills_root(tmp_path, monkeypatch):
     """An org whose builtins are already seeded, so the exact-payload assertions
-    below stay about the selection rules. Seeding itself is covered by
-    tests/test_builtin_skills_seeding.py."""
+        below stay about the selection rules. Seeding itself is covered by
+        tests/test_builtin_skills_seeding.py."""
     from cowork.migrations import BUILTIN_SKILLS_MARKER, BUILTIN_SKILLS_VERSION
 
     root = tmp_path / "skills"
-    monkeypatch.setenv("COWORK_SKILLS_DIR", str(root))
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
     for org in (ORG_A, ORG_B):
         (root / org).mkdir(parents=True)
