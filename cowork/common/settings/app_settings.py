@@ -41,7 +41,7 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 # providers use their smallest model. The frontend falls back
 # to the coding slot when the 3rd is absent, so an older client still works.
 RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
-    "minds-cloud": ("sonnet", "haiku", "kimi"),
+    "minds-cloud": ("sonnet", "haiku", "gpt-mini"),
     "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
     "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
     # All three roles default to the one id confirmed to resolve on a fresh
@@ -96,7 +96,7 @@ ROUTER_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5-mini",
     "gemini": "gemini-3.6-flash",
-    "minds_cloud": "kimi",
+    "minds_cloud": "gpt-mini",
 }
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
