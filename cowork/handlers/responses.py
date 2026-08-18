@@ -177,6 +177,8 @@ class ResponsesHandler:
                         topic=self._prompt_text(harness_input)[:80],
                         project_id=self._resolve_project_id(request),
                         conversation_id=conv_id,
+                        harness=self.harness_name,
+                        model=request.model,
                     )
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
@@ -186,12 +188,16 @@ class ResponsesHandler:
                 conversation = conversation_service.create_conversation(
                     topic=self._prompt_text(harness_input)[:80],
                     project_id=self._resolve_project_id(request),
+                    harness=self.harness_name,
+                    model=request.model,
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
             conversation = conversation_service.create_conversation(
                 topic=self._prompt_text(harness_input)[:80],
                 project_id=self._resolve_project_id(request),
+                harness=self.harness_name,
+                model=request.model,
             )
 
         self.last_conversation_id = str(conversation.id)
@@ -214,6 +220,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=bool(disabled),
+            model=request.model,
         )
         trace_metadata = {
             **trace_metadata,
@@ -292,6 +299,7 @@ class ResponsesHandler:
             stream = harness.stream_response(
                 conversation=conversation,
                 input=harness_input,
+                model=request.model,
                 disabled_connections=disabled,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
@@ -305,6 +313,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
+        model: str | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
@@ -335,6 +344,7 @@ class ResponsesHandler:
                     has_attachments=has_attachments,
                     has_disabled_connections=has_disabled_connections,
                     binding=binding,
+                    model_override=model,
                 )
             return decision, turn_llm
         except Exception:
@@ -825,7 +835,7 @@ class ResponsesHandler:
             ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=conv, input=harness_input, disabled_connections=disabled,
+                conversation=conv, input=harness_input, model=model, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0

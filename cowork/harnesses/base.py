@@ -45,7 +45,10 @@ class HarnessProvider(Protocol):
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        # Per-conversation model pick (the composer's dropdown), overriding
+        # this harness's planning/router/coding roles for just this call.
+        # None keeps the account-wide default for every role, as before.
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Optional observability pass-through (see ResponsesRequest). Forwarded
         # to the trace the harness emits; harnesses without tracing accept and
