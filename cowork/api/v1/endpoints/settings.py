@@ -41,6 +41,7 @@ from cowork.services.providers import (
 )
 from cowork.services.settings import SettingService
 from cowork.common.settings.app_settings import (
+    AGENT_ROLE_ORDER,
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
@@ -79,6 +80,34 @@ def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None
 @router.get("/", response_model=list[SettingResponse])
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()
+
+
+def _cached_map_write(desired: dict, stored_raw: str | None, *, ordered: bool) -> str | None:
+    """The JSON to persist for a map cached off ``/v1/models``, or None if unchanged.
+
+    Only writing on a real change matters because this endpoint is hit on every
+    boot and every settings open, and `upsert_setting` commits a row and
+    invalidates the settings cache, so an unconditional write churns every
+    UserSettings reader.
+
+    ``ordered`` is the difference between the two maps that come through here, and
+    it is not cosmetic. `minds_model_enabled` must keep insertion order: the
+    first-enabled fallback (`_enabled_aware_default`) walks it in order and relies
+    on `/v1/models` listing the free model first, so an alphabetized map could
+    silently promote the wrong one. Order-sensitivity in the compare is wanted for
+    the same reason, because a gateway re-ranking the same set is a real change.
+    `minds_role_defaults` is looked up by role name and nothing reads its order, so
+    it sorts and a re-ranking stops counting as a change.
+
+    A stored value that is not JSON compares as empty, so the next good read
+    replaces it rather than the endpoint raising on it.
+    """
+    desired_text = json.dumps(desired, sort_keys=not ordered)
+    try:
+        stored_text = json.dumps(json.loads(stored_raw or "{}"), sort_keys=not ordered)
+    except (ValueError, TypeError):
+        stored_text = "{}"
+    return None if desired_text == stored_text else desired_text
 
 
 def _bearer_token(request: Request | None) -> str:
@@ -434,29 +463,17 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # (the id list): a gateway that returns ids without `enabled` flags
             # yields `live` non-empty but `live_enabled == {}`, and writing {}
             # would wipe a previously-good map — re-locking the canonical
-            # default, i.e. the exact bug this PR fixes. And only write on a real
-            # change: this endpoint is hit on every boot/settings-open, and
-            # upsert_setting commits a row + invalidates the settings cache, so
-            # an unconditional write churns every UserSettings reader.
+            # default, i.e. the exact bug this PR fixes.
             if live_enabled:
-                # Persist ORDER-PRESERVING JSON — never sort_keys. The
-                # first-enabled default fallback (_enabled_aware_default)
-                # iterates the map in insertion order, relying on /v1/models
-                # listing the free/baseline model first; an alphabetized map
-                # could silently promote the wrong model. The compare is
-                # order-sensitive too, so a gateway re-ranking (same set, new
-                # baseline first) also counts as a change and refreshes the map.
-                desired = json.dumps(live_enabled)
-                try:
-                    stored = json.dumps(json.loads(s.minds_model_enabled or "{}"))
-                except (ValueError, TypeError):
-                    stored = "{}"
-                if desired != stored:
+                # Ordered, because the first-enabled fallback reads this map by
+                # position; see _cached_map_write.
+                write = _cached_map_write(live_enabled, s.minds_model_enabled, ordered=True)
+                if write is not None:
                     # Intentionally ungated by _require_org_admin_for: the value
                     # is system-derived (MindsHub, via admin-set key/URL), so a
                     # member can trigger this refresh but can't steer what's
                     # stored — and gating it would leave the map stale.
-                    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+                    SettingService(session, scope).upsert_setting("minds_model_enabled", write)
         # Cache the catalog's declared per-role defaults on the same terms, so a
         # default moved in the config reaches this install on its next settings
         # load with no client release (UserSettings._minds_role_default_map).
@@ -472,20 +489,16 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         # a client release behind. A gateway that predates `default_for` omits it
         # per row, so an empty parse means "nothing to say", not "no defaults".
         if live_role_defaults:
-            desired_roles = json.dumps(live_role_defaults, sort_keys=True)
-            try:
-                stored_roles = json.dumps(json.loads(s.minds_role_defaults or "{}"), sort_keys=True)
-            except (ValueError, TypeError):
-                stored_roles = "{}"
-            if desired_roles != stored_roles:
-                SettingService(session, scope).upsert_setting("minds_role_defaults", desired_roles)
+            write = _cached_map_write(live_role_defaults, s.minds_role_defaults, ordered=False)
+            if write is not None:
+                SettingService(session, scope).upsert_setting("minds_role_defaults", write)
             # The picker asks the server which model each role starts on, so it
             # has to be told the same answer resolution will give. Left off the
             # static map, the two disagree the moment a default moves in config
             # and the user sees one model in Settings while turns run another.
             pair["minds-cloud"] = [
                 live_role_defaults.get(role, fallback)
-                for role, fallback in zip(("planning", "coding", "router"), pair["minds-cloud"])
+                for role, fallback in zip(AGENT_ROLE_ORDER, pair["minds-cloud"])
             ]
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
