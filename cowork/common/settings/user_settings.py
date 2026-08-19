@@ -645,7 +645,14 @@ class UserSettings(Settings):
         description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
     artifact_autopublish_enabled: Annotated[bool, ORG] = Field(
-        default=False,
+        # TEMP REVERT-ME (ENG-1680): default flipped to True so the branch
+        # deploy on cowork.staging.mindshub.ai exercises the feature without an
+        # org-admin write or a chart change. MUST go back to False before merge —
+        # shipping it enabled turns autopublish on for every organization on
+        # every deployment, which is exactly what the paragraph below argues
+        # against, and §1.1 of the accepted-limitations doc (fullstack datasource
+        # secrets read from an org-unscoped vault) is still open.
+        default=True,
         title="Auto-publish artifacts",
         description=(
             "In org deployments, publish every artifact the agent creates or changes "

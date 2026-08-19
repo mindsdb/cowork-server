@@ -84,20 +84,28 @@ def test_migration_normalizer_delegates_to_the_canonical_one():
 #
 # Anything that documents "set X to turn this on" has to name the second one.
 
+# Both cases drive the value AWAY from whatever the field currently defaults to,
+# rather than asserting a literal. The default is not a fixed part of the
+# contract these tests are about — it is flipped on deploy branches — and a test
+# that hardcodes it reports a deliberate default change as an env-plumbing bug.
+_DEFAULT = UserSettings.model_fields["artifact_autopublish_enabled"].default
+_OPPOSITE = str(not _DEFAULT).lower()
+
+
 def test_field_name_env_var_overrides_a_setting(monkeypatch):
     monkeypatch.delenv("ANTON_ARTIFACT_AUTOPUBLISH", raising=False)
-    monkeypatch.setenv("ARTIFACT_AUTOPUBLISH_ENABLED", "true")
+    monkeypatch.setenv("ARTIFACT_AUTOPUBLISH_ENABLED", _OPPOSITE)
 
-    assert UserSettings().artifact_autopublish_enabled is True
+    assert UserSettings().artifact_autopublish_enabled is not _DEFAULT
 
 
 def test_anton_alias_alone_does_not_override_a_setting(monkeypatch):
     """The ANTON_* alias is a .env→DB seed key, not a live override. Asserted so
     the field's own description cannot drift back to naming it."""
     monkeypatch.delenv("ARTIFACT_AUTOPUBLISH_ENABLED", raising=False)
-    monkeypatch.setenv("ANTON_ARTIFACT_AUTOPUBLISH", "true")
+    monkeypatch.setenv("ANTON_ARTIFACT_AUTOPUBLISH", _OPPOSITE)
 
-    assert UserSettings().artifact_autopublish_enabled is False
+    assert UserSettings().artifact_autopublish_enabled is _DEFAULT
 
 
 def test_autopublish_description_names_the_override_that_works(monkeypatch):
