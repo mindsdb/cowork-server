@@ -215,14 +215,12 @@ def test_collect_raises_500_generic_for_unmapped_error():
 
 # ── Internal server / version-skew errors (ENG-1412) ──────────────
 #
-# A bug in cowork-server, or an anton↔cowork-server API/version skew, crashes
-# session build with a bare structural Python error (the ENG-1412 TypeError from
-# ToolDef(..., unlock_skill=…) against a stale anton; David Fraser's second case,
-# a NameError from a binding rc7 left dangling). friendly_turn_error can't map it
-# (it's not a provider failure), so it fell through to the opaque "An unexpected
-# error occurred." with the real cause buried in the server log. These pin that
-# the class is now recognised and surfaced actionably — while an arbitrary
-# Exception (which may embed provider text/secrets) stays fully redacted.
+# A cowork-server bug or an anton skew crashes session build with a bare
+# structural error (the ENG-1412 TypeError from ToolDef(..., unlock_skill=…);
+# a NameError from a binding rc7 left dangling). friendly_turn_error can't map
+# it, so it fell through to the opaque generic message. These pin that the
+# class is now surfaced actionably, while an arbitrary Exception (which may
+# embed provider secrets) stays redacted.
 
 _ENG_1412_TYPEERROR = TypeError(
     "ToolDef.__init__() got an unexpected keyword argument 'unlock_skill'"
