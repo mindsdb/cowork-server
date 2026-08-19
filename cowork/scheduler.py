@@ -32,6 +32,10 @@ _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.we
 # is disabled without running, so a long-stale task doesn't fire unexpectedly on
 # the next launch. Mirrors the recurring branch, which lets a single overdue slot
 # (missed == 1) run rather than fast-forwarding past it.
+#
+# Independent of `_FRESHNESS_WINDOW_SECONDS[Cadence.once]` below despite the shared
+# 1h value: this bounds how late a one-off may still run; the freshness window
+# suppresses a slot after a recent successful run. Tune them separately.
 _ONCE_CATCHUP_WINDOW_SECONDS = 60 * 60
 
 # Freshness guard (ENG-688): if a successful run — typically a manual
@@ -82,7 +86,10 @@ def _handle_missed_runs(session) -> None:
             # this same tick. Only disable it without running when it is overdue
             # beyond the catch-up window — the app was offline when its slot
             # passed — so a long-stale one-off doesn't fire on the next launch.
+            # Bump missed_runs like the recurring branch so an auto-disabled
+            # one-off carries a signal it was skipped rather than run.
             if (now - next_run).total_seconds() > _ONCE_CATCHUP_WINDOW_SECONDS:
+                schedule.missed_runs += 1
                 schedule.enabled = False
                 session.add(schedule)
             continue
