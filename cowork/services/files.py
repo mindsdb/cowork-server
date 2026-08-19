@@ -63,7 +63,7 @@ def stage_project_instructions(project_path: str | Path, conversation_id: str | 
     pod picks it up: anton reads ``<workspace>/.anton/anton.md``, but the pod's
     workspace is the conversation dir while the project's Instructions live at
     the project root — the same project-level/conversation-scoped delivery gap
-    as attachments. Idempotent (skips when the copy is current), best-effort.
+    as attachments. Re-copied every turn (the file is tiny), best-effort.
     Returns whether an instruction file is in place. ``.anton/anton.md`` matches
     anton's Workspace and cowork's project_files endpoint.
     """
@@ -91,13 +91,11 @@ def stage_project_instructions(project_path: str | Path, conversation_id: str | 
             pass
         return False
     try:
-        s = src.stat()
-        if dest.is_file():
-            d = dest.stat()
-            if d.st_size == s.st_size and d.st_mtime >= s.st_mtime:
-                return True
+        # anton.md is tiny — always overwrite rather than skip on a size/mtime
+        # match: a same-length edit that lands on the same mtime second (both
+        # files share the EFS clock) would otherwise serve stale instructions.
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)  # preserves mtime, so the check above stays cheap
+        shutil.copy2(src, dest)
         return True
     except OSError:
         logger.warning("could not stage instructions for conversation %s", conversation_id, exc_info=True)
