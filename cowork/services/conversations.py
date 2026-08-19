@@ -354,6 +354,7 @@ class ConversationService:
         from cowork.services.files import (
             FileService,
             attachment_purpose,
+            remove_conversation_workspace_dir,
             unlink_file_dirs,
         )
         attachment_dirs = FileService(self.session).delete_by_purpose(
@@ -378,6 +379,9 @@ class ConversationService:
         self.session.commit()
         unlink_file_dirs(attachment_dirs)
         remove_conversation_sessions(session_project_path, conversation_id)
+        # Also drop the per-conversation workspace (staged attachments +
+        # instructions on the shared mount) so it doesn't orphan there.
+        remove_conversation_workspace_dir(session_project_path, conversation_id)
         return True
 
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
