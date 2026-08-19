@@ -702,7 +702,11 @@ class ResponsesHandler:
 
         # Stage attachments + project instructions into the workspace before the
         # pod runs, so it can read them off the shared mount (no other channel).
-        self._stage_remote_workspace_files(producer_session, conv_id)
+        # Off the event loop: the copies are blocking fs I/O (multi-MB uploads,
+        # EFS latency) and would otherwise stall every other SSE stream on this
+        # worker. Safe to share the producer session with the thread — nothing
+        # else touches it until the reply stream below starts.
+        await asyncio.to_thread(self._stage_remote_workspace_files, producer_session, conv_id)
 
         async def replies_as_stream_events():
             from anton.core.llm.provider import StreamTextDelta
