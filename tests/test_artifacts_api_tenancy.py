@@ -60,9 +60,14 @@ def _scoped(session, org_id: str) -> ScopedSession:
     return ScopedSession(session, TenantScope(org_mode=True, org_id=org_id, user_id="u-1"))
 
 
-def _project_with_artifact(session, tmp_path, *, name, org_id, slug):
+def _project_with_artifact(session, tmp_path, *, name, org_id, slug, conversation=None):
     path = tmp_path / (org_id or "local") / name
-    folder = path / ".anton" / "artifacts" / slug
+    # Org projects carry the conversation segment the cloud pod writes under
+    # (artifact_roots.CONVERSATIONS_DIRNAME); desktop projects do not. Mirroring
+    # both real layouts here is what makes these tests exercise the resolver
+    # rather than a shape only the tests believe in.
+    workspace = path / "conversations" / (conversation or "c1") if org_id is not None else path
+    folder = workspace / ".anton" / "artifacts" / slug
     folder.mkdir(parents=True)
     (folder / "index.html").write_text("<html></html>")
     (folder / "metadata.json").write_text(
@@ -147,8 +152,9 @@ async def test_list_merges_projects_and_labels_them(session, tmp_path, org_mode)
 async def test_list_is_capped_at_eighty(session, tmp_path, org_mode):
     # The cap is pre-existing but matters more here: the org list spans every
     # project, so a large org silently loses the tail.
-    row, _ = _project_with_artifact(session, tmp_path, name="big", org_id=ORG_A, slug="a-000")
-    base = tmp_path / ORG_A / "big" / ".anton" / "artifacts"
+    row, first = _project_with_artifact(session, tmp_path, name="big", org_id=ORG_A, slug="a-000")
+    # Same conversation root the helper just created — sibling of a-000.
+    base = first.parent
     for i in range(1, 90):
         folder = base / f"a-{i:03d}"
         folder.mkdir()
