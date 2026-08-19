@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
 from cowork.db.scoped import ScopedSessionDep
+from cowork.principal import Principal, get_principal
 from cowork.schemas.schedules import (
     ScheduleCreateRequest,
     ScheduleResponse,
@@ -94,7 +95,12 @@ def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 
 
 @router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED)
-def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks):
+def run_schedule_now(
+    schedule_id: UUID,
+    scoped: ScopedSessionDep,
+    background_tasks: BackgroundTasks,
+    principal: Principal | None = Depends(get_principal),
+):
     try:
         schedule = ScheduleService(scoped).get_schedule(schedule_id)
     except ValueError as e:
@@ -108,9 +114,13 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
         project_id=schedule.project_id,
     )
 
+    # Pass the caller's principal so the background turn registers in the
+    # streaming registry under this user's org. Without it the run registers
+    # under the system scope and /responses/in-flight-list filters it out in
+    # org mode, so the client never shows an in-progress state (ENG-289).
     background_tasks.add_task(
         execute_schedule, schedule_id, is_manual=True,
-        conversation_id=conversation.id,
+        conversation_id=conversation.id, principal=principal,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
 

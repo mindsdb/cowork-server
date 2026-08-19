@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from cowork.common.datetime_utils import ensure_utc
@@ -12,6 +13,9 @@ from cowork.schedule_timing import count_missed_occurrences, next_future_occurre
 from cowork.schemas.schedules import Cadence, RunStatus
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 from cowork.streaming.registry import registry
+
+if TYPE_CHECKING:
+    from cowork.principal import Principal
 
 logger = get_logger(__name__)
 
@@ -98,6 +102,7 @@ async def execute_schedule(
     schedule_id: UUID,
     is_manual: bool = False,
     conversation_id: UUID | None = None,
+    principal: "Principal | None" = None,
 ) -> None:
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
@@ -147,8 +152,16 @@ async def execute_schedule(
         async def _drain_run() -> None:
             # ResponsesHandler takes a RAW session (it wraps its own scope from
             # the principal); hand it the underlying session, not our scoped one.
+            # Pass the requesting principal (manual "Run now") so the turn
+            # registers in the streaming registry under the caller's org, not
+            # the system scope — otherwise /responses/in-flight-list filters it
+            # out in org mode and no client ever sees the run as in progress
+            # (ENG-289 / ENG-1465). None on the cron path keeps today's
+            # local-mode behavior.
             from cowork.db.scoped import unsafe_unscoped_session
-            stream = await ResponsesHandler(unsafe_unscoped_session(session)).handle(request)
+            stream = await ResponsesHandler(
+                unsafe_unscoped_session(session), principal=principal
+            ).handle(request)
             async for _ in stream:
                 pass
 
