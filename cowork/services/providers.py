@@ -854,10 +854,12 @@ def build_llm_client():
             # the user pointed us at. An explicit non-secret string keeps that
             # fallback from ever engaging.
             #
-            # deepcode ignore HardcodedNonCryptoSecret: not a credential — a literal placeholder for an endpoint that authenticates no one, deliberately used so the SDK cannot fall back to a real ambient OPENAI_API_KEY.
             if key is None and role == Provider.OPENAI_COMPATIBLE and base:
                 return OpenAIProvider(
-                    api_key=NO_AUTH_PLACEHOLDER, base_url=base, **effort_kw
+                    # deepcode ignore HardcodedNonCryptoSecret: not a credential — a placeholder for an endpoint that authenticates no one, used so the SDK cannot fall back to a real ambient OPENAI_API_KEY.
+                    api_key=NO_AUTH_PLACEHOLDER,
+                    base_url=base,
+                    **effort_kw,
                 )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
