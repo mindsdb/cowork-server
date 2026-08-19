@@ -570,6 +570,23 @@ class ResponsesHandler:
         )
 
     @staticmethod
+    def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
+        """Stage the project-level files the pod can't otherwise see — the
+        conversation's attachments and the project's anton.md instructions —
+        into the conversation workspace on the shared mount. Never fails the
+        turn: a staging error degrades to a turn without them, same policy as
+        memory/skills."""
+        try:
+            from cowork.services.files import stage_project_instructions
+
+            conversation = ConversationService(session).get_conversation(conv_id)
+            project_path = conversation.project.path
+            FileService(session).stage_conversation_attachments(conv_id, project_path)
+            stage_project_instructions(project_path, conv_id)
+        except Exception:
+            logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
+
+    @staticmethod
     def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
         """The conversation's project as a path relative to the org root.
 
@@ -718,6 +735,14 @@ class ResponsesHandler:
             collected_events.append(data)
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
+
+        # Stage attachments + project instructions into the workspace before the
+        # pod runs, so it can read them off the shared mount (no other channel).
+        # Off the event loop: the copies are blocking fs I/O (multi-MB uploads,
+        # EFS latency) and would otherwise stall every other SSE stream on this
+        # worker. Safe to share the producer session with the thread — nothing
+        # else touches it until the reply stream below starts.
+        await asyncio.to_thread(self._stage_remote_workspace_files, producer_session, conv_id)
 
         async def replies_as_stream_events():
             from anton.core.llm.provider import StreamTextDelta
