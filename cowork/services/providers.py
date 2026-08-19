@@ -64,6 +64,11 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+# Sent as the api_key to an endpoint that authenticates no one (a local model
+# server). Never a credential, and never sent anywhere that reads one.
+# deepcode ignore HardcodedNonCryptoSecret: a placeholder for "no authentication", not a secret.
+NO_AUTH_PLACEHOLDER = "not-needed"
+
 
 def provider_base_url(
     provider: str, *, openai_base_url: str = "", minds_url: str = ""
@@ -840,10 +845,19 @@ def build_llm_client():
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
             # A local endpoint authenticates by being reachable, so an
             # openai-compatible provider with a base URL and no key is a valid
-            # config, not a broken one. The SDK still requires some string.
+            # config, not a broken one.
+            #
+            # The placeholder is load-bearing, not filler. anton drops the
+            # api_key kwarg when it is falsy, and the OpenAI SDK then falls back
+            # to an ambient OPENAI_API_KEY from the environment — so passing
+            # nothing here could send an unrelated real key to whatever machine
+            # the user pointed us at. An explicit non-secret string keeps that
+            # fallback from ever engaging.
+            #
+            # deepcode ignore HardcodedNonCryptoSecret: not a credential — a literal placeholder for an endpoint that authenticates no one, deliberately used so the SDK cannot fall back to a real ambient OPENAI_API_KEY.
             if key is None and role == Provider.OPENAI_COMPATIBLE and base:
                 return OpenAIProvider(
-                    api_key="not-needed", base_url=base, **effort_kw
+                    api_key=NO_AUTH_PLACEHOLDER, base_url=base, **effort_kw
                 )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
