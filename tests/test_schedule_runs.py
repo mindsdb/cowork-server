@@ -22,12 +22,19 @@ def _session():
     return session
 
 
-def _schedule(session: Session) -> Schedule:
+def _schedule(
+    session: Session,
+    *,
+    cadence: str = "daily",
+    next_run_at: datetime = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+    title: str = "Daily report",
+    prompt: str = "Summarize",
+) -> Schedule:
     schedule = Schedule(
-        title="Daily report",
-        prompt="Summarize",
-        cadence="daily",
-        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        title=title,
+        prompt=prompt,
+        cadence=cadence,
+        next_run_at=next_run_at,
         model="default",
         project_id=GENERAL_PROJECT_ID,
     )
@@ -495,21 +502,6 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
 # --- ENG-1675: a due one-off must RUN on the tick its slot passes, not get
 # disabled ("Paused") by the missed-run sweep before `_due_schedules` sees it.
 
-def _once_schedule(session: Session, next_run_at: datetime) -> Schedule:
-    schedule = Schedule(
-        title="One-off report",
-        prompt="Reply OK",
-        cadence="once",
-        next_run_at=next_run_at,
-        model="default",
-        project_id=GENERAL_PROJECT_ID,
-    )
-    session.add(schedule)
-    session.commit()
-    session.refresh(schedule)
-    return schedule
-
-
 def test_missed_runs_leaves_just_due_once_enabled_to_run():
     from cowork.scheduler import _due_schedules, _handle_missed_runs
 
@@ -517,7 +509,7 @@ def test_missed_runs_leaves_just_due_once_enabled_to_run():
     now = datetime.now(timezone.utc)
     # Slot passed 30s ago — the normal case where the app is open and the
     # scheduled time just arrived. It must stay enabled and be run.
-    schedule = _once_schedule(session, now - timedelta(seconds=30))
+    schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=30))
     scoped = ScopedSession(session, SYSTEM_SCOPE)
 
     _handle_missed_runs(scoped)
@@ -533,14 +525,44 @@ def test_missed_runs_disables_stale_once_overdue_beyond_window():
     session = _session()
     now = datetime.now(timezone.utc)
     # Slot passed hours ago (app was offline) — do not fire it late.
-    schedule = _once_schedule(session, now - timedelta(hours=2))
+    schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(hours=2))
     scoped = ScopedSession(session, SYSTEM_SCOPE)
 
     _handle_missed_runs(scoped)
 
     session.refresh(schedule)
     assert schedule.enabled is False
+    # Auto-disabled without running carries a missed-run signal.
+    assert schedule.missed_runs == 1
     assert _due_schedules(scoped, now) == []
+
+
+def test_missed_runs_once_near_catchup_boundary():
+    from cowork.scheduler import (
+        _ONCE_CATCHUP_WINDOW_SECONDS,
+        _due_schedules,
+        _handle_missed_runs,
+    )
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    window = _ONCE_CATCHUP_WINDOW_SECONDS
+    # Straddle the catch-up boundary: just inside stays enabled and runs, just
+    # outside is disabled. `_handle_missed_runs` reads its own wall clock, so a
+    # small margin keeps each case on its intended side without flaking.
+    inside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window - 30))
+    outside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window + 30))
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    _handle_missed_runs(scoped)
+
+    session.refresh(inside)
+    session.refresh(outside)
+    assert inside.enabled is True
+    assert outside.enabled is False
+    due_ids = [s.id for s in _due_schedules(scoped, now)]
+    assert inside.id in due_ids
+    assert outside.id not in due_ids
 
 
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
