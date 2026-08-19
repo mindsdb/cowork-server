@@ -387,3 +387,128 @@ def test_delete_after_root_move_still_ignores_escaped_paths(engine, tmp_path, mo
         assert (victim / "keep.txt").exists()  # untouched
     finally:
         get_app_settings.cache_clear()
+
+
+# ── cloud attachment staging into the pod workspace ──────────────────────────
+
+def test_stage_conversation_attachments_copies_into_workspace(engine, tmp_path):
+    svc = _svc(engine, _scope(ORG_A))
+    conv = str(uuid4())
+    a = svc.create_file_from_bytes(filename="shot.png", content_type="image/png",
+                                   data=b"img", purpose=attachment_purpose(conv))
+    b = svc.create_file_from_bytes(filename="notes.txt", content_type="text/plain",
+                                   data=b"hi", purpose=attachment_purpose(conv))
+    proj = tmp_path / "proj"
+    assert svc.stage_conversation_attachments(conv, proj) == 2
+    base = proj / "conversations" / conv / "attachments"
+    assert (base / str(a.id) / "shot.png").read_bytes() == b"img"
+    assert (base / str(b.id) / "notes.txt").read_bytes() == b"hi"
+
+
+def test_stage_is_idempotent_and_conversation_scoped(engine, tmp_path):
+    svc = _svc(engine, _scope(ORG_A))
+    conv, other = str(uuid4()), str(uuid4())
+    svc.create_file_from_bytes(filename="a.txt", content_type="text/plain",
+                               data=b"x", purpose=attachment_purpose(conv))
+    svc.create_file_from_bytes(filename="b.txt", content_type="text/plain",
+                               data=b"y", purpose=attachment_purpose(other))
+    proj = tmp_path / "proj"
+    assert svc.stage_conversation_attachments(conv, proj) == 1      # only this conv's
+    assert svc.stage_conversation_attachments(conv, proj) == 1      # idempotent
+    assert not (proj / "conversations" / other).exists()           # other conv untouched
+
+
+def test_stage_project_instructions_copies_anton_md_into_workspace(tmp_path):
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    (proj / ".anton").mkdir(parents=True)
+    (proj / ".anton" / "anton.md").write_text("# Project rules\nBe concise.")
+
+    assert stage_project_instructions(proj, conv) is True
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    assert dest.read_text() == "# Project rules\nBe concise."
+    # idempotent: no error, still in place
+    assert stage_project_instructions(proj, conv) is True
+    assert dest.is_file()
+
+
+def test_stage_project_instructions_noop_without_anton_md(tmp_path):
+    from cowork.services.files import stage_project_instructions
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert stage_project_instructions(proj, str(uuid4())) is False
+
+
+def test_stage_prunes_a_deleted_attachment(engine, tmp_path):
+    svc = _svc(engine, _scope(ORG_A))
+    conv = str(uuid4())
+    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+                                   data=b"k", purpose=attachment_purpose(conv))
+    b = svc.create_file_from_bytes(filename="gone.txt", content_type="text/plain",
+                                   data=b"g", purpose=attachment_purpose(conv))
+    proj = tmp_path / "proj"
+    assert svc.stage_conversation_attachments(conv, proj) == 2
+    base = proj / "conversations" / conv / "attachments"
+    assert (base / str(b.id)).is_dir()
+
+    svc.delete_file(b.id)                       # user removes one attachment
+    assert svc.stage_conversation_attachments(conv, proj) == 1
+    assert (base / str(a.id)).is_dir()          # kept one remains
+    assert not (base / str(b.id)).exists()      # deleted one pruned → agent stops seeing it
+
+
+def test_stage_rejects_non_uuid_conversation_segment(engine, tmp_path):
+    from cowork.services.files import stage_project_instructions
+    svc = _svc(engine, _scope(ORG_A))
+    assert svc.stage_conversation_attachments("../evil", tmp_path / "proj") == 0
+    assert stage_project_instructions(tmp_path / "proj", "../evil") is False
+
+
+def test_remove_conversation_workspace_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")   # cloud-only cleanup
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    ws = proj / "conversations" / conv
+    (ws / "attachments" / "x").mkdir(parents=True)
+    (ws / ".anton").mkdir(parents=True)
+    remove_conversation_workspace_dir(proj, conv)
+    assert not ws.exists()
+    remove_conversation_workspace_dir(proj, conv)   # idempotent, no error
+    remove_conversation_workspace_dir(None, conv)   # no project → no-op
+
+
+def test_remove_conversation_workspace_dir_is_noop_on_desktop(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    ws = proj / "conversations" / conv
+    (ws / "notes").mkdir(parents=True)               # a user's own dir, coincidental name
+    remove_conversation_workspace_dir(proj, conv)
+    assert ws.exists(), "desktop conversation delete must not rmtree a project subdir"
+
+
+def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
+    """A typo-fix edit (same length, same mtime second) must still re-stage —
+    the old size+mtime skip could serve stale instructions."""
+    import os
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    (proj / ".anton").mkdir(parents=True)
+    src = proj / ".anton" / "anton.md"
+    src.write_text("be terse")
+    assert stage_project_instructions(proj, conv) is True
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    assert dest.read_text() == "be terse"
+
+    # same-length edit, pinned to the same mtime as the staged copy
+    fixed_mtime = dest.stat().st_mtime
+    src.write_text("be funny")                       # same length (8), different content
+    os.utime(src, (fixed_mtime, fixed_mtime))
+    assert stage_project_instructions(proj, conv) is True
+    assert dest.read_text() == "be funny"            # re-staged despite the tie
