@@ -150,14 +150,10 @@ async def execute_schedule(
             },
         )
         async def _drain_run() -> None:
-            # ResponsesHandler takes a RAW session (it wraps its own scope from
-            # the principal); hand it the underlying session, not our scoped one.
-            # Pass the requesting principal (manual "Run now") so the turn
-            # registers in the streaming registry under the caller's org, not
-            # the system scope — otherwise /responses/in-flight-list filters it
-            # out in org mode and no client ever sees the run as in progress
-            # (ENG-289 / ENG-1465). None on the cron path keeps today's
-            # local-mode behavior.
+            # Raw session (the handler re-scopes from the principal). The
+            # principal must be the caller's so the turn registers under their
+            # org and shows in /responses/in-flight-list; None on the cron path
+            # keeps local-mode behavior.
             from cowork.db.scoped import unsafe_unscoped_session
             stream = await ResponsesHandler(
                 unsafe_unscoped_session(session), principal=principal
