@@ -179,6 +179,25 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 
+### The default model is the one the free allowance covers
+
+Every minds-cloud role defaults to `mindshub_air` (`MODEL_ROLE_DEFAULTS` in
+`cowork/common/settings/app_settings.py`), for all three roles: planning, coding
+and router. Its usage draws the monthly included allowance, so a user who has
+picked no model can finish a whole turn without the wallet being charged for any
+part of it.
+
+The two roles a user never sees are why this is the default rather than a
+premium model. Planning is the model in the picker, so a wrong choice there is
+visible and fixable. Coding (the completion verifier and the scratchpad) and
+router (respond-versus-delegate gating and history summarization) run unseen, so
+a paid default there is denied on an empty wallet with nothing on screen to
+explain why.
+
+An explicitly stored model is never rewritten by this. Paying for a better model
+is a pick in the Settings picker, and a funded wallet resolves to the same
+default as an empty one until that pick is made.
+
 ### Provider probes always use a model any key can call
 
 Both `POST /settings/test-providers` (the Settings health dot) and
