@@ -422,6 +422,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         live_efforts = listing.efforts
         live_enabled = listing.enabled
         live_labels = listing.labels
+        live_role_defaults = listing.role_defaults
         if live:
             recommended["minds-cloud"] = live
             # Cache the availability map so model-default resolution
@@ -456,6 +457,36 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
                     # member can trigger this refresh but can't steer what's
                     # stored — and gating it would leave the map stale.
                     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+        # Cache the catalog's declared per-role defaults on the same terms, so a
+        # default moved in the config reaches this install on its next settings
+        # load with no client release (UserSettings._minds_role_default_map).
+        #
+        # Its OWN guard and its own compare, deliberately NOT folded into the
+        # block above: that one is gated on `live_enabled`, and a gateway that
+        # lists ids without `enabled` flags yields an empty map there while still
+        # publishing perfectly good role defaults. Nested, the defaults would be
+        # silently dropped for exactly that gateway.
+        #
+        # Non-empty is the same rule and for the same reason: writing {} over a
+        # good map would drop every role back to the compiled constant, which is
+        # a client release behind. A gateway that predates `default_for` omits it
+        # per row, so an empty parse means "nothing to say", not "no defaults".
+        if live_role_defaults:
+            desired_roles = json.dumps(live_role_defaults, sort_keys=True)
+            try:
+                stored_roles = json.dumps(json.loads(s.minds_role_defaults or "{}"), sort_keys=True)
+            except (ValueError, TypeError):
+                stored_roles = "{}"
+            if desired_roles != stored_roles:
+                SettingService(session, scope).upsert_setting("minds_role_defaults", desired_roles)
+            # The picker asks the server which model each role starts on, so it
+            # has to be told the same answer resolution will give. Left off the
+            # static map, the two disagree the moment a default moves in config
+            # and the user sees one model in Settings while turns run another.
+            pair["minds-cloud"] = [
+                live_role_defaults.get(role, fallback)
+                for role, fallback in zip(("planning", "coding", "router"), pair["minds-cloud"])
+            ]
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)

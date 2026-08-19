@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 
 from cowork.common.settings.app_settings import (
+    AGENT_ROLE_NAMES,
     CODING_MODEL_DEFAULTS,
     MINDS_FREE_MODEL,
     PLANNING_MODEL_DEFAULTS,
@@ -684,9 +685,23 @@ class UserSettings(Settings):
         ),
     )
 
+    minds_role_defaults: Annotated[str, ORG] = Field(
+        default="{}",
+        title="MindsHub Role Defaults",
+        description=(
+            "JSON-encoded map of agent role -> the model id MindsHub's catalog "
+            "declares as that role's default, cached from /v1/models whenever "
+            "recommended-models fetches it live. Lets the default a new user "
+            "starts on move by config, without a client release and without a "
+            "network call in the turn path."
+        ),
+    )
+
     # Memoized parse of `minds_model_enabled` (see `_minds_enabled_map`). Not a
     # settings field — never validated or serialized.
     _enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
+    # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
+    _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
 
     @field_validator("harness")
     @classmethod
@@ -727,6 +742,60 @@ class UserSettings(Settings):
         self._enabled_map_cache = result
         return result
 
+    def _minds_role_default_map(self) -> dict[str, str]:
+        """The cached agent-role -> model-id map MindsHub's catalog declares, or {}.
+
+        Sourced from the ``minds_role_defaults`` setting, which the
+        recommended-models endpoint refreshes from ``/v1/models`` on every
+        settings load, so moving a default in the catalog reaches this install on
+        its next settings load with no client release.
+
+        Parsed once per instance and memoized, for the same reason
+        ``_minds_enabled_map`` is: this is read once per role by
+        ``apply_model_defaults`` and again by each ``resolved_*_model``.
+        """
+        if self._role_default_cache is not None:
+            return self._role_default_cache
+        try:
+            raw = json.loads(self.minds_role_defaults or "{}")
+        except (ValueError, TypeError):
+            raw = {}
+        # Both halves must be real non-empty strings. A role is looked up by name
+        # and its value is handed to the gateway as a model id, so a stringified
+        # null or a number here would resolve a role onto a model that cannot
+        # exist, and the compiled fallback below is strictly better than that.
+        result = (
+            {
+                k: v
+                for k, v in raw.items()
+                if isinstance(k, str) and isinstance(v, str) and k in AGENT_ROLE_NAMES and v
+            }
+            if isinstance(raw, dict)
+            else {}
+        )
+        self._role_default_cache = result
+        return result
+
+    def _defaults_for_role(self, role: str, compiled: dict[str, str]) -> dict[str, str]:
+        """``compiled``, with the catalog's declared default over the minds-cloud slot.
+
+        The one place the remote declaration is preferred over the compiled table,
+        so the six resolution sites cannot drift on which wins.
+
+        Only the minds-cloud slot moves. The direct providers are BYOK models that
+        are not in MindsHub's catalog, so it has nothing to say about them and
+        their defaults stay compiled in.
+
+        The compiled value is not dead code underneath: it is what resolves before
+        any ``/v1/models`` fetch has been persisted, which is every fresh install
+        on its first message, and what resolves when the catalog is unreachable.
+        Demoted, not retired.
+        """
+        declared = self._minds_role_default_map().get(role)
+        if declared is None:
+            return compiled
+        return {**compiled, Provider.MINDS_CLOUD.value: declared}
+
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
         # Defaults are availability-aware for minds-cloud: when the canonical
@@ -755,15 +824,21 @@ class UserSettings(Settings):
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
-                self.planning_provider.value, PLANNING_MODEL_DEFAULTS, enabled_map
+                self.planning_provider.value,
+                self._defaults_for_role("planning", PLANNING_MODEL_DEFAULTS),
+                enabled_map,
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
-                self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value,
+                self._defaults_for_role("coding", CODING_MODEL_DEFAULTS),
+                enabled_map,
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value,
+                self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
+                enabled_map,
             )
         return self
 
@@ -820,7 +895,7 @@ class UserSettings(Settings):
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
-            PLANNING_MODEL_DEFAULTS,
+            self._defaults_for_role("planning", PLANNING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
         )
 
@@ -833,7 +908,7 @@ class UserSettings(Settings):
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
-            CODING_MODEL_DEFAULTS,
+            self._defaults_for_role("coding", CODING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -851,7 +926,7 @@ class UserSettings(Settings):
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
-            ROUTER_MODEL_DEFAULTS,
+            self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
         )

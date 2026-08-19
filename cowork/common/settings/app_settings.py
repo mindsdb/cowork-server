@@ -90,6 +90,15 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
         "router": MINDS_FREE_MODEL,
     },
 }
+# The agent roles a model is resolved for, taken from the table above rather than
+# retyped, so a role added there is a role the catalog is allowed to declare a
+# default for. Mirrors the role enum in the MindsHub model policy's JSON Schema;
+# the two are a cross-repo contract and a role in one and not the other is
+# silently dropped at the parse in fetch_minds_models.
+AGENT_ROLE_NAMES: frozenset[str] = frozenset(
+    role for roles in MODEL_ROLE_DEFAULTS.values() for role in roles
+)
+
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {p: r["planning"] for p, r in MODEL_ROLE_DEFAULTS.items()}
 CODING_MODEL_DEFAULTS: dict[str, str] = {p: r["coding"] for p, r in MODEL_ROLE_DEFAULTS.items()}
 ROUTER_MODEL_DEFAULTS: dict[str, str] = {p: r["router"] for p, r in MODEL_ROLE_DEFAULTS.items()}
