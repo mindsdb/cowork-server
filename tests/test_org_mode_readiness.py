@@ -151,9 +151,27 @@ class TestOrgModeCreditAwareDefaults:
         assert s.resolved_planning_model == _PLANNING
         assert s.resolved_coding_model == MINDS_FREE_MODEL
 
-    def test_org_explicit_choice_is_never_rewritten(self, org_mode):
+    def test_org_explicit_stored_choice_survives_the_default_fill(self, org_mode):
+        # apply_model_defaults only fills a None model at construction time —
+        # an explicitly stored value (whatever it is) is never touched there,
+        # regardless of what resolved_planning_model later does with it.
         s = _settings(minds_model_enabled=self.FREE, planning_model="opus")
-        assert s.resolved_planning_model == "opus"
+        assert s.planning_model == "opus"
+
+    def test_org_explicit_choice_of_an_available_model_is_not_rewritten(self, org_mode):
+        # A real, currently-enabled MindsHub pick is left alone by the
+        # wallet-aware fallback below — only a locked/foreign id gets swapped.
+        s = _settings(minds_model_enabled=self.PAID, planning_model=_PLANNING)
+        assert s.resolved_planning_model == _PLANNING
+
+    def test_org_explicit_choice_of_a_locked_or_foreign_model_falls_back(self, org_mode):
+        # wallet_aware (ENG-1632 follow-up): planning gets the same fallback
+        # as coding/router — an id absent from a non-empty map (e.g. a BYOK
+        # id like "opus" surviving a MindsHub SSO sign-in, or a locked
+        # MindsHub model) resolves to the first enabled model instead of
+        # 404ing the gateway on every turn.
+        s = _settings(minds_model_enabled=self.FREE, planning_model="opus")
+        assert s.resolved_planning_model == MINDS_FREE_MODEL
 
 
 def test_ambient_provider_keys_do_not_override_minds(monkeypatch, org_mode):
