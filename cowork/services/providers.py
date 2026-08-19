@@ -838,6 +838,13 @@ def build_llm_client():
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            # A local endpoint authenticates by being reachable, so an
+            # openai-compatible provider with a base URL and no key is a valid
+            # config, not a broken one. The SDK still requires some string.
+            if key is None and role == Provider.OPENAI_COMPATIBLE and base:
+                return OpenAIProvider(
+                    api_key="not-needed", base_url=base, **effort_kw
+                )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
             # No base for openai-compatible → OpenAIProvider would silently
