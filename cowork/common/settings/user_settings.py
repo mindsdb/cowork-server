@@ -12,7 +12,6 @@ from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_valid
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     MINDS_FREE_MODEL,
-    role_defaults,
     PLANNING_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
@@ -119,23 +118,26 @@ def _enabled_aware_default(
 ) -> str | None:
     """The provider's canonical default model, adjusted for availability.
 
-    MindsHub marks a model the org's wallet can't currently pay for (or whose
-    free allowance is exhausted) as ``enabled: false`` from ``/v1/models``, so
-    blindly handing out the canonical default could be denied every turn. When
-    the cached availability map (``minds_model_enabled``) marks the default as
-    disabled, fall back to the first enabled model in the map — the map
-    preserves the gateway's ``/v1/models`` ordering, which lists the
-    free/baseline model first. Applies only to minds-cloud: direct (BYOK)
-    providers have no such availability map.
+    Applies only to minds-cloud; direct (BYOK) providers have no such
+    availability map. A non-empty map always carries an explicit flag for
+    every alias the catalog serves, so a default that's locked OR simply
+    missing from it falls back to the first enabled model — missing means
+    gone (renamed/retired), not degraded data. An empty/absent map (no tier
+    data at all) leaves the default untouched.
 
-    Deliberately conservative: an absent/empty map, a default missing from the
-    map, or a map with nothing enabled all leave the canonical default
-    untouched — degraded metadata must never change behavior.
+    Org mode requires the same positive evidence, but falls back to
+    MINDS_FREE_MODEL instead, so a credit-less org isn't charged.
     """
     default = defaults.get(provider_value)
-    if provider_value != Provider.MINDS_CLOUD.value or not enabled_map:
+    if provider_value != Provider.MINDS_CLOUD.value:
         return default
-    if default is None or enabled_map.get(default, True):
+    if get_app_settings().tenancy_mode == "org":
+        if default is not None and enabled_map.get(default) is True:
+            return default
+        return MINDS_FREE_MODEL
+    if not enabled_map:
+        return default
+    if default is None or enabled_map.get(default) is True:
         return default
     for model_id, enabled in enabled_map.items():
         if enabled:
@@ -794,15 +796,15 @@ class UserSettings(Settings):
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
-                self.planning_provider.value, role_defaults(PLANNING_MODEL_DEFAULTS), enabled_map
+                self.planning_provider.value, PLANNING_MODEL_DEFAULTS, enabled_map
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
-                self.coding_provider.value, role_defaults(CODING_MODEL_DEFAULTS), enabled_map
+                self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, role_defaults(ROUTER_MODEL_DEFAULTS), enabled_map
+                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
             )
         return self
 
@@ -873,7 +875,7 @@ class UserSettings(Settings):
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
-            role_defaults(PLANNING_MODEL_DEFAULTS),
+            PLANNING_MODEL_DEFAULTS,
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -887,7 +889,7 @@ class UserSettings(Settings):
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
-            role_defaults(CODING_MODEL_DEFAULTS),
+            CODING_MODEL_DEFAULTS,
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -905,7 +907,7 @@ class UserSettings(Settings):
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
-            role_defaults(ROUTER_MODEL_DEFAULTS),
+            ROUTER_MODEL_DEFAULTS,
             self._minds_enabled_map(),
             wallet_aware=True,
         )
