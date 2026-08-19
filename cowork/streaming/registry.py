@@ -27,6 +27,16 @@ from cowork.streaming.buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on a single in-flight turn. A hung producer (wedged tool call,
+# stalled model stream) otherwise runs forever: its handle stays `is_running`,
+# no terminal record is ever written, and an in-process FileStreamBuffer tail
+# — the desktop path — blocks indefinitely, holding the client's shared stream
+# slot so sends wedge in every conversation (ENG-1717). Boot recovery
+# (`seal_orphan_buffers`) only covers a genuine process restart; a re-adopted
+# crash-orphan sidecar keeps the same hung task alive, so the bound has to be
+# enforced at runtime. Mirrors the scheduler's _MAX_RUN_DURATION_SECONDS.
+_MAX_TURN_DURATION_SECONDS = 600
+
 
 @dataclass
 class TurnLifecycle:
@@ -128,7 +138,10 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 return existing
-            task = asyncio.create_task(producer_coro, name=f"turn[{conversation_id}/{turn_id}]")
+            task = asyncio.create_task(
+                self._run_bounded(producer_coro, conversation_id, turn_id),
+                name=f"turn[{conversation_id}/{turn_id}]",
+            )
             handle = RunHandle(
                 conversation_id=conversation_id,
                 turn_id=turn_id,
@@ -143,6 +156,30 @@ class RunRegistry:
             )
             self._by_cid[conversation_id] = handle
             return handle
+
+    async def _run_bounded(self, producer_coro, conversation_id: str, turn_id: int) -> None:
+        """Run a producer under an upper bound on turn duration (ENG-1717).
+
+        On timeout the producer is cancelled. Every producer's CancelledError
+        handler persists its pending state and closes the buffer with a
+        terminal record (the same path a user Stop takes), so the tail ends and
+        the client releases its shared stream slot instead of wedging every
+        conversation's sends behind a turn that will never finish.
+
+        An external cancel/discard cancels this wrapper; ``wait_for`` propagates
+        that into the producer unchanged, so ``RunHandle.cancel`` and
+        ``discard`` keep working as before. A producer that raises on its own
+        propagates here exactly as it did when it was the registered task
+        directly — no swallowing.
+        """
+        try:
+            await asyncio.wait_for(producer_coro, timeout=_MAX_TURN_DURATION_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Turn for conversation %s (turn %d) exceeded max duration of %ss; "
+                "producer cancelled and its buffer sealed.",
+                conversation_id, turn_id, _MAX_TURN_DURATION_SECONDS,
+            )
 
     def get(self, conversation_id: str) -> Optional[RunHandle]:
         """Current handle (incl. recently-finished, useful for replay)."""
