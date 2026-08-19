@@ -120,6 +120,39 @@ async def test_ineligible_request_shapes_delegate_without_router_call(
 
 
 @pytest.mark.asyncio
+async def test_model_override_wins_over_settings_router_model(monkeypatch):
+    """ENG-1656 follow-up: the composer's per-conversation model pick must
+    drive the router gate too, not just cosmetically label the response."""
+    import cowork.handlers.response_routing as routing
+
+    client = _Client(_response(content="The result was 42."))
+    seen_models = []
+
+    async def fake_gate(binding, *, history):
+        seen_models.append(binding.model)
+        return "The result was 42."
+
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="router-model"),
+    )
+    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "_gate", fake_gate)
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "Hello"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        model_override="picked-model",
+    )
+
+    assert seen_models == ["picked-model"]
+    assert decision.model == "picked-model"
+
+
+@pytest.mark.asyncio
 async def test_router_decline_delegates(monkeypatch):
     import cowork.handlers.response_routing as routing
 
@@ -254,6 +287,36 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
 
     assert seen["scope"] is sentinel_scope
     assert turn_llm is None
+
+
+@pytest.mark.asyncio
+async def test_route_request_forwards_model_to_decide_route(monkeypatch):
+    """ENG-1656 follow-up: the composer's model pick must reach the gate."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen["model_override"] = kwargs.get("model_override")
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id=None,
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        model="picked-model",
+    )
+
+    assert seen["model_override"] == "picked-model"
 
 
 @pytest.mark.asyncio

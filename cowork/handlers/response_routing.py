@@ -69,16 +69,20 @@ async def _gate(binding: RouterBinding, *, history: list[dict]):
     return text or None
 
 
-def _settings_binding() -> RouterBinding | None:
-    """Router binding from stored settings (desktop / BYOK orgs)."""
+def _settings_binding(model_override: str | None = None) -> RouterBinding | None:
+    """Router binding from stored settings (desktop / BYOK orgs).
+
+    `model_override` is the composer's per-conversation model pick, taking
+    precedence over the account-wide router_model for this turn only.
+    """
     settings = get_user_settings()
-    model = settings.resolved_router_model
+    model = model_override or settings.resolved_router_model
     if not model:
         return None
     client = build_llm_client()
     return RouterBinding(
         provider=client.router_provider,
-        model=client.router_model or model,
+        model=model_override or client.router_model or model,
         label=settings.resolved_router_provider.value,
     )
 
@@ -134,11 +138,13 @@ async def decide_route(
     has_attachments: bool,
     has_disabled_connections: bool,
     binding: RouterBinding | None = None,
+    model_override: str | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation using the configured router role.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
-    per-turn key); when None the binding comes from stored settings.
+    per-turn key); when None the binding comes from stored settings, honoring
+    `model_override` (the composer's per-conversation model pick) if given.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
     """
@@ -156,7 +162,7 @@ async def decide_route(
 
     try:
         if binding is None:
-            binding = _settings_binding()
+            binding = _settings_binding(model_override)
         if binding is None:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True

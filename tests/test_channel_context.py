@@ -98,7 +98,7 @@ def test_stream_response_forwards_channel_context(monkeypatch):
     monkeypatch.setattr(autopublish, "autopublish_project_artifacts", _no_autopublish)
     received = {}
 
-    async def _fake_build(self, conversation, disabled_connections, channel_context=None):
+    async def _fake_build(self, conversation, model=None, disabled_connections=None, channel_context=None):
         received["channel_context"] = channel_context
         return _FakeSession(), None, None
 

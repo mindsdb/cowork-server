@@ -14,7 +14,12 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 @router.get("/")
 def list_skills(scope: ScopeDep):
-    skills = SkillService(scope).list_skills()
+    # Seeded here for an org that opens this menu before it has ever chatted.
+    # The turn payload seeds too, so whichever comes first wins; see
+    # `build_turn_skills`.
+    skill_service = SkillService(scope)
+    skill_service.ensure_builtin_skills()
+    skills = skill_service.list_skills()
     return {"skills": [SkillResponse.serialize(s) for s in skills]}
 
 
