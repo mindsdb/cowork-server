@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from cowork.common.settings.app_settings import default_minds_api_host
+from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
@@ -175,18 +175,31 @@ class MindsModelListing(NamedTuple):
     # what the picker tags "latest"; anything else names the moving alias this
     # row is a frozen version of.
     families: dict[str, str]
+    # Agent role -> the model id the catalog declares as that role's default,
+    # inverted from the per-row ``default_for`` list. Keyed by role rather than by
+    # model id, unlike every other map here, because that is the question asked of
+    # it: resolution wants "what starts the planning role", not "which roles does
+    # this model lead". Empty whenever the gateway publishes no defaults, which
+    # includes every gateway that predates the field and every plain
+    # OpenAI-compatible endpoint.
+    #
+    # Required rather than defaulted, like every other field here. A NamedTuple
+    # default is one object shared by every instance that omits it, which is the
+    # hazard ``_empty_listing`` is a factory to avoid; a default would reintroduce
+    # it for the sake of not touching three test fakes.
+    role_defaults: dict[str, str]
 
 
 def _empty_listing() -> MindsModelListing:
     """The "we got nothing" listing: ``ids`` None, every map empty.
 
-    One place to build it, so the failure paths don't each repeat six literals
+    One place to build it, so the failure paths don't each repeat the literals
     that have to agree. A factory rather than a shared constant because a
-    failure is also cached, per base URL: handing every entry the same five dict
+    failure is also cached, per base URL: handing every entry the same dict
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {})
 
 
 # Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
@@ -303,6 +316,7 @@ async def fetch_minds_models(
     labels: dict[str, str] = {}
     providers: dict[str, str] = {}
     families: dict[str, str] = {}
+    role_defaults: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -360,8 +374,24 @@ async def fetch_minds_models(
             # version "latest" — the one claim it must never make. Recorded, the
             # app sees a pin whose head it cannot find and lists it plainly.
             families[model_id] = family
+        # Which agent roles this model is the catalog's default for. Inverted
+        # here, at the single place every row is parsed, so resolution can ask
+        # "what starts the planning role" without walking the catalog.
+        #
+        # A role we do not serve is dropped rather than recorded. The catalog is
+        # editable in a console, so an unknown role is a typo far more often than
+        # a role a newer client understands, and carrying it would mean a stored
+        # map whose keys nothing reads. The gateway-side gate rejects that typo
+        # before it ships; this is what keeps a live one out of the settings row.
+        # First declaration wins, which cannot arise against a validated catalog
+        # and keeps the parse total when it does.
+        for role in row.get("default_for") or ():
+            if isinstance(role, str) and role in AGENT_ROLE_NAMES:
+                role_defaults.setdefault(role, model_id)
     return _remember(
-        MindsModelListing((ids or None), efforts, enabled, labels, providers, families)
+        MindsModelListing(
+            (ids or None), efforts, enabled, labels, providers, families, role_defaults
+        )
     )
 
 

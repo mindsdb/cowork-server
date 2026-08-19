@@ -23,7 +23,7 @@ CATALOG = ["mindshub_air", "claude-sonnet-5", "deepseek-v4-pro"]
 
 def _listing(ids):
     return providers.MindsModelListing(
-        ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}
+        ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}, role_defaults={}
     )
 
 

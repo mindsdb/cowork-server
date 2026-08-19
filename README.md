@@ -181,9 +181,11 @@ All endpoints live under `/api/v1/`. Key resource groups:
 
 ### The default model is the one the free allowance covers
 
-Every minds-cloud role defaults to `mindshub_air` (`MODEL_ROLE_DEFAULTS` in
-`cowork/common/settings/app_settings.py`), for all three roles: planning, coding
-and router. Its usage draws the monthly included allowance, so a user who has
+Every minds-cloud role defaults to `mindshub_air`, for all three roles: planning,
+coding and router. **MindsHub's catalog declares it**, in the
+`mindshub_model_policy_v1` config that already owns the alias registry, and the
+declaration arrives as a `default_for` list on each `/v1/models` row. So moving a
+default is a config edit plus an apply, not a release. Its usage draws the monthly included allowance, so a user who has
 picked no model can finish a whole turn without the wallet being charged for any
 part of it.
 
@@ -197,6 +199,30 @@ explain why.
 An explicitly stored model is never rewritten by this. Paying for a better model
 is a pick in the Settings picker, and a funded wallet resolves to the same
 default as an empty one until that pick is made.
+
+#### Where the answer comes from, in order
+
+`MODEL_ROLE_DEFAULTS` in `cowork/common/settings/app_settings.py` is still a real
+answer, not a legacy layer. Resolution is synchronous and does no network call in
+the turn path, so the catalog's declaration has to be *persisted* before it can be
+read, exactly as the availability map is.
+
+| State | What resolves | When you are in it |
+| :---- | :---- | :---- |
+| A model is stored for the role | that model | the user picked one, or saved Settings once |
+| `minds_role_defaults` names the role | the alias the catalog declares | any install that has loaded Settings since the catalog declared it |
+| Nothing persisted | `MODEL_ROLE_DEFAULTS` | a fresh install sending its first message, and any install that has never reached the catalog |
+
+The availability map still overrides the answer in every case where the wallet
+cannot pay for it, so a declared default is not a grant: it says where to start,
+never what may be called.
+
+`GET /settings/recommended-models` writes the map, from the same fetch that
+already refreshes `minds_model_enabled`, and it overlays the same values onto the
+`recommendedPair` it serves the picker. Those two must agree: the picker shows the
+pair as the model each role starts on and writes it back as an explicit pin when
+the user saves, so a picker reading the compiled table while turns ran the
+declared one would pin the wrong model.
 
 ### Provider probes always use a model any key can call
 
