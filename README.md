@@ -200,28 +200,46 @@ default as an empty one until that pick is made.
 
 ### Provider probes always use a model any key can call
 
-Both `POST /settings/test-providers` (the Settings health dot) and
-`POST /settings/validate-provider` (onboarding and the provider cards) reach
-MindsHub with a one-token chat completion rather than a listing route, because
-listing routes are not deployed on every MindsHub host and answer 404 or 401 even
-for a valid key.
+Why a probe sends a model at all: MindsHub bills per model, so a model the wallet
+cannot pay for is denied, and that denial is indistinguishable from a bad key.
+Probing a paid model tells an account with an empty wallet that its working key is
+invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the monthly included allowance
+instead of the wallet, so the result reports reachability and key validity, which
+is what these endpoints are for.
 
-The model they send is `MINDS_PROBE_MODEL` (`mindshub_air`), never the configured
-or recommended one. MindsHub bills per model, so a model the wallet cannot pay for
-is denied, and that denial is indistinguishable here from a bad key: probing a paid
-model tells an account with an empty wallet that its working key is invalid.
-`mindshub_air` draws the monthly included allowance instead of the wallet, so the
-result reports reachability and key validity, which is what these endpoints are for.
+Two endpoints, and they do not behave identically.
 
-`validate-provider` takes an optional `model`. Omit it against a MindsHub base URL
-and it probes `mindshub_air`; omit it against any other host and the generic
-openai-compatible default applies. A `model` sent explicitly is always the model
-probed, MindsHub or not, so validating one specific model cannot report a pass for a
-different one.
+`POST /settings/validate-provider` (onboarding, and the only caller is the
+onboarding screen) probes a chat completion on every branch, and takes an optional
+`model`:
+
+- `provider: "minds"` always sends `MINDS_PROBE_MODEL` and **ignores** `model`.
+- `provider: "openai-compatible"` sends `model` as asked, so validating one
+  specific model never reports a pass earned by a different one. Omit it against a
+  MindsHub base URL and it falls back to `MINDS_PROBE_MODEL`; omit it against any
+  other host and the generic openai-compatible default applies.
+- `provider: "anthropic"` sends `model` or `claude-sonnet-4-6`.
+
+`POST /settings/test-providers` (the Settings health dot) probes **per provider
+type**, and only the `minds-cloud` type is a chat completion, on
+`MINDS_PROBE_MODEL`. The `openai-compatible` type is a `GET {baseUrl}/models`
+listing probe, so a MindsHub host configured through that card is health-checked
+against a route MindsHub does not deploy everywhere; those routes answer 404 or 401
+even for a valid key, which is the reason the `minds-cloud` type does not use one.
+
+Every MindsHub-bound chat probe caps the completion at `max_tokens: 20`, not 1:
+some models refuse a 1-token budget and fail the probe for a perfectly good key
+(see `_chat_probe`). The cap is not sent to a non-MindsHub endpoint, because
+OpenAI's reasoning models reject `max_tokens` and want `max_completion_tokens`.
 
 The desktop app has a second copy of these validators in its Electron main process
-(`cowork/src/main/index.ts`), which is what a packaged build actually calls;
-the endpoints here serve the web build. Both copies have to change together.
+(`cowork/src/main/provider-validation.ts`, called from the `settings:validate` IPC
+handler in `cowork/src/main/index.ts`); the endpoints here serve the web build.
+Both copies have to change together. One asymmetry worth knowing: the desktop
+MindsHub onboarding path signs in through Keycloak rather than validating a pasted
+key, so main's `validateMinds` has no live caller today, and it is the
+openai-compatible and anthropic validators there that a packaged build actually
+runs.
 
 ## Configuration
 
