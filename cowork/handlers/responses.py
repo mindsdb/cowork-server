@@ -920,11 +920,8 @@ class ResponsesHandler:
                 code, message = friendly
                 logger.info("[responses] user-facing turn error: %s", exc)
             else:
-                # Unmapped by friendly_turn_error. An internal structural error
-                # (our bug / an anton↔cowork-server skew) still gets an
-                # actionable, named message instead of the bare dead-end
-                # (ENG-1412); a provider failure stays fully redacted. The full
-                # traceback is still logged below either way.
+                # Unmapped: an internal structural error gets an actionable,
+                # named message; a provider failure stays redacted (ENG-1412).
                 code = GENERIC_TURN_ERROR_CODE
                 message = internal_error_message(exc)
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
@@ -1079,9 +1076,8 @@ class ResponsesHandler:
                 logger.info("[responses] user-facing turn error: %s", exc)
                 raise HTTPException(status_code=400, detail=message)
             logger.exception("[responses] turn failed")
-            # Internal structural errors (our bug / anton skew) surface an
-            # actionable, named 500 instead of the bare generic; a provider
-            # failure stays fully redacted (ENG-1412).
+            # Internal structural errors surface an actionable 500; a provider
+            # failure stays redacted (ENG-1412).
             raise HTTPException(status_code=500, detail=internal_error_message(exc))
 
         assistant_text = "".join(collected_text)
