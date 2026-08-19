@@ -35,22 +35,6 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
     "openai-compatible": [],
 }
 
-# Per-provider default model tuple served to the picker as `recommendedPair`.
-# Order: (planning, coding, router). The 3rd slot is the "routing and
-# summarization" role: MindsHub defaults to the cheap `kimi`; direct
-# providers use their smallest model. The frontend falls back
-# to the coding slot when the 3rd is absent, so an older client still works.
-RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
-    "minds-cloud": ("sonnet", "haiku", "kimi"),
-    "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
-    "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
-    # All three roles default to the one id confirmed to resolve on a fresh
-    # free-tier Google key (ENG-1145); gemini-2.5-pro was zero-quota for new
-    # free-tier keys and gemini-2.5-flash 404s. Pro stays reachable via the picker.
-    "gemini": ("gemini-3.6-flash", "gemini-3.6-flash", "gemini-3.6-flash"),
-    "openai-compatible": ("", "", ""),
-}
-
 # Keyed by the Provider enum *value* (the string) rather than the enum
 # itself, so this module stays free of a circular import with user_settings,
 # which owns the Provider enum.
@@ -60,44 +44,56 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 # while openai-compatible is the explicitly selected provider; on a *switch* to
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
+#
+# Single source for the per-role defaults: PLANNING/CODING/ROUTER_MODEL_
+# DEFAULTS and RECOMMENDED_PAIR below are all derived from this table.
+MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "planning": "claude-sonnet-4-6",
+        "coding": "claude-haiku-4-5-20251001",
+        "router": "claude-haiku-4-5-20251001",
+    },
+    "openai": {
+        "planning": "gpt-5.5",
+        "coding": "gpt-5.5-mini",
+        "router": "gpt-5.5-mini",
+    },
+    "gemini": {
+        # All three roles use the one id confirmed to work on a fresh
+        # free-tier Google key; other ids were zero-quota/404 for new keys
+        # but stay reachable via the picker.
+        "planning": "gemini-3.6-flash",
+        "coding": "gemini-3.6-flash",
+        "router": "gemini-3.6-flash",
+    },
+    "minds_cloud": {
+        "planning": "kimi",  # cheapest/fastest, for the high-volume planning role
+        "coding": "gpt-codex",  # product pick for a code-specialized model, not benchmarked
+        "router": "haiku",
+    },
+}
+PLANNING_MODEL_DEFAULTS: dict[str, str] = {p: r["planning"] for p, r in MODEL_ROLE_DEFAULTS.items()}
+CODING_MODEL_DEFAULTS: dict[str, str] = {p: r["coding"] for p, r in MODEL_ROLE_DEFAULTS.items()}
+ROUTER_MODEL_DEFAULTS: dict[str, str] = {p: r["router"] for p, r in MODEL_ROLE_DEFAULTS.items()}
+
+# Per-provider default model tuple served to the picker as `recommendedPair`.
+# Order: (planning, coding, router); derived from MODEL_ROLE_DEFAULTS above.
+# openai-compatible has no canonical default, so it's a literal special case.
+# The frontend falls back to the coding slot when the 3rd is absent, so an
+# older client still works.
+RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
+    **{
+        provider.replace("_", "-"): (roles["planning"], roles["coding"], roles["router"])
+        for provider, roles in MODEL_ROLE_DEFAULTS.items()
+    },
+    "openai-compatible": ("", "", ""),
+}
+
 # The one model MindsHub's free monthly allowance covers; every other alias
-# bills the wallet. Org mode (managed, free-first) defaults to it so a tenant
-# with no wallet balance isn't 402'd on its first turn. Desktop keeps the
-# premium canonical defaults below.
+# bills the wallet. Org mode resolves to it unless the cached availability
+# map shows the wallet can pay for the canonical default (see
+# _enabled_aware_default in user_settings).
 MINDS_FREE_MODEL = "mindshub_air"
-
-
-def role_defaults(base: dict[str, str]) -> dict[str, str]:
-    """Model defaults for the current deployment: org mode overrides the
-    minds-cloud default to the free-bucket model (no wallet balance yet);
-    desktop keeps the premium canonical maps below."""
-    if get_app_settings().tenancy_mode == "org":
-        return {**base, "minds_cloud": MINDS_FREE_MODEL}
-    return base
-
-PLANNING_MODEL_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-sonnet-4-6",
-    "openai": "gpt-5.5",
-    "gemini": "gemini-3.6-flash",
-    "minds_cloud": "sonnet",
-}
-CODING_MODEL_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5-20251001",
-    "openai": "gpt-5.5-mini",
-    "gemini": "gemini-3.6-flash",
-    "minds_cloud": "haiku",
-}
-# Router role: the cheap front-model that runs history summarization (and later
-# gates each turn, respond-vs-delegate). Defaults: MindsHub →
-# `kimi` (Kimi K2 — fast and cheap; the deprecated `latest:` prefix still
-# resolves but the bare alias is preferred), direct providers → their smallest
-# model (same as the coding tier). Keyed by Provider.value (snake_case).
-ROUTER_MODEL_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5-20251001",
-    "openai": "gpt-5.5-mini",
-    "gemini": "gemini-3.6-flash",
-    "minds_cloud": "kimi",
-}
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
 # advertises its levels live via MindsHub's `/v1/models`; direct Anthropic/OpenAI
