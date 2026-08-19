@@ -1,9 +1,9 @@
 """Tier-aware model defaults (ENG-597).
 
 MindsHub gates models per plan tier: a free-tier key gets the paid models
-(sonnet/haiku — the canonical minds-cloud defaults) as ``enabled: false`` from
-``/v1/models``, so handing out the static default guarantees a 403 on the
-user's very first message. These tests pin the fix:
+(kimi/gpt-codex/haiku — the canonical minds-cloud defaults) as ``enabled:
+false`` from ``/v1/models``, so handing out the static default guarantees a
+403 on the user's very first message. These tests pin the fix:
 
 - ``UserSettings`` resolves its planning/coding defaults against the cached
   availability map (``minds_model_enabled``), falling back to the first
@@ -28,8 +28,12 @@ from _fakes import FakeRequest
 
 # The gateway's free-tier registry shape: whole catalog listed, paid models
 # disabled, the baseline model first and enabled.
-FREE_MAP = json.dumps({"mindshub_air": True, "sonnet": False, "opus": False, "haiku": False})
-PAID_MAP = json.dumps({"mindshub_air": True, "sonnet": True, "opus": True, "haiku": True})
+FREE_MAP = json.dumps(
+    {"mindshub_air": True, "kimi": False, "gpt-codex": False, "haiku": False, "sonnet": False}
+)
+PAID_MAP = json.dumps(
+    {"mindshub_air": True, "kimi": True, "gpt-codex": True, "haiku": True, "sonnet": True}
+)
 
 
 def _minds(**kw) -> UserSettings:
@@ -47,19 +51,21 @@ def test_free_tier_defaults_fall_back_to_first_enabled_model():
     s = _minds(minds_model_enabled=FREE_MAP)
     assert s.planning_model == "mindshub_air"
     assert s.coding_model == "mindshub_air"
+    assert s.router_model == "mindshub_air"
 
 
 def test_paid_tier_keeps_canonical_defaults():
     s = _minds(minds_model_enabled=PAID_MAP)
-    assert s.planning_model == "sonnet"
-    assert s.coding_model == "haiku"
+    assert s.planning_model == "kimi"
+    assert s.coding_model == "gpt-codex"
+    assert s.router_model == "haiku"
 
 
 def test_absent_map_keeps_canonical_defaults():
     # No cached map (fresh install, fetch never ran) → behavior unchanged.
     s = _minds()
-    assert s.planning_model == "sonnet"
-    assert s.coding_model == "haiku"
+    assert s.planning_model == "kimi"
+    assert s.coding_model == "gpt-codex"
 
 
 def test_explicit_model_choice_is_never_rewritten():
@@ -71,25 +77,26 @@ def test_explicit_model_choice_is_never_rewritten():
 
 def test_all_disabled_map_keeps_canonical_default():
     # Degenerate metadata (nothing enabled) must not invent a model.
-    s = _minds(minds_model_enabled=json.dumps({"sonnet": False, "haiku": False}))
-    assert s.planning_model == "sonnet"
+    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
+    assert s.planning_model == "kimi"
 
 
-def test_default_missing_from_map_is_treated_as_available():
-    # Older gateway that doesn't list the default at all → default untouched.
+def test_default_missing_from_nonempty_map_falls_back_to_first_enabled():
+    # A non-empty map always carries every alias the catalog currently
+    # serves, so missing means gone (renamed/retired) — same as disabled.
     s = _minds(minds_model_enabled=json.dumps({"mindshub_air": True}))
-    assert s.planning_model == "sonnet"
+    assert s.planning_model == "mindshub_air"
 
 
 def test_invalid_map_json_degrades_to_canonical_default():
     s = _minds(minds_model_enabled="not json")
-    assert s.planning_model == "sonnet"
+    assert s.planning_model == "kimi"
 
 
 def test_map_order_decides_the_fallback():
     # First enabled entry in map order wins (mirrors /v1/models ordering).
-    s = _minds(minds_model_enabled=json.dumps({"sonnet": False, "kimi": True, "mindshub_air": True}))
-    assert s.planning_model == "kimi"
+    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "sonnet": True, "mindshub_air": True}))
+    assert s.planning_model == "sonnet"
 
 
 def test_direct_providers_ignore_the_minds_map():
@@ -125,7 +132,7 @@ def test_provider_switch_onto_minds_paid_keeps_canonical():
         minds_api_key=SecretStr("mdb_test"),
         minds_model_enabled=PAID_MAP,
     )
-    assert s.resolved_planning_model == "sonnet"
+    assert s.resolved_planning_model == "kimi"
 
 
 # ── Wallet-aware resolution, all three roles (ENG-1632, ENG-1632 follow-up) ──
