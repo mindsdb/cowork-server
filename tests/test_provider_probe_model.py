@@ -10,7 +10,13 @@ validation (`validate_minds`) used to POST `CODING_MODEL_DEFAULTS["minds_cloud"]
 import asyncio
 
 import cowork.services.providers as providers
-from cowork.services.providers import MINDS_PROBE_MODEL, ping_provider, validate_minds
+from cowork.services.providers import (
+    MINDS_PROBE_MODEL,
+    is_minds_host,
+    ping_provider,
+    validate_minds,
+    validate_provider,
+)
 
 
 class _CapturingClient:
@@ -110,3 +116,74 @@ def test_ping_minds_cloud_surfaces_provider_message(monkeypatch):
     assert status == "fail"
     assert "HTTP 429" in detail
     assert "Wallet allowance exhausted" in detail
+
+
+# ── The omitted-model default on a MindsHub host ──────────────────────
+#
+# Onboarding validates the MindsHub key through validate_provider. The generic
+# openai-compatible default ("gpt-5.5") is not a MindsHub alias, so it 404s
+# there, and the recommended MindsHub model is paid, so it 402s for an account
+# whose wallet is empty. Both come back looking like a bad key, which routed a
+# brand-new user to bring-your-own-key holding a valid MindsHub key.
+
+
+def test_omitted_model_on_minds_host_probes_free_model(monkeypatch):
+    _patch(monkeypatch)
+    result = asyncio.run(
+        validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", None)
+    )
+    assert result.get("ok") is True
+    assert _CapturingClient.captured["json"]["model"] == "mindshub_air"
+
+
+def test_empty_model_on_minds_host_probes_free_model(monkeypatch):
+    # The client sends `model` as an optional field, so an empty string arrives
+    # as often as a missing key. Both mean "no model was chosen".
+    _patch(monkeypatch)
+    asyncio.run(validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", ""))
+    assert _CapturingClient.captured["json"]["model"] == "mindshub_air"
+
+
+def test_explicit_model_on_minds_host_is_sent_as_asked(monkeypatch):
+    # The negative case that keeps the default honest: a user validating one
+    # specific model must not be told a different model passed.
+    _patch(monkeypatch)
+    asyncio.run(
+        validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", "sonnet")
+    )
+    assert _CapturingClient.captured["json"]["model"] == "sonnet"
+
+
+def test_omitted_model_off_minds_host_keeps_generic_default(monkeypatch):
+    # A real openai-compatible endpoint is unchanged by this.
+    _patch(monkeypatch)
+    asyncio.run(
+        validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", None)
+    )
+    assert _CapturingClient.captured["json"]["model"] == "gpt-5.5"
+
+
+def test_is_minds_host_matches_the_host_not_a_substring():
+    for url in (
+        "https://api.mindshub.ai/v1",
+        "https://api.staging.mindshub.ai",
+        "https://api-pr-12.dev.mindshub.ai/v1",
+        "https://mindshub.ai",
+        "https://mdb.ai/api/v1",
+        "https://llm.mdb.ai",
+        "api.mindshub.ai/v1",  # no scheme, as a stored setting can be
+    ):
+        assert is_minds_host(url) is True, url
+
+    for url in (
+        "",
+        None,
+        "https://api.openai.com/v1",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        # A lookalike domain and a redirect-style parameter both defeat a
+        # substring test, which is why this compares the parsed hostname.
+        "https://mindshub.ai.example.test/v1",
+        "https://evil-mindshub.ai/v1",
+        "https://example.test/r?u=https://api.mindshub.ai/v1",
+    ):
+        assert is_minds_host(url) is False, url
