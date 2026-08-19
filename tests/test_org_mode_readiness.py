@@ -8,9 +8,17 @@ writing ``planning_provider``/``coding_provider``, which are admin-owned, so a
 non-admin member got a 403 and could never reach the app.
 """
 
+import json
+
 import pytest
 
 from cowork.common.settings import user_settings as us
+from cowork.common.settings.app_settings import (
+    CODING_MODEL_DEFAULTS,
+    MINDS_FREE_MODEL,
+    PLANNING_MODEL_DEFAULTS,
+    ROUTER_MODEL_DEFAULTS,
+)
 from cowork.common.settings.user_settings import Provider, UserSettings
 
 
@@ -30,8 +38,8 @@ _KEY_ENV = (
 
 def _mode(monkeypatch, mode: str) -> None:
     """Set tenancy_mode via the real settings (env + cache clear), so every
-    module's get_app_settings() agrees — user_settings, app_settings.role_defaults,
-    and providers all read the same source."""
+    module's get_app_settings() agrees — user_settings, app_settings, and
+    providers all read the same source."""
     for name in _KEY_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("COWORK_TENANCY_MODE", mode)
@@ -107,6 +115,47 @@ class TestOrgModeReadiness:
         assert cs["provider"] == Provider.MINDS_CLOUD.value
 
 
+_PLANNING = PLANNING_MODEL_DEFAULTS["minds_cloud"]
+_CODING = CODING_MODEL_DEFAULTS["minds_cloud"]
+_ROUTER = ROUTER_MODEL_DEFAULTS["minds_cloud"]
+
+
+class TestOrgModeCreditAwareDefaults:
+    """An org with credit gets the canonical defaults; anything short of
+    positive evidence in the availability map stays on MINDS_FREE_MODEL."""
+
+    PAID = json.dumps({MINDS_FREE_MODEL: True, _PLANNING: True, _CODING: True, _ROUTER: True})
+    FREE = json.dumps({MINDS_FREE_MODEL: True, _PLANNING: False, _CODING: False, _ROUTER: False})
+
+    def test_org_with_credits_gets_premium_defaults(self, org_mode):
+        s = _settings(minds_model_enabled=self.PAID)
+        assert s.resolved_planning_model == _PLANNING
+        assert s.resolved_coding_model == _CODING
+        assert s.resolved_router_model == _ROUTER
+
+    def test_org_without_credits_stays_on_free_model(self, org_mode):
+        s = _settings(minds_model_enabled=self.FREE)
+        assert s.resolved_planning_model == MINDS_FREE_MODEL
+        assert s.resolved_coding_model == MINDS_FREE_MODEL
+        assert s.resolved_router_model == MINDS_FREE_MODEL
+
+    def test_org_cold_start_stays_on_free_model(self, org_mode):
+        # Empty map (fetch never ran) is not evidence of credit — free-first.
+        s = _settings()
+        assert s.resolved_router_model == MINDS_FREE_MODEL
+
+    def test_org_default_missing_from_map_stays_free(self, org_mode):
+        # Unlike desktop (missing = available), org needs the default itself
+        # marked payable; a gateway that stops listing it downgrades to free.
+        s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, _PLANNING: True}))
+        assert s.resolved_planning_model == _PLANNING
+        assert s.resolved_coding_model == MINDS_FREE_MODEL
+
+    def test_org_explicit_choice_is_never_rewritten(self, org_mode):
+        s = _settings(minds_model_enabled=self.FREE, planning_model="opus")
+        assert s.resolved_planning_model == "opus"
+
+
 def test_ambient_provider_keys_do_not_override_minds(monkeypatch, org_mode):
     """The live bug: the pod carries ANTHROPIC_API_KEY/OPENAI_API_KEY in its env,
     so the resolver picked Anthropic and the UI showed it instead of MindsHub.
@@ -118,3 +167,27 @@ def test_ambient_provider_keys_do_not_override_minds(monkeypatch, org_mode):
     assert cs["provider"] == Provider.MINDS_CLOUD.value
     assert cs["model"] == "mindshub_air"
     assert cs["config_ready"] is True
+
+
+class TestUserSettingsIgnoresProcessEnvInOrgMode:
+    """A shared cloud server injects provider secrets as process env vars
+    (ANTHROPIC_API_KEY, ...). Per-user UserSettings must not read them in org
+    mode, or every tenant sees another config's keys as connected and the
+    Agent-Models UI resolves to a BYOK provider (staging bug). Desktop/local
+    keeps env reading so the standalone CLI / .env-first flow still work.
+    """
+
+    def test_org_mode_ignores_bare_provider_env(self, monkeypatch, org_mode):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-leak")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-oai-leak")
+        s = UserSettings(_env_file=None)
+        assert s.anthropic_api_key is None
+        assert s.openai_api_key is None
+        # Default provider stays MindsHub, not the leaked BYOK key.
+        assert s.planning_provider == Provider.MINDS_CLOUD
+
+    def test_local_mode_still_reads_provider_env(self, monkeypatch, local_mode):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-local")
+        s = UserSettings(_env_file=None)
+        assert s.anthropic_api_key is not None
+        assert s.anthropic_api_key.get_secret_value() == "sk-ant-local"
