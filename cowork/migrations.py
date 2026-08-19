@@ -233,18 +233,25 @@ def _copy_builtin_skills(store: SkillService) -> int:
             continue
         try:
             dest = store._skill_dir(src.name)
+            if dest.exists():
+                continue  # keep the user-editable copy untouched
+            # Copied file by file, each destination re-checked for containment
+            # with safe_join. copy2, not copyfile: copytree preserved mode, and a
+            # future builtin shipping an executable helper must keep its +x.
+            for child in sorted(p for p in src.rglob("*") if p.is_file()):
+                target = safe_join(dest, *child.relative_to(src).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, target)
         except ValueError:
-            # The slug resolves outside the store
-            logger.warning("Skipping builtin %r: its slug does not resolve inside %s",
+            # Either the slug resolves outside the store, or safe_join rejected a
+            # destination. The agent writes into its own org's tree on shared
+            # storage, so it can plant a symlink under `dest` between the exists()
+            # check above and the write. Skip this builtin: propagating would 500
+            # every skills read and every turn for the org, which a tenant must
+            # not be able to do to itself.
+            logger.warning("Skipping builtin %r: it does not resolve inside %s",
                            src.name, store.root, exc_info=True)
             continue
-        if dest.exists():
-            continue  # keep the user-editable copy untouched
-        # Copied file by file, each destination re-checked for containment with safe_join
-        for child in sorted(p for p in src.rglob("*") if p.is_file()):
-            target = safe_join(dest, *child.relative_to(src).parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(child, target)
         copied += 1
     return copied
 
