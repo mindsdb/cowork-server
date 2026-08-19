@@ -187,3 +187,39 @@ def test_a_build_without_the_packaged_skills_is_not_marked_seeded(skills_root, m
     monkeypatch.setattr(migrations_mod, "BUILTIN_SKILLS_DIR", packaged)
     assert ensure_builtin_skills(_org()) is True
     assert {s.name for s in SkillService(_org()).list_skills()} == _packaged_slugs()
+
+
+def test_a_symlink_planted_under_dest_does_not_break_the_org(skills_root, tmp_path):
+    """Sibling of the poisoned-slug case: the agent can create the slug folder
+    with a symlinked SKILL.md between our exists() check and the write. safe_join
+    rejects it with ValueError, which must not escape and 500 the org."""
+    escaped = tmp_path / "escaped.md"
+    store = _store()
+    victim = sorted(_packaged_slugs())[0]
+    (store / victim).mkdir(parents=True)
+    (store / victim / "SKILL.md").symlink_to(escaped)   # dangling: exists() is False
+
+    ensure_builtin_skills(_org())                        # must not raise
+
+    assert not escaped.exists()                          # no write through the link
+    names = {s.name for s in SkillService(_org()).list_skills()}
+    assert names == _packaged_slugs() - {victim}         # the rest still seeded
+    assert build_turn_skills(_org(), None)               # and turns still work
+
+
+def test_file_mode_survives_seeding(skills_root, tmp_path, monkeypatch):
+    """copytree preserved mode; the per-file copy must too, or a future builtin
+    shipping an executable helper arrives without +x."""
+    import cowork.migrations as migrations_mod
+
+    packaged = tmp_path / "packaged"
+    (packaged / "with-script" / "scripts").mkdir(parents=True)
+    (packaged / "with-script" / "SKILL.md").write_text("---\nname: with-script\n---\nbody")
+    helper = packaged / "with-script" / "scripts" / "run.sh"
+    helper.write_text("#!/bin/sh\necho hi\n")
+    helper.chmod(0o755)
+    monkeypatch.setattr(migrations_mod, "BUILTIN_SKILLS_DIR", packaged)
+
+    assert ensure_builtin_skills(_org()) is True
+    copied = _store() / "with-script" / "scripts" / "run.sh"
+    assert copied.stat().st_mode & 0o111, "executable bit lost in the copy"
