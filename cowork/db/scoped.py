@@ -145,8 +145,22 @@ def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: st
     person's rather than the org's. ``base`` in local mode (one user per machine);
     org mode fail-closes without BOTH ids, since silently sharing one person's
     store across an org is a correctness bug, not a lenient default (ADR-0002).
-    Id checks run before any settings resolution."""
-    if scope is None or not scope.org_mode:
+    Id checks run before any settings resolution.
+
+    ``scope=None`` fail-closes on an org deployment for the same reason it does
+    in ``scoped_storage_root``: ``base`` is the shared namespace root there, so
+    returning it verbatim gives an unscoped caller a path outside every org's
+    subtree. This matters most for the in-process harness memory root, whose
+    caller reads an ambient scope that is None outside a bound turn."""
+    if scope is None:
+        if get_app_settings().tenancy_mode == "org":
+            raise MissingTenantScopeError(
+                f"per-user filesystem store {store!r} requires a TenantScope on an org "
+                "deployment; the caller must thread one through rather than defaulting "
+                "to the shared root"
+            )
+        return base
+    if not scope.org_mode:
         return base
     if not scope.user_id:
         raise MissingTenantScopeError("per-user filesystem store requires a user in scope")
