@@ -422,8 +422,8 @@ def _skill_draft_payload(folder: Path) -> dict | None:
     }
 
 
-def remote_skill_draft_payload(entry: dict) -> dict | None:
-    """Card payload for a draft a remote pod reported, or None to drop it.
+def remote_skill_draft_result(entry: dict) -> tuple[dict | None, list[str]]:
+    """Card payload for a draft a remote pod reported, plus any drop reasons.
 
     The pod sends `{"slug", "files": {name: text}}`. This materializes it into a
     throwaway folder and reuses `_skill_draft_payload`, so a remote card is
@@ -433,22 +433,30 @@ def remote_skill_draft_payload(entry: dict) -> dict | None:
     - the slug must be a valid skill name, or it could name any folder
     - filenames must be plain basenames, since `a/../../b` would escape the temp
       dir and let a turn write anywhere the server process can
-    A bad entry is dropped and logged; one draft must never fail the turn.
+    A bad entry is dropped and logged; one draft must never fail the turn. The
+    reason is also returned (not just logged) so the caller can surface it in
+    the chat stream — a lost draft, or a sibling file quietly excluded from an
+    otherwise-saved one, must not be invisible to the user.
+
+    Returns ``(payload, reasons)``. ``payload`` is None when the whole draft
+    was rejected. ``reasons`` can be non-empty even when ``payload`` succeeded
+    (e.g. one unsafe sibling file skipped out of several).
     """
     import tempfile
 
     from anton.core.tools.skill_format import SKILL_FILE, validate_name
 
+    reasons: list[str] = []
     slug = entry.get("slug") if isinstance(entry, dict) else None
     files = entry.get("files") if isinstance(entry, dict) else None
     if not isinstance(slug, str) or not isinstance(files, dict):
         logger.warning("Remote skill draft: malformed entry, dropping it")
-        return None
+        return None, ["the agent sent a malformed draft; nothing was saved."]
     try:
         validate_name(slug)
     except ValueError:
         logger.warning("Remote skill draft: invalid slug %r, dropping it", slug)
-        return None
+        return None, [f"{slug!r} is not a valid skill name; nothing was saved."]
     try:
         with tempfile.TemporaryDirectory(prefix="cowork-remote-draft-") as tmp:
             folder = Path(tmp) / slug
@@ -458,17 +466,29 @@ def remote_skill_draft_payload(entry: dict) -> dict | None:
                     continue
                 if name != Path(name).name or name in (".", ".."):
                     logger.warning("Remote skill draft %r: dropping unsafe filename %r", slug, name)
+                    reasons.append(f"{slug!r}: skipped file {name!r} (unsafe path).")
                     continue
                 (folder / name).write_text(text, encoding="utf-8")
             payload = _skill_draft_payload(folder)
     except (OSError, ValueError):
         logger.warning("Remote skill draft %r: could not build a card", slug, exc_info=True)
-        return None
+        return None, [f"{slug!r} could not be saved (internal error)."]
     # Covers every reason the shared builder rejects a folder — missing or
     # unparseable SKILL.md — without restating its preconditions here.
     if payload is None:
         logger.warning("Remote skill draft %r: no usable %s, dropping it", slug, SKILL_FILE)
-    return payload
+        reasons.append(f"{slug!r}: no usable {SKILL_FILE}; nothing was saved.")
+    return payload, reasons
+
+
+def remote_skill_draft_payload(entry: dict) -> dict | None:
+    """Card payload for a draft a remote pod reported, or None to drop it.
+
+    Thin wrapper over `remote_skill_draft_result` for callers that only need
+    the card and don't stream drop reasons anywhere (e.g. tests); see that
+    docstring for the drop rules.
+    """
+    return remote_skill_draft_result(entry)[0]
 
 
 def _seed_draft_from_store(folder: Path, slug: str) -> None:

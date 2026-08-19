@@ -68,7 +68,7 @@ from cowork.services.files import FileService
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
 from cowork.services.skills import SkillService
-from cowork.services.task_objects import remote_skill_draft_payload
+from cowork.services.task_objects import remote_skill_draft_result
 
 
 import logging
@@ -704,7 +704,7 @@ class ResponsesHandler:
         await asyncio.to_thread(self._stage_remote_workspace_files, producer_session, conv_id)
 
         async def replies_as_stream_events():
-            from anton.core.llm.provider import StreamTextDelta
+            from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
 
             async for kind, data in stream_remote_replies(
                 conversation_id=str(conv_id),
@@ -733,11 +733,18 @@ class ResponsesHandler:
                     # Not persisted like memory: a draft is the user's decision.
                     # Yielding SkillCreated puts it through the same formatter the
                     # in-process path uses, so the card renders — and replays off
-                    # the events log — identically to a desktop one.
+                    # the events log — identically to a desktop one. A rejected
+                    # draft, or a sibling file quietly excluded from an otherwise
+                    # saved one, also gets a StreamTaskProgress notice — the
+                    # generic "thought_progress" role already rendered inline,
+                    # so a loss is visible in the turn instead of only in the
+                    # server log.
                     for entry in data.get("entries") or []:
-                        payload = remote_skill_draft_payload(entry)
+                        payload, reasons = remote_skill_draft_result(entry)
                         if payload is not None:
                             yield SkillCreated(payload)
+                        for reason in reasons:
+                            yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
                 elif kind == "turn_completed":
                     return
                 elif kind == "turn_failed":

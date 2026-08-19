@@ -490,7 +490,11 @@ async def test_produce_remote_surfaces_a_skill_draft_as_a_card(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
     """An unusable entry from the pod is dropped, not fatal: the turn still
-    completes and its text is still persisted."""
+    completes and its text is still persisted. The drop is not silent, though —
+    it surfaces as an inline progress notice (ENG-1679 review: a rejected draft
+    used to vanish with only a server-side log line)."""
+    import json
+
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
@@ -517,5 +521,12 @@ async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
     )
 
     assert not any(f.startswith("event: response.skill_created") for f in frames)
+
+    progress = [json.loads(f.split("data: ", 1)[1]) for f in frames
+                if f.startswith("event: response.in_progress")]
+    dropped = [p for p in progress if p.get("phase") == "skill_draft_dropped"]
+    assert len(dropped) == 1
+    assert "../escape" in dropped[0]["message"]
+
     assert frames[-1] == "CLOSE:completed"
     assert saved["assistant"] == "Done."
