@@ -41,13 +41,13 @@ from cowork.services.providers import (
 )
 from cowork.services.settings import SettingService
 from cowork.common.settings.app_settings import (
-    AGENT_ROLE_ORDER,
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
 )
 from cowork.common.settings.user_settings import (
     Provider,
+    minds_role_start_models,
     provider_api_key_str,
     setting_is_org_scoped,
 )
@@ -492,14 +492,24 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             write = _cached_map_write(live_role_defaults, s.minds_role_defaults, ordered=False)
             if write is not None:
                 SettingService(session, scope).upsert_setting("minds_role_defaults", write)
-            # The picker asks the server which model each role starts on, so it
-            # has to be told the same answer resolution will give. Left off the
-            # static map, the two disagree the moment a default moves in config
-            # and the user sees one model in Settings while turns run another.
-            pair["minds-cloud"] = [
-                live_role_defaults.get(role, fallback)
-                for role, fallback in zip(AGENT_ROLE_ORDER, pair["minds-cloud"])
-            ]
+        # The picker asks the server which model each role starts on, so it has to
+        # be told the same answer resolution will give. Left on the compiled table,
+        # the two disagree the moment a default moves in config and the user sees
+        # one model in Settings while turns run another — and the desktop writes
+        # this pair back as explicit model pins when a save repoints a role onto
+        # MindsHub, so a wrong value here does not stay a display bug.
+        #
+        # Read from the map resolution will read, which is the live one when the
+        # gateway published defaults and the stored one otherwise. Not gated on
+        # `live_role_defaults`: a gateway that stops sending `default_for` leaves a
+        # good cache in place, resolution keeps using it, and a pair rebuilt from
+        # the compiled table would then contradict every turn.
+        declared_roles = live_role_defaults or s._minds_role_default_map()
+        if declared_roles:
+            pair["minds-cloud"] = minds_role_start_models(
+                declared=declared_roles,
+                enabled_map=live_enabled or s._minds_enabled_map(),
+            )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)

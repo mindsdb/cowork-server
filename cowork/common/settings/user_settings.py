@@ -14,6 +14,7 @@ from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     MINDS_FREE_MODEL,
     PLANNING_MODEL_DEFAULTS,
+    ROLE_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
     default_minds_url,
@@ -110,6 +111,51 @@ def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
     across reveal_key / resolve_stored_key / recommended_models / hermes."""
     val = provider_api_key(settings, provider)
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
+
+
+def _defaults_with_declared(
+    role: str, compiled: dict[str, str], declared: dict[str, str]
+) -> dict[str, str]:
+    """``compiled``, with the catalog's declared default over the minds-cloud slot.
+
+    Only that slot moves. The direct providers are BYOK models that are not in
+    MindsHub's catalog, so it has nothing to say about them and their defaults stay
+    compiled in.
+
+    The compiled value is not dead code underneath: it is what resolves before any
+    ``/v1/models`` fetch has been persisted, which is every fresh install on its
+    first message, and what resolves when the catalog is unreachable. Demoted, not
+    retired.
+    """
+    if role not in declared:
+        return compiled
+    return {**compiled, Provider.MINDS_CLOUD.value: declared[role]}
+
+
+def minds_role_start_models(
+    *, declared: dict[str, str], enabled_map: dict[str, bool]
+) -> list[str]:
+    """The model each minds-cloud role starts on, in ``AGENT_ROLE_ORDER``.
+
+    Ordered by ``ROLE_MODEL_DEFAULTS``, which is built in that order, so the list
+    lines up with the ``recommendedPair`` slots without anyone counting them.
+
+    What the picker is served as ``recommendedPair``, and it goes through the same
+    two steps resolution does: the declared default replaces the compiled one, then
+    availability adjusts it. Both steps matter to the picker, because the desktop
+    writes these values back as explicit model pins when a save repoints a role
+    onto MindsHub. Served unadjusted, it would show, and then pin, a model the
+    wallet cannot pay for while turns ran something else.
+    """
+    return [
+        _enabled_aware_default(
+            Provider.MINDS_CLOUD.value,
+            _defaults_with_declared(role, compiled, declared),
+            enabled_map,
+        )
+        or ""
+        for role, compiled in ROLE_MODEL_DEFAULTS.items()
+    ]
 
 
 def _enabled_aware_default(
@@ -781,20 +827,8 @@ class UserSettings(Settings):
 
         The one place the remote declaration is preferred over the compiled table,
         so the six resolution sites cannot drift on which wins.
-
-        Only the minds-cloud slot moves. The direct providers are BYOK models that
-        are not in MindsHub's catalog, so it has nothing to say about them and
-        their defaults stay compiled in.
-
-        The compiled value is not dead code underneath: it is what resolves before
-        any ``/v1/models`` fetch has been persisted, which is every fresh install
-        on its first message, and what resolves when the catalog is unreachable.
-        Demoted, not retired.
         """
-        declared = self._minds_role_default_map().get(role)
-        if declared is None:
-            return compiled
-        return {**compiled, Provider.MINDS_CLOUD.value: declared}
+        return _defaults_with_declared(role, compiled, self._minds_role_default_map())
 
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':

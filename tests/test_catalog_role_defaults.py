@@ -421,6 +421,64 @@ def test_the_picker_is_told_what_the_server_will_resolve(monkeypatch):
     ]
 
 
+def test_the_pair_is_availability_adjusted_like_resolution_is(monkeypatch):
+    """A declared default the wallet cannot pay for must not reach the picker.
+
+    Resolution runs the declared value through the availability map and lands on a
+    callable model. The picker has to be told that same answer, because the desktop
+    writes the pair back as an explicit pin when a save repoints a role onto
+    MindsHub: shown the locked model, it pins the one model the org cannot call.
+    """
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "sonnet"],
+        enabled={"mindshub_air": True, "sonnet": False},
+        role_defaults={"planning": "sonnet", "coding": "sonnet", "router": "sonnet"},
+    )
+
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["recommendedPair"]["minds-cloud"] == ["mindshub_air"] * 3
+
+    resolved = _minds(
+        minds_role_defaults=json.dumps({"planning": "sonnet", "coding": "sonnet", "router": "sonnet"}),
+        minds_model_enabled=json.dumps({"mindshub_air": True, "sonnet": False}),
+    )
+    assert payload["recommendedPair"]["minds-cloud"] == [
+        resolved.resolved_planning_model,
+        resolved.resolved_coding_model,
+        resolved.resolved_router_model,
+    ]
+
+
+def test_the_pair_follows_the_cache_when_the_gateway_stops_declaring(monkeypatch):
+    """The write guard must not leave the picker reading the compiled table.
+
+    Not writing `{}` over a good cache is right, and it means resolution keeps
+    using that cache. A pair rebuilt from the compiled table would then contradict
+    every turn, which is the same wrong pin from the other direction.
+    """
+    with _Endpoint() as endpoint:
+        _stub_listing(
+            monkeypatch,
+            ids=["mindshub_air", "sonnet"],
+            enabled={"mindshub_air": True, "sonnet": True},
+            role_defaults={"planning": "sonnet"},
+        )
+        endpoint.call()
+
+        _stub_listing(
+            monkeypatch,
+            ids=["mindshub_air", "sonnet"],
+            enabled={"mindshub_air": True, "sonnet": True},
+            role_defaults={},
+        )
+        payload = endpoint.call()
+
+    assert payload["recommendedPair"]["minds-cloud"][0] == "sonnet"
+
+
 def test_a_role_the_catalog_omits_keeps_the_compiled_slot_in_the_pair(monkeypatch):
     """The pair stays a full triple, so an older client indexing it still works."""
     _stub_listing(
