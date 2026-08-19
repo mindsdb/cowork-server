@@ -653,9 +653,13 @@ class UserSettings(Settings):
             "Off by default: it uploads user content — and, for fullstack artifacts, "
             "datasource secrets from a vault that is not scoped per organization — "
             "without an explicit user action. ORG-scoped on purpose, so it can be "
-            "enabled for one organization at a time; the ANTON_ARTIFACT_AUTOPUBLISH "
-            "env alias is process-global and would turn it on for every tenant of a "
-            "deployment."
+            "enabled for one organization at a time. The env override that actually "
+            "bypasses that is ARTIFACT_AUTOPUBLISH_ENABLED, the field name itself: "
+            "UserSettings is a pydantic-settings model, so any field with no DB row "
+            "falls back to the environment, process-global, for every tenant of the "
+            "deployment. (The ANTON_ARTIFACT_AUTOPUBLISH alias below is NOT that "
+            "override — SETTING_ENV_ALIASES only drives the .env→DB seed, which org "
+            "deployments skip entirely; see dev_setup._migrate_env_to_db_if_local.)"
         ),
     )
     openai_base_url: Annotated[str, ORG] = Field(
