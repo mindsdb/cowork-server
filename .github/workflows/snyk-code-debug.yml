@@ -1,0 +1,28 @@
+name: snyk-code-debug
+
+# TEMPORARY. Prints the Snyk Code findings so the PR-check failure can be read
+# without Snyk UI access. Delete before merge.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - maxabouchar/eng-1634-local-model-base-url
+
+permissions:
+  contents: read
+
+jobs:
+  snyk-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+      - name: Run Snyk Code
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk code test --severity-threshold=low || true
