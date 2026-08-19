@@ -91,6 +91,24 @@ async def lifespan(app: FastAPI):
             recovery_session.close()
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
+    # Warm the MindsHub availability map at boot when a key is already stored
+    # (desktop, returning user). Combined with the post-credential-sync warm in
+    # POST /settings/raw, this keeps the empty-map state — which resolves a
+    # free-tier default to a paid alias and 402s the first message (ENG-748) —
+    # rare. Desktop only: org mode stores no key and is handled by role_defaults.
+    try:
+        from cowork.db.session import get_open_session
+        from cowork.services.providers import warm_enabled_model_map
+
+        if get_app_settings().tenancy_mode != "org":
+            warm_session = get_open_session()
+            try:
+                if await warm_enabled_model_map(warm_session):
+                    logger.info("warmed MindsHub model-availability map on boot")
+            finally:
+                warm_session.close()
+    except Exception:
+        logger.exception("model-map boot warm failed (non-fatal)")
     start_scheduler()
     await _start_channels(app)
     try:

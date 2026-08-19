@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -35,11 +36,15 @@ from cowork.services.providers import (
     fetch_minds_models,
     fetch_org_model_catalog,
     model_value_rejection,
+    persist_enabled_model_map,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
+    warm_enabled_model_map,
 )
 from cowork.services.settings import SettingService
+
+logger = logging.getLogger(__name__)
 from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
@@ -427,35 +432,16 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # Cache the availability map so model-default resolution
             # (UserSettings._minds_enabled_map) can avoid locked models without
             # a network call in the turn path. Adding credits re-enables the
-            # canonical defaults on the next settings load.
+            # canonical defaults on the next settings load. The guarded write
+            # (never clobber a good map with {}, order-preserving, change-only)
+            # is shared with the startup / credential-sync warm via
+            # persist_enabled_model_map so the invariants can't drift.
             #
-            # Guard on `live_enabled` (the map we actually write), NOT `live`
-            # (the id list): a gateway that returns ids without `enabled` flags
-            # yields `live` non-empty but `live_enabled == {}`, and writing {}
-            # would wipe a previously-good map — re-locking the canonical
-            # default, i.e. the exact bug this PR fixes. And only write on a real
-            # change: this endpoint is hit on every boot/settings-open, and
-            # upsert_setting commits a row + invalidates the settings cache, so
-            # an unconditional write churns every UserSettings reader.
-            if live_enabled:
-                # Persist ORDER-PRESERVING JSON — never sort_keys. The
-                # first-enabled default fallback (_enabled_aware_default)
-                # iterates the map in insertion order, relying on /v1/models
-                # listing the free/baseline model first; an alphabetized map
-                # could silently promote the wrong model. The compare is
-                # order-sensitive too, so a gateway re-ranking (same set, new
-                # baseline first) also counts as a change and refreshes the map.
-                desired = json.dumps(live_enabled)
-                try:
-                    stored = json.dumps(json.loads(s.minds_model_enabled or "{}"))
-                except (ValueError, TypeError):
-                    stored = "{}"
-                if desired != stored:
-                    # Intentionally ungated by _require_org_admin_for: the value
-                    # is system-derived (MindsHub, via admin-set key/URL), so a
-                    # member can trigger this refresh but can't steer what's
-                    # stored — and gating it would leave the map stale.
-                    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+            # Intentionally ungated by _require_org_admin_for: the value is
+            # system-derived (MindsHub, via admin-set key/URL), so a member can
+            # trigger this refresh but can't steer what's stored — and gating it
+            # would leave the map stale.
+            persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
@@ -585,7 +571,7 @@ class _RawSettingsBody(BaseModel):
 
 
 @router.post("/raw")
-def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
+async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
     Uses key-level merge (not full overwrite) because callers like the
@@ -624,6 +610,16 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail="Settings could not be saved.") from e
+
+    # A fresh MindsHub sign-in lands the key here (buildMindsEnvContent POSTs
+    # /raw). Warm the availability map now — before the first turn — so a
+    # free-tier default resolves to an affordable model instead of 402'ing on
+    # message one (ENG-748). Fail-open and best-effort: never let a warm failure
+    # break the save the client is waiting on.
+    try:
+        await warm_enabled_model_map(session)
+    except Exception:
+        logger.debug("post-credential-sync model-map warm failed (non-fatal)", exc_info=True)
 
     return {"ok": True}
 
