@@ -375,6 +375,31 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
     assert any(e.get("thought_role") == "thought.scratchpad.start" for e in saved["events"])
 
 
+@pytest.mark.asyncio
+async def test_produce_remote_stages_workspace_files(monkeypatch):
+    """Wiring guard: the remote produce path must stage attachments +
+    instructions into the workspace before the turn — removing that call
+    (responses.py) has to fail here, not just leave the helper's own tests green."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    called = []
+    monkeypatch.setattr(
+        type(handler), "_stage_remote_workspace_files",
+        staticmethod(lambda session, conv_id: called.append(conv_id)),
+    )
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+    assert called, "produce_remote must stage workspace files before the turn"
+
+
 _DRAFT_MD = ("---\nname: competitive-analysis\ndescription: Compare rivals\n"
              "metadata:\n  display_name: Competitive Analysis\n---\n1. Gather\n2. Compare")
 
