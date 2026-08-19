@@ -205,3 +205,26 @@ def test_unparseable_base_url_is_a_failed_probe_not_a_500():
     # so this makes no network call.
     result = asyncio.run(validate_provider("openai-compatible", "k", "https://[", None))
     assert result["ok"] is False
+
+
+def test_minds_probe_caps_its_token_budget_and_keeps_the_host_path(monkeypatch):
+    # Asserted on the wire, because both are easy to lose: without max_tokens the
+    # probe asks for a full-length completion that MindsHub bills to the included
+    # allowance on every onboarding attempt, and the URL is the only thing that
+    # catches a base whose chat path is derived wrongly.
+    _patch(monkeypatch)
+    asyncio.run(
+        validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", None)
+    )
+    assert _CapturingClient.captured["json"]["max_tokens"] == 20
+    assert _CapturingClient.captured["url"] == "https://api.mindshub.ai/v1/chat/completions"
+
+
+def test_a_non_minds_probe_sends_no_token_cap(monkeypatch):
+    # The cap is MindsHub-only on purpose. OpenAI's reasoning models reject
+    # max_tokens and want max_completion_tokens, and o3/o4-mini are both in
+    # RECOMMENDED_MODELS, so sending it to any endpoint would report a working key
+    # as invalid for exactly the models this ticket is about.
+    _patch(monkeypatch)
+    asyncio.run(validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", "o3"))
+    assert "max_tokens" not in _CapturingClient.captured["json"]
