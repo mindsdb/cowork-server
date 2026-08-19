@@ -114,10 +114,9 @@ def run_schedule_now(
         project_id=schedule.project_id,
     )
 
-    # Pass the caller's principal so the background turn registers in the
-    # streaming registry under this user's org. Without it the run registers
-    # under the system scope and /responses/in-flight-list filters it out in
-    # org mode, so the client never shows an in-progress state (ENG-289).
+    # Pass the caller's principal so the turn registers under their org and
+    # appears in /responses/in-flight-list (else the client shows no
+    # in-progress state).
     background_tasks.add_task(
         execute_schedule, schedule_id, is_manual=True,
         conversation_id=conversation.id, principal=principal,

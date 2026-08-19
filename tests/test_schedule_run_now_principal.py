@@ -1,12 +1,6 @@
-"""Regression for ENG-289: manual "Run now" must register its turn under the
-caller's identity, not the system scope.
-
-The chat client only shows an in-progress state for a run whose conversation
-appears in ``GET /responses/in-flight-list``, which is filtered by the caller's
-org. If ``run_schedule_now`` fires the background run without the caller's
-principal, the turn registers under the system scope and is filtered out in org
-mode, so no client ever sees the run as in progress. This locks the endpoint's
-forwarding of the principal into ``execute_schedule``.
+"""Regression (ENG-289): manual "Run now" must forward the caller's principal
+so the turn registers under their org and appears in /responses/in-flight-list;
+otherwise the client shows no in-progress state.
 """
 
 from __future__ import annotations
@@ -77,8 +71,7 @@ def test_run_now_forwards_caller_principal_to_execute_schedule():
 
 
 def test_execute_schedule_accepts_a_principal():
-    # The scheduler (cron) path calls execute_schedule with no principal, while
-    # run-now forwards one; guard the keyword so neither caller breaks.
+    # Cron calls execute_schedule with no principal; guard the keyword default.
     import inspect
 
     params = inspect.signature(execute_schedule).parameters
