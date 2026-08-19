@@ -108,7 +108,7 @@ def run_dev_setup() -> None:
     # Skill migration + builtin seeding write the unkeyed root via an unscoped
     # SkillService, so both are desktop-only. An org store is per-org and there
     # is no org-creation hook at boot, so org deployments seed lazily on first
-    # read instead — see `migrations.ensure_builtin_skills`.
+    # read instead — see `SkillService.ensure_builtin_skills`.
     if get_app_settings().tenancy_mode != "org":
         from cowork.migrations import migrate_skills_to_files, seed_builtin_skills
 

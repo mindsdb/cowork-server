@@ -33,7 +33,7 @@ def skills_root(tmp_path, monkeypatch):
     store as `<shared_root>/<org_id>/skills`, and a hand-built path silently stops
     marking anything the next time that layout moves.
     """
-    from cowork.migrations import BUILTIN_SKILLS_MARKER, BUILTIN_SKILLS_VERSION
+    from cowork.services.skills import BUILTIN_SKILLS_MARKER, BUILTIN_SKILLS_VERSION
 
     root = tmp_path / "skills"
     monkeypatch.setenv("COWORK_HOME", str(tmp_path))

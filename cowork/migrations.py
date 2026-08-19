@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import shutil
 from pathlib import Path
 
 from cowork.common.settings.app_settings import default_minds_api_host
@@ -31,8 +30,8 @@ from cowork.common.settings.app_settings import default_minds_api_host
 from sqlmodel import Session, select
 from pydantic import ValidationError
 
-from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
-from cowork.common.paths import cowork_home, safe_join
+from anton.core.tools.skill_format import normalize_name, DESC_MAX
+from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import (
     ENV_ALIAS_TO_SETTING,
@@ -43,7 +42,7 @@ from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
-from cowork.services.skills import SkillService
+from cowork.services.skills import BUILTIN_SKILLS_VERSION, SkillService
 
 logger = logging.getLogger(__name__)
 
@@ -206,107 +205,19 @@ def backfill_minds_url(session: Session) -> bool:
 
 
 
-# Packaged skills shipped with cowork. Bump BUILTIN_SKILLS_VERSION when the
-# set changes; seeding re-runs only when the stored version is lower, so a
-# future release can ship more skills without touching ones the user edited
-# or deleted.
-BUILTIN_SKILLS_DIR = Path(__file__).parent / "skills_builtin"
+#: Desktop-mode version marker: a DB sentinel row, since the store there is
+#: unkeyed (one shared install, not per-org). See
+#: ``SkillService.ensure_builtin_skills`` for the org-mode counterpart, which
+#: shares ``BUILTIN_SKILLS_VERSION`` but keys its marker per org.
 BUILTIN_SKILLS_SENTINEL = "_builtin_skills_set"
-BUILTIN_SKILLS_VERSION = 1
-#: Org-mode version marker, a file in the org's own store. See
-#: ``ensure_builtin_skills`` for why this is not a Setting row.
-BUILTIN_SKILLS_MARKER = ".builtins_seeded"
-
-
-def _copy_builtin_skills(store: SkillService) -> int:
-    """Copy packaged builtins into ``store``, skipping slugs it already has.
-
-    Returns how many were copied. Never overwrites, so a skill the user edited
-    or deleted stays as they left it.
-    """
-    if not BUILTIN_SKILLS_DIR.exists():
-        return 0
-    store._ensure_root()
-    copied = 0
-    for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
-        if not src.is_dir() or not (src / SKILL_FILE).exists():
-            continue
-        try:
-            dest = store._skill_dir(src.name)
-            if dest.exists():
-                continue  # keep the user-editable copy untouched
-            # Copied file by file, each destination re-checked for containment
-            # with safe_join. copy2, not copyfile: copytree preserved mode, and a
-            # future builtin shipping an executable helper must keep its +x.
-            for child in sorted(p for p in src.rglob("*") if p.is_file()):
-                target = safe_join(dest, *child.relative_to(src).parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(child, target)
-        except ValueError:
-            # Either the slug resolves outside the store, or safe_join rejected a
-            # destination. The agent writes into its own org's tree on shared
-            # storage, so it can plant a symlink under `dest` between the exists()
-            # check above and the write. Skip this builtin: propagating would 500
-            # every skills read and every turn for the org, which a tenant must
-            # not be able to do to itself.
-            logger.warning("Skipping builtin %r: it does not resolve inside %s",
-                           src.name, store.root, exc_info=True)
-            continue
-        copied += 1
-    return copied
-
-
-def ensure_builtin_skills(scope) -> bool:
-    """Seed one org's skill store with the packaged builtins, on first use.
-
-    Org mode only: desktop seeds once at boot via ``seed_builtin_skills``, and
-    its store is unkeyed so there is nothing per-tenant to do. There is no
-    org-creation hook to hang this on, so it runs lazily where skills are read.
-
-    The version marker is a FILE in the org's store rather than a Setting row,
-    so marker and skills share fate:
-    - a DB row would outlive a lost volume and leave the org permanently empty,
-      because seeding would believe it had already run
-    - a deliberate deletion of every skill is still respected, since the marker
-      survives it and blocks a re-seed
-
-    Returns True if seeding ran. Fail-soft: a filesystem problem leaves the org
-    unseeded and retries on the next read rather than failing the request.
-    """
-    if scope is None or not scope.org_mode:
-        return False
-    try:
-        store = SkillService(scope)
-        marker = store.root / BUILTIN_SKILLS_MARKER
-        current = 0
-        if marker.is_file():
-            raw = marker.read_text(encoding="utf-8").strip()
-            current = int(raw) if raw.isdigit() else 0
-        if current >= BUILTIN_SKILLS_VERSION:
-            return False
-        if not BUILTIN_SKILLS_DIR.exists():
-            # Nothing to seed from — a packaging fault, not a seeded org. Writing
-            # the marker here would record "done" against an empty store, and the
-            # org would stay empty forever once the image is fixed.
-            logger.warning("Builtin skills are missing from this build (%s); not marking %s seeded",
-                           BUILTIN_SKILLS_DIR, store.root)
-            return False
-        copied = _copy_builtin_skills(store)
-        marker.write_text(f"{BUILTIN_SKILLS_VERSION}\n", encoding="utf-8")
-    except OSError:
-        logger.warning("Could not seed builtin skills for org %s",
-                       getattr(scope, "org_id", None), exc_info=True)
-        return False
-    logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)
-    return True
 
 
 def seed_builtin_skills(session: Session) -> bool:
     """Copy packaged builtin skills into the canonical (unkeyed) skills store.
 
     Desktop path. Runs only when the stored set version is below
-    ``BUILTIN_SKILLS_VERSION``. Org deployments use ``ensure_builtin_skills``,
-    which keys the store per org.
+    ``BUILTIN_SKILLS_VERSION``. Org deployments use
+    ``SkillService.ensure_builtin_skills``, which keys the store per org.
     Returns True if seeding ran (version advanced), False if skipped.
     """
     svc = SettingService(session)
@@ -321,7 +232,7 @@ def seed_builtin_skills(session: Session) -> bool:
         link.unlink()
 
     store = SkillService()
-    copied = _copy_builtin_skills(store)
+    copied = store._copy_builtin_skills()
 
     if copied:
         logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)

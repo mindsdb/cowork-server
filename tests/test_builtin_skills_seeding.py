@@ -13,13 +13,19 @@ import pytest
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
-from cowork.migrations import (
+from cowork.services.skills import (
     BUILTIN_SKILLS_DIR,
     BUILTIN_SKILLS_MARKER,
     BUILTIN_SKILLS_VERSION,
-    ensure_builtin_skills,
+    SkillService,
+    build_turn_skills,
 )
-from cowork.services.skills import SkillService, build_turn_skills
+
+
+def ensure_builtin_skills(scope) -> bool:
+    """``SkillService(scope).ensure_builtin_skills()``, worded for the tests
+    below: seeding is a scope-level fact, not a fact about one instance."""
+    return SkillService(scope).ensure_builtin_skills()
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -96,7 +102,7 @@ def test_a_bumped_version_reseeds(skills_root, monkeypatch):
     marker = _store() / BUILTIN_SKILLS_MARKER
     assert marker.read_text().strip() == str(BUILTIN_SKILLS_VERSION)
 
-    monkeypatch.setattr("cowork.migrations.BUILTIN_SKILLS_VERSION", BUILTIN_SKILLS_VERSION + 1)
+    monkeypatch.setattr("cowork.services.skills.BUILTIN_SKILLS_VERSION", BUILTIN_SKILLS_VERSION + 1)
     assert ensure_builtin_skills(_org()) is True
     assert marker.read_text().strip() == str(BUILTIN_SKILLS_VERSION + 1)
 
@@ -145,7 +151,7 @@ def test_an_unwritable_store_does_not_break_reads(skills_root, monkeypatch):
     def _boom(*args, **kwargs):
         raise OSError("read-only filesystem")
 
-    monkeypatch.setattr("cowork.migrations._copy_builtin_skills", _boom)
+    monkeypatch.setattr("cowork.services.skills.SkillService._copy_builtin_skills", _boom)
     assert ensure_builtin_skills(_org()) is False
     assert build_turn_skills(_org(), None) == {}
 
@@ -173,10 +179,10 @@ def test_a_poisoned_slug_does_not_break_the_org(skills_root, tmp_path):
 def test_a_build_without_the_packaged_skills_is_not_marked_seeded(skills_root, monkeypatch):
     """Nothing to seed from is a packaging fault, not a seeded org. Marking it
     done would leave the org empty forever once the image is fixed."""
-    import cowork.migrations as migrations_mod
+    import cowork.services.skills as skills_mod
 
-    packaged = migrations_mod.BUILTIN_SKILLS_DIR
-    monkeypatch.setattr(migrations_mod, "BUILTIN_SKILLS_DIR", Path("/nonexistent"))
+    packaged = skills_mod.BUILTIN_SKILLS_DIR
+    monkeypatch.setattr(skills_mod, "BUILTIN_SKILLS_DIR", Path("/nonexistent"))
     _store().mkdir(parents=True, exist_ok=True)     # store exists, just unseeded
 
     assert ensure_builtin_skills(_org()) is False
@@ -184,7 +190,7 @@ def test_a_build_without_the_packaged_skills_is_not_marked_seeded(skills_root, m
 
     # A later build that ships them seeds normally. Restored narrowly rather than
     # with monkeypatch.undo(), which would also revert the fixture's env vars.
-    monkeypatch.setattr(migrations_mod, "BUILTIN_SKILLS_DIR", packaged)
+    monkeypatch.setattr(skills_mod, "BUILTIN_SKILLS_DIR", packaged)
     assert ensure_builtin_skills(_org()) is True
     assert {s.name for s in SkillService(_org()).list_skills()} == _packaged_slugs()
 
@@ -210,7 +216,7 @@ def test_a_symlink_planted_under_dest_does_not_break_the_org(skills_root, tmp_pa
 def test_file_mode_survives_seeding(skills_root, tmp_path, monkeypatch):
     """copytree preserved mode; the per-file copy must too, or a future builtin
     shipping an executable helper arrives without +x."""
-    import cowork.migrations as migrations_mod
+    import cowork.services.skills as skills_mod
 
     packaged = tmp_path / "packaged"
     (packaged / "with-script" / "scripts").mkdir(parents=True)
@@ -218,7 +224,7 @@ def test_file_mode_survives_seeding(skills_root, tmp_path, monkeypatch):
     helper = packaged / "with-script" / "scripts" / "run.sh"
     helper.write_text("#!/bin/sh\necho hi\n")
     helper.chmod(0o755)
-    monkeypatch.setattr(migrations_mod, "BUILTIN_SKILLS_DIR", packaged)
+    monkeypatch.setattr(skills_mod, "BUILTIN_SKILLS_DIR", packaged)
 
     assert ensure_builtin_skills(_org()) is True
     copied = _store() / "with-script" / "scripts" / "run.sh"
