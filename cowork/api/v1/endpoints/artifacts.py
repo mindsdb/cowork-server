@@ -23,7 +23,7 @@ from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
 from cowork.services.artifact_roots import (
-    artifacts_source_for_project as _source_for_project,
+    artifacts_sources_for_project as _sources_for_project,
     artifacts_sources_for_scan as _sources_for_scan,
     artifacts_sources_for_scope as _sources_for_scope,
 )
@@ -99,7 +99,7 @@ def _sources(session, project_id: UUID | None, project_path: str | None):
 
     if project_id is not None:
         try:
-            return [_source_for_project(session, project_id)]
+            return _sources_for_project(session, project_id)
         except ValueError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
 
@@ -169,7 +169,22 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
     from cowork.services.artifact_publish_key import PublishKey
     from cowork.services.publish import _resolve_publish_endpoint
 
-    base = _sources(session, project_id, None)[0].base
+    # A project can have several artifacts roots in org mode (one per
+    # conversation — see artifact_roots.CONVERSATIONS_DIRNAME), so the slug alone
+    # does not name a directory. Pick the root that actually holds it.
+    #
+    # MVP limitation: the slug is only unique WITHIN a conversation, so two
+    # conversations can both produce e.g. `untitled-artifact` and this deletes
+    # whichever sorts first. Addressing by the artifact's own `metadata.json` id
+    # (already on the card) is the fix; deliberately deferred.
+    bases = [source.base for source in _sources(session, project_id, None)]
+    base = next((b for b in bases if (b / slug).is_dir()), None)
+    if base is None:
+        # No root holds it. Report against the first one so the message names a
+        # real location; with no roots at all there is nothing to delete.
+        if not bases:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+        base = bases[0]
     folder = base / slug
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():

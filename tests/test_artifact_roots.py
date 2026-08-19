@@ -8,6 +8,7 @@ whichever project happens to sort first.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 from sqlmodel import Session
@@ -17,8 +18,9 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.project import Project
 from cowork.services.artifact_roots import (
-    artifacts_source_for_project,
+    artifacts_sources_for_project,
     artifacts_sources_for_scope,
+    conversation_artifacts_base,
 )
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
@@ -48,15 +50,34 @@ def org_mode(monkeypatch):
     monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: True)
 
 
-def test_source_for_project_points_at_the_project_artifacts_dir(session, tmp_path, org_mode):
+def test_sources_for_project_cover_each_conversation(session, tmp_path, org_mode):
+    """Org mode: the agent's workspace is a conversation, so a project's artifacts
+    are spread across `conversations/<id>/.anton/artifacts` — one root each."""
     row = _project(session, tmp_path, name="proj-a", org_id=ORG_A)
+    project_dir = tmp_path / ORG_A / "proj-a"
+    for conv in ("conv-1", "conv-2"):
+        (project_dir / "conversations" / conv / ".anton" / "artifacts").mkdir(parents=True)
     scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id="u"))
 
-    source = artifacts_source_for_project(scoped, row.id)
+    sources = artifacts_sources_for_project(scoped, row.id)
 
-    assert source.base == tmp_path / ORG_A / "proj-a" / ".anton" / "artifacts"
-    assert source.project_id == str(row.id)
-    assert source.project_name == "proj-a"
+    assert [s.base for s in sources] == [
+        project_dir / "conversations" / "conv-1" / ".anton" / "artifacts",
+        project_dir / "conversations" / "conv-2" / ".anton" / "artifacts",
+    ]
+    # Every root reports the SAME project: a conversation is where the bytes sit,
+    # not something the client addresses by.
+    assert {s.project_id for s in sources} == {str(row.id)}
+    assert {s.project_name for s in sources} == {"proj-a"}
+
+
+def test_sources_for_project_is_empty_before_any_conversation_wrote(session, tmp_path, org_mode):
+    """The `conversations/` dir only appears once a pod has mounted one. A project
+    with no cloud artifacts yet is not an error."""
+    row = _project(session, tmp_path, name="fresh", org_id=ORG_A)
+    scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id="u"))
+
+    assert artifacts_sources_for_project(scoped, row.id) == []
 
 
 def test_source_for_foreign_project_raises(session, tmp_path, org_mode):
@@ -64,12 +85,16 @@ def test_source_for_foreign_project_raises(session, tmp_path, org_mode):
     scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id="u"))
 
     with pytest.raises(ValueError):
-        artifacts_source_for_project(scoped, row.id)
+        artifacts_sources_for_project(scoped, row.id)
 
 
 def test_sources_for_scope_covers_only_own_org(session, tmp_path, org_mode):
     mine = _project(session, tmp_path, name="mine", org_id=ORG_A)
-    _project(session, tmp_path, name="theirs", org_id=ORG_B)
+    theirs = _project(session, tmp_path, name="theirs", org_id=ORG_B)
+    # Both need a conversation on disk to yield a root at all — a project with an
+    # empty tree contributes nothing, which would make this pass vacuously.
+    for row in (mine, theirs):
+        (Path(row.path) / "conversations" / "c1" / ".anton" / "artifacts").mkdir(parents=True)
     scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id="u"))
 
     sources = artifacts_sources_for_scope(scoped)
@@ -87,10 +112,12 @@ def test_source_for_project_works_in_desktop_mode_too(session, tmp_path, monkeyp
     row = _project(session, tmp_path, name="solo", org_id=None)
     scoped = ScopedSession(session, LOCAL_SCOPE)
 
-    source = artifacts_source_for_project(scoped, row.id)
+    sources = artifacts_sources_for_project(scoped, row.id)
 
-    assert source.base == tmp_path / "local" / "solo" / ".anton" / "artifacts"
-    assert source.project_id == str(row.id)
+    # Exactly one, and no `conversations` segment: on the desktop the workspace IS
+    # the project directory and every conversation shares one artifacts folder.
+    assert [s.base for s in sources] == [tmp_path / "local" / "solo" / ".anton" / "artifacts"]
+    assert sources[0].project_id == str(row.id)
 
 
 def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monkeypatch):
@@ -105,3 +132,38 @@ def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monke
 
     assert artifacts_sources_for_scope(ScopedSession(session, LOCAL_SCOPE)) == []
     assert called == [1]
+
+
+# ─── the turn-end root ─────────────────────────────────────────────────────
+#
+# `_remote_artifacts_context` resolves through `conversation_artifacts_base`, so
+# this is the layout the end-of-turn diff, the cards and autopublish all key off.
+# Getting it wrong is silent: the snapshot and the diff are both empty, no card
+# is emitted, and the reconciler has nothing to publish — exactly what a missing
+# `conversations/` segment produced on staging.
+
+def test_conversation_base_is_scoped_to_the_conversation_in_org_mode(org_mode, tmp_path):
+    base = conversation_artifacts_base(str(tmp_path / "proj"), "conv-7")
+
+    assert base == tmp_path / "proj" / "conversations" / "conv-7" / ".anton" / "artifacts"
+
+
+def test_conversation_base_ignores_the_conversation_on_desktop(monkeypatch, tmp_path):
+    """Desktop's workspace IS the project dir — every conversation shares one
+    artifacts folder, so the id is accepted and dropped rather than refused."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+
+    base = conversation_artifacts_base(str(tmp_path / "proj"), "conv-7")
+
+    assert base == tmp_path / "proj" / ".anton" / "artifacts"
+
+
+def test_conversation_base_agrees_with_the_listed_roots(session, tmp_path, org_mode):
+    """The turn writes where the list reads. These are separate code paths and a
+    drift between them shows up as artifacts that exist but never appear."""
+    row = _project(session, tmp_path, name="agree", org_id=ORG_A)
+    turn_base = conversation_artifacts_base(row.path, "conv-9")
+    turn_base.mkdir(parents=True)
+    scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id="u"))
+
+    assert turn_base in [s.base for s in artifacts_sources_for_project(scoped, row.id)]

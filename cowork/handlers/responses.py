@@ -613,11 +613,15 @@ class ResponsesHandler:
         None on any failure: no artifact card and no autopublish is a recoverable
         outcome (the next turn in this project reconciles), a failed turn is not.
         """
-        from pathlib import Path
+        from cowork.services.artifact_roots import conversation_artifacts_base
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            artifacts_base = Path(conversation.project.path) / ".anton" / "artifacts"
+            # Conversation-scoped in org mode: the pod's workspace is
+            # <project>/conversations/<id>, not the project, so that is where the
+            # worker's artifacts land. Resolved through artifact_roots so this and
+            # the artifacts list agree on the layout.
+            artifacts_base = conversation_artifacts_base(conversation.project.path, conv_id)
             return (
                 conversation,
                 artifacts_base,
