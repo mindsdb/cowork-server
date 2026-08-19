@@ -64,8 +64,18 @@ def is_minds_host(url: str | None) -> bool:
         return False
     # A bare `api.mindshub.ai/v1` has no scheme, so urlparse would read the whole
     # thing as a path and find no hostname. Prefixing `//` makes it a netloc.
-    parsed = urlparse(raw if "//" in raw else f"//{raw}")
-    host = (parsed.hostname or "").lower()
+    #
+    # The try is load-bearing, not defensive: `.hostname` raises ValueError on an
+    # unbalanced `[` or `]`, this runs in validate_provider OUTSIDE
+    # validate_openai_compatible's except, and base_url is free text off the
+    # provider card. Without it, `baseUrl: "["` leaves the service layer and the
+    # endpoint answers 500 where it used to answer ok:false. The TypeScript copy
+    # guards the same case with try/catch around `new URL`.
+    try:
+        parsed = urlparse(raw if "//" in raw else f"//{raw}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
     return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
 
 
