@@ -490,3 +490,25 @@ def test_remove_conversation_workspace_dir_is_noop_on_desktop(tmp_path, monkeypa
     (ws / "notes").mkdir(parents=True)               # a user's own dir, coincidental name
     remove_conversation_workspace_dir(proj, conv)
     assert ws.exists(), "desktop conversation delete must not rmtree a project subdir"
+
+
+def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
+    """A typo-fix edit (same length, same mtime second) must still re-stage —
+    the old size+mtime skip could serve stale instructions."""
+    import os
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    (proj / ".anton").mkdir(parents=True)
+    src = proj / ".anton" / "anton.md"
+    src.write_text("be terse")
+    assert stage_project_instructions(proj, conv) is True
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    assert dest.read_text() == "be terse"
+
+    # same-length edit, pinned to the same mtime as the staged copy
+    fixed_mtime = dest.stat().st_mtime
+    src.write_text("be funny")                       # same length (8), different content
+    os.utime(src, (fixed_mtime, fixed_mtime))
+    assert stage_project_instructions(proj, conv) is True
+    assert dest.read_text() == "be funny"            # re-staged despite the tie
