@@ -40,6 +40,35 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
+def is_minds_host(url: str | None) -> bool:
+    """True when `url` points at a MindsHub inference host.
+
+    Used to decide whether a probe that omitted its model should fall back to
+    MINDS_PROBE_MODEL rather than to a generic OpenAI default that MindsHub does
+    not serve.
+
+    Compares the parsed hostname, never a substring of the whole URL: a
+    substring test matches `mindshub.ai.example.test` and a `?next=` parameter
+    carrying our host, and the base URL here is partly user-supplied (the
+    openai-compatible card's own field). Covers the prod host, the per-env
+    `api.<env>.mindshub.ai` / `api-<ns>.dev.mindshub.ai` hosts, and the legacy
+    `mdb.ai` host.
+
+    A self-hosted gateway on some other hostname does not match, the same
+    limitation `build_llm_client` documents where it states the MindsHub flavor
+    outright instead of deriving it from the URL. The consequence here is only
+    that such a caller keeps today's generic default.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    # A bare `api.mindshub.ai/v1` has no scheme, so urlparse would read the whole
+    # thing as a path and find no hostname. Prefixing `//` makes it a netloc.
+    parsed = urlparse(raw if "//" in raw else f"//{raw}")
+    host = (parsed.hostname or "").lower()
+    return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
+
+
 # Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
 # publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
 # can't map to a non-prod MindsHub env, falls back here.
@@ -770,7 +799,21 @@ async def validate_provider(provider: str, api_key: str,
     if provider == "minds":
         return await validate_minds(api_key, base_url or default_minds_api_host())
     if provider == "openai-compatible":
-        return await validate_openai_compatible(api_key, base_url or "https://api.openai.com/v1", model)
+        resolved_base = base_url or "https://api.openai.com/v1"
+        # A caller that omits the model against a MindsHub host gets the free
+        # probe model. Neither alternative works there: validate_openai_compatible's
+        # generic default is not a MindsHub alias so it 404s, and the recommended
+        # MindsHub model is paid so a wallet with no balance 402s. Both read back
+        # as an invalid key and send a new user to bring-your-own-key with a
+        # working key already saved. The connectivity probe above was fixed for
+        # this same reason; the validation path never got the same treatment.
+        #
+        # Only when the model is omitted. An explicit model is always validated
+        # as asked, or picking one model in the provider card would silently
+        # validate a different one and report a pass the user cannot trust.
+        if not model and is_minds_host(resolved_base):
+            model = MINDS_PROBE_MODEL
+        return await validate_openai_compatible(api_key, resolved_base, model)
     return {"ok": False, "error": "Unknown provider"}
 
 

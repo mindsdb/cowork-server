@@ -179,6 +179,31 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 
+### Provider probes always use a model any key can call
+
+Both `POST /settings/test-providers` (the Settings health dot) and
+`POST /settings/validate-provider` (onboarding and the provider cards) reach
+MindsHub with a one-token chat completion rather than a listing route, because
+listing routes are not deployed on every MindsHub host and answer 404 or 401 even
+for a valid key.
+
+The model they send is `MINDS_PROBE_MODEL` (`mindshub_air`), never the configured
+or recommended one. MindsHub bills per model, so a model the wallet cannot pay for
+is denied, and that denial is indistinguishable here from a bad key: probing a paid
+model tells an account with an empty wallet that its working key is invalid.
+`mindshub_air` draws the monthly included allowance instead of the wallet, so the
+result reports reachability and key validity, which is what these endpoints are for.
+
+`validate-provider` takes an optional `model`. Omit it against a MindsHub base URL
+and it probes `mindshub_air`; omit it against any other host and the generic
+openai-compatible default applies. A `model` sent explicitly is always the model
+probed, MindsHub or not, so validating one specific model cannot report a pass for a
+different one.
+
+The desktop app has a second copy of these validators in its Electron main process
+(`cowork/src/main/index.ts`), which is what a packaged build actually calls;
+the endpoints here serve the web build. Both copies have to change together.
+
 ## Configuration
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
