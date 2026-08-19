@@ -320,7 +320,6 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_skills = lambda session, conv_id: None
 
     async def fake_replies(**kwargs):
         yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
@@ -398,3 +397,136 @@ async def test_produce_remote_stages_workspace_files(monkeypatch):
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
     assert called, "produce_remote must stage workspace files before the turn"
+
+
+def test_stage_remote_workspace_files_seeds_builtin_skills(monkeypatch):
+    """The pod reads skills straight off the shared mount, not through a
+    payload — GET /skills is not the only place a fresh org can get seeded, or
+    an org that chats before it ever opens the skills menu stays empty
+    forever on cloud turns (ENG-1679 review)."""
+    calls = []
+
+    class FakeSkillService:
+        def __init__(self, scope):
+            calls.append(scope)
+
+        def ensure_builtin_skills(self):
+            calls.append("seeded")
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(project=SimpleNamespace(path="/tmp/proj"))
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "SkillService", FakeSkillService)
+    monkeypatch.setattr(
+        responses_mod, "FileService",
+        lambda session: SimpleNamespace(stage_conversation_attachments=lambda *a, **k: None),
+    )
+    monkeypatch.setattr("cowork.services.files.stage_project_instructions", lambda *a, **k: None)
+
+    scope = _FakeScope()
+    ResponsesHandler._stage_remote_workspace_files(SimpleNamespace(scope=scope), uuid4())
+
+    assert calls == [scope, "seeded"]
+
+
+_DRAFT_MD = ("---\nname: competitive-analysis\ndescription: Compare rivals\n"
+             "metadata:\n  display_name: Competitive Analysis\n---\n1. Gather\n2. Compare")
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_surfaces_a_skill_draft_as_a_card(monkeypatch):
+    """A draft the pod built comes out as the same response.skill_created card
+    the desktop path emits, and lands in the persisted events log so a reload
+    replays it. The skill itself is NOT saved — the card is the user's decision."""
+    import json
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "Built it."}
+        yield "turn_skill", {"entries": [{
+            "slug": "competitive-analysis",
+            "files": {"SKILL.md": _DRAFT_MD, "recipe.md": "detail"},
+        }]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+
+    cards = [json.loads(f.split("data: ", 1)[1]) for f in frames
+             if f.startswith("event: response.skill_created")]
+    assert len(cards) == 1
+    skill = cards[0]["skill"]
+    assert skill["slug"] == "competitive-analysis"
+    assert skill["name"] == "Competitive Analysis"
+    assert "1. Gather" in skill["instructions"]
+    assert skill["files"] == [{"name": "recipe.md", "text": "detail"}]
+
+    # Replay on reload reads the events log, not the live stream.
+    assert any(e.get("type") == "response.skill_created" for e in saved["events"])
+    assert frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
+async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
+    """An unusable entry from the pod is dropped, not fatal: the turn still
+    completes and its text is still persisted. The drop is not silent, though —
+    it surfaces as an inline progress notice (ENG-1679 review: a rejected draft
+    used to vanish with only a server-side log line)."""
+    import json
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+
+    async def fake_replies(**kwargs):
+        yield "turn_skill", {"entries": [{"slug": "../escape", "files": {"SKILL.md": "x"}}]}
+        yield "turn_delta", {"text": "Done."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+
+    assert not any(f.startswith("event: response.skill_created") for f in frames)
+
+    progress = [json.loads(f.split("data: ", 1)[1]) for f in frames
+                if f.startswith("event: response.in_progress")]
+    dropped = [p for p in progress if p.get("phase") == "skill_draft_dropped"]
+    assert len(dropped) == 1
+    assert "../escape" in dropped[0]["message"]
+
+    assert frames[-1] == "CLOSE:completed"
+    assert saved["assistant"] == "Done."
