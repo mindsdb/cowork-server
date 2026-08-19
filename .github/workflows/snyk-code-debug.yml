@@ -27,15 +27,7 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           snyk code test --sarif-file-output=out.sarif || true
-          echo '--- ruleIds for cowork/services/providers.py ---'
-          python3 - <<'EOF'
-          import json
-          d = json.load(open('out.sarif'))
-          for run in d.get('runs', []):
-              for r in run.get('results', []):
-                  for loc in r.get('locations', []):
-                      uri = loc['physicalLocation']['artifactLocation']['uri']
-                      line = loc['physicalLocation']['region']['startLine']
-                      if 'services/providers.py' in uri:
-                          print(f"ruleId={r.get('ruleId')!r} line={line} level={r.get('level')}")
-          EOF
+          echo '--- providers.py findings ---'
+          python3 -c "import json;d=json.load(open('out.sarif'));[print('ruleId=',r.get('ruleId'),'line=',l['physicalLocation']['region']['startLine'],'level=',r.get('level')) for run in d.get('runs',[]) for r in run.get('results',[]) for l in r.get('locations',[]) if 'services/providers.py' in l['physicalLocation']['artifactLocation']['uri']]"
+          echo '--- rule metadata ---'
+          python3 -c "import json;d=json.load(open('out.sarif'));[print(x.get('id'),'|',x.get('name'),'|',x.get('shortDescription',{}).get('text')) for run in d.get('runs',[]) for x in run.get('tool',{}).get('driver',{}).get('rules',[]) if 'Hardcoded' in str(x.get('name',''))+str(x.get('id',''))]"
