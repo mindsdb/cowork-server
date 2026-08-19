@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import UUID
 
 import sqlalchemy as sa
+from sqlalchemy import Index, text
 from sqlmodel import Field
 
 from cowork.models.base import BaseSQLModel
@@ -61,3 +62,20 @@ class ScheduleRun(BaseSQLModel, table=True):
         description="Conversation created during this run",
     )
     is_manual: bool = Field(default=False, description="True if triggered via run-now endpoint")
+
+    __table_args__ = (
+        # Single-flight: at most one in-flight run per schedule. The INSERT is
+        # the atomic claim — a second concurrent run (overlapping cron ticks, or
+        # a manual "run now" racing a cron dispatch) loses with an
+        # IntegrityError instead of double-running the schedule. Only 'running'
+        # rows are constrained, so finished runs pile up freely. Partial index;
+        # created for Postgres and SQLite alike. Full rationale: ScheduleRun-
+        # Service.try_claim_run and migration a7e4c2f1b9d3 (ENG-1733).
+        Index(
+            "uq_schedule_runs_one_active",
+            "schedule_id",
+            unique=True,
+            sqlite_where=text("status = 'running'"),
+            postgresql_where=text("status = 'running'"),
+        ),
+    )

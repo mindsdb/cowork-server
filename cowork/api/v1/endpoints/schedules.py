@@ -100,6 +100,20 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
+    # Single-flight: claim the run before creating anything so a manual click
+    # can't race a concurrent cron dispatch (or a double-click) into two
+    # overlapping runs of the same schedule. _due_schedules gates the cron path
+    # on has_active_run; this gives the manual path the same guard, atomically
+    # (ENG-1733 #4). The claim also means no orphan conversation is created when
+    # a run is already in flight.
+    run_service = ScheduleRunService(scoped)
+    run = run_service.try_claim_run(schedule_id, is_manual=True)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A run for this schedule is already in progress",
+        )
+
     from cowork.scheduler import execute_schedule
     from cowork.services.conversations import ConversationService
 
@@ -107,10 +121,11 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
         topic=schedule.title,
         project_id=schedule.project_id,
     )
+    run_service.set_run_conversation(run.id, conversation.id)
 
     background_tasks.add_task(
         execute_schedule, schedule_id, is_manual=True,
-        conversation_id=conversation.id,
+        conversation_id=conversation.id, run_id=run.id,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
 

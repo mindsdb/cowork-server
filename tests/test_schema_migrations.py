@@ -172,6 +172,9 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
             "uq_settings_key_global",
             "uq_settings_key_org",
             "uq_settings_key_user",
+            # The single-flight partial index (a7e4c2f1b9d3) is created by its
+            # migration, so drop the model-declared copy first.
+            "uq_schedule_runs_one_active",
         ):
             connection.execute(text(f"DROP INDEX IF EXISTS {index}"))
         # The settings row-shape CHECK (c8e1a4f7b2d9) references scope/org_id/
