@@ -17,6 +17,7 @@ from cowork.channels.plugin import (
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
+    VerifyResult,
     WebhookRoute,
 )
 from cowork.channels.text import split_for_limit
@@ -405,6 +406,26 @@ class DiscordBridge:
         return str((resp.json() or {}).get("id", ""))
 
 
+async def verify_discord_credentials(credentials: Mapping[str, str]) -> VerifyResult:
+    """GET /users/@me is the cheapest real proof a bot token works — building
+    a DiscordBridge never rejects one on its own."""
+    bot_token = (credentials.get("bot_token") or "").strip()
+    if not bot_token:
+        return VerifyResult(ok=False, detail="bot_token is not set")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{DISCORD_API_BASE}/users/@me",
+                headers={"Authorization": f"Bot {bot_token}"},
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        return VerifyResult(ok=False, detail=f"could not reach Discord: {exc}")
+    if resp.status_code == 200:
+        name = (resp.json() or {}).get("username", "")
+        return VerifyResult(ok=True, detail=f"Connected as {name}" if name else "Connected")
+    return VerifyResult(ok=False, detail=f"Discord rejected the token: HTTP {resp.status_code}")
+
+
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
     # Only the bot token is required: it powers the Gateway (inbound) and the
     # REST API (outbound). public_key is needed solely for the interactions
@@ -434,6 +455,8 @@ plugin = ChannelPlugin(
         supports_oauth=False,
         supports_direct_credentials=True,
         supports_custom_ack=True,
+        supports_verify=True,
     ),
     extract_routing_key=extract_application_id,
+    verify=verify_discord_credentials,
 )

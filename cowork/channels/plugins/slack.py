@@ -18,6 +18,7 @@ from cowork.channels.plugin import (
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
+    VerifyResult,
     WebhookRoute,
 )
 from cowork.channels.text import split_for_limit
@@ -331,6 +332,27 @@ class SlackBridge:
         return str(result.get("ts", ""))
 
 
+async def verify_slack_credentials(credentials: Mapping[str, str]) -> VerifyResult:
+    """auth.test is the cheapest real proof a bot token works — building a
+    SlackBridge never rejects one on its own."""
+    bot_token = (credentials.get("bot_token") or "").strip()
+    if not bot_token:
+        return VerifyResult(ok=False, detail="bot_token is not set")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{SLACK_API_BASE}/auth.test",
+                headers={"Authorization": f"Bearer {bot_token}"},
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        return VerifyResult(ok=False, detail=f"could not reach Slack: {exc}")
+    body = resp.json()
+    if body.get("ok"):
+        team = body.get("team") or body.get("team_id") or ""
+        return VerifyResult(ok=True, detail=f"Connected to {team}" if team else "Connected")
+    return VerifyResult(ok=False, detail=f"Slack rejected the token: {body.get('error', 'unknown error')}")
+
+
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
     if not (credentials.get("bot_token") or "").strip():
         return None
@@ -364,6 +386,8 @@ plugin = ChannelPlugin(
         supports_oauth=False,
         supports_direct_credentials=True,
         supports_custom_ack=False,
+        supports_verify=True,
     ),
     extract_routing_key=extract_team_id,
+    verify=verify_slack_credentials,
 )

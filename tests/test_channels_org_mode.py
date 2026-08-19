@@ -283,3 +283,11 @@ def test_bindings_do_not_require_org_admin(client):
     # Chat-routing assignment, not channel configuration — any org member.
     res = client.get("/api/v1/channels/bindings", headers=A)
     assert res.status_code == 200
+
+
+# --- test-connection: read-only (spends the stored creds on a live API call,
+# writes nothing) — any org member, same tier as GET config/status ----------
+
+def test_test_connection_does_not_require_org_admin(client):
+    res = client.post("/api/v1/channels/slack/test-connection", headers=A)
+    assert res.status_code == 200

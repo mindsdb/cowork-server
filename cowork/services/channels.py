@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlmodel import Session, select
 
-from cowork.channels.plugin import ChannelPlugin
+from cowork.channels.plugin import ChannelPlugin, VerifyResult
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.app_settings import get_app_settings
@@ -100,6 +100,15 @@ class ChannelConfigService:
     def get_config(self, channel_type: str) -> ChannelConfigResponse:
         plugin = self._require_plugin(channel_type)
         return self._config_dto(plugin)
+
+    async def test_connection(self, channel_type: str) -> VerifyResult:
+        """Calls the plugin's `verify` hook against the currently STORED
+        credentials — proof they actually authenticate, not just that
+        `_is_configured` found something typed into every required field."""
+        plugin = self._require_plugin(channel_type)
+        if plugin.verify is None:
+            return VerifyResult(ok=False, detail=f"{plugin.display_name} has no connection test yet")
+        return await plugin.verify(self.load_credentials(channel_type))
 
     def load_credentials(self, channel_type: str) -> dict[str, str]:
         """Decrypted credential values for internal runtime use only — building

@@ -70,6 +70,15 @@ class OAuthSpec:
 
 
 @dataclass(frozen=True)
+class VerifyResult:
+    """Outcome of a plugin's `verify` hook: did these credentials actually
+    authenticate against the platform, not just get typed into the form."""
+
+    ok: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class ChannelCapabilities:
     """What a channel supports, for the UI to decide which forms/buttons to show.
 
@@ -83,6 +92,7 @@ class ChannelCapabilities:
     supports_oauth: bool = False
     supports_direct_credentials: bool = True
     supports_custom_ack: bool = False
+    supports_verify: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,3 +113,7 @@ class ChannelPlugin:
     # inbound body/headers, for platforms that carry one. None (most plugins
     # today) means: no per-org webhook routing, the plain resolver decides.
     extract_routing_key: Callable[[bytes, Mapping[str, str]], str | None] | None = None
+    # Calls the platform to check these credentials actually authenticate —
+    # `_is_configured` only checks presence, not validity. None means no live
+    # check is available yet for this channel.
+    verify: Callable[[Mapping[str, str]], Awaitable["VerifyResult"]] | None = None
