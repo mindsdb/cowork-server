@@ -134,12 +134,27 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Project ID for a new conversation",
     )
-    # In OpenAI's Responses API, the model is required.
-    # However, we currently do not allow this to be specified at the time of making the request,
-    # via the Cowork UI. Instead, the model is retrieved from the user provided settings.
+    # In OpenAI's Responses API, the model is required; here it is optional.
+    # When set (the composer's per-conversation model pick), it overrides the
+    # account-wide planning/coding/router model settings for this turn only
+    # (see AntonHarness._apply_model_override) and is persisted onto the new
+    # conversation's Conversation.model so a reopened task remembers the pick.
+    # When omitted, the account-wide user settings govern as before.
     model: str | None = Field(
         default=None,
         description="Model name for the chat completion request"
+    )
+    # The composer's per-task harness pick (Coding Mode). Overrides the
+    # account-wide `harness` setting for THIS conversation only — mirrors
+    # `model` above. Silently ignored (falls back to the account default) if
+    # it doesn't name a harness this account currently has registered/
+    # available (see ResponsesHandler.handle); an invalid transient value
+    # (e.g. a stale client cache after Hermes gets uninstalled) must never
+    # fail the turn. Persisted onto the new conversation's Conversation.harness
+    # so a reopened task remembers the pick, same as `model`.
+    harness: str | None = Field(
+        default=None,
+        description="Harness name for this conversation, overriding the account default",
     )
     stream: bool | None = Field(
         default=False,

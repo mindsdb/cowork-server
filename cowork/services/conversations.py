@@ -258,6 +258,8 @@ class ConversationService:
         topic: str,
         project_id: UUID | None = None,
         conversation_id: UUID | None = None,
+        harness: str | None = None,
+        model: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
@@ -271,6 +273,8 @@ class ConversationService:
         conversation = Conversation(
             topic=topic,
             project_id=target_project_id,
+            harness=harness,
+            model=model,
         )
         if conversation_id is not None:
             conversation.id = conversation_id

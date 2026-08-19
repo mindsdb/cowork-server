@@ -92,6 +92,31 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     return applied
 
 
+def _apply_model_override(anton_settings, model: str | None) -> list[str]:
+    """A per-conversation model pick (the composer's dropdown) overrides
+    planning/coding/router for THIS call only — the account-wide
+    planning_model/coding_model/router_model settings applied by
+    ``_overlay_user_settings`` above are left untouched for every other
+    conversation. Provider is deliberately NOT overridden: the composer's
+    model list is itself scoped to whichever provider is already configured,
+    so the existing planning/coding/router providers stay correct for the
+    picked model.
+
+    No-op (returns []) when ``model`` is falsy, so the account-wide defaults
+    keep governing conversations with no per-conversation pick.
+
+    Same hasattr skew guard as ``_overlay_user_settings`` — see its docstring.
+    """
+    if not model:
+        return []
+    applied: list[str] = []
+    for attr in ("planning_model", "coding_model", "router_model"):
+        if hasattr(anton_settings, attr):
+            setattr(anton_settings, attr, model)
+            applied.append(attr)
+    return applied
+
+
 def _apply_workspace_env_if_safe(workspace) -> bool:
     """Load `<project>/.anton/.env` into this process's environment, unless
     org mode. Returns whether it applied.
@@ -402,7 +427,9 @@ class AntonHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        # Per-conversation model pick (the composer's dropdown) — overrides
+        # planning/coding/router for this call only; see _build_chat_session.
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Observability pass-through (see ResponsesRequest / HarnessProvider):
         # forwarded to Anton's per-turn TraceContext so they land on the
@@ -466,6 +493,7 @@ class AntonHarness:
         try:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
+                model=model,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
@@ -534,6 +562,31 @@ class AntonHarness:
             yield SkillCreated(draft)
         if turn_rows:
             yield TurnHistory(turn_rows)
+
+    @staticmethod
+    def _stamp_message(m) -> dict:
+        """Embed a USER message's created_at as a `[YYYY-MM-DD HH:MM] ` prefix
+        so the agent always knows WHEN something was said (even resuming a
+        conversation days/weeks later). Absolute stamps are fixed per
+        message, so the history prefix stays byte-stable across turns
+        (cache-safe).
+
+        User-only, matching anton's own live-turn stamping
+        (core_agent/anton/core/session.py's _stamp_user_content). An earlier
+        version stamped assistant replies too, which meant Anton's own prior
+        replies came back to it prefixed with a timestamp in its replayed
+        history, and it would imitate that visible convention in new
+        output — most visible on short turns like "hi"/"who are you?" with
+        little else to anchor generation.
+
+        Extracted (not an inline closure) so this can be unit-tested
+        directly against fake messages, same reasoning as _seed_history.
+        """
+        om = m.to_openai_message().model_dump()
+        ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+        if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
+            om["content"] = f"[{ts}] {om['content']}"
+        return om
 
     @staticmethod
     def _seed_history(ordered_messages: list, history_summary: str | None, cutoff_id, stamp) -> tuple[list[dict], dict]:
@@ -642,7 +695,7 @@ class AntonHarness:
     async def _build_chat_session(
         self,
         conversation: Conversation,
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
     ):
@@ -734,6 +787,8 @@ class AntonHarness:
         router_model = getattr(user, "router_model", None)
         if router_model is not None and hasattr(anton_settings, "router_model"):
             anton_settings.router_model = router_model
+
+        _apply_model_override(anton_settings, model)
 
         workspace = Workspace(base)
         workspace.initialize()
@@ -956,17 +1011,6 @@ class AntonHarness:
         cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
-        # Per-message timestamps: embed each message's created_at so the agent
-        # always knows WHEN something was said (even resuming a conversation
-        # days/weeks later). Absolute stamps are fixed per message, so the
-        # history prefix stays byte-stable across turns (cache-safe).
-        def _stamped(m):
-            om = m.to_openai_message().model_dump()
-            ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
-            if ts and isinstance(om.get("content"), str) and om["content"]:
-                om["content"] = f"[{ts}] {om['content']}"
-            return om
-
         replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
         # Replay [summary] + [messages after cutoff] instead of full history
         # when a saved compaction is still valid (ENG-664). Disabled → plain
@@ -976,10 +1020,10 @@ class AntonHarness:
                 replayable,
                 conversation.history_summary,
                 conversation.history_summary_cutoff_id,
-                _stamped,
+                self._stamp_message,
             )
         else:
-            initial_history = [_stamped(m) for m in replayable]
+            initial_history = [self._stamp_message(m) for m in replayable]
             seed_info = None
 
         config = ChatSessionConfig(
