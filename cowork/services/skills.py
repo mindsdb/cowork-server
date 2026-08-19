@@ -114,9 +114,12 @@ def build_turn_skills(scope: TenantScope | None, project_path: str | None = None
     """
     svc = SkillService(scope)
     # A fresh org's store starts empty and there is no org-creation hook, so the
-    # builtins are seeded on first read. Seeded here for an org that chats before
-    # it ever opens the skills menu; the menu seeds too, so whichever comes first
-    # wins. No-op after that, and in local mode.
+    # builtins are seeded on first read. This function has no production caller
+    # today — cloud turns read skills off the shared mount directly rather than
+    # through this payload (see `_stage_remote_workspace_files`, which is the
+    # actual seed trigger for a chat-first org) — but it seeds too, so it stays
+    # correct if a future caller reappears. No-op after the first run, and in
+    # local mode.
     svc.ensure_builtin_skills()
 
     project_name = Path(project_path).name if project_path else None

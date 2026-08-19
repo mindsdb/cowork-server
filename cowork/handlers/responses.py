@@ -67,7 +67,7 @@ from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
-from cowork.services.skills import SkillService, build_turn_skills
+from cowork.services.skills import SkillService
 from cowork.services.task_objects import remote_skill_draft_payload
 
 
@@ -574,9 +574,14 @@ class ResponsesHandler:
     def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
         """Stage the project-level files the pod can't otherwise see — the
         conversation's attachments and the project's anton.md instructions —
-        into the conversation workspace on the shared mount. Never fails the
-        turn: a staging error degrades to a turn without them, same policy as
-        memory/skills."""
+        into the conversation workspace on the shared mount, and seed this
+        org's skill store with the packaged builtins if it hasn't been yet.
+
+        The seeding call belongs here, not just behind ``GET /skills``: the pod
+        reads skills straight off the shared mount (no payload), so this is the
+        only place that runs on every remote turn and can catch an org that
+        chats before it ever opens the skills menu. Never fails the turn: a
+        staging error degrades to a turn without the missing piece."""
         try:
             from cowork.services.files import stage_project_instructions
 
@@ -584,6 +589,7 @@ class ResponsesHandler:
             project_path = conversation.project.path
             FileService(session).stage_conversation_attachments(conv_id, project_path)
             stage_project_instructions(project_path, conv_id)
+            SkillService(session.scope).ensure_builtin_skills()
         except Exception:
             logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
 
@@ -624,18 +630,6 @@ class ResponsesHandler:
             return build_turn_memory(session.scope, conversation.project.path)
         except Exception:
             logger.exception("[responses] failed to read memory for conversation %s", conv_id)
-            return {}
-
-    @staticmethod
-    def _remote_skills(session: ScopedSession, conv_id: UUID) -> dict:
-        """This org's skills for the pod, filtered to the conversation's project.
-        A read error degrades to a turn without skills rather than failing the
-        turn."""
-        try:
-            conversation = ConversationService(session).get_conversation(conv_id)
-            return build_turn_skills(session.scope, conversation.project.path)
-        except Exception:
-            logger.exception("[responses] failed to read skills for conversation %s", conv_id)
             return {}
 
     @staticmethod

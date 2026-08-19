@@ -37,7 +37,9 @@ def _distribute_skill_links() -> None:
     """Boot-time symlink fan-out of the skill store into project dirs.
 
     Desktop-only: in org mode this reads the unkeyed root and scans every
-    project dir. Cloud turns get skills via the payload (build_turn_skills).
+    project dir. Cloud turns read skills straight off the shared mount instead
+    (no payload); the pod's org gets seeded lazily, see
+    `_stage_remote_workspace_files` and `SkillService.ensure_builtin_skills`.
     """
     if get_app_settings().tenancy_mode == "org":
         return
