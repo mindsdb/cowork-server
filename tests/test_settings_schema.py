@@ -67,3 +67,42 @@ def test_migration_normalizer_delegates_to_the_canonical_one():
         == "minds_cloud"
     )
     assert _normalize_provider_value("openai-compatible", {}) == "openai_compatible"
+
+
+# ─── which env var actually overrides a setting ────────────────────────────
+#
+# There are two env paths onto a UserSettings field and they are easy to confuse
+# — the artifact_autopublish_enabled docstring got it wrong until these tests
+# were written:
+#
+#   SETTING_ENV_ALIASES  (ANTON_*)  seeds DB rows from a .env file, and org
+#     deployments skip that seed entirely (dev_setup._migrate_env_to_db_if_local),
+#     so on the cloud it overrides nothing.
+#   the FIELD NAME itself                is read by pydantic-settings whenever no
+#     DB row supplies the field. Process-global: it applies to every tenant of
+#     the deployment, with no row for an operator to find afterwards.
+#
+# Anything that documents "set X to turn this on" has to name the second one.
+
+def test_field_name_env_var_overrides_a_setting(monkeypatch):
+    monkeypatch.delenv("ANTON_ARTIFACT_AUTOPUBLISH", raising=False)
+    monkeypatch.setenv("ARTIFACT_AUTOPUBLISH_ENABLED", "true")
+
+    assert UserSettings().artifact_autopublish_enabled is True
+
+
+def test_anton_alias_alone_does_not_override_a_setting(monkeypatch):
+    """The ANTON_* alias is a .env→DB seed key, not a live override. Asserted so
+    the field's own description cannot drift back to naming it."""
+    monkeypatch.delenv("ARTIFACT_AUTOPUBLISH_ENABLED", raising=False)
+    monkeypatch.setenv("ANTON_ARTIFACT_AUTOPUBLISH", "true")
+
+    assert UserSettings().artifact_autopublish_enabled is False
+
+
+def test_autopublish_description_names_the_override_that_works(monkeypatch):
+    text = UserSettings.model_fields["artifact_autopublish_enabled"].description
+    assert "ARTIFACT_AUTOPUBLISH_ENABLED" in text
+    # Naming the alias is fine — saying it is the override is not. The
+    # description must mark it as NOT the bypass.
+    assert "NOT that" in text or "not that" in text
