@@ -41,6 +41,7 @@ from cowork.services.providers import (
 )
 from cowork.services.settings import SettingService
 from cowork.common.settings.app_settings import (
+    AGENT_ROLE_NAMES,
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
@@ -121,6 +122,44 @@ def _bearer_token(request: Request | None) -> str:
     return header[7:].strip() if header.lower().startswith("bearer ") else ""
 
 
+def _reject_malformed_role_defaults(updates: dict[str, Any]) -> None:
+    """400 on a ``minds_role_defaults`` write that is not role -> model id.
+
+    The endpoint below writes this map itself, from the catalog, but the key is a
+    declared `UserSettings` field like any other, so `PUT /settings/{key}` accepts
+    it too and its values become the model every role with no explicit pick starts
+    on. Resolution filters the map when it reads it, which turns a bad hand-write
+    into every role silently falling back to the compiled table; failing the write
+    says which part was wrong instead.
+
+    Catalog membership is deliberately NOT checked here (see the writer inventory
+    in `cowork/services/providers.py`): the value is derived from the catalog in the
+    first place, and `_enabled_aware_default` discards a model the availability map
+    does not affirm.
+    """
+    raw = (updates or {}).get("minds_role_defaults")
+    if raw is None or not isinstance(raw, str) or not raw.strip():
+        return
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="minds_role_defaults must be a JSON object of agent role -> model id",
+        ) from None
+    bad = None
+    if not isinstance(parsed, dict):
+        bad = "must be a JSON object of agent role -> model id"
+    elif unknown := sorted(k for k in parsed if k not in AGENT_ROLE_NAMES):
+        bad = f"names no agent role: {', '.join(unknown)}"
+    elif empty := sorted(k for k, v in parsed.items() if not isinstance(v, str) or not v.strip()):
+        bad = f"gives no model id for: {', '.join(empty)}"
+    if bad:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"minds_role_defaults {bad}"
+        )
+
+
 async def _reject_unservable_models(
     session: Session,
     scope: TenantScope,
@@ -192,6 +231,7 @@ async def bulk_upsert_settings(
     _require_org_admin_for(live_keys, scope, principal)
     # Before anything is staged, so a bad model id 400s with nothing written —
     # same all-or-nothing contract as the field validation below.
+    _reject_malformed_role_defaults(body.values or {})
     await _reject_unservable_models(session, scope, body.values or {}, request)
     try:
         updated = SettingService(session, scope).save_all(body.values)
@@ -210,6 +250,7 @@ async def upsert_setting(
     request: Request = None,
 ) -> SettingResponse:
     _require_org_admin_for([key], scope, principal)
+    _reject_malformed_role_defaults({key: body.value})
     await _reject_unservable_models(session, scope, {key: body.value}, request)
     try:
         return SettingService(session, scope).upsert_setting(key, body.value)
