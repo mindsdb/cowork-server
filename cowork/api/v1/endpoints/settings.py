@@ -611,15 +611,21 @@ async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, reques
     except Exception as e:
         raise HTTPException(status_code=500, detail="Settings could not be saved.") from e
 
-    # A fresh MindsHub sign-in lands the key here (buildMindsEnvContent POSTs
-    # /raw). Warm the availability map now — before the first turn — so a
-    # free-tier default resolves to an affordable model instead of 402'ing on
-    # message one (ENG-748). Fail-open and best-effort: never let a warm failure
-    # break the save the client is waiting on.
+    # If this write lands a MindsHub key, warm the availability map now — before
+    # any first turn — so a free-tier default resolves to an affordable model
+    # instead of 402'ing on message one (ENG-748). NOTE: the Electron desktop
+    # sign-in does NOT reach here — it writes .env directly and syncs keys via
+    # per-key PUTs (see cowork minds-auth.ts), so the desktop first-turn gap is
+    # closed by the boot warm in server.py, not this seam. This covers the
+    # non-Electron dotenv-import callers (standalone anton, direct /raw). Keep
+    # it: it's the correct place to warm for any caller that does POST here, and
+    # it's fail-open. Best-effort: never let a warm failure break the save the
+    # client is waiting on, and log message-only (the warm frames hold the API
+    # key, which RICH_LOGGING's tracebacks_show_locals would render).
     try:
         await warm_enabled_model_map(session)
-    except Exception:
-        logger.debug("post-credential-sync model-map warm failed (non-fatal)", exc_info=True)
+    except Exception as exc:
+        logger.debug("post-credential-sync model-map warm failed (non-fatal): %s", exc)
 
     return {"ok": True}
 

@@ -117,6 +117,12 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
+# Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
+# `follow_redirects` chains and trickled responses (each chunk under the per-op
+# read timeout) can otherwise run far past it — minutes, unbounded. This fetch
+# sits on the desktop boot path before the socket binds, so it must have a real
+# ceiling; the outer asyncio.wait_for below enforces it.
+_MINDS_MODELS_TIMEOUT_S = 6.0
 
 
 class MindsModelListing(NamedTuple):
@@ -218,7 +224,11 @@ async def fetch_minds_models(
     A cached *failure* is still honored under ``force_refresh``: the negative
     TTL exists so an unreachable MindsHub isn't re-probed on every call, and
     the picker opens on demand, so bypassing it would make every open pay the
-    full HTTP timeout for as long as the outage lasts.
+    fetch budget for as long as the outage lasts.
+
+    Never raises and never runs longer than ``_MINDS_MODELS_TIMEOUT_S`` — a
+    slow/degraded gateway (hang, redirect loop, trickled body) returns an empty
+    listing that is negatively cached, so callers on the boot path can't hang.
     """
     if not minds_url or not api_key:
         return _empty_listing()
@@ -239,9 +249,15 @@ async def fetch_minds_models(
         _minds_models_cache[cache_key] = (time.monotonic(), val)
         return val
 
-    try:
+    async def _fetch() -> httpx.Response:
+        # `max_redirects` low (not the httpx default of 20) so a same-origin
+        # redirect loop can't multiply the per-op timeout into a long stall;
+        # the endpoint is hit directly at `/models/` so no real redirect is
+        # expected. The outer wait_for is the true ceiling.
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(6.0), follow_redirects=True
+            timeout=httpx.Timeout(_MINDS_MODELS_TIMEOUT_S),
+            follow_redirects=True,
+            max_redirects=2,
         ) as client:
             # Trailing slash is required: the MindsHub router serves the
             # listing at `/models/` and a recent minds-inference release
@@ -249,10 +265,17 @@ async def fetch_minds_models(
             # left this fetch empty and emptied the model picker. Hitting
             # `/models/` directly is what the other frameworks' shared
             # model-catalog helper already does.
-            r = await client.get(
+            return await client.get(
                 f"{base}/models/",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
+
+    try:
+        # Hard TOTAL budget: httpx.Timeout is per-operation, so it alone does
+        # not bound a redirect chain or a trickled response. asyncio.wait_for
+        # cancels the whole fetch at the ceiling and the TimeoutError falls
+        # through to the negative-cache path below.
+        r = await asyncio.wait_for(_fetch(), _MINDS_MODELS_TIMEOUT_S)
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
             return _remember(_empty_listing())
@@ -528,9 +551,13 @@ def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabl
       ``enabled`` flags yields ``{}``, which would silently re-lock the
       canonical default). The guard here is belt-and-suspenders.
     - Persist ORDER-PRESERVING JSON — never ``sort_keys``. The first-enabled
-      fallback (``_enabled_aware_default``) iterates the map in insertion order,
-      relying on /v1/models listing the free/baseline model first; an
-      alphabetized map could promote the wrong model.
+      fallback (``_enabled_aware_default``) iterates the map in insertion order
+      and returns the first *enabled* model, which must stay the gateway's own
+      /v1/models ranking (a remote order we don't control or pin — e.g. today
+      prod lists ``fable`` first, and the free ``mindshub_air`` is reached only
+      because the paid aliases ahead of it are marked disabled). Alphabetizing
+      would substitute our ordering for the gateway's and could promote a
+      different enabled model.
     - Write only on a real change (the compare is order-sensitive too, so a
       gateway re-ranking also refreshes): ``upsert_setting`` commits a row and
       invalidates the settings cache, so an unconditional write churns every
@@ -568,9 +595,11 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     sync) closes that race without touching the turn path.
 
     Fail-open: ``fetch_minds_models`` never raises and returns an empty listing
-    on any error (6s cap), and ``persist_enabled_model_map`` never writes an
-    empty map — so an unreachable MindsHub leaves the stored map untouched and
-    is never worse than today. Returns True iff the map was updated.
+    on any error, bounded by a hard total budget (``_MINDS_MODELS_TIMEOUT_S``)
+    so a degraded gateway can't stall the caller, and ``persist_enabled_model_map``
+    never writes an empty map — so an unreachable MindsHub leaves the stored map
+    untouched and is never worse than today. Returns True iff the map was
+    updated.
     """
     from cowork.db.scoped import LOCAL_SCOPE
     from cowork.services.settings import SettingService

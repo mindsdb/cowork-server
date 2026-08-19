@@ -118,12 +118,18 @@ def _enabled_aware_default(
 ) -> str | None:
     """The provider's canonical default model, adjusted for availability.
 
-    Applies only to minds-cloud; direct (BYOK) providers have no such
-    availability map. A non-empty map always carries an explicit flag for
-    every alias the catalog serves, so a default that's locked OR simply
-    missing from it falls back to the first enabled model — missing means
-    gone (renamed/retired), not degraded data. An empty/absent map (no tier
-    data at all) leaves the default untouched.
+    MindsHub marks a model the org's wallet can't currently pay for (or whose
+    free allowance is exhausted) as ``enabled: false`` from ``/v1/models``, so
+    blindly handing out the canonical default could be denied every turn. When
+    the cached availability map (``minds_model_enabled``) marks the default as
+    disabled — OR simply doesn't list it, meaning gone (renamed/retired), not
+    degraded data — fall back to the first enabled model in the map. That map
+    preserves the gateway's ``/v1/models`` ordering (a remote order we neither
+    control nor pin), so this is the first model MindsHub itself ranks that the
+    wallet can actually pay for: a free-tier wallet, with the paid aliases ahead
+    of it marked disabled, lands on the free/baseline model. An empty/absent map
+    (no tier data at all) leaves the default untouched. Applies only to
+    minds-cloud: direct (BYOK) providers have no such availability map.
 
     Org mode requires the same positive evidence, but falls back to
     MINDS_FREE_MODEL instead, so a credit-less org isn't charged.
