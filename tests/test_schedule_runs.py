@@ -211,7 +211,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
@@ -348,7 +348,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
@@ -463,7 +463,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session):
+        def __init__(self, session, principal=None):
             pass
 
         async def handle(self, request):
