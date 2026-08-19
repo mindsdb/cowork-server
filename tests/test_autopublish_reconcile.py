@@ -394,3 +394,28 @@ async def test_busy_lock_skips_the_slug(base, enabled, key, published):
 
     assert out == set()
     assert published == []
+
+
+# ─── the metric has to survive the deployment's log level ──────────────────
+
+async def test_metric_is_emitted_above_the_deployment_log_level(
+    base, enabled, key, published, caplog,
+):
+    """Every deployment running this feature runs at LOG_LEVEL=WARNING
+    (deployment/cowork-server/values-{staging,prod}.yaml). The reconciler
+    swallows publish failures by design, so if the metric is filtered out too,
+    an artifact that failed to publish is indistinguishable from one that was
+    never eligible — the exact hole that made a live staging diagnosis
+    impossible. Asserting the level, not just the text, is what keeps a later
+    "info is the right level for a success line" cleanup from reopening it."""
+    import logging
+
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+
+    lines = [r for r in caplog.records if r.message.startswith("artifact_autopublish")]
+    assert lines, "the metric must be visible at WARNING"
+    assert any("result=published" in r.getMessage() for r in lines)
