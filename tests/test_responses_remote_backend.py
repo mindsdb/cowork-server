@@ -320,7 +320,6 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_skills = lambda session, conv_id: None
 
     async def fake_replies(**kwargs):
         yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
@@ -400,6 +399,41 @@ async def test_produce_remote_stages_workspace_files(monkeypatch):
     assert called, "produce_remote must stage workspace files before the turn"
 
 
+def test_stage_remote_workspace_files_seeds_builtin_skills(monkeypatch):
+    """The pod reads skills straight off the shared mount, not through a
+    payload — GET /skills is not the only place a fresh org can get seeded, or
+    an org that chats before it ever opens the skills menu stays empty
+    forever on cloud turns (ENG-1679 review)."""
+    calls = []
+
+    class FakeSkillService:
+        def __init__(self, scope):
+            calls.append(scope)
+
+        def ensure_builtin_skills(self):
+            calls.append("seeded")
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(project=SimpleNamespace(path="/tmp/proj"))
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "SkillService", FakeSkillService)
+    monkeypatch.setattr(
+        responses_mod, "FileService",
+        lambda session: SimpleNamespace(stage_conversation_attachments=lambda *a, **k: None),
+    )
+    monkeypatch.setattr("cowork.services.files.stage_project_instructions", lambda *a, **k: None)
+
+    scope = _FakeScope()
+    ResponsesHandler._stage_remote_workspace_files(SimpleNamespace(scope=scope), uuid4())
+
+    assert calls == [scope, "seeded"]
+
+
 _DRAFT_MD = ("---\nname: competitive-analysis\ndescription: Compare rivals\n"
              "metadata:\n  display_name: Competitive Analysis\n---\n1. Gather\n2. Compare")
 
@@ -414,7 +448,6 @@ async def test_produce_remote_surfaces_a_skill_draft_as_a_card(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_skills = lambda session, conv_id: None
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "Built it."}
@@ -461,7 +494,6 @@ async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_skills = lambda session, conv_id: None
 
     async def fake_replies(**kwargs):
         yield "turn_skill", {"entries": [{"slug": "../escape", "files": {"SKILL.md": "x"}}]}
