@@ -13,12 +13,7 @@ import json
 import pytest
 
 from cowork.common.settings import user_settings as us
-from cowork.common.settings.app_settings import (
-    CODING_MODEL_DEFAULTS,
-    MINDS_FREE_MODEL,
-    PLANNING_MODEL_DEFAULTS,
-    ROUTER_MODEL_DEFAULTS,
-)
+from cowork.common.settings.app_settings import MINDS_FREE_MODEL
 from cowork.common.settings.user_settings import Provider, UserSettings
 
 
@@ -115,44 +110,84 @@ class TestOrgModeReadiness:
         assert cs["provider"] == Provider.MINDS_CLOUD.value
 
 
-_PLANNING = PLANNING_MODEL_DEFAULTS["minds_cloud"]
-_CODING = CODING_MODEL_DEFAULTS["minds_cloud"]
-_ROUTER = ROUTER_MODEL_DEFAULTS["minds_cloud"]
-
-
 class TestOrgModeCreditAwareDefaults:
-    """An org with credit gets the canonical defaults; anything short of
-    positive evidence in the availability map stays on MINDS_FREE_MODEL."""
+    """Org mode needs positive evidence in the availability map before it hands
+    out the canonical default, and falls back to MINDS_FREE_MODEL otherwise.
 
-    PAID = json.dumps({MINDS_FREE_MODEL: True, _PLANNING: True, _CODING: True, _ROUTER: True})
-    FREE = json.dumps({MINDS_FREE_MODEL: True, _PLANNING: False, _CODING: False, _ROUTER: False})
+    Every minds-cloud role default IS MINDS_FREE_MODEL now, so the two arms of
+    that branch return the same string for every real map: an org resolves to the
+    free model whether its wallet can pay or not. That makes a fixture built from
+    the role defaults useless here — ``{MINDS_FREE_MODEL: True, _PLANNING: False}``
+    is one key, not two, and every assertion becomes
+    ``mindshub_air == mindshub_air``. So the map cases below assert the single
+    outcome they actually have, and the branch itself is pinned separately by
+    ``test_org_needs_positive_evidence_for_a_non_free_default``, which is the only
+    test here that can still tell the two arms apart.
+    """
 
-    def test_org_with_credits_gets_premium_defaults(self, org_mode):
-        s = _settings(minds_model_enabled=self.PAID)
-        assert s.resolved_planning_model == _PLANNING
-        assert s.resolved_coding_model == _CODING
-        assert s.resolved_router_model == _ROUTER
-
-    def test_org_without_credits_stays_on_free_model(self, org_mode):
-        s = _settings(minds_model_enabled=self.FREE)
+    # A funded wallet and no map at all: every role lands on the free model,
+    # because that is what the canonical default is now.
+    @pytest.mark.parametrize(
+        "enabled_map",
+        [
+            pytest.param(json.dumps({MINDS_FREE_MODEL: True, "sonnet": True}), id="funded"),
+            pytest.param(None, id="cold-start"),
+        ],
+    )
+    def test_org_resolves_every_role_to_the_free_model(self, org_mode, enabled_map):
+        s = _settings(**({"minds_model_enabled": enabled_map} if enabled_map else {}))
         assert s.resolved_planning_model == MINDS_FREE_MODEL
         assert s.resolved_coding_model == MINDS_FREE_MODEL
         assert s.resolved_router_model == MINDS_FREE_MODEL
 
-    def test_org_cold_start_stays_on_free_model(self, org_mode):
-        # Empty map (fetch never ran) is not evidence of credit — free-first.
-        s = _settings()
-        assert s.resolved_router_model == MINDS_FREE_MODEL
+    # Once the map stops vouching for the free model the three roles diverge, and
+    # the org branch is not what decides it for two of them.
+    @pytest.mark.parametrize(
+        "enabled_map",
+        [
+            pytest.param(json.dumps({MINDS_FREE_MODEL: False, "sonnet": True}), id="drained"),
+            pytest.param(json.dumps({"sonnet": True}), id="default-unlisted"),
+        ],
+    )
+    def test_org_planning_holds_the_free_model_while_the_aux_roles_move(
+        self, org_mode, enabled_map
+    ):
+        """Planning goes through the org branch; coding and router do not.
 
-    def test_org_default_missing_from_map_stays_free(self, org_mode):
-        # Unlike desktop (missing = available), org needs the default itself
-        # marked payable; a gateway that stops listing it downgrades to free.
-        s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, _PLANNING: True}))
-        assert s.resolved_planning_model == _PLANNING
-        assert s.resolved_coding_model == MINDS_FREE_MODEL
+        The org arm of ``_enabled_aware_default`` has no first-enabled fallback, so
+        planning stays on MINDS_FREE_MODEL even when the map says it is not
+        callable. Coding and router resolve through ENG-1632's wallet-aware path
+        instead, which does substitute the first enabled alias. So a drained org
+        runs its two invisible roles on a paid model while the visible one points
+        at a model the map has disabled. That is the fully-drained account
+        ENG-1652 puts out of scope, pinned here so the split is on the record
+        rather than discovered again.
+        """
+        s = _settings(minds_model_enabled=enabled_map)
+        assert s.resolved_planning_model == MINDS_FREE_MODEL
+        assert s.resolved_coding_model == "sonnet"
+        assert s.resolved_router_model == "sonnet"
+
+    @pytest.mark.parametrize("listed", [True, False])
+    def test_org_needs_positive_evidence_for_a_non_free_default(
+        self, org_mode, monkeypatch, listed
+    ):
+        """The branch, tested where it still has two answers.
+
+        Point the planning default at a paid alias and the org arm becomes
+        observable again: listed-and-enabled keeps it, anything less falls back to
+        the free model. This is the test that fails if someone collapses the
+        branch to an unconditional return, and it is the one to delete or rewrite
+        if org is ever given a non-free default of its own.
+        """
+        monkeypatch.setitem(us.PLANNING_MODEL_DEFAULTS, "minds_cloud", "sonnet")
+        s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, "sonnet": listed}))
+        assert s.resolved_planning_model == ("sonnet" if listed else MINDS_FREE_MODEL)
 
     def test_org_explicit_choice_is_never_rewritten(self, org_mode):
-        s = _settings(minds_model_enabled=self.FREE, planning_model="opus")
+        s = _settings(
+            minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False}), planning_model="opus"
+        )
         assert s.resolved_planning_model == "opus"
 
 
