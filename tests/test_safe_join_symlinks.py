@@ -89,3 +89,21 @@ def test_safe_join_lexical_does_not_resolve_symlinks(tmp_path):
     (base / "link").symlink_to(outside)
 
     assert safe_join_lexical(base, "link") == base / "link"
+
+
+def test_returns_the_resolved_path_not_the_lexical_one(tmp_path):
+    """The caller must act on the path that was actually checked.
+
+    Returning the lexical path left every component a live symlink at use time,
+    so containment was proved about a string nobody went on to use. It does not
+    make the join atomic, but it removes the check-one-path-use-another gap.
+    """
+    base = tmp_path / "base"
+    (base / "real").mkdir(parents=True)
+    (base / "real" / "f.txt").write_text("x")
+    (base / "link").symlink_to(base / "real")
+
+    joined = safe_join(base, "link", "f.txt")
+
+    assert joined == (base / "real" / "f.txt").resolve()
+    assert "link" not in joined.parts
