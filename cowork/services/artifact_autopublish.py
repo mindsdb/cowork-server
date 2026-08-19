@@ -134,9 +134,21 @@ def _record(result: str, **fields: object) -> None:
 
     Strictly `key=value` pairs and no free-form tail, so the line parses the same
     way whatever the caller passes.
+
+    WARNING, not INFO, and not because any of these results is a fault —
+    `result=published` is the happy path. Every deployment that runs this feature
+    runs at LOG_LEVEL=WARNING (deployment/cowork-server/values-{staging,prod}.yaml),
+    so an INFO line is invisible on exactly the deployments it exists for. That
+    made a live diagnosis impossible: the reconciler also swallows publish
+    failures by design, so with the metric filtered out too, an artifact that
+    never published looked identical to one that was never eligible — no signal
+    of any kind, anywhere.
+
+    Volume is bounded: at most one line per artifact considered, per turn, and
+    only in org mode.
     """
     tail = " ".join(f"{k}={v}" for k, v in fields.items() if v not in (None, ""))
-    logger.info("artifact_autopublish result=%s %s", result, tail)
+    logger.warning("artifact_autopublish result=%s %s", result, tail)
 
 
 def _candidate_slugs(artifacts_base: Path) -> list[str]:
