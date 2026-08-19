@@ -18,7 +18,7 @@ def list_skills(scope: ScopeDep):
     # Seeded here for an org that opens this menu before it has ever chatted.
     # The turn payload seeds too, so whichever comes first wins; see
     # `build_turn_skills`.
-    ensure_builtin_skills(scope)
+    # ensure_builtin_skills(scope)
     skills = SkillService(scope).list_skills()
     return {"skills": [SkillResponse.serialize(s) for s in skills]}
 
