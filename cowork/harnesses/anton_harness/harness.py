@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from cowork import build_info
 from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
@@ -19,6 +20,29 @@ from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
+
+
+def _surface_kwarg(config_cls) -> dict[str, str]:
+    """``{"surface": ...}``, or ``{}`` when this anton predates the field.
+
+    cowork-server pins anton to a branch, so a lock that has not yet picked up
+    anton's half of ENG-1459 would get an unexpected keyword and **fail every
+    turn**. A telemetry field must never be able to do that, so the kwarg is
+    only passed when the installed dataclass actually declares it.
+
+    Also returns ``{}`` when the surface is unresolvable, so an unknown surface
+    stays absent rather than being sent as a guess.
+    """
+    import dataclasses
+
+    try:
+        if not any(f.name == "surface" for f in dataclasses.fields(config_cls)):
+            return {}
+        resolved = build_info.surface()
+        return {"surface": resolved} if resolved else {}
+    except Exception:  # pragma: no cover - defensive: never fail a turn over telemetry
+        logger.warning("could not resolve the trace surface", exc_info=True)
+        return {}
 
 
 def _vault_scratch_dir() -> Path:
@@ -1077,6 +1101,11 @@ class AntonHarness:
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
+            # WHERE the user is, which `harness` cannot say: this one server
+            # serves both the desktop sidecar and the multi-tenant web build,
+            # and both report harness="anton" (ENG-1459). Only the deployment
+            # knows which, so it is resolved here rather than by anton.
+            **_surface_kwarg(ChatSessionConfig),
             proactive_dashboards=anton_settings.proactive_dashboards,
             act_first=anton_settings.act_first,
             # "Conversation started" stamp for the cache-stable prompt prefix
