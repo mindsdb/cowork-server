@@ -25,4 +25,17 @@ jobs:
       - name: Run Snyk Code
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk code test --severity-threshold=low || true
+        run: |
+          snyk code test --sarif-file-output=out.sarif || true
+          echo '--- ruleIds for cowork/services/providers.py ---'
+          python3 - <<'EOF'
+          import json
+          d = json.load(open('out.sarif'))
+          for run in d.get('runs', []):
+              for r in run.get('results', []):
+                  for loc in r.get('locations', []):
+                      uri = loc['physicalLocation']['artifactLocation']['uri']
+                      line = loc['physicalLocation']['region']['startLine']
+                      if 'services/providers.py' in uri:
+                          print(f"ruleId={r.get('ruleId')!r} line={line} level={r.get('level')}")
+          EOF
