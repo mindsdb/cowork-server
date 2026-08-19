@@ -445,6 +445,15 @@ async def fetch_org_model_catalog(
 #     - cowork-kinaxis-preview's divergent inline `syncOnboardingModels`;
 #     - anything hand-rolled (curl, scripts, a console surface).
 #
+#   GATED FOR SHAPE ONLY: `minds_role_defaults`, the cached role -> model id map
+#     this endpoint's own writer fills from the catalog. `PUT /settings/{key}`
+#     accepts it like any declared field, and its values become the model an
+#     unset role starts on, so `_reject_malformed_role_defaults` 400s a body that
+#     is not role -> non-empty id. Catalog membership is NOT checked: the value
+#     comes from the catalog to begin with, and `_enabled_aware_default` discards
+#     a model the availability map does not affirm, so an id that no longer
+#     resolves costs a role its declared default rather than a turn.
+#
 #   NOT GATED, because they cannot carry a model key at all — the ENG-739
 #   carve-out keeps planning/coding/router models out of `SETTING_ENV_ALIASES`,
 #   so a bulk .env sync can never re-pin a picker choice:

@@ -15,6 +15,8 @@ existing tests green.
 import asyncio
 import json
 
+import pytest
+
 from pydantic import SecretStr
 
 from cowork.common.settings.app_settings import MODEL_ROLE_DEFAULTS
@@ -477,6 +479,33 @@ def test_the_pair_follows_the_cache_when_the_gateway_stops_declaring(monkeypatch
         payload = endpoint.call()
 
     assert payload["recommendedPair"]["minds-cloud"][0] == "sonnet"
+
+
+# ── Writing the map by hand ───────────────────────────────────────────
+
+
+def test_a_hand_written_role_map_is_rejected_rather_than_filtered():
+    """`PUT /settings/minds_role_defaults` reaches the same field the endpoint writes.
+
+    Resolution filters what it cannot use, so a bad hand-write would show up as
+    every role quietly falling back to the compiled table. The write says which
+    part was wrong instead.
+    """
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.settings import _reject_malformed_role_defaults
+
+    for value in ('not json', '["planning"]', '{"planing": "sonnet"}', '{"planning": ""}',
+                  '{"planning": 7}'):
+        with pytest.raises(HTTPException) as raised:
+            _reject_malformed_role_defaults({"minds_role_defaults": value})
+        assert raised.value.status_code == 400, value
+        assert "minds_role_defaults" in str(raised.value.detail), value
+
+    # The endpoint's own writes, and an unset value, go through untouched.
+    _reject_malformed_role_defaults({"minds_role_defaults": MOVED})
+    _reject_malformed_role_defaults({"minds_role_defaults": ""})
+    _reject_malformed_role_defaults({"coding_model": "sonnet"})
 
 
 def test_a_role_the_catalog_omits_keeps_the_compiled_slot_in_the_pair(monkeypatch):
