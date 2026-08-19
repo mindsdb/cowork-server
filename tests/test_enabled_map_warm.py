@@ -202,10 +202,14 @@ def test_persist_preserves_map_order():
 
     session = _fresh_session()
     try:
-        ordered = {"kimi": True, "mindshub_air": True, "sonnet": False}
+        # Deliberately NOT alphabetical, so a `sort_keys=True` regression would
+        # reorder to [fable, mindshub_air, sonnet] and fail this — mirrors prod,
+        # where /v1/models ranks a paid alias first and the first *enabled* model
+        # is what the fallback must land on.
+        ordered = {"sonnet": False, "fable": True, "mindshub_air": True}
         persist_enabled_model_map(session, LOCAL_SCOPE, "{}", ordered)
         stored = SettingService(session).load().minds_model_enabled
-        assert list(json.loads(stored)) == ["kimi", "mindshub_air", "sonnet"]
+        assert list(json.loads(stored)) == ["sonnet", "fable", "mindshub_air"]
     finally:
         _clear(session, "minds_model_enabled")
         session.close()
@@ -238,4 +242,86 @@ def test_write_raw_settings_warms_after_sync(monkeypatch, tmp_path):
         assert result == {"ok": True}
         assert warmed == [True]  # the sync path warmed the map exactly once
     finally:
+        session.close()
+
+
+# ── boot seam: server startup warms the map (the load-bearing desktop seam) ──
+#
+# On desktop the /settings/raw seam above never fires (Electron writes .env and
+# syncs via per-key PUTs), so the boot warm in server.py is the only seam that
+# actually closes the ENG-748 first-turn gap. These lock it: deleting the warm
+# block or inverting its `tenancy_mode` gate must turn one of them red.
+
+def test_boot_warm_populates_map_on_desktop(monkeypatch):
+    from cowork import server
+    from cowork.services import providers
+
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+        return _listing(FREE_ENABLED)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
+    session = _fresh_session()  # local tenancy
+    try:
+        _set(session, minds_api_key="mdb_test", minds_url="https://minds.example/v1")
+        assert asyncio.run(server._warm_model_map_on_boot()) is True
+        assert json.loads(SettingService(session).load().minds_model_enabled) == FREE_ENABLED
+    finally:
+        _clear(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+
+
+def test_boot_warm_is_gated_off_in_org_mode(monkeypatch):
+    """Org mode stores no key and is floored by role_defaults; the boot warm
+    must not fetch. A stored key is present so that inverting the gate would
+    reach the (spied) fetch and fail this test."""
+    from cowork import server
+    from cowork.services import providers
+
+    called = False
+
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+        nonlocal called
+        called = True
+        return _listing(FREE_ENABLED)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
+    session = _fresh_session()
+    try:
+        _set(session, minds_api_key="mdb_test", minds_url="https://minds.example/v1")
+        monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+        us.get_app_settings.cache_clear()
+        assert asyncio.run(server._warm_model_map_on_boot()) is False
+        assert called is False  # the org gate short-circuited before the fetch
+    finally:
+        _clear(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+        us.get_app_settings.cache_clear()
+
+
+def test_boot_warm_is_bounded_and_fail_open(monkeypatch):
+    """The warm runs before uvicorn binds the port, so a degraded MindsHub must
+    not stall it. A fetch that hangs past the ceiling returns without raising
+    and leaves the stored map untouched. The outer wait_for proves the bound:
+    without it, an unbounded warm would make this test hang, not fail fast."""
+    from cowork import server
+    from cowork.services import providers
+
+    async def hanging_fetch(url, key, *, force_refresh=False, tenant_key=None):
+        await asyncio.sleep(30)
+        return _listing(FREE_ENABLED)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", hanging_fetch)
+    monkeypatch.setattr(server, "_BOOT_WARM_TIMEOUT_S", 0.1)
+    session = _fresh_session()
+    try:
+        _set(session, minds_api_key="mdb_test", minds_url="https://minds.example/v1")
+
+        async def _run():
+            return await asyncio.wait_for(server._warm_model_map_on_boot(), timeout=3.0)
+
+        assert asyncio.run(_run()) is False
+        # A hung fetch never writes the map.
+        assert SettingService(session).load().minds_model_enabled in (None, "{}")
+    finally:
+        _clear(session, "minds_api_key", "minds_url", "minds_model_enabled")
         session.close()
