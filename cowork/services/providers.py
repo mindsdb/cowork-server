@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -514,6 +515,72 @@ async def model_value_rejection(
         f"'{value}' is not a model this provider offers. "
         f"Pick one from the model list in Settings (for example: {known})."
     )
+
+
+def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabled: dict) -> bool:
+    """Guarded write of the `minds_model_enabled` availability map.
+
+    Shared by every writer (the recommended-models endpoint and the startup /
+    credential-sync warm below) so the invariants can't drift between them:
+
+    - Never clobber a known-good map with an empty one — callers must already
+      have a non-empty ``live_enabled`` (a gateway that returns ids without
+      ``enabled`` flags yields ``{}``, which would silently re-lock the
+      canonical default). The guard here is belt-and-suspenders.
+    - Persist ORDER-PRESERVING JSON — never ``sort_keys``. The first-enabled
+      fallback (``_enabled_aware_default``) iterates the map in insertion order,
+      relying on /v1/models listing the free/baseline model first; an
+      alphabetized map could promote the wrong model.
+    - Write only on a real change (the compare is order-sensitive too, so a
+      gateway re-ranking also refreshes): ``upsert_setting`` commits a row and
+      invalidates the settings cache, so an unconditional write churns every
+      ``UserSettings`` reader.
+
+    Returns True iff the stored map was updated.
+    """
+    from cowork.services.settings import SettingService
+
+    if not live_enabled:
+        return False
+    desired = json.dumps(live_enabled)
+    try:
+        stored = json.dumps(json.loads(prior_json or "{}"))
+    except (ValueError, TypeError):
+        stored = "{}"
+    if desired == stored:
+        return False
+    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+    return True
+
+
+async def warm_enabled_model_map(session, scope=None) -> bool:
+    """Desktop: populate `minds_model_enabled` from /v1/models so the FIRST turn
+    resolves an affordable default (ENG-748).
+
+    On desktop the minds-cloud role defaults stay the premium canonical models
+    (``sonnet``/``haiku``); free-tier users are steered off them only by the
+    availability map. That map is refreshed lazily on GET /recommended-models,
+    so a brand-new sign-in that sends before the picker ever loads resolves the
+    default against an EMPTY map — ``_enabled_aware_default`` returns canonical
+    ``sonnet`` and MindsHub denies the empty free-tier wallet (``wallet_empty``
+    402) on message one. Warming the map at the two guaranteed-pre-first-turn
+    seams (server startup with a stored key, and immediately after a credential
+    sync) closes that race without touching the turn path.
+
+    Fail-open: ``fetch_minds_models`` never raises and returns an empty listing
+    on any error (6s cap), and ``persist_enabled_model_map`` never writes an
+    empty map — so an unreachable MindsHub leaves the stored map untouched and
+    is never worse than today. Returns True iff the map was updated.
+    """
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services.settings import SettingService
+
+    scope = scope if scope is not None else LOCAL_SCOPE
+    s = SettingService(session, scope).load()
+    if s.minds_api_key is None or not s.minds_url:
+        return False
+    listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
+    return persist_enabled_model_map(session, scope, s.minds_model_enabled, listing.enabled)
 
 
 # ── Config readiness ─────────────────────────────────────────────────
