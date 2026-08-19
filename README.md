@@ -218,11 +218,15 @@ cannot pay for it, so a declared default is not a grant: it says where to start,
 never what may be called.
 
 `GET /settings/recommended-models` writes the map, from the same fetch that
-already refreshes `minds_model_enabled`, and it overlays the same values onto the
-`recommendedPair` it serves the picker. Those two must agree: the picker shows the
-pair as the model each role starts on and writes it back as an explicit pin when
-the user saves, so a picker reading the compiled table while turns ran the
-declared one would pin the wrong model.
+already refreshes `minds_model_enabled`, and it builds the `recommendedPair` it
+serves the picker through `minds_role_start_models`, the same two steps resolution
+takes: the declared default replaces the compiled one, then availability adjusts
+it. Those two have to agree, because the picker shows the pair as the model each
+role starts on and the desktop writes it back as an explicit pin when a save
+repoints a role onto MindsHub. A pair built from the compiled table, or from a
+declared default the wallet cannot pay for, would pin a model that turns never
+run. The pair is rebuilt from whichever map resolution will read: the live one
+when the gateway published defaults, the cached one when it did not.
 
 ### Provider probes always use a model any key can call
 
