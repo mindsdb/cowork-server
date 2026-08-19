@@ -82,6 +82,15 @@ def safe_join(base: Path | str, *parts: str) -> Path:
        only check the string. ``os.path.realpath`` on a path that does not exist
        yet resolves the existing prefix and leaves the rest literal, so callers
        that join before creating still work.
+
+    Returns the RESOLVED path, not the lexical one. Returning the lexical path
+    meant the caller acted on a different path from the one that was checked:
+    every component was still a live symlink at use time, so the containment
+    proof applied to a string nobody subsequently used. This does not make the
+    join atomic. An attacker who can replace a component between this call and
+    the caller's open or mkdir still redirects it, and closing that needs
+    O_NOFOLLOW at the use site. It does remove the check-one-path-use-another
+    mismatch, which is the part that made the guard misleading.
     """
     base_norm = os.path.normpath(str(base))
     target = os.path.normpath(os.path.join(base_norm, *parts))
@@ -93,7 +102,7 @@ def safe_join(base: Path | str, *parts: str) -> Path:
     if os.path.commonpath([base_real, target_real]) != base_real:
         raise ValueError(f"path {target!r} resolves outside base directory {base_norm!r}")
 
-    return Path(target)
+    return Path(target_real)
 
 
 def safe_join_lexical(base: Path | str, *parts: str) -> Path:
