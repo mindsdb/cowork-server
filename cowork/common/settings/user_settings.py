@@ -523,6 +523,11 @@ class UserSettings(Settings):
         title="Show 8-Bit Toggle",
         description="Show the floating 8-bit style toggle button.",
     )
+    show_coding_mode_toggle: bool = Field(
+        default=True,
+        title="Show Coding Mode Toggle",
+        description="Show the floating coding-mode toggle button.",
+    )
     accent_variant: str = Field(
         default="aqua",
         title="Accent Variant",
