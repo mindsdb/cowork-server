@@ -20,6 +20,7 @@ from cowork.schemas.channels import (
     ChannelLifecycleResponse,
     ChannelReloadResponse,
     ChannelStatusResponse,
+    ChannelTestConnectionResponse,
     PluginResponse,
 )
 from cowork.channels.lifecycle import LifecycleError
@@ -218,6 +219,17 @@ async def reload_channel(
         active = await adapters.refresh(channel_type, session=scoped)
     await _reconcile_ingress(request, channel_type)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
+
+
+@router.post("/{channel_type}/test-connection", response_model=ChannelTestConnectionResponse)
+async def test_connection(channel_type: str, scoped: ScopedSessionDep) -> ChannelTestConnectionResponse:
+    """Calls the platform to check the STORED credentials actually
+    authenticate — not admin-gated, since it reads but never writes."""
+    try:
+        result = await ChannelConfigService(scoped).test_connection(channel_type)
+    except UnknownChannelError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
+    return ChannelTestConnectionResponse(channel_type=channel_type, ok=result.ok, detail=result.detail)
 
 
 @router.get("/bindings", response_model=list[BindingResponse])

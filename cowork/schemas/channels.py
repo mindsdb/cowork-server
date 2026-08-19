@@ -135,6 +135,7 @@ class PluginCapabilities(BaseModel):
     supports_oauth: bool = False
     supports_direct_credentials: bool = True
     supports_custom_ack: bool = False
+    supports_verify: bool = False
 
 
 class PluginResponse(BaseModel):
@@ -196,4 +197,10 @@ class ChannelLifecycleResponse(BaseModel):
     channel_type: str
     action: str  # "setup" | "teardown"
     active: bool
+    detail: str
+
+
+class ChannelTestConnectionResponse(BaseModel):
+    channel_type: str
+    ok: bool
     detail: str
