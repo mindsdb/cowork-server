@@ -13,7 +13,7 @@ import logging
 import time
 import uuid
 
-from cowork.build_info import build_trace_metadata, surface
+from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
 from cowork.handlers.turn_errors import remote_turn_error
 from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import mint_turn_key
@@ -41,7 +41,17 @@ def _trace_block() -> dict[str, str]:
     """
     try:
         resolved = surface()
-        return build_trace_metadata({"surface": resolved} if resolved else None)
+        block = build_trace_metadata({"surface": resolved} if resolved else None)
+        # Drop OUR anton version: the pod runs a different anton entirely (its
+        # own pinned `minds-anton-scratchpad` image, bumped independently of
+        # this server's vendored dep), so the value would be wrong on the wire.
+        # It is harmless today only because anton overwrites it when building
+        # its headers — shipping a knowingly-wrong value and relying on a
+        # downstream overwrite is a trap for whoever touches that overwrite.
+        # ENG-1279 sends it in-process as a fallback for antons too old to
+        # self-report; the pod image is never that old.
+        block.pop(KEY_ANTON_VERSION, None)
+        return block
     except Exception:  # pragma: no cover - defensive: never block a turn
         logger.warning("could not build the turn's trace attribution", exc_info=True)
         return {}

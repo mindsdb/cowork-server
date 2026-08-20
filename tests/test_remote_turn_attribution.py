@@ -59,10 +59,17 @@ class TestTheBlockSentToThePod:
         # Reusing build_trace_metadata is deliberate: two hand-rolled blocks
         # would drift, and the drift would be invisible until someone compared
         # a desktop trace against a web one.
+        #
+        # The remote block is that helper's output with exactly two deltas:
+        # `surface` added, and `anton_version` removed (the pod runs a different
+        # anton and self-reports). Pinning the delta rather than a subset means
+        # a NEW key appearing in the helper reaches the pod automatically, and
+        # a key silently going missing fails here.
         _patch(monkeypatch, tenancy="local")
         from cowork.build_info import build_trace_metadata
 
-        assert set(build_trace_metadata()) <= set(_trace_block())
+        expected = (set(build_trace_metadata()) - {"anton_version"}) | {"surface"}
+        assert set(_trace_block()) == expected
 
     def test_an_unresolvable_surface_still_sends_the_build_attribution(self, monkeypatch):
         # An invalid override yields no surface. The build half must survive —
@@ -122,3 +129,13 @@ class TestItActuallyReachesTheJob:
             "the remote job's params omit the trace block, so web turns reach "
             f"Langfuse unattributed (ENG-1459). keys={sorted(keys)}"
         )
+
+    def test_our_anton_version_is_not_sent(self, monkeypatch):
+        # The pod runs a DIFFERENT anton — its own pinned scratchpad image,
+        # bumped independently of this server's vendored dep. Sending ours
+        # would put a wrong value on the wire, harmless today only because
+        # anton overwrites it when building its headers. Don't rely on that.
+        _patch(monkeypatch, tenancy="org")
+        assert "anton_version" not in _trace_block()
+        # …while the values that ARE ours still go.
+        assert "cowork_server_version" in _trace_block()
