@@ -45,6 +45,12 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
 #
+# The one model MindsHub's free monthly allowance covers; every other alias
+# bills the wallet. It is also every minds-cloud role default below, so the
+# name is declared here rather than beside the org-mode fallback that used to
+# be its only reader.
+MINDS_FREE_MODEL = "mindshub_air"
+
 # Single source for the per-role defaults: PLANNING/CODING/ROUTER_MODEL_
 # DEFAULTS and RECOMMENDED_PAIR below are all derived from this table.
 MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
@@ -66,10 +72,22 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
         "coding": "gemini-3.6-flash",
         "router": "gemini-3.6-flash",
     },
+    # Every role defaults to the free model, so a user who has picked nothing
+    # can complete a whole turn without the wallet being charged for any of it.
+    # The two invisible roles are the reason this matters: a user sees and can
+    # change the planning model, but the coding role (completion verifier,
+    # scratchpad) and the router role (respond-vs-delegate, history
+    # summarization) run unseen, so a paid default there is denied on an empty
+    # wallet with nothing the user can look at to explain why. Wallet-aware
+    # resolution downstream is the safety net for a stored pin; this is the
+    # value a fresh account starts from, which is also the state where no
+    # availability map has been fetched yet and there is nothing to be aware of.
     "minds_cloud": {
-        "planning": "kimi",  # cheapest/fastest, for the high-volume planning role
-        "coding": "gpt-codex",  # product pick for a code-specialized model, not benchmarked
-        "router": "haiku",
+        "planning": MINDS_FREE_MODEL,
+        "coding": MINDS_FREE_MODEL,
+        # Not chosen on price: this role gates every turn, and a slow model here
+        # is measurably worse than no router at all. Unmeasured on that axis.
+        "router": MINDS_FREE_MODEL,
     },
 }
 PLANNING_MODEL_DEFAULTS: dict[str, str] = {p: r["planning"] for p, r in MODEL_ROLE_DEFAULTS.items()}
@@ -88,12 +106,6 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
     },
     "openai-compatible": ("", "", ""),
 }
-
-# The one model MindsHub's free monthly allowance covers; every other alias
-# bills the wallet. Org mode resolves to it unless the cached availability
-# map shows the wallet can pay for the canonical default (see
-# _enabled_aware_default in user_settings).
-MINDS_FREE_MODEL = "mindshub_air"
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
 # advertises its levels live via MindsHub's `/v1/models`; direct Anthropic/OpenAI

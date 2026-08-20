@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import stat
 from pathlib import Path
 from uuid import UUID
 
@@ -115,6 +117,109 @@ def attachment_purpose(session_id: str) -> str:
     ("attachment:{project}:{session}") are rewritten by migration
     f7d2b9e4a1c6."""
     return f"attachment:{session_id}"
+
+
+def _secure_attachments_fd(conv_dir: Path) -> int | None:
+    """Return an ``O_NOFOLLOW`` descriptor for ``<conv_dir>/attachments``.
+
+    The worker pod mounts the conversation dir read-write, so it can replace
+    ``attachments`` (or any child) with a symlink pointing into another org's
+    subtree. cowork-server mounts every org, so staging or pruning *through*
+    that link escapes the tenant: worst case a namespace-wide ``rmtree`` of
+    every organization's data. ``safe_join`` cannot catch this, because it
+    resolves the base as well as the target, so a symlinked base has already
+    escaped before the containment check runs.
+
+    Pin the conversation dir by descriptor with ``O_NOFOLLOW``, drop any symlink
+    or non-directory squatting the ``attachments`` name, recreate it as a real
+    directory, and hand back a descriptor the caller acts relative to (the same
+    defence ``ProjectService`` applies to the projects root). Attachments
+    staging is cowork-server-owned state, so self-healing a planted link is
+    safe. The caller owns the returned fd and must close it. ``None`` means the
+    dir could not be secured and the caller must not fall back to a path.
+    """
+    try:
+        # The conversation dir and its `conversations` parent are cowork-server
+        # state (the pod mounts INTO <conv>, it does not create it), so creating
+        # them is trusted. Only the `attachments` child below is agent-reachable.
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        conv_fd = os.open(conv_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        try:
+            st = os.lstat("attachments", dir_fd=conv_fd)
+            if not stat.S_ISDIR(st.st_mode):
+                # A symlink (S_ISLNK, never S_ISDIR under lstat) or a plain file
+                # squatting the name: remove it and recreate a real dir.
+                os.unlink("attachments", dir_fd=conv_fd)
+                os.mkdir("attachments", dir_fd=conv_fd)
+        except FileNotFoundError:
+            os.mkdir("attachments", dir_fd=conv_fd)
+        return os.open(
+            "attachments", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=conv_fd
+        )
+    except OSError:
+        return None
+    finally:
+        os.close(conv_fd)
+
+
+def _stage_attachment(attach_fd: int, file_id: str, name: str, src: Path, size: int) -> None:
+    """Copy *src* to ``<attachments>/<file_id>/<name>`` relative to *attach_fd*.
+
+    Never follows a symlink the pod may have planted for the per-id directory or
+    the file name (``O_NOFOLLOW`` on every component the agent can reach). Skips
+    a copy already present at the right size so the caller stays idempotent.
+    """
+    try:
+        st = os.lstat(file_id, dir_fd=attach_fd)
+        if not stat.S_ISDIR(st.st_mode):
+            os.unlink(file_id, dir_fd=attach_fd)
+            os.mkdir(file_id, dir_fd=attach_fd)
+    except FileNotFoundError:
+        os.mkdir(file_id, dir_fd=attach_fd)
+    id_fd = os.open(file_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=attach_fd)
+    try:
+        try:
+            dst_st = os.stat(name, dir_fd=id_fd, follow_symlinks=False)
+            if stat.S_ISREG(dst_st.st_mode) and dst_st.st_size == size:
+                return
+        except FileNotFoundError:
+            pass
+        dst_fd = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=id_fd
+        )
+        with open(dst_fd, "wb") as dst, open(src, "rb") as fsrc:
+            shutil.copyfileobj(fsrc, dst)
+    finally:
+        os.close(id_fd)
+
+
+def _prune_staged_attachments(attach_fd: int, keep: set[str]) -> None:
+    """Drop every staged entry whose file id is not in *keep*.
+
+    Acts relative to *attach_fd* and never follows a symlink out of the
+    attachments dir: a planted link is unlinked (the link only, never its
+    target), a real dir is removed with ``rmtree(dir_fd=...)``.
+    """
+    try:
+        entries = list(os.scandir(attach_fd))
+    except OSError:
+        logger.warning("could not list staged attachments for pruning", exc_info=True)
+        return
+    for entry in entries:
+        if entry.name in keep:
+            continue
+        try:
+            if entry.is_symlink():
+                os.unlink(entry.name, dir_fd=attach_fd)
+            elif entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.name, dir_fd=attach_fd)
+            else:
+                os.unlink(entry.name, dir_fd=attach_fd)
+        except OSError:
+            logger.warning("could not prune staged attachment %s", entry.name, exc_info=True)
 
 
 class FileService:
@@ -304,51 +409,48 @@ class FileService:
             conv_seg = str(UUID(str(conversation_id)))  # path segment must be a real id, never `..`
         except (ValueError, TypeError):
             return 0
-        dest_root = Path(project_path) / "conversations" / conv_seg / "attachments"
-        # Only copy bytes that live under THIS org's files root — a legacy
+        # The pod mounts this conversation dir read-write, so it can replace
+        # `attachments` (or a child) with a symlink into another org's subtree.
+        # Pin the dir by an O_NOFOLLOW descriptor and do every copy/prune
+        # relative to it, so a planted link cannot redirect us out of the tenant
+        # (see _secure_attachments_fd). Fail closed rather than fall back to a
+        # path the agent can still swap.
+        conv_dir = Path(project_path) / "conversations" / conv_seg
+        attach_fd = _secure_attachments_fd(conv_dir)
+        if attach_fd is None:
+            logger.warning("could not secure attachments dir for conversation %s", conversation_id)
+            return 0
+        # Only copy bytes that live under THIS org's files root: a legacy
         # escaped row (path into another org) must not be dragged into the
         # workspace where the pod would read it.
         try:
             files_root = self._root_dir().resolve()
         except Exception:
             files_root = None
-        rows = self.list_file_rows(attachment_purpose(str(conversation_id)))
         staged_ids: set[str] = set()
         staged = 0
-        for row in rows:
-            try:
-                src = Path(row.path)
-                if not src.is_file():
-                    continue
-                if files_root is not None and files_root not in src.resolve().parents:
-                    logger.warning("attachment %s path is outside the org files root; skipping", row.id)
-                    continue
-                # Containment: the pod can write under attachments/, so resolve
-                # symlinks and refuse a dest that escapes the conversation dir.
-                dest = safe_join(dest_root, str(row.id), src.name)
-                if not (dest.is_file() and dest.stat().st_size == row.size):
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dest)
-                staged_ids.add(str(row.id))
-                staged += 1
-            except (OSError, ValueError):
-                logger.warning(
-                    "could not stage attachment %s for conversation %s",
-                    getattr(row, "id", "?"), conversation_id, exc_info=True,
-                )
-        # Prune every staged dir we did NOT just (re)stage — covers a deleted
-        # row, a row whose source bytes vanished, and one skipped as out-of-root
-        # — so the agent stops seeing content the store no longer backs.
         try:
-            if dest_root.is_dir():
-                for child in dest_root.iterdir():
-                    if child.name in staged_ids:
+            rows = self.list_file_rows(attachment_purpose(str(conversation_id)))
+            for row in rows:
+                try:
+                    src = Path(row.path)
+                    if not src.is_file():
                         continue
-                    if child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
-                    else:
-                        child.unlink()
-        except OSError:
-            logger.warning("could not prune stale staged attachments for conversation %s",
-                           conversation_id, exc_info=True)
+                    if files_root is not None and files_root not in src.resolve().parents:
+                        logger.warning("attachment %s path is outside the org files root; skipping", row.id)
+                        continue
+                    _stage_attachment(attach_fd, str(row.id), src.name, src, row.size)
+                    staged_ids.add(str(row.id))
+                    staged += 1
+                except (OSError, ValueError):
+                    logger.warning(
+                        "could not stage attachment %s for conversation %s",
+                        getattr(row, "id", "?"), conversation_id, exc_info=True,
+                    )
+            # Prune every staged entry we did NOT just (re)stage: a deleted row, a
+            # row whose source bytes vanished, or one skipped as out-of-root, so
+            # the agent stops seeing content the store no longer backs.
+            _prune_staged_attachments(attach_fd, staged_ids)
+        finally:
+            os.close(attach_fd)
         return staged
