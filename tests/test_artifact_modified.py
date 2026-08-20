@@ -63,19 +63,34 @@ def _patch_scan(container: Path):
     return patch("cowork.services.artifacts._scan_artifact_dirs", lambda: [container])
 
 
+def _patch_publish_scan(container: Path):
+    """publish.py binds `_scan_artifact_dirs` at import, so patching only the
+    artifacts module leaves its own reference pointing at the real projects
+    root — which `desktop_publish_context` then scans and finds nothing in."""
+    return patch.object(publish_mod, "_scan_artifact_dirs", lambda: [container])
+
+
+def _publish(root: Path, container: Path, **kw):
+    """Publish the way the desktop endpoints do: resolve first, then publish."""
+    return publish_mod.publish_artifact(
+        root, artifacts_base=container, api_key="fake-key",
+        publish_url="https://4nton.ai", **kw,
+    )
+
+
 def test_compute_publish_md5_matches_zip_md5(tmp_path: Path):
     root = _make_static_html(tmp_path)
     # Reference md5: exactly what the lambda stores — md5 of the zip bytes
     # anton produces for the primary file.
     expected = hashlib.md5(_zip_html(root / "index.html")).hexdigest()
-    with _patch_scan(tmp_path):
-        got = publish_mod.compute_publish_md5(str(root))
+    got = publish_mod.compute_publish_md5(root, artifacts_base=tmp_path)
     assert got == expected
 
 
 def test_compute_publish_md5_unresolvable_returns_none(tmp_path: Path):
-    # No _patch_scan -> resolve_artifact_path raises -> None (can't tell).
-    got = publish_mod.compute_publish_md5(str(tmp_path / "nope"))
+    # A folder that isn't an artifact -> the target resolver raises -> None
+    # ("can't tell"), so no caller ever flags it as modified on a guess.
+    got = publish_mod.compute_publish_md5(tmp_path / "nope", artifacts_base=tmp_path)
     assert got is None
 
 
@@ -103,6 +118,7 @@ def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1",
                      report_id="uuid-1", md5="m1"):
     stack = ExitStack()
     stack.enter_context(_patch_scan(container))
+    stack.enter_context(_patch_publish_scan(container))
     stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
     stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
     stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
@@ -119,7 +135,7 @@ def test_publish_records_published_mtime(tmp_path: Path):
     root = _make_static_html(tmp_path)
     expected_mtime = publish_mod._content_mtime(root)
     with _patched_publish(tmp_path):
-        publish_mod.publish_artifact(str(root))
+        _publish(root, tmp_path)
     entry = json.loads((root / ".published.json").read_text(encoding="utf-8"))["index.html"]
     assert entry["published_mtime"] == expected_mtime
     assert entry["last_md5"] == "m1"
@@ -136,7 +152,7 @@ def _publish_static(tmp_path: Path) -> Path:
     """Make + publish a static artifact, returning its folder."""
     root = _make_static_html(tmp_path)
     with _patched_publish(tmp_path, md5=hashlib.md5(_zip_html(root / "index.html")).hexdigest()):
-        publish_mod.publish_artifact(str(root))
+        _publish(root, tmp_path)
     return root
 
 
@@ -205,6 +221,7 @@ def test_update_reuses_report_id_and_refreshes_state(tmp_path: Path):
 
     with ExitStack() as stack:
         stack.enter_context(_patch_scan(tmp_path))
+        stack.enter_context(_patch_publish_scan(tmp_path))
         stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
         stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
         stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
@@ -240,6 +257,7 @@ def test_update_preserves_password_access(tmp_path: Path):
 
     with ExitStack() as stack:
         stack.enter_context(_patch_scan(tmp_path))
+        stack.enter_context(_patch_publish_scan(tmp_path))
         stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
         stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
         stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
@@ -453,7 +471,7 @@ def _publish_fullstack(tmp_path: Path) -> Path:
     root = _make_fullstack(tmp_path)
     md5 = hashlib.md5(_zip_fullstack(root)[0]).hexdigest()
     with _patched_publish(tmp_path, md5=md5):
-        publish_mod.publish_artifact(str(root))
+        _publish(root, tmp_path)
     return root
 
 

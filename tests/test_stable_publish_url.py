@@ -78,12 +78,19 @@ def _patch_scan(container: Path):
     return patch("cowork.services.artifacts._scan_artifact_dirs", lambda: [container])
 
 
+def _patch_publish_scan(container: Path):
+    """publish.py binds `_scan_artifact_dirs` at import, so the artifacts-module
+    patch above does not reach its own reference."""
+    return patch.object(publish_mod, "_scan_artifact_dirs", lambda: [container])
+
+
 def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", report_id="uuid-1"):
     """Context-manager stack patching everything publish_artifact touches."""
     from contextlib import ExitStack
 
     stack = ExitStack()
     stack.enter_context(_patch_scan(container))
+    stack.enter_context(_patch_publish_scan(container))
     stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
     stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
     stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
@@ -101,7 +108,10 @@ def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", repo
 def test_publish_artifact_marks_entry_published(tmp_path: Path):
     root = _make_fullstack(tmp_path)
     with _patched_publish(tmp_path):
-        publish_mod.publish_artifact(str(root))
+        publish_mod.publish_artifact(
+            root, artifacts_base=tmp_path,
+            api_key="fake-key", publish_url="https://4nton.ai",
+        )
     entry = _read_map(root)["index.html"]
     assert entry["report_id"] == "uuid-1"
     assert entry["url"] == "https://4nton.ai/a/uuid-1"
@@ -121,9 +131,13 @@ def test_unpublish_keeps_report_id_and_marks_unpublished(tmp_path: Path):
     from contextlib import ExitStack
     with ExitStack() as stack:
         stack.enter_context(_patch_scan(tmp_path))
+        stack.enter_context(_patch_publish_scan(tmp_path))
         stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
         stack.enter_context(patch("anton.publisher.unpublish", lambda *a, **k: {"deleted": True}))
-        publish_mod.unpublish_artifact(str(root))
+        publish_mod.unpublish_artifact(
+            root, artifacts_base=tmp_path,
+            api_key="fake-key", publish_url="https://4nton.ai",
+        )
 
     entry = _read_map(root)["index.html"]
     assert entry["report_id"] == "uuid-1"          # anchor survives
@@ -147,13 +161,17 @@ def test_republish_after_unpublish_reuses_report_id(tmp_path: Path):
     from contextlib import ExitStack
     with ExitStack() as stack:
         stack.enter_context(_patch_scan(tmp_path))
+        stack.enter_context(_patch_publish_scan(tmp_path))
         stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
         stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
         stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
         stack.enter_context(patch.object(publish_mod, "_save_state", lambda state: None))
         stack.enter_context(patch("anton.core.datasources.data_vault.LocalDataVault", lambda *a, **k: object()))
         stack.enter_context(patch("anton.publisher.publish", _spy_publish))
-        publish_mod.publish_artifact(str(root))
+        publish_mod.publish_artifact(
+            root, artifacts_base=tmp_path,
+            api_key="fake-key", publish_url="https://4nton.ai",
+        )
 
     assert seen["report_id"] == "uuid-1"           # old anchor was re-sent
     assert _read_map(root)["index.html"]["published"] is True
@@ -461,6 +479,7 @@ def test_unpublish_folder_skips_soft_deleted(tmp_path: Path):
     # The keyed file must exist on disk so the only reason to skip is the flag.
     (root / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
     called = []
-    with patch.object(publish_mod, "unpublish_artifact", lambda p: called.append(p)):
-        _unpublish_folder(root)
+    with patch.object(publish_mod, "unpublish_artifact", lambda p, **kw: called.append(p)):
+        _unpublish_folder(root, artifacts_base=tmp_path, api_key="k",
+                          publish_url="https://4nton.ai")
     assert called == []

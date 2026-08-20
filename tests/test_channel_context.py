@@ -9,6 +9,7 @@ import asyncio
 import inspect
 from types import SimpleNamespace
 
+import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
 from cowork.harnesses.anton_harness.harness import AntonHarness, _turn_style_context
 from cowork.harnesses.base import ChannelContext
@@ -87,8 +88,14 @@ class _FakeSession:
 
 
 def test_stream_response_forwards_channel_context(monkeypatch):
-    monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", lambda *_a, **_k: set())
-    monkeypatch.setattr(task_objects, "finalize_turn_artifacts", lambda *_a, **_k: [])
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
+    monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
+
+    async def _no_autopublish(*_a, **_k):
+        return set()
+
+    monkeypatch.setattr(autopublish, "autopublish_project_artifacts", _no_autopublish)
     received = {}
 
     async def _fake_build(self, conversation, model=None, disabled_connections=None, channel_context=None):
@@ -97,7 +104,7 @@ def test_stream_response_forwards_channel_context(monkeypatch):
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(
-        id="conv-1", project_id="proj-1", project=SimpleNamespace(path="/tmp")
+        id="conv-1", project_id="proj-1", project=SimpleNamespace(path="/tmp", name="tmp")
     )
     ctx = ChannelContext(channel_type="telegram", is_group=True)
 
