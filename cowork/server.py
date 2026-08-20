@@ -5,6 +5,8 @@ This module sets up the FastAPI application with middleware, routing,
 and all necessary configurations for the Cowork service.
 """
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -94,6 +96,13 @@ async def lifespan(app: FastAPI):
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
     start_scheduler()
     await _start_channels(app)
+    app.state.channel_ingress_reconciler = None
+    if get_app_settings().tenancy_mode == "org":
+        from cowork.channels.ingress import start_reconciler
+
+        app.state.channel_ingress_reconciler = start_reconciler(
+            app.state.channel_ingress, app.state.channel_adapters
+        )
     try:
         yield
     finally:
@@ -101,6 +110,12 @@ async def lifespan(app: FastAPI):
         from cowork.common.http_client import close_proxy_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
+
+        reconciler = getattr(app.state, "channel_ingress_reconciler", None)
+        if reconciler is not None:
+            reconciler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reconciler
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()

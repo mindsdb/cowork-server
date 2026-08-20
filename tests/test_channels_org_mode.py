@@ -6,9 +6,6 @@ loaded no plugins and mounted no routes outside local mode, and
 `_require_local_channels()` 501-gated the config/lifecycle endpoints. This
 file proves the activation itself, not the underlying mechanisms (see
 test_channels_tenancy.py / test_channel_webhooks.py for those).
-
-Streaming/polling ingress (Discord Gateway, Slack Socket Mode) deliberately
-stays inert in org mode even after this — see the ingress test at the bottom.
 """
 from __future__ import annotations
 
@@ -205,17 +202,18 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
         get_app_settings.cache_clear()
 
 
-# --- streaming/polling ingress stays inert in org mode, like Telegram/
-# WhatsApp already are — reconciling it per-request would need a per-org
-# IngressManager, which is its own deferred design, not part of this change.
+# --- streaming/polling ingress is now per-org (IngressManager keys on
+# (channel_type, org_id) and a Redis lease arbitrates cross-replica
+# ownership) — a config change reconciles the caller's own org, not the
+# deployment-global slot local mode uses.
 
-def test_channel_config_put_does_not_start_ingress_in_org_mode(client, monkeypatch):
+def test_channel_config_put_reconciles_ingress_for_the_calling_org(client, monkeypatch):
     import cowork.api.v1.endpoints.channels as channels_ep
 
-    called = []
+    calls = []
 
     async def spy(*args, **kwargs):
-        called.append(True)
+        calls.append((args, kwargs))
 
     monkeypatch.setattr(channels_ep, "sync_channel_ingress", spy)
     try:
@@ -224,7 +222,12 @@ def test_channel_config_put_does_not_start_ingress_in_org_mode(client, monkeypat
             json={"values": {"bot_token": "discord-bot-token"}},
         )
         assert res.status_code == 200, res.text
-        assert called == []
+        assert len(calls) == 1
+        args, kwargs = calls[0]
+        # (manager, adapters, channel_type, org_id) — org_id must be ORG_A,
+        # never None, in org mode.
+        assert args[2] == "discord"
+        assert args[3] == ORG_A
     finally:
         client.delete("/api/v1/channels/discord/config", headers=A_ADMIN)
 

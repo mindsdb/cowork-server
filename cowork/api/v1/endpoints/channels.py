@@ -77,19 +77,13 @@ def _require_org_ready(channel_type: str) -> None:
         )
 
 
-async def _reconcile_ingress(request: Request, channel_type: str) -> None:
-    """Start/stop background ingress (Gateway stream or tunnel-free poll) after a
-    change to the channel's live adapter (config/setup/teardown/reload).
-
-    Org mode stays a no-op: IngressManager keys its one running task per
-    channel_type, not per org, so a second org configuring the same channel
-    would silently starve the first's connection. Deferred like Telegram/
-    WhatsApp until ingress itself is made per-org.
-    """
-    if get_app_settings().tenancy_mode == "org":
-        return
+async def _reconcile_ingress(request: Request, channel_type: str, org_id: str | None) -> None:
+    """Start/stop background ingress (Gateway stream or tunnel-free poll) after
+    a change to the channel's live adapter (config/setup/teardown/reload).
+    org_id=None in local mode preserves today's single global slot; a real
+    org_id in org mode goes through IngressManager's per-org Redis lease."""
     manager = getattr(request.app.state, "channel_ingress", None)
-    await sync_channel_ingress(manager, _live_adapters(request), channel_type)
+    await sync_channel_ingress(manager, _live_adapters(request), channel_type, org_id)
 
 
 @router.get("/status", response_model=ChannelStatusResponse)
@@ -176,7 +170,7 @@ async def set_config(
     adapters = _live_adapters(request)
     if adapters is not None:
         await adapters.refresh(channel_type, session=scoped)
-    await _reconcile_ingress(request, channel_type)
+    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
     return result
 
 
@@ -199,7 +193,7 @@ async def delete_config(
     adapters = _live_adapters(request)
     if adapters is not None:
         await adapters.remove(channel_type)
-    await _reconcile_ingress(request, channel_type)
+    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
 
 
 @router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
@@ -217,7 +211,7 @@ async def reload_channel(
     active = False
     if adapters is not None:
         active = await adapters.refresh(channel_type, session=scoped)
-    await _reconcile_ingress(request, channel_type)
+    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
 
 
@@ -291,7 +285,7 @@ async def setup_channel(
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_ingress(request, channel_type)
+    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
     return ChannelLifecycleResponse(channel_type=channel_type, action="setup", active=result.active, detail=result.detail)
 
 
@@ -313,5 +307,5 @@ async def teardown_channel(
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_ingress(request, channel_type)
+    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
     return ChannelLifecycleResponse(channel_type=channel_type, action="teardown", active=result.active, detail=result.detail)
