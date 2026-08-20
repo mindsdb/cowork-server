@@ -232,6 +232,20 @@ class FileService:
             Path(get_app_settings().file.root_dir), self.session.scope, store="files"
         )
 
+    def _owned_select(self):
+        """Files are personal. The scoped session enforces the org, but user_id
+        has no automatic scoping (see PinService), so without this every org
+        member could list/read/delete every other member's files."""
+        stmt = self.session.select(File)
+        if self.session.scope.org_mode:
+            stmt = stmt.where(File.created_by == self.session.scope.user_id)
+        return stmt
+
+    def _owned(self, file_id: UUID) -> "File | None":
+        """A file only if it belongs to the caller. A bare session.get by PK
+        does no owner filter, so a guessed id must not resolve cross-user."""
+        return self.session.exec(self._owned_select().where(File.id == file_id)).first()
+
     def _to_response(self, file: File) -> FileResponse:
         return FileResponse(
             id=str(file.id),
@@ -242,7 +256,7 @@ class FileService:
         )
 
     def list_files(self, purpose: str | None = None) -> list[FileResponse]:
-        stmt = self.session.select(File)
+        stmt = self._owned_select()
         if purpose is not None:
             stmt = stmt.where(File.purpose == purpose)
         return [self._to_response(f) for f in self.session.exec(stmt).all()]
@@ -251,7 +265,7 @@ class FileService:
         """Raw File rows for callers that need fields the OpenAI-style
         FileResponse drops (content_type, timestamps) — e.g. the
         attachments compat endpoints."""
-        return list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
+        return list(self.session.exec(self._owned_select().where(File.purpose == purpose)).all())
 
     def get_file_row(self, file_id: UUID) -> File:
         return self._get_file_model(file_id)
@@ -260,7 +274,7 @@ class FileService:
         """Repoint every file stored under `old_purpose`. Used when a
         conversation ends up with a different id than the one the client
         uploaded attachments against. Returns the number relinked."""
-        files = self.session.exec(self.session.select(File).where(File.purpose == old_purpose)).all()
+        files = self.session.exec(self._owned_select().where(File.purpose == old_purpose)).all()
         for file in files:
             file.purpose = new_purpose
             self.session.add(file)
@@ -269,7 +283,7 @@ class FileService:
         return len(files)
 
     def get_file(self, file_id: UUID) -> FileResponse:
-        file = self.session.get(File, file_id)
+        file = self._owned(file_id)
         if file is None:
             raise ValueError("File not found")
         return self._to_response(file)
@@ -335,7 +349,7 @@ class FileService:
         return file
 
     def _get_file_model(self, file_id: UUID) -> File:
-        file = self.session.get(File, file_id)
+        file = self._owned(file_id)
         if file is None:
             raise ValueError("File not found")
         return file
@@ -355,7 +369,7 @@ class FileService:
         return dirs
 
     def delete_file(self, file_id: UUID) -> bool:
-        file = self.session.get(File, file_id)
+        file = self._owned(file_id)
         if file is None:
             return False
         doomed = self._doomed_dirs(file)
@@ -377,7 +391,7 @@ class FileService:
         conversation), then the caller unlinks the returned dirs via
         `unlink_file_dirs` AFTER committing.
         """
-        rows = list(self.session.exec(self.session.select(File).where(File.purpose == purpose)).all())
+        rows = list(self.session.exec(self._owned_select().where(File.purpose == purpose)).all())
         # Same validated candidates as delete_file (_doomed_dirs).
         dirs = [d for f in rows for d in self._doomed_dirs(f)]
         for f in rows:
