@@ -68,7 +68,7 @@ BridgeResolver = Callable[[str], "WebhookBridge | None"]
 # (channel_type, routing_key) -> (bridge, org_id), or None if nothing claims
 # that routing key. org_id is the org the bridge belongs to.
 OrgBridgeResolver = Callable[[str, str], Awaitable["tuple[WebhookBridge, str | None] | None"]]
-InboundSink = Callable[[str, Any], Awaitable[None]]
+InboundSink = Callable[[str, Any, "str | None"], Awaitable[None]]
 Scheduler = Callable[[Coroutine[Any, Any, None]], None]
 
 
@@ -268,7 +268,7 @@ async def _process_event(
         scope = SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
         channel_log = ChannelEventService(ScopedSession(session, scope))
         try:
-            await sink(channel_type, event)
+            await sink(channel_type, event, org_id)
             channel_log.set_status(event_id, "routed")
         except Exception as exc:
             channel_log.set_status(event_id, "failed", error=type(exc).__name__)

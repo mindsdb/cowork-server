@@ -24,7 +24,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.models.project import Project
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import get_user_settings
+from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.services.artifacts import list_artifacts
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
@@ -265,20 +265,22 @@ class AntonChannelRuntime:
         thread_key = event.address.thread_id or _DEFAULT_THREAD_KEY
         return f"{channel_type}:{event.address.platform_id}:{thread_key}"
 
-    async def handle(self, channel_type: str, event: Any) -> None:
+    async def handle(self, channel_type: str, event: Any, org_id: str | None = None) -> None:
         log.info(
             "channel %s: runtime received inbound from %s thread=%s",
             channel_type, event.address.platform_id, event.address.thread_id,
         )
         async with self._locks.acquire(self._lock_key(channel_type, event)):
-            await self._handle_locked(channel_type, event)
+            await self._handle_locked(channel_type, event, org_id)
 
-    async def _handle_locked(self, channel_type: str, event: Any) -> None:
+    async def _handle_locked(self, channel_type: str, event: Any, org_id: str | None) -> None:
         session = get_open_session()
         try:
-            # One scope per turn. Org mode fails loudly here until the
-            # service-principal ticket lands — never a silent unscoped write.
-            scoped = ScopedSession(session, scope_for_background_context())
+            # One scope per turn. org_id comes from the webhook's own org
+            # resolution (resolve_bridge) — None means local mode, or (in org
+            # mode) a genuinely unresolved org, which still fails closed below.
+            scope = TenantScope(org_mode=True, org_id=org_id) if org_id else scope_for_background_context()
+            scoped = ScopedSession(session, scope)
             binding = self._resolve_or_create_binding(scoped, channel_type, event)
             log.info(
                 "channel %s: binding %s → project %s (trigger=%s)",
@@ -288,11 +290,11 @@ class AntonChannelRuntime:
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
             if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
-                await self._start_fresh(scoped, channel_type, binding, event)
+                await self._start_fresh(scoped, channel_type, binding, event, org_id)
                 return
             # Optional hook: adapters with set_typing show a typing indicator
             # for the duration of the turn; others are untouched.
-            adapter = self._adapters.get(channel_type)
+            adapter = self._adapters.get(channel_type, org_id)
             typing = None
             if adapter is not None and callable(getattr(adapter, "set_typing", None)):
                 typing = asyncio.create_task(typing_loop(adapter, event.address))
@@ -307,9 +309,12 @@ class AntonChannelRuntime:
                     display_name=binding.display_name,
                     instructions=binding.instructions,
                 )
-                reply, used_tools = await self._run_anton(
-                    scoped, conversation, event, adapter, channel_context=channel_context
-                )
+                # Nested get_user_settings() reads (model/provider, channels_harness)
+                # must resolve against this org, not fall back to local/global.
+                with use_settings_scope(scope):
+                    reply, used_tools = await self._run_anton(
+                        scoped, conversation, event, adapter, channel_context=channel_context
+                    )
             finally:
                 if typing is not None:
                     typing.cancel()
@@ -327,14 +332,17 @@ class AntonChannelRuntime:
                     link = conversation_link(conversation.id)
                     if link:
                         outbound = f"{reply}\n\n{link}"
-                await self._deliver(channel_type, event, outbound)
+                await self._deliver(channel_type, event, outbound, org_id)
             if used_tools:
                 await self.send_turn_artifacts(adapter, event, conversation, turn_started)
         finally:
             session.close()
 
 
-    async def _start_fresh(self, scoped: ScopedSession, channel_type: str, binding: ChannelBinding, event: Any) -> None:
+    async def _start_fresh(
+        self, scoped: ScopedSession, channel_type: str, binding: ChannelBinding, event: Any,
+        org_id: str | None,
+    ) -> None:
         """Handle /new: detach the pinned conversation and confirm deterministically instead of running a turn."""
         ChannelBindingService(scoped).detach_conversation(binding)
         project = scoped.get(Project, binding.anton_project_id or self._resolve_default_project_id(scoped))
@@ -343,6 +351,7 @@ class AntonChannelRuntime:
         await self._deliver(
             channel_type, event,
             f'Starting fresh — your next message begins a new conversation in the "{name}" project.',
+            org_id,
         )
 
     def _resolve_or_create_binding(self, scoped: ScopedSession, channel_type: str, event: Any) -> ChannelBinding:
@@ -564,8 +573,8 @@ class AntonChannelRuntime:
             except Exception:
                 log.warning("channel %s: failed sending artifact %s", event.address.channel_type, filename)
 
-    async def _deliver(self, channel_type: str, event: Any, reply: str) -> None:
-        adapter = self._adapters.get(channel_type)
+    async def _deliver(self, channel_type: str, event: Any, reply: str, org_id: str | None = None) -> None:
+        adapter = self._adapters.get(channel_type, org_id)
         if adapter is None:
             log.warning("channel %s: no live adapter; reply not delivered", channel_type)
             return

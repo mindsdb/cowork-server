@@ -12,7 +12,7 @@ import cowork.channels.plugins.telegram as telegram
 from cowork.channels.ingress import IngressManager, sync_channel_ingress
 
 
-async def _noop_sink(channel_type, event):
+async def _noop_sink(channel_type, event, org_id=None):
     return None
 
 

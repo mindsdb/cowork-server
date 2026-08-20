@@ -11,7 +11,7 @@ from cowork.common.settings.app_settings import get_app_settings
 
 log = logging.getLogger(__name__)
 
-InboundSink = Callable[[str, Any], Awaitable[None]]
+InboundSink = Callable[[str, Any, "str | None"], Awaitable[None]]
 
 # Pause before reconnecting/retrying after an ingress loop ends or raises, so a
 # persistent failure (network down, bad token) doesn't spin a tight loop.

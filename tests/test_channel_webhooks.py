@@ -150,7 +150,7 @@ async def test_intake_events_stamps_the_resolved_org(monkeypatch):
     try:
         intake_events(
             "slack", _FakeBridge(), [{"key": "evt-a"}],
-            sink=lambda ct, evt: None, scheduler=_capturing_scheduler(captured), org_id=ORG_A,
+            sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured), org_id=ORG_A,
         )
         for coro in captured:
             await coro
@@ -175,14 +175,14 @@ async def test_intake_events_isolates_dedupe_across_orgs():
     try:
         intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
-            sink=lambda ct, evt: None, scheduler=_capturing_scheduler(captured_a), org_id=ORG_A,
+            sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_a), org_id=ORG_A,
         )
         for coro in captured_a:
             await coro
 
         intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
-            sink=lambda ct, evt: None, scheduler=_capturing_scheduler(captured_b), org_id=ORG_B,
+            sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_b), org_id=ORG_B,
         )
 
         assert len(captured_a) == 1
@@ -285,7 +285,7 @@ async def test_local_mode_webhook_falls_through_to_local_bridge_end_to_end():
 
         delivered = []
 
-        async def sink(channel_type, event):
+        async def sink(channel_type, event, org_id=None):
             delivered.append((channel_type, event))
 
         app = FastAPI()
