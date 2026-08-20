@@ -686,22 +686,26 @@ class UserSettings(Settings):
         description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
     artifact_autopublish_enabled: Annotated[bool, ORG] = Field(
-        # TEMP REVERT-ME (ENG-1680): default flipped to True so the branch
-        # deploy on cowork.staging.mindshub.ai exercises the feature without an
-        # org-admin write or a chart change. MUST go back to False before merge —
-        # shipping it enabled turns autopublish on for every organization on
-        # every deployment, which is exactly what the paragraph below argues
-        # against, and §1.1 of the accepted-limitations doc (fullstack datasource
-        # secrets read from an org-unscoped vault) is still open.
+        # On by default, deliberately. It was drafted as off because publishing a
+        # fullstack artifact resolved datasource secrets from a process-global
+        # vault, so one org's artifact could ship another's credentials. That is
+        # closed: the vault is org-keyed now (`vault_for_scope` ->
+        # `scoped_storage_root(..., store="data-vault")`), and a missing scope
+        # RAISES on an org deployment rather than falling back to the shared root,
+        # so the leak cannot reappear silently.
+        #
+        # Inert outside org mode: `autopublish_project_artifacts` returns on the
+        # scope guard before it ever reads this, so a desktop install is
+        # unaffected by the default either way.
         default=True,
         title="Auto-publish artifacts",
         description=(
             "In org deployments, publish every artifact the agent creates or changes "
             "to the viewer automatically, restricted to the author's organization. "
-            "Off by default: it uploads user content — and, for fullstack artifacts, "
-            "datasource secrets from a vault that is not scoped per organization — "
-            "without an explicit user action. ORG-scoped on purpose, so it can be "
-            "enabled for one organization at a time. The env override that actually "
+            "On by default. ORG-scoped, so an organization can still turn it off "
+            "for itself. It uploads user content without an explicit user action, "
+            "which is the reason to keep the per-org switch. The env override that "
+            "actually "
             "bypasses that is ARTIFACT_AUTOPUBLISH_ENABLED, the field name itself: "
             "UserSettings is a pydantic-settings model, so any field with no DB row "
             "falls back to the environment, process-global, for every tenant of the "
