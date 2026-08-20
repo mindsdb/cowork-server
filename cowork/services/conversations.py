@@ -262,6 +262,11 @@ class ConversationService:
             Conversation.created_at,
         )
         stmt = self.session.select(Conversation)
+        # Conversations are personal: the scoped session enforces the org, but
+        # user_id has no automatic scoping (see PinService), so without this
+        # every org member's tasks show in everyone's list.
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         if not all_projects:
             stmt = stmt.where(
                 Conversation.project_id == (project_id or self._default_project_id())
@@ -291,8 +296,23 @@ class ConversationService:
             (conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs
         ]
 
+    def _owned(self, conversation_id: UUID) -> Conversation | None:
+        """Fetch a conversation only if it belongs to the caller.
+
+        Conversations are personal. The scoped session enforces the org, but
+        user_id has no automatic scoping (see PinService) and a bare
+        session.get by PK bypasses even the org filter — so every by-id access
+        must go through here or a member can read/rename/delete another
+        member's chat by guessing its id. Local mode has one user, so no owner
+        filter applies.
+        """
+        stmt = self.session.select(Conversation).where(Conversation.id == conversation_id)
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
+        return self.session.exec(stmt).first()
+
     def get_conversation(self, conversation_id: UUID) -> Conversation:
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             raise ValueError("Conversation not found")
         return conversation
@@ -340,7 +360,7 @@ class ConversationService:
         topic: str | None = None,
         project_id: UUID | None = None,
     ) -> Conversation:
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             raise ValueError("Conversation not found")
         if topic is not None:
@@ -366,7 +386,7 @@ class ConversationService:
         Best-effort: silently no-ops if the conversation is gone (this runs
         from a turn's cleanup path, after the turn's real outcome is settled).
         """
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             return
         conversation.history_summary = summary
@@ -375,7 +395,7 @@ class ConversationService:
         self.session.commit()
 
     def delete_conversation(self, conversation_id: UUID) -> bool:
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             return False
         messages = self.session.exec(
