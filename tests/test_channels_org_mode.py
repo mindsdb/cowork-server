@@ -202,10 +202,8 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
         get_app_settings.cache_clear()
 
 
-# --- streaming/polling ingress is now per-org (IngressManager keys on
-# (channel_type, org_id) and a Redis lease arbitrates cross-replica
-# ownership) — a config change reconciles the caller's own org, not the
-# deployment-global slot local mode uses.
+# --- streaming/polling ingress is now per-org: a config change reconciles
+# the caller's own org's ingress, not local mode's one deployment-global slot.
 
 def test_channel_config_put_reconciles_ingress_for_the_calling_org(client, monkeypatch):
     import cowork.api.v1.endpoints.channels as channels_ep
