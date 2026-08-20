@@ -5,9 +5,9 @@ On desktop the minds-cloud role defaults stay the premium canonical models
 `minds_model_enabled` availability map. That map is refreshed lazily on GET
 /recommended-models, so a brand-new sign-in that sends a message before the
 picker ever loads resolves the planning default against an EMPTY map —
-`_enabled_aware_default` returns canonical `sonnet` and MindsHub denies the
-empty free-tier wallet (`wallet_empty` 402) on message one. That is the live
-first-contact cohort in ENG-748.
+`_enabled_aware_default` returns the paid canonical (minds-cloud plans on
+`kimi`) and MindsHub denies the empty free-tier wallet (`wallet_empty` 402) on
+message one. That is the live first-contact cohort in ENG-748.
 
 `warm_enabled_model_map` closes the race at the two guaranteed-pre-first-turn
 seams — server startup with a stored key, and immediately after a credential
@@ -20,6 +20,8 @@ The org surface is fixed separately by `role_defaults` (see
 """
 import asyncio
 import json
+
+import httpx
 
 from cowork.common.settings import user_settings as us
 from cowork.db.scoped import LOCAL_SCOPE
@@ -158,8 +160,9 @@ def test_warm_flips_the_free_tier_default_off_the_paid_canonical(monkeypatch):
              planning_provider="minds_cloud", coding_provider="minds_cloud")
 
         # Cold map (the first-turn state): planning default is the paid canonical
-        # that 402s a free-tier wallet.
-        assert SettingService(session).load().resolved_planning_model == "sonnet"
+        # (minds-cloud plans on `kimi` per MODEL_ROLE_DEFAULTS) that 402s a
+        # free-tier wallet.
+        assert SettingService(session).load().resolved_planning_model == "kimi"
 
         asyncio.run(providers.warm_enabled_model_map(session))
 
@@ -268,6 +271,56 @@ def test_boot_warm_populates_map_on_desktop(monkeypatch):
     finally:
         _clear(session, "minds_api_key", "minds_url", "minds_model_enabled")
         session.close()
+
+
+# ── fetch_minds_models total budget (the layer under the boot bound) ──
+#
+# The boot seam's own ceiling is covered by test_boot_warm_is_bounded_and_fail_open,
+# but that stubs fetch_minds_models out entirely. This exercises the REAL fetch and
+# pins its total budget — `asyncio.wait_for(_fetch(), _MINDS_MODELS_TIMEOUT_S)` — which
+# is the only thing that bounds a *successful-but-trickled* response: httpx.Timeout is
+# per-operation, so a body dribbled in under-timeout chunks (or a redirect chain) has no
+# ceiling without the outer wait_for. Deleting that wrapper leaves the whole suite green
+# otherwise. A slow transport reproduces the unbounded case: the fetch would "succeed"
+# after the sleep (so the negative cache never engages), and only the wait_for stops it —
+# hence the hang→fail outer guard, matching the boot test above.
+
+def test_fetch_minds_models_total_budget_bounds_a_slow_success(monkeypatch):
+    from cowork.services import providers
+
+    async def slow_get(self, url, *args, **kwargs):
+        # A successful 200 that arrives only after the sleep. httpx's per-op
+        # timeout is bypassed here (we replace .get), so nothing but the outer
+        # wait_for can cut it off — exactly the trickle case with no per-op cap.
+        await asyncio.sleep(30)
+        return httpx.Response(
+            200,
+            json={"object": "list", "data": [{"id": "mindshub_air", "enabled": True}]},
+            request=httpx.Request("GET", str(url)),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", slow_get)
+    monkeypatch.setattr(providers, "_MINDS_MODELS_TIMEOUT_S", 0.1)
+    providers._minds_models_cache.clear()
+    try:
+        async def _run():
+            # Guard well above the 0.1s budget but far below the 30s sleep: with
+            # the budget in place this returns fast; remove it and the sleep runs
+            # past the guard and the test times out (hang) rather than passing.
+            return await asyncio.wait_for(
+                providers.fetch_minds_models("https://minds.example/v1", "mdb_test"),
+                timeout=3.0,
+            )
+
+        listing = asyncio.run(_run())
+        # The budget expired mid-fetch: the failure falls through to an empty
+        # listing (ids is None), never the slow gateway's real data.
+        assert listing.ids is None
+        # ...and that empty result is negatively cached so a degraded gateway
+        # isn't re-probed on every boot/open.
+        assert any(v.ids is None for _, v in providers._minds_models_cache.values())
+    finally:
+        providers._minds_models_cache.clear()
 
 
 def test_boot_warm_is_gated_off_in_org_mode(monkeypatch):
