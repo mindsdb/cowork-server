@@ -85,7 +85,7 @@ jobs:
           build-for-environment: ${{ inputs.build-environment }}
 
   scan:
-    runs-on: ${{ inputs.build-runner }}
+    runs-on: mdb-dev
     needs: [build]
     name: Scan Minds Image
     steps:
