@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-import shutil
+import os
+import stat
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -9,6 +10,12 @@ from uuid import UUID
 from sqlalchemy import case, func
 from sqlalchemy import select as sa_select
 
+from cowork.common.paths import (
+    dir_lstat,
+    dir_rmtree,
+    dir_unlink,
+    opened_subdir_nofollow,
+)
 from cowork.db.scoped import ScopedSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
@@ -50,7 +57,10 @@ logger = logging.getLogger(__name__)
 
 def _skill_created_slug(event_data) -> str | None:
     """The draft slug of a persisted `response.skill_created` event, else None."""
-    if not isinstance(event_data, dict) or event_data.get("type") != "response.skill_created":
+    if (
+        not isinstance(event_data, dict)
+        or event_data.get("type") != "response.skill_created"
+    ):
         return None
     skill = event_data.get("skill")
     slug = skill.get("slug") if isinstance(skill, dict) else None
@@ -67,14 +77,39 @@ def _sweep_skill_drafts(session, project_id, slugs: set[str]) -> None:
     project = session.get(Project, project_id)
     if project is None or not project.path:
         return
-    drafts_root = Path(project.path) / ".anton" / "skill_drafts"
-    for slug in slugs:
-        folder = drafts_root / slug
-        try:
-            if folder.parent == drafts_root and folder.is_dir():
-                shutil.rmtree(folder, ignore_errors=True)
-        except OSError:
-            logger.warning("Could not sweep skill draft %r on turn delete", slug, exc_info=True)
+    # `<project>/.anton/skill_drafts` sits under the agent-writable tree, so a
+    # planted symlink at `.anton`, `skill_drafts`, or the slug could redirect
+    # this delete into another org. Pin the dir by O_NOFOLLOW descriptor and
+    # rmtree each slug relative to it, never following a link (see
+    # opened_subdir_nofollow). slug comes from an event, so reject anything that
+    # is not a single path component before handing it to the kernel.
+    try:
+        with opened_subdir_nofollow(Path(project.path), ".anton", "skill_drafts") as d:
+            for slug in slugs:
+                if (
+                    os.sep in slug
+                    or (os.altsep and os.altsep in slug)
+                    or slug in {"", ".", ".."}
+                ):
+                    continue
+                try:
+                    st = dir_lstat(d, slug)
+                except FileNotFoundError:
+                    continue
+                try:
+                    if stat.S_ISLNK(st.st_mode):
+                        dir_unlink(d, slug)  # drop the link only, never follow it
+                    elif stat.S_ISDIR(st.st_mode):
+                        dir_rmtree(d, slug)
+                except OSError:
+                    logger.warning(
+                        "Could not sweep skill draft %r on turn delete",
+                        slug,
+                        exc_info=True,
+                    )
+    except OSError:
+        # No drafts dir (or a symlink squatting `.anton`/`skill_drafts`): nothing to sweep.
+        return
 
 
 def _discard_conversation_streams(conversation_id) -> None:
@@ -90,7 +125,11 @@ def _discard_conversation_streams(conversation_id) -> None:
 
         discard_conversation(conversation_id)
     except Exception:
-        logger.warning("Could not discard streams for conversation %s", conversation_id, exc_info=True)
+        logger.warning(
+            "Could not discard streams for conversation %s",
+            conversation_id,
+            exc_info=True,
+        )
 
 
 class ConversationService:
@@ -101,6 +140,7 @@ class ConversationService:
         """The caller's default project. Imported lazily: projects imports this
         module's models, so a top-level import would cycle."""
         from cowork.services.projects import ProjectService
+
         return ProjectService(self.session).default_project_id()
 
     def _next_seq(self, conversation_id: UUID) -> int:
@@ -152,7 +192,9 @@ class ConversationService:
         self.session.refresh(message)
         return message
 
-    def finalize_pending(self, conversation_id: UUID, message_id: UUID | None = None) -> None:
+    def finalize_pending(
+        self, conversation_id: UUID, message_id: UUID | None = None
+    ) -> None:
         """Clear the in-flight flag at turn end (ENG-1231), so the finished turn
         rejoins replayed LLM history.
 
@@ -222,8 +264,15 @@ class ConversationService:
             Conversation.created_at,
         )
         stmt = self.session.select(Conversation)
+        # Conversations are personal: the scoped session enforces the org, but
+        # user_id has no automatic scoping (see PinService), so without this
+        # every org member's tasks show in everyone's list.
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         if not all_projects:
-            stmt = stmt.where(Conversation.project_id == (project_id or self._default_project_id()))
+            stmt = stmt.where(
+                Conversation.project_id == (project_id or self._default_project_id())
+            )
         # created_at then id break ties deterministically so equal-activity rows
         # (e.g. two empty conversations) keep a stable order across polls.
         stmt = stmt.order_by(
@@ -245,10 +294,27 @@ class ConversationService:
         convs = self.list_conversations(
             project_id=project_id, limit=limit, all_projects=all_projects
         )
-        return [(conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs]
+        return [
+            (conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs
+        ]
+
+    def _owned(self, conversation_id: UUID) -> Conversation | None:
+        """Fetch a conversation only if it belongs to the caller.
+
+        Conversations are personal. The scoped session enforces the org, but
+        user_id has no automatic scoping (see PinService) and a bare
+        session.get by PK bypasses even the org filter — so every by-id access
+        must go through here or a member can read/rename/delete another
+        member's chat by guessing its id. Local mode has one user, so no owner
+        filter applies.
+        """
+        stmt = self.session.select(Conversation).where(Conversation.id == conversation_id)
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
+        return self.session.exec(stmt).first()
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             raise ValueError("Conversation not found")
         return conversation
@@ -258,6 +324,8 @@ class ConversationService:
         topic: str,
         project_id: UUID | None = None,
         conversation_id: UUID | None = None,
+        harness: str | None = None,
+        model: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
@@ -271,6 +339,8 @@ class ConversationService:
         conversation = Conversation(
             topic=topic,
             project_id=target_project_id,
+            harness=harness,
+            model=model,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
@@ -292,7 +362,7 @@ class ConversationService:
         topic: str | None = None,
         project_id: UUID | None = None,
     ) -> Conversation:
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             raise ValueError("Conversation not found")
         if topic is not None:
@@ -318,7 +388,7 @@ class ConversationService:
         Best-effort: silently no-ops if the conversation is gone (this runs
         from a turn's cleanup path, after the turn's real outcome is settled).
         """
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             return
         conversation.history_summary = summary
@@ -327,9 +397,25 @@ class ConversationService:
         self.session.commit()
 
     def delete_conversation(self, conversation_id: UUID) -> bool:
-        conversation = self.session.get(Conversation, conversation_id)
+        """Owner-scoped delete for the request path: a member can only delete
+        their own conversation."""
+        conversation = self._owned(conversation_id)
         if conversation is None:
             return False
+        return self._delete_conversation(conversation)
+
+    def delete_conversation_row(self, conversation: Conversation) -> bool:
+        """Owner-AGNOSTIC cascade delete, given an already-authorized row.
+
+        Used by ProjectService.delete_project, which is an intentional org-wide
+        cleanup: the project's conversations may belong to several members, and
+        skipping the foreign ones would orphan their messages/events/task
+        objects/attachment bytes (the ENG-701 orphaning the cascade exists to
+        prevent). The caller has already scoped the fetch to the org."""
+        return self._delete_conversation(conversation)
+
+    def _delete_conversation(self, conversation: Conversation) -> bool:
+        conversation_id = conversation.id
         messages = self.session.exec(
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -337,7 +423,9 @@ class ConversationService:
         ).all()
         for message in messages:
             for event in self.session.exec(
-                self.session.select(MessageEvent).where(MessageEvent.message_id == message.id)
+                self.session.select(MessageEvent).where(
+                    MessageEvent.message_id == message.id
+                )
             ).all():
                 self.session.delete(event)
             self.session.delete(message)
@@ -354,8 +442,10 @@ class ConversationService:
         from cowork.services.files import (
             FileService,
             attachment_purpose,
+            remove_conversation_workspace_dir,
             unlink_file_dirs,
         )
+
         attachment_dirs = FileService(self.session).delete_by_purpose(
             attachment_purpose(str(conversation_id))
         )
@@ -370,10 +460,17 @@ class ConversationService:
         session_project_path = (
             conversation.project.path if conversation.project is not None else None
         )
+        # Its buffers and turn-index entry outlive the rows otherwise: on the
+        # Redis backend /in-flight keeps naming a turn whose conversation is
+        # gone, and a reused turn_id would replay a deleted turn's answer.
+        _discard_conversation_streams(conversation_id)
         self.session.delete(conversation)
         self.session.commit()
         unlink_file_dirs(attachment_dirs)
         remove_conversation_sessions(session_project_path, conversation_id)
+        # Also drop the per-conversation workspace (staged attachments +
+        # instructions on the shared mount) so it doesn't orphan there.
+        remove_conversation_workspace_dir(session_project_path, conversation_id)
         return True
 
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
@@ -418,7 +515,9 @@ class ConversationService:
         swept_slugs: set[str] = set()
         for msg in to_delete:
             for event in self.session.exec(
-                self.session.select(MessageEvent).where(MessageEvent.message_id == msg.id)
+                self.session.select(MessageEvent).where(
+                    MessageEvent.message_id == msg.id
+                )
             ).all():
                 slug = _skill_created_slug(event.event_data)
                 if slug:
@@ -503,11 +602,13 @@ class ConversationService:
         self.session.refresh(assistant_msg)
 
         for event_seq, event_data in enumerate(events):
-            self.session.add(MessageEvent(
-                message_id=assistant_msg.id,
-                sequence_number=event_seq,
-                event_data=event_data,
-            ))
+            self.session.add(
+                MessageEvent(
+                    message_id=assistant_msg.id,
+                    sequence_number=event_seq,
+                    event_data=event_data,
+                )
+            )
         if events:
             self.session.commit()
             # A skill card supersedes its earlier versions: when this turn emits a
@@ -517,9 +618,13 @@ class ConversationService:
             # the "latest card" durable across reload (not just a render-time dedup).
             new_slugs = {s for s in (_skill_created_slug(e) for e in events) if s}
             if new_slugs:
-                self._supersede_skill_cards(conversation_id, assistant_msg.id, new_slugs)
+                self._supersede_skill_cards(
+                    conversation_id, assistant_msg.id, new_slugs
+                )
 
-    def _supersede_skill_cards(self, conversation_id: UUID, keep_message_id: UUID, slugs: set[str]) -> None:
+    def _supersede_skill_cards(
+        self, conversation_id: UUID, keep_message_id: UUID, slugs: set[str]
+    ) -> None:
         """Delete earlier `skill_created` events (for `slugs`) in this conversation,
         keeping only the one on `keep_message_id`.
 
@@ -528,15 +633,20 @@ class ConversationService:
         turn, which is rare; upgrade to an indexed column if skills get chatty.
         """
         msg_ids = [
-            m.id for m in self.session.exec(
-                self.session.select(Message).where(Message.conversation_id == conversation_id)
+            m.id
+            for m in self.session.exec(
+                self.session.select(Message).where(
+                    Message.conversation_id == conversation_id
+                )
             ).all()
         ]
         if not msg_ids:
             return
         deleted = False
         for event in self.session.exec(
-            self.session.select(MessageEvent).where(MessageEvent.message_id.in_(msg_ids))
+            self.session.select(MessageEvent).where(
+                MessageEvent.message_id.in_(msg_ids)
+            )
         ).all():
             if event.message_id == keep_message_id:
                 continue
@@ -546,7 +656,9 @@ class ConversationService:
         if deleted:
             self.session.commit()
 
-    def get_ordered_messages(self, conversation_id: UUID, *, include_pending: bool = False) -> list[Message]:
+    def get_ordered_messages(
+        self, conversation_id: UUID, *, include_pending: bool = False
+    ) -> list[Message]:
         """All messages of a conversation in canonical order (see
         _MESSAGE_ORDER). Includes history-only tool rows — harnesses replay
         them into the LLM context; use get_messages for the UI-facing view.
@@ -560,9 +672,8 @@ class ConversationService:
         # id must answer like a nonexistent one, not leak another org's
         # history (the remote-turn replay path passes ids from the wire).
         self.get_conversation(conversation_id)  # raises if not found
-        stmt = (
-            self.session.select(Message)
-            .where(Message.conversation_id == conversation_id)
+        stmt = self.session.select(Message).where(
+            Message.conversation_id == conversation_id
         )
         if not include_pending:
             stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity

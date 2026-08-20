@@ -28,7 +28,12 @@ def _scope(org: str, user: str = "user-1") -> TenantScope:
 @pytest.fixture()
 def db(tmp_path, monkeypatch):
     """Isolated engine + projects root, seeded with the GENERAL row (NULL org)."""
+    # Org mode roots at cowork_home() regardless of COWORK_PROJECTS_DIR (see
+    # scoped_storage_root), so it must be pinned here too or org-scoped tests
+    # fall through to the real ~/.cowork.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     from cowork.common.settings.app_settings import get_app_settings
     get_app_settings.cache_clear()
 
@@ -97,7 +102,7 @@ def test_project_paths_cannot_escape_the_root(db, tmp_path, evil):
     # The created dir must sit directly under this ORG's projects root (the root
     # is org-keyed, like the skills/memory stores), not wherever the (sanitized)
     # name happened to point.
-    projects_root = (tmp_path / "projects" / str(ORG_A)).resolve()
+    projects_root = (tmp_path / str(ORG_A) / "projects").resolve()
     assert Path(project.path).resolve().parent == projects_root
     assert "/" not in project.name and ".." != project.name
 
@@ -211,7 +216,7 @@ def test_general_repoints_a_legacy_unkeyed_path_with_no_content(db, tmp_path):
     general = a.ensure_general_for_scope()
 
     assert general is not None
-    assert Path(general.path).parent == (tmp_path / "projects" / str(ORG_A))
+    assert Path(general.path).parent == (tmp_path / str(ORG_A) / "projects")
     assert Path(general.path).is_dir()
 
 
@@ -356,7 +361,7 @@ def test_repoints_off_an_empty_legacy_directory(db, tmp_path):
     general = _svc(db, _scope(ORG_A)).ensure_general_for_scope()
 
     assert general is not None
-    assert Path(general.path).parent == (tmp_path / "projects" / str(ORG_A))
+    assert Path(general.path).parent == (tmp_path / str(ORG_A) / "projects")
 
 
 def test_any_project_recovers_a_missing_directory(db):
@@ -381,7 +386,7 @@ def test_rename_works_when_the_org_root_does_not_exist_yet(db, tmp_path):
     raw.add(Project(name="legacy-proj", path=str(legacy), is_active=False, org_id=ORG_A))
     raw.commit()
     a = _svc(db, _scope(ORG_A))
-    assert not (tmp_path / "projects" / str(ORG_A)).exists()  # org root absent
+    assert not (tmp_path / str(ORG_A) / "projects").exists()  # org root absent
 
     renamed = a.update_project(a.get_project_by_name("legacy-proj").id, name="renamed")
 
@@ -458,3 +463,27 @@ def test_ensure_dir_never_creates_a_path_outside_the_sanitizer(db, tmp_path):
     a.ensure_dir_exists(a.get_project_by_name("reports"))
 
     assert not escape.exists()  # the tampered path was never created
+
+
+def test_delete_project_cascades_all_members_conversations(db):
+    """Regression (owner-scoping PR): delete_project is org-wide cleanup, so it
+    must delete EVERY member's conversation in the project — owner-scoping the
+    cascade would orphan foreign members' rows/bytes (ENG-701)."""
+    from cowork.services.conversations import ConversationService
+    from cowork.models.conversation import Conversation
+    from sqlmodel import select as _select
+
+    alice = _svc(db, _scope(ORG_A, "alice"))
+    proj = alice.create_project("shared-reports")
+
+    a_conv = ConversationService(ScopedSession(Session(db), _scope(ORG_A, "alice"))).create_conversation(
+        topic="alice", project_id=proj.id)
+    b_conv = ConversationService(ScopedSession(Session(db), _scope(ORG_A, "bob"))).create_conversation(
+        topic="bob", project_id=proj.id)
+
+    # Bob's conversation lives in Alice's project; deleting the project (as any
+    # org member) must remove BOTH, leaving no orphaned conversation rows.
+    assert alice.delete_project(proj.id) is True
+    with Session(db) as s:
+        remaining = s.exec(_select(Conversation).where(Conversation.project_id == proj.id)).all()
+    assert remaining == []

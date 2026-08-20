@@ -25,9 +25,26 @@ def _org(org: str | None, user: str = "u") -> TenantScope:
 
 @pytest.fixture()
 def skills_root(tmp_path, monkeypatch):
-    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    """Both orgs already seeded, so the exact-payload assertions below stay about
+    the selection rules. Seeding itself is covered by
+    tests/test_builtin_skills_seeding.py.
+
+    The marker path comes from the service, not from a literal: org mode keys the
+    store as `<shared_root>/<org_id>/skills`, and a hand-built path silently stops
+    marking anything the next time that layout moves.
+    """
+    from cowork.services.skills import BUILTIN_SKILLS_MARKER, BUILTIN_SKILLS_VERSION
+
+    root = tmp_path / "skills"
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(root))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
-    yield tmp_path / "skills"
+    for org in (ORG_A, ORG_B):
+        store = SkillService(_org(org)).root
+        store.mkdir(parents=True, exist_ok=True)
+        (store / BUILTIN_SKILLS_MARKER).write_text(f"{BUILTIN_SKILLS_VERSION}\n")
+    yield root
     get_app_settings.cache_clear()
 
 

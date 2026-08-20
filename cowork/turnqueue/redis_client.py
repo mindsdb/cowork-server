@@ -8,19 +8,37 @@ from __future__ import annotations
 
 import os
 
+import redis as syncredis
 import redis.asyncio as aioredis
 
 _client: aioredis.Redis | None = None
+_sync_client: syncredis.Redis | None = None
+
+
+def _url() -> str:
+    return os.environ.get("COWORK_TURN_REDIS_URL", "redis://localhost:6379/0")
 
 
 def get_redis() -> aioredis.Redis:
     global _client
     if _client is None:
-        url = os.environ.get("COWORK_TURN_REDIS_URL", "redis://localhost:6379/0")
-        _client = aioredis.from_url(url, decode_responses=True)
+        _client = aioredis.from_url(_url(), decode_responses=True)
     return _client
 
 
+def get_sync_redis() -> syncredis.Redis:
+    """Blocking client on the same URL, for callers with no event loop.
+
+    Conversation delete runs in a threadpool thread (the endpoint is a sync
+    ``def``), so it cannot await the async client.
+    """
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = syncredis.Redis.from_url(_url(), decode_responses=True)
+    return _sync_client
+
+
 def reset_redis() -> None:
-    global _client
+    global _client, _sync_client
     _client = None
+    _sync_client = None

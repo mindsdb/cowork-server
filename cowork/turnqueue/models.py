@@ -39,6 +39,10 @@ class TurnJob(BaseModel):
     reply_stream: str
     organization_id: str | None = None
     user_id: str | None = None
+    #: Project the turn runs in. The pod joins the params' org-relative
+    #: workspace path under its own mount root to reach
+    #: ``projects/<name>/conversations/<conversation_id>/``.
+    project_id: str | None = None
     #: How long the turn may run, in milliseconds. A duration, NOT an epoch
     #: timestamp: the controller reads it as a relative budget, so an epoch value
     #: would mean a ~57 year deadline and no timeout at all.
@@ -63,6 +67,9 @@ class TurnReply(BaseModel):
     """Mirror of scratchpad-controller ScratchpadReplyPayload (reply cowork consumes)."""
 
     correlation_id: str
+    # Must accept every kind the controller can publish: the reply loop validates
+    # each entry unguarded, so a missing kind fails the turn rather than being
+    # ignored. Kinds this build does nothing with are dropped further down.
     kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
-                  "turn_memory", "turn_completed", "turn_failed"]
+                  "turn_memory", "turn_skill", "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)

@@ -19,14 +19,30 @@ class ScheduleService:
         from cowork.services.projects import ProjectService
         return ProjectService(self.session).default_project_id()
 
-    def list_schedules(self, project_id: UUID | None = None) -> list[Schedule]:
+    def _owned_select(self):
+        """Schedules are personal. The scoped session enforces the org, but
+        user_id has no automatic scoping (see PinService), so a member could
+        otherwise list/read/pause/delete another member's schedules. The
+        scheduler runs under LOCAL_SCOPE (org_mode False), so it is unaffected
+        and still scans every org's schedules."""
         query = self.session.select(Schedule)
+        if self.session.scope.org_mode:
+            query = query.where(Schedule.created_by == self.session.scope.user_id)
+        return query
+
+    def _owned(self, schedule_id: UUID) -> "Schedule | None":
+        return self.session.exec(
+            self._owned_select().where(Schedule.id == schedule_id)
+        ).first()
+
+    def list_schedules(self, project_id: UUID | None = None) -> list[Schedule]:
+        query = self._owned_select()
         if project_id is not None:
             query = query.where(Schedule.project_id == project_id)
         return list(self.session.exec(query).all())
 
     def get_schedule(self, schedule_id: UUID) -> Schedule:
-        schedule = self.session.get(Schedule, schedule_id)
+        schedule = self._owned(schedule_id)
         if schedule is None:
             raise ValueError("Schedule not found")
         return schedule
@@ -76,7 +92,7 @@ class ScheduleService:
         return schedule
 
     def delete_schedule(self, schedule_id: UUID) -> bool:
-        schedule = self.session.get(Schedule, schedule_id)
+        schedule = self._owned(schedule_id)
         if schedule is None:
             return False
         for run in self.session.exec(
@@ -140,7 +156,10 @@ class ScheduleRunService:
         (unlike has_running_run, which only guards cron overlap)."""
         # Anchor: ScheduleRun has no org column, so gate on the parent
         # schedule being visible in scope (request-reachable via _serialize).
-        if self.session.get(Schedule, schedule_id) is None:
+        _stmt = self.session.select(Schedule).where(Schedule.id == schedule_id)
+        if self.session.scope.org_mode:
+            _stmt = _stmt.where(Schedule.created_by == self.session.scope.user_id)
+        if self.session.exec(_stmt).first() is None:
             return False
         run = self.session.exec(
             self.session.select(ScheduleRun)
@@ -232,7 +251,10 @@ class ScheduleRunService:
 
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
         # Anchor on parent visibility (child table, request-reachable).
-        if self.session.get(Schedule, schedule_id) is None:
+        _stmt = self.session.select(Schedule).where(Schedule.id == schedule_id)
+        if self.session.scope.org_mode:
+            _stmt = _stmt.where(Schedule.created_by == self.session.scope.user_id)
+        if self.session.exec(_stmt).first() is None:
             return []
         return list(
             self.session.exec(

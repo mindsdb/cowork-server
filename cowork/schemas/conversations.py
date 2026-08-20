@@ -11,6 +11,8 @@ class ConversationCreateRequest(CamelRequest):
     title: str | None = None
     project: str | None = None
     project_id: UUID | None = None
+    harness: str | None = None
+    model: str | None = None
 
 
 class ConversationUpdateRequest(CamelRequest):
@@ -38,3 +40,5 @@ class ConversationListItem(CamelResponse):
     project: str | None = None
     project_path: str | None = None
     project_id: UUID | None
+    harness: str | None = None
+    model: str | None = None

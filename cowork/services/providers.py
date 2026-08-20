@@ -40,6 +40,50 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
+def is_minds_host(url: str | None) -> bool:
+    """True when `url` points at a MindsHub inference host.
+
+    Used to decide whether a probe that omitted its model should fall back to
+    MINDS_PROBE_MODEL rather than to a generic OpenAI default that MindsHub does
+    not serve.
+
+    Compares the parsed hostname, never a substring of the whole URL: a
+    substring test matches `mindshub.ai.example.test` and a `?next=` parameter
+    carrying our host, and the base URL here is partly user-supplied (the
+    openai-compatible card's own field). Covers the prod host, the per-env
+    `api.<env>.mindshub.ai` / `api-<ns>.dev.mindshub.ai` hosts, and the legacy
+    `mdb.ai` host.
+
+    A self-hosted gateway on some other hostname does not match, the same
+    limitation `build_llm_client` documents where it states the MindsHub flavor
+    outright instead of deriving it from the URL. The consequence here is only
+    that such a caller keeps today's generic default.
+
+    Matching the `mdb.ai` host chooses the model, not the path. The
+    openai-compatible probe appends `/v1` generically and never applies
+    minds_chat_base_url's `mdb.ai` -> `/api/v1` rule, so a bare `mdb.ai` base
+    with no version segment is still probed at a path that host does not serve.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    # A bare `api.mindshub.ai/v1` has no scheme, so urlparse would read the whole
+    # thing as a path and find no hostname. Prefixing `//` makes it a netloc.
+    #
+    # The try is load-bearing, not defensive: `.hostname` raises ValueError on an
+    # unbalanced `[` or `]`, this runs in validate_provider OUTSIDE
+    # validate_openai_compatible's except, and base_url is free text off the
+    # provider card. Without it, `baseUrl: "["` leaves the service layer and the
+    # endpoint answers 500 where it used to answer ok:false. The TypeScript copy
+    # guards the same case with try/catch around `new URL`.
+    try:
+        parsed = urlparse(raw if "//" in raw else f"//{raw}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
+
+
 # Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
 # publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
 # can't map to a non-prod MindsHub env, falls back here.
@@ -355,6 +399,167 @@ async def fetch_org_model_catalog(
     return await fetch_minds_models(url, bearer_token, force_refresh=refresh, tenant_key=org_id)
 
 
+# ── Model-value validation on write (ENG-1358) ───────────────────────
+#
+# WRITER INVENTORY — every path that can put a model id into the settings DB.
+# Recorded here because the ENG-597 lesson is that a check added to one writer is
+# defeated by the writer nobody enumerated; if you add a writer, it belongs on
+# this list and behind this gate.
+#
+#   GATED (both call `_reject_unservable_models` in api/v1/endpoints/settings.py):
+#     1. PUT /api/v1/settings/{key}   → SettingService.upsert_setting
+#     2. PUT /api/v1/settings/        → SettingService.save_all
+#   Every product surface that writes a model does so OVER HTTP, so it travels
+#   one of those two (see the scope limit on _reject_unservable_models — the
+#   in-process service methods are not gated):
+#     - the Settings model picker (cowork SettingsView.jsx) — values already come
+#       from the live catalog, so it was never the leak. Note it saves provider +
+#       credential + model in ONE bulk PUT, which is why the gate must resolve
+#       against pending state;
+#     - desktop onboarding's `syncModelsToDb` (cowork syncSettings.ts), which
+#       replays `ANTON_*_MODEL` lines from .env VERBATIM — unvalidated until now,
+#       and the most plausible origin of the ENG-1358 report;
+#     - mindsdb/cowork-enterprise `scripts/docker-entrypoint.py`
+#       (`sync_settings_when_healthy`) — the container's own Python writer, NOT
+#       the Electron `syncSettings.ts`, which ships unused there. It PUTs both
+#       models from `ANTON_*_MODEL` on first boot and swallows failures;
+#     - cowork_evals `src/eval_service/provisioning/cowork_admin.py`
+#       (`apply_runtime_settings`),
+#       which raises on any >=400 — every shipped run spec pins a `latest:` alias,
+#       hence the legacy-prefix allowance in model_value_rejection;
+#     - cowork-kinaxis-preview's divergent inline `syncOnboardingModels`;
+#     - anything hand-rolled (curl, scripts, a console surface).
+#
+#   NOT GATED, because they cannot carry a model key at all — the ENG-739
+#   carve-out keeps planning/coding/router models out of `SETTING_ENV_ALIASES`,
+#   so a bulk .env sync can never re-pin a picker choice:
+#     3. POST /api/v1/settings/raw    → SettingService.bulk_upsert
+#     4. cowork/migrations.py (first-boot .env→DB seed)
+#     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
+#   Two more write settings but only their own fixed key: channels.py
+#   (`channels_harness`) and the `minds_model_enabled` refresh in settings.py.
+#
+#   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
+#   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its
+#   equivalent bug).
+
+#: The settings whose VALUE names a model id. `UserSettings` types these as bare
+#: `str | None`, so the settings API validates the key and the type and nothing
+#: else — an id no provider can serve saves cleanly and only fails much later, at
+#: turn time. Router model is included: same field shape, same failure.
+MODEL_VALUE_SETTINGS = frozenset({"planning_model", "coding_model", "router_model"})
+
+
+#: Deprecated-but-live alias namespace. MindsHub aliases are bare (``sonnet``),
+#: but the gateway still RESOLVES a ``latest:`` prefix (app_settings.py:23), and
+#: minds-auth.ts deliberately preserves such a pin as a user choice. `/v1/models`
+#: is a listing, not the servable set, so a strict membership test would 400 an
+#: id prod serves today — including every shipped cowork_evals run spec.
+#: Stripping the prefix and re-testing keeps `latest:nonsense` rejected, which a
+#: bare "starts with latest:" allowance would not.
+_LEGACY_MODEL_PREFIX = "latest:"
+
+
+async def model_value_rejection(
+    settings: UserSettings,
+    key: str,
+    value: str,
+    *,
+    org_id: str | None = None,
+    bearer_token: str = "",
+) -> str | None:
+    """Why ``value`` is not a servable model for ``key``, or None to allow it.
+
+    ENG-1358: a model id that MindsHub cannot serve could be written into
+    `planning_model` / `coding_model` and nothing caught it — not on write, not
+    by the (deliberately model-blind) connection test, and at turn time only as
+    a 404. This is the write-time check.
+
+    ``settings`` must be the state the write PRODUCES (``load_pending``), not the
+    stored one — see that method.
+
+    In org (hosted) tenancy no MindsHub key is stored at all (a per-turn key is
+    minted, ``user_settings._has_key``), so the catalog comes from the operator
+    endpoint keyed by ``org_id`` + the caller's own bearer, exactly as
+    ``recommended_models`` does. Without those the org path has no evidence and
+    allows the write.
+
+    **Soft-fail is the whole contract.** This returns None — allow the write —
+    for every case except "we hold a real catalog and this id is definitively
+    not in it":
+
+    - not a model-valued setting, or an empty value (clearing the pin);
+    - the target provider isn't MindsHub (a BYOK/custom endpoint has its own
+      catalog, and Anthropic publishes no `/v1/models` at all);
+    - no credentials to fetch a catalog with — onboarding writes a model before
+      they exist, and blocking that would deadlock a fresh install;
+    - the catalog fetch failed, timed out, or came back empty.
+
+    An offline or degraded MindsHub must never stop someone changing settings,
+    so every failure mode above resolves to "allow". The fetch is the cached one
+    the picker already uses (TTL + negative TTL), so the common case costs no
+    network call, and a MindsHub outage costs one timeout, once.
+
+    Never put the API key — or the raw catalog — in the returned string: it is
+    surfaced to the client as a 400 body.
+    """
+    if key not in MODEL_VALUE_SETTINGS or not value or not value.strip():
+        return None
+
+    # Which provider will actually serve this model. Only MindsHub has a catalog
+    # we can check; anything else is the user's own endpoint.
+    provider_attr = {
+        "planning_model": "resolved_planning_provider",
+        "coding_model": "resolved_coding_provider",
+        "router_model": "resolved_router_provider",
+    }[key]
+    try:
+        from cowork.common.settings.user_settings import Provider
+
+        if getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
+            return None
+        stored_key = settings.minds_api_key
+        api_key = stored_key.get_secret_value() if stored_key is not None else ""
+    except Exception:
+        # Settings shapes vary across versions/scopes; a resolution failure is
+        # not grounds to block a write.
+        logger.debug("model validation: could not resolve provider for %s", key, exc_info=True)
+        return None
+
+    try:
+        if org_id and bearer_token:
+            listing = await fetch_org_model_catalog(
+                org_id=org_id, bearer_token=bearer_token
+            )
+        elif api_key and settings.minds_url:
+            listing = await fetch_minds_models(settings.minds_url, api_key)
+        else:
+            return None
+    except Exception:
+        # The fetchers swallow their own errors, but never let an unexpected one
+        # turn into a failed settings save.
+        logger.warning("model validation: catalog fetch failed for %s — allowing write", key)
+        return None
+
+    # ids is None on any failure and the list is empty for a gateway that serves
+    # no chat models; in both cases we hold no evidence, so we allow.
+    if not listing.ids:
+        return None
+    if value in listing.ids:
+        return None
+    if value.startswith(_LEGACY_MODEL_PREFIX) and (
+        value[len(_LEGACY_MODEL_PREFIX):] in listing.ids
+    ):
+        return None
+
+    # Definitive: a real catalog that does not contain this id.
+    known = ", ".join(sorted(listing.ids)[:5])
+    return (
+        f"'{value}' is not a model this provider offers. "
+        f"Pick one from the model list in Settings (for example: {known})."
+    )
+
+
 # ── Config readiness ─────────────────────────────────────────────────
 
 
@@ -574,16 +779,38 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
 
 
 async def validate_openai_compatible(api_key: str, base_url: str = "https://api.openai.com/v1",
-                                     model: str | None = None) -> dict[str, Any]:
+                                     model: str | None = None,
+                                     max_tokens: int | None = None) -> dict[str, Any]:
+    """Probe an openai-compatible chat endpoint.
+
+    `max_tokens` is opt-in, and deliberately not sent by default. It belongs on a
+    probe we know the shape of: MindsHub bills per model, so an uncapped probe
+    draws a full-length completion from the included allowance every time
+    onboarding runs. It does not belong on an arbitrary endpoint, because
+    `max_tokens` is not universal — OpenAI's reasoning models reject it and want
+    `max_completion_tokens`, and `o3`/`o4-mini` are both in RECOMMENDED_MODELS, so
+    sending it unconditionally would report a working key as invalid for exactly
+    the models this ticket is about. `validate_provider` passes it on the MindsHub
+    fallback only.
+
+    `follow_redirects` matches validate_minds and _chat_probe. Safe on a
+    user-supplied base URL because httpx strips `Authorization` on a redirect that
+    leaves the origin (`_redirect_headers`), so the key cannot follow a bounce to
+    another host.
+    """
     try:
         normalized = base_url.rstrip("/")
         chat_url = f"{normalized}/chat/completions" if re.search(r"/v\d", normalized) else f"{normalized}/v1/chat/completions"
         timeout = httpx.Timeout(15.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        payload: dict[str, Any] = {"model": model or "gpt-5.5",
+                                   "messages": [{"role": "user", "content": "ping"}]}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(
                 chat_url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model or "gpt-5.5", "messages": [{"role": "user", "content": "ping"}]},
+                json=payload,
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
@@ -609,7 +836,28 @@ async def validate_provider(provider: str, api_key: str,
     if provider == "minds":
         return await validate_minds(api_key, base_url or default_minds_api_host())
     if provider == "openai-compatible":
-        return await validate_openai_compatible(api_key, base_url or "https://api.openai.com/v1", model)
+        resolved_base = base_url or "https://api.openai.com/v1"
+        # A caller that omits the model against a MindsHub host gets the free
+        # probe model. Neither alternative works there: validate_openai_compatible's
+        # generic default is not a MindsHub alias so it 404s, and the recommended
+        # MindsHub model is paid so a wallet with no balance 402s. Both read back
+        # as an invalid key and send a new user to bring-your-own-key with a
+        # working key already saved. The connectivity probe above was fixed for
+        # this same reason; the validation path never got the same treatment.
+        #
+        # Only when the model is omitted. An explicit model is always validated
+        # as asked, or picking one model in the provider card would silently
+        # validate a different one and report a pass the user cannot trust.
+        if not model and is_minds_host(resolved_base):
+            model = MINDS_PROBE_MODEL
+            # Cap it the way validate_minds and _chat_probe do: this probe is
+            # MindsHub-bound and otherwise draws a full-length completion from the
+            # included allowance on every onboarding attempt. 20 rather than 1 for
+            # the reason _chat_probe documents. Only here, because max_tokens is
+            # not safe to send to an arbitrary endpoint (see
+            # validate_openai_compatible).
+            return await validate_openai_compatible(api_key, resolved_base, model, max_tokens=20)
+        return await validate_openai_compatible(api_key, resolved_base, model)
     return {"ok": False, "error": "Unknown provider"}
 
 

@@ -17,6 +17,7 @@ from anton.core.tools.skill_format import (
     parse_skill_dir,
     validate_name,
 )
+from cowork.common.paths import safe_join
 from cowork.common.settings import get_app_settings
 from cowork.db.scoped import TenantScope, scoped_storage_root
 from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
@@ -36,6 +37,17 @@ logger = logging.getLogger(__name__)
 # stops one bad skill from bloating the payload. The aggregate request size is
 # bounded downstream by the producer's _fit_request against the real stdin cap.
 _TURN_SKILL_FILE_MAX = 200_000
+
+# Packaged skills shipped with cowork. Bump BUILTIN_SKILLS_VERSION when the set
+# changes; seeding re-runs only when the stored version is lower, so a future
+# release can ship more skills without touching ones the user edited or deleted.
+# Desktop seeding (unkeyed store, DB sentinel) lives in migrations.py and shares
+# this version; org seeding (per-org store, file marker) is a SkillService method.
+BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills_builtin"
+BUILTIN_SKILLS_VERSION = 1
+#: Org-mode version marker, a file in the org's own store. See
+#: ``SkillService.ensure_builtin_skills`` for why this is not a Setting row.
+BUILTIN_SKILLS_MARKER = ".builtins_seeded"
 
 
 def _wire_len(text: str) -> int:
@@ -101,6 +113,15 @@ def build_turn_skills(scope: TenantScope | None, project_path: str | None = None
     ship another (e.g. disabled) skill's files. Every drop is logged.
     """
     svc = SkillService(scope)
+    # A fresh org's store starts empty and there is no org-creation hook, so the
+    # builtins are seeded on first read. This function has no production caller
+    # today — cloud turns read skills off the shared mount directly rather than
+    # through this payload (see `_stage_remote_workspace_files`, which is the
+    # actual seed trigger for a chat-first org) — but it seeds too, so it stays
+    # correct if a future caller reappears. No-op after the first run, and in
+    # local mode.
+    svc.ensure_builtin_skills()
+
     project_name = Path(project_path).name if project_path else None
 
     out: dict[str, dict] = {}
@@ -151,12 +172,13 @@ def _skill_from_dir(skill_dir: Path) -> Skill | None:
 class SkillService:
     """File-backed skill store using the agentskills.io ``SKILL.md`` format.
 
-    Org mode keys the store per org (``<root>/<org_id>``); local mode uses the
-    shared root unchanged."""
+    Org mode keys the store per org (``<shared_root>/<org_id>/skills``); local
+    mode uses the shared root unchanged."""
 
     def __init__(self, scope: TenantScope | None = None) -> None:
         settings = get_app_settings()
-        self.root = scoped_storage_root(Path(settings.skill.root_dir), scope)
+        self._scope = scope
+        self.root = scoped_storage_root(Path(settings.skill.root_dir), scope, store="skills")
         # Symlink distribution is desktop-only (skill_links resolves the unkeyed
         # root and scans all project dirs). Keyed on deployment mode, not just
         # scope — an unscoped service (migration, seeding) must not fan symlinks
@@ -457,3 +479,84 @@ class SkillService:
     def _rename_dir(self, old_slug: str, new_slug: str) -> None:
         self._ensure_root()
         os.replace(self._skill_dir(old_slug), self._skill_dir(new_slug))
+
+    # ── builtin seeding ──────────────────────────────────────────────────────
+    def _copy_builtin_skills(self) -> int:
+        """Copy packaged builtins into this store, skipping slugs it already has.
+
+        Returns how many were copied. Never overwrites, so a skill the user
+        edited or deleted stays as they left it.
+        """
+        if not BUILTIN_SKILLS_DIR.exists():
+            return 0
+        self._ensure_root()
+        copied = 0
+        for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
+            if not src.is_dir() or not (src / SKILL_FILE).exists():
+                continue
+            try:
+                dest = self._skill_dir(src.name)
+                if dest.exists():
+                    continue  # keep the user-editable copy untouched
+                # Copied file by file, each destination re-checked for containment
+                # with safe_join. copy2, not copyfile: copytree preserved mode, and a
+                # future builtin shipping an executable helper must keep its +x.
+                for child in sorted(p for p in src.rglob("*") if p.is_file()):
+                    target = safe_join(dest, *child.relative_to(src).parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(child, target)
+            except ValueError:
+                # Either the slug resolves outside the store, or safe_join rejected a
+                # destination. The agent writes into its own org's tree on shared
+                # storage, so it can plant a symlink under `dest` between the exists()
+                # check above and the write. Skip this builtin: propagating would 500
+                # every skills read and every turn for the org, which a tenant must
+                # not be able to do to itself.
+                logger.warning("Skipping builtin %r: it does not resolve inside %s",
+                               src.name, self.root, exc_info=True)
+                continue
+            copied += 1
+        return copied
+
+    def ensure_builtin_skills(self) -> bool:
+        """Seed this org's skill store with the packaged builtins, on first use.
+
+        Org mode only: desktop seeds once at boot via ``migrations.seed_builtin_skills``,
+        and its store is unkeyed so there is nothing per-tenant to do. There is no
+        org-creation hook to hang this on, so it runs lazily where skills are read.
+
+        The version marker is a FILE in the org's store rather than a Setting row,
+        so marker and skills share fate:
+        - a DB row would outlive a lost volume and leave the org permanently empty,
+          because seeding would believe it had already run
+        - a deliberate deletion of every skill is still respected, since the marker
+          survives it and blocks a re-seed
+
+        Returns True if seeding ran. Fail-soft: a filesystem problem leaves the org
+        unseeded and retries on the next read rather than failing the request.
+        """
+        if self._scope is None or not self._scope.org_mode:
+            return False
+        try:
+            marker = self.root / BUILTIN_SKILLS_MARKER
+            current = 0
+            if marker.is_file():
+                raw = marker.read_text(encoding="utf-8").strip()
+                current = int(raw) if raw.isdigit() else 0
+            if current >= BUILTIN_SKILLS_VERSION:
+                return False
+            if not BUILTIN_SKILLS_DIR.exists():
+                # Nothing to seed from — a packaging fault, not a seeded org. Writing
+                # the marker here would record "done" against an empty store, and the
+                # org would stay empty forever once the image is fixed.
+                logger.warning("Builtin skills are missing from this build (%s); not marking %s seeded",
+                               BUILTIN_SKILLS_DIR, self.root)
+                return False
+            copied = self._copy_builtin_skills()
+            marker.write_text(f"{BUILTIN_SKILLS_VERSION}\n", encoding="utf-8")
+        except OSError:
+            logger.warning("Could not seed builtin skills for org %s",
+                           getattr(self._scope, "org_id", None), exc_info=True)
+            return False
+        logger.info("Seeded %d builtin skill(s) into %s", copied, self.root)
+        return True

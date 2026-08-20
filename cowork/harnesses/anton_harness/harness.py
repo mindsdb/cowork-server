@@ -5,8 +5,9 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
@@ -18,6 +19,19 @@ from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
+
+
+def _vault_scratch_dir() -> Path:
+    """Where the temporary filtered data-vault directory is staged when a
+    turn disables one or more connections (see ``_build_chat_session``).
+
+    Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
+    EFS storage by pod_local_only (see its docstring), because this directory
+    carries no org_id segment: left on cowork_home() it would put every
+    organization's temporary vault contents under the same shared, readable
+    location.
+    """
+    return pod_local_only(cowork_home() / "tmp", "tmp")
 
 
 #: Settings copied from the Cowork DB onto anton's own settings object, in
@@ -76,6 +90,58 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
         setattr(anton_settings, attr, db_val)
         applied.append(attr)
     return applied
+
+
+def _apply_model_override(anton_settings, model: str | None) -> list[str]:
+    """A per-conversation model pick (the composer's dropdown) overrides
+    planning/coding/router for THIS call only — the account-wide
+    planning_model/coding_model/router_model settings applied by
+    ``_overlay_user_settings`` above are left untouched for every other
+    conversation. Provider is deliberately NOT overridden: the composer's
+    model list is itself scoped to whichever provider is already configured,
+    so the existing planning/coding/router providers stay correct for the
+    picked model.
+
+    No-op (returns []) when ``model`` is falsy, so the account-wide defaults
+    keep governing conversations with no per-conversation pick.
+
+    Same hasattr skew guard as ``_overlay_user_settings`` — see its docstring.
+    """
+    if not model:
+        return []
+    applied: list[str] = []
+    for attr in ("planning_model", "coding_model", "router_model"):
+        if hasattr(anton_settings, attr):
+            setattr(anton_settings, attr, model)
+            applied.append(attr)
+    return applied
+
+
+def _apply_workspace_env_if_safe(workspace) -> bool:
+    """Load `<project>/.anton/.env` into this process's environment, unless
+    org mode. Returns whether it applied.
+
+    `workspace` is an `anton.workspace.Workspace`; left unannotated since that
+    type is only ever imported locally in `_build_chat_session`, not at
+    module scope.
+
+    Extracted from `_build_chat_session` so the guard is testable without
+    constructing a full ChatSession.
+
+    `Workspace.apply_env_to_process` (anton's workspace.py) loads every key
+    from that file that isn't already set into THIS PROCESS's os.environ,
+    not a child process's, cowork-server's own, for the rest of its life. In
+    org mode that .env lives on shared EFS and any org's agent can write it;
+    a PYTHONPATH or LD_PRELOAD entry there would turn the next subprocess
+    this pod spawns into arbitrary code execution, and the mutation outlives
+    this turn, reaching every later request from every tenant this pod
+    serves.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return False
+    workspace.apply_env_to_process()
+    return True
+
 
 settings = AntonHarnessSettings()
 
@@ -361,7 +427,9 @@ class AntonHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        # Per-conversation model pick (the composer's dropdown) — overrides
+        # planning/coding/router for this call only; see _build_chat_session.
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Observability pass-through (see ResponsesRequest / HarnessProvider):
         # forwarded to Anton's per-turn TraceContext so they land on the
@@ -371,25 +439,51 @@ class AntonHarness:
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
     ) -> AsyncIterator[str]:
+        if get_app_settings().tenancy_mode == "org":
+            # Org-mode turns must run on the remote worker, never in this
+            # process: _build_chat_session below hands the LLM a `scratchpad`
+            # tool (anton/core/session.py) that spawns a per-named-venv
+            # subprocess and pipes agent-written Python into it, exactly the
+            # code execution this whole EFS-hardening task exists to keep out
+            # of cowork-server. The remote-turn producer normally routes
+            # streaming requests to the worker over Redis (see
+            # handlers/responses.py's _select_producer), but three callers
+            # reach this method directly, bypassing that gate entirely: the
+            # legacy non-streaming branch in handlers/responses.py.handle
+            # (ResponsesRequest.stream defaults to False, and any client can
+            # leave it unset), _produce/_run_turn's in-process fallback
+            # whenever COWORK_TURN_BACKEND isn't "remote", and the
+            # channel-ingress runtime (cowork/channels/runtime.py). This
+            # refusal is the single point that closes all three.
+            raise RuntimeError(
+                "Turns must run on the remote worker in this deployment; "
+                "in-process execution is disabled."
+            )
         temp_vault_dir: Path | None = None
         # Attribute + surface any artifact created during this turn. Anton runs
         # with its own session id and doesn't tag artifacts with the cowork
         # conversation_id, so we diff the project's artifacts dir around the run
         # (see services.task_objects.finalize_turn_artifacts).
         from cowork.services.task_objects import (
-            finalize_turn_artifacts,
             finalize_turn_skill_drafts,
-            snapshot_artifact_slugs,
+            index_turn_artifacts,
+            publish_and_card_turn_artifacts,
+            snapshot_artifact_state,
             snapshot_skill_drafts,
             snapshot_stray_skills,
         )
         project_path = Path(conversation.project.path)
         artifacts_base = project_path / ".anton" / "artifacts"
-        before_slugs = snapshot_artifact_slugs(artifacts_base)
+        # Names AND content mtimes: a name diff only reveals artifacts the turn
+        # CREATED, and the reconciler must also see the ones it EDITED.
+        before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
+        # Same reason: the card carries the project name to the client, and reading
+        # the relation after the turn could hit an expired session.
+        conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -399,12 +493,16 @@ class AntonHarness:
         before_strays = snapshot_stray_skills(project_path / "skills")
         cards: list[dict] = []
         skill_drafts: list[dict] = []
+        new_slugs: list[str] = []
+        touched_slugs: set[str] = set()
+        turn_scope = None
         turn_rows: list[dict] | None = None
         session = None
         seed_info: dict | None = None
         try:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
+                model=model,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
@@ -460,19 +558,61 @@ class AntonHarness:
                         "[anton_harness] failed to persist history compaction for conversation %s",
                         conv_id,
                     )
-            # One dir diff → index the new artifacts AND build their cards.
-            # Runs on every exit (success, error, cancel) so an artifact is
-            # always indexed; cards are yielded just below on normal completion.
-            cards = finalize_turn_artifacts(conversation, conv_id, conv_project_id, artifacts_base, before_slugs)
+            # One dir diff → index the new artifacts and work out what this turn
+            # touched. Runs on every exit (success, error, cancel), so an artifact
+            # is always indexed. Synchronous by design: an `await` here would be
+            # skipped on cancellation, so anything awaited would silently not run.
+            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
+                conversation, conv_id, conv_project_id, artifacts_base,
+                before_slugs, before_mtimes,
+            )
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,
             )
+        # Autopublish and cards live in the normal-completion path, matching what
+        # cards already did: on Stop/cancel neither runs, and the next turn in this
+        # project heals it (if there is one — an abandoned conversation never does).
+        # Inline, so the card carries its published URL rather than appearing
+        # without one and needing a later refresh.
+        cards = await publish_and_card_turn_artifacts(
+            artifacts_base,
+            new_slugs=new_slugs,
+            touched_slugs=touched_slugs,
+            scope=turn_scope,
+            project_id=str(conv_project_id) if conv_project_id else None,
+            project_name=conv_project_name,
+        )
         for card in cards:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
         if turn_rows:
             yield TurnHistory(turn_rows)
+
+    @staticmethod
+    def _stamp_message(m) -> dict:
+        """Embed a USER message's created_at as a `[YYYY-MM-DD HH:MM] ` prefix
+        so the agent always knows WHEN something was said (even resuming a
+        conversation days/weeks later). Absolute stamps are fixed per
+        message, so the history prefix stays byte-stable across turns
+        (cache-safe).
+
+        User-only, matching anton's own live-turn stamping
+        (core_agent/anton/core/session.py's _stamp_user_content). An earlier
+        version stamped assistant replies too, which meant Anton's own prior
+        replies came back to it prefixed with a timestamp in its replayed
+        history, and it would imitate that visible convention in new
+        output — most visible on short turns like "hi"/"who are you?" with
+        little else to anchor generation.
+
+        Extracted (not an inline closure) so this can be unit-tested
+        directly against fake messages, same reasoning as _seed_history.
+        """
+        om = m.to_openai_message().model_dump()
+        ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+        if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
+            om["content"] = f"[{ts}] {om['content']}"
+        return om
 
     @staticmethod
     def _seed_history(ordered_messages: list, history_summary: str | None, cutoff_id, stamp) -> tuple[list[dict], dict]:
@@ -581,7 +721,7 @@ class AntonHarness:
     async def _build_chat_session(
         self,
         conversation: Conversation,
-        # model: str,
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
     ):
@@ -592,7 +732,7 @@ class AntonHarness:
         from anton.core.memory.cortex import Cortex
         # from anton.core.memory.episodes import EpisodicMemory
         from anton.core.memory.hippocampus import Hippocampus
-        from anton.core.session import ChatSession, ChatSessionConfig, SystemPromptContext
+        from anton.core.session import ChatSessionConfig, SystemPromptContext
         # from anton.memory.history_store import HistoryStore
         from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
@@ -637,6 +777,12 @@ class AntonHarness:
         project_skills_dir.mkdir(parents=True, exist_ok=True)
         anton_settings.skills_root = project_skills_dir
 
+        # Host skills: read-only, they back
+        # the deferred tool bundles (e.g. `connect-datasource` unlocks the
+        # interactive connection tools). Path relative to this module.
+        host_skills_dir = Path(__file__).parent / "skills"
+        anton_settings.skills_extra_roots = [host_skills_dir]
+
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
 
@@ -668,9 +814,11 @@ class AntonHarness:
         if router_model is not None and hasattr(anton_settings, "router_model"):
             anton_settings.router_model = router_model
 
+        _apply_model_override(anton_settings, model)
+
         workspace = Workspace(base)
         workspace.initialize()
-        workspace.apply_env_to_process()
+        _apply_workspace_env_if_safe(workspace)
 
         anton_dir = base / ".anton"
 
@@ -702,7 +850,9 @@ class AntonHarness:
         # Per-(org, user) via the turn's ambient scope — the in-process harness
         # must read/write the same global-scope memory the /memory API serves.
         global_memory_dir = scoped_user_storage_root(
-            Path(get_app_settings().memory.root_dir).expanduser(), current_settings_scope()
+            Path(get_app_settings().memory.root_dir).expanduser(),
+            current_settings_scope(),
+            store="memory",
         )
         global_memory_dir.mkdir(parents=True, exist_ok=True)
         cortex = Cortex(
@@ -782,7 +932,7 @@ class AntonHarness:
         if LocalDataVault is not None:
             source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
             if disabled_connections:
-                _tmp_base = cowork_home() / "tmp"
+                _tmp_base = _vault_scratch_dir()
                 _tmp_base.mkdir(parents=True, exist_ok=True)
                 temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
@@ -887,17 +1037,6 @@ class AntonHarness:
         cells = extract_scratchpad_cells_from_message_events(ordered_messages)
         os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
-        # Per-message timestamps: embed each message's created_at so the agent
-        # always knows WHEN something was said (even resuming a conversation
-        # days/weeks later). Absolute stamps are fixed per message, so the
-        # history prefix stays byte-stable across turns (cache-safe).
-        def _stamped(m):
-            om = m.to_openai_message().model_dump()
-            ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
-            if ts and isinstance(om.get("content"), str) and om["content"]:
-                om["content"] = f"[{ts}] {om['content']}"
-            return om
-
         replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
         # Replay [summary] + [messages after cutoff] instead of full history
         # when a saved compaction is still valid (ENG-664). Disabled → plain
@@ -907,10 +1046,10 @@ class AntonHarness:
                 replayable,
                 conversation.history_summary,
                 conversation.history_summary_cutoff_id,
-                _stamped,
+                self._stamp_message,
             )
         else:
-            initial_history = [_stamped(m) for m in replayable]
+            initial_history = [self._stamp_message(m) for m in replayable]
             seed_info = None
 
         config = ChatSessionConfig(
@@ -956,7 +1095,14 @@ class AntonHarness:
             ],
             cells=cells
         )
-        return ChatSession(config), temp_vault_dir, seed_info
+        # Not `ChatSession(config)` directly: every construction of anton's
+        # executor inside cowork-server goes through build_chat_session, which
+        # refuses in org mode. stream_response already refuses earlier on this
+        # path, so this is the second of two gates rather than the only one,
+        # but keeping the construction uniform is what lets the static test
+        # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
+        # call under cowork/ as a new, unreviewed execution site.
+        return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
     def _build_llm_client():

@@ -1,9 +1,11 @@
 """Tier-aware model defaults (ENG-597).
 
-MindsHub gates models per plan tier: a free-tier key gets the paid models
-(sonnet/haiku — the canonical minds-cloud defaults) as ``enabled: false`` from
-``/v1/models``, so handing out the static default guarantees a 403 on the
-user's very first message. These tests pin the fix:
+MindsHub gates models per plan tier: a wallet that cannot pay gets the paid
+aliases as ``enabled: false`` from ``/v1/models``. Every minds-cloud role now
+defaults to the free model, so the canonical default is affordable by
+construction; the availability map matters for the cases where it is not,
+namely a stored pin and a default that the catalog has stopped serving. These
+tests pin the fix:
 
 - ``UserSettings`` resolves its planning/coding defaults against the cached
   availability map (``minds_model_enabled``), falling back to the first
@@ -28,8 +30,12 @@ from _fakes import FakeRequest
 
 # The gateway's free-tier registry shape: whole catalog listed, paid models
 # disabled, the baseline model first and enabled.
-FREE_MAP = json.dumps({"mindshub_air": True, "sonnet": False, "opus": False, "haiku": False})
-PAID_MAP = json.dumps({"mindshub_air": True, "sonnet": True, "opus": True, "haiku": True})
+FREE_MAP = json.dumps(
+    {"mindshub_air": True, "kimi": False, "gpt-codex": False, "haiku": False, "sonnet": False}
+)
+PAID_MAP = json.dumps(
+    {"mindshub_air": True, "kimi": True, "gpt-codex": True, "haiku": True, "sonnet": True}
+)
 
 
 def _minds(**kw) -> UserSettings:
@@ -43,23 +49,30 @@ def _minds(**kw) -> UserSettings:
 
 # ── Default resolution (apply_model_defaults) ─────────────────────────
 
-def test_free_tier_defaults_fall_back_to_first_enabled_model():
+def test_free_tier_map_keeps_the_canonical_defaults():
+    # The canonical default IS the free model, so nothing has to fall back.
     s = _minds(minds_model_enabled=FREE_MAP)
     assert s.planning_model == "mindshub_air"
     assert s.coding_model == "mindshub_air"
+    assert s.router_model == "mindshub_air"
 
 
-def test_paid_tier_keeps_canonical_defaults():
+def test_paid_tier_gets_the_same_defaults_as_everyone_else():
+    # A funded wallet does not change what an unset model resolves to. Paying
+    # for a better model is an explicit pick in the picker, not a default.
     s = _minds(minds_model_enabled=PAID_MAP)
-    assert s.planning_model == "sonnet"
-    assert s.coding_model == "haiku"
+    assert s.planning_model == "mindshub_air"
+    assert s.coding_model == "mindshub_air"
+    assert s.router_model == "mindshub_air"
 
 
 def test_absent_map_keeps_canonical_defaults():
-    # No cached map (fresh install, fetch never ran) → behavior unchanged.
+    # No cached map (fresh install, fetch never ran). This is the state a
+    # brand-new account is in on its first turn, and the reason the default
+    # itself has to be affordable rather than corrected by the map.
     s = _minds()
-    assert s.planning_model == "sonnet"
-    assert s.coding_model == "haiku"
+    assert s.planning_model == "mindshub_air"
+    assert s.coding_model == "mindshub_air"
 
 
 def test_explicit_model_choice_is_never_rewritten():
@@ -71,25 +84,34 @@ def test_explicit_model_choice_is_never_rewritten():
 
 def test_all_disabled_map_keeps_canonical_default():
     # Degenerate metadata (nothing enabled) must not invent a model.
-    s = _minds(minds_model_enabled=json.dumps({"sonnet": False, "haiku": False}))
-    assert s.planning_model == "sonnet"
+    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
+    assert s.planning_model == "mindshub_air"
 
 
-def test_default_missing_from_map_is_treated_as_available():
-    # Older gateway that doesn't list the default at all → default untouched.
-    s = _minds(minds_model_enabled=json.dumps({"mindshub_air": True}))
+def test_default_missing_from_nonempty_map_falls_back_to_first_enabled():
+    # A non-empty map always carries every alias the catalog currently
+    # serves, so missing means gone (renamed/retired), same as disabled.
+    # The map here deliberately omits the canonical default, which is the only
+    # way to reach this branch now that the default is the free model.
+    s = _minds(minds_model_enabled=json.dumps({"sonnet": True}))
     assert s.planning_model == "sonnet"
 
 
 def test_invalid_map_json_degrades_to_canonical_default():
     s = _minds(minds_model_enabled="not json")
-    assert s.planning_model == "sonnet"
+    assert s.planning_model == "mindshub_air"
 
 
 def test_map_order_decides_the_fallback():
     # First enabled entry in map order wins (mirrors /v1/models ordering).
-    s = _minds(minds_model_enabled=json.dumps({"sonnet": False, "kimi": True, "mindshub_air": True}))
-    assert s.planning_model == "kimi"
+    # The canonical default is disabled here, which is the drained-wallet
+    # state: even the free model stops being callable, so ordering decides.
+    s = _minds(
+        minds_model_enabled=json.dumps(
+            {"mindshub_air": False, "sonnet": True, "kimi": True}
+        )
+    )
+    assert s.planning_model == "sonnet"
 
 
 def test_direct_providers_ignore_the_minds_map():
@@ -120,21 +142,28 @@ def test_provider_switch_onto_minds_is_tier_aware():
 
 
 def test_provider_switch_onto_minds_paid_keeps_canonical():
+    # A funded wallet resolves to the same canonical default as an empty one:
+    # the switch picks the default, and the default is the free model.
     s = UserSettings(
         planning_provider=Provider.ANTHROPIC,
         minds_api_key=SecretStr("mdb_test"),
         minds_model_enabled=PAID_MAP,
     )
-    assert s.resolved_planning_model == "sonnet"
+    assert s.resolved_planning_model == "mindshub_air"
 
 
-# ── Wallet-aware aux resolution (ENG-1632) ────────────────────────────
+# ── Wallet-aware resolution, all three roles (ENG-1632, ENG-1632 follow-up) ──
 #
-# The aux roles (coding = completion verifier + scratchpad, router = gating +
-# summarization) are invisible in default mode: a wallet-locked pin there 402s
-# on every turn with no way for the user to see or fix it. Resolution — never
-# the stored row — falls back to a strictly-enabled model. Planning keeps the
-# ENG-598/ENG-1248 behavior: an explicit pick is never silently swapped.
+# Originally aux-roles-only (coding = completion verifier + scratchpad,
+# router = gating + summarization): they're invisible in default mode, so a
+# wallet-locked pin there 402s on every turn with no way for the user to see
+# or fix it. Resolution — never the stored row — falls back to a
+# strictly-enabled model. Planning was later given the same fallback: a
+# MindsHub sign-in rewrites planning_provider without touching the paired
+# planning_model, so a pre-sign-in BYOK pick survives and 404s every turn,
+# never reaching the picker's ENG-1248 "Needs credits" lane at all (that
+# lane is for a real, currently-unaffordable MindsHub model — a separate,
+# still-visible per-model tag, unaffected by this fallback).
 
 # Whole catalog listed, everything paid locked — the ENG-1632 cohort's map.
 LOCKED_MAP = json.dumps(
@@ -158,6 +187,31 @@ def test_locked_router_pin_resolves_to_first_enabled():
     assert s.resolved_router_model == "mindshub_air"
 
 
+def test_locked_planning_pin_resolves_to_first_enabled():
+    # ENG-1632 follow-up: planning now gets the same self-healing fallback
+    # as coding/router. MindsHub SSO sign-in rewrites planning_provider to
+    # minds_cloud without touching the paired planning_model, so a stale
+    # pick from a prior provider would otherwise 404 the gateway on every
+    # single turn — never reaching the picker's "Needs credits" lane at all.
+    s = _pinned(minds_model_enabled=LOCKED_MAP, planning_model="sonnet")
+    assert s.planning_model == "sonnet"  # the stored row is never rewritten
+    assert s.resolved_planning_model == "mindshub_air"
+
+
+def test_stale_byok_planning_pin_survives_a_provider_switch_onto_minds():
+    # The exact reported bug: signed out with e.g. Anthropic configured for
+    # planning (a real, non-MindsHub id), then MindsHub sign-in flips
+    # planning_provider to minds_cloud without touching planning_model. The
+    # foreign id can never appear in the MindsHub enabled map (it isn't a
+    # MindsHub model), so it must fall back rather than 404 every turn.
+    s = _pinned(
+        minds_model_enabled=json.dumps({"mindshub_air": True}),
+        planning_model="claude-opus-4-8",
+    )
+    assert s.planning_model == "claude-opus-4-8"
+    assert s.resolved_planning_model == "mindshub_air"
+
+
 def test_latest_prefixed_pin_is_probed_bare():
     # /v1/models ids are always bare; login-era pins carry "latest:". The map
     # probe must strip it or those pins silently escape the fallback.
@@ -167,11 +221,14 @@ def test_latest_prefixed_pin_is_probed_bare():
 
 def test_funded_pin_is_kept():
     # The map is written from the full catalogue, so a funded wallet lists the
-    # pinned ids as enabled — both stay put.
+    # pinned ids as enabled — all three roles stay put.
     funded = json.dumps(
         {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True}
     )
-    s = _pinned(minds_model_enabled=funded, coding_model="haiku", router_model="kimi")
+    s = _pinned(
+        minds_model_enabled=funded, planning_model="sonnet", coding_model="haiku", router_model="kimi",
+    )
+    assert s.resolved_planning_model == "sonnet"
     assert s.resolved_coding_model == "haiku"
     assert s.resolved_router_model == "kimi"
 
@@ -205,14 +262,6 @@ def test_pin_absent_from_nonempty_map_is_treated_as_not_served():
     assert s.resolved_coding_model == "mindshub_air"
 
 
-def test_planning_pin_is_never_silently_swapped():
-    # Deliberate asymmetry: planning is visible in the picker and has the
-    # pick-it-and-see-"Needs credits" lane (ENG-1248); only the invisible aux
-    # roles fall back.
-    s = _pinned(minds_model_enabled=LOCKED_MAP, planning_model="sonnet")
-    assert s.resolved_planning_model == "sonnet"
-
-
 def test_byok_aux_pin_ignores_the_minds_map():
     s = UserSettings(
         planning_provider=Provider.ANTHROPIC,
@@ -220,8 +269,13 @@ def test_byok_aux_pin_ignores_the_minds_map():
         anthropic_api_key=SecretStr("sk-ant-test"),
         minds_model_enabled=json.dumps({"claude-haiku-4-5-20251001": False}),
         coding_model="claude-haiku-4-5-20251001",
+        planning_model="claude-haiku-4-5-20251001",
     )
+    # wallet_aware only ever probes when the RESOLVED provider is
+    # minds-cloud — a real BYOK provider's pick is never second-guessed
+    # against MindsHub's map, planning included.
     assert s.resolved_coding_model == "claude-haiku-4-5-20251001"
+    assert s.resolved_planning_model == "claude-haiku-4-5-20251001"
 
 
 # ── Endpoint cache write (recommended-models) ─────────────────────────

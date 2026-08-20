@@ -71,7 +71,7 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, is_fullstack
     monkeypatch.setattr(publish, "resolve_artifact_path", lambda raw, allow_dir=True: target)
     monkeypatch.setattr(
         publish, "_resolve_publish_target",
-        lambda a: (target, target.parent, key, is_fullstack),
+        lambda a, container_dirs=None: (target, target.parent, key, is_fullstack),
     )
 
     captured: dict = {}
@@ -94,7 +94,7 @@ def test_publish_markdown_uploads_rendered_html_and_keys_registry_on_md(tmp_path
     md.write_text("# Title\n\nbody text")
 
     captured = _wire_publish(monkeypatch, tmp_path, md, "report.md")
-    result = publish.publish_artifact(str(md))
+    result = publish.publish_artifact(md, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
 
     # The publisher received a generated index.html, not the raw .md.
     assert captured["src"].name == "index.html"
@@ -114,11 +114,11 @@ def test_republish_markdown_reuses_report_id(tmp_path, monkeypatch):
     md.write_text("# Title\n\nv1")
 
     captured = _wire_publish(monkeypatch, tmp_path, md, "report.md")
-    publish.publish_artifact(str(md))          # first publish → records rid-1
+    publish.publish_artifact(md, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")          # first publish → records rid-1
     assert captured["report_id"] is None        # no prior id on first call
 
     md.write_text("# Title\n\nv2")
-    publish.publish_artifact(str(md))          # re-publish
+    publish.publish_artifact(md, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")          # re-publish
     assert captured["report_id"] == "rid-1"     # reused from .published.json
 
 
@@ -130,7 +130,7 @@ def test_publish_rejects_unsupported_extension(tmp_path, monkeypatch):
 
     _wire_publish(monkeypatch, tmp_path, txt, "notes.txt")
     with pytest.raises(ValueError, match="HTML and Markdown"):
-        publish.publish_artifact(str(txt))
+        publish.publish_artifact(txt, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
 
 
 def test_html_still_published_verbatim(tmp_path, monkeypatch):
@@ -140,7 +140,7 @@ def test_html_still_published_verbatim(tmp_path, monkeypatch):
     page.write_text("<h1>dash</h1>")
 
     captured = _wire_publish(monkeypatch, tmp_path, page, "dashboard.html")
-    publish.publish_artifact(str(page))
+    publish.publish_artifact(page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
 
     # HTML is handed to the publisher as-is (no markdown temp indirection).
     assert captured["src"] == page

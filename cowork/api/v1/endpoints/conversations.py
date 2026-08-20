@@ -34,6 +34,8 @@ def _serialize_conversation(c, updated_at=None):
         "project": c.project.name if c.project else None,
         "project_path": c.project.path if c.project else None,
         "project_id": c.project_id,
+        "harness": c.harness,
+        "model": c.model,
     })
 
 
@@ -68,7 +70,10 @@ def create_conversation(body: ConversationCreateRequest, scoped: ScopedSessionDe
         project_id = project.id
     try:
         conversation = svc.create_conversation(
-            topic=body.topic or body.title or "Untitled task", project_id=project_id
+            topic=body.topic or body.title or "Untitled task",
+            project_id=project_id,
+            harness=body.harness,
+            model=body.model,
         )
     except ValueError as e:
         # e.g. a project_id that isn't visible in this scope

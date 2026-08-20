@@ -117,11 +117,29 @@ POLICY_UNAVAILABLE_USER_MESSAGE = (
     "Billing is temporarily unavailable. Please retry in a moment."
 )
 
-# Curated copy + wire code for an unknown/removed model (gateway 404
-# `unknown_model`). Adding credits can't fix it, so the copy steers to Settings
-# rather than to the out-of-credits card.
-UNKNOWN_MODEL_CODE = "unknown_model"
-UNKNOWN_MODEL_USER_MESSAGE = (
+# Wire code + fallback copy for a model the provider can't serve — the gateway's
+# 404 (`X-MindsHub-Reason: unknown_model`, body `code: model_not_found`), a BYOK
+# OpenAI 404 carrying the same body code, or the equivalent from Gemini/Anthropic.
+# Adding credits can't fix it, so this steers to Settings rather than to the
+# out-of-credits card.
+#
+# The code mirrors the OpenAI-dialect `error.code` that every one of those
+# providers emits (and that anton's `classify_404` keys on), so one name travels
+# the whole path — gateway → anton → here → the renderer's card. It renames the
+# server-invented `unknown_model` wire code (ENG-1282 gave that one a card, so
+# the rename moves in lockstep with ChatView.jsx and the inventory test below).
+#
+# The rename is not cosmetic: under the old name this code could only ever be
+# produced by the reason-header branch, whose copy is generic. anton's typed
+# ModelUnavailableError — the one that NAMES the model — carries code
+# `model_not_found`, so it could never match `MODEL_UNAVAILABLE_CODES` and the
+# model id never reached the card. One shared name is what closes ENG-1358.
+#
+# The copy is only a fallback. anton's ModelUnavailableError carries curated text
+# that NAMES the rejected model, and `friendly_turn_error` prefers it — this is
+# for a version-skewed anton that sends the reason header without the typed error.
+MODEL_NOT_FOUND_CODE = "model_not_found"
+MODEL_NOT_FOUND_USER_MESSAGE = (
     "That model isn't available. Switch to another model in Settings."
 )
 
@@ -150,7 +168,16 @@ AUTH_ERROR_CODE = "provider_auth"
 # nothing is lost in translation, and the renderer keys its card on them.
 MODEL_ACCESS_DENIED_CODE = "model_access_denied"
 MODEL_DISABLED_CODE = "model_disabled"
-_MODEL_UNAVAILABLE_CODES = frozenset({MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE})
+# Every code that means "the turn died on the MODEL, and picking another one is
+# the remedy" — the two legacy 403s plus the live 404. They share a renderer
+# card; only its copy differs. model_not_found is the one that still occurs.
+# Public: responses.py branches on this to decide whether the failure frame
+# carries `model`. Shared rather than re-listed there, so the two can't drift —
+# and so a merge conflict in that elif-chain has no tuple members to silently
+# drop (the ENG-1358 re-review's rebase hazard).
+MODEL_UNAVAILABLE_CODES = frozenset(
+    {MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE, MODEL_NOT_FOUND_CODE}
+)
 
 # Fallback copy if the exception somehow carries no usable message — anton
 # normally supplies curated, user-facing copy which we pass through verbatim.
@@ -268,7 +295,7 @@ def model_unavailable_info(exc: Exception) -> tuple[str, str] | None:
     except Exception:
         pass
     code = getattr(exc, "code", None)
-    if isinstance(code, str) and code in _MODEL_UNAVAILABLE_CODES:
+    if isinstance(code, str) and code in MODEL_UNAVAILABLE_CODES:
         return code, str(getattr(exc, "model", "") or "")
     return None
 
@@ -613,6 +640,37 @@ def allowance_reset_at(exc: BaseException) -> str | None:
     return None
 
 
+def _origin_is_known_third_party(host: str | None) -> bool:
+    """Whether the failing request provably went somewhere that is NOT our gateway.
+
+    Deliberately three-valued, unlike ``_from_minds_gateway``: this answers
+    "do we KNOW it was someone else", so an unknown origin (``host is None``)
+    is not treated as third-party.
+
+    That distinction is the whole reason the header carrier could be gated at
+    all. A flat ``not _from_minds_gateway(host)`` also rejects the
+    unknown-origin case, which breaks
+    ``test_reason_header_maps_even_without_request_url`` — a deliberate test
+    asserting the header still maps when the response carries no URL.
+
+    Leaving unknown-origin trusted is safe, and checked (ENG-1686). A real SDK
+    error always carries its request, so ``host`` resolves for every genuine
+    HTTP response. There are exactly two routes to ``host is None``, and a
+    remote server can choose neither:
+
+    1. a response with no request attached — its ``.url`` raises
+       ``RuntimeError``, which is our own client plumbing, not the peer's;
+    2. an exception carrying ``headers`` with **no response object at all**
+       (``_http_error_context`` falls back to ``getattr(cur, "headers", None)``,
+       and ``_response_url_host`` names this case too). Nothing in anton or
+       cowork-server raises such an exception today, so the lane is unreachable
+       rather than merely unlikely — but a future client that attaches headers
+       directly to an error would reopen it silently, which is why it is named
+       here rather than left to be rediscovered.
+    """
+    return host is not None and not _from_minds_gateway(host)
+
+
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
@@ -636,7 +694,7 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     if reason == _REASON_POLICY_UNAVAILABLE:
         return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
     if reason == _REASON_UNKNOWN_MODEL:
-        return UNKNOWN_MODEL_CODE, UNKNOWN_MODEL_USER_MESSAGE
+        return MODEL_NOT_FOUND_CODE, MODEL_NOT_FOUND_USER_MESSAGE
     return None
 
 
@@ -656,10 +714,34 @@ def friendly_turn_error(
 
     # The gateway's explicit reason header wins — it names the billing decision
     # exactly, so we never have to guess from a status code or message text.
-    # Unconditional on origin: only the gateway sets X-MindsHub-Reason.
-    if reason is not None:
+    #
+    # Origin-checked (ENG-1686). This used to read "unconditional on origin:
+    # only the gateway sets X-MindsHub-Reason", which is an assumption about
+    # well-behaved upstreams rather than something enforced: on a BYOK
+    # OPENAI_COMPATIBLE provider the response is entirely third-party
+    # controlled, so any endpoint could set the header and choose which billing
+    # card the user sees — including the out-of-credits CTA for a wallet that
+    # is fine. The body-`code` twin below is gated for exactly this reason and
+    # the argument is carrier-agnostic.
+    #
+    # Skipped rather than returned-None on purpose: a spoofed header should
+    # lose its authority, not suppress the rest of the ladder.
+    if reason is not None and not _origin_is_known_third_party(host):
         mapped = _map_gateway_reason(reason)
         if mapped is not None:
+            # ...except for unknown_model, where anton's typed error is strictly
+            # better than the header: `classify_404` already resolved this to a
+            # ModelUnavailableError whose copy NAMES the rejected model ("The
+            # model 'deepseek-v4-flash' isn't available: …"), while the header
+            # only says *that* a model was rejected. Returning the header copy
+            # here threw the model id away and left the user with nothing to act
+            # on — ENG-1358. The billing reasons have no such typed counterpart,
+            # so they still short-circuit.
+            if mapped[0] == MODEL_NOT_FOUND_CODE:
+                if model_info is _UNSET:
+                    model_info = model_unavailable_info(exc)
+                if model_info is not None:
+                    return MODEL_NOT_FOUND_CODE, str(exc) or mapped[1]
             return mapped
 
     # Same decision from the body's `code` when the header didn't survive the
@@ -669,6 +751,11 @@ def friendly_turn_error(
     # that rule cannot tell the velocity 429 from the allowance 429, and
     # guessing "out of credits" for a rate limit is the ENG-1537 defect.
     denial_code = _gateway_denial_code(exc)
+    # NOTE: strict here (provably-gateway), unlike the header above. The header
+    # needs the looser three-valued check because an existing test requires an
+    # unknown origin to still map; the body carrier has no such constraint, so
+    # it stays as tight as it can be. Don't "unify" these without re-reading
+    # test_reason_header_maps_even_without_request_url.
     if denial_code is not None and _from_minds_gateway(host):
         mapped = _map_gateway_reason(denial_code)
         if mapped is not None:
@@ -762,7 +849,24 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     if type_name == "ProviderOverloadedError":
         return PROVIDER_OVERLOADED_CODE, message or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
     if type_name == "ModelUnavailableError":
-        return MODEL_ACCESS_DENIED_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
+        # _scrub sends "Type: message" — the structured `code` doesn't survive,
+        # so 403-gate and 404-not-found are indistinguishable here. Default to
+        # the CONSERVATIVE one: model_not_found steers to Settings and promises
+        # nothing, while model_access_denied renders a "Top up balance" button
+        # that is simply wrong for a model that doesn't exist — and since the
+        # current gateway no longer emits the 403 codes at all, not-found is
+        # also the likelier case.
+        #
+        # The message is returned for the SSE `error` field and the DB sidecar,
+        # not for the card: both model cards render their own literal copy and
+        # never read `m.content` (ChatView.jsx). So the choice of code decides
+        # everything the user sees, which is why it errs conservative.
+        #
+        # Known gap, not fixed here: this path also can't supply `model` —
+        # producer.py emits response_failed_sse without it, so a remote/hosted
+        # turn still shows the UNNAMED copy. Naming it needs anton to carry the
+        # code+model through _scrub's wire format (tracked separately).
+        return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if type_name == "ConnectionError" and "api key" in message.lower():
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE

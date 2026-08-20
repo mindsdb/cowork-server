@@ -12,7 +12,6 @@ from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_valid
 from cowork.common.settings.app_settings import (
     CODING_MODEL_DEFAULTS,
     MINDS_FREE_MODEL,
-    role_defaults,
     PLANNING_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
@@ -119,23 +118,26 @@ def _enabled_aware_default(
 ) -> str | None:
     """The provider's canonical default model, adjusted for availability.
 
-    MindsHub marks a model the org's wallet can't currently pay for (or whose
-    free allowance is exhausted) as ``enabled: false`` from ``/v1/models``, so
-    blindly handing out the canonical default could be denied every turn. When
-    the cached availability map (``minds_model_enabled``) marks the default as
-    disabled, fall back to the first enabled model in the map — the map
-    preserves the gateway's ``/v1/models`` ordering, which lists the
-    free/baseline model first. Applies only to minds-cloud: direct (BYOK)
-    providers have no such availability map.
+    Applies only to minds-cloud; direct (BYOK) providers have no such
+    availability map. A non-empty map always carries an explicit flag for
+    every alias the catalog serves, so a default that's locked OR simply
+    missing from it falls back to the first enabled model — missing means
+    gone (renamed/retired), not degraded data. An empty/absent map (no tier
+    data at all) leaves the default untouched.
 
-    Deliberately conservative: an absent/empty map, a default missing from the
-    map, or a map with nothing enabled all leave the canonical default
-    untouched — degraded metadata must never change behavior.
+    Org mode requires the same positive evidence, but falls back to
+    MINDS_FREE_MODEL instead, so a credit-less org isn't charged.
     """
     default = defaults.get(provider_value)
-    if provider_value != Provider.MINDS_CLOUD.value or not enabled_map:
+    if provider_value != Provider.MINDS_CLOUD.value:
         return default
-    if default is None or enabled_map.get(default, True):
+    if get_app_settings().tenancy_mode == "org":
+        if default is not None and enabled_map.get(default) is True:
+            return default
+        return MINDS_FREE_MODEL
+    if not enabled_map:
+        return default
+    if default is None or enabled_map.get(default) is True:
         return default
     for model_id, enabled in enabled_map.items():
         if enabled:
@@ -168,24 +170,33 @@ def _resolved_model(
         so config_status's model gate reports "select a model" rather than
         silently running a wrong model.
 
-    ``wallet_aware`` (ENG-1632) — the auxiliary roles (coding, router) only.
-    A stored minds-cloud model the availability map marks ``enabled: false``
-    (wallet can't pay / allowance spent) is guaranteed to be denied on every
-    call, and the aux roles are invisible in default mode: the user cannot see
-    or fix the pin, so the verifier 402s every turn and surfaces as a spurious
-    "internal error". When a strictly-enabled model exists in the map, resolve
-    to it instead of the doomed stored value; when nothing is enabled (fully
-    drained account) or the map is absent/degraded, keep the stored value —
-    degraded metadata must never change behavior, and anton's verifier handles
-    the denial quietly. The stored row is never rewritten, so a topped-up
-    wallet (``enabled: true`` on the next settings load) restores the stored
-    model automatically.
+    ``wallet_aware`` (ENG-1632, now all three roles). A stored minds-cloud
+    model the availability map marks ``enabled: false`` is guaranteed to be
+    denied on every call — either because the wallet can't pay / allowance is
+    spent, OR because the id isn't a MindsHub model at all (absent from a
+    non-empty map counts as unavailable; see the probe note below). When a
+    strictly-enabled model exists in the map, resolve to it instead of the
+    doomed stored value; when nothing is enabled (fully drained account) or
+    the map is absent/degraded, keep the stored value — degraded metadata
+    must never change behavior. The stored row is never rewritten, so a
+    topped-up wallet (``enabled: true`` on the next settings load) restores
+    the stored model automatically.
 
-    This is a deliberate asymmetry with planning: "an explicit choice is never
-    rewritten" still holds for the planning role, which is visible in the
-    picker and has the pick-it-and-see-"Needs credits" lane (ENG-1248). The
-    aux roles get the silent fallback precisely because no such lane exists
-    for them.
+    Originally auxiliary-roles-only (coding, router): they're invisible in
+    default mode, so a stuck pin 402s every turn with no way for the user to
+    see or fix it, surfacing as a spurious "internal error". Planning was
+    deliberately exempted at the time — "an explicit choice is never
+    rewritten" holds because planning is visible in the picker and has the
+    pick-it-and-see-"Needs credits" lane (ENG-1248) — but that reasoning
+    assumed the stored id was chosen for the CURRENT provider. MindsHub SSO
+    sign-in breaks that assumption: it rewrites planning_provider to
+    minds_cloud without touching the paired planning_model, so a pre-sign-in
+    BYOK pick (e.g. an Anthropic id) survives untouched and 404s the gateway
+    on every turn — never reaching the picker's "Needs credits" lane at all,
+    since that lane is for a real MindsHub model the wallet can't currently
+    afford, not a foreign id. Planning now gets the same fallback; the
+    "Needs credits" lane is unaffected — it's a separate, still-visible
+    per-model tag (``modelEnabled``) on the picker, not this resolution path.
     """
     if resolved_provider == preferred_provider and user_model:
         enabled = enabled_map or {}
@@ -321,6 +332,7 @@ SETTING_ENV_ALIASES: dict[str, str] = {
     "proactive_dashboards": "ANTON_PROACTIVE_DASHBOARDS",
     "act_first": "ANTON_ACT_FIRST",
     "publish_url": "ANTON_PUBLISH_URL",
+    "artifact_autopublish_enabled": "ANTON_ARTIFACT_AUTOPUBLISH",
 }
 
 # Inverse view (ANTON_* .env var → DB setting key) for .env-first callers, i.e.
@@ -349,6 +361,17 @@ class UserSettings(Settings):
     # The recommended-model catalog and per-provider model defaults are
     # global, application-level config and live in app_settings
     # (RECOMMENDED_MODELS / RECOMMENDED_PAIR / *_MODEL_DEFAULTS).
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        # Only local reads process env; a shared server's injected provider
+        # secrets would otherwise leak into every tenant's settings. Fail closed:
+        # anything not local is DB-only.
+        if get_app_settings().tenancy_mode == "local":
+            return (init_settings, env_settings, dotenv_settings, file_secret_settings)
+        return (init_settings,)
 
     # ── Provider / model settings ──
 
@@ -437,7 +460,8 @@ class UserSettings(Settings):
         description=(
             "The cheap model used for respond-vs-delegate routing and history "
             "summarization. Defaults to the recommended model for the selected "
-            "provider (MindsHub → kimi; other providers → their smallest model)."
+            "provider (MindsHub → MindsHub Air; other providers → their smallest "
+            "model)."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -503,6 +527,11 @@ class UserSettings(Settings):
         title="Show 8-Bit Toggle",
         description="Show the floating 8-bit style toggle button.",
     )
+    show_coding_mode_toggle: bool = Field(
+        default=True,
+        title="Show Coding Mode Toggle",
+        description="Show the floating coding-mode toggle button.",
+    )
     accent_variant: str = Field(
         default="aqua",
         title="Accent Variant",
@@ -512,6 +541,33 @@ class UserSettings(Settings):
         default=True,
         title="Memory Enabled",
         description="Enable conversation memory.",
+    )
+    coding_mode_enabled: bool = Field(
+        default=False,
+        title="Enable Coding Mode",
+        description=(
+            "Show a per-task harness/model picker and allow launching tasks in "
+            "an external coding CLI (e.g. Claude Code) instead of the in-app chat."
+        ),
+    )
+    # Which harnesses appear as options in the per-task harness picker
+    # (Coding Mode's composer pill). All default true — an account that never
+    # visits this setting sees every harness it's otherwise eligible for.
+    # Anton has no enable flag: it's the default agent and always offered —
+    # a picker with every harness disabled would have nothing to run.
+    # `claude-code` isn't a cowork.harnesses.base-registered harness (it runs
+    # the `claude` CLI entirely client-side in the Electron app, never
+    # through this server), so it has no `available_harness_ids()` entry to
+    # validate against — this flag is the only server-side notion of it.
+    harness_hermes_enabled: bool = Field(
+        default=True,
+        title="Enable Hermes in the Harness Picker",
+        description="Offer Hermes as a per-task harness choice in Coding Mode.",
+    )
+    harness_claude_code_enabled: bool = Field(
+        default=True,
+        title="Enable Claude Code in the Harness Picker",
+        description="Offer Claude Code as a per-task harness choice in Coding Mode.",
     )
     memory_mode: str = Field(
         default="autopilot",
@@ -630,6 +686,35 @@ class UserSettings(Settings):
         title="Publish URL",
         description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
     )
+    artifact_autopublish_enabled: Annotated[bool, ORG] = Field(
+        # On by default, deliberately. It was drafted as off because publishing a
+        # fullstack artifact resolved datasource secrets from a process-global
+        # vault, so one org's artifact could ship another's credentials. That is
+        # closed: the vault is org-keyed now (`vault_for_scope` ->
+        # `scoped_storage_root(..., store="data-vault")`), and a missing scope
+        # RAISES on an org deployment rather than falling back to the shared root,
+        # so the leak cannot reappear silently.
+        #
+        # Inert outside org mode: `autopublish_project_artifacts` returns on the
+        # scope guard before it ever reads this, so a desktop install is
+        # unaffected by the default either way.
+        default=True,
+        title="Auto-publish artifacts",
+        description=(
+            "In org deployments, publish every artifact the agent creates or changes "
+            "to the viewer automatically, restricted to the author's organization. "
+            "On by default. ORG-scoped, so an organization can still turn it off "
+            "for itself. It uploads user content without an explicit user action, "
+            "which is the reason to keep the per-org switch. The env override that "
+            "actually "
+            "bypasses that is ARTIFACT_AUTOPUBLISH_ENABLED, the field name itself: "
+            "UserSettings is a pydantic-settings model, so any field with no DB row "
+            "falls back to the environment, process-global, for every tenant of the "
+            "deployment. (The ANTON_ARTIFACT_AUTOPUBLISH alias below is NOT that "
+            "override — SETTING_ENV_ALIASES only drives the .env→DB seed, which org "
+            "deployments skip entirely; see dev_setup._migrate_env_to_db_if_local.)"
+        ),
+    )
     openai_base_url: Annotated[str, ORG] = Field(
         default="",
         title="OpenAI Base URL",
@@ -742,15 +827,15 @@ class UserSettings(Settings):
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
-                self.planning_provider.value, role_defaults(PLANNING_MODEL_DEFAULTS), enabled_map
+                self.planning_provider.value, PLANNING_MODEL_DEFAULTS, enabled_map
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
-                self.coding_provider.value, role_defaults(CODING_MODEL_DEFAULTS), enabled_map
+                self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, role_defaults(ROUTER_MODEL_DEFAULTS), enabled_map
+                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
             )
         return self
 
@@ -803,12 +888,27 @@ class UserSettings(Settings):
 
     @property
     def resolved_planning_model(self) -> str | None:
+        # wallet_aware (ENG-1632 follow-up): the docstring on _resolved_model
+        # originally kept planning exempt from this because a bad pick is
+        # "visible in the picker" — the user can see it and fix it. That
+        # holds for a genuinely unaffordable MindsHub model (the ENG-1248
+        # "Needs credits" lane still surfaces those separately, unaffected by
+        # this flag). It does NOT hold for a model that isn't a MindsHub
+        # model at all: MindsHub SSO sign-in rewrites planning_provider to
+        # minds_cloud without touching the paired planning_model, so a BYOK
+        # pick from before sign-in (e.g. an Anthropic id) survives untouched
+        # and gets sent straight to the gateway on the next turn, which
+        # 404s ("That model isn't available") on every single message
+        # instead of surfacing anywhere the user would see it first. Falling
+        # back to an actually-available MindsHub model — same self-healing
+        # coding/router already get — beats a hard failure on every turn.
         return _resolved_model(
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
-            role_defaults(PLANNING_MODEL_DEFAULTS),
+            PLANNING_MODEL_DEFAULTS,
             self._minds_enabled_map(),
+            wallet_aware=True,
         )
 
     @property
@@ -820,7 +920,7 @@ class UserSettings(Settings):
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
-            role_defaults(CODING_MODEL_DEFAULTS),
+            CODING_MODEL_DEFAULTS,
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -838,7 +938,7 @@ class UserSettings(Settings):
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
-            role_defaults(ROUTER_MODEL_DEFAULTS),
+            ROUTER_MODEL_DEFAULTS,
             self._minds_enabled_map(),
             wallet_aware=True,
         )
