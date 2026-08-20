@@ -699,3 +699,38 @@ def test_reap_orphaned_runs_leaves_finished_runs_untouched():
     session.refresh(run)
     assert run.status == RunStatus.success
     assert run.error is None
+
+
+def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
+    """Staging audit P0: schedules are personal (created_by) but CRUD/list
+    filtered by org only, so coworkers saw/paused/deleted each other's."""
+    import pytest
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine, select
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.models.project import Project
+    from cowork.services.schedules import ScheduleService
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "p"))
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+    ORG = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(eng)
+    with Session(eng) as s:
+        s.add(Project(name="proj", path="/tmp/p", org_id=ORG)); s.commit()
+        pid = s.exec(select(Project).where(Project.name == "proj")).one().id
+
+    def svc(user):
+        return ScheduleService(ScopedSession(Session(eng), TenantScope(org_mode=True, org_id=ORG, user_id=user)))
+
+    when = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    a = svc("alice").create_schedule(title="a", prompt="secret", cadence="daily",
+                                     next_run_at=when, model="m", project_id=pid)
+    assert a.id not in {x.id for x in svc("bob").list_schedules()}
+    with pytest.raises(ValueError):
+        svc("bob").get_schedule(a.id)
+    assert svc("bob").delete_schedule(a.id) is False
+    assert svc("alice").get_schedule(a.id).id == a.id
+    get_app_settings.cache_clear()
