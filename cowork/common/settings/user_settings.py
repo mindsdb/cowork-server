@@ -459,7 +459,8 @@ class UserSettings(Settings):
         description=(
             "The cheap model used for respond-vs-delegate routing and history "
             "summarization. Defaults to the recommended model for the selected "
-            "provider (MindsHub → kimi; other providers → their smallest model)."
+            "provider (MindsHub → MindsHub Air; other providers → their smallest "
+            "model)."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(

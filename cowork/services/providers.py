@@ -40,6 +40,50 @@ def minds_chat_base_url(minds_url: str) -> str:
     return f"{base}/api/v1" if "mdb.ai" in base else f"{base}/v1"
 
 
+def is_minds_host(url: str | None) -> bool:
+    """True when `url` points at a MindsHub inference host.
+
+    Used to decide whether a probe that omitted its model should fall back to
+    MINDS_PROBE_MODEL rather than to a generic OpenAI default that MindsHub does
+    not serve.
+
+    Compares the parsed hostname, never a substring of the whole URL: a
+    substring test matches `mindshub.ai.example.test` and a `?next=` parameter
+    carrying our host, and the base URL here is partly user-supplied (the
+    openai-compatible card's own field). Covers the prod host, the per-env
+    `api.<env>.mindshub.ai` / `api-<ns>.dev.mindshub.ai` hosts, and the legacy
+    `mdb.ai` host.
+
+    A self-hosted gateway on some other hostname does not match, the same
+    limitation `build_llm_client` documents where it states the MindsHub flavor
+    outright instead of deriving it from the URL. The consequence here is only
+    that such a caller keeps today's generic default.
+
+    Matching the `mdb.ai` host chooses the model, not the path. The
+    openai-compatible probe appends `/v1` generically and never applies
+    minds_chat_base_url's `mdb.ai` -> `/api/v1` rule, so a bare `mdb.ai` base
+    with no version segment is still probed at a path that host does not serve.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    # A bare `api.mindshub.ai/v1` has no scheme, so urlparse would read the whole
+    # thing as a path and find no hostname. Prefixing `//` makes it a netloc.
+    #
+    # The try is load-bearing, not defensive: `.hostname` raises ValueError on an
+    # unbalanced `[` or `]`, this runs in validate_provider OUTSIDE
+    # validate_openai_compatible's except, and base_url is free text off the
+    # provider card. Without it, `baseUrl: "["` leaves the service layer and the
+    # endpoint answers 500 where it used to answer ok:false. The TypeScript copy
+    # guards the same case with try/catch around `new URL`.
+    try:
+        parsed = urlparse(raw if "//" in raw else f"//{raw}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
+
+
 # Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
 # publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
 # can't map to a non-prod MindsHub env, falls back here.
@@ -735,16 +779,38 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
 
 
 async def validate_openai_compatible(api_key: str, base_url: str = "https://api.openai.com/v1",
-                                     model: str | None = None) -> dict[str, Any]:
+                                     model: str | None = None,
+                                     max_tokens: int | None = None) -> dict[str, Any]:
+    """Probe an openai-compatible chat endpoint.
+
+    `max_tokens` is opt-in, and deliberately not sent by default. It belongs on a
+    probe we know the shape of: MindsHub bills per model, so an uncapped probe
+    draws a full-length completion from the included allowance every time
+    onboarding runs. It does not belong on an arbitrary endpoint, because
+    `max_tokens` is not universal — OpenAI's reasoning models reject it and want
+    `max_completion_tokens`, and `o3`/`o4-mini` are both in RECOMMENDED_MODELS, so
+    sending it unconditionally would report a working key as invalid for exactly
+    the models this ticket is about. `validate_provider` passes it on the MindsHub
+    fallback only.
+
+    `follow_redirects` matches validate_minds and _chat_probe. Safe on a
+    user-supplied base URL because httpx strips `Authorization` on a redirect that
+    leaves the origin (`_redirect_headers`), so the key cannot follow a bounce to
+    another host.
+    """
     try:
         normalized = base_url.rstrip("/")
         chat_url = f"{normalized}/chat/completions" if re.search(r"/v\d", normalized) else f"{normalized}/v1/chat/completions"
         timeout = httpx.Timeout(15.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        payload: dict[str, Any] = {"model": model or "gpt-5.5",
+                                   "messages": [{"role": "user", "content": "ping"}]}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(
                 chat_url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model or "gpt-5.5", "messages": [{"role": "user", "content": "ping"}]},
+                json=payload,
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
@@ -770,7 +836,28 @@ async def validate_provider(provider: str, api_key: str,
     if provider == "minds":
         return await validate_minds(api_key, base_url or default_minds_api_host())
     if provider == "openai-compatible":
-        return await validate_openai_compatible(api_key, base_url or "https://api.openai.com/v1", model)
+        resolved_base = base_url or "https://api.openai.com/v1"
+        # A caller that omits the model against a MindsHub host gets the free
+        # probe model. Neither alternative works there: validate_openai_compatible's
+        # generic default is not a MindsHub alias so it 404s, and the recommended
+        # MindsHub model is paid so a wallet with no balance 402s. Both read back
+        # as an invalid key and send a new user to bring-your-own-key with a
+        # working key already saved. The connectivity probe above was fixed for
+        # this same reason; the validation path never got the same treatment.
+        #
+        # Only when the model is omitted. An explicit model is always validated
+        # as asked, or picking one model in the provider card would silently
+        # validate a different one and report a pass the user cannot trust.
+        if not model and is_minds_host(resolved_base):
+            model = MINDS_PROBE_MODEL
+            # Cap it the way validate_minds and _chat_probe do: this probe is
+            # MindsHub-bound and otherwise draws a full-length completion from the
+            # included allowance on every onboarding attempt. 20 rather than 1 for
+            # the reason _chat_probe documents. Only here, because max_tokens is
+            # not safe to send to an arbitrary endpoint (see
+            # validate_openai_compatible).
+            return await validate_openai_compatible(api_key, resolved_base, model, max_tokens=20)
+        return await validate_openai_compatible(api_key, resolved_base, model)
     return {"ok": False, "error": "Unknown provider"}
 
 
