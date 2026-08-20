@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import shutil
 from pathlib import Path
 
 from cowork.common.settings.app_settings import default_minds_api_host
@@ -31,7 +30,7 @@ from cowork.common.settings.app_settings import default_minds_api_host
 from sqlmodel import Session, select
 from pydantic import ValidationError
 
-from anton.core.tools.skill_format import normalize_name, DESC_MAX, SKILL_FILE
+from anton.core.tools.skill_format import normalize_name, DESC_MAX
 from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import (
@@ -43,7 +42,7 @@ from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
-from cowork.services.skills import SkillService
+from cowork.services.skills import BUILTIN_SKILLS_VERSION, SkillService
 
 logger = logging.getLogger(__name__)
 
@@ -206,20 +205,19 @@ def backfill_minds_url(session: Session) -> bool:
 
 
 
-# Packaged skills shipped with cowork. Bump BUILTIN_SKILLS_VERSION when the
-# set changes; seeding re-runs only when the stored version is lower, so a
-# future release can ship more skills without touching ones the user edited
-# or deleted.
-BUILTIN_SKILLS_DIR = Path(__file__).parent / "skills_builtin"
+#: Desktop-mode version marker: a DB sentinel row, since the store there is
+#: unkeyed (one shared install, not per-org). See
+#: ``SkillService.ensure_builtin_skills`` for the org-mode counterpart, which
+#: shares ``BUILTIN_SKILLS_VERSION`` but keys its marker per org.
 BUILTIN_SKILLS_SENTINEL = "_builtin_skills_set"
-BUILTIN_SKILLS_VERSION = 1
 
 
 def seed_builtin_skills(session: Session) -> bool:
-    """Copy packaged builtin skills into the canonical skills store.
+    """Copy packaged builtin skills into the canonical (unkeyed) skills store.
 
-    Runs only when the stored set version is below ``BUILTIN_SKILLS_VERSION``.
-    Existing folders are never overwritten, so user edits/deletes survive.
+    Desktop path. Runs only when the stored set version is below
+    ``BUILTIN_SKILLS_VERSION``. Org deployments use
+    ``SkillService.ensure_builtin_skills``, which keys the store per org.
     Returns True if seeding ran (version advanced), False if skipped.
     """
     svc = SettingService(session)
@@ -234,17 +232,7 @@ def seed_builtin_skills(session: Session) -> bool:
         link.unlink()
 
     store = SkillService()
-    copied = 0
-    if BUILTIN_SKILLS_DIR.exists():
-        store._ensure_root()
-        for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
-            if not src.is_dir() or not (src / SKILL_FILE).exists():
-                continue
-            dest = store._skill_dir(src.name)
-            if dest.exists():
-                continue  # keep the user-editable copy untouched
-            shutil.copytree(src, dest)
-            copied += 1
+    copied = store._copy_builtin_skills()
 
     if copied:
         logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)

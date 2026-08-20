@@ -70,6 +70,25 @@ def test_creation_stamps_org_and_author(db):
     assert conv.created_by == "alice"
 
 
+def test_creation_persists_harness_and_model(db):
+    svc = _svc(db, _scope(ORG_A, "alice"))
+    conv = svc.create_conversation(
+        topic="hello",
+        project_id=_project_id(db, "a-proj"),
+        harness="claude-code",
+        model="kimi",
+    )
+    assert conv.harness == "claude-code"
+    assert conv.model == "kimi"
+
+
+def test_creation_defaults_harness_and_model_to_none(db):
+    svc = _svc(db, _scope(ORG_A, "alice"))
+    conv = svc.create_conversation(topic="hello", project_id=_project_id(db, "a-proj"))
+    assert conv.harness is None
+    assert conv.model is None
+
+
 def test_creation_rejects_another_orgs_project(db):
     # Linking to a foreign project would leak its name/path via serialization.
     b = _svc(db, _scope(ORG_B, "bob"))

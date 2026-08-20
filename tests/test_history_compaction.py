@@ -1,10 +1,12 @@
 """Tests for replaying anton's persisted history summary instead of full
 history (ENG-664): `AntonHarness._seed_history` (build initial_history from
-summary + tail, or fall back to full history) and
-`AntonHarness._persist_history_compaction` (save the result after a turn).
+summary + tail, or fall back to full history),
+`AntonHarness._persist_history_compaction` (save the result after a turn),
+and `AntonHarness._stamp_message` (per-message timestamp prefix).
 """
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -99,6 +101,50 @@ class TestSeedHistory:
         assert initial_history == [_stamp(m) for m in messages]
         assert seed_info["tail_start"] == 0
         assert seed_info["synthetic_prefix_len"] == 0
+
+
+class TestStampMessage:
+    """A leaked timestamp bug: an earlier version of `_stamp_message`
+    (formerly an inline `_stamped` closure in `_build_chat_session`)
+    stamped BOTH roles, so Anton's own replayed assistant replies came back
+    to it prefixed with `[YYYY-MM-DD HH:MM] `, and it started imitating that
+    visible convention in its own new output — most noticeable on short
+    turns ("hi", "who are you?") with little else to anchor generation.
+    User-only stamping matches anton's own live-turn stamping
+    (core_agent/anton/core/session.py's _stamp_user_content)."""
+
+    @staticmethod
+    def _msg(role, content, created_at):
+        return SimpleNamespace(
+            role=role,
+            created_at=created_at,
+            to_openai_message=lambda: SimpleNamespace(
+                model_dump=lambda: {"role": role, "content": content}
+            ),
+        )
+
+    def test_stamps_a_user_message(self):
+        ts = datetime(2026, 8, 18, 17, 41)
+        m = self._msg("user", "who are you?", ts)
+
+        assert AntonHarness._stamp_message(m) == {
+            "role": "user", "content": "[2026-08-18 17:41] who are you?",
+        }
+
+    def test_does_not_stamp_an_assistant_message(self):
+        """The regression: an assistant reply replayed back to Anton must
+        stay byte-identical to what was actually said, or the model starts
+        echoing the bracketed-timestamp convention in new replies."""
+        ts = datetime(2026, 8, 18, 17, 41)
+        m = self._msg("assistant", "I'm Anton, your AI coworker.", ts)
+
+        assert AntonHarness._stamp_message(m) == {
+            "role": "assistant", "content": "I'm Anton, your AI coworker.",
+        }
+
+    def test_no_created_at_leaves_content_untouched(self):
+        m = self._msg("user", "hi", None)
+        assert AntonHarness._stamp_message(m) == {"role": "user", "content": "hi"}
 
 
 class TestPersistHistoryCompaction:
