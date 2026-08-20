@@ -545,3 +545,18 @@ def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
     os.utime(src, (fixed_mtime, fixed_mtime))
     assert stage_project_instructions(proj, conv) is True
     assert dest.read_text() == "be funny"            # re-staged despite the tie
+
+
+def test_same_org_users_cannot_see_each_others_files(engine):
+    """Staging audit P0: files are personal (created_by) but list/get/delete
+    filtered by org only, so coworkers saw/read/deleted each other's files."""
+    alice = _svc(engine, _scope(ORG_A, "alice"))
+    bob = _svc(engine, _scope(ORG_A, "bob"))
+    a_file = _mkfile(alice)
+
+    assert a_file.id not in {f.id for f in bob.list_files()}
+    import pytest
+    with pytest.raises(ValueError):
+        bob.get_file(a_file.id)
+    assert bob.delete_file(a_file.id) is False
+    assert alice.get_file(a_file.id).id == str(a_file.id)  # still Alice's
