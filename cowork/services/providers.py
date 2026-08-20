@@ -627,17 +627,21 @@ def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabl
 
 async def warm_enabled_model_map(session, scope=None) -> bool:
     """Desktop: populate `minds_model_enabled` from /v1/models so the FIRST turn
-    resolves an affordable default (ENG-748).
+    resolves an affordable model for a free-tier user with a stored paid pin
+    (ENG-748).
 
-    On desktop the minds-cloud role defaults stay the premium canonical models
-    (``sonnet``/``haiku``); free-tier users are steered off them only by the
-    availability map. That map is refreshed lazily on GET /recommended-models,
-    so a brand-new sign-in that sends before the picker ever loads resolves the
-    default against an EMPTY map — ``_enabled_aware_default`` returns canonical
-    ``sonnet`` and MindsHub denies the empty free-tier wallet (``wallet_empty``
-    402) on message one. Warming the map at the two guaranteed-pre-first-turn
-    seams (server startup with a stored key, and immediately after a credential
-    sync) closes that race without touching the turn path.
+    Since ENG-1652 the minds-cloud role defaults are the free model in both
+    modes, so the UNSET default is already affordable (floored by
+    ``role_defaults``). A stored PAID pin is the case left: it is steered off an
+    unaffordable model only by the availability map, via the wallet-aware
+    fallback in ``_resolved_model``. That map is refreshed lazily on GET
+    /recommended-models, so a brand-new sign-in that sends before the picker ever
+    loads resolves the pin against an EMPTY map — an empty map is no evidence, so
+    the pin is kept and MindsHub denies the empty free-tier wallet
+    (``wallet_empty`` 402) on message one. Warming the map at the two
+    guaranteed-pre-first-turn seams (server startup with a stored key, and
+    immediately after a credential sync) closes that race without touching the
+    turn path.
 
     Fail-open: ``fetch_minds_models`` never raises and returns an empty listing
     on any error, bounded by a hard total budget (``_MINDS_MODELS_TIMEOUT_S``)
