@@ -1,19 +1,23 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import logging
 import re
-import shutil
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
-from sqlmodel import select
 
-from cowork.common.paths import safe_join
+from cowork.common.paths import (
+    PinnedDir,
+    dir_mkdir,
+    dir_rename_into,
+    dir_rmtree,
+    pinned_dir,
+    safe_join,
+)
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
 from cowork.models.project import Project
@@ -230,15 +234,10 @@ class ProjectService:
     # guarantees a project dir is a DIRECT child of root.
 
     @contextmanager
-    def _root_fd(self) -> "Iterator[int]":
-        """A descriptor for the projects root, refusing to follow a symlink."""
-        root = self._root_dir()
-        root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            yield fd
-        finally:
-            os.close(fd)
+    def _root_fd(self) -> "Iterator[PinnedDir]":
+        """A handle for the projects root, refusing to follow a symlink (POSIX)."""
+        with pinned_dir(self._root_dir(), create=True, nofollow_base=True) as d:
+            yield d
 
     def _child_name(self, path: Path) -> str:
         """The single component *path* adds to the projects root.
@@ -253,9 +252,9 @@ class ProjectService:
         return path.name
 
     def _mkdir_in_root(self, path: Path, *, exist_ok: bool = False) -> None:
-        with self._root_fd() as fd:
+        with self._root_fd() as root:
             try:
-                os.mkdir(self._child_name(path), dir_fd=fd)
+                dir_mkdir(root, self._child_name(path))
             except FileExistsError:
                 if not exist_ok:
                     raise
@@ -270,12 +269,12 @@ class ProjectService:
         would aim at another org, so that is the side that must not be
         re-walked.
         """
-        with self._root_fd() as fd:
-            os.rename(str(old), self._child_name(new), dst_dir_fd=fd)
+        with self._root_fd() as root:
+            dir_rename_into(root, old, self._child_name(new))
 
     def _rmtree_in_root(self, path: Path) -> None:
-        with self._root_fd() as fd:
-            shutil.rmtree(self._child_name(path), dir_fd=fd)
+        with self._root_fd() as root:
+            dir_rmtree(root, self._child_name(path))
 
     def _project_path(self, name: str) -> Path:
         # Containment guard: a project dir is always a direct child of the

@@ -24,13 +24,17 @@ rest outliving the conversation that was allowed to see it.
 from __future__ import annotations
 
 import logging
-import os
-import shutil
 import stat
 from pathlib import Path
 from uuid import UUID
 
-from cowork.common.paths import opened_subdir_nofollow
+from cowork.common.paths import (
+    dir_lstat,
+    dir_rmtree,
+    dir_scandir,
+    dir_unlink,
+    opened_subdir_nofollow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,17 +103,17 @@ def _rmtree_session_child(project_path: str | Path, canonical: str) -> bool:
     try:
         with opened_subdir_nofollow(
             Path(project_path), ".anton", _SESSIONS_DIRNAME
-        ) as fd:
+        ) as d:
             try:
-                st = os.lstat(canonical, dir_fd=fd)
+                st = dir_lstat(d, canonical)
             except FileNotFoundError:
                 return False
             if stat.S_ISLNK(st.st_mode):
-                os.unlink(canonical, dir_fd=fd)  # drop a planted link, never follow it
+                dir_unlink(d, canonical)  # drop a planted link, never follow it
                 return False
             if not stat.S_ISDIR(st.st_mode):
                 return False
-            shutil.rmtree(canonical, dir_fd=fd)
+            dir_rmtree(d, canonical)
             return True
     except OSError:
         logger.warning(
@@ -189,8 +193,8 @@ def sweep_orphan_sessions(session) -> int:
             # is skipped rather than followed out of the tree.
             with opened_subdir_nofollow(
                 Path(project.path), ".anton", _SESSIONS_DIRNAME
-            ) as fd:
-                for entry in os.scandir(fd):
+            ) as d:
+                for entry in dir_scandir(d):
                     if entry.name in live or entry.name == _UNSCOPED_BUCKET:
                         continue
                     if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
@@ -200,7 +204,7 @@ def sweep_orphan_sessions(session) -> int:
                     if _canonical_conversation_id(entry.name) is None:
                         continue
                     try:
-                        shutil.rmtree(entry.name, dir_fd=fd)
+                        dir_rmtree(d, entry.name)
                         removed += 1
                     except OSError:
                         logger.exception(
