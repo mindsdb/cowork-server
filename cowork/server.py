@@ -58,8 +58,10 @@ _BOOT_WARM_TIMEOUT_S = 3.0
 
 async def _warm_model_map_on_boot() -> bool:
     """Warm the MindsHub availability map at boot when a key is already stored
-    (desktop, returning user), so the FIRST turn resolves an affordable default
-    instead of 402'ing against an empty map (ENG-748).
+    (desktop, returning user), so the FIRST turn heals a stored paid pin instead
+    of 402'ing against an empty map (ENG-748). Since ENG-1652 the unset default
+    is already free (floored by ``role_defaults``); the map is what steers a
+    stored *paid pin* off an unaffordable model on a free-tier wallet.
 
     Desktop only: org mode stores no key and is floored by ``role_defaults``.
 
@@ -135,8 +137,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
     # Warm the MindsHub availability map at boot (desktop, returning or
-    # freshly-signed-in user) so the empty-map state — which resolves a
-    # free-tier default to a paid alias and 402s the first message (ENG-748) —
+    # freshly-signed-in user) so the empty-map state — which keeps a stored
+    # paid pin and 402s the first message on a free-tier wallet (ENG-748) —
     # is closed before the first turn. Bounded and fail-open; see the helper.
     if await _warm_model_map_on_boot():
         logger.info("warmed MindsHub model-availability map on boot")

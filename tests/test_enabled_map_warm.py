@@ -1,13 +1,16 @@
 """Warm the MindsHub availability map before the first turn (ENG-748, desktop).
 
-On desktop the minds-cloud role defaults stay the premium canonical models
-(`sonnet`/`haiku`); free-tier users are steered off them only by the cached
-`minds_model_enabled` availability map. That map is refreshed lazily on GET
-/recommended-models, so a brand-new sign-in that sends a message before the
-picker ever loads resolves the planning default against an EMPTY map —
-`_enabled_aware_default` returns the paid canonical (minds-cloud plans on
-`kimi`) and MindsHub denies the empty free-tier wallet (`wallet_empty` 402) on
-message one. That is the live first-contact cohort in ENG-748.
+ENG-1652 made the minds-cloud role defaults the free model in both tenancy
+modes, so the UNSET default no longer 402s a free-tier wallet on turn one — the
+floor covers it (see `test_first_turn_default_floor`). What the availability map
+still governs is a stored PAID pin: a user who explicitly picked a premium model
+(e.g. `kimi`) is steered back off it only by the cached `minds_model_enabled`
+map, via the wallet-aware fallback in `_resolved_model`. That map is refreshed
+lazily on GET /recommended-models, so a brand-new sign-in that sends a message
+before the picker ever loads resolves that pin against an EMPTY map — an empty
+map is no evidence, so the pin is kept and MindsHub denies the empty free-tier
+wallet (`wallet_empty` 402) on message one. That is the residual first-contact
+cohort in ENG-748.
 
 `warm_enabled_model_map` closes the race at the two guaranteed-pre-first-turn
 seams — server startup with a stored key, and immediately after a credential
@@ -15,8 +18,9 @@ sync (POST /settings/raw) — by fetching /v1/models and persisting the map
 through the same guarded writer the recommended-models endpoint uses
 (`persist_enabled_model_map`), so the invariants can't drift.
 
-The org surface is fixed separately by `role_defaults` (see
-`test_first_turn_default_floor`); this file covers the desktop surface.
+The unset default is floored by `role_defaults` in both modes (see
+`test_first_turn_default_floor`); this file covers the desktop warm that heals a
+stored pin before the picker loads.
 """
 import asyncio
 import json
@@ -145,9 +149,9 @@ def test_warm_is_a_noop_when_map_already_current(monkeypatch):
         session.close()
 
 
-# ── the payoff: warm -> DB -> free-tier default resolves affordable ───
+# ── the payoff: warm -> DB -> a free-tier user's paid pin resolves affordable ─
 
-def test_warm_flips_the_free_tier_default_off_the_paid_canonical(monkeypatch):
+def test_warm_flips_a_stored_paid_pin_off_the_paid_canonical(monkeypatch):
     from cowork.services import providers
 
     async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
@@ -156,21 +160,28 @@ def test_warm_flips_the_free_tier_default_off_the_paid_canonical(monkeypatch):
     monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
     session = _fresh_session()
     try:
+        # ENG-1652 made the UNSET default the free model, so the warm no longer
+        # rescues the default — the floor does (see test_first_turn_default_floor).
+        # What still 402s on turn one is a stored PAID pin: this user explicitly
+        # picked `kimi`.
         _set(session, minds_api_key="mdb_test", minds_url="https://minds.example/v1",
-             planning_provider="minds_cloud", coding_provider="minds_cloud")
+             planning_provider="minds_cloud", coding_provider="minds_cloud",
+             planning_model="kimi")
 
-        # Cold map (the first-turn state): planning default is the paid canonical
-        # (minds-cloud plans on `kimi` per MODEL_ROLE_DEFAULTS) that 402s a
-        # free-tier wallet.
+        # Cold map (the first-turn state): an empty map is no evidence, so the
+        # pin is kept and a free-tier wallet 402s on `kimi`.
         assert SettingService(session).load().resolved_planning_model == "kimi"
 
         asyncio.run(providers.warm_enabled_model_map(session))
 
-        # After the warm the same default resolves to the free-allowance model.
+        # After the warm the map marks `kimi` disabled, so the wallet-aware
+        # fallback resolves to the free-allowance model. The stored pin itself is
+        # never rewritten — a topped-up wallet restores it on the next load.
         assert SettingService(session).load().resolved_planning_model == "mindshub_air"
+        assert SettingService(session).load().planning_model == "kimi"
     finally:
         _clear(session, "minds_api_key", "minds_url", "minds_model_enabled",
-               "planning_provider", "coding_provider")
+               "planning_provider", "coding_provider", "planning_model")
         session.close()
 
 
