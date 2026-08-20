@@ -156,9 +156,7 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
         async def flow():
             bridge = await adapters.get_or_refresh("discord", ORG_A)
             assert bridge is not None
-            # No guild_id → DiscordBridge._normalize_message treats this as a
-            # DM (is_group=False, is_mention=True), same convention the Slack
-            # org-chat test uses ("D1"): a fresh binding defaults to
+            # No guild_id → DM (is_mention=True); a fresh binding defaults to
             # trigger_rule="always", so the turn runs without needing a mention.
             normalized = bridge._normalize_message({
                 "id": "55", "channel_id": "D1", "content": "hello bot",
