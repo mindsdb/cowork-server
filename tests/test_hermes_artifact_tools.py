@@ -192,7 +192,12 @@ def test_created_artifact_appears_in_cowork_listing():
     (Path(result["path"]) / "index.html").write_text("<html></html>")
     finalize_artifact_run_context(TASK_ID)
 
-    listed = artifacts_service.list_artifacts(str(project))
+    listed = artifacts_service.list_artifacts([
+        artifacts_service.ProjectArtifacts(
+            base=Path(project) / ".anton" / "artifacts",
+            project_id=None, project_name=Path(project).name,
+        )
+    ])
     # The general project is shared across the test session — assert on
     # our artifact rather than the full listing.
     entry = next((a for a in listed if a["slug"] == "hermes-dash"), None)

@@ -332,6 +332,7 @@ SETTING_ENV_ALIASES: dict[str, str] = {
     "proactive_dashboards": "ANTON_PROACTIVE_DASHBOARDS",
     "act_first": "ANTON_ACT_FIRST",
     "publish_url": "ANTON_PUBLISH_URL",
+    "artifact_autopublish_enabled": "ANTON_ARTIFACT_AUTOPUBLISH",
 }
 
 # Inverse view (ANTON_* .env var → DB setting key) for .env-first callers, i.e.
@@ -684,6 +685,35 @@ class UserSettings(Settings):
         default="",
         title="Publish URL",
         description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
+    )
+    artifact_autopublish_enabled: Annotated[bool, ORG] = Field(
+        # On by default, deliberately. It was drafted as off because publishing a
+        # fullstack artifact resolved datasource secrets from a process-global
+        # vault, so one org's artifact could ship another's credentials. That is
+        # closed: the vault is org-keyed now (`vault_for_scope` ->
+        # `scoped_storage_root(..., store="data-vault")`), and a missing scope
+        # RAISES on an org deployment rather than falling back to the shared root,
+        # so the leak cannot reappear silently.
+        #
+        # Inert outside org mode: `autopublish_project_artifacts` returns on the
+        # scope guard before it ever reads this, so a desktop install is
+        # unaffected by the default either way.
+        default=True,
+        title="Auto-publish artifacts",
+        description=(
+            "In org deployments, publish every artifact the agent creates or changes "
+            "to the viewer automatically, restricted to the author's organization. "
+            "On by default. ORG-scoped, so an organization can still turn it off "
+            "for itself. It uploads user content without an explicit user action, "
+            "which is the reason to keep the per-org switch. The env override that "
+            "actually "
+            "bypasses that is ARTIFACT_AUTOPUBLISH_ENABLED, the field name itself: "
+            "UserSettings is a pydantic-settings model, so any field with no DB row "
+            "falls back to the environment, process-global, for every tenant of the "
+            "deployment. (The ANTON_ARTIFACT_AUTOPUBLISH alias below is NOT that "
+            "override — SETTING_ENV_ALIASES only drives the .env→DB seed, which org "
+            "deployments skip entirely; see dev_setup._migrate_env_to_db_if_local.)"
+        ),
     )
     openai_base_url: Annotated[str, ORG] = Field(
         default="",
