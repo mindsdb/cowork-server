@@ -458,6 +458,39 @@ def test_stage_prunes_a_deleted_attachment(engine, tmp_path):
     assert not (base / str(b.id)).exists()      # deleted one pruned → agent stops seeing it
 
 
+def test_stage_refuses_symlinked_attachments_dir(engine, tmp_path):
+    # A prompt-injected pod mounts its conversation dir read-write, so it can
+    # replace `attachments` with a symlink into another org's subtree. cowork-server
+    # sees every org; a staging pass that followed the link would iterdir+rmtree
+    # the victim's data. The staging path must never follow it.
+    svc = _svc(engine, _scope(ORG_A))
+    conv = str(uuid4())
+    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+                                   data=b"k", purpose=attachment_purpose(conv))
+
+    # Stand-in for another org's tree, and the pod-planted symlink over `attachments`.
+    victim = tmp_path / "other-org"
+    (victim / "sub").mkdir(parents=True)
+    (victim / "secret.txt").write_text("do not delete")
+    (victim / "sub" / "data.txt").write_text("keep me")
+
+    proj = tmp_path / "proj"
+    conv_dir = proj / "conversations" / conv
+    conv_dir.mkdir(parents=True)
+    (conv_dir / "attachments").symlink_to(victim, target_is_directory=True)
+
+    svc.stage_conversation_attachments(conv, proj)
+
+    # The victim tree is untouched: nothing followed the link, nothing deleted.
+    assert (victim / "secret.txt").read_text() == "do not delete"
+    assert (victim / "sub" / "data.txt").read_text() == "keep me"
+    assert {p.name for p in victim.iterdir()} == {"secret.txt", "sub"}
+    # The planted link was replaced by a real dir the attachment staged into.
+    attachments = conv_dir / "attachments"
+    assert not attachments.is_symlink()
+    assert (attachments / str(a.id) / "keep.txt").read_bytes() == b"k"
+
+
 def test_stage_rejects_non_uuid_conversation_segment(engine, tmp_path):
     from cowork.services.files import stage_project_instructions
     svc = _svc(engine, _scope(ORG_A))
