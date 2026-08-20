@@ -1,9 +1,11 @@
 """Tier-aware model defaults (ENG-597).
 
-MindsHub gates models per plan tier: a free-tier key gets the paid models
-(kimi/gpt-codex/haiku — the canonical minds-cloud defaults) as ``enabled:
-false`` from ``/v1/models``, so handing out the static default guarantees a
-403 on the user's very first message. These tests pin the fix:
+MindsHub gates models per plan tier: a wallet that cannot pay gets the paid
+aliases as ``enabled: false`` from ``/v1/models``. Every minds-cloud role now
+defaults to the free model, so the canonical default is affordable by
+construction; the availability map matters for the cases where it is not,
+namely a stored pin and a default that the catalog has stopped serving. These
+tests pin the fix:
 
 - ``UserSettings`` resolves its planning/coding defaults against the cached
   availability map (``minds_model_enabled``), falling back to the first
@@ -47,25 +49,30 @@ def _minds(**kw) -> UserSettings:
 
 # ── Default resolution (apply_model_defaults) ─────────────────────────
 
-def test_free_tier_defaults_fall_back_to_first_enabled_model():
+def test_free_tier_map_keeps_the_canonical_defaults():
+    # The canonical default IS the free model, so nothing has to fall back.
     s = _minds(minds_model_enabled=FREE_MAP)
     assert s.planning_model == "mindshub_air"
     assert s.coding_model == "mindshub_air"
     assert s.router_model == "mindshub_air"
 
 
-def test_paid_tier_keeps_canonical_defaults():
+def test_paid_tier_gets_the_same_defaults_as_everyone_else():
+    # A funded wallet does not change what an unset model resolves to. Paying
+    # for a better model is an explicit pick in the picker, not a default.
     s = _minds(minds_model_enabled=PAID_MAP)
-    assert s.planning_model == "kimi"
-    assert s.coding_model == "gpt-codex"
-    assert s.router_model == "haiku"
+    assert s.planning_model == "mindshub_air"
+    assert s.coding_model == "mindshub_air"
+    assert s.router_model == "mindshub_air"
 
 
 def test_absent_map_keeps_canonical_defaults():
-    # No cached map (fresh install, fetch never ran) → behavior unchanged.
+    # No cached map (fresh install, fetch never ran). This is the state a
+    # brand-new account is in on its first turn, and the reason the default
+    # itself has to be affordable rather than corrected by the map.
     s = _minds()
-    assert s.planning_model == "kimi"
-    assert s.coding_model == "gpt-codex"
+    assert s.planning_model == "mindshub_air"
+    assert s.coding_model == "mindshub_air"
 
 
 def test_explicit_model_choice_is_never_rewritten():
@@ -78,24 +85,32 @@ def test_explicit_model_choice_is_never_rewritten():
 def test_all_disabled_map_keeps_canonical_default():
     # Degenerate metadata (nothing enabled) must not invent a model.
     s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
-    assert s.planning_model == "kimi"
+    assert s.planning_model == "mindshub_air"
 
 
 def test_default_missing_from_nonempty_map_falls_back_to_first_enabled():
     # A non-empty map always carries every alias the catalog currently
-    # serves, so missing means gone (renamed/retired) — same as disabled.
-    s = _minds(minds_model_enabled=json.dumps({"mindshub_air": True}))
-    assert s.planning_model == "mindshub_air"
+    # serves, so missing means gone (renamed/retired), same as disabled.
+    # The map here deliberately omits the canonical default, which is the only
+    # way to reach this branch now that the default is the free model.
+    s = _minds(minds_model_enabled=json.dumps({"sonnet": True}))
+    assert s.planning_model == "sonnet"
 
 
 def test_invalid_map_json_degrades_to_canonical_default():
     s = _minds(minds_model_enabled="not json")
-    assert s.planning_model == "kimi"
+    assert s.planning_model == "mindshub_air"
 
 
 def test_map_order_decides_the_fallback():
     # First enabled entry in map order wins (mirrors /v1/models ordering).
-    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "sonnet": True, "mindshub_air": True}))
+    # The canonical default is disabled here, which is the drained-wallet
+    # state: even the free model stops being callable, so ordering decides.
+    s = _minds(
+        minds_model_enabled=json.dumps(
+            {"mindshub_air": False, "sonnet": True, "kimi": True}
+        )
+    )
     assert s.planning_model == "sonnet"
 
 
@@ -127,12 +142,14 @@ def test_provider_switch_onto_minds_is_tier_aware():
 
 
 def test_provider_switch_onto_minds_paid_keeps_canonical():
+    # A funded wallet resolves to the same canonical default as an empty one:
+    # the switch picks the default, and the default is the free model.
     s = UserSettings(
         planning_provider=Provider.ANTHROPIC,
         minds_api_key=SecretStr("mdb_test"),
         minds_model_enabled=PAID_MAP,
     )
-    assert s.resolved_planning_model == "kimi"
+    assert s.resolved_planning_model == "mindshub_air"
 
 
 # ── Wallet-aware resolution, all three roles (ENG-1632, ENG-1632 follow-up) ──
