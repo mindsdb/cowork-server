@@ -123,8 +123,16 @@ def _conversation_workspace_ok(
 
 def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -> None:
     """404 (no existence oracle) if `target` is inside another member's
-    conversation workspace."""
-    rel = target.resolve().relative_to(base.resolve()).as_posix()
+    conversation workspace.
+
+    `target` came from `_safe_relpath`, which already confirmed it sits under
+    `base`, but re-derive the relative path defensively: a symlink that makes
+    the resolved path escape `base` must 404, never raise (CodeQL: user data in
+    a path expression)."""
+    try:
+        rel = target.relative_to(base.resolve()).as_posix()
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail="File not found")
     if not _conversation_workspace_ok(rel, scoped):
         raise HTTPException(status_code=404, detail="File not found")
 
