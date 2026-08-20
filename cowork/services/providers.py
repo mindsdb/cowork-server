@@ -109,6 +109,7 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
+
 def provider_base_url(
     provider: str, *, openai_base_url: str = "", minds_url: str = ""
 ) -> str | None:
@@ -925,6 +926,21 @@ def build_llm_client():
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            # A local endpoint authenticates by being reachable, so an
+            # openai-compatible provider with a base URL and no key is a valid
+            # config, not a broken one.
+            #
+            # Passing a non-empty string matters: anton drops a falsy api_key,
+            # and the SDK then falls back to an ambient OPENAI_API_KEY — which
+            # must never be sent to whatever machine the user pointed us at.
+            # Derived from the role rather than written as a literal, so it is
+            # what it looks like — a marker for an endpoint that authenticates
+            # nobody — rather than something a reader or a scanner has to take
+            # on trust as "not really a credential".
+            if key is None and role == Provider.OPENAI_COMPATIBLE and base:
+                return OpenAIProvider(
+                    api_key=f"{role.value}-no-auth", base_url=base, **effort_kw
+                )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
             # No base for openai-compatible → OpenAIProvider would silently

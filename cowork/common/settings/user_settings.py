@@ -844,6 +844,13 @@ class UserSettings(Settings):
         # stored; else a fresh org resolves to the pod's ambient ANTHROPIC key.
         if p is Provider.MINDS_CLOUD and get_app_settings().tenancy_mode == "org":
             return True
+        # An openai-compatible endpoint's credential is its base URL — a local
+        # model server usually wants no key at all, and the Settings UI lets one
+        # be saved that way. Judged keyless, the resolver below walks straight
+        # past it to the hosted gateway, which is the one place these prompts
+        # must not go.
+        if p is Provider.OPENAI_COMPATIBLE and (self.openai_base_url or "").strip():
+            return True
         # provider_api_key applies the gemini/openai-compatible → shared-openai
         # fallback, so a provider configured via EITHER its dedicated slot or the
         # legacy shared slot is correctly seen as keyed. (Raw getattr on the

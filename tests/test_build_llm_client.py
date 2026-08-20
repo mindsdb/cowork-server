@@ -222,3 +222,54 @@ def test_effort_survives_when_no_model_row_is_stored(build):
     assert settings.coding_model is not None  # the validator pre-fill
     _client, calls = build(settings)
     assert calls["openai"][-1].get("reasoning_effort") == "high"
+
+
+def test_keyless_local_endpoint_routes_to_its_base(build):
+    """A local model server needs no API key — only a reachable base URL.
+
+    Treated as unconfigured, the resolver walks past openai-compatible to the
+    first provider that does have a key (MindsHub first), so prompts meant for
+    a machine on the user's own network are sent to the hosted gateway instead.
+    """
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE,
+        coding_provider=Provider.OPENAI_COMPATIBLE,
+        router_provider=Provider.OPENAI_COMPATIBLE,
+        planning_model="qwen/qwen3.5-9b",
+        coding_model="qwen/qwen3.5-9b",
+        router_model="qwen/qwen3.5-9b",
+        minds_api_key=SecretStr("mdb_abc"),  # signed in, but not the endpoint
+        openai_base_url="http://192.168.1.100:1234/v1",
+    )
+    _client, calls = build(settings)
+    for kw in calls["openai"]:
+        assert kw["base_url"] == "http://192.168.1.100:1234/v1"
+        assert kw["api_key"]  # the SDK requires some string
+    assert "anthropic" not in calls
+
+
+def test_keyless_local_endpoint_reports_ready(build):
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE,
+        coding_provider=Provider.OPENAI_COMPATIBLE,
+        planning_model="qwen/qwen3.5-9b",
+        coding_model="qwen/qwen3.5-9b",
+        minds_api_key=SecretStr("mdb_abc"),
+        openai_base_url="http://192.168.1.100:1234/v1",
+    )
+    status = settings.config_status
+    assert status["provider"] == Provider.OPENAI_COMPATIBLE.value
+    assert status["config_ready"] is True
+    assert status["config_error"] is None
+
+
+def test_keyless_openai_compatible_without_base_still_gates(build):
+    """No key and no base URL is genuinely unconfigured — it must not read as
+    ready, and must never quietly become a hosted-gateway turn."""
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE,
+        coding_provider=Provider.OPENAI_COMPATIBLE,
+        openai_base_url="",
+    )
+    assert settings._has_key(Provider.OPENAI_COMPATIBLE) is False
+    assert settings.config_status["config_ready"] is False
