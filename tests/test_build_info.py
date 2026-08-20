@@ -308,3 +308,38 @@ class TestSurface:
             "cowork.common.settings.app_settings.get_app_settings", _boom
         )
         assert build_info.surface() is None
+
+
+class TestTheWebSurfaceIsNotReachableYet:
+    """Pins a known GAP, not desired behaviour (ENG-1459).
+
+    `surface()` returns "web" exactly when `tenancy_mode == "org"`, and
+    `AntonHarness.stream_response` refuses to run in-process under that same
+    condition — the web deployment routes turns to a scratchpad-controller pod
+    instead (`COWORK_TURN_BACKEND=remote`). So the only consumer of a "web"
+    surface has already raised by the time one exists, and this PR delivers
+    `desktop` only.
+
+    This test exists so the gap is visible in the suite rather than living in a
+    docstring nobody reads. **If it starts failing, that is progress** — either
+    the in-process refusal was lifted or the surface now reaches the pod. Update
+    this test and the `surface()` warning together; do not just delete it.
+    """
+
+    def test_web_and_the_in_process_refusal_share_one_condition(self, monkeypatch):
+        import inspect
+
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        _patch_surface_inputs(monkeypatch, tenancy="org")
+        assert build_info.surface() == "web", "the web answer comes from org tenancy"
+
+        # …and the same tenancy check gates the in-process path off.
+        src = inspect.getsource(AntonHarness.stream_response)
+        assert 'tenancy_mode == "org"' in src
+        assert "in-process execution is disabled" in src
+
+    def test_desktop_is_the_half_that_actually_works(self, monkeypatch):
+        # Local tenancy runs in-process, so the kwarg reaches a real turn.
+        _patch_surface_inputs(monkeypatch, tenancy="local")
+        assert build_info.surface() == "desktop"

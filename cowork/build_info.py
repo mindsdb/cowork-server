@@ -64,6 +64,28 @@ def surface() -> str | None:
     signal** — it is set only on the multi-tenant cloud deployment, so it means
     web; anything else is a desktop sidecar.
 
+    .. warning::
+
+       **``web`` is currently unreachable through the in-process turn path, so
+       this only delivers ``desktop`` in practice.** The web deployment sets
+       ``COWORK_TURN_BACKEND=remote`` (``deployment/cowork-server/values.yaml``),
+       and :meth:`AntonHarness.stream_response` refuses to run in-process when
+       ``tenancy_mode == "org"`` — the *same* condition under which this function
+       returns ``web``. So whenever the answer is ``web``, the only consumer of
+       it has already raised, and the turn is executing in a scratchpad-controller
+       pod via ``anton.cloud_turn`` instead.
+
+       Reaching the pod means carrying the surface over the Redis job contract:
+       cowork-server puts it in ``ScratchpadJobPayload.params``,
+       scratchpad-controller forwards it in ``anton_turn._build_request`` (an
+       explicit allowlist), and anton adds it to ``TurnRequestV1`` and passes it
+       into the pod's ``ChatSessionConfig``. Four repos, tracked on ENG-1459.
+
+       Not urgent as of 2026-08-19: the web surface has no real traffic yet
+       (scratchpad-controller has no GitHub Release, and prod deploys only on
+       one), so nothing is being mis-measured today — the desktop half is
+       correct and the web half is absent rather than wrong.
+
     Deliberately NOT cached, unlike ``install_channel``: the channel is a fact
     about how the process was installed, while this reads settings that tests
     and a reload can legitimately change.
