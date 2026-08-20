@@ -395,9 +395,25 @@ class ConversationService:
         self.session.commit()
 
     def delete_conversation(self, conversation_id: UUID) -> bool:
+        """Owner-scoped delete for the request path: a member can only delete
+        their own conversation."""
         conversation = self._owned(conversation_id)
         if conversation is None:
             return False
+        return self._delete_conversation(conversation)
+
+    def delete_conversation_row(self, conversation: Conversation) -> bool:
+        """Owner-AGNOSTIC cascade delete, given an already-authorized row.
+
+        Used by ProjectService.delete_project, which is an intentional org-wide
+        cleanup: the project's conversations may belong to several members, and
+        skipping the foreign ones would orphan their messages/events/task
+        objects/attachment bytes (the ENG-701 orphaning the cascade exists to
+        prevent). The caller has already scoped the fetch to the org."""
+        return self._delete_conversation(conversation)
+
+    def _delete_conversation(self, conversation: Conversation) -> bool:
+        conversation_id = conversation.id
         messages = self.session.exec(
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
