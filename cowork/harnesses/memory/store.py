@@ -61,7 +61,10 @@ class MemoryStore:
             or (os.altsep and os.altsep in name)
         ):
             raise ValueError(f"invalid memory slot filename: {name!r}")
-        return name
+        # basename strips any directory component, guaranteeing a bare filename
+        # reaches os.open / os.unlink (it is one already; this is belt-and-braces
+        # and the sanitiser static analysis recognises for CWE-23).
+        return os.path.basename(name)
 
     @contextmanager
     def _root_fd(self, *, create: bool) -> Iterator[int]:
