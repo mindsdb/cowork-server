@@ -27,15 +27,30 @@ from cowork.streaming.buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
 
-# Upper bound on a single in-flight turn. A hung producer (wedged tool call,
-# stalled model stream) otherwise runs forever: its handle stays `is_running`,
-# no terminal record is ever written, and an in-process FileStreamBuffer tail
-# — the desktop path — blocks indefinitely, holding the client's shared stream
-# slot so sends wedge in every conversation (ENG-1717). Boot recovery
-# (`seal_orphan_buffers`) only covers a genuine process restart; a re-adopted
-# crash-orphan sidecar keeps the same hung task alive, so the bound has to be
-# enforced at runtime. Mirrors the scheduler's _MAX_RUN_DURATION_SECONDS.
-_MAX_TURN_DURATION_SECONDS = 600
+# A turn is reaped only after it makes NO progress — writes no buffer record —
+# for this long. A hung producer (wedged tool call, stalled model stream)
+# otherwise runs forever: its handle stays `is_running`, no terminal record is
+# ever written, and an in-process FileStreamBuffer tail — the desktop path —
+# blocks indefinitely, holding the client's shared stream slot so sends wedge in
+# every conversation (ENG-1717). Boot recovery (`seal_orphan_buffers`) only
+# covers a genuine process restart; a re-adopted crash-orphan sidecar keeps the
+# same hung task alive, so the bound has to be enforced at runtime.
+#
+# This is an IDLE bound, not a total-duration one: it resets on every record the
+# producer writes (`buffer.latest_seq` advances), so it never reaps a turn that
+# is actively streaming. It also never reaps one legitimately blocked on the
+# user: an `ask_user` card blocks the producer with no writes for up to
+# elicitor.DEFAULT_TIMEOUT_S (300s), which sits well inside this window, and a
+# multi-question turn writes a frame between questions so human wait never
+# accumulates toward the bound. A total-duration cap — the scheduler's model,
+# for non-interactive runs with no human in the loop — would instead reap a long
+# deliberate turn mid-conversation and surface a spurious error to an engaged
+# user.
+_MAX_TURN_IDLE_SECONDS = 600
+
+# How often the idle watchdog samples buffer progress. Detection latency for a
+# fully wedged producer is at most _MAX_TURN_IDLE_SECONDS + this.
+_IDLE_POLL_SECONDS = 15
 
 
 @dataclass
@@ -139,7 +154,7 @@ class RunRegistry:
                 )
                 return existing
             task = asyncio.create_task(
-                self._run_bounded(producer_coro, conversation_id, turn_id),
+                self._run_bounded(producer_coro, buffer, conversation_id, turn_id),
                 name=f"turn[{conversation_id}/{turn_id}]",
             )
             handle = RunHandle(
@@ -157,29 +172,83 @@ class RunRegistry:
             self._by_cid[conversation_id] = handle
             return handle
 
-    async def _run_bounded(self, producer_coro, conversation_id: str, turn_id: int) -> None:
-        """Run a producer under an upper bound on turn duration (ENG-1717).
+    async def _run_bounded(
+        self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
+    ) -> None:
+        """Run a producer under an idle bound on turn duration (ENG-1717).
 
-        On timeout the producer is cancelled. Every producer's CancelledError
-        handler persists its pending state and closes the buffer with a
-        terminal record (the same path a user Stop takes), so the tail ends and
-        the client releases its shared stream slot instead of wedging every
-        conversation's sends behind a turn that will never finish.
+        A watchdog reaps the producer only after it goes fully silent — writes
+        no buffer record — for ``_MAX_TURN_IDLE_SECONDS``. On reap the producer
+        is cancelled; every producer's CancelledError handler persists its
+        pending state and closes the buffer with a terminal record (the same
+        path a user Stop takes), so the tail ends and the client releases its
+        shared stream slot instead of wedging every conversation's sends behind
+        a turn that will never finish.
 
-        An external cancel/discard cancels this wrapper; ``wait_for`` propagates
-        that into the producer unchanged, so ``RunHandle.cancel`` and
-        ``discard`` keep working as before. A producer that raises on its own
-        propagates here exactly as it did when it was the registered task
-        directly — no swallowing.
+        The bound is on IDLE time, not total duration: ``buffer.latest_seq``
+        advances on every frame the producer emits, so an actively-streaming
+        turn — or one legitimately blocked on an ``ask_user`` card, which
+        resumes with more frames — resets the window and is never reaped. Only a
+        producer that stops emitting entirely trips it.
+
+        An external cancel/discard cancels this wrapper; the ``await task`` below
+        forwards that into the producer, so ``RunHandle.cancel`` and ``discard``
+        keep working as before. A producer that raises on its own propagates
+        here exactly as it did when it was the registered task directly — no
+        swallowing.
         """
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(producer_coro)
+        reaped = False
+
+        async def _watchdog() -> None:
+            nonlocal reaped
+            # The watchdog is a safety net, never a source of failure: an
+            # unexpected error here must not touch the turn, so it fails open
+            # (turn runs unbounded) and is logged rather than propagated.
+            try:
+                last_seq = buffer.latest_seq
+                last_progress = loop.time()
+                while True:
+                    await asyncio.sleep(_IDLE_POLL_SECONDS)
+                    seq = buffer.latest_seq
+                    if seq != last_seq:
+                        last_seq, last_progress = seq, loop.time()
+                    elif loop.time() - last_progress >= _MAX_TURN_IDLE_SECONDS:
+                        reaped = True
+                        logger.warning(
+                            "Turn for conversation %s (turn %d) made no progress for %ss; "
+                            "producer cancelled and its buffer sealed.",
+                            conversation_id, turn_id, _MAX_TURN_IDLE_SECONDS,
+                        )
+                        task.cancel()
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Idle watchdog for conversation %s (turn %d) failed; "
+                    "turn runs unbounded.", conversation_id, turn_id,
+                )
+
+        watchdog = asyncio.ensure_future(_watchdog())
         try:
-            await asyncio.wait_for(producer_coro, timeout=_MAX_TURN_DURATION_SECONDS)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Turn for conversation %s (turn %d) exceeded max duration of %ss; "
-                "producer cancelled and its buffer sealed.",
-                conversation_id, turn_id, _MAX_TURN_DURATION_SECONDS,
-            )
+            await task
+        except asyncio.CancelledError:
+            # A watchdog reap surfaces here as the producer's own cancellation.
+            # Unlike an external cancel/discard — which must propagate so
+            # RunHandle.cancel observes it — a reap is terminal on its own (the
+            # buffer is already sealed), so swallow it and let the wrapper end
+            # normally.
+            if not reaped:
+                raise
+        finally:
+            # Retrieve the watchdog's result without ever propagating it: its
+            # outcome (cancelled, or a fail-open exception) must not overwrite
+            # the turn's own result — including a cancellation RunHandle.cancel
+            # is waiting to observe.
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
 
     def get(self, conversation_id: str) -> Optional[RunHandle]:
         """Current handle (incl. recently-finished, useful for replay)."""
