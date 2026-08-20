@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.paths import cowork_home, pod_local_only
 
@@ -415,6 +416,11 @@ class CredentialProbe:
 
         config = ChatSessionConfig(
             llm_client=self.llm_client,
+            # This runs a real turn (see turn_stream below), so it needs the
+            # same surface attribution as a UI turn — the connector path is
+            # explicitly one of the things ENG-1459 wants compared between web
+            # and desktop.
+            **surface_kwarg(ChatSessionConfig),
             system_prompt_context=SystemPromptContext(
                 runtime_context="",
                 suffix=(

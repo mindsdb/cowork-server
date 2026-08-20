@@ -105,6 +105,36 @@ def surface() -> str | None:
         return None
 
 
+def surface_kwarg(config_cls) -> dict[str, str]:
+    """``{"surface": ...}`` for ``ChatSessionConfig``, or ``{}`` — never raises.
+
+    Lives here rather than in one harness because every path that ORIGINATES a
+    turn needs it, and there is more than one: the anton harness serves the UI
+    and the channel bots, and the connector probe runs its own turn (the
+    datasource-connection path, which is one of the things ENG-1459 wants
+    measured per surface). ``tests/test_trace_stamp_seams.py`` enforces that
+    every such call site passes it.
+
+    cowork-server pins anton to a *branch*, so the installed copy can predate
+    anton's half of ENG-1459. Passing an unexpected keyword would then raise on
+    **every turn**, which a telemetry field must never be able to do — so the
+    kwarg is only produced when the installed dataclass actually declares it.
+
+    Returns ``{}`` when the surface is unresolvable, so an unknown surface stays
+    absent rather than being sent as a guess.
+    """
+    import dataclasses
+
+    try:
+        if not any(f.name == "surface" for f in dataclasses.fields(config_cls)):
+            return {}
+        resolved = surface()
+        return {"surface": resolved} if resolved else {}
+    except Exception:  # pragma: no cover - defensive: never fail a turn over telemetry
+        logger.warning("could not resolve the trace surface", exc_info=True)
+        return {}
+
+
 @lru_cache(maxsize=None)
 def install_channel() -> str:
     """How this server was installed: hosted / git / pypi / local / unknown.
