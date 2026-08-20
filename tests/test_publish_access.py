@@ -27,6 +27,22 @@ def test_publish_body_restricted():
     assert b.access.org_allowed is True
 
 
+def test_publish_body_owner_only():
+    b = _PublishBody.model_validate(
+        {"path": "/tmp/a", "access": {"mode": "restricted", "emails": [], "owner_only": True}}
+    )
+    assert b.access.owner_only is True
+    assert b.access.emails == []
+    assert b.access.org_allowed is False
+
+
+def test_publish_body_owner_only_defaults_false():
+    b = _PublishBody.model_validate(
+        {"path": "/tmp/a", "access": {"mode": "restricted", "emails": ["a@x.com"]}}
+    )
+    assert b.access.owner_only is False
+
+
 def test_publish_body_back_compat_password():
     b = _PublishBody.model_validate({"path": "/tmp/a", "password": "p"})
     assert b.password == "p"
@@ -142,6 +158,35 @@ def test_published_access_restricted(tmp_path: Path):
     assert out["accessEmails"] == ["a@x.com"]
     assert out["orgAllowed"] is True
     assert out["accessProtected"] is False
+
+
+def test_published_access_owner_only(tmp_path: Path):
+    """The card must distinguish owner-only from a restricted list, otherwise the
+    publish dialog's summary claims 'people you list' with nobody listed."""
+    primary = _write_published(
+        tmp_path,
+        {"mode": "restricted", "emails": [], "org_allowed": False,
+         "owner_only": True, "access_version": 1},
+    )
+    out = _published_access_for(tmp_path, primary)
+    assert out["accessMode"] == "restricted"
+    assert out["accessEmails"] == []
+    assert out["orgAllowed"] is False
+    assert out["ownerOnly"] is True
+
+
+def test_published_access_legacy_restricted_has_owner_only_false(tmp_path: Path):
+    """A pre-ENG-1769 entry has no owner_only key — it must read as False."""
+    primary = _write_published(
+        tmp_path,
+        {"mode": "restricted", "emails": ["a@x.com"], "org_allowed": False, "access_version": 1},
+    )
+    assert _published_access_for(tmp_path, primary)["ownerOnly"] is False
+
+
+def test_published_access_public_has_owner_only_false(tmp_path: Path):
+    primary = _write_published(tmp_path, {"mode": "public", "requires_password": False})
+    assert _published_access_for(tmp_path, primary)["ownerOnly"] is False
 
 
 def test_published_access_password(tmp_path: Path):

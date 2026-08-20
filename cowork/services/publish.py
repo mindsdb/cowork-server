@@ -518,6 +518,7 @@ def publish_artifact(
         "accessProtected": bool(owner_side.get("requires_password")),
         "accessEmails": owner_side.get("emails", []),
         "orgAllowed": bool(owner_side.get("org_allowed")),
+        "ownerOnly": bool(owner_side.get("owner_only")),
         # Composite comments scope for the panel (Plan 5).
         "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
         "result": {k: v for k, v in result.items() if k != "file_payload"},
