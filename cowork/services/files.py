@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import UploadFile
 
+from cowork.common.paths import safe_join
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, scoped_storage_root
 from cowork.models.file import File
@@ -28,6 +29,77 @@ def unlink_file_dirs(dirs: list[Path]) -> None:
                 shutil.rmtree(d)
         except OSError:
             logger.warning("could not remove file dir %s", d, exc_info=True)
+
+
+def remove_conversation_workspace_dir(project_path: str | Path | None, conversation_id: str | UUID) -> None:
+    """Remove ``<project>/conversations/<conv>/`` on conversation delete — the
+    per-conversation workspace holding the staged attachments and instructions
+    (and, in cloud, session state). Otherwise it orphans on the shared mount,
+    keeping a duplicate of the very upload bytes delete_by_purpose reclaims
+    (ENG-701 class). Best-effort; the id is validated so it can only ever target
+    a real conversation dir. A no-op on desktop, where no such dir exists.
+    """
+    if project_path is None:
+        return
+    # Org mode only: the conversation workspace dir is a cloud artifact we
+    # create. On desktop no such dir exists from our code, and a user's project
+    # could coincidentally hold a `conversations/<id>/` folder — never rmtree it.
+    if get_app_settings().tenancy_mode != "org":
+        return
+    try:
+        conv_seg = str(UUID(str(conversation_id)))
+    except (ValueError, TypeError):
+        return
+    target = Path(project_path) / "conversations" / conv_seg
+    try:
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        logger.warning("could not remove conversation workspace dir %s", target, exc_info=True)
+
+
+def stage_project_instructions(project_path: str | Path, conversation_id: str | UUID) -> bool:
+    """Copy the project's ``anton.md`` into the conversation workspace so the
+    pod picks it up: anton reads ``<workspace>/.anton/anton.md``, but the pod's
+    workspace is the conversation dir while the project's Instructions live at
+    the project root — the same project-level/conversation-scoped delivery gap
+    as attachments. Re-copied every turn (the file is tiny), best-effort.
+    Returns whether an instruction file is in place. ``.anton/anton.md`` matches
+    anton's Workspace and cowork's project_files endpoint.
+    """
+    try:
+        conv_seg = str(UUID(str(conversation_id)))  # path segment must be a real id, never `..`
+    except (ValueError, TypeError):
+        return False
+    conv_root = Path(project_path) / "conversations" / conv_seg
+    # Containment: the workspace is writable by the (untrusted) pod, so resolve
+    # symlinks and refuse a dest that escapes the conversation dir — a planted
+    # `.anton` symlink must not redirect the write into another tenant's tree.
+    try:
+        dest = safe_join(conv_root, ".anton", "anton.md")
+    except ValueError:
+        logger.warning("staged instructions path escapes workspace for conversation %s", conversation_id)
+        return False
+    src = Path(project_path) / ".anton" / "anton.md"
+    if not src.is_file():
+        # Instructions removed at the project → drop the stale staged copy so
+        # the agent stops seeing them.
+        try:
+            if dest.is_file():
+                dest.unlink()
+        except OSError:
+            pass
+        return False
+    try:
+        # anton.md is tiny — always overwrite rather than skip on a size/mtime
+        # match: a same-length edit that lands on the same mtime second (both
+        # files share the EFS clock) would otherwise serve stale instructions.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        return True
+    except OSError:
+        logger.warning("could not stage instructions for conversation %s", conversation_id, exc_info=True)
+        return False
 
 
 def attachment_purpose(session_id: str) -> str:
@@ -213,3 +285,70 @@ class FileService:
         if not path.exists():
             raise ValueError("File content not found on disk")
         return file.content_type, file.filename, path
+
+    def stage_conversation_attachments(self, conversation_id: UUID | str, project_path: str | Path) -> int:
+        """Copy this conversation's attachments into the pod-visible workspace at
+        ``<project_path>/conversations/<conv>/attachments/<file_id>/<name>`` so a
+        delegated (cloud) turn can read them off the shared mount — the flat
+        files store stays the source of truth.
+
+        Re-run every turn (idempotent: skips a file already staged with the same
+        size), so a file attached at message 4 is still there at message 40. The
+        staged dir is kept in sync with the live rows — a deleted attachment's
+        staged copy is pruned, so the agent stops seeing content the user
+        removed (the store stays the source of truth). Best-effort per file:
+        one unreadable file is logged and skipped, never fails the turn. Returns
+        the number staged.
+        """
+        try:
+            conv_seg = str(UUID(str(conversation_id)))  # path segment must be a real id, never `..`
+        except (ValueError, TypeError):
+            return 0
+        dest_root = Path(project_path) / "conversations" / conv_seg / "attachments"
+        # Only copy bytes that live under THIS org's files root — a legacy
+        # escaped row (path into another org) must not be dragged into the
+        # workspace where the pod would read it.
+        try:
+            files_root = self._root_dir().resolve()
+        except Exception:
+            files_root = None
+        rows = self.list_file_rows(attachment_purpose(str(conversation_id)))
+        staged_ids: set[str] = set()
+        staged = 0
+        for row in rows:
+            try:
+                src = Path(row.path)
+                if not src.is_file():
+                    continue
+                if files_root is not None and files_root not in src.resolve().parents:
+                    logger.warning("attachment %s path is outside the org files root; skipping", row.id)
+                    continue
+                # Containment: the pod can write under attachments/, so resolve
+                # symlinks and refuse a dest that escapes the conversation dir.
+                dest = safe_join(dest_root, str(row.id), src.name)
+                if not (dest.is_file() and dest.stat().st_size == row.size):
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                staged_ids.add(str(row.id))
+                staged += 1
+            except (OSError, ValueError):
+                logger.warning(
+                    "could not stage attachment %s for conversation %s",
+                    getattr(row, "id", "?"), conversation_id, exc_info=True,
+                )
+        # Prune every staged dir we did NOT just (re)stage — covers a deleted
+        # row, a row whose source bytes vanished, and one skipped as out-of-root
+        # — so the agent stops seeing content the store no longer backs.
+        try:
+            if dest_root.is_dir():
+                for child in dest_root.iterdir():
+                    if child.name in staged_ids:
+                        continue
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink()
+        except OSError:
+            logger.warning("could not prune stale staged attachments for conversation %s",
+                           conversation_id, exc_info=True)
+        return staged

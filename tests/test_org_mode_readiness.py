@@ -117,12 +117,17 @@ class TestOrgModeCreditAwareDefaults:
     Every minds-cloud role default IS MINDS_FREE_MODEL now, so the two arms of
     that branch return the same string for every real map: an org resolves to the
     free model whether its wallet can pay or not. That makes a fixture built from
-    the role defaults useless here — ``{MINDS_FREE_MODEL: True, _PLANNING: False}``
-    is one key, not two, and every assertion becomes
+    the role defaults useless here: a map spelled "free enabled, canonical default
+    disabled" is one key rather than two, and every assertion through it becomes
     ``mindshub_air == mindshub_air``. So the map cases below assert the single
     outcome they actually have, and the branch itself is pinned separately by
     ``test_org_needs_positive_evidence_for_a_non_free_default``, which is the only
     test here that can still tell the two arms apart.
+
+    That branch is also no longer the last word. ``_resolved_model`` runs with
+    ``wallet_aware=True`` on all three roles now, so whatever this branch fills in
+    is replaced by the first enabled alias when the map marks it uncallable. The
+    two layers apply in order, and the cases below say which one decided.
     """
 
     # A funded wallet and no map at all: every role lands on the free model,
@@ -140,8 +145,7 @@ class TestOrgModeCreditAwareDefaults:
         assert s.resolved_coding_model == MINDS_FREE_MODEL
         assert s.resolved_router_model == MINDS_FREE_MODEL
 
-    # Once the map stops vouching for the free model the three roles diverge, and
-    # the org branch is not what decides it for two of them.
+    # Once the map stops vouching for the free model, every role leaves it.
     @pytest.mark.parametrize(
         "enabled_map",
         [
@@ -149,22 +153,28 @@ class TestOrgModeCreditAwareDefaults:
             pytest.param(json.dumps({"sonnet": True}), id="default-unlisted"),
         ],
     )
-    def test_org_planning_holds_the_free_model_while_the_aux_roles_move(
+    def test_org_moves_every_role_off_a_free_model_the_map_disowns(
         self, org_mode, enabled_map
     ):
-        """Planning goes through the org branch; coding and router do not.
+        """Both layers fire, and the second one decides.
 
         The org arm of ``_enabled_aware_default`` has no first-enabled fallback, so
-        planning stays on MINDS_FREE_MODEL even when the map says it is not
-        callable. Coding and router resolve through ENG-1632's wallet-aware path
-        instead, which does substitute the first enabled alias. So a drained org
-        runs its two invisible roles on a paid model while the visible one points
-        at a model the map has disabled. That is the fully-drained account
-        ENG-1652 puts out of scope, pinned here so the split is on the record
-        rather than discovered again.
+        it fills all three roles with MINDS_FREE_MODEL even here, where the map
+        says that model cannot be called. ``_resolved_model`` then runs
+        ``wallet_aware`` on each role and swaps in the first enabled alias, so the
+        org arm's answer never reaches a turn.
+
+        Planning was exempt from that second layer until the wallet-aware pass was
+        extended to it (ENG-1632 follow-up), which is why this used to read as a
+        three-way split: the visible role held a disabled model while the two
+        invisible ones moved. All three move now.
+
+        The alias they land on is paid, which is the fully-drained account
+        ENG-1652 puts out of scope. Pinned here so it stays on the record rather
+        than being rediscovered.
         """
         s = _settings(minds_model_enabled=enabled_map)
-        assert s.resolved_planning_model == MINDS_FREE_MODEL
+        assert s.resolved_planning_model == "sonnet"
         assert s.resolved_coding_model == "sonnet"
         assert s.resolved_router_model == "sonnet"
 
@@ -184,7 +194,41 @@ class TestOrgModeCreditAwareDefaults:
         s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, "sonnet": listed}))
         assert s.resolved_planning_model == ("sonnet" if listed else MINDS_FREE_MODEL)
 
-    def test_org_explicit_choice_is_never_rewritten(self, org_mode):
+    def test_org_explicit_stored_choice_survives_the_default_fill(self, org_mode):
+        # apply_model_defaults only fills a None model at construction time. An
+        # explicitly stored value is never touched there, whatever
+        # resolved_planning_model later does with it.
+        s = _settings(
+            minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True}), planning_model="opus"
+        )
+        assert s.planning_model == "opus"
+
+    def test_org_explicit_choice_of_an_available_model_is_not_rewritten(self, org_mode):
+        # A pick the map currently enables is left alone by the wallet-aware
+        # fallback; only a locked or foreign id gets swapped.
+        s = _settings(
+            minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, "sonnet": True}),
+            planning_model="sonnet",
+        )
+        assert s.resolved_planning_model == "sonnet"
+
+    def test_org_explicit_choice_of_a_locked_or_foreign_model_falls_back(self, org_mode):
+        # wallet_aware (ENG-1632 follow-up): planning gets the same fallback as
+        # coding and router. An id absent from a non-empty map — a BYOK pick like
+        # "opus" surviving a MindsHub SSO sign-in, or a locked MindsHub model —
+        # resolves to the first enabled model instead of 404ing the gateway on
+        # every turn.
+        s = _settings(
+            minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True}), planning_model="opus"
+        )
+        assert s.resolved_planning_model == MINDS_FREE_MODEL
+
+    def test_org_keeps_an_explicit_choice_when_nothing_is_enabled(self, org_mode):
+        # The one case the fallback above deliberately does not cover: with no
+        # enabled entry anywhere there is nothing to fall back TO, so the stored
+        # value stays. Degraded metadata must not change behaviour, and this is
+        # the arm that keeps a drained account on the model the user picked
+        # instead of inventing one.
         s = _settings(
             minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False}), planning_model="opus"
         )
