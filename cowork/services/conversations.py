@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import stat
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +10,12 @@ from uuid import UUID
 from sqlalchemy import case, func
 from sqlalchemy import select as sa_select
 
-from cowork.common.paths import opened_subdir_nofollow
+from cowork.common.paths import (
+    dir_lstat,
+    dir_rmtree,
+    dir_unlink,
+    opened_subdir_nofollow,
+)
 from cowork.db.scoped import ScopedSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
@@ -80,7 +84,7 @@ def _sweep_skill_drafts(session, project_id, slugs: set[str]) -> None:
     # opened_subdir_nofollow). slug comes from an event, so reject anything that
     # is not a single path component before handing it to the kernel.
     try:
-        with opened_subdir_nofollow(Path(project.path), ".anton", "skill_drafts") as fd:
+        with opened_subdir_nofollow(Path(project.path), ".anton", "skill_drafts") as d:
             for slug in slugs:
                 if (
                     os.sep in slug
@@ -89,16 +93,14 @@ def _sweep_skill_drafts(session, project_id, slugs: set[str]) -> None:
                 ):
                     continue
                 try:
-                    st = os.lstat(slug, dir_fd=fd)
+                    st = dir_lstat(d, slug)
                 except FileNotFoundError:
                     continue
                 try:
                     if stat.S_ISLNK(st.st_mode):
-                        os.unlink(
-                            slug, dir_fd=fd
-                        )  # drop the link only, never follow it
+                        dir_unlink(d, slug)  # drop the link only, never follow it
                     elif stat.S_ISDIR(st.st_mode):
-                        shutil.rmtree(slug, dir_fd=fd)
+                        dir_rmtree(d, slug)
                 except OSError:
                     logger.warning(
                         "Could not sweep skill draft %r on turn delete",
