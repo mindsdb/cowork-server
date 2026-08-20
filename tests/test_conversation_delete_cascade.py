@@ -160,14 +160,17 @@ def test_delete_project_survives_one_conversation_delete_failure(session, monkey
     _attach(session, bad.id)
     good_file = _attach(session, good.id)
 
-    real = ConversationService.delete_conversation
+    # The project cascade deletes each conversation owner-agnostically via
+    # delete_conversation_row (not the owner-scoped delete_conversation), so
+    # inject the fault there.
+    real = ConversationService.delete_conversation_row
 
-    def flaky(self, cid):
-        if str(cid) == str(bad.id):
+    def flaky(self, conversation):
+        if str(conversation.id) == str(bad.id):
             raise RuntimeError("boom")
-        return real(self, cid)
+        return real(self, conversation)
 
-    monkeypatch.setattr(ConversationService, "delete_conversation", flaky)
+    monkeypatch.setattr(ConversationService, "delete_conversation_row", flaky)
 
     assert ProjectService(ScopedSession(session, LOCAL_SCOPE)).delete_project(proj.id) is True
     assert session.get(Project, proj.id) is None, "project deleted despite one failure"
