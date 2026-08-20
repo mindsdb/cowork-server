@@ -13,7 +13,8 @@ silently leak across builds and defeat the isolation.
 """
 
 import os
-import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 _DEFAULT_HOME = Path.home() / ".cowork"
@@ -66,6 +67,45 @@ def pod_local_only(local_path: Path, name: str) -> Path:
     return Path(settings.pod_scratch_dir) / name
 
 
+@contextmanager
+def opened_subdir_nofollow(
+    base: Path | str, *names: str, create: bool = False
+) -> Iterator[int]:
+    """Yield a directory descriptor for ``base/<names...>``, opening every
+    component below *base* with ``O_NOFOLLOW`` so no symlink in the chain can
+    redirect the caller out of *base*'s tree.
+
+    *base* is trusted (a cowork-server-created directory, e.g. a project dir)
+    and is opened normally. Each *name* is opened ``O_NOFOLLOW``, so a symlink
+    planted at any level (the agent's pod mounts its own subtree read-write and
+    can swap a component for a link into another org) raises ``OSError``
+    (``ELOOP``) instead of being traversed. With ``create=True`` each missing
+    level is ``mkdir``'d first; the open is still ``O_NOFOLLOW``, so a link
+    already squatting the name is refused, not followed.
+
+    The caller acts relative to the yielded fd (``os.open(child, dir_fd=fd)``,
+    ``shutil.rmtree(child, dir_fd=fd)``), which the kernel resolves against the
+    pinned inode with nothing left to swap between check and use. This is the
+    same defence ``ProjectService`` applies to the projects root, and closes
+    the ``safe_join`` gap where a symlinked *base* has already escaped before
+    the containment check runs. Caller must NOT close the yielded fd.
+    """
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in names:
+            if create:
+                try:
+                    os.mkdir(name, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def safe_join(base: Path | str, *parts: str) -> Path:
     """Join user-controlled *parts* onto *base*, guaranteeing containment.
 
@@ -100,7 +140,9 @@ def safe_join(base: Path | str, *parts: str) -> Path:
     base_real = os.path.realpath(base_norm)
     target_real = os.path.realpath(target)
     if os.path.commonpath([base_real, target_real]) != base_real:
-        raise ValueError(f"path {target!r} resolves outside base directory {base_norm!r}")
+        raise ValueError(
+            f"path {target!r} resolves outside base directory {base_norm!r}"
+        )
 
     return Path(target_real)
 

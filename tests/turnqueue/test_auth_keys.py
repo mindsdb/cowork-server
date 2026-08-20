@@ -33,7 +33,8 @@ async def test_mint_turn_key_posts_and_returns_plaintext(monkeypatch):
         ttl_seconds=1200, settings=_Settings(),
     )
     assert key == "mdb_turnkey123"
-    assert captured["url"].endswith("/v1/internal/turn-keys/")
+    assert captured["url"].endswith("/internal/turn-keys/")
+    assert "/v1/internal/turn-keys/" not in captured["url"]
     assert captured["headers"]["X-Internal-Auth"] == "shh"
     assert "Authorization" not in captured["headers"]
     assert captured["json"]["instance_id"] == "corr-1"
