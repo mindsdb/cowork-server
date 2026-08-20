@@ -53,7 +53,7 @@ class _FakeAdapters:
     def __init__(self, by_type):
         self._by_type = by_type
 
-    def get(self, channel_type):
+    def get(self, channel_type, org_id=None):
         return self._by_type.get(channel_type)
 
 
@@ -272,3 +272,85 @@ def test_slack_event_from_callback():
 
     # Non-event envelopes (e.g. a bare url_verification) are ignored here.
     assert bridge._event_from_callback({"type": "url_verification", "challenge": "abc"}) is None
+
+
+def test_ingress_manager_org_scoped_lease_mutual_exclusion(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    async def scenario():
+        mgr1 = IngressManager(sink=_noop_sink)
+        mgr2 = IngressManager(sink=_noop_sink)
+        bridge1 = _FakeStreamBridge()
+        bridge2 = _FakeStreamBridge()
+
+        await mgr1.start("discord", bridge1, org_id="org-a")
+        await mgr2.start("discord", bridge2, org_id="org-a")
+
+        assert mgr1.is_running("discord", "org-a")
+        assert not mgr2.is_running("discord", "org-a")
+        assert not bridge2.opened.is_set()
+
+        await mgr1.stop("discord", "org-a")
+        assert not mgr1.is_running("discord", "org-a")
+
+        # The lease was released on stop — mgr2 can now acquire it.
+        await mgr2.start("discord", bridge2, org_id="org-a")
+        assert mgr2.is_running("discord", "org-a")
+        await mgr2.stop("discord", "org-a")
+
+    asyncio.run(scenario())
+
+
+def test_ingress_manager_org_scoped_lease_failover_on_renew_loss(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+    monkeypatch.setattr(ingress_lease, "RENEW_INTERVAL_S", 0.01)
+    monkeypatch.setattr(ingress_lease, "LEASE_TTL_S", 0.03)
+
+    async def scenario():
+        mgr1 = IngressManager(sink=_noop_sink)
+        bridge1 = _FakeStreamBridge()
+        await mgr1.start("discord", bridge1, org_id="org-a")
+        assert mgr1.is_running("discord", "org-a")
+
+        # Simulate another replica stealing the lease after mgr1's TTL lapsed.
+        await client.delete(ingress_lease._key("discord", "org-a"))
+        await ingress_lease.acquire("discord", "org-a", "someone-else")
+
+        # mgr1's next renewal tick must notice and stop its own stream loop.
+        await asyncio.sleep(0.05)
+        assert not mgr1.is_running("discord", "org-a")
+
+        mgr2 = IngressManager(sink=_noop_sink)
+        bridge2 = _FakeStreamBridge()
+        await mgr2.start("discord", bridge2, org_id="org-a")
+        assert mgr2.is_running("discord", "org-a")
+        await mgr2.stop("discord", "org-a")
+
+    asyncio.run(scenario())
+
+
+def test_ingress_manager_local_mode_never_touches_the_lease(monkeypatch):
+    # org_id=None must skip the lease path entirely — if it didn't, this
+    # would blow up (get_redis is never patched in this test).
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        bridge = _FakeStreamBridge()
+        await mgr.start("discord", bridge)
+        assert mgr.is_running("discord")
+        await mgr.stop("discord")
+
+    asyncio.run(scenario())
