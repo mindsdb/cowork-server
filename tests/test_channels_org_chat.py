@@ -16,7 +16,6 @@ import asyncio
 import hashlib
 import hmac
 import json
-import os
 import time
 
 import httpx
@@ -24,19 +23,15 @@ import pytest
 from sqlmodel import select
 
 import cowork.channels.runtime as runtime_mod
-from cowork.channels.registry import load_first_party_plugins
 from cowork.channels.webhooks import drain_background_tasks
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import get_user_settings, invalidate_user_settings_cache
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.models.conversation import Conversation
-from cowork.models.message import Message
 from cowork.services.channels import ChannelConfigService
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 SIGNING_SECRET = "test-signing-secret-org-chat"
 
 
