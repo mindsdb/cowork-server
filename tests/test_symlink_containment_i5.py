@@ -49,8 +49,8 @@ def test_opened_subdir_nofollow_refuses_a_symlinked_component(tmp_path):
 def test_opened_subdir_nofollow_creates_real_dirs(tmp_path):
     base = tmp_path / "project"
     base.mkdir()
-    with opened_subdir_nofollow(base, ".anton", "memory", create=True) as fd:
-        assert isinstance(fd, int)
+    with opened_subdir_nofollow(base, ".anton", "memory", create=True) as d:
+        assert isinstance(d.fd, int)  # a real O_NOFOLLOW descriptor on POSIX
     assert (base / ".anton" / "memory").is_dir()
     assert not (base / ".anton" / "memory").is_symlink()
 
