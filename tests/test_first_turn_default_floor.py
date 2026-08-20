@@ -7,19 +7,22 @@ tracked the resulting gap: with an empty map the resolver handed out the paid
 canonical default (``sonnet``) and the empty free-tier wallet 403'd on turn one.
 
 The fix is a FLOOR, not a cache-warm. ``role_defaults`` (app_settings) makes the
-org-mode minds-cloud default the free-allowance model (``mindshub_air``), which
-the free monthly allowance always covers — so a cold boot is correct regardless
-of whether the availability map has been fetched yet. cowork-server#341 (warm
-the map on the turn path) was closed as superseded: it added yet another refresh
-trigger for a cache that no longer gates correctness, reintroducing the
+minds-cloud default the free-allowance model (``mindshub_air``) in both tenancy
+modes, which the free monthly allowance always covers — so a cold boot resolves
+the *unset* default correctly regardless of whether the availability map has been
+fetched yet. The map warm #353 adds (``test_enabled_map_warm``) is a narrower
+thing that survives alongside this floor: it heals a stored *paid pin* before the
+picker loads, which the floor does not cover. cowork-server#341 (warm on the
+*turn path*) stays closed — a per-turn refresh trigger is the
 multiple-writers-of-availability shape these defaults were meant to retire.
 
 These tests pin the floor so a future refactor can't quietly bring back the
 paid-default-on-first-turn 403 — the empty-map path is what a real first turn
-hits, not the funded happy path. In org mode the free model is the default for
-*every* tenant (funded or not): premium is opt-in via an explicit pick, which is
-honored when the map says it's enabled. Desktop (local mode) is deliberately
-unaffected: it keeps the premium canonical defaults, gated on a real stored key.
+hits, not the funded happy path. The free model is the default for *every*
+tenant (funded or not) in both tenancy modes: premium is opt-in via an explicit
+pick, which is honored when the map says it's enabled. ENG-1652 (#346) folded
+desktop (local mode) into the same floor; it is no longer carved out with the
+premium canonical defaults.
 
 Companion coverage: ``test_enabled_aware_model_defaults`` (local-mode map
 resolution + endpoint cache writes) and ``test_org_mode_readiness`` (org-mode
@@ -112,11 +115,14 @@ def test_org_explicit_paid_pick_is_honored_when_enabled(org_mode):
     assert s.resolved_planning_model == "sonnet"
 
 
-# ── The floor is org-only ─────────────────────────────────────────────
+# ── The floor is mode-independent ─────────────────────────────────────
 
-def test_local_mode_keeps_paid_canonical_on_empty_map(local_mode):
-    # Desktop resolves against a real stored key and keeps the premium
-    # canonical defaults; the free-first floor is an org-mode override only.
+def test_local_mode_also_floors_every_role_to_the_free_model(local_mode):
+    # ENG-1652 (#346) made the minds-cloud default the free model in both
+    # tenancy modes; desktop is no longer carved out. A stored MindsHub key
+    # does not change what an *unset* role resolves to on an empty map — the
+    # same first-turn floor as org mode. Premium stays opt-in via an explicit
+    # pick (see the paid-pick test above), not a mode-dependent default.
     s = _settings(
         planning_provider=Provider.MINDS_CLOUD,
         coding_provider=Provider.MINDS_CLOUD,
@@ -124,6 +130,6 @@ def test_local_mode_keeps_paid_canonical_on_empty_map(local_mode):
         minds_api_key="mdb_test",
         minds_model_enabled="{}",
     )
-    assert s.resolved_planning_model == "sonnet"
-    assert s.resolved_coding_model == "haiku"
-    assert s.resolved_router_model == "kimi"
+    assert s.resolved_planning_model == "mindshub_air"
+    assert s.resolved_coding_model == "mindshub_air"
+    assert s.resolved_router_model == "mindshub_air"
