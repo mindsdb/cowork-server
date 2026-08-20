@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from urllib.error import HTTPError
+from urllib.parse import urlparse
 
 import pytest
 
@@ -132,9 +133,9 @@ class _FakeJsonResponse:
 
 def test_fetch_userinfo_posthog_falls_back_to_eu_host_on_us_failure(monkeypatch):
     def _fake_urlopen(request, timeout=20):
-        if request.full_url.startswith("https://us.posthog.com"):
+        if urlparse(request.full_url).hostname == "us.posthog.com":
             raise HTTPError(request.full_url, 401, "Unauthorized", {}, None)
-        assert request.full_url.startswith("https://eu.posthog.com")
+        assert urlparse(request.full_url).hostname == "eu.posthog.com"
         return _FakeJsonResponse({"email": "eu-user@example.com", "first_name": "EU", "last_name": "User"})
 
     monkeypatch.setattr(google_module, "urlopen", _fake_urlopen)
@@ -146,7 +147,7 @@ def test_fetch_userinfo_posthog_falls_back_to_eu_host_on_us_failure(monkeypatch)
 
 def test_fetch_userinfo_posthog_uses_us_host_when_it_succeeds(monkeypatch):
     def _fake_urlopen(request, timeout=20):
-        assert request.full_url.startswith("https://us.posthog.com")
+        assert urlparse(request.full_url).hostname == "us.posthog.com"
         return _FakeJsonResponse({"email": "us-user@example.com", "first_name": "US", "last_name": "User"})
 
     monkeypatch.setattr(google_module, "urlopen", _fake_urlopen)
