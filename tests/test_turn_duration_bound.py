@@ -1,11 +1,17 @@
-"""An in-flight turn must not run forever (ENG-1711 / ENG-1717).
+"""An in-flight turn must not run forever, but must not be reaped while it is
+making progress or waiting on the user (ENG-1711 / ENG-1717).
 
-A hung producer (wedged tool call, stalled model stream) otherwise keeps its
-handle `is_running`, never writes a terminal record, and — on the in-process
+A hung producer (wedged tool call, stalled model stream) keeps its handle
+`is_running`, never writes a terminal record, and — on the in-process
 FileStreamBuffer path — leaves a client tail blocking indefinitely, holding the
 shared stream slot so sends wedge in every conversation. Boot recovery only
 covers a process restart; a re-adopted crash-orphan sidecar keeps the same task
 alive, so the bound is enforced at runtime in `RunRegistry`.
+
+The bound is on IDLE time (no buffer record written), not total duration: a
+turn that streams frames — or one blocked on an `ask_user` card and then
+resuming — keeps advancing `buffer.latest_seq` and is never reaped, so a long
+deliberate turn is not killed mid-conversation.
 """
 
 from __future__ import annotations
@@ -20,39 +26,51 @@ from cowork.streaming.registry import registry
 
 # The submodule name `cowork.streaming.registry` is shadowed on the package by
 # the re-exported `registry` instance, so reach the real module (to patch its
-# duration-bound global) through sys.modules rather than attribute access.
+# idle-bound globals) through sys.modules rather than attribute access.
 _REGISTRY_MODULE = sys.modules["cowork.streaming.registry"]
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry():
+def _fast_watchdog(monkeypatch):
+    # Sample often so the tests' small idle windows are detected promptly.
+    monkeypatch.setattr(_REGISTRY_MODULE, "_IDLE_POLL_SECONDS", 0.01)
     yield
     registry.reset()
 
 
 class _FakeBuffer:
+    """Faithful to the progress signal the watchdog reads: `latest_seq` counts
+    records written, advancing on every `append` and staying flat while the
+    producer is silent (a wedge, or an open `ask_user` card)."""
+
     def __init__(self) -> None:
         self.closed: str | None = None
+        self._seq = 0
+
+    @property
+    def latest_seq(self) -> int:
+        return self._seq
 
     async def append(self, type_, data):
-        return 1
+        self._seq += 1
+        return self._seq
 
     async def close(self, reason, extra=None):
         self.closed = reason
 
 
 async def test_hung_turn_is_bounded_and_sealed(monkeypatch):
-    """A producer that never finishes is cancelled at the duration bound, and
-    its CancelledError handler seals the buffer — the same path a user Stop
-    takes — so a tail ends and the client releases its shared stream slot."""
-    monkeypatch.setattr(_REGISTRY_MODULE, "_MAX_TURN_DURATION_SECONDS", 0.05)
+    """A producer that goes fully silent is cancelled at the idle bound, and its
+    CancelledError handler seals the buffer — the same path a user Stop takes —
+    so a tail ends and the client releases its shared stream slot."""
+    monkeypatch.setattr(_REGISTRY_MODULE, "_MAX_TURN_IDLE_SECONDS", 0.05)
     buffer = _FakeBuffer()
     started = asyncio.Event()
 
     async def _hung_producer():
         started.set()
         try:
-            await asyncio.sleep(3600)  # wedged: writes no terminal on its own
+            await asyncio.sleep(3600)  # wedged: writes no record on its own
         except asyncio.CancelledError:
             await buffer.close("cancelled")  # mirror every real producer
 
@@ -62,7 +80,7 @@ async def test_hung_turn_is_bounded_and_sealed(monkeypatch):
     )
     await asyncio.wait_for(started.wait(), timeout=5)
 
-    # The 0.05 s bound elapses well within this wait.
+    # The 0.05 s idle window elapses well within this wait.
     await asyncio.wait_for(
         asyncio.gather(handle.task, return_exceptions=True), timeout=5
     )
@@ -74,7 +92,7 @@ async def test_hung_turn_is_bounded_and_sealed(monkeypatch):
 
 async def test_normal_turn_completes_without_the_bound_firing(monkeypatch):
     """A producer that finishes on its own is untouched by the bound."""
-    monkeypatch.setattr(_REGISTRY_MODULE, "_MAX_TURN_DURATION_SECONDS", 5)
+    monkeypatch.setattr(_REGISTRY_MODULE, "_MAX_TURN_IDLE_SECONDS", 5)
     buffer = _FakeBuffer()
 
     async def _quick_producer():
@@ -88,10 +106,35 @@ async def test_normal_turn_completes_without_the_bound_firing(monkeypatch):
     assert buffer.closed == "completed"
 
 
+async def test_a_progressing_turn_is_not_reaped_past_the_window(monkeypatch):
+    """The regression the idle bound exists to prevent: a turn whose total
+    wall-clock exceeds the window is NOT reaped as long as it keeps writing
+    records. This is the `ask_user`/long-deliberation case — each frame (a
+    question, an answer's continuation) resets the idle window, so human wait
+    never accumulates toward the bound."""
+    monkeypatch.setattr(_REGISTRY_MODULE, "_MAX_TURN_IDLE_SECONDS", 0.05)
+    buffer = _FakeBuffer()
+
+    async def _progressing_producer():
+        # ~0.18 s total, far past the 0.05 s window, but each silent gap
+        # (0.03 s) stays under it — so the watchdog must never fire.
+        for _ in range(6):
+            await buffer.append("sse", {})
+            await asyncio.sleep(0.03)
+        await buffer.close("completed")
+
+    handle = await registry.start(
+        conversation_id="conv-progress", turn_id=0, buffer=buffer,
+        producer_coro=_progressing_producer(),
+    )
+    await asyncio.wait_for(handle.task, timeout=5)
+    assert buffer.closed == "completed"  # completed on its own, not "cancelled"
+
+
 async def test_external_cancel_still_propagates_through_the_bound(monkeypatch):
     """RunHandle.cancel must still cancel the producer through the wrapper, so
     an ordinary Stop keeps working and persists its partial turn."""
-    monkeypatch.setattr(_REGISTRY_MODULE, "_MAX_TURN_DURATION_SECONDS", 3600)
+    monkeypatch.setattr(_REGISTRY_MODULE, "_MAX_TURN_IDLE_SECONDS", 3600)
     buffer = _FakeBuffer()
     started = asyncio.Event()
 
