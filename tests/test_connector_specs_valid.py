@@ -98,16 +98,41 @@ def test_spec_has_no_unknown_keys(path: Path):
     )
 
 
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_spec_id_matches_its_filename(path: Path):
+    """`id` and the filename must agree, and it is load-bearing in two places.
+
+    The registry keys connectors by the `id` field while every consumer reaches
+    for them by slug, and `FormLogo` derives its brand mark from
+    `logos/{connector_id}.svg` (DataVaultForm.jsx, ENG-1534) — so a spec whose
+    id drifts from its filename would silently lose its logo.
+
+    Asserted separately from the load test below so a divergence reports itself
+    as a mismatch rather than as a phantom "the registry skipped this file".
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data.get("id", path.stem) == path.stem, (
+        f"{path.name} declares id={data.get('id')!r}; the registry keys on the id "
+        "while consumers use the filename slug."
+    )
+
+
 def test_registry_loads_every_spec_file():
     """The direct guard on the silent skip.
 
     `_load_all` swallows a parse failure, so a broken spec shows up only as a
     connector that is not there. Comparing counts is what turns that into a
     red test instead of a missing feature.
+
+    Keyed on the spec's own `id` (which the registry uses), not the filename —
+    `test_spec_id_matches_its_filename` above is what ties the two together, so
+    a failure here means a genuine load failure rather than a naming drift.
     """
     loaded = ConnectorSpecRegistry(SPECS_DIR).get_connectors()
-    on_disk = {p.stem for p in SPEC_FILES}
-    missing = on_disk - set(loaded)
+    declared = {
+        json.loads(p.read_text(encoding="utf-8")).get("id", p.stem) for p in SPEC_FILES
+    }
+    missing = declared - set(loaded)
     assert not missing, f"specs on disk that the registry silently skipped: {sorted(missing)}"
     assert len(loaded) == len(SPEC_FILES)
 
