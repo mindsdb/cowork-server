@@ -258,6 +258,8 @@ class ConversationService:
         topic: str,
         project_id: UUID | None = None,
         conversation_id: UUID | None = None,
+        harness: str | None = None,
+        model: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
@@ -271,6 +273,8 @@ class ConversationService:
         conversation = Conversation(
             topic=topic,
             project_id=target_project_id,
+            harness=harness,
+            model=model,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
@@ -354,6 +358,7 @@ class ConversationService:
         from cowork.services.files import (
             FileService,
             attachment_purpose,
+            remove_conversation_workspace_dir,
             unlink_file_dirs,
         )
         attachment_dirs = FileService(self.session).delete_by_purpose(
@@ -378,6 +383,9 @@ class ConversationService:
         self.session.commit()
         unlink_file_dirs(attachment_dirs)
         remove_conversation_sessions(session_project_path, conversation_id)
+        # Also drop the per-conversation workspace (staged attachments +
+        # instructions on the shared mount) so it doesn't orphan there.
+        remove_conversation_workspace_dir(session_project_path, conversation_id)
         return True
 
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:

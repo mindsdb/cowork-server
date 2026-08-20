@@ -22,6 +22,29 @@ def test_turn_reply_parses_and_validates():
     assert reply.data["text"] == "hi"
 
 
+def test_turn_reply_accepts_every_kind_the_controller_publishes():
+    """Hand-synced with scratchpad-controller's ScratchpadReplyPayload. The reply
+    loop validates each entry unguarded, so a kind missing here fails the whole
+    turn instead of being ignored — which is why this is an exhaustive list and
+    not a spot check of the kinds cowork currently acts on."""
+    import typing
+
+    published = {
+        "progress", "cell", "error", "turn_delta", "turn_step",
+        "turn_memory", "turn_skill", "turn_completed", "turn_failed",
+    }
+    accepted = set(typing.get_args(TurnReply.model_fields["kind"].annotation))
+    assert published == accepted
+
+
+def test_turn_reply_parses_a_skill_draft():
+    """A draft on the reply stream must not blow up the turn it belongs to."""
+    reply = TurnReply.model_validate_json(
+        '{"correlation_id":"r","kind":"turn_skill","data":'
+        '{"entries":[{"slug":"my-skill","files":{"SKILL.md":"body"}}]}}')
+    assert reply.data["entries"][0]["slug"] == "my-skill"
+
+
 def test_deadline_ms_is_a_duration_not_an_epoch():
     """The controller reads this as a relative budget. An epoch value would mean a
     ~57 year deadline, i.e. no timeout at all, so it must fail loudly here."""

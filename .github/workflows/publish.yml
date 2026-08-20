@@ -51,6 +51,7 @@ jobs:
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: production
+      build-runner: mdb-prod
       # On again now that prod is stood up. It was off because the rollout ran
       # against a namespace with no cowork-server release and no
       # scratchpad-controller, which failed every push to main.
