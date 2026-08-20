@@ -15,6 +15,12 @@ from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
 
 PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
 
+# Every slot filename is a fixed, hardcoded value in the registry; a slot id is a
+# validated `MemorySlot` enum. `_filename` re-checks the resolved name against
+# this closed set (and rejects any separator) so the value reaching os.open /
+# os.unlink is provably one of a handful of constants, never attacker-shaped.
+_KNOWN_SLOT_FILENAMES = frozenset(spec.filename for spec in SLOT_REGISTRY.values())
+
 
 class MemoryStore:
     def __init__(
@@ -45,7 +51,17 @@ class MemoryStore:
     def _filename(self, slot_id: MemorySlot | str) -> str:
         slot_id = MemorySlot(slot_id) if isinstance(slot_id, str) else slot_id
         self._validate_slot(slot_id)
-        return SLOT_REGISTRY[slot_id].filename
+        name = SLOT_REGISTRY[slot_id].filename
+        # Allowlist the resolved filename before it reaches a filesystem sink: it
+        # is always a fixed registry constant, so anything else (or a separator)
+        # is a bug, not a path to honour.
+        if (
+            name not in _KNOWN_SLOT_FILENAMES
+            or os.sep in name
+            or (os.altsep and os.altsep in name)
+        ):
+            raise ValueError(f"invalid memory slot filename: {name!r}")
+        return name
 
     @contextmanager
     def _root_fd(self, *, create: bool) -> Iterator[int]:
