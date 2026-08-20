@@ -1,0 +1,76 @@
+{
+  "id": "langfuse",
+  "label": "Langfuse",
+  "aliases": [
+    "langfuse.com",
+    "langfuse cloud",
+    "llm observability",
+    "llm tracing"
+  ],
+  "keywords": [
+    "llm observability",
+    "llm tracing",
+    "traces",
+    "observations",
+    "generations",
+    "spans",
+    "sessions",
+    "scores",
+    "evals",
+    "prompt management",
+    "token cost",
+    "latency",
+    "agent debugging"
+  ],
+  "description": "Connect to Langfuse to query LLM traces, observations, sessions, and evaluation scores from your projects.",
+  "category": "observability",
+  "logo": "sparkle",
+  "logo_color": "#0A60B5",
+  "logo_url": "logos/langfuse.svg",
+  "form": {
+    "form_id": "langfuse-connector",
+    "title": "Connect Langfuse",
+    "subtitle": "Paste your Langfuse public and secret keys to start querying your LLM traces.",
+    "logo": "sparkle",
+    "logo_color": "#0A60B5",
+    "logo_url": "logos/langfuse.svg",
+    "methods": [
+      {
+        "id": "api-key",
+        "label": "API Key Pair",
+        "description": "Paste the public and secret keys from your Langfuse project settings. Used together as HTTP Basic credentials — no OAuth setup required.",
+        "recommended": true,
+        "how_to": "## Connect Langfuse with an API key pair\n\nLangfuse authenticates with **two keys used together as HTTP Basic credentials**: a public key (the username) and a secret key (the password).\n\n### Create the keys\n\n1. Open your Langfuse project and go to **Settings → API Keys**.\n2. Click **Create new API keys**.\n3. Copy the **Public Key** (`pk-lf-...`) and the **Secret Key** (`sk-lf-...`).\n4. The secret key is shown **only once** — copy it before closing the dialog. If you lose it, delete the pair and create a new one.\n\n### Pick the right host\n\n- **`https://cloud.langfuse.com`** — Langfuse Cloud, EU region (the default).\n- **`https://us.cloud.langfuse.com`** — Langfuse Cloud, US region.\n- **Self-hosted** — enter your own base URL, e.g. `https://langfuse.mycompany.com`.\n\nUse `cloud.langfuse.com`, not `eu.cloud.langfuse.com`. The `eu.` form is an alias that answers with a redirect, and a Basic-auth request that does not follow redirects fails against it — which looks like a rejected credential rather than a wrong host.\n\n---\n\n## Notes for Anton\n\nRead the credentials from the environment. They are injected with a `DS_LANGFUSE_` prefix and a per-connection suffix, so discover them rather than hard-coding a name — and note these are **not** the `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` names the official SDK auto-reads, so `Langfuse()` will not configure itself:\n\n```python\nimport os, httpx\n\nenv = {k: v for k, v in os.environ.items() if k.startswith(\"DS_LANGFUSE_\")}\npk   = next(v for k, v in env.items() if k.endswith(\"__PUBLIC_KEY\"))\nsk   = next(v for k, v in env.items() if k.endswith(\"__SECRET_KEY\"))\nbase = next((v for k, v in env.items() if k.endswith(\"__BASE_URL\")), \"https://cloud.langfuse.com\").rstrip(\"/\")\n\nr = httpx.get(f\"{base}/api/public/projects\", auth=(pk, sk), timeout=30)\nr.raise_for_status()\nprint(r.json())   # {\"data\": [{\"id\": ..., \"name\": ..., \"organization\": {...}}]}\n```\n\nUse plain HTTP Basic as above rather than the `langfuse` SDK — the package is not guaranteed to be installed.\n\n**Read endpoints** (all under `/api/public/`, all returning `{\"data\": [...], \"meta\": {...}}` with `meta.totalPages` for paging):\n\n| endpoint | returns |\n| -- | -- |\n| `projects` | which project these keys belong to — use it to confirm the connection |\n| `traces` / `traces/{id}` | traces; `{id}` includes the full observation tree |\n| `observations` | individual generations and spans, with `usageDetails`, `model`, `level`, `statusMessage` |\n| `sessions` | grouped conversations |\n| `scores`, `v2/scores` | evaluation scores |\n| `metrics`, `metrics/daily` | aggregates; `metrics/daily` gives per-day counts and cost |\n\nUseful filters on `traces` and `observations`: `userId`, `name`, `tags`, `fromTimestamp`, `toTimestamp`, `page`, `limit`.\n\n**The `traces` list endpoint is intermittently slow** and can time out or return a transient error under load. Retry it before reporting a failure — a single non-200 from `traces` is not evidence the connection is broken. Confirm with `projects` instead, which is cheap and authoritative.\n",
+        "help_url": "https://langfuse.com/faq/all/where-are-langfuse-api-keys",
+        "fields": [
+          {
+            "name": "public_key",
+            "label": "Public Key",
+            "type": "text",
+            "required": true,
+            "placeholder": "pk-lf-...",
+            "description": "From Settings → API Keys. Acts as the Basic-auth username; Langfuse treats it as non-secret."
+          },
+          {
+            "name": "secret_key",
+            "label": "Secret Key",
+            "type": "password",
+            "required": true,
+            "secret": true,
+            "placeholder": "sk-lf-...",
+            "description": "From Settings → API Keys. Shown only once at creation — create a new pair if lost."
+          },
+          {
+            "name": "base_url",
+            "label": "Langfuse Host",
+            "type": "url",
+            "required": false,
+            "default": "https://cloud.langfuse.com",
+            "placeholder": "https://cloud.langfuse.com",
+            "description": "Langfuse Cloud EU (default), https://us.cloud.langfuse.com for US, or your own base URL if self-hosted."
+          }
+        ]
+      }
+    ]
+  }
+}
