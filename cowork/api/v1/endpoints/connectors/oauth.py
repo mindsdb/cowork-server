@@ -7,7 +7,12 @@ from cowork.api.v1.endpoints.guards import require_local
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
-from cowork.services.connectors.oauth.google import _ENGINE_TO_SERVICE, _SERVICE_CREDENTIAL_ATTRS, oauth_service
+from cowork.services.connectors.oauth.google import (
+    _ENGINE_TO_SERVICE,
+    _SERVICE_CREDENTIAL_ATTRS,
+    _credentials_complete,
+    oauth_service,
+)
 
 router = APIRouter()
 
@@ -36,7 +41,7 @@ def get_oauth_credentials(engine: str, request: Request):
     # client_secret exists, so an empty string here means "correctly has
     # none", not "not configured".
     client_secret = getattr(settings, secret_attr, "") if secret_attr else ""
-    if not client_id or (secret_attr and not client_secret):
+    if not _credentials_complete(client_id, client_secret, secret_attr):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"OAuth credentials not configured for {engine!r}.")
     response = {"client_id": client_id, "client_secret": client_secret}
     if OAUTH_SERVICES[service_id].uses_picker and settings.google_picker_api_key:
