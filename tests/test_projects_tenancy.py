@@ -463,3 +463,27 @@ def test_ensure_dir_never_creates_a_path_outside_the_sanitizer(db, tmp_path):
     a.ensure_dir_exists(a.get_project_by_name("reports"))
 
     assert not escape.exists()  # the tampered path was never created
+
+
+def test_delete_project_cascades_all_members_conversations(db):
+    """Regression (owner-scoping PR): delete_project is org-wide cleanup, so it
+    must delete EVERY member's conversation in the project — owner-scoping the
+    cascade would orphan foreign members' rows/bytes (ENG-701)."""
+    from cowork.services.conversations import ConversationService
+    from cowork.models.conversation import Conversation
+    from sqlmodel import select as _select
+
+    alice = _svc(db, _scope(ORG_A, "alice"))
+    proj = alice.create_project("shared-reports")
+
+    a_conv = ConversationService(ScopedSession(Session(db), _scope(ORG_A, "alice"))).create_conversation(
+        topic="alice", project_id=proj.id)
+    b_conv = ConversationService(ScopedSession(Session(db), _scope(ORG_A, "bob"))).create_conversation(
+        topic="bob", project_id=proj.id)
+
+    # Bob's conversation lives in Alice's project; deleting the project (as any
+    # org member) must remove BOTH, leaving no orphaned conversation rows.
+    assert alice.delete_project(proj.id) is True
+    with Session(db) as s:
+        remaining = s.exec(_select(Conversation).where(Conversation.project_id == proj.id)).all()
+    assert remaining == []
