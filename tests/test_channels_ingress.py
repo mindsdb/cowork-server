@@ -354,3 +354,92 @@ def test_ingress_manager_local_mode_never_touches_the_lease(monkeypatch):
         await mgr.stop("discord")
 
     asyncio.run(scenario())
+
+
+def test_reconcile_once_starts_configured_orgs_and_stops_deleted_ones(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+    from cowork.channels.ingress import reconcile_once
+    from cowork.db.session import get_open_session
+    from cowork.models.channel import ChannelInstallation
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    session = get_open_session()
+    try:
+        row = ChannelInstallation(
+            channel_type="discord", display_name="Discord", org_id="org-recon-1",
+        )
+        session.add(row)
+        session.commit()
+        row_id = row.id
+    finally:
+        session.close()
+
+    class _FakeOrgAdapters:
+        """No cache yet for this org — get() misses until get_or_refresh()
+        populates it, exactly like the real LiveAdapterRegistry."""
+
+        def __init__(self):
+            self.bridge = _FakeStreamBridge()
+            self._cached = False
+
+        def get(self, channel_type, org_id=None):
+            if self._cached and channel_type == "discord" and org_id == "org-recon-1":
+                return self.bridge
+            return None
+
+        async def get_or_refresh(self, channel_type, org_id, *, session=None):
+            if channel_type == "discord" and org_id == "org-recon-1":
+                self._cached = True
+                return self.bridge
+            return None
+
+    try:
+        async def scenario():
+            mgr = IngressManager(sink=_noop_sink)
+            adapters = _FakeOrgAdapters()
+
+            await reconcile_once(mgr, adapters)
+            assert mgr.is_running("discord", "org-recon-1")
+
+            cleanup = get_open_session()
+            try:
+                stored = cleanup.get(ChannelInstallation, row_id)
+                cleanup.delete(stored)
+                cleanup.commit()
+            finally:
+                cleanup.close()
+
+            await reconcile_once(mgr, adapters)
+            assert not mgr.is_running("discord", "org-recon-1")
+
+        asyncio.run(scenario())
+    finally:
+        cleanup = get_open_session()
+        try:
+            stored = cleanup.get(ChannelInstallation, row_id)
+            if stored is not None:
+                cleanup.delete(stored)
+                cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_reconciler_task_can_be_started_and_cancelled():
+    from cowork.channels.ingress import start_reconciler
+
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        task = start_reconciler(mgr, _FakeAdapters({}), interval_s=0.01)
+        await asyncio.sleep(0.03)
+        assert not task.done()
+        task.cancel()
+        with __import__("contextlib").suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())

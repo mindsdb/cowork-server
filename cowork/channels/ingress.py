@@ -172,3 +172,57 @@ async def sync_channel_ingress(
             await manager.start(channel_type, adapter, org_id)
         return
     await manager.stop(channel_type, org_id)
+
+
+_RECONCILE_INTERVAL_S = 30.0
+
+
+async def reconcile_once(manager: IngressManager, adapters: Any) -> None:
+    """One reconciliation pass across every org-scoped channel installation.
+
+    Refreshes each org's cached adapter first (a replica that has never seen
+    this org's webhook/config yet would otherwise see a cache miss and never
+    start it), then starts ingress for anything newly resolvable and stops
+    any locally running (channel_type, org_id) whose installation is gone —
+    covering both "a new org just configured Discord" and "a config got
+    deleted on a different replica than the one holding the connection"."""
+    from sqlmodel import select
+
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.db.session import get_open_session
+    from cowork.models.channel import ChannelInstallation
+
+    session = get_open_session()
+    try:
+        rows = session.exec(
+            select(ChannelInstallation).where(ChannelInstallation.org_id.is_not(None))
+        ).all()
+        desired = {(r.channel_type, r.org_id) for r in rows}
+        for channel_type, org_id in desired:
+            scope = TenantScope(org_mode=True, org_id=org_id)
+            await adapters.get_or_refresh(channel_type, org_id, session=ScopedSession(session, scope))
+    finally:
+        session.close()
+
+    for channel_type, org_id in desired:
+        await sync_channel_ingress(manager, adapters, channel_type, org_id)
+    for channel_type, org_id in manager.running_keys():
+        if org_id is not None and (channel_type, org_id) not in desired:
+            await manager.stop(channel_type, org_id)
+
+
+async def _reconcile_loop(manager: IngressManager, adapters: Any, interval_s: float) -> None:
+    while True:
+        try:
+            await reconcile_once(manager, adapters)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("ingress reconciliation pass failed")
+        await asyncio.sleep(interval_s)
+
+
+def start_reconciler(
+    manager: IngressManager, adapters: Any, *, interval_s: float = _RECONCILE_INTERVAL_S
+) -> asyncio.Task[None]:
+    return asyncio.create_task(_reconcile_loop(manager, adapters, interval_s))
