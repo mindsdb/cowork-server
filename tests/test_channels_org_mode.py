@@ -205,6 +205,53 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
 # --- streaming/polling ingress is now per-org: a config change reconciles
 # the caller's own org's ingress, not local mode's one deployment-global slot.
 
+def test_config_writes_land_in_the_calling_orgs_adapter_slot(client, monkeypatch):
+    """sync_channel_ingress looks the adapter up as (channel_type, org_id), so
+    a config write that lands in the local slot is invisible to it."""
+    adapters = client.app.state.channel_adapters
+    # Starting real ingress here would open a Discord Gateway socket; the
+    # adapter cache is what this test is about.
+    monkeypatch.setattr(client.app.state, "channel_ingress", None)
+
+    try:
+        put = client.put(
+            "/api/v1/channels/discord/config", headers=A_ADMIN,
+            json={"values": {"bot_token": "discord-bot-token"}},
+        )
+        assert put.status_code == 200, put.text
+        assert adapters.get("discord", ORG_A) is not None
+        assert adapters.get("discord") is None
+    finally:
+        delete = client.delete("/api/v1/channels/discord/config", headers=A_ADMIN)
+
+    assert delete.status_code == 204
+    assert adapters.get("discord", ORG_A) is None
+
+
+def test_reload_rebuilds_the_calling_orgs_adapter_slot(client, monkeypatch):
+    import asyncio
+
+    adapters = client.app.state.channel_adapters
+    monkeypatch.setattr(client.app.state, "channel_ingress", None)
+
+    put = client.put(
+        "/api/v1/channels/discord/config", headers=A_ADMIN,
+        json={"values": {"bot_token": "discord-bot-token"}},
+    )
+    assert put.status_code == 200, put.text
+    try:
+        asyncio.run(adapters.remove("discord", ORG_A))
+        assert adapters.get("discord", ORG_A) is None
+
+        res = client.post("/api/v1/channels/discord/reload", headers=A_ADMIN)
+        assert res.status_code == 200, res.text
+        assert res.json()["active"] is True
+        assert adapters.get("discord", ORG_A) is not None
+        assert adapters.get("discord") is None
+    finally:
+        client.delete("/api/v1/channels/discord/config", headers=A_ADMIN)
+
+
 def test_channel_config_put_reconciles_ingress_for_the_calling_org(client, monkeypatch):
     import cowork.api.v1.endpoints.channels as channels_ep
 

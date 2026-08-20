@@ -34,7 +34,6 @@ from cowork.services.channel_lifecycle import (
     ChannelLifecycleService,
     LifecycleNotImplementedError,
 )
-from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope
 from cowork.principal import Principal, can_manage_org, get_principal
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
@@ -169,7 +168,7 @@ async def set_config(
 
     adapters = _live_adapters(request)
     if adapters is not None:
-        await adapters.refresh(channel_type, session=scoped)
+        await adapters.refresh(channel_type, scoped.scope.org_id, session=scoped)
     await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
     return result
 
@@ -192,7 +191,7 @@ async def delete_config(
     # Tear the live adapter down — its credentials are gone.
     adapters = _live_adapters(request)
     if adapters is not None:
-        await adapters.remove(channel_type)
+        await adapters.remove(channel_type, scoped.scope.org_id)
     await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
 
 
@@ -210,7 +209,7 @@ async def reload_channel(
     adapters = _live_adapters(request)
     active = False
     if adapters is not None:
-        active = await adapters.refresh(channel_type, session=scoped)
+        active = await adapters.refresh(channel_type, scoped.scope.org_id, session=scoped)
     await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
 

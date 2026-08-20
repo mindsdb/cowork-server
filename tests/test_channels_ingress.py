@@ -39,10 +39,15 @@ class _FakeStreamBridge:
 
     def __init__(self):
         self.opened = asyncio.Event()
+        self.cancelled = False
 
     async def stream_events(self):
         self.opened.set()
-        await asyncio.sleep(3600)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
         yield []  # unreachable; makes this an async generator
 
     def dedupe_key(self, event):
@@ -339,6 +344,93 @@ def test_ingress_manager_org_scoped_lease_failover_on_renew_loss(monkeypatch):
         await mgr2.start("discord", bridge2, org_id="org-a")
         assert mgr2.is_running("discord", "org-a")
         await mgr2.stop("discord", "org-a")
+
+    asyncio.run(scenario())
+
+
+def test_start_swaps_in_a_rebuilt_bridge_for_an_already_running_key(monkeypatch):
+    """Rotating credentials rebuilds the adapter, so start() is handed a new
+    bridge for a key already running on the old token, and must take over."""
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        old_token, new_token = _FakeStreamBridge(), _FakeStreamBridge()
+
+        await mgr.start("discord", old_token, org_id="org-rotate")
+        await asyncio.wait_for(old_token.opened.wait(), 1.0)
+
+        # Same instance again: idempotent, the connection is left alone.
+        await mgr.start("discord", old_token, org_id="org-rotate")
+        assert not old_token.cancelled
+
+        await mgr.start("discord", new_token, org_id="org-rotate")
+        assert mgr.is_running("discord", "org-rotate")
+        await asyncio.wait_for(new_token.opened.wait(), 1.0)
+        assert old_token.cancelled
+
+        await mgr.stop("discord", "org-rotate")
+        assert new_token.cancelled
+
+    asyncio.run(scenario())
+
+
+def test_start_swaps_in_a_rebuilt_bridge_in_local_mode_too():
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        old_token, new_token = _FakeStreamBridge(), _FakeStreamBridge()
+
+        await mgr.start("discord", old_token)
+        await asyncio.wait_for(old_token.opened.wait(), 1.0)
+        await mgr.start("discord", new_token)
+        await asyncio.wait_for(new_token.opened.wait(), 1.0)
+
+        assert old_token.cancelled
+        assert mgr.is_running("discord")
+        await mgr.stop("discord")
+
+    asyncio.run(scenario())
+
+
+def test_renew_loop_releases_the_lease_when_its_own_task_died(monkeypatch):
+    """A stream loop can die without going through stop(); renewing forever
+    would then pin the org to a replica that no longer consumes anything."""
+    import contextlib
+
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+    monkeypatch.setattr(ingress_lease, "RENEW_INTERVAL_S", 0.01)
+
+    async def scenario():
+        mgr1 = IngressManager(sink=_noop_sink)
+        await mgr1.start("discord", _FakeStreamBridge(), org_id="org-dead")
+        task = mgr1._tasks[("discord", "org-dead")]
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        await asyncio.sleep(0.05)
+        assert await client.get(ingress_lease._key("discord", "org-dead")) is None
+
+        mgr2 = IngressManager(sink=_noop_sink)
+        await mgr2.start("discord", _FakeStreamBridge(), org_id="org-dead")
+        assert mgr2.is_running("discord", "org-dead")
+        await mgr2.stop_all()
+        await mgr1.stop_all()
 
     asyncio.run(scenario())
 

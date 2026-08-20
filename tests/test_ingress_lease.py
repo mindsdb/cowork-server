@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import fakeredis
 import fakeredis.aioredis as fakeaioredis
 import pytest
 
@@ -27,6 +26,15 @@ def test_acquire_fails_when_already_held(redis_client):
     assert asyncio.run(ingress_lease.acquire("discord", "org-1", "owner-b")) is False
 
 
+def test_owner_can_reacquire_a_lease_it_already_holds(redis_client):
+    # A replica whose local task died without releasing must not have to wait
+    # out the TTL before it can own its own lease again.
+    assert asyncio.run(ingress_lease.acquire("discord", "org-1", "owner-a")) is True
+    assert asyncio.run(ingress_lease.acquire("discord", "org-1", "owner-a")) is True
+    # Still exclusive against everyone else.
+    assert asyncio.run(ingress_lease.acquire("discord", "org-1", "owner-b")) is False
+
+
 def test_renew_succeeds_for_the_true_owner(redis_client):
     asyncio.run(ingress_lease.acquire("discord", "org-1", "owner-a"))
     assert asyncio.run(ingress_lease.renew("discord", "org-1", "owner-a")) is True
@@ -39,6 +47,43 @@ def test_renew_fails_for_a_non_owner(redis_client):
 
 def test_renew_fails_once_the_lease_is_gone(redis_client):
     # No one holds it — nothing to renew.
+    assert asyncio.run(ingress_lease.renew("discord", "org-1", "owner-a")) is False
+
+
+def test_renew_fails_when_the_expire_did_not_land(monkeypatch):
+    """PEXPIRE on a key that vanished mid-transaction is a no-op returning 0,
+    so the lease is gone, not renewed."""
+
+    class _Pipe:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def watch(self, key):
+            return True
+
+        async def get(self, key):
+            return "owner-a"
+
+        def multi(self):
+            return None
+
+        def pexpire(self, key, ms):
+            return None
+
+        async def execute(self):
+            return [0]
+
+        async def reset(self):
+            return None
+
+    class _Client:
+        def pipeline(self, transaction=True):
+            return _Pipe()
+
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: _Client())
     assert asyncio.run(ingress_lease.renew("discord", "org-1", "owner-a")) is False
 
 

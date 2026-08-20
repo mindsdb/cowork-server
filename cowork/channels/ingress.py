@@ -44,6 +44,7 @@ class IngressManager:
         self._sink = sink
         self._tasks: dict[tuple[str, str | None], asyncio.Task[None]] = {}
         self._renewals: dict[tuple[str, str | None], asyncio.Task[None]] = {}
+        self._bridges: dict[tuple[str, str | None], Any] = {}
         self._owner_id = uuid.uuid4().hex
 
     def is_running(self, channel_type: str, org_id: str | None = None) -> bool:
@@ -55,23 +56,30 @@ class IngressManager:
 
     async def start(self, channel_type: str, bridge: Any, org_id: str | None = None) -> None:
         """Begin ingress for a channel, optionally scoped to one org. No-op if
-        the adapter can't ingest this way, a loop is already running for this
-        key, or (org mode) another replica already holds this org's lease."""
-        if not self._can_ingest(bridge) or self.is_running(channel_type, org_id):
+        the adapter can't ingest this way, this exact bridge is already running,
+        or (org mode) another replica already holds this org's lease. A
+        different bridge for a running key replaces it: credentials changed."""
+        if not self._can_ingest(bridge):
             return
+        key = (channel_type, org_id)
+        if self.is_running(channel_type, org_id):
+            if self._bridges.get(key) is bridge:
+                return
+            await self.stop(channel_type, org_id)
         if org_id is not None:
             acquired = await ingress_lease.acquire(channel_type, org_id, self._owner_id)
             if not acquired:
-                log.info("channel %s org %s: lease held by another replica", channel_type, org_id)
+                log.debug("channel %s org %s: lease held by another replica", channel_type, org_id)
                 return
-        key = (channel_type, org_id)
         self._tasks[key] = asyncio.create_task(self._loop(channel_type, org_id, bridge))
+        self._bridges[key] = bridge
         if org_id is not None:
             self._renewals[key] = asyncio.create_task(self._renew_loop(channel_type, org_id))
         log.info("channel %s: started background ingress (org=%s)", channel_type, org_id)
 
     async def stop(self, channel_type: str, org_id: str | None = None) -> None:
         key = (channel_type, org_id)
+        self._bridges.pop(key, None)
         renewal = self._renewals.pop(key, None)
         if renewal is not None:
             renewal.cancel()
@@ -99,13 +107,21 @@ class IngressManager:
         key = (channel_type, org_id)
         while True:
             await asyncio.sleep(ingress_lease.RENEW_INTERVAL_S)
+            task = self._tasks.get(key)
+            # A loop that died without stop() would otherwise leave us renewing
+            # a lease for an org this replica no longer consumes.
+            if task is None or task.done():
+                self._renewals.pop(key, None)
+                self._bridges.pop(key, None)
+                await ingress_lease.release(channel_type, org_id, self._owner_id)
+                return
             ok = await ingress_lease.renew(channel_type, org_id, self._owner_id)
             if not ok:
                 log.warning("channel %s org %s: lease lost; stopping local ingress", channel_type, org_id)
-                task = self._tasks.pop(key, None)
-                if task is not None:
-                    task.cancel()
+                self._tasks.pop(key, None)
+                task.cancel()
                 self._renewals.pop(key, None)
+                self._bridges.pop(key, None)
                 return
 
     async def _loop(self, channel_type: str, org_id: str | None, bridge: Any) -> None:

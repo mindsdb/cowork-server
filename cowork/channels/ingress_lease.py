@@ -20,15 +20,21 @@ def _key(channel_type: str, org_id: str) -> str:
 
 
 async def acquire(channel_type: str, org_id: str, owner: str) -> bool:
-    """True if `owner` now holds the lease. Fails closed: any Redis error is
-    treated as "not acquired", never as "acquired"."""
+    """True if `owner` now holds the lease, whether freshly acquired or held
+    by this same owner already. Idempotent, so a replica whose local task died
+    without releasing doesn't wait out the TTL to regain its own lease. Fails
+    closed: any Redis error is treated as "not acquired", never as "acquired"."""
     client = get_redis()
+    key = _key(channel_type, org_id)
     try:
-        ok = await client.set(_key(channel_type, org_id), owner, nx=True, px=int(LEASE_TTL_S * 1000))
+        ok = await client.set(key, owner, nx=True, px=int(LEASE_TTL_S * 1000))
     except Exception:
         log.warning("ingress lease acquire failed for %s org %s", channel_type, org_id, exc_info=True)
         return False
-    return bool(ok)
+    if ok:
+        return True
+    # A renew() success proves `owner` still holds it, so this is a re-acquire.
+    return await renew(channel_type, org_id, owner)
 
 
 async def renew(channel_type: str, org_id: str, owner: str) -> bool:
@@ -46,8 +52,9 @@ async def renew(channel_type: str, org_id: str, owner: str) -> bool:
                 return False
             pipe.multi()
             pipe.pexpire(key, int(LEASE_TTL_S * 1000))
-            await pipe.execute()
-            return True
+            results = await pipe.execute()
+            # PEXPIRE returns 0 if the key vanished between the GET and the EXEC.
+            return bool(results and results[0])
     except Exception:
         log.warning("ingress lease renew failed for %s org %s", channel_type, org_id, exc_info=True)
         return False

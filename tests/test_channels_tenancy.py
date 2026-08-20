@@ -401,3 +401,51 @@ async def test_resolve_org_bridge_resolves_the_local_installation_too(engine):
     assert org_id is None
     assert bridge.creds == {"signing_secret": "desktop-secret"}
     assert registry.get("slack") is bridge  # same cache slot as the local bootstrap
+
+
+# --- ChannelLifecycleService: setup/teardown act on the caller's own org slot ---
+
+def _lifecycle_registry() -> PluginRegistry:
+    from cowork.channels.lifecycle import ChannelLifecycle, LifecycleResult
+
+    async def _factory(creds):
+        return _FakeAdapter(creds)
+
+    async def _setup(ctx):
+        await ctx.refresh_adapter()
+        return LifecycleResult(active=True, detail="ok")
+
+    async def _teardown(ctx):
+        await ctx.remove_adapter()
+        return LifecycleResult(active=False, detail="ok")
+
+    registry = PluginRegistry()
+    registry.register(
+        ChannelPlugin(
+            channel_type="slack",
+            display_name="Slack",
+            factory=_factory,
+            credentials=CredentialSchema(
+                fields=(CredentialField(name="signing_secret", label="Signing secret"),)
+            ),
+            lifecycle=ChannelLifecycle(setup=_setup, teardown=_teardown),
+        )
+    )
+    return registry
+
+
+async def test_lifecycle_setup_and_teardown_hit_the_callers_own_org_slot(engine):
+    from cowork.services.channel_lifecycle import ChannelLifecycleService
+
+    plugins = _lifecycle_registry()
+    scoped = _scoped(engine, _org(ORG_A))
+    ChannelConfigService(scoped, registry=plugins).set_config("slack", {"signing_secret": "org-a-secret"})
+    adapters = LiveAdapterRegistry(plugins)
+    svc = ChannelLifecycleService(scoped, adapters, plugins)
+
+    await svc.setup("slack")
+    assert adapters.get("slack", ORG_A) is not None
+    assert adapters.get("slack") is None  # never the local slot
+
+    await svc.teardown("slack")
+    assert adapters.get("slack", ORG_A) is None
