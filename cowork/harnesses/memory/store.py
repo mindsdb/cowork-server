@@ -8,7 +8,15 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from cowork.common.paths import opened_subdir_nofollow
+from cowork.common.paths import (
+    PinnedDir,
+    O_NOFOLLOW,
+    dir_lstat,
+    dir_open,
+    dir_unlink,
+    opened_subdir_nofollow,
+    pinned_dir,
+)
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope, scoped_user_storage_root
 from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
@@ -67,29 +75,24 @@ class MemoryStore:
         return os.path.basename(name)
 
     @contextmanager
-    def _root_fd(self, *, create: bool) -> Iterator[int]:
-        """A directory descriptor for the store root. With a nofollow base, no
-        symlink in the `.anton`/`memory` chain can redirect the caller; slot
-        files are then opened O_NOFOLLOW relative to it."""
+    def _root_fd(self, *, create: bool) -> Iterator[PinnedDir]:
+        """A handle for the store root. With a nofollow base, no symlink in the
+        `.anton`/`memory` chain can redirect the caller; slot files are then
+        opened O_NOFOLLOW relative to it."""
         if self._nofollow_base is not None:
             with opened_subdir_nofollow(
                 self._nofollow_base, *self._nofollow_tail, create=create
-            ) as fd:
-                yield fd
+            ) as d:
+                yield d
             return
-        if create:
-            self._root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._root, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            yield fd
-        finally:
-            os.close(fd)
+        with pinned_dir(self._root, create=create) as d:
+            yield d
 
     def read(self, slot_id: MemorySlot | str) -> str:
         name = self._filename(slot_id)
         try:
-            with self._root_fd(create=False) as fd:
-                sfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            with self._root_fd(create=False) as root:
+                sfd = dir_open(root, name, os.O_RDONLY | O_NOFOLLOW)
                 with open(sfd, encoding="utf-8") as f:
                     return f.read()
         except OSError:
@@ -99,15 +102,15 @@ class MemoryStore:
 
     def write(self, slot_id: MemorySlot | str, content: str) -> None:
         name = self._filename(slot_id)
-        with self._root_fd(create=True) as fd:
+        with self._root_fd(create=True) as root:
             # O_NOFOLLOW refuses a symlink squatting the slot name (writing
             # through it would land in another org); a real slot file opens
             # normally and is truncated.
-            sfd = os.open(
+            sfd = dir_open(
+                root,
                 name,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
                 0o600,
-                dir_fd=fd,
             )
             with open(sfd, "w", encoding="utf-8") as f:
                 f.write(content.rstrip() + "\n")
@@ -115,10 +118,10 @@ class MemoryStore:
     def delete(self, slot_id: MemorySlot | str) -> None:
         name = self._filename(slot_id)
         try:
-            with self._root_fd(create=False) as fd:
-                st = os.lstat(name, dir_fd=fd)
+            with self._root_fd(create=False) as root:
+                st = dir_lstat(root, name)
                 if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
-                    os.unlink(name, dir_fd=fd)
+                    dir_unlink(root, name)
         except OSError:
             return
 
