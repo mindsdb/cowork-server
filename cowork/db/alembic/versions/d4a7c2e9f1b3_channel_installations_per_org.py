@@ -13,7 +13,7 @@ same way, so one org's redelivered event id can never dedupe against
 another's.
 
 Revision ID: d4a7c2e9f1b3
-Revises: c3f8a2b6d1e4
+Revises: f1a3c9d7e2b5
 Create Date: 2026-08-17 18:00:00.000000
 
 """
@@ -25,7 +25,9 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "d4a7c2e9f1b3"
-down_revision: Union[str, Sequence[str], None] = "c3f8a2b6d1e4"
+# Rebased onto f1a3c9d7e2b5, which landed on staging after this migration was
+# first written — neither this nor e5b8d3f0a2c7 has run anywhere real yet.
+down_revision: Union[str, Sequence[str], None] = "f1a3c9d7e2b5"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
