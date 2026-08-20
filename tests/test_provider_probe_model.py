@@ -10,7 +10,13 @@ validation (`validate_minds`) used to POST `CODING_MODEL_DEFAULTS["minds_cloud"]
 import asyncio
 
 import cowork.services.providers as providers
-from cowork.services.providers import MINDS_PROBE_MODEL, ping_provider, validate_minds
+from cowork.services.providers import (
+    MINDS_PROBE_MODEL,
+    is_minds_host,
+    ping_provider,
+    validate_minds,
+    validate_provider,
+)
 
 
 class _CapturingClient:
@@ -110,3 +116,115 @@ def test_ping_minds_cloud_surfaces_provider_message(monkeypatch):
     assert status == "fail"
     assert "HTTP 429" in detail
     assert "Wallet allowance exhausted" in detail
+
+
+# ── The omitted-model default on a MindsHub host ──────────────────────
+#
+# Onboarding validates the MindsHub key through validate_provider. The generic
+# openai-compatible default ("gpt-5.5") is not a MindsHub alias, so it 404s
+# there, and the recommended MindsHub model is paid, so it 402s for an account
+# whose wallet is empty. Both come back looking like a bad key, which routed a
+# brand-new user to bring-your-own-key holding a valid MindsHub key.
+
+
+def test_omitted_model_on_minds_host_probes_free_model(monkeypatch):
+    _patch(monkeypatch)
+    result = asyncio.run(
+        validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", None)
+    )
+    assert result.get("ok") is True
+    assert _CapturingClient.captured["json"]["model"] == "mindshub_air"
+
+
+def test_empty_model_on_minds_host_probes_free_model(monkeypatch):
+    # The client sends `model` as an optional field, so an empty string arrives
+    # as often as a missing key. Both mean "no model was chosen".
+    _patch(monkeypatch)
+    asyncio.run(validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", ""))
+    assert _CapturingClient.captured["json"]["model"] == "mindshub_air"
+
+
+def test_explicit_model_on_minds_host_is_sent_as_asked(monkeypatch):
+    # The negative case that keeps the default honest: a user validating one
+    # specific model must not be told a different model passed.
+    _patch(monkeypatch)
+    asyncio.run(
+        validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", "sonnet")
+    )
+    assert _CapturingClient.captured["json"]["model"] == "sonnet"
+
+
+def test_omitted_model_off_minds_host_keeps_generic_default(monkeypatch):
+    # A real openai-compatible endpoint is unchanged by this.
+    _patch(monkeypatch)
+    asyncio.run(
+        validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", None)
+    )
+    assert _CapturingClient.captured["json"]["model"] == "gpt-5.5"
+
+
+def test_is_minds_host_matches_the_host_not_a_substring():
+    for url in (
+        "https://api.mindshub.ai/v1",
+        "https://api.staging.mindshub.ai",
+        "https://api-pr-12.dev.mindshub.ai/v1",
+        "https://mindshub.ai",
+        "https://mdb.ai/api/v1",
+        "https://llm.mdb.ai",
+        "api.mindshub.ai/v1",  # no scheme, as a stored setting can be
+    ):
+        assert is_minds_host(url) is True, url
+
+    for url in (
+        "",
+        None,
+        "https://api.openai.com/v1",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        # A lookalike domain and a redirect-style parameter both defeat a
+        # substring test, which is why this compares the parsed hostname.
+        "https://mindshub.ai.example.test/v1",
+        "https://evil-mindshub.ai/v1",
+        "https://example.test/r?u=https://api.mindshub.ai/v1",
+        # Unbalanced brackets: urlparse raises ValueError reading .hostname on
+        # these, and this predicate is called outside the caller's except, so an
+        # unguarded parse would answer 500 instead of ok:false. See the try in
+        # is_minds_host.
+        "https://[",
+        "https://a[b].mindshub.ai/v1",
+        "[",
+        "https://]",
+    ):
+        assert is_minds_host(url) is False, url
+
+
+def test_unparseable_base_url_is_a_failed_probe_not_a_500():
+    # The base URL is free text off the openai-compatible card, and
+    # validate_provider runs is_minds_host before validate_openai_compatible's
+    # except can catch anything. A ValueError here leaves the service layer and
+    # FastAPI turns it into a 500. No client patch: httpx rejects the URL locally,
+    # so this makes no network call.
+    result = asyncio.run(validate_provider("openai-compatible", "k", "https://[", None))
+    assert result["ok"] is False
+
+
+def test_minds_probe_caps_its_token_budget_and_keeps_the_host_path(monkeypatch):
+    # Asserted on the wire, because both are easy to lose: without max_tokens the
+    # probe asks for a full-length completion that MindsHub bills to the included
+    # allowance on every onboarding attempt, and the URL is the only thing that
+    # catches a base whose chat path is derived wrongly.
+    _patch(monkeypatch)
+    asyncio.run(
+        validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", None)
+    )
+    assert _CapturingClient.captured["json"]["max_tokens"] == 20
+    assert _CapturingClient.captured["url"] == "https://api.mindshub.ai/v1/chat/completions"
+
+
+def test_a_non_minds_probe_sends_no_token_cap(monkeypatch):
+    # The cap is MindsHub-only on purpose. OpenAI's reasoning models reject
+    # max_tokens and want max_completion_tokens, and o3/o4-mini are both in
+    # RECOMMENDED_MODELS, so sending it to any endpoint would report a working key
+    # as invalid for exactly the models this ticket is about.
+    _patch(monkeypatch)
+    asyncio.run(validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", "o3"))
+    assert "max_tokens" not in _CapturingClient.captured["json"]
