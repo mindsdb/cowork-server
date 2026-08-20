@@ -38,8 +38,18 @@ def _published_state(raw_path: str) -> dict:
 
 
 def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
-    from cowork.services.publish import publish_artifact
-    return publish_artifact(raw_path, access=access)
+    """Desktop publish for the agent's own `publish_or_preview` tool.
+
+    Resolves the artifact, its root and the credential the same way the HTTP
+    endpoints do — `publish_artifact` takes all three explicitly now.
+    """
+    from cowork.services.publish import desktop_publish_context, publish_artifact
+
+    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(raw_path)
+    return publish_artifact(
+        artifact, artifacts_base=artifacts_base,
+        api_key=api_key, publish_url=publish_url, access=access,
+    )
 
 
 def _published_owner_state(raw_path: str) -> dict:
