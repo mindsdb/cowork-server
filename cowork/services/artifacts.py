@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -27,6 +28,56 @@ from urllib.parse import quote
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProjectArtifacts:
+    """One project's artifacts root plus the identity the client sees.
+
+    Callers resolve this (see services.artifact_roots) and hand it in; the
+    service never discovers roots on its own, because discovery cannot tell
+    which tenant is asking.
+    """
+
+    base: Path
+    project_id: str | None
+    project_name: str
+
+
+def _org_mode() -> bool:
+    """True on the multi-tenant deployment.
+
+    In org mode, artifact files live on shared EFS and are written by any
+    org's agent. Executing them, or handing them to the desktop's file
+    manager, would run untrusted code inside cowork-server. `noexec` on the
+    mount does not stop this: it blocks `./script`, not `python script.py`.
+
+    The same predicate also gates what a card may carry: there is no in-app
+    server to serve a live artifact from, and the desktop-only publish
+    credentials (`accessPassword`/`accessEmails`) must not reach a client that
+    shares its artifacts root with other members of the org.
+    """
+    return get_app_settings().tenancy_mode == "org"
+
+
+_NO_EXEC_DETAIL = (
+    "Live artifact backends are not available on this deployment. "
+    "Open the published version instead."
+)
+
+
+class ExecutionRefused(RuntimeError):
+    """Raised instead of running something, because `_org_mode()` is true.
+
+    A distinct type, not a bare RuntimeError, so callers can tell a deployment
+    policy apart from a genuine failure. The /artifacts/reveal endpoint maps
+    this to 403; any other RuntimeError out of `reveal_in_file_manager` (a
+    broken `open`, a platform call that blew up) still has to read as a 500,
+    or a real fault would be reported to the client as "not available on this
+    deployment" and never looked at again. Subclasses RuntimeError so existing
+    `except RuntimeError` callers keep catching the refusal.
+    """
+
 
 # In-memory registry: deterministic token → parent dir of an artifact.
 # Used for both static (HTML asset) and proxy (fullstack backend) mounts;
@@ -104,6 +155,9 @@ def _human_mtime(ts: float) -> str:
 
 
 def _projects_root() -> Path:
+    # Unkeyed: in org mode this dir is empty (projects live org-first under the
+    # shared root), so the in-app artifact API sees nothing there. Tracked in
+    # next.md §1 (artifacts org-scoping).
     return Path(get_app_settings().project.root_dir)
 
 
@@ -247,6 +301,20 @@ def _content_mtime(folder: Path) -> int:
         return 0
 
 
+# Public alias: task_objects and the autopublish reconciler need this exact
+# basis for their "changed since publish" gate. Keeping one implementation means
+# the gate, the `modified` badge, and the card's cache-bust token can never
+# disagree.
+content_mtime = _content_mtime
+
+
+def load_published_map(folder: Path) -> dict:
+    """The `.published.json` record for an artifact folder, `{}` when absent or
+    unreadable. Public because the autopublish reconciler needs the same view of
+    publish state that the card builder uses."""
+    return _load_published_map(folder)
+
+
 def _published_url_for(folder: Path, primary: Path | None) -> str:
     if primary is None:
         return ""
@@ -291,7 +359,10 @@ def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool
     # circular import (mirrors _unpublish_folder below).
     from cowork.services.publish import compute_publish_md5
 
-    current_md5 = compute_publish_md5(str(folder))
+    # `folder.parent` IS the artifacts root: artifacts always live at
+    # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
+    # mode, where the module-level FS scan finds no roots at all.
+    current_md5 = compute_publish_md5(folder, artifacts_base=folder.parent)
     if current_md5 is None:
         return False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):
@@ -382,7 +453,14 @@ def _project_artifacts_base(project_name: str) -> Path | None:
 def serve_url_for(path: str | Path) -> str:
     """Origin-relative `/api/v1/artifacts/serve/...` URL for a file under a
     project's `.anton/artifacts` tree. Returns "" when the path isn't
-    inside such a tree."""
+    inside such a tree.
+
+    Always "" in org mode: there the server does not serve artifact content at
+    all. The only route to content is the published URL, which carries an access
+    check — so there is no local URL to build.
+    """
+    if _org_mode():
+        return ""
     try:
         p = Path(path).resolve(strict=False)
     except (OSError, ValueError):
@@ -502,7 +580,9 @@ def _fullstack_types() -> frozenset[str]:
         return frozenset()
 
 
-def _unpublish_folder(folder: Path) -> None:
+def _unpublish_folder(
+    folder: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+) -> None:
     """Unpublish every published file in an artifact folder.
 
     Reads `.published.json` and unpublishes each recorded file from the
@@ -528,46 +608,58 @@ def _unpublish_folder(folder: Path) -> None:
             continue
         if not (entry.get("report_id") or entry.get("last_md5")):
             continue
-        # The path-based unpublish needs the file present; a stale record
-        # for a missing file can't be unpublished this way, so skip it.
         if not (folder / name).is_file():
+            # The path-based unpublish needs the file present, so this record
+            # cannot be cleared upstream — and once the folder is gone there is
+            # nothing left pointing at the remote copy. No metrics backend
+            # exists here, so this log line is the metric; keep the prefix.
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=primary_missing",
+                entry.get("report_id") or entry.get("last_md5"),
+                entry.get("url", ""),
+            )
             continue
-        unpublish_artifact(str(folder / name))
+        unpublish_artifact(
+            folder / name, artifacts_base=artifacts_base,
+            api_key=api_key, publish_url=publish_url,
+        )
 
 
-def delete_artifact(raw_path: str) -> None:
+def delete_artifact(
+    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+) -> None:
     """Permanently delete an artifact folder from disk.
 
-    If the artifact has published files, they are unpublished from the
-    remote first. If any unpublish fails, the artifact is left on disk
-    and the error propagates to the caller.
+    Published files are unpublished first; if any unpublish fails the artifact is
+    left on disk and the error propagates. Containment is checked against the
+    caller-supplied root — the only thing that ties the request to a tenant.
     """
-    target = resolve_artifact_path(raw_path)
-    if target is None:
-        raise ValueError("Invalid artifact path")
-
-    if target.is_dir() and (target / "metadata.json").exists():
-        folder = target
-    elif target.is_file():
-        folder = target.parent
+    if artifact.is_dir() and (artifact / "metadata.json").exists():
+        folder = artifact
+    elif artifact.is_file():
+        folder = artifact.parent
         if not (folder / "metadata.json").exists():
             raise ValueError("Not a valid artifact folder")
     else:
         raise FileNotFoundError("Artifact not found")
 
-    for art_root in _scan_artifact_dirs():
-        try:
-            folder.relative_to(art_root.resolve())
-        except ValueError:
-            continue
-        # Unpublish before deleting; if this raises, the artifact stays.
-        _unpublish_folder(folder)
-        shutil.rmtree(folder)
-        return
-    raise FileNotFoundError("Artifact is not in a known artifacts directory")
+    try:
+        folder.resolve().relative_to(Path(artifacts_base).resolve())
+    except (ValueError, OSError):
+        raise FileNotFoundError("Artifact is not in a known artifacts directory")
+
+    # Unpublish before deleting; if this raises, the artifact stays.
+    _unpublish_folder(
+        folder, artifacts_base=artifacts_base, api_key=api_key, publish_url=publish_url,
+    )
+    shutil.rmtree(folder)
 
 
 def reveal_in_file_manager(path: Path) -> None:
+    """Open the OS file manager on `path`. In org mode this always refuses;
+    see `_org_mode`."""
+    if _org_mode():
+        raise ExecutionRefused(_NO_EXEC_DETAIL)
     if sys.platform == "darwin":
         subprocess.run(["open", "-R", str(path)], check=False)
     elif sys.platform == "win32":
@@ -578,13 +670,24 @@ def reveal_in_file_manager(path: Path) -> None:
 
 # ─── Public API ───────────────────────────────────────────────────
 
-def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
+def card_for_folder(
+    folder: Path,
+    idx: int = 0,
+    *,
+    project_id: str | None = None,
+    project_name: str = "",
+) -> dict | None:
     """The artifact card for a single folder, or ``None`` if its metadata is
     unreadable. This is the canonical card shape — used both by the artifacts
     list and by the inline chat cards (see services.task_objects), so the two
     can never disagree about how an artifact is named, typed, or opened.
 
-    `idx` only selects a background gradient (cosmetic)."""
+    `idx` only selects a background gradient (cosmetic).
+
+    `project_id`/`project_name` identify the owning project. The client needs
+    them to address an artifact by project + slug: in an org deployment the
+    artifacts list spans every project of the organization, so a card cannot be
+    tied to a project by inspecting its path."""
     meta = _load_metadata(folder)
     if meta is None:
         return None
@@ -604,9 +707,11 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
     # Max mtime across the artifact's content files — a precise
     # "content changed" signal for the renderer's preview viewer to
     # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
-    content_mtime = _content_mtime(folder)
+    # Named `mtime_seconds` so it does not shadow the module-level
+    # `content_mtime` alias other services import.
+    mtime_seconds = _content_mtime(folder)
 
-    return {
+    card = {
         "id": meta.get("id") or folder.name,
         "slug": meta.get("slug") or folder.name,
         "title": meta.get("name") or folder.name,
@@ -614,21 +719,38 @@ def card_for_folder(folder: Path, idx: int = 0) -> dict | None:
         "type": artifact_type,
         "kind": kind,
         "ext": primary_ext,
-        "updated": _human_mtime(content_mtime),
-        "mtime": content_mtime,
+        "updated": _human_mtime(mtime_seconds),
+        "mtime": mtime_seconds,
         "live": is_live,
         "bg": BG_CYCLE[idx % len(BG_CYCLE)],
         "fileCount": len(files),
+        # `folder`/`path` stay in the payload even in org mode: the renderer uses
+        # `path` as an opaque state key (the in-flight `busyPaths` set, live-row
+        # matching, title fallbacks), and it is no secret — a client of its own
+        # organization already knows `<root>/<org_id>`. Isolation comes from
+        # `projectId` plus the server-side scope, not from hiding the path.
         "folder": str(folder),
         "path": primary_path,
         "primary": meta.get("primary") or None,
+        "projectId": project_id,
+        "projectName": project_name,
         "publishedUrl": _published_url_for(folder, primary),
-        "modified": _is_modified(folder, primary, content_mtime),
+        "modified": _is_modified(folder, primary, mtime_seconds),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
         # is the plaintext, returned only to the owner's own session.
         **_published_access_for(folder, primary),
         "serveUrl": serve_url_for(primary_path),
     }
+    if _org_mode():
+        # Dropped at the single card builder so inline chat cards are covered
+        # too: they call this function as well, and a filter applied only at the
+        # list endpoint would still hand the plaintext password to the chat.
+        # Access in org mode is always restricted-to-org, so neither field has a
+        # consumer there. `accessMode` stays — ArtifactStatus draws its badge
+        # from it.
+        card.pop("accessPassword", None)
+        card.pop("accessEmails", None)
+    return card
 
 
 def artifact_status(raw_path: str) -> dict:
@@ -679,18 +801,37 @@ def artifact_status(raw_path: str) -> dict:
     }
 
 
-def list_artifacts(project_path: str | None = None) -> list[dict]:
-    """Every artifact across all projects, newest first."""
+def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
+    """Every artifact under the given roots, newest first, capped at 80.
+
+    Roots come from the caller (see services.artifact_roots) — this function
+    never discovers them, because a filesystem scan cannot tell which tenant is
+    asking. The 80-item cap is pre-existing but matters more in org mode, where
+    `sources` spans every project of the organization instead of one tree.
+    """
     cards: list[dict] = []
-    for folder in _iter_artifact_folders(project_path):
-        card = card_for_folder(folder, len(cards))
-        if card is None:
+    for source in sources:
+        base = Path(source.base)
+        if not base.is_dir():
             continue
         try:
-            card["_sortTs"] = (folder / "metadata.json").stat().st_mtime
+            children = sorted(base.iterdir())
         except OSError:
-            card["_sortTs"] = 0.0
-        cards.append(card)
+            continue
+        for folder in children:
+            if not folder.is_dir() or not (folder / "metadata.json").is_file():
+                continue
+            card = card_for_folder(
+                folder, len(cards),
+                project_id=source.project_id, project_name=source.project_name,
+            )
+            if card is None:
+                continue
+            try:
+                card["_sortTs"] = (folder / "metadata.json").stat().st_mtime
+            except OSError:
+                card["_sortTs"] = 0.0
+            cards.append(card)
 
     cards.sort(key=lambda c: c["_sortTs"], reverse=True)
     for c in cards:
@@ -745,12 +886,24 @@ async def mount_preview(path: Path) -> dict:
             backend_port = None
 
     if backend_port is not None:
-        # Proxy mode. Register the artifact root (where metadata.json +
-        # the live port live) so the proxy endpoint reads a current port
-        # by token, then auto-launch the backend if dead. Returns without
-        # `proxyUrl` — the route layer fills it in using the incoming
-        # Request URL so the absolute URL matches whatever host/scheme
-        # the client used to reach us.
+        # Proxy mode. In org mode this must refuse before registering
+        # anything: the token minted below maps into _PREVIEW_MOUNTS, and
+        # cowork.services.preview_proxy re-reads `port` from this artifact's
+        # own (agent-writable) metadata.json on every proxied request, then
+        # issues an httpx call to 127.0.0.1:<port> carrying the caller's
+        # method, path, query, headers and body. _ensure_backend_running
+        # already refuses to launch a backend here (see `_org_mode`), but
+        # that alone does not stop the registration: any org's agent could
+        # still point `port` at an unrelated loopback listener inside this
+        # pod and use the mount as an SSRF pivot, backend running or not.
+        if _org_mode():
+            raise ValueError(_NO_EXEC_DETAIL)
+        # Register the artifact root (where metadata.json and the live port
+        # live) so the proxy endpoint reads a current port by token, then
+        # auto-launch the backend if dead. Returns without `proxyUrl`; the
+        # route layer fills it in using the incoming Request URL so the
+        # absolute URL matches whatever host/scheme the client used to
+        # reach us.
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
         running, launch_detail, current_port = await _ensure_backend_running(
@@ -909,7 +1062,12 @@ async def _ensure_backend_running(
         input when the helper had to allocate a fresh free port.
       - `running=False` → backend is down and we couldn't start it;
         `detail` carries the reason; `port` echoes the input port.
+
+    In org mode this always refuses; see `_org_mode`.
     """
+    if _org_mode():
+        return False, _NO_EXEC_DETAIL, 0
+
     slug = artifact_dir.name
     if _probe_port(port):
         return True, "already_running", port

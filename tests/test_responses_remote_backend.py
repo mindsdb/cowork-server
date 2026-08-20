@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed.
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -320,7 +321,6 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_skills = lambda session, conv_id: None
 
     async def fake_replies(**kwargs):
         yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
@@ -373,3 +373,292 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
 
     assert saved["assistant"] == "Preamble.\n\nThe answer."
     assert any(e.get("thought_role") == "thought.scratchpad.start" for e in saved["events"])
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_stages_workspace_files(monkeypatch):
+    """Wiring guard: the remote produce path must stage attachments +
+    instructions into the workspace before the turn — removing that call
+    (responses.py) has to fail here, not just leave the helper's own tests green."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    called = []
+    monkeypatch.setattr(
+        type(handler), "_stage_remote_workspace_files",
+        staticmethod(lambda session, conv_id: called.append(conv_id)),
+    )
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert called, "produce_remote must stage workspace files before the turn"
+
+
+def test_stage_remote_workspace_files_seeds_builtin_skills(monkeypatch):
+    """The pod reads skills straight off the shared mount, not through a
+    payload — GET /skills is not the only place a fresh org can get seeded, or
+    an org that chats before it ever opens the skills menu stays empty
+    forever on cloud turns (ENG-1679 review)."""
+    calls = []
+
+    class FakeSkillService:
+        def __init__(self, scope):
+            calls.append(scope)
+
+        def ensure_builtin_skills(self):
+            calls.append("seeded")
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(project=SimpleNamespace(path="/tmp/proj"))
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "SkillService", FakeSkillService)
+    monkeypatch.setattr(
+        responses_mod, "FileService",
+        lambda session: SimpleNamespace(stage_conversation_attachments=lambda *a, **k: None),
+    )
+    monkeypatch.setattr("cowork.services.files.stage_project_instructions", lambda *a, **k: None)
+
+    scope = _FakeScope()
+    ResponsesHandler._stage_remote_workspace_files(SimpleNamespace(scope=scope), uuid4())
+
+    assert calls == [scope, "seeded"]
+
+
+_DRAFT_MD = ("---\nname: competitive-analysis\ndescription: Compare rivals\n"
+             "metadata:\n  display_name: Competitive Analysis\n---\n1. Gather\n2. Compare")
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_surfaces_a_skill_draft_as_a_card(monkeypatch):
+    """A draft the pod built comes out as the same response.skill_created card
+    the desktop path emits, and lands in the persisted events log so a reload
+    replays it. The skill itself is NOT saved — the card is the user's decision."""
+    import json
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "Built it."}
+        yield "turn_skill", {"entries": [{
+            "slug": "competitive-analysis",
+            "files": {"SKILL.md": _DRAFT_MD, "recipe.md": "detail"},
+        }]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+
+    cards = [json.loads(f.split("data: ", 1)[1]) for f in frames
+             if f.startswith("event: response.skill_created")]
+    assert len(cards) == 1
+    skill = cards[0]["skill"]
+    assert skill["slug"] == "competitive-analysis"
+    assert skill["name"] == "Competitive Analysis"
+    assert "1. Gather" in skill["instructions"]
+    assert skill["files"] == [{"name": "recipe.md", "text": "detail"}]
+
+    # Replay on reload reads the events log, not the live stream.
+    assert any(e.get("type") == "response.skill_created" for e in saved["events"])
+    assert frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
+async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
+    """An unusable entry from the pod is dropped, not fatal: the turn still
+    completes and its text is still persisted. The drop is not silent, though —
+    it surfaces as an inline progress notice (ENG-1679 review: a rejected draft
+    used to vanish with only a server-side log line)."""
+    import json
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+
+    async def fake_replies(**kwargs):
+        yield "turn_skill", {"entries": [{"slug": "../escape", "files": {"SKILL.md": "x"}}]}
+        yield "turn_delta", {"text": "Done."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+
+    assert not any(f.startswith("event: response.skill_created") for f in frames)
+
+    progress = [json.loads(f.split("data: ", 1)[1]) for f in frames
+                if f.startswith("event: response.in_progress")]
+    dropped = [p for p in progress if p.get("phase") == "skill_draft_dropped"]
+    assert len(dropped) == 1
+    assert "../escape" in dropped[0]["message"]
+
+    assert frames[-1] == "CLOSE:completed"
+    assert saved["assistant"] == "Done."
+
+
+# ─── artifacts written by the worker during a remote turn ──────────────────
+#
+# On an org deployment the in-process harness refuses to run, so this producer
+# is the ONLY one that indexes, publishes and cards artifacts. The pod writes
+# them into the same shared tree cowork-server reads, which is what lets the
+# before/after diff work from here at all.
+
+def _artifact(folder, slug, *, body="<html>report</html>"):
+    target = folder / slug
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "report.html").write_text(body)
+    (target / "metadata.json").write_text(
+        json.dumps({"slug": slug, "type": "html-app", "title": slug})
+    )
+    return target
+
+
+def _conversation_at(project_dir):
+    project = SimpleNamespace(path=str(project_dir), name=project_dir.name, id=uuid4())
+    return SimpleNamespace(project=project, project_id=project.id)
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tmp_path):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    published = {}
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        published["base"] = base
+        published["touched"] = set(touched)
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "done"}
+        # The worker writes into the shared tree mid-turn.
+        _artifact(artifacts_base, "sales-report")
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    # The diff saw the new folder and handed it to the reconciler...
+    assert published["base"] == artifacts_base
+    assert published["touched"] == {"sales-report"}
+    # ...and the card reached the stream, so the artifact shows up on the answer
+    # rather than only after the next artifacts-list fetch.
+    cards = [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+    assert len(cards) == 1
+    assert cards[0]["artifact"]["slug"] == "sales-report"
+    assert cards[0]["artifact"]["projectName"] == "proj"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path):
+    """A failed turn still INDEXES what the worker wrote (the finally), but must
+    not publish or card it — matching the in-process path, where the next turn in
+    the project reconciles instead."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    # Patched on the source module, not on responses_mod: the producer imports
+    # these names inside the generator, at call time.
+    from cowork.services import task_objects
+
+    indexed = {}
+
+    def spy_index(*args, **kwargs):
+        indexed["ran"] = True
+        return [], set(), None
+
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", spy_index)
+
+    async def fake_autopublish(*args, **kwargs):
+        raise AssertionError("a failed turn must not publish")
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+
+    async def fake_replies(**kwargs):
+        _artifact(artifacts_base, "half-written")
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "failed"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed.get("ran") is True
+    assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]

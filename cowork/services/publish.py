@@ -14,14 +14,18 @@ import tempfile
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from pydantic import SecretStr
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, pod_local_only
+# Imported for its side effect on the module namespace as well as its use:
+# tests monkeypatch `publish.get_app_settings`, so removing it because a
+# linter sees no local call breaks them. noqa keeps that from recurring.
+from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
@@ -36,6 +40,12 @@ from cowork.services.artifacts import (
     html_artifacts,
     resolve_artifact_path,
 )
+
+# Type-only, matching connectors/persist.py: cowork.db.scoped drags in the
+# session factory and the FastAPI dependency graph, and this module is imported
+# from the harness turn path where that is dead weight.
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +66,12 @@ def _cowork_state_dir() -> Path:
         path = Path(base).expanduser()
     else:
         # Consolidated under the cowork data root (was ~/.anton/cowork); the
-        # desktop app migrates the existing state.json on first run.
-        path = cowork_home()
+        # desktop app migrates the existing state.json on first run. Org mode
+        # relocates this off shared EFS storage via pod_local_only (see its
+        # docstring): state.json holds publish_history below, which carries
+        # no org_id segment, so left on cowork_home() every organization
+        # would read every other organization's publish history.
+        path = pod_local_only(cowork_home(), "publish")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -102,18 +116,89 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _resolve_publish_target(artifact: Path) -> tuple[Path, Path, str, bool]:
+def _write_published_map(published_json: Path, published_map: dict[str, Any]) -> None:
+    """Write `.published.json` atomically.
+
+    Two turns in one project (different conversations) can reconcile the same
+    slug, and a publish thread abandoned by a timeout can still land here after
+    the turn closed. A partially written record would lose `report_id` - and with
+    it the ability to reuse or revoke the published URL - so the write goes to a
+    sibling temp file and is swapped in with os.replace.
+    """
+    tmp = published_json.with_name(f"{published_json.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, published_json)
+    except Exception:
+        logger.warning("Could not write %s", published_json, exc_info=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
+    """(artifact, artifacts_base) for a desktop request path.
+
+    Split from credential resolution so callers can validate cheap, local things
+    first: `update_artifact` must still answer "no published version to update"
+    for an unpublished artifact rather than "configure your API key".
+
+    The loop only IDENTIFIES which root the artifact sits under;
+    `resolve_artifact_path` has already rejected anything outside them.
+    """
+    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    if artifact is None:
+        raise FileNotFoundError("Artifact not found")
+    for root in _scan_artifact_dirs():
+        try:
+            artifact.resolve().relative_to(root.resolve())
+        except (ValueError, OSError):
+            continue
+        return artifact, root
+    raise FileNotFoundError("Artifact is not in a known artifacts directory")
+
+
+def desktop_publish_credential() -> tuple[str, str]:
+    """(api_key, publish_url) from the active provider, for the desktop path."""
+    publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
+    if not api_key:
+        raise ValueError("Configure your provider API key in Settings before publishing")
+    return api_key, publish_url
+
+
+def desktop_publish_context(raw_path: str) -> tuple[Path, Path, str, str]:
+    """(artifact, artifacts_base, api_key, publish_url) for the desktop path.
+
+    Keeps the pre-existing behavior - path resolution against the registered
+    artifact roots, credential resolution from the active provider - in one
+    place, so the publish functions themselves stay free of both. The org path
+    supplies these four values from the DB and a minted turn key instead.
+    """
+    artifact, root = desktop_artifact_and_base(raw_path)
+    api_key, publish_url = desktop_publish_credential()
+    return artifact, root, api_key, publish_url
+
+
+def _resolve_publish_target(
+    artifact: Path, container_dirs: list[Path] | None = None
+) -> tuple[Path, Path, str, bool]:
     """Decide what to publish + where `.published.json` lives + its key.
 
     Thin wrapper over the single source of truth in anton
     (`anton.publish_access.resolve_publish_target`); cowork supplies its own
-    container dirs (`_scan_artifact_dirs()`) so the metadata-climb is bounded
-    to the registered `.anton/artifacts/` roots. Keeping this wrapper preserves
-    the existing cowork call sites and signature.
+    container dirs so the metadata-climb is bounded to `.anton/artifacts/` roots.
+
+    `container_dirs` MUST be passed on the org path: the default
+    (`_scan_artifact_dirs()`) only sees the desktop layout, because org projects
+    live one level deeper under `<root>/<org_id>/`, and it would return nothing
+    there. Omitting it keeps the desktop behavior unchanged.
 
     Returns (publish_target, published_dir, published_key, is_fullstack).
     """
-    return _anton_resolve_publish_target(artifact, _scan_artifact_dirs())
+    return _anton_resolve_publish_target(
+        artifact, container_dirs if container_dirs is not None else _scan_artifact_dirs()
+    )
 
 
 def _resolve_publish_endpoint(settings) -> tuple[str, str]:
@@ -261,22 +346,46 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
-def publish_artifact(raw_path: str, password: str | None = None, access: dict | None = None) -> dict:
-    settings = get_user_settings()
-    publish_url, api_key = _resolve_publish_endpoint(settings)
-    if not api_key:
-        raise ValueError("Configure your provider API key in Settings before publishing")
+def publish_artifact(
+    artifact: Path,
+    *,
+    artifacts_base: Path,
+    api_key: str,
+    publish_url: str,
+    password: str | None = None,
+    access: dict | None = None,
+    scope: TenantScope | None = None,
+) -> dict:
+    """Zip an artifact and upload it, returning its public URL.
 
-    # The request path is either the artifact folder (folder-based
-    # artifacts) or a single file (legacy loose-HTML / chat-bubble / the
-    # Utilities per-page list). `_resolve_publish_target` normalizes both.
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(artifact)
+    `artifact` is the artifact folder or a single legacy loose file (loose-HTML /
+    chat-bubble / the Utilities per-page list); `_resolve_publish_target`
+    normalizes both. `artifacts_base` is the container root that bounds its
+    metadata-climb.
+
+    `api_key`/`publish_url` come from the caller: desktop resolves them from the
+    active provider (see `desktop_publish_context`), the org path mints a
+    per-reconciliation turn key. That distinction is load-bearing - the upload
+    lambda takes `owner_keycloak_id` from the token and folds md5(user_id)[:9]
+    into the URL, so the key decides who owns the published artifact.
+
+    `scope` selects the connector vault the publisher reads datasource secrets
+    from; it is org-keyed, so an unscoped lookup would resolve to the shared
+    namespace root. Optional because the loose-file and Markdown paths carry no
+    datasources at all, and because `vault_for_scope` fail-closes on an org
+    deployment when it is missing - a caller that forgets it gets an error, not
+    another org's secrets.
+    """
+    if not api_key:
+        raise ValueError("Publishing requires an API key")
+
+    publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
     if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
     try:
-        from anton.core.datasources.data_vault import LocalDataVault
         from anton.publisher import publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
@@ -321,7 +430,9 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             # (`~/.cowork/data-vault`), not anton's default
             # (`~/.anton/data_vault`) — otherwise secrets are missed and
             # the published artifact has no DB connection in the cloud.
-            vault=LocalDataVault(Path(get_app_settings().connector.vault_dir)),
+            # Org-keyed: the persisted vault is per organization, and an
+            # unscoped lookup would resolve to the shared namespace root.
+            vault=vault_for_scope(scope),
         )
     except Exception as exc:
         logger.exception("Publishing failed")
@@ -369,10 +480,7 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
             **owner_side,
         }
         published_map[published_key] = entry
-        try:
-            published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
-        except Exception:
-            pass
+        _write_published_map(published_json, published_map)
         state = _load_state()
         state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
         _save_state(state)
@@ -390,8 +498,8 @@ def publish_artifact(raw_path: str, password: str | None = None, access: dict | 
     }
 
 
-def compute_publish_md5(raw_path: str) -> str | None:
-    """Recompute the md5 of the publish bundle for an artifact path.
+def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
+    """Recompute the md5 of the publish bundle for an artifact.
 
     Matches the `last_md5` the lambda stores at publish time (md5 of the zip
     bytes `anton.publisher` produces). Mirrors `publish_artifact`'s source
@@ -399,12 +507,19 @@ def compute_publish_md5(raw_path: str) -> str | None:
     static publishes the single primary file; fullstack publishes the
     artifact directory.
 
+    `artifact` is the folder (or the single legacy loose file) and
+    `artifacts_base` is its container root — both supplied by the caller, so this
+    works identically on desktop and on the org layout the module-level FS scan
+    cannot see. Without that, the "changed since publish" gate would silently
+    never fire in an org deployment.
+
     Returns None when the artifact can't be resolved or bundled — the caller
     treats None as "can't tell" and does not flag the artifact as modified.
     """
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
-        publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(artifact)
+        publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(
+            artifact, container_dirs=[artifacts_base]
+        )
     except Exception:
         return None
     if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
@@ -432,16 +547,25 @@ def compute_publish_md5(raw_path: str) -> str | None:
     return hashlib.md5(zipped).hexdigest()
 
 
-def unpublish_artifact(raw_path: str) -> dict:
-    settings = get_user_settings()
-    publish_url, api_key = _resolve_publish_endpoint(settings)
-    if not api_key:
-        raise ValueError("Configure your provider API key in Settings before unpublishing")
+def unpublish_artifact(
+    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+) -> dict:
+    """Soft-delete a published artifact: drop it upstream, keep `report_id`.
 
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    Same explicit-input contract as `publish_artifact`. A 404 from upstream is
+    treated as "already gone" (pre-existing behavior) - but it can also mean the
+    remote object is alive under a DIFFERENT owner prefix, because the delete
+    lambda scopes by the token's user_dir. Once the local record is cleared there
+    is nothing left to find it by, so that case is logged as `orphaned_publish`.
+    """
+    if not api_key:
+        raise ValueError("Unpublishing requires an API key")
+
     # Mirror publish: resolve the same .published.json location + key
     # (primary file name) whether a folder or a file was passed.
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
     published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError("Artifact has no publish record")
@@ -474,7 +598,15 @@ def unpublish_artifact(raw_path: str) -> dict:
     except Exception as exc:
         msg = str(exc) or "Unpublishing failed."
         if "404" in msg or "not found" in msg.lower():
-            pass  # Already gone upstream — clear local record below
+            # Already gone upstream, OR still alive under another owner's prefix
+            # and now unreachable — see the docstring. cowork-server has no
+            # metrics backend, so this structured log line IS the metric; keep
+            # the `orphaned_publish` prefix stable.
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=unpublish_404",
+                identifier,
+                entry.get("url", "") if isinstance(entry, dict) else "",
+            )
         else:
             logger.exception("Unpublishing failed (identifier=%s)", identifier)
             raise RuntimeError(f"Unpublishing failed: {msg}") from exc
@@ -486,10 +618,7 @@ def unpublish_artifact(raw_path: str) -> dict:
     if isinstance(entry, dict):
         entry["published"] = False
         published_map[published_key] = entry
-        try:
-            published_json.write_text(json.dumps(published_map, indent=2) + "\n", encoding="utf-8")
-        except Exception:
-            pass
+        _write_published_map(published_json, published_map)
     return {"status": "ok"}
 
 
@@ -502,8 +631,12 @@ def update_artifact(raw_path: str) -> dict:
     pass it through. After republish, refresh `published_mtime` so the badge
     clears. Raises FileNotFoundError when there's nothing published to update.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    # Path first, credential later: an artifact with nothing published must
+    # report that, not "configure your API key".
+    artifact, artifacts_base = desktop_artifact_and_base(raw_path)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
     published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError("Artifact has no publish record")
@@ -521,7 +654,11 @@ def update_artifact(raw_path: str) -> dict:
     access = access_from_owner_side(entry)
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
-    result = publish_artifact(raw_path, access=access)
+    api_key, publish_url = desktop_publish_credential()
+    result = publish_artifact(
+        artifact, artifacts_base=artifacts_base, api_key=api_key,
+        publish_url=publish_url, access=access,
+    )
 
     # Refresh the mtime snapshot so the cheap gate clears the `modified` badge.
     try:
@@ -530,7 +667,7 @@ def update_artifact(raw_path: str) -> dict:
         if isinstance(fresh_entry, dict):
             fresh_entry["published_mtime"] = _content_mtime(published_dir)
             fresh_map[published_key] = fresh_entry
-            published_json.write_text(json.dumps(fresh_map, indent=2) + "\n", encoding="utf-8")
+            _write_published_map(published_json, fresh_map)
     except Exception:
         pass
 

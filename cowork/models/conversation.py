@@ -23,6 +23,19 @@ class Conversation(BaseSQLModel, table=True):
     history_summary_cutoff_id: UUID | None = Field(
         default=None, description="Last message id covered by history_summary"
     )
+    harness: str | None = Field(
+        default=None,
+        description=(
+            "Harness this task launched with (e.g. 'anton', 'claude-code'). "
+            "Distinct from UserSettings.harness (the global default) and "
+            "Message.harness (per-turn) — this is the task's own choice, "
+            "recorded even when the actual work happens outside the app "
+            "(e.g. an external CLI in a terminal)."
+        ),
+    )
+    model: str | None = Field(
+        default=None, description="Model alias the task's harness was launched with"
+    )
 
     project: "Project" = Relationship()
     messages: list["Message"] = Relationship()

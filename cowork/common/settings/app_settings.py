@@ -1,4 +1,5 @@
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -34,22 +35,6 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
     "openai-compatible": [],
 }
 
-# Per-provider default model tuple served to the picker as `recommendedPair`.
-# Order: (planning, coding, router). The 3rd slot is the "routing and
-# summarization" role: MindsHub defaults to the cheap `kimi`; direct
-# providers use their smallest model. The frontend falls back
-# to the coding slot when the 3rd is absent, so an older client still works.
-RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
-    "minds-cloud": ("sonnet", "haiku", "kimi"),
-    "anthropic": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
-    "openai": ("gpt-5.5", "gpt-5.5-mini", "gpt-5.5-mini"),
-    # All three roles default to the one id confirmed to resolve on a fresh
-    # free-tier Google key (ENG-1145); gemini-2.5-pro was zero-quota for new
-    # free-tier keys and gemini-2.5-flash 404s. Pro stays reachable via the picker.
-    "gemini": ("gemini-3.6-flash", "gemini-3.6-flash", "gemini-3.6-flash"),
-    "openai-compatible": ("", "", ""),
-}
-
 # Keyed by the Provider enum *value* (the string) rather than the enum
 # itself, so this module stays free of a circular import with user_settings,
 # which owns the Provider enum.
@@ -59,43 +44,67 @@ RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
 # while openai-compatible is the explicitly selected provider; on a *switch* to
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
+#
 # The one model MindsHub's free monthly allowance covers; every other alias
-# bills the wallet. Org mode (managed, free-first) defaults to it so a tenant
-# with no wallet balance isn't 402'd on its first turn. Desktop keeps the
-# premium canonical defaults below.
+# bills the wallet. It is also every minds-cloud role default below, so the
+# name is declared here rather than beside the org-mode fallback that used to
+# be its only reader.
 MINDS_FREE_MODEL = "mindshub_air"
 
-
-def role_defaults(base: dict[str, str]) -> dict[str, str]:
-    """Model defaults for the current deployment: org mode overrides the
-    minds-cloud default to the free-bucket model (no wallet balance yet);
-    desktop keeps the premium canonical maps below."""
-    if get_app_settings().tenancy_mode == "org":
-        return {**base, "minds_cloud": MINDS_FREE_MODEL}
-    return base
-
-PLANNING_MODEL_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-sonnet-4-6",
-    "openai": "gpt-5.5",
-    "gemini": "gemini-3.6-flash",
-    "minds_cloud": "sonnet",
+# Single source for the per-role defaults: PLANNING/CODING/ROUTER_MODEL_
+# DEFAULTS and RECOMMENDED_PAIR below are all derived from this table.
+MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "planning": "claude-sonnet-4-6",
+        "coding": "claude-haiku-4-5-20251001",
+        "router": "claude-haiku-4-5-20251001",
+    },
+    "openai": {
+        "planning": "gpt-5.5",
+        "coding": "gpt-5.5-mini",
+        "router": "gpt-5.5-mini",
+    },
+    "gemini": {
+        # All three roles use the one id confirmed to work on a fresh
+        # free-tier Google key; other ids were zero-quota/404 for new keys
+        # but stay reachable via the picker.
+        "planning": "gemini-3.6-flash",
+        "coding": "gemini-3.6-flash",
+        "router": "gemini-3.6-flash",
+    },
+    # Every role defaults to the free model, so a user who has picked nothing
+    # can complete a whole turn without the wallet being charged for any of it.
+    # The two invisible roles are the reason this matters: a user sees and can
+    # change the planning model, but the coding role (completion verifier,
+    # scratchpad) and the router role (respond-vs-delegate, history
+    # summarization) run unseen, so a paid default there is denied on an empty
+    # wallet with nothing the user can look at to explain why. Wallet-aware
+    # resolution downstream is the safety net for a stored pin; this is the
+    # value a fresh account starts from, which is also the state where no
+    # availability map has been fetched yet and there is nothing to be aware of.
+    "minds_cloud": {
+        "planning": MINDS_FREE_MODEL,
+        "coding": MINDS_FREE_MODEL,
+        # Not chosen on price: this role gates every turn, and a slow model here
+        # is measurably worse than no router at all. Unmeasured on that axis.
+        "router": MINDS_FREE_MODEL,
+    },
 }
-CODING_MODEL_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5-20251001",
-    "openai": "gpt-5.5-mini",
-    "gemini": "gemini-3.6-flash",
-    "minds_cloud": "haiku",
-}
-# Router role: the cheap front-model that runs history summarization (and later
-# gates each turn, respond-vs-delegate). Defaults: MindsHub →
-# `kimi` (Kimi K2 — fast and cheap; the deprecated `latest:` prefix still
-# resolves but the bare alias is preferred), direct providers → their smallest
-# model (same as the coding tier). Keyed by Provider.value (snake_case).
-ROUTER_MODEL_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5-20251001",
-    "openai": "gpt-5.5-mini",
-    "gemini": "gemini-3.6-flash",
-    "minds_cloud": "kimi",
+PLANNING_MODEL_DEFAULTS: dict[str, str] = {p: r["planning"] for p, r in MODEL_ROLE_DEFAULTS.items()}
+CODING_MODEL_DEFAULTS: dict[str, str] = {p: r["coding"] for p, r in MODEL_ROLE_DEFAULTS.items()}
+ROUTER_MODEL_DEFAULTS: dict[str, str] = {p: r["router"] for p, r in MODEL_ROLE_DEFAULTS.items()}
+
+# Per-provider default model tuple served to the picker as `recommendedPair`.
+# Order: (planning, coding, router); derived from MODEL_ROLE_DEFAULTS above.
+# openai-compatible has no canonical default, so it's a literal special case.
+# The frontend falls back to the coding slot when the 3rd is absent, so an
+# older client still works.
+RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
+    **{
+        provider.replace("_", "-"): (roles["planning"], roles["coding"], roles["router"])
+        for provider, roles in MODEL_ROLE_DEFAULTS.items()
+    },
+    "openai-compatible": ("", "", ""),
 }
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
@@ -242,7 +251,11 @@ class ProjectSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "projects"),
         validation_alias=AliasChoices("COWORK_PROJECTS_DIR", "PROJECTS_ROOT_DIR"),
-        description="Root directory where project folders are stored",
+        description=(
+            "Root directory where project folders are stored. In org mode, only "
+            "this path's final component is kept; the parent directory is always "
+            "COWORK_HOME, so one organization stays one subtree there."
+        ),
     )  # PROJECT_ROOT_DIR or COWORK_PROJECTS_DIR or PROJECTS_ROOT_DIR
 
 
@@ -254,11 +267,27 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class StorageSettings(Settings):
+    # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
+    # mountable subtree per org). Local mode never reads this; in org mode the
+    # per-store *_DIR overrides are inert.
+    shared_root: str = Field(
+        default_factory=lambda: str(cowork_home()),
+        validation_alias=AliasChoices("COWORK_SHARED_DIR", "STORAGE_SHARED_ROOT"),
+        description="Root of the org-keyed shared storage tree (org mode only)",
+    )
+
+
 class SkillSettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "skills"),
         validation_alias=AliasChoices("COWORK_SKILLS_DIR", "SKILLS_ROOT_DIR"),
-        description="Root directory where agentskills.io-format skill folders are stored",
+        description=(
+            "Root directory where agentskills.io-format skill folders are stored. "
+            "In org mode, only this path's final component is kept; the parent "
+            "directory is always COWORK_HOME, so one organization stays one "
+            "subtree there."
+        ),
     )  # COWORK_SKILLS_DIR or SKILLS_ROOT_DIR
 
 
@@ -314,7 +343,11 @@ class MemorySettings(Settings):
     root_dir: str = Field(
         default_factory=lambda: str(cowork_home() / "memory"),
         validation_alias=AliasChoices("COWORK_MEMORY_DIR", "MEMORY_ROOT_DIR"),
-        description="Root directory for all memory files",
+        description=(
+            "Root directory for all memory files. In org mode, only this path's "
+            "final component is kept; the parent directory is always COWORK_HOME, "
+            "so one organization stays one subtree there."
+        ),
     )
 
 
@@ -477,6 +510,21 @@ class AppSettings(Settings):
             "from which a per-request principal is built."
         ),
     )
+    pod_scratch_dir: str = Field(
+        default_factory=lambda: str(Path(tempfile.gettempdir()) / "cowork"),
+        validation_alias=AliasChoices("COWORK_POD_SCRATCH_DIR"),
+        description=(
+            "Org mode only (see cowork.common.paths.pod_local_only): root for "
+            "scratch and deployment-local state that carries no org_id segment "
+            "and so must never sit on the shared COWORK_HOME tree. Covers the "
+            "connector probe's plaintext credential env files, publish's "
+            "state.json, and the anton harness's temporary data-vault "
+            "directory. Local mode never reads this field; those stores keep "
+            "resolving under COWORK_HOME exactly as before. Defaults to the "
+            "container's own temp directory, which is never the shared EFS "
+            "mount and is gone on pod restart."
+        ),
+    )
     ask_user_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
@@ -618,6 +666,7 @@ class AppSettings(Settings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
+    storage: StorageSettings = Field(default_factory=StorageSettings)  # STORAGE_*
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*

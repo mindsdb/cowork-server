@@ -179,6 +179,68 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 
+### The default model is the one the free allowance covers
+
+Every minds-cloud role defaults to `mindshub_air` (`MODEL_ROLE_DEFAULTS` in
+`cowork/common/settings/app_settings.py`), for all three roles: planning, coding
+and router. Its usage draws the monthly included allowance, so a user who has
+picked no model can finish a whole turn without the wallet being charged for any
+part of it.
+
+The two roles a user never sees are why this is the default rather than a
+premium model. Planning is the model in the picker, so a wrong choice there is
+visible and fixable. Coding (the completion verifier and the scratchpad) and
+router (respond-versus-delegate gating and history summarization) run unseen, so
+a paid default there is denied on an empty wallet with nothing on screen to
+explain why.
+
+An explicitly stored model is never rewritten by this. Paying for a better model
+is a pick in the Settings picker, and a funded wallet resolves to the same
+default as an empty one until that pick is made.
+
+### Provider probes always use a model any key can call
+
+Why a probe sends a model at all: MindsHub bills per model, so a model the wallet
+cannot pay for is denied, and that denial is indistinguishable from a bad key.
+Probing a paid model tells an account with an empty wallet that its working key is
+invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the monthly included allowance
+instead of the wallet, so the result reports reachability and key validity, which
+is what these endpoints are for.
+
+Two endpoints, and they do not behave identically.
+
+`POST /settings/validate-provider` (onboarding, and the only caller is the
+onboarding screen) probes a chat completion on every branch, and takes an optional
+`model`:
+
+- `provider: "minds"` always sends `MINDS_PROBE_MODEL` and **ignores** `model`.
+- `provider: "openai-compatible"` sends `model` as asked, so validating one
+  specific model never reports a pass earned by a different one. Omit it against a
+  MindsHub base URL and it falls back to `MINDS_PROBE_MODEL`; omit it against any
+  other host and the generic openai-compatible default applies.
+- `provider: "anthropic"` sends `model` or `claude-sonnet-4-6`.
+
+`POST /settings/test-providers` (the Settings health dot) probes **per provider
+type**, and only the `minds-cloud` type is a chat completion, on
+`MINDS_PROBE_MODEL`. The `openai-compatible` type is a `GET {baseUrl}/models`
+listing probe, so a MindsHub host configured through that card is health-checked
+against a route MindsHub does not deploy everywhere; those routes answer 404 or 401
+even for a valid key, which is the reason the `minds-cloud` type does not use one.
+
+Every MindsHub-bound chat probe caps the completion at `max_tokens: 20`, not 1:
+some models refuse a 1-token budget and fail the probe for a perfectly good key
+(see `_chat_probe`). The cap is not sent to a non-MindsHub endpoint, because
+OpenAI's reasoning models reject `max_tokens` and want `max_completion_tokens`.
+
+The desktop app has a second copy of these validators in its Electron main process
+(`cowork/src/main/provider-validation.ts`, called from the `settings:validate` IPC
+handler in `cowork/src/main/index.ts`); the endpoints here serve the web build.
+Both copies have to change together. One asymmetry worth knowing: the desktop
+MindsHub onboarding path signs in through Keycloak rather than validating a pasted
+key, so main's `validateMinds` has no live caller today, and it is the
+openai-compatible and anthropic validators there that a packaged build actually
+runs.
+
 ## Configuration
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
@@ -191,8 +253,11 @@ Environment variables fall into two namespaces:
 |----------|---------|-------------|
 | `COWORK_LISTEN_PORT` | `26866` | Server port |
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
-| `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root |
-| `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root |
+| `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
+| `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
+| `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
+| `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
+| `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
 
 **Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:

@@ -115,6 +115,12 @@ jobs:
         id: rollout
         run: echo "deployed=true" >> "$GITHUB_OUTPUT"
 
+  integration-tests-pr-env:
+    needs: [deploy-pr-env]
+    uses: ./.github/workflows/tests-integration.yml
+    with:
+      deploy-env: pr-cowork-server-${{ github.event.pull_request.number }}
+    secrets: inherit
 
   deploy:
     runs-on: ${{ inputs.build-runner }}
@@ -170,3 +176,10 @@ jobs:
           env-url: ${{ vars.MDB_ENV_URL }}
           slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
           update-message-id: ${{ steps.slack.outputs.ts }}
+
+  integration-tests:
+    needs: [deploy]
+    uses: ./.github/workflows/tests-integration.yml
+    with:
+      deploy-env: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
+    secrets: inherit

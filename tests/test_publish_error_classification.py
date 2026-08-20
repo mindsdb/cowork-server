@@ -34,6 +34,15 @@ def _client() -> TestClient:
     return TestClient(app)
 
 
+def _patch_context():
+    """The endpoint resolves the artifact + credential before publishing, so the
+    exception-mapping tests below must get past that step to reach `_publish`."""
+    return patch.object(
+        publish_ep, "_desktop_context",
+        lambda raw: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
+    )
+
+
 @pytest.mark.parametrize(
     "exc",
     [
@@ -52,7 +61,7 @@ def test_upstream_runtime_error_always_maps_to_502(exc):
     in its message — including the two cases whose text happens to contain
     "unavailable" (a timeout's advice string, and a real HTTP 503 reason
     phrase) that used to flip this to 503 via substring matching."""
-    with patch.object(publish_ep, "_publish", side_effect=exc):
+    with _patch_context(), patch.object(publish_ep, "_publish", side_effect=exc):
         res = _client().post("/api/v1/publish/", json={"path": "/some/art"})
     assert res.status_code == 502
     assert res.json()["detail"] == str(exc)
@@ -62,7 +71,7 @@ def test_publisher_unavailable_maps_to_503():
     """The local "a publish dependency didn't import" case is still a 503,
     now via the exception type instead of message sniffing."""
     exc = PublisherUnavailable("Anton publisher is unavailable")
-    with patch.object(publish_ep, "_publish", side_effect=exc):
+    with _patch_context(), patch.object(publish_ep, "_publish", side_effect=exc):
         res = _client().post("/api/v1/publish/", json={"path": "/some/art"})
     assert res.status_code == 503
     assert res.json()["detail"] == "Anton publisher is unavailable"
@@ -87,7 +96,7 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, publish_side
     monkeypatch.setattr(publish, "resolve_artifact_path", lambda raw, allow_dir=True: target)
     monkeypatch.setattr(
         publish, "_resolve_publish_target",
-        lambda a: (target, target.parent, key, False),
+        lambda a, container_dirs=None: (target, target.parent, key, False),
     )
 
     def fake_publish(src, **kw):
@@ -111,7 +120,7 @@ def test_local_failure_before_any_request_is_not_framed_as_connection_failure(tm
     _wire_publish(monkeypatch, tmp_path, page, "dashboard.html", publish_side_effect=local_exc)
 
     with pytest.raises(RuntimeError) as exc_info:
-        publish.publish_artifact(str(page))
+        publish.publish_artifact(page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
 
     msg = str(exc_info.value)
     assert "Connection failed" not in msg
@@ -131,7 +140,7 @@ def test_real_gateway_timeout_is_still_framed_as_connection_failure(tmp_path, mo
     _wire_publish(monkeypatch, tmp_path, page, "dashboard.html", publish_side_effect=upstream_exc)
 
     with pytest.raises(RuntimeError) as exc_info:
-        publish.publish_artifact(str(page))
+        publish.publish_artifact(page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
 
     msg = str(exc_info.value)
     assert "Connection failed" in msg

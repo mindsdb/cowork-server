@@ -34,6 +34,7 @@ def _scope(org: str, user: str = "user-1") -> TenantScope:
 @pytest.fixture()
 def engine(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_FILES_DIR", str(tmp_path / "files"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
     import cowork.models.message, cowork.models.message_event  # noqa: F401  mappers
     eng = create_engine(
@@ -107,14 +108,13 @@ def test_local_scope_sees_everything(engine):
 
 def test_upload_fail_closed_writes_no_bytes(engine, tmp_path):
     from cowork.db.scoped import MissingTenantScopeError
-    files_root = Path(get_app_settings().file.root_dir)
-    before = set(files_root.iterdir()) if files_root.exists() else set()
+    # Watch the whole isolated tree — a leak could land in either layout.
+    before = set(tmp_path.rglob("*"))
     # org mode without an org in scope (audit gap) must fail BEFORE disk I/O
     svc = _svc(engine, TenantScope(org_mode=True, org_id=None))
     with pytest.raises(MissingTenantScopeError):
         _mkfile(svc)
-    after = set(files_root.iterdir()) if files_root.exists() else set()
-    assert before == after, "no orphaned bytes on scope failure"
+    assert set(tmp_path.rglob("*")) == before, "no orphaned bytes on scope failure"
 
 
 def test_compat_upload_scope_failure_is_401_not_500(monkeypatch):
@@ -269,7 +269,8 @@ async def test_upload_filename_cannot_escape_root(engine, tmp_path, name):
     svc = _svc(engine, _scope(ORG_A))
     res = await svc.create_file(_upload(name), purpose="assistants")
     stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
-    assert (tmp_path / "files").resolve() in stored.parents  # contained
+    # org-first layout: bytes contained under <shared>/<org>/files
+    assert (tmp_path / ORG_A / "files").resolve() in stored.parents
     assert stored.name in ("pwned", "upload")                # basename or fallback
     assert not (tmp_path / "etc").exists()
 
@@ -305,3 +306,257 @@ def test_delete_by_purpose_never_rmtrees_an_escaped_legacy_path(engine, tmp_path
     svc.session.commit()
     unlink_file_dirs(dirs)  # the caller unlinks after committing
     assert (victim / "keep.txt").exists()  # untouched
+
+
+# ── org-first files layout ───────────────────────────────────────────────────
+
+def test_files_land_in_separate_org_subtrees(engine, tmp_path):
+    # Disk-level separation, not just row filtering.
+    row_a = _mkfile(_svc(engine, _scope(ORG_A)))
+    row_b = _mkfile(_svc(engine, _scope(ORG_B)))
+    assert Path(row_a.path) == tmp_path / ORG_A / "files" / str(row_a.id) / "report.csv"
+    assert Path(row_b.path) == tmp_path / ORG_B / "files" / str(row_b.id) / "report.csv"
+
+
+def test_same_org_delete_removes_bytes(engine):
+    # Write and delete must resolve the same root, or bytes silently orphan.
+    svc = _svc(engine, _scope(ORG_A))
+    row = _mkfile(svc)
+    path = Path(row.path)
+    assert path.exists()
+    assert svc.delete_file(row.id) is True
+    assert not path.parent.exists()
+
+
+def test_local_mode_delete_removes_bytes(engine, tmp_path):
+    svc = _svc(engine, LOCAL_SCOPE)
+    row = _mkfile(svc)
+    path = Path(row.path)
+    assert (tmp_path / "files").resolve() in path.resolve().parents  # unkeyed base
+    assert svc.delete_file(row.id) is True
+    assert not path.parent.exists()
+
+
+def test_delete_by_purpose_removes_bytes_under_current_root(engine):
+    # Staged dirs must be the real on-disk dirs.
+    from cowork.services.files import unlink_file_dirs
+    svc = _svc(engine, _scope(ORG_A))
+    purpose = attachment_purpose(str(uuid4()))
+    rows = [_mkfile(svc, purpose=purpose) for _ in range(2)]
+    paths = [Path(r.path) for r in rows]
+    assert all(p.exists() for p in paths)
+
+    dirs = svc.delete_by_purpose(purpose)
+    svc.session.commit()
+    unlink_file_dirs(dirs)
+    assert all(not p.parent.exists() for p in paths)
+
+
+def test_delete_unlinks_stored_dir_after_root_move(engine, tmp_path, monkeypatch):
+    # If the root moves between write and delete, the stored dir must still go.
+    svc = _svc(engine, _scope(ORG_A))
+    row = _mkfile(svc)
+    old_path = Path(row.path)
+    assert old_path.exists()
+
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "moved-root"))
+    get_app_settings.cache_clear()
+    try:
+        assert svc.delete_file(row.id) is True
+        assert not old_path.parent.exists(), "bytes at the old root must not orphan"
+    finally:
+        get_app_settings.cache_clear()
+
+
+def test_delete_after_root_move_still_ignores_escaped_paths(engine, tmp_path, monkeypatch):
+    # Stored dir only counts when its resolved parent is named <file.id>.
+    svc = _svc(engine, _scope(ORG_A))
+    victim = tmp_path / "victim-moved"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("x")
+    f = File(filename="x", content_type="text/plain", size=1,
+             purpose="assistants", path=str(victim / "x"))
+    svc.session.add(f)
+    svc.session.commit()
+    svc.session.refresh(f)
+
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "moved-root2"))
+    get_app_settings.cache_clear()
+    try:
+        assert svc.delete_file(f.id) is True
+        assert (victim / "keep.txt").exists()  # untouched
+    finally:
+        get_app_settings.cache_clear()
+
+
+# ── cloud attachment staging into the pod workspace ──────────────────────────
+
+def test_stage_conversation_attachments_copies_into_workspace(engine, tmp_path):
+    svc = _svc(engine, _scope(ORG_A))
+    conv = str(uuid4())
+    a = svc.create_file_from_bytes(filename="shot.png", content_type="image/png",
+                                   data=b"img", purpose=attachment_purpose(conv))
+    b = svc.create_file_from_bytes(filename="notes.txt", content_type="text/plain",
+                                   data=b"hi", purpose=attachment_purpose(conv))
+    proj = tmp_path / "proj"
+    assert svc.stage_conversation_attachments(conv, proj) == 2
+    base = proj / "conversations" / conv / "attachments"
+    assert (base / str(a.id) / "shot.png").read_bytes() == b"img"
+    assert (base / str(b.id) / "notes.txt").read_bytes() == b"hi"
+
+
+def test_stage_is_idempotent_and_conversation_scoped(engine, tmp_path):
+    svc = _svc(engine, _scope(ORG_A))
+    conv, other = str(uuid4()), str(uuid4())
+    svc.create_file_from_bytes(filename="a.txt", content_type="text/plain",
+                               data=b"x", purpose=attachment_purpose(conv))
+    svc.create_file_from_bytes(filename="b.txt", content_type="text/plain",
+                               data=b"y", purpose=attachment_purpose(other))
+    proj = tmp_path / "proj"
+    assert svc.stage_conversation_attachments(conv, proj) == 1      # only this conv's
+    assert svc.stage_conversation_attachments(conv, proj) == 1      # idempotent
+    assert not (proj / "conversations" / other).exists()           # other conv untouched
+
+
+def test_stage_project_instructions_copies_anton_md_into_workspace(tmp_path):
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    (proj / ".anton").mkdir(parents=True)
+    (proj / ".anton" / "anton.md").write_text("# Project rules\nBe concise.")
+
+    assert stage_project_instructions(proj, conv) is True
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    assert dest.read_text() == "# Project rules\nBe concise."
+    # idempotent: no error, still in place
+    assert stage_project_instructions(proj, conv) is True
+    assert dest.is_file()
+
+
+def test_stage_project_instructions_noop_without_anton_md(tmp_path):
+    from cowork.services.files import stage_project_instructions
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert stage_project_instructions(proj, str(uuid4())) is False
+
+
+def test_stage_prunes_a_deleted_attachment(engine, tmp_path):
+    svc = _svc(engine, _scope(ORG_A))
+    conv = str(uuid4())
+    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+                                   data=b"k", purpose=attachment_purpose(conv))
+    b = svc.create_file_from_bytes(filename="gone.txt", content_type="text/plain",
+                                   data=b"g", purpose=attachment_purpose(conv))
+    proj = tmp_path / "proj"
+    assert svc.stage_conversation_attachments(conv, proj) == 2
+    base = proj / "conversations" / conv / "attachments"
+    assert (base / str(b.id)).is_dir()
+
+    svc.delete_file(b.id)                       # user removes one attachment
+    assert svc.stage_conversation_attachments(conv, proj) == 1
+    assert (base / str(a.id)).is_dir()          # kept one remains
+    assert not (base / str(b.id)).exists()      # deleted one pruned → agent stops seeing it
+
+
+def test_stage_refuses_symlinked_attachments_dir(engine, tmp_path):
+    # A prompt-injected pod mounts its conversation dir read-write, so it can
+    # replace `attachments` with a symlink into another org's subtree. cowork-server
+    # sees every org; a staging pass that followed the link would iterdir+rmtree
+    # the victim's data. The staging path must never follow it.
+    svc = _svc(engine, _scope(ORG_A))
+    conv = str(uuid4())
+    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+                                   data=b"k", purpose=attachment_purpose(conv))
+
+    # Stand-in for another org's tree, and the pod-planted symlink over `attachments`.
+    victim = tmp_path / "other-org"
+    (victim / "sub").mkdir(parents=True)
+    (victim / "secret.txt").write_text("do not delete")
+    (victim / "sub" / "data.txt").write_text("keep me")
+
+    proj = tmp_path / "proj"
+    conv_dir = proj / "conversations" / conv
+    conv_dir.mkdir(parents=True)
+    (conv_dir / "attachments").symlink_to(victim, target_is_directory=True)
+
+    svc.stage_conversation_attachments(conv, proj)
+
+    # The victim tree is untouched: nothing followed the link, nothing deleted.
+    assert (victim / "secret.txt").read_text() == "do not delete"
+    assert (victim / "sub" / "data.txt").read_text() == "keep me"
+    assert {p.name for p in victim.iterdir()} == {"secret.txt", "sub"}
+    # The planted link was replaced by a real dir the attachment staged into.
+    attachments = conv_dir / "attachments"
+    assert not attachments.is_symlink()
+    assert (attachments / str(a.id) / "keep.txt").read_bytes() == b"k"
+
+
+def test_stage_rejects_non_uuid_conversation_segment(engine, tmp_path):
+    from cowork.services.files import stage_project_instructions
+    svc = _svc(engine, _scope(ORG_A))
+    assert svc.stage_conversation_attachments("../evil", tmp_path / "proj") == 0
+    assert stage_project_instructions(tmp_path / "proj", "../evil") is False
+
+
+def test_remove_conversation_workspace_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")   # cloud-only cleanup
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    ws = proj / "conversations" / conv
+    (ws / "attachments" / "x").mkdir(parents=True)
+    (ws / ".anton").mkdir(parents=True)
+    remove_conversation_workspace_dir(proj, conv)
+    assert not ws.exists()
+    remove_conversation_workspace_dir(proj, conv)   # idempotent, no error
+    remove_conversation_workspace_dir(None, conv)   # no project → no-op
+
+
+def test_remove_conversation_workspace_dir_is_noop_on_desktop(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    ws = proj / "conversations" / conv
+    (ws / "notes").mkdir(parents=True)               # a user's own dir, coincidental name
+    remove_conversation_workspace_dir(proj, conv)
+    assert ws.exists(), "desktop conversation delete must not rmtree a project subdir"
+
+
+def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
+    """A typo-fix edit (same length, same mtime second) must still re-stage —
+    the old size+mtime skip could serve stale instructions."""
+    import os
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    (proj / ".anton").mkdir(parents=True)
+    src = proj / ".anton" / "anton.md"
+    src.write_text("be terse")
+    assert stage_project_instructions(proj, conv) is True
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    assert dest.read_text() == "be terse"
+
+    # same-length edit, pinned to the same mtime as the staged copy
+    fixed_mtime = dest.stat().st_mtime
+    src.write_text("be funny")                       # same length (8), different content
+    os.utime(src, (fixed_mtime, fixed_mtime))
+    assert stage_project_instructions(proj, conv) is True
+    assert dest.read_text() == "be funny"            # re-staged despite the tie
+
+
+def test_same_org_users_cannot_see_each_others_files(engine):
+    """Staging audit P0: files are personal (created_by) but list/get/delete
+    filtered by org only, so coworkers saw/read/deleted each other's files."""
+    alice = _svc(engine, _scope(ORG_A, "alice"))
+    bob = _svc(engine, _scope(ORG_A, "bob"))
+    a_file = _mkfile(alice)
+
+    assert a_file.id not in {f.id for f in bob.list_files()}
+    import pytest
+    with pytest.raises(ValueError):
+        bob.get_file(a_file.id)
+    assert bob.delete_file(a_file.id) is False
+    assert alice.get_file(a_file.id).id == str(a_file.id)  # still Alice's
