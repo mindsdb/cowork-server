@@ -43,6 +43,18 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
 _ENGINE_TO_SERVICE: dict[str, str] = {cfg.engine: svc for svc, cfg in OAUTH_SERVICES.items()}
 
 
+def _credentials_complete(client_id: str, client_secret: str, secret_attr: str | None) -> bool:
+    """True once `client_id` is set and, for providers that actually have a
+    client_secret (`secret_attr` is not `None`), `client_secret` is set too.
+    Public, PKCE-only providers (`secret_attr is None`, e.g. PostHog) need
+    only `client_id` — a present-but-empty `client_secret` there is correct,
+    not "not configured yet". One helper for every place that needs this
+    check (`_resolve_credentials`, `start`'s BYOK bypass, `callback`'s
+    cached-credentials branch, `get_catalogue`, and the `/credentials`
+    endpoint) so the rule can't drift between call sites."""
+    return bool(client_id and (client_secret or not secret_attr))
+
+
 def _fetch_userinfo_google(access_token: str) -> dict[str, Any]:
     return _json_request(
         "https://openidconnect.googleapis.com/v1/userinfo",
@@ -65,15 +77,22 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
 
 def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
     """PostHog's own user object — email plus optional first/last name.
-    Queried against the US Cloud API host; PostHog's OAuth authorize/token
-    endpoints are region-agnostic (`oauth.posthog.com`), but we haven't yet
-    confirmed a token issued that way is accepted against every regional
-    API host, so this may need adjusting once tested against a real
-    EU-hosted account."""
-    result = _json_request(
-        "https://us.posthog.com/api/users/@me/",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
+    PostHog's OAuth authorize/token endpoints are region-agnostic
+    (`oauth.posthog.com`), but the resource API is split by region
+    (us.posthog.com / eu.posthog.com) and a token issued for one region is
+    not guaranteed to be accepted by the other's host. Try US Cloud first
+    (the default/most common case) and fall back to EU Cloud on failure,
+    rather than requiring the caller to know the account's region upfront."""
+    try:
+        result = _json_request(
+            "https://us.posthog.com/api/users/@me/",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    except HTTPException:
+        result = _json_request(
+            "https://eu.posthog.com/api/users/@me/",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
     email = str(result.get("email") or "").strip()
     first_name = str(result.get("first_name") or "").strip()
     last_name = str(result.get("last_name") or "").strip()
@@ -172,7 +191,7 @@ class OAuthService:
         # `secret_attr` is `None` for public, PKCE-only providers (PostHog) —
         # no client_secret exists to look up, and none is required.
         client_secret = getattr(settings, secret_attr) if secret_attr else ""
-        if not client_id or (secret_attr and not client_secret):
+        if not _credentials_complete(client_id, client_secret, secret_attr):
             raise HTTPException(status_code=400, detail=f"OAuth credentials not configured for {service}.")
         return client_id, client_secret
 
@@ -203,7 +222,8 @@ class OAuthService:
         return None
 
     def start(self, service: str, settings: OAuthSettings, *, client_id: str = "", client_secret: str = "", extra_fields: dict[str, str] | None = None) -> OAuthStartResponse:
-        if client_id and client_secret:
+        _, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
+        if _credentials_complete(client_id, client_secret, secret_attr):
             cid, csecret = client_id, client_secret
         else:
             cid, csecret = self._resolve_credentials(service, settings)
@@ -288,7 +308,8 @@ class OAuthService:
 
         pending_client_id = str(pending.get("clientId", "")).strip()
         pending_client_secret = str(pending.get("clientSecret", "")).strip()
-        if pending_client_id and pending_client_secret:
+        _, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
+        if _credentials_complete(pending_client_id, pending_client_secret, secret_attr):
             client_id, client_secret = pending_client_id, pending_client_secret
         else:
             try:
@@ -461,7 +482,7 @@ class OAuthService:
             id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service_id]
             cid = getattr(oauth_settings, id_attr, "")
             csecret = getattr(oauth_settings, secret_attr, "") if secret_attr else ""
-            ready = bool(cid and (csecret or not secret_attr))
+            ready = _credentials_complete(cid, csecret, secret_attr)
             config_error = "" if ready else f"OAuth credentials not configured for {service_id}."
 
             connections = []
