@@ -472,7 +472,15 @@ class ProjectService:
             # the whole project delete and leave it half-cascaded. Log and move
             # on — a skipped conversation just retains today's orphan behavior.
             try:
-                conv_svc.delete_conversation(cid)
+                # Owner-AGNOSTIC: a project is org-shared and may hold several
+                # members' conversations. Fetch org-scoped (session.get validates
+                # org, not owner) and delete the row directly — the request-facing
+                # delete_conversation is owner-scoped and would skip foreign rows,
+                # re-orphaning them (ENG-701).
+                conv = self.session.get(Conversation, cid)
+                if conv is None:
+                    continue
+                conv_svc.delete_conversation_row(conv)
             except Exception:
                 # Roll back the failed conversation's partial work FIRST.
                 # delete_conversation stages its row deletes (messages, events,

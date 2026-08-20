@@ -67,18 +67,21 @@ def _authorized_handle(
     """
     if handle is None:
         return None
-    return handle if _org_matches(handle.org_id, scope) else None
+    return handle if _owner_matches(handle.org_id, handle.user_id, scope) else None
 
 
-def _org_matches(org_id: str | None, scope: TenantScope) -> bool:
-    """Whether the caller's scope may touch a turn owned by ``org_id``.
+def _owner_matches(org_id: str | None, user_id: str | None, scope: TenantScope) -> bool:
+    """Whether the caller may touch a turn owned by (org_id, user_id).
 
-    Shared by the local-handle check above and the Redis turn index, so the two
-    cannot drift into disagreeing about who may cancel whose turn.
+    Turns are personal — a conversation belongs to its creator — so in org mode
+    BOTH the org and the owning user must match. Matching the org alone let any
+    member tail/cancel/answer a teammate's live turn and read its prompts and
+    output (staging audit P0). Local mode never filters (single user). Shared by
+    the local-handle check and the Redis turn index so the two can't disagree.
     """
     if not scope.org_mode:
         return True   # today's single-user behavior
-    return org_id == scope.org_id
+    return org_id == scope.org_id and user_id == scope.user_id
 
 
 class SharedTurn(NamedTuple):
@@ -108,7 +111,7 @@ async def _shared_turn(
     if not conversation_id or get_backend() != "redis":
         return None
     turn = await get_turn(conversation_id)
-    if turn is None or not _org_matches(turn.get("org_id") or None, scope):
+    if turn is None or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
         return None
     buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
     await buf.refresh()
@@ -206,7 +209,7 @@ async def in_flight_list(scope: TenantScopeDep):
         seen = {row["conversation_id"] for row in out}
         for turn in await list_turns():
             cid = turn["conversation_id"]
-            if cid in seen or not _org_matches(turn.get("org_id") or None, scope):
+            if cid in seen or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
                 continue
             buf = RedisStreamBuffer(conversation_id=cid, turn_id=int(turn["turn_id"]))
             await buf.refresh()
