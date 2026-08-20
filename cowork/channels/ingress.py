@@ -188,7 +188,6 @@ async def reconcile_once(manager: IngressManager, adapters: Any) -> None:
     deleted on a different replica than the one holding the connection"."""
     from sqlmodel import select
 
-    from cowork.db.scoped import ScopedSession, TenantScope
     from cowork.db.session import get_open_session
     from cowork.models.channel import ChannelInstallation
 
@@ -198,11 +197,11 @@ async def reconcile_once(manager: IngressManager, adapters: Any) -> None:
             select(ChannelInstallation).where(ChannelInstallation.org_id.is_not(None))
         ).all()
         desired = {(r.channel_type, r.org_id) for r in rows}
-        for channel_type, org_id in desired:
-            scope = TenantScope(org_mode=True, org_id=org_id)
-            await adapters.get_or_refresh(channel_type, org_id, session=ScopedSession(session, scope))
     finally:
         session.close()
+
+    for channel_type, org_id in desired:
+        await adapters.get_or_refresh(channel_type, org_id)
 
     for channel_type, org_id in desired:
         await sync_channel_ingress(manager, adapters, channel_type, org_id)

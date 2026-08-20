@@ -443,3 +443,78 @@ def test_reconciler_task_can_be_started_and_cancelled():
             await task
 
     asyncio.run(scenario())
+
+
+def test_reconcile_once_with_multiple_orgs(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+    from cowork.channels.ingress import reconcile_once
+    from cowork.db.session import get_open_session
+    from cowork.models.channel import ChannelInstallation
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    session = get_open_session()
+    row_ids = []
+    try:
+        row1 = ChannelInstallation(
+            channel_type="discord", display_name="Discord", org_id="org-multi-1",
+        )
+        row2 = ChannelInstallation(
+            channel_type="slack", display_name="Slack", org_id="org-multi-2",
+        )
+        session.add(row1)
+        session.add(row2)
+        session.commit()
+        row_ids = [row1.id, row2.id]
+    finally:
+        session.close()
+
+    class _FakeMultiOrgAdapters:
+        """Adapters for two distinct orgs."""
+
+        def __init__(self):
+            self.bridge1 = _FakeStreamBridge()
+            self.bridge2 = _FakeStreamBridge()
+            self._cached = set()
+
+        def get(self, channel_type, org_id=None):
+            if channel_type == "discord" and org_id == "org-multi-1" and "org-multi-1" in self._cached:
+                return self.bridge1
+            if channel_type == "slack" and org_id == "org-multi-2" and "org-multi-2" in self._cached:
+                return self.bridge2
+            return None
+
+        async def get_or_refresh(self, channel_type, org_id, *, session=None):
+            if channel_type == "discord" and org_id == "org-multi-1":
+                self._cached.add("org-multi-1")
+                return self.bridge1
+            if channel_type == "slack" and org_id == "org-multi-2":
+                self._cached.add("org-multi-2")
+                return self.bridge2
+            return None
+
+    try:
+        async def scenario():
+            mgr = IngressManager(sink=_noop_sink)
+            adapters = _FakeMultiOrgAdapters()
+
+            await reconcile_once(mgr, adapters)
+            assert mgr.is_running("discord", "org-multi-1")
+            assert mgr.is_running("slack", "org-multi-2")
+
+        asyncio.run(scenario())
+    finally:
+        cleanup = get_open_session()
+        try:
+            for row_id in row_ids:
+                stored = cleanup.get(ChannelInstallation, row_id)
+                if stored is not None:
+                    cleanup.delete(stored)
+            cleanup.commit()
+        finally:
+            cleanup.close()
