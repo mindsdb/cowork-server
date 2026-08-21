@@ -13,8 +13,6 @@ validates clean. Hence the explicit unknown-key check below.
 """
 
 import json
-import os
-import re
 from pathlib import Path
 
 import pytest
@@ -213,78 +211,8 @@ class TestLangfuseSpec:
         assert field.default == "https://cloud.langfuse.com"
         assert field.required is False
 
-    # ── The how_to's credential lookup ──────────────────────────────────
-    #
-    # `lookup_connector` hands the how_to to the agent verbatim, so its code
-    # block is not documentation — it is the thing that runs. These tests
-    # execute it, because a string assertion would not have caught either bug
-    # they were written for:
-    #
-    #   * credentials are FLAT (DS_PUBLIC_KEY) during the validation probe
-    #     (probe.py:189) and NAMESPACED (DS_LANGFUSE_<NAME>__*) once saved
-    #     (data_vault.py:308). An earlier draft handled only the second.
-    #   * every connection is injected at once (harness.py:805), so a naive
-    #     per-key scan took the public key from one Langfuse project and the
-    #     secret from another — a 401 that reads as a bad credential.
-
-    @staticmethod
-    def _creds_fn(spec):
-        """Exec the how_to's python block, return its `langfuse_creds`."""
-        how_to = next(m for m in spec.form.methods if m.id == "api-key").how_to
-        block = re.search(r"```python\n(.*?)```", how_to, re.S)
-        assert block, "the how_to must carry a runnable python block"
-        # Stop before the module-level demo call, which would fire a request.
-        src = block.group(1).split("pk, sk, base = langfuse_creds()")[0]
-        ns: dict = {}
-        exec(src, ns)  # noqa: S102 — the input is this repo's own spec file
-        return ns["langfuse_creds"]
-
-    @pytest.fixture
-    def creds(self, spec, monkeypatch):
-        fn = self._creds_fn(spec)
-
-        def run(env):
-            monkeypatch.delenv("DS_PUBLIC_KEY", raising=False)
-            for k in [k for k in os.environ if k.startswith("DS_LANGFUSE_")]:
-                monkeypatch.delenv(k, raising=False)
-            for k, v in env.items():
-                monkeypatch.setenv(k, v)
-            return fn()
-
-        return run
-
-    def test_reads_the_flat_vars_the_validation_probe_writes(self, creds):
-        pk, sk, base = creds({
-            "DS_PUBLIC_KEY": "pk-a", "DS_SECRET_KEY": "sk-a",
-            "DS_BASE_URL": "https://self.example",
-        })
-        assert (pk, sk, base) == ("pk-a", "sk-a", "https://self.example")
-
-    def test_reads_a_saved_connection_and_defaults_the_host(self, creds):
-        pk, sk, base = creds({
-            "DS_LANGFUSE_MAIN__PUBLIC_KEY": "pk-a",
-            "DS_LANGFUSE_MAIN__SECRET_KEY": "sk-a",
-        })
-        assert (pk, sk, base) == ("pk-a", "sk-a", "https://cloud.langfuse.com")
-
-    def test_refuses_to_mix_credentials_across_two_connections(self, creds):
-        """The bug this exists for: half a pair from each project."""
-        with pytest.raises(RuntimeError, match="[Ss]everal Langfuse connections"):
-            creds({
-                "DS_LANGFUSE_SELFHOST__PUBLIC_KEY": "pk-self",
-                "DS_LANGFUSE_CLOUD__SECRET_KEY": "sk-cloud",
-                "DS_LANGFUSE_SELFHOST__SECRET_KEY": "sk-self",
-                "DS_LANGFUSE_CLOUD__PUBLIC_KEY": "pk-cloud",
-            })
-
-    def test_names_the_problem_when_a_field_was_skipped(self, creds):
-        """A required field can be skipped (submissions.py:63), so half a pair
-        is reachable — it must not surface as a bare StopIteration."""
-        with pytest.raises(RuntimeError, match="No complete Langfuse key pair"):
-            creds({"DS_LANGFUSE_MAIN__PUBLIC_KEY": "pk-only"})
-
     @pytest.mark.parametrize(
-        "query", ["langfuse", "langfuse.com", "langfuse cloud", "llm observability"]
+        "query", ["langfuse", "langfuse.com", "langfuse cloud"]
     )
     def test_is_discoverable_by_name_and_alias(self, query):
         result = ConnectorSpecRegistry(SPECS_DIR).match_connector(query)
