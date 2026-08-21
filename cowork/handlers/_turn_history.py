@@ -88,6 +88,13 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
         if not isinstance(row, dict):
             return _reject("row is %s, not a dict", type(row).__name__)
         role = row.get("role")
+        # Type-check before the lookup, not after: a dict or list is valid JSON
+        # and unhashable, so `_BLOCK_FOR_ROLE.get(role)` would raise TypeError
+        # rather than reject. This function's contract is that `[]` answers
+        # EVERY malformed input, so nothing may reach a hash before it is known
+        # to be a string.
+        if not isinstance(role, str):
+            return _reject("row role is %s, not a string", type(role).__name__)
         want = _BLOCK_FOR_ROLE.get(role)
         if want is None:
             return _reject("unexpected role %r", role)
@@ -102,8 +109,16 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
             if block.get("type") != want:
                 return _reject("role %s carries a %r block, expected %r",
                                role, block.get("type"), want)
-            if not block.get(_ID_FIELD[want]):
-                return _reject("%s block without %s", want, _ID_FIELD[want])
+            block_id = block.get(_ID_FIELD[want])
+            # Must be a non-empty *string*, not merely truthy. A dict or list id
+            # is valid JSON, passes a truthiness check, and then raises
+            # TypeError in the Counter below — turning a turn that should
+            # degrade to text-only into a failed turn, the exact outcome this
+            # module exists to prevent. Both provider APIs use string ids
+            # anyway, so the strictness costs nothing.
+            if not isinstance(block_id, str) or not block_id:
+                return _reject("%s block carries %s as its %s, expected a non-empty string",
+                               want, type(block_id).__name__, _ID_FIELD[want])
             blocks.append(_cap_tool_result(block) if want == "tool_result" else block)
         clean.append({"role": role, "content": blocks})
 
