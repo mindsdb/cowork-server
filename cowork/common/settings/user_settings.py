@@ -111,6 +111,22 @@ def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
 
 
+def _first_available_model(enabled_map: dict[str, bool]) -> str | None:
+    """First enabled model in map order, else the first served one, else None.
+
+    The map lists the full ``/v1/models`` catalogue in the gateway's ranking, so
+    its first enabled entry is the affordable baseline; when nothing is enabled the
+    first key is still a served (locked) model — recoverable via top-up, unlike a
+    retired id that 404s every turn. Empty map → None.
+    """
+    if not enabled_map:
+        return None
+    return next(
+        (m for m, en in enabled_map.items() if en),
+        next(iter(enabled_map)),
+    )
+
+
 def _enabled_aware_default(
     provider_value: str,
     defaults: dict[str, str],
@@ -140,6 +156,12 @@ def _enabled_aware_default(
     if get_app_settings().tenancy_mode == "org":
         if default is not None and enabled_map.get(default) is True:
             return default
+        # Free model, unless a known catalogue no longer serves it — then it's
+        # retired and would 404 every turn, so hand out a served model.
+        if enabled_map and MINDS_FREE_MODEL not in enabled_map:
+            served = _first_available_model(enabled_map)
+            if served is not None:
+                return served
         return MINDS_FREE_MODEL
     if not enabled_map:
         return default
@@ -148,6 +170,13 @@ def _enabled_aware_default(
     for model_id, enabled in enabled_map.items():
         if enabled:
             return model_id
+    # Nothing affordable. A still-served (locked) default is kept — it 402s with a
+    # top-up path. A default absent from this non-empty catalogue is retired and
+    # would 404 every turn, so fall back to a served model instead.
+    if default is not None and default not in enabled_map:
+        served = _first_available_model(enabled_map)
+        if served is not None:
+            return served
     return default
 
 
@@ -225,16 +254,22 @@ def _resolved_model(
             bare = user_model.removeprefix("latest:")
             if not enabled.get(bare, False):
                 # First enabled entry in map order. The real guarantee here is
-                # NOT "the gateway lists the free model first" (it doesn't —
-                # verified against prod, haiku leads the catalogue): it is
-                # that enablement tracks affordability, so on a locked wallet
-                # only free-bucket models are enabled and the first enabled
-                # entry is affordable by construction. Embedding rows never
+                # NOT "the gateway lists the free model first" (it doesn't, and
+                # the ranking changes per deployment): it is that enablement
+                # tracks affordability, so on a locked wallet only free-bucket
+                # models are enabled and the first enabled entry is affordable
+                # by construction. Embedding rows never
                 # reach this map — filtered at construction in
                 # fetch_minds_models (_is_embedding_row).
                 fallback = next((mid for mid, en in enabled.items() if en), None)
                 if fallback:
                     return fallback
+                # Nothing affordable. A still-served (locked) pin is kept below. But
+                # an id absent from this non-empty catalogue is retired/foreign and
+                # 404s every turn with no recovery, so hand out a served model
+                # instead of a dead id.
+                if bare not in enabled:
+                    return next(iter(enabled))
         return user_model
     # No explicit choice (or provider switched): the resolved provider's default,
     # availability-adjusted. openai-compatible has no default -> None, so the

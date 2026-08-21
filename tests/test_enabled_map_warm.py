@@ -229,6 +229,73 @@ def test_persist_preserves_map_order():
         session.close()
 
 
+def test_persist_densifies_sparse_enabled_over_full_catalogue():
+    # `fetch_minds_models` only records rows that publish `enabled`, so a served
+    # model that omits the flag (missing = available) is ABSENT from the raw
+    # map. The resolution logic reads absence from a non-empty map as "retired"
+    # and steers off it — so the sparse map must be densified over the full
+    # served catalogue (`live_ids`) before it is stored, or a working free model
+    # gets misread as retired. Here only `sonnet` publishes a flag; `mindshub_air`
+    # and `haiku` are served but unflagged and must persist as available.
+    from cowork.services.providers import persist_enabled_model_map
+
+    session = _fresh_session()
+    try:
+        sparse = {"sonnet": False}
+        catalogue = ["mindshub_air", "sonnet", "haiku"]
+        assert persist_enabled_model_map(
+            session, LOCAL_SCOPE, "{}", sparse, catalogue
+        ) is True
+        stored = json.loads(SettingService(session).load().minds_model_enabled)
+        # Full catalogue, in gateway order, with the unflagged rows defaulted to
+        # available and the published lock preserved.
+        assert stored == {"mindshub_air": True, "sonnet": False, "haiku": True}
+        assert list(stored) == catalogue
+    finally:
+        _clear(session, "minds_model_enabled")
+        session.close()
+
+
+def test_persist_prunes_retired_ids_when_enabled_flags_absent():
+    # A gateway can return a real catalogue WITHOUT any `enabled` flags (version
+    # skew / a plain OpenAI-compatible endpoint) -> live_enabled == {}. We can't
+    # re-derive the locks, but the id list is still authoritative membership, so
+    # a retired id must be PRUNED and the surviving locks preserved. Without the
+    # prune the retired id lingers as "still served" and resolution keeps
+    # selecting a model that 404s (ENG-1820).
+    from cowork.services.providers import persist_enabled_model_map
+
+    session = _fresh_session()
+    try:
+        prior = json.dumps({"mindshub_air": True, "opus": False})
+        catalogue = ["opus", "sonnet"]  # mindshub_air retired; sonnet new
+        assert persist_enabled_model_map(
+            session, LOCAL_SCOPE, prior, {}, catalogue
+        ) is True
+        stored = json.loads(SettingService(session).load().minds_model_enabled)
+        # mindshub_air pruned, opus's stored lock preserved, sonnet defaulted on.
+        assert stored == {"opus": False, "sonnet": True}
+        assert list(stored) == catalogue
+    finally:
+        _clear(session, "minds_model_enabled")
+        session.close()
+
+
+def test_persist_holds_map_when_no_catalogue_and_no_flags():
+    # A fetch FAILURE yields neither a catalogue nor flags (live_ids None,
+    # live_enabled {}). With no evidence at all we must NOT prune — hold the
+    # known-good map rather than wipe it.
+    from cowork.services.providers import persist_enabled_model_map
+
+    session = _fresh_session()
+    try:
+        prior = json.dumps({"mindshub_air": True, "opus": False})
+        assert persist_enabled_model_map(session, LOCAL_SCOPE, prior, {}, None) is False
+    finally:
+        _clear(session, "minds_model_enabled")
+        session.close()
+
+
 # ── credential-sync seam: POST /settings/raw warms after the sync ─────
 
 def test_write_raw_settings_warms_after_sync(monkeypatch, tmp_path):
