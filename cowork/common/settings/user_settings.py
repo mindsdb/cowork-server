@@ -117,7 +117,7 @@ def _first_available_model(enabled_map: dict[str, bool]) -> str | None:
     The map lists the full ``/v1/models`` catalogue in the gateway's ranking, so
     its first enabled entry is the affordable baseline; when nothing is enabled the
     first key is still a served (locked) model — recoverable via top-up, unlike a
-    retired id that 404s every turn (ENG-1820). Empty map → None.
+    retired id that 404s every turn. Empty map → None.
     """
     if not enabled_map:
         return None
@@ -157,7 +157,7 @@ def _enabled_aware_default(
         if default is not None and enabled_map.get(default) is True:
             return default
         # Free model, unless a known catalogue no longer serves it — then it's
-        # retired and would 404 every turn, so hand out a served model (ENG-1820).
+        # retired and would 404 every turn, so hand out a served model.
         if enabled_map and MINDS_FREE_MODEL not in enabled_map:
             served = _first_available_model(enabled_map)
             if served is not None:
@@ -172,7 +172,7 @@ def _enabled_aware_default(
             return model_id
     # Nothing affordable. A still-served (locked) default is kept — it 402s with a
     # top-up path. A default absent from this non-empty catalogue is retired and
-    # would 404 every turn, so fall back to a served model instead (ENG-1820).
+    # would 404 every turn, so fall back to a served model instead.
     if default is not None and default not in enabled_map:
         served = _first_available_model(enabled_map)
         if served is not None:
@@ -267,7 +267,7 @@ def _resolved_model(
                 # Nothing affordable. A still-served (locked) pin is kept below. But
                 # an id absent from this non-empty catalogue is retired/foreign and
                 # 404s every turn with no recovery, so hand out a served model
-                # instead of a dead id (ENG-1820).
+                # instead of a dead id.
                 if bare not in enabled:
                     return next(iter(enabled))
         return user_model

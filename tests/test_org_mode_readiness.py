@@ -224,7 +224,7 @@ class TestOrgModeCreditAwareDefaults:
         assert s.resolved_planning_model == MINDS_FREE_MODEL
 
     def test_org_retired_pin_falls_back_to_a_served_model_when_nothing_enabled(self, org_mode):
-        # ENG-1820: a pin absent from a non-empty catalogue (retired/foreign) with
+        # A pin absent from a non-empty catalogue (retired/foreign) with
         # nothing enabled used to be kept, but that id 404s every turn. Fall back to
         # a served model (here the locked free model); the stored row is never rewritten.
         s = _settings(
