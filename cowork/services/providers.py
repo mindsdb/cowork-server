@@ -593,10 +593,18 @@ def persist_enabled_model_map(
     Shared by every writer (the recommended-models endpoint and the startup /
     credential-sync warm below) so the invariants can't drift between them:
 
-    - Never clobber a known-good map with an empty one — callers must already
-      have a non-empty ``live_enabled`` (a gateway that returns ids without
-      ``enabled`` flags yields ``{}``, which would silently re-lock the
-      canonical default). The guard here is belt-and-suspenders.
+    - Only ever write with real evidence. A fetch failure yields neither a
+      catalogue nor flags (``live_ids`` None and ``live_enabled`` ``{}``); with
+      nothing to go on we hold the known-good map rather than clobber it with an
+      empty one — silently re-locking the canonical default is the ENG-597 bug.
+      But a real catalogue is evidence on its own: a gateway that returns ids
+      WITHOUT ``enabled`` flags (version skew / a plain OpenAI-compatible
+      endpoint) still tells us which ids are served, so we prune the ids it
+      dropped — preserving the flags already stored for the survivors, since we
+      can't re-derive which paid aliases are locked from a flag-less response.
+      Otherwise a retired id (a ``mindshub_air`` MindsHub stopped serving)
+      lingers as "still served" and resolution keeps selecting a model that
+      404s.
     - Persist the FULL served catalogue, not just the flagged rows.
       ``fetch_minds_models`` only records rows that publish the optional
       ``enabled`` field, so ``live_enabled`` alone is sparse: a served model
@@ -626,16 +634,35 @@ def persist_enabled_model_map(
     """
     from cowork.services.settings import SettingService
 
-    if not live_enabled:
-        return False
-    if live_ids:
-        live_enabled = {mid: live_enabled.get(mid, True) for mid in live_ids}
-    desired = json.dumps(live_enabled)
     try:
-        stored = json.dumps(json.loads(prior_json or "{}"))
+        prior = json.loads(prior_json or "{}")
+        if not isinstance(prior, dict):
+            prior = {}
     except (ValueError, TypeError):
-        stored = "{}"
-    if desired == stored:
+        prior = {}
+
+    if live_enabled:
+        # Gateway published availability: densify over the served catalogue so
+        # key ABSENCE means genuinely not-served — every served id folded in
+        # with the flag it published, unflagged rows defaulting to available
+        # (missing = available), in the gateway's own /v1/models order.
+        live_enabled = {mid: live_enabled.get(mid, True) for mid in (live_ids or live_enabled)}
+    elif live_ids:
+        # A real catalogue that published NO enabled flags (gateway version
+        # skew / a plain OpenAI-compatible endpoint). We can't re-derive which
+        # paid aliases are locked, so PRESERVE the flags already stored for the
+        # ids that survive — but still PRUNE the ids the catalogue dropped.
+        # Otherwise a retired id (a ``mindshub_air`` MindsHub stopped serving)
+        # lingers as "still served" and resolution keeps selecting a model that
+        # 404s. A never-before-seen served id defaults to available.
+        live_enabled = {mid: prior.get(mid, True) for mid in live_ids}
+    else:
+        # No flags AND no catalogue — no evidence at all (a fetch failure), so
+        # hold the known-good map rather than clobber it with an empty one.
+        return False
+
+    desired = json.dumps(live_enabled)
+    if desired == json.dumps(prior):
         return False
     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
     return True
