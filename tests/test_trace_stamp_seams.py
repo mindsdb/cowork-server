@@ -89,12 +89,32 @@ def test_the_guard_actually_sees_the_known_call_sites():
 # ---------------------------------------------------------------------------
 
 
+def _is_config_call(node: ast.AST) -> bool:
+    """A ``ChatSessionConfig(...)`` construction, however it was imported.
+
+    Matches the attribute form (``mod.ChatSessionConfig(...)``) as well as the
+    bare name. A name-only rule would let a future originator that imports the
+    module rather than the symbol slip past — and a guard that quietly matches
+    nothing is worse than no guard, because it reports green. This also makes
+    the finder agree with :func:`_declares_surface`, which already tolerates
+    both shapes for ``surface_kwarg`` (#357 review).
+
+    Extracted from the loop so the matching rule is itself testable; the
+    previous inline form was a nested ternary that read as a precedence puzzle.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+    return name == "ChatSessionConfig"
+
+
 def _config_sites() -> list[tuple[Path, ast.Call]]:
     sites: list[tuple[Path, ast.Call]] = []
     for path in sorted(COWORK_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node.func, ast.Name) and node.func.id == "ChatSessionConfig" if isinstance(node, ast.Call) else False:
+            if _is_config_call(node):
                 sites.append((path, node))
     return sites
 
@@ -132,6 +152,28 @@ def test_the_surface_guard_actually_sees_the_known_call_sites():
     found = {str(path.relative_to(COWORK_ROOT.parent)) for path, _ in _config_sites()}
     assert "cowork/harnesses/anton_harness/harness.py" in found
     assert "cowork/services/connectors/probe.py" in found
+
+
+def test_the_matcher_catches_an_attribute_qualified_construction():
+    """Positive control on the MATCHER, not the predicate.
+
+    The guard exists to notice a turn originator that forgot to declare its
+    surface. If the matcher only saw bare-name calls, an originator written as
+    `session.ChatSessionConfig(...)` would never be examined at all — the guard
+    would pass while the site went unchecked, which is the exact
+    silently-vacuous failure this file was created to prevent (#357 review).
+    """
+    bare = ast.parse("ChatSessionConfig(llm_client=x)").body[0].value
+    qualified = ast.parse("session.ChatSessionConfig(llm_client=x)").body[0].value
+    deep = ast.parse("anton.core.session.ChatSessionConfig(llm_client=x)").body[0].value
+    other = ast.parse("SomethingElse(llm_client=x)").body[0].value
+    not_a_call = ast.parse("ChatSessionConfig").body[0].value
+
+    assert _is_config_call(bare)
+    assert _is_config_call(qualified)
+    assert _is_config_call(deep)
+    assert not _is_config_call(other)
+    assert not _is_config_call(not_a_call)
 
 
 def test_the_surface_predicate_actually_rejects_a_bare_call():
