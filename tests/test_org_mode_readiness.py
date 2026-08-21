@@ -224,13 +224,9 @@ class TestOrgModeCreditAwareDefaults:
         assert s.resolved_planning_model == MINDS_FREE_MODEL
 
     def test_org_retired_pin_falls_back_to_a_served_model_when_nothing_enabled(self, org_mode):
-        # ENG-1820: a stored id ABSENT from a non-empty catalogue (retired /
-        # renamed / a foreign BYOK pick) with nothing enabled used to be kept —
-        # but the map lists the full catalogue, so an absent id is not served and
-        # 404s as model_not_found on every turn, hard-blocking the account.
-        # Fall back to the first served model (here the free model, locked) so the
-        # account lands on a real, recoverable state (402 with a reset/top-up path)
-        # instead of a dead id. The stored row is still never rewritten.
+        # ENG-1820: a pin absent from a non-empty catalogue (retired/foreign) with
+        # nothing enabled used to be kept, but that id 404s every turn. Fall back to
+        # a served model (here the locked free model); the stored row is never rewritten.
         s = _settings(
             minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False}), planning_model="opus"
         )
@@ -238,10 +234,8 @@ class TestOrgModeCreditAwareDefaults:
         assert s.resolved_planning_model == MINDS_FREE_MODEL
 
     def test_org_keeps_a_still_served_pin_when_nothing_is_enabled(self, org_mode):
-        # The invariant that genuinely still holds: a pin the catalogue still
-        # SERVES (present but locked) is kept even with nothing enabled — it 402s
-        # with a top-up path and re-enables when credits/allowance return.
-        # Degraded metadata (an empty map) likewise keeps the stored value.
+        # A pin still served (locked) is kept even with nothing enabled — it 402s
+        # with a top-up path and re-enables when credits return.
         s = _settings(
             minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False, "opus": False}),
             planning_model="opus",

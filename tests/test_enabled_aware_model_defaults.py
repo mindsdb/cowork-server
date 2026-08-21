@@ -83,9 +83,8 @@ def test_explicit_model_choice_is_never_rewritten():
 
 
 def test_drained_wallet_keeps_a_still_served_default():
-    # Nothing enabled AND the canonical default is still in the catalogue (just
-    # locked — the free allowance is spent). Keep it: it 402s with an actionable
-    # top-up/reset path, and adding credits re-enables it on the next fetch.
+    # Nothing enabled but the default is still served (locked). Keep it — it 402s
+    # with a top-up path and re-enables when credits return.
     s = _minds(
         minds_model_enabled=json.dumps({"mindshub_air": False, "kimi": False})
     )
@@ -93,11 +92,8 @@ def test_drained_wallet_keeps_a_still_served_default():
 
 
 def test_retired_default_with_nothing_enabled_falls_back_to_first_served():
-    # ENG-1820: the canonical default is ABSENT from a non-empty catalogue map
-    # (retired/renamed) and nothing is enabled. Returning the removed id would
-    # 404 as model_not_found on every turn with no recovery; hand out the first
-    # served model instead — locked, so it 402s with a top-up path rather than a
-    # dead end, and it's a real, currently-offered model.
+    # ENG-1820: default absent from a non-empty catalogue (retired) and nothing
+    # enabled — the removed id would 404 every turn, so hand out a served model.
     s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
     assert s.planning_model == "kimi"
     assert s.coding_model == "kimi"
@@ -249,9 +245,8 @@ def test_funded_pin_is_kept():
 
 
 def test_fully_drained_map_keeps_a_still_served_pin():
-    # Nothing enabled (drained wallet AND spent allowance) but the pin is still
-    # in the catalogue (locked) → keep it. It 402s with a top-up path, and adding
-    # credits re-enables it; the stored row is never rewritten.
+    # Nothing enabled but the pin is still served (locked) → keep it; the stored
+    # row is never rewritten.
     all_off = json.dumps(
         {"mindshub_air": False, "sonnet": False, "haiku": False, "kimi": False}
     )
@@ -260,11 +255,9 @@ def test_fully_drained_map_keeps_a_still_served_pin():
 
 
 def test_retired_pin_with_nothing_enabled_falls_back_to_first_served():
-    # ENG-1820: the pinned id is ABSENT from a non-empty catalogue map
-    # (retired/renamed/foreign) AND nothing is enabled — the exact hard-block the
-    # ticket reports. Sending the removed id 404s as model_not_found every turn;
-    # fall back to the first served model (locked → 402 with a top-up path)
-    # instead of a dead id. The stored row is still never rewritten.
+    # ENG-1820 hard-block: pin absent from a non-empty catalogue (retired/foreign)
+    # and nothing enabled — the removed id 404s every turn, so fall back to a
+    # served model. The stored row is still never rewritten.
     all_off = json.dumps({"sonnet": False, "haiku": False, "kimi": False})
     s = _pinned(minds_model_enabled=all_off, coding_model="mindshub_air")
     assert s.coding_model == "mindshub_air"
