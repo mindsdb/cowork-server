@@ -619,9 +619,10 @@ def persist_enabled_model_map(
     - Persist ORDER-PRESERVING JSON — never ``sort_keys``. The first-enabled
       fallback (``_enabled_aware_default``) iterates the map in insertion order
       and returns the first *enabled* model, which must stay the gateway's own
-      /v1/models ranking (a remote order we don't control or pin — e.g. today
-      prod lists ``fable`` first, and the free ``mindshub_air`` is reached only
-      because the paid aliases ahead of it are marked disabled). Densifying over
+      /v1/models ranking (a remote order we don't control or pin, and which
+      changes per deployment — a paid alias often ranks ahead of the free
+      ``mindshub_air``, which is then reached only because those aliases are
+      marked disabled). Densifying over
       ``live_ids`` (already in that ranking) preserves it; alphabetizing would
       substitute our ordering for the gateway's and could promote a different
       enabled model.

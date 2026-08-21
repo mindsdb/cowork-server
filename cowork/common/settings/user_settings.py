@@ -254,11 +254,11 @@ def _resolved_model(
             bare = user_model.removeprefix("latest:")
             if not enabled.get(bare, False):
                 # First enabled entry in map order. The real guarantee here is
-                # NOT "the gateway lists the free model first" (it doesn't —
-                # verified against prod, haiku leads the catalogue): it is
-                # that enablement tracks affordability, so on a locked wallet
-                # only free-bucket models are enabled and the first enabled
-                # entry is affordable by construction. Embedding rows never
+                # NOT "the gateway lists the free model first" (it doesn't, and
+                # the ranking changes per deployment): it is that enablement
+                # tracks affordability, so on a locked wallet only free-bucket
+                # models are enabled and the first enabled entry is affordable
+                # by construction. Embedding rows never
                 # reach this map — filtered at construction in
                 # fetch_minds_models (_is_embedding_row).
                 fallback = next((mid for mid, en in enabled.items() if en), None)
