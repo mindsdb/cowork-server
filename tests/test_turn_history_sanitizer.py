@@ -103,6 +103,67 @@ def test_a_tool_result_without_a_tool_use_id_drops_the_set():
     assert sanitize_turn_history_rows(rows) == []
 
 
+# --- the contract itself: [] for everything, never an exception --------------
+#
+# Both bugs found in review were the same shape: a value that is valid JSON,
+# passes a truthiness check, and only blows up later at a hash operation
+# (`_BLOCK_FOR_ROLE.get(role)`, `Counter(...)`). A raise here is worse than a
+# rejection — it escapes the dispatch into _produce_remote's generic
+# `except Exception` and FAILS THE TURN, which is precisely the outcome this
+# module exists to prevent. So the tests below pin the contract, not the two
+# known instances of breaking it.
+
+#: Valid JSON values that are not strings. Includes the unhashable ones, which
+#: are the dangerous case.
+_HOSTILE = [{"evil": 1}, ["evil"], 1, 1.5, True, None, {}, []]
+
+
+@pytest.mark.parametrize("value", _HOSTILE)
+def test_a_hostile_role_is_rejected_not_raised(value):
+    rows = _pair()
+    rows[0]["role"] = value
+    assert sanitize_turn_history_rows(rows) == []
+
+
+@pytest.mark.parametrize("value", _HOSTILE)
+def test_a_hostile_tool_use_id_is_rejected_not_raised(value):
+    rows = _pair()
+    rows[0]["content"][0]["id"] = value
+    assert sanitize_turn_history_rows(rows) == []
+
+
+@pytest.mark.parametrize("value", _HOSTILE)
+def test_a_hostile_tool_result_id_is_rejected_not_raised(value):
+    rows = _pair()
+    rows[1]["content"][0]["tool_use_id"] = value
+    assert sanitize_turn_history_rows(rows) == []
+
+
+@pytest.mark.parametrize("value", _HOSTILE)
+def test_a_hostile_block_type_is_rejected_not_raised(value):
+    rows = _pair()
+    rows[0]["content"][0]["type"] = value
+    assert sanitize_turn_history_rows(rows) == []
+
+
+def test_numeric_ids_are_rejected():
+    """Both provider APIs use string ids. Accepting an int would pair fine but
+    is a sign the payload did not come from the splitter."""
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": 1, "name": "x", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": 1, "content": "b"}]},
+    ]
+    assert sanitize_turn_history_rows(rows) == []
+
+
+def test_an_empty_string_id_is_rejected():
+    rows = _pair()
+    rows[0]["content"][0]["id"] = ""
+    assert sanitize_turn_history_rows(rows) == []
+
+
 # --- pairing ---------------------------------------------------------------
 
 def test_a_tool_use_with_no_result_drops_the_set():
