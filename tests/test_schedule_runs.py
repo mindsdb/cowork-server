@@ -22,12 +22,19 @@ def _session():
     return session
 
 
-def _schedule(session: Session) -> Schedule:
+def _schedule(
+    session: Session,
+    *,
+    cadence: str = "daily",
+    next_run_at: datetime = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+    title: str = "Daily report",
+    prompt: str = "Summarize",
+) -> Schedule:
     schedule = Schedule(
-        title="Daily report",
-        prompt="Summarize",
-        cadence="daily",
-        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        title=title,
+        prompt=prompt,
+        cadence=cadence,
+        next_run_at=next_run_at,
         model="default",
         project_id=GENERAL_PROJECT_ID,
     )
@@ -652,6 +659,72 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s.close()
 
 
+# --- ENG-1675: a due one-off must RUN on the tick its slot passes, not get
+# disabled ("Paused") by the missed-run sweep before `_due_schedules` sees it.
+
+def test_missed_runs_leaves_just_due_once_enabled_to_run():
+    from cowork.scheduler import _due_schedules, _handle_missed_runs
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    # Slot passed 30s ago — the normal case where the app is open and the
+    # scheduled time just arrived. It must stay enabled and be run.
+    schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=30))
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    _handle_missed_runs(scoped)
+
+    session.refresh(schedule)
+    assert schedule.enabled is True
+    assert [s.id for s in _due_schedules(scoped, now)] == [schedule.id]
+
+
+def test_missed_runs_disables_stale_once_overdue_beyond_window():
+    from cowork.scheduler import _due_schedules, _handle_missed_runs
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    # Slot passed hours ago (app was offline) — do not fire it late.
+    schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(hours=2))
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    _handle_missed_runs(scoped)
+
+    session.refresh(schedule)
+    assert schedule.enabled is False
+    # Auto-disabled without running carries a missed-run signal.
+    assert schedule.missed_runs == 1
+    assert _due_schedules(scoped, now) == []
+
+
+def test_missed_runs_once_near_catchup_boundary():
+    from cowork.scheduler import (
+        _ONCE_CATCHUP_WINDOW_SECONDS,
+        _due_schedules,
+        _handle_missed_runs,
+    )
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    window = _ONCE_CATCHUP_WINDOW_SECONDS
+    # Straddle the catch-up boundary: just inside stays enabled and runs, just
+    # outside is disabled. `_handle_missed_runs` reads its own wall clock, so a
+    # small margin keeps each case on its intended side without flaking.
+    inside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window - 30))
+    outside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window + 30))
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    _handle_missed_runs(scoped)
+
+    session.refresh(inside)
+    session.refresh(outside)
+    assert inside.enabled is True
+    assert outside.enabled is False
+    due_ids = [s.id for s in _due_schedules(scoped, now)]
+    assert inside.id in due_ids
+    assert outside.id not in due_ids
+
+
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
 
 def test_reap_orphaned_runs_marks_running_as_failed():
@@ -699,3 +772,38 @@ def test_reap_orphaned_runs_leaves_finished_runs_untouched():
     session.refresh(run)
     assert run.status == RunStatus.success
     assert run.error is None
+
+
+def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
+    """Staging audit P0: schedules are personal (created_by) but CRUD/list
+    filtered by org only, so coworkers saw/paused/deleted each other's."""
+    import pytest
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine, select
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.models.project import Project
+    from cowork.services.schedules import ScheduleService
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "p"))
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+    ORG = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(eng)
+    with Session(eng) as s:
+        s.add(Project(name="proj", path="/tmp/p", org_id=ORG)); s.commit()
+        pid = s.exec(select(Project).where(Project.name == "proj")).one().id
+
+    def svc(user):
+        return ScheduleService(ScopedSession(Session(eng), TenantScope(org_mode=True, org_id=ORG, user_id=user)))
+
+    when = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    a = svc("alice").create_schedule(title="a", prompt="secret", cadence="daily",
+                                     next_run_at=when, model="m", project_id=pid)
+    assert a.id not in {x.id for x in svc("bob").list_schedules()}
+    with pytest.raises(ValueError):
+        svc("bob").get_schedule(a.id)
+    assert svc("bob").delete_schedule(a.id) is False
+    assert svc("alice").get_schedule(a.id).id == a.id
+    get_app_settings.cache_clear()

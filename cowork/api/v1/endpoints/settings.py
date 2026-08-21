@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -35,11 +36,15 @@ from cowork.services.providers import (
     fetch_minds_models,
     fetch_org_model_catalog,
     model_value_rejection,
+    persist_cached_map,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
+    warm_enabled_model_map,
 )
 from cowork.services.settings import SettingService
+
+logger = logging.getLogger(__name__)
 from cowork.common.settings.app_settings import (
     AGENT_ROLE_NAMES,
     DIRECT_EFFORT_CATALOG,
@@ -81,34 +86,6 @@ def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None
 @router.get("/", response_model=list[SettingResponse])
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()
-
-
-def _cached_map_write(desired: dict, stored_raw: str | None, *, ordered: bool) -> str | None:
-    """The JSON to persist for a map cached off ``/v1/models``, or None if unchanged.
-
-    Only writing on a real change matters because this endpoint is hit on every
-    boot and every settings open, and `upsert_setting` commits a row and
-    invalidates the settings cache, so an unconditional write churns every
-    UserSettings reader.
-
-    ``ordered`` is the difference between the two maps that come through here, and
-    it is not cosmetic. `minds_model_enabled` must keep insertion order: the
-    first-enabled fallback (`_enabled_aware_default`) walks it in order and relies
-    on `/v1/models` listing the free model first, so an alphabetized map could
-    silently promote the wrong one. Order-sensitivity in the compare is wanted for
-    the same reason, because a gateway re-ranking the same set is a real change.
-    `minds_role_defaults` is looked up by role name and nothing reads its order, so
-    it sorts and a re-ranking stops counting as a change.
-
-    A stored value that is not JSON compares as empty, so the next good read
-    replaces it rather than the endpoint raising on it.
-    """
-    desired_text = json.dumps(desired, sort_keys=not ordered)
-    try:
-        stored_text = json.dumps(json.loads(stored_raw or "{}"), sort_keys=not ordered)
-    except (ValueError, TypeError):
-        stored_text = "{}"
-    return None if desired_text == stored_text else desired_text
 
 
 def _bearer_token(request: Request | None) -> str:
@@ -498,41 +475,44 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # Cache the availability map so model-default resolution
             # (UserSettings._minds_enabled_map) can avoid locked models without
             # a network call in the turn path. Adding credits re-enables the
-            # canonical defaults on the next settings load.
+            # canonical defaults on the next settings load. The guarded write
+            # (never clobber a good map with {}, order-preserving, change-only)
+            # is shared with the startup / credential-sync warm via
+            # persist_cached_map so the invariants can't drift.
             #
             # Guard on `live_enabled` (the map we actually write), NOT `live`
             # (the id list): a gateway that returns ids without `enabled` flags
             # yields `live` non-empty but `live_enabled == {}`, and writing {}
             # would wipe a previously-good map — re-locking the canonical
             # default, i.e. the exact bug this PR fixes.
-            if live_enabled:
-                # Ordered, because the first-enabled fallback reads this map by
-                # position; see _cached_map_write.
-                write = _cached_map_write(live_enabled, s.minds_model_enabled, ordered=True)
-                if write is not None:
-                    # Intentionally ungated by _require_org_admin_for: the value
-                    # is system-derived (MindsHub, via admin-set key/URL), so a
-                    # member can trigger this refresh but can't steer what's
-                    # stored — and gating it would leave the map stale.
-                    SettingService(session, scope).upsert_setting("minds_model_enabled", write)
+            #
+            # Intentionally ungated by _require_org_admin_for: the value is
+            # system-derived (MindsHub, via admin-set key/URL), so a member can
+            # trigger this refresh but can't steer what's stored — and gating it
+            # would leave the map stale.
+            #
+            # Ordered, because the first-enabled fallback reads this map by
+            # position; see persist_cached_map.
+            persist_cached_map(
+                session, scope, "minds_model_enabled", s.minds_model_enabled,
+                live_enabled, ordered=True,
+            )
         # Cache the catalog's declared per-role defaults on the same terms, so a
         # default moved in the config reaches this install on its next settings
         # load with no client release (UserSettings._minds_role_default_map).
         #
-        # Its OWN guard and its own compare, deliberately NOT folded into the
-        # block above: that one is gated on `live_enabled`, and a gateway that
-        # lists ids without `enabled` flags yields an empty map there while still
+        # Its OWN call and its own guard, deliberately NOT folded into the block
+        # above: that one is gated on `live_enabled`, and a gateway that lists
+        # ids without `enabled` flags yields an empty map there while still
         # publishing perfectly good role defaults. Nested, the defaults would be
         # silently dropped for exactly that gateway.
         #
-        # Non-empty is the same rule and for the same reason: writing {} over a
-        # good map would drop every role back to the compiled constant, which is
-        # a client release behind. A gateway that predates `default_for` omits it
-        # per row, so an empty parse means "nothing to say", not "no defaults".
-        if live_role_defaults:
-            write = _cached_map_write(live_role_defaults, s.minds_role_defaults, ordered=False)
-            if write is not None:
-                SettingService(session, scope).upsert_setting("minds_role_defaults", write)
+        # Sorted rather than ordered: this map is looked up by role name and
+        # nothing reads its order, so a gateway re-ranking is not a change.
+        persist_cached_map(
+            session, scope, "minds_role_defaults", s.minds_role_defaults,
+            live_role_defaults, ordered=False,
+        )
         # The picker asks the server which model each role starts on, so it has to
         # be told the same answer resolution will give. Left on the compiled table,
         # the two disagree the moment a default moves in config and the user sees
@@ -680,7 +660,7 @@ class _RawSettingsBody(BaseModel):
 
 
 @router.post("/raw")
-def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
+async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
     Uses key-level merge (not full overwrite) because callers like the
@@ -719,6 +699,22 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail="Settings could not be saved.") from e
+
+    # If this write lands a MindsHub key, warm the availability map now — before
+    # any first turn — so a free-tier default resolves to an affordable model
+    # instead of 402'ing on message one (ENG-748). NOTE: the Electron desktop
+    # sign-in does NOT reach here — it writes .env directly and syncs keys via
+    # per-key PUTs (see cowork minds-auth.ts), so the desktop first-turn gap is
+    # closed by the boot warm in server.py, not this seam. This covers the
+    # non-Electron dotenv-import callers (standalone anton, direct /raw). Keep
+    # it: it's the correct place to warm for any caller that does POST here, and
+    # it's fail-open. Best-effort: never let a warm failure break the save the
+    # client is waiting on, and log message-only (the warm frames hold the API
+    # key, which RICH_LOGGING's tracebacks_show_locals would render).
+    try:
+        await warm_enabled_model_map(session)
+    except Exception as exc:
+        logger.debug("post-credential-sync model-map warm failed (non-fatal): %s", exc)
 
     return {"ok": True}
 

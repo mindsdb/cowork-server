@@ -26,6 +26,21 @@ _PROVIDER_ENV_KEY = {
 }
 
 
+class HermesTurnFailed(RuntimeError):
+    """Raised when run_agent's conversation loop reports ``failed: True``.
+
+    run_agent swallows provider/API errors internally (retries, then gives up
+    and returns a result dict) rather than raising — unlike Anton, where the
+    same failure propagates as an exception straight out of stream_response.
+    Left unchecked, the empty ``final_response`` flows through
+    format_hermes_stream's fallback into a plain, silent
+    ``response.completed`` with no text — the turn looks like it succeeded
+    with nothing to say. Raising here instead routes the failure through
+    _run_turn's existing exception handler, the same one that turns an
+    Anton exception into a visible response.failed error card.
+    """
+
+
 def _sync_hermes_config(
     provider: str,
     api_key: str | None,
@@ -114,7 +129,10 @@ class HermesHarness:
         *,
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
-        # model: str,
+        # Accepted for HarnessProvider compatibility; Hermes does not support
+        # a per-conversation model override, so this hint is intentionally
+        # ignored.
+        model: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Accepted for HarnessProvider compatibility; Hermes does not emit
         # Langfuse traces, so these observability hints are intentionally
@@ -253,6 +271,11 @@ class HermesHarness:
             yield {"type": "artifact_created", "artifact": card}
         for draft in skill_drafts:
             yield {"type": "skill_created", "skill": draft}
+
+        if result.get("failed"):
+            raise HermesTurnFailed(
+                str(result.get("turn_exit_reason") or "Hermes turn failed")
+            )
 
         yield result
 

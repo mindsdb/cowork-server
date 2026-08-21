@@ -24,9 +24,17 @@ rest outliving the conversation that was allowed to see it.
 from __future__ import annotations
 
 import logging
-import shutil
+import stat
 from pathlib import Path
 from uuid import UUID
+
+from cowork.common.paths import (
+    dir_lstat,
+    dir_rmtree,
+    dir_scandir,
+    dir_unlink,
+    opened_subdir_nofollow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +76,9 @@ def _canonical_conversation_id(conversation_id: UUID | str) -> str | None:
         return None
 
 
-def conversation_session_dir(project_path: str | Path, conversation_id: UUID | str) -> Path | None:
+def conversation_session_dir(
+    project_path: str | Path, conversation_id: UUID | str
+) -> Path | None:
     """Snapshot directory for one conversation, or None if the id isn't a UUID."""
     canonical = _canonical_conversation_id(conversation_id)
     if canonical is None:
@@ -76,34 +86,42 @@ def conversation_session_dir(project_path: str | Path, conversation_id: UUID | s
     return sessions_root(project_path) / canonical
 
 
-def _remove_contained(target: Path, root: Path) -> bool:
-    """`rmtree` *target*, but only if it really sits inside *root*.
+def _rmtree_session_child(project_path: str | Path, canonical: str) -> bool:
+    """`rmtree` ``<project>/.anton/scratchpad-sessions/<canonical>`` safely.
 
-    Both legs are resolved before comparing, so a symlink or a `..` segment
-    cannot redirect the delete outside the snapshot tree. Returns True if
-    something was removed. Never raises — retention is best-effort and must not
-    fail a conversation delete or block boot.
+    Resolving both legs and comparing (the previous approach) does NOT defend a
+    symlinked base: `Path.resolve()` follows a `.anton` or `scratchpad-sessions`
+    link the agent may have planted, so the containment check passed against an
+    already-escaped path. Instead pin the sessions dir by an ``O_NOFOLLOW``
+    descriptor (refusing a link at any level) and delete *canonical* relative to
+    it, so the kernel resolves only that one component against the pinned inode.
+
+    *canonical* is a validated UUID string (a direct child, no separators).
+    Returns True if a directory was removed. Never raises: retention is
+    best-effort and must not fail a conversation delete or block boot.
     """
     try:
-        resolved_root = root.resolve()
-        resolved = target.resolve()
+        with opened_subdir_nofollow(
+            Path(project_path), ".anton", _SESSIONS_DIRNAME
+        ) as d:
+            try:
+                st = dir_lstat(d, canonical)
+            except FileNotFoundError:
+                return False
+            if stat.S_ISLNK(st.st_mode):
+                dir_unlink(d, canonical)  # drop a planted link, never follow it
+                return False
+            if not stat.S_ISDIR(st.st_mode):
+                return False
+            dir_rmtree(d, canonical)
+            return True
     except OSError:
-        return False
-    if resolved == resolved_root:
-        # Refuse to delete the root itself — only per-conversation children.
-        return False
-    try:
-        resolved.relative_to(resolved_root)
-    except ValueError:
-        logger.warning("refusing to remove %s: outside %s", resolved, resolved_root)
-        return False
-    if not resolved.is_dir():
-        return False
-    try:
-        shutil.rmtree(resolved)
-        return True
-    except OSError:
-        logger.exception("failed to remove scratchpad session dir %s", resolved)
+        logger.warning(
+            "failed to remove scratchpad session dir %s in %s",
+            canonical,
+            project_path,
+            exc_info=True,
+        )
         return False
 
 
@@ -118,11 +136,11 @@ def remove_conversation_sessions(
     """
     if not project_path:
         return False
-    target = conversation_session_dir(project_path, conversation_id)
-    if target is None:
+    canonical = _canonical_conversation_id(conversation_id)
+    if canonical is None:
         logger.warning("refusing to remove sessions for a non-UUID conversation id")
         return False
-    return _remove_contained(target, sessions_root(project_path))
+    return _rmtree_session_child(project_path, canonical)
 
 
 def sweep_orphan_sessions(session) -> int:
@@ -154,34 +172,46 @@ def sweep_orphan_sessions(session) -> int:
         # delete only ever cleans the current project. Scoping the check lets the sweep
         # reclaim the one left behind by the move.
         live_by_project: dict = {}
-        for cid, pid in session.exec(select(Conversation.id, Conversation.project_id)).all():
+        for cid, pid in session.exec(
+            select(Conversation.id, Conversation.project_id)
+        ).all():
             live_by_project.setdefault(str(pid), set()).add(str(cid))
     except Exception:
-        logger.exception("scratchpad-session sweep: could not read projects/conversations")
+        logger.exception(
+            "scratchpad-session sweep: could not read projects/conversations"
+        )
         return 0
 
     for project in projects:
-        root = sessions_root(project.path) if project.path else None
-        if root is None or not root.is_dir():
+        if not project.path:
             continue
         live = live_by_project.get(str(project.id), set())
         try:
-            children = list(root.iterdir())
+            # Pin the sessions dir by O_NOFOLLOW descriptor and scan/delete
+            # relative to it: a planted `.anton`/`scratchpad-sessions` symlink is
+            # refused (raising here, caught below), and a symlinked child entry
+            # is skipped rather than followed out of the tree.
+            with opened_subdir_nofollow(
+                Path(project.path), ".anton", _SESSIONS_DIRNAME
+            ) as d:
+                for entry in dir_scandir(d):
+                    if entry.name in live or entry.name == _UNSCOPED_BUCKET:
+                        continue
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    # Only conversation-shaped (UUID) names, same boundary validation
+                    # as the delete path.
+                    if _canonical_conversation_id(entry.name) is None:
+                        continue
+                    try:
+                        dir_rmtree(d, entry.name)
+                        removed += 1
+                    except OSError:
+                        logger.exception(
+                            "failed to remove scratchpad session dir %s", entry.name
+                        )
         except OSError:
             continue
-        for child in children:
-            if not child.is_dir() or child.name in live:
-                continue
-            if child.name == _UNSCOPED_BUCKET:
-                continue
-            # Rebuild the target from a validated id rather than deleting the directory
-            # entry we just listed. Same boundary validation as the delete path, and it
-            # keeps the allowlist ("only conversation-shaped names") in one place.
-            target = conversation_session_dir(project.path, child.name)
-            if target is None:
-                continue
-            if _remove_contained(target, root):
-                removed += 1
     if removed:
         logger.info("Swept %d orphaned scratchpad session dir(s) on boot", removed)
     return removed

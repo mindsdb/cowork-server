@@ -93,6 +93,50 @@ def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:
     }
 
 
+def _conversation_workspace_ok(
+    rel_posix: str, scoped: ScopedSession, cache: dict | None = None
+) -> bool:
+    """`conversations/<id>/…` is a per-conversation PRIVATE workspace even
+    though the project directory is org-shared, so only that conversation's
+    owner may list/read/write/delete inside it. Anything else is a shared
+    project file. Local mode has one user, so nothing is gated."""
+    if not scoped.scope.org_mode:
+        return True
+    parts = rel_posix.split("/", 2)
+    if len(parts) < 2 or parts[0] != "conversations":
+        return True  # shared project file
+    seg = parts[1]
+    if cache is not None and seg in cache:
+        return cache[seg]
+    try:
+        conv_id = UUID(seg)
+    except ValueError:
+        ok = True  # not a real conversation dir → treat as shared
+    else:
+        from cowork.services.conversations import ConversationService
+
+        ok = ConversationService(scoped)._owned(conv_id) is not None
+    if cache is not None:
+        cache[seg] = ok
+    return ok
+
+
+def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -> None:
+    """404 (no existence oracle) if `target` is inside another member's
+    conversation workspace.
+
+    `target` came from `_safe_relpath`, which already confirmed it sits under
+    `base`, but re-derive the relative path defensively: a symlink that makes
+    the resolved path escape `base` must 404, never raise (CodeQL: user data in
+    a path expression)."""
+    try:
+        rel = target.relative_to(base.resolve()).as_posix()
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not _conversation_workspace_ok(rel, scoped):
+        raise HTTPException(status_code=404, detail="File not found")
+
+
 @router.get("/{project_name}/instructions")
 def get_project_instructions(project_name: str, scoped: ScopedSessionDep):
     base = _project_dir(project_name, scoped)
@@ -111,11 +155,12 @@ def get_project_instructions(project_name: str, scoped: ScopedSessionDep):
 def list_project_files(project_name: str, scoped: ScopedSessionDep):
     base = _project_dir(project_name, scoped)
     files: list[dict[str, Any]] = []
+    _conv_cache: dict = {}
     for p in sorted(base.rglob("*")):
         if p.is_dir():
             continue
         meta = _file_meta(p, base)
-        if meta:
+        if meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache):
             files.append(meta)
 
     anton_rel = _anton_md_path(base).relative_to(base).as_posix()
@@ -138,6 +183,7 @@ def list_project_files(project_name: str, scoped: ScopedSessionDep):
 def read_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
+    _require_workspace_access(target, base, scoped)
     if not target.exists():
         anton_rel = _anton_md_path(base).relative_to(base).as_posix()
         if path == anton_rel:
@@ -159,6 +205,7 @@ def read_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
 def write_project_file(project_name: str, path: str, req: _FileWriteRequest, scoped: ScopedSessionDep):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
+    _require_workspace_access(target, base, scoped)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=400, detail="Path is a directory")
     body = req.content or ""
@@ -201,6 +248,7 @@ async def upload_project_files(
 def delete_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
+    _require_workspace_access(target, base, scoped)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if target.is_dir():
