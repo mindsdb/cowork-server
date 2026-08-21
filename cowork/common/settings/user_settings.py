@@ -111,6 +111,26 @@ def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
 
 
+def _first_available_model(enabled_map: dict[str, bool]) -> str | None:
+    """First enabled model in map order, else the first *served* one, else None.
+
+    The availability map is written from the full ``/v1/models`` catalogue in the
+    gateway's own ranking, so its first enabled entry is the affordable baseline
+    (a free-tier wallet has the paid aliases ahead of it marked disabled). When
+    NOTHING is enabled (drained wallet + spent allowance) the first key is still a
+    model the catalogue currently SERVES — locked, so it 402s with an actionable
+    "Needs credits"/top-up path — which is a real, recoverable state, unlike a
+    retired id that 404s as ``model_not_found`` on every turn (ENG-1820). Empty
+    map (no catalogue evidence) → None, so callers keep whatever they hold.
+    """
+    if not enabled_map:
+        return None
+    return next(
+        (m for m, en in enabled_map.items() if en),
+        next(iter(enabled_map)),
+    )
+
+
 def _enabled_aware_default(
     provider_value: str,
     defaults: dict[str, str],
@@ -140,6 +160,13 @@ def _enabled_aware_default(
     if get_app_settings().tenancy_mode == "org":
         if default is not None and enabled_map.get(default) is True:
             return default
+        # Normally the free model. But if a known (non-empty) catalogue no longer
+        # serves it, it has been retired and would 404 every turn — hand out a
+        # model the catalogue actually serves instead (ENG-1820).
+        if enabled_map and MINDS_FREE_MODEL not in enabled_map:
+            served = _first_available_model(enabled_map)
+            if served is not None:
+                return served
         return MINDS_FREE_MODEL
     if not enabled_map:
         return default
@@ -148,6 +175,15 @@ def _enabled_aware_default(
     for model_id, enabled in enabled_map.items():
         if enabled:
             return model_id
+    # Nothing affordable. A default still SERVED (present but locked) is kept — it
+    # 402s with an actionable top-up path. But a default ABSENT from this non-empty
+    # catalogue map has been retired/renamed and would 404 as a dead id every turn;
+    # fall back to the first served model (still locked, so no silent charge) so the
+    # user lands on a real, currently-offered model instead of a removed one (ENG-1820).
+    if default is not None and default not in enabled_map:
+        served = _first_available_model(enabled_map)
+        if served is not None:
+            return served
     return default
 
 
@@ -235,6 +271,14 @@ def _resolved_model(
                 fallback = next((mid for mid, en in enabled.items() if en), None)
                 if fallback:
                     return fallback
+                # Nothing affordable. A stored id still SERVED (present but locked)
+                # is kept below — it 402s with a top-up path. But an id ABSENT from
+                # this non-empty catalogue map is retired/renamed/foreign and 404s
+                # as model_not_found on every turn, blocking the account with no
+                # recovery (ENG-1820); hand out the first served model instead of a
+                # guaranteed-dead id. Still locked, so no silent charge.
+                if bare not in enabled:
+                    return next(iter(enabled))
         return user_model
     # No explicit choice (or provider switched): the resolved provider's default,
     # availability-adjusted. openai-compatible has no default -> None, so the
