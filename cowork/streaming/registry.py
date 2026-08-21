@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -46,7 +47,29 @@ logger = logging.getLogger(__name__)
 # for non-interactive runs with no human in the loop — would instead reap a long
 # deliberate turn mid-conversation and surface a spurious error to an engaged
 # user.
-_MAX_TURN_IDLE_SECONDS = 600
+#
+# Configurable via COWORK_MAX_TURN_IDLE_SECONDS as a pressure-release valve: a
+# deployment that runs legitimately long silent tool calls (slow builds, big
+# network fetches that emit no progress frames) can widen the window rather than
+# have them reaped. The real fix for those is a periodic progress frame from the
+# tool — which resets this window by design — but the knob is the escape hatch
+# until then. A non-positive or unparseable value falls back to the default.
+def _idle_bound_seconds() -> int:
+    raw = os.environ.get("COWORK_MAX_TURN_IDLE_SECONDS")
+    if raw is None:
+        return 600
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.warning("COWORK_MAX_TURN_IDLE_SECONDS=%r is not an int; using default 600s", raw)
+        return 600
+    if val <= 0:
+        logger.warning("COWORK_MAX_TURN_IDLE_SECONDS=%d is not positive; using default 600s", val)
+        return 600
+    return val
+
+
+_MAX_TURN_IDLE_SECONDS = _idle_bound_seconds()
 
 # How often the idle watchdog samples buffer progress. Detection latency for a
 # fully wedged producer is at most _MAX_TURN_IDLE_SECONDS + this.
