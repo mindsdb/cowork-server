@@ -194,6 +194,23 @@ class TestOrgModeCreditAwareDefaults:
         s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, "sonnet": listed}))
         assert s.resolved_planning_model == ("sonnet" if listed else MINDS_FREE_MODEL)
 
+    def test_org_retired_free_default_fills_a_served_model(self, org_mode):
+        # ENG-1820, the org headline case: the free default IS the retired id.
+        # A non-empty catalogue that no longer lists MINDS_FREE_MODEL means the
+        # canonical default itself would 404 every turn — the one path the
+        # role_defaults floor can't save, because the floor is the dead id. The
+        # org arm of _enabled_aware_default must fill a served model instead of
+        # handing back the retired free model.
+        #
+        # Asserts the STORED default (set by apply_model_defaults straight from
+        # _enabled_aware_default), which is what this branch decides. resolved_*
+        # would mask a revert here — the wallet-aware layer self-heals the dead
+        # id on its own — so only the construction-time fill pins the branch.
+        s = _settings(minds_model_enabled=json.dumps({"gpt-codex": True, "sonnet": False}))
+        assert s.planning_model == "gpt-codex"
+        assert s.coding_model == "gpt-codex"
+        assert s.router_model == "gpt-codex"
+
     def test_org_explicit_stored_choice_survives_the_default_fill(self, org_mode):
         # apply_model_defaults only fills a None model at construction time. An
         # explicitly stored value is never touched there, whatever
