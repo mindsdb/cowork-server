@@ -585,24 +585,47 @@ async def model_value_rejection(
     )
 
 
-def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabled: dict) -> bool:
+def persist_enabled_model_map(
+    session, scope, prior_json: str | None, live_enabled: dict, live_ids: list[str] | None = None
+) -> bool:
     """Guarded write of the `minds_model_enabled` availability map.
 
     Shared by every writer (the recommended-models endpoint and the startup /
     credential-sync warm below) so the invariants can't drift between them:
 
-    - Never clobber a known-good map with an empty one — callers must already
-      have a non-empty ``live_enabled`` (a gateway that returns ids without
-      ``enabled`` flags yields ``{}``, which would silently re-lock the
-      canonical default). The guard here is belt-and-suspenders.
+    - Only ever write with real evidence. A fetch failure yields neither a
+      catalogue nor flags (``live_ids`` None and ``live_enabled`` ``{}``); with
+      nothing to go on we hold the known-good map rather than clobber it with an
+      empty one — silently re-locking the canonical default is the ENG-597 bug.
+      But a real catalogue is evidence on its own: a gateway that returns ids
+      WITHOUT ``enabled`` flags (version skew / a plain OpenAI-compatible
+      endpoint) still tells us which ids are served, so we prune the ids it
+      dropped — preserving the flags already stored for the survivors, since we
+      can't re-derive which paid aliases are locked from a flag-less response.
+      Otherwise a retired id (a ``mindshub_air`` MindsHub stopped serving)
+      lingers as "still served" and resolution keeps selecting a model that
+      404s.
+    - Persist the FULL served catalogue, not just the flagged rows.
+      ``fetch_minds_models`` only records rows that publish the optional
+      ``enabled`` field, so ``live_enabled`` alone is sparse: a served model
+      that omits the flag (``missing = available``) is absent from it. The
+      resolution logic (``_enabled_aware_default`` / ``_resolved_model``) reads
+      key ABSENCE from a non-empty stored map as "retired from the catalogue"
+      and steers off it — so a sparse map would misread a working free model as
+      retired and resolve a ``mindshub_air`` default/pin to a locked paid model.
+      Once we actually have availability metadata (``live_enabled`` non-empty),
+      fold every served id in with the flag it published, defaulting the
+      unflagged ones to ``True``, so key absence means genuinely-not-served.
     - Persist ORDER-PRESERVING JSON — never ``sort_keys``. The first-enabled
       fallback (``_enabled_aware_default``) iterates the map in insertion order
       and returns the first *enabled* model, which must stay the gateway's own
-      /v1/models ranking (a remote order we don't control or pin — e.g. today
-      prod lists ``fable`` first, and the free ``mindshub_air`` is reached only
-      because the paid aliases ahead of it are marked disabled). Alphabetizing
-      would substitute our ordering for the gateway's and could promote a
-      different enabled model.
+      /v1/models ranking (a remote order we don't control or pin, and which
+      changes per deployment — a paid alias often ranks ahead of the free
+      ``mindshub_air``, which is then reached only because those aliases are
+      marked disabled). Densifying over
+      ``live_ids`` (already in that ranking) preserves it; alphabetizing would
+      substitute our ordering for the gateway's and could promote a different
+      enabled model.
     - Write only on a real change (the compare is order-sensitive too, so a
       gateway re-ranking also refreshes): ``upsert_setting`` commits a row and
       invalidates the settings cache, so an unconditional write churns every
@@ -612,14 +635,35 @@ def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabl
     """
     from cowork.services.settings import SettingService
 
-    if not live_enabled:
-        return False
-    desired = json.dumps(live_enabled)
     try:
-        stored = json.dumps(json.loads(prior_json or "{}"))
+        prior = json.loads(prior_json or "{}")
+        if not isinstance(prior, dict):
+            prior = {}
     except (ValueError, TypeError):
-        stored = "{}"
-    if desired == stored:
+        prior = {}
+
+    if live_enabled:
+        # Gateway published availability: densify over the served catalogue so
+        # key ABSENCE means genuinely not-served — every served id folded in
+        # with the flag it published, unflagged rows defaulting to available
+        # (missing = available), in the gateway's own /v1/models order.
+        live_enabled = {mid: live_enabled.get(mid, True) for mid in (live_ids or live_enabled)}
+    elif live_ids:
+        # A real catalogue that published NO enabled flags (gateway version
+        # skew / a plain OpenAI-compatible endpoint). We can't re-derive which
+        # paid aliases are locked, so PRESERVE the flags already stored for the
+        # ids that survive — but still PRUNE the ids the catalogue dropped.
+        # Otherwise a retired id (a ``mindshub_air`` MindsHub stopped serving)
+        # lingers as "still served" and resolution keeps selecting a model that
+        # 404s. A never-before-seen served id defaults to available.
+        live_enabled = {mid: prior.get(mid, True) for mid in live_ids}
+    else:
+        # No flags AND no catalogue — no evidence at all (a fetch failure), so
+        # hold the known-good map rather than clobber it with an empty one.
+        return False
+
+    desired = json.dumps(live_enabled)
+    if desired == json.dumps(prior):
         return False
     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
     return True
@@ -658,7 +702,9 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     if s.minds_api_key is None or not s.minds_url:
         return False
     listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
-    return persist_enabled_model_map(session, scope, s.minds_model_enabled, listing.enabled)
+    return persist_enabled_model_map(
+        session, scope, s.minds_model_enabled, listing.enabled, listing.ids
+    )
 
 
 # ── Config readiness ─────────────────────────────────────────────────
