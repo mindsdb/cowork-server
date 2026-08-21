@@ -61,9 +61,48 @@ KNOWN_KEYS = {
 }
 
 
+# LEGACY_EXTRA_KEYS bounds key *names*, not the number of specs using them, so
+# on its own it is a request for restraint rather than a gate — a new spec can
+# adopt a dead key and stay green. This baseline makes the two genuinely dead
+# ones a tripwire.
+#
+# `form.logo_url` is deliberately NOT here. It is inert but it is also what 169
+# of 213 specs do, so it is the convention; failing a new connector for
+# following it would be backwards. The other two have no known consumer, so a
+# fourth `form.engine` is almost certainly a mistake worth catching.
+DEAD_KEY_BASELINE = {"form.engine": 3, "method.name_from": 2}
+
+
+def _count_dead_keys() -> dict[str, int]:
+    counts = {k: 0 for k in DEAD_KEY_BASELINE}
+    for path in SPEC_FILES:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        form = data.get("form") or {}
+        if "engine" in form:
+            counts["form.engine"] += 1
+        for method in form.get("methods") or []:
+            if "name_from" in method:
+                counts["method.name_from"] += 1
+    return counts
+
+
 def test_specs_directory_is_not_empty():
     """Guard the guard: a bad glob would make every test below vacuously pass."""
     assert len(SPEC_FILES) > 100, f"expected the full catalog, found {len(SPEC_FILES)}"
+
+
+def test_dead_keys_are_not_spreading():
+    """A key nothing reads should not gain new users.
+
+    Equality, not `<=`: a cleanup that removes one should lower the baseline
+    deliberately rather than drift past an inequality unnoticed.
+    """
+    assert _count_dead_keys() == DEAD_KEY_BASELINE, (
+        "the count of specs carrying a key no model declares has changed. "
+        "If you added one: the schema will silently ignore it — either drop it "
+        "or declare the field in cowork/schemas/connectors.py. If you removed "
+        "one: lower the baseline in DEAD_KEY_BASELINE."
+    )
 
 
 @pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
