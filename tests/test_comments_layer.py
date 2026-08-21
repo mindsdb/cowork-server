@@ -89,16 +89,9 @@ def _make_project(tmp: str):
 
 def test_serve_injects_only_with_flag():
     with tempfile.TemporaryDirectory() as tmp:
-        # `.resolve()` matters, and only on macOS. The real
-        # `_registered_project_dirs()` returns RESOLVED paths
-        # (`child.resolve(strict=False)`), and `_artifact_root_for_project`
-        # compares them against a resolved candidate — so a stub returning an
-        # unresolved path breaks the contract it is standing in for.
-        #
-        # `tempfile` hands back `/var/folders/...`, which on macOS is a symlink
-        # to `/private/var/folders/...`. The candidate resolves, the stub's
-        # value does not, the membership check misses and serve 404s. On Linux
-        # `/var` is a real directory, so the two coincide and CI never sees it.
+        # Resolved because the stub must honour the contract of the function it
+        # replaces — see `_registered_project_dirs`. Without it this fails on
+        # macOS only, where tempfile's /var path is a symlink.
         project_dir = _make_project(tmp).resolve()
         with patch(
             "cowork.services.artifacts._registered_project_dirs",
