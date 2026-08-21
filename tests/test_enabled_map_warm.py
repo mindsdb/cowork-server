@@ -229,6 +229,33 @@ def test_persist_preserves_map_order():
         session.close()
 
 
+def test_persist_densifies_sparse_enabled_over_full_catalogue():
+    # `fetch_minds_models` only records rows that publish `enabled`, so a served
+    # model that omits the flag (missing = available) is ABSENT from the raw
+    # map. The resolution logic reads absence from a non-empty map as "retired"
+    # and steers off it — so the sparse map must be densified over the full
+    # served catalogue (`live_ids`) before it is stored, or a working free model
+    # gets misread as retired. Here only `sonnet` publishes a flag; `mindshub_air`
+    # and `haiku` are served but unflagged and must persist as available.
+    from cowork.services.providers import persist_enabled_model_map
+
+    session = _fresh_session()
+    try:
+        sparse = {"sonnet": False}
+        catalogue = ["mindshub_air", "sonnet", "haiku"]
+        assert persist_enabled_model_map(
+            session, LOCAL_SCOPE, "{}", sparse, catalogue
+        ) is True
+        stored = json.loads(SettingService(session).load().minds_model_enabled)
+        # Full catalogue, in gateway order, with the unflagged rows defaulted to
+        # available and the published lock preserved.
+        assert stored == {"mindshub_air": True, "sonnet": False, "haiku": True}
+        assert list(stored) == catalogue
+    finally:
+        _clear(session, "minds_model_enabled")
+        session.close()
+
+
 # ── credential-sync seam: POST /settings/raw warms after the sync ─────
 
 def test_write_raw_settings_warms_after_sync(monkeypatch, tmp_path):

@@ -441,7 +441,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # system-derived (MindsHub, via admin-set key/URL), so a member can
             # trigger this refresh but can't steer what's stored — and gating it
             # would leave the map stale.
-            persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled)
+            persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled, live)
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
