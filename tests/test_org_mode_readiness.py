@@ -223,14 +223,28 @@ class TestOrgModeCreditAwareDefaults:
         )
         assert s.resolved_planning_model == MINDS_FREE_MODEL
 
-    def test_org_keeps_an_explicit_choice_when_nothing_is_enabled(self, org_mode):
-        # The one case the fallback above deliberately does not cover: with no
-        # enabled entry anywhere there is nothing to fall back TO, so the stored
-        # value stays. Degraded metadata must not change behaviour, and this is
-        # the arm that keeps a drained account on the model the user picked
-        # instead of inventing one.
+    def test_org_retired_pin_falls_back_to_a_served_model_when_nothing_enabled(self, org_mode):
+        # ENG-1820: a stored id ABSENT from a non-empty catalogue (retired /
+        # renamed / a foreign BYOK pick) with nothing enabled used to be kept —
+        # but the map lists the full catalogue, so an absent id is not served and
+        # 404s as model_not_found on every turn, hard-blocking the account.
+        # Fall back to the first served model (here the free model, locked) so the
+        # account lands on a real, recoverable state (402 with a reset/top-up path)
+        # instead of a dead id. The stored row is still never rewritten.
         s = _settings(
             minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False}), planning_model="opus"
+        )
+        assert s.planning_model == "opus"
+        assert s.resolved_planning_model == MINDS_FREE_MODEL
+
+    def test_org_keeps_a_still_served_pin_when_nothing_is_enabled(self, org_mode):
+        # The invariant that genuinely still holds: a pin the catalogue still
+        # SERVES (present but locked) is kept even with nothing enabled — it 402s
+        # with a top-up path and re-enables when credits/allowance return.
+        # Degraded metadata (an empty map) likewise keeps the stored value.
+        s = _settings(
+            minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False, "opus": False}),
+            planning_model="opus",
         )
         assert s.resolved_planning_model == "opus"
 
