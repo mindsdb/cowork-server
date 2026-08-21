@@ -21,7 +21,7 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
 )
 from cowork.db.session import get_open_session
-from cowork.harnesses.base import get_harness
+from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
@@ -30,7 +30,7 @@ from cowork.handlers.response_routing import (
     decide_route,
     ineligible_reason,
 )
-from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.schemas.responses import (
@@ -67,7 +67,8 @@ from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
-from cowork.services.skills import SkillService, build_turn_skills
+from cowork.services.skills import SkillService
+from cowork.services.task_objects import remote_skill_draft_result
 
 
 import logging
@@ -149,6 +150,18 @@ class ResponsesHandler:
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
+        # A per-conversation harness pick (Coding Mode's composer pill)
+        # overrides the account default for THIS call only — mirrors the
+        # per-conversation model override below. Ignored (not raised) when it
+        # doesn't name a currently-registered/available harness: a stale
+        # client cache (e.g. Hermes got uninstalled since the picker last
+        # loaded) must never fail the turn, it just falls back to the
+        # account default. self.harness stays None either way — still lazy,
+        # only self.harness_name (which harness _get_harness() will build)
+        # changes here.
+        if request.harness and request.harness in available_harness_ids():
+            self.harness_name = request.harness
+
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
         # metric be attributed to a release instead of to a date on which
@@ -177,6 +190,8 @@ class ResponsesHandler:
                         topic=self._prompt_text(harness_input)[:80],
                         project_id=self._resolve_project_id(request),
                         conversation_id=conv_id,
+                        harness=self.harness_name,
+                        model=request.model,
                     )
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
@@ -186,12 +201,16 @@ class ResponsesHandler:
                 conversation = conversation_service.create_conversation(
                     topic=self._prompt_text(harness_input)[:80],
                     project_id=self._resolve_project_id(request),
+                    harness=self.harness_name,
+                    model=request.model,
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
             conversation = conversation_service.create_conversation(
                 topic=self._prompt_text(harness_input)[:80],
                 project_id=self._resolve_project_id(request),
+                harness=self.harness_name,
+                model=request.model,
             )
 
         self.last_conversation_id = str(conversation.id)
@@ -214,6 +233,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=bool(disabled),
+            model=request.model,
         )
         trace_metadata = {
             **trace_metadata,
@@ -311,6 +331,7 @@ class ResponsesHandler:
             stream = harness.stream_response(
                 conversation=conversation,
                 input=harness_input,
+                model=request.model,
                 disabled_connections=disabled,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
@@ -324,6 +345,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
+        model: str | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
@@ -354,6 +376,7 @@ class ResponsesHandler:
                     has_attachments=has_attachments,
                     has_disabled_connections=has_disabled_connections,
                     binding=binding,
+                    model_override=model,
                 )
             return decision, turn_llm
         except Exception:
@@ -570,6 +593,29 @@ class ResponsesHandler:
         )
 
     @staticmethod
+    def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
+        """Stage the project-level files the pod can't otherwise see — the
+        conversation's attachments and the project's anton.md instructions —
+        into the conversation workspace on the shared mount, and seed this
+        org's skill store with the packaged builtins if it hasn't been yet.
+
+        The seeding call belongs here, not just behind ``GET /skills``: the pod
+        reads skills straight off the shared mount (no payload), so this is the
+        only place that runs on every remote turn and can catch an org that
+        chats before it ever opens the skills menu. Never fails the turn: a
+        staging error degrades to a turn without the missing piece."""
+        try:
+            from cowork.services.files import stage_project_instructions
+
+            conversation = ConversationService(session).get_conversation(conv_id)
+            project_path = conversation.project.path
+            FileService(session).stage_conversation_attachments(conv_id, project_path)
+            stage_project_instructions(project_path, conv_id)
+            SkillService(session.scope).ensure_builtin_skills()
+        except Exception:
+            logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
+
+    @staticmethod
     def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
         """The conversation's project as a path relative to the org root.
 
@@ -598,6 +644,42 @@ class ResponsesHandler:
             return {}
 
     @staticmethod
+    def _remote_artifacts_context(session: ScopedSession, conv_id: UUID):
+        """`(conversation, artifacts_base, project_id, project_name)` for the
+        remote turn's end-of-turn artifact bookkeeping, or None if unavailable.
+
+        The pod writes artifacts into `<project>/.anton/artifacts/` on the shared
+        mount, so cowork-server reads the same directory the worker just wrote —
+        this is the whole reason the in-process flow transplants onto the remote
+        path unchanged. `conversation` comes back attached to `session` because
+        `index_turn_artifacts` recovers the tenant scope from the session the row
+        is bound to; the ids and the project name are read here, while it is
+        unambiguously attached, rather than after the turn.
+
+        None on any failure: no artifact card and no autopublish is a recoverable
+        outcome (the next turn in this project reconciles), a failed turn is not.
+        """
+        from cowork.services.artifact_roots import conversation_artifacts_base
+
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            # Conversation-scoped in org mode: the pod's workspace is
+            # <project>/conversations/<id>, not the project, so that is where the
+            # worker's artifacts land. Resolved through artifact_roots so this and
+            # the artifacts list agree on the layout.
+            artifacts_base = conversation_artifacts_base(conversation.project.path, conv_id)
+            return (
+                conversation,
+                artifacts_base,
+                str(conversation.project_id) if conversation.project_id else None,
+                conversation.project.name,
+            )
+        except Exception:
+            logger.exception(
+                "[responses] failed to resolve artifacts context for conversation %s", conv_id)
+            return None
+
+    @staticmethod
     def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
         """This org's memory slots for the pod. A read error degrades to a turn
         without memory rather than failing the turn."""
@@ -606,18 +688,6 @@ class ResponsesHandler:
             return build_turn_memory(session.scope, conversation.project.path)
         except Exception:
             logger.exception("[responses] failed to read memory for conversation %s", conv_id)
-            return {}
-
-    @staticmethod
-    def _remote_skills(session: ScopedSession, conv_id: UUID) -> dict:
-        """This org's skills for the pod, filtered to the conversation's project.
-        A read error degrades to a turn without skills rather than failing the
-        turn."""
-        try:
-            conversation = ConversationService(session).get_conversation(conv_id)
-            return build_turn_skills(session.scope, conversation.project.path)
-        except Exception:
-            logger.exception("[responses] failed to read skills for conversation %s", conv_id)
             return {}
 
     @staticmethod
@@ -683,37 +753,107 @@ class ResponsesHandler:
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
-        async def replies_as_stream_events():
-            from anton.core.llm.provider import StreamTextDelta
+        # Stage attachments + project instructions into the workspace before the
+        # pod runs, so it can read them off the shared mount (no other channel).
+        # Off the event loop: the copies are blocking fs I/O (multi-MB uploads,
+        # EFS latency) and would otherwise stall every other SSE stream on this
+        # worker. Safe to share the producer session with the thread — nothing
+        # else touches it until the reply stream below starts.
+        await asyncio.to_thread(self._stage_remote_workspace_files, producer_session, conv_id)
 
-            async for kind, data in stream_remote_replies(
-                conversation_id=str(conv_id),
-                org_id=self.scoped.scope.org_id,
-                user_id=self.scoped.scope.user_id,
-                input_text=input_text,
-                model=model,
-                turn_id=turn_id,
-                # Producer session, NOT self.scoped: this coroutine is detached
-                # and the request session may be closed by the time it runs.
-                history=self._remote_history(producer_session, conv_id),
-                # Skills and memory are NOT sent: the pod reads them off the
-                # shared mount. Only the org-relative project path travels.
-                **self._remote_workspace(producer_session, conv_id),
-                correlation_id=(turn_llm or {}).get("correlation_id"),
-                llm=(turn_llm or {}).get("llm"),
-            ):
-                if kind == "turn_delta":
-                    yield StreamTextDelta(text=data.get("text", ""))
-                elif kind == "turn_step":
-                    for event in step_stream_events(data):
-                        yield event
-                elif kind == "turn_memory":
-                    self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
-                elif kind == "turn_completed":
-                    return
-                elif kind == "turn_failed":
-                    failure.update(data)
-                    raise _RemoteTurnFailed()
+        async def replies_as_stream_events():
+            from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
+            from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
+            from cowork.services.task_objects import (
+                index_turn_artifacts,
+                publish_and_card_turn_artifacts,
+                snapshot_artifact_state,
+            )
+
+            # The worker writes artifacts into the shared tree while this turn
+            # runs, so cowork-server does the same before/after diff it does for
+            # an in-process turn. Snapshotting here rather than in the caller is
+            # what makes it a genuine "before": stream_remote_replies below only
+            # enqueues the job once this generator is first iterated.
+            artifacts = self._remote_artifacts_context(producer_session, conv_id)
+            before_slugs, before_mtimes = (
+                snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
+            )
+            new_slugs: list[str] = []
+            touched_slugs: set[str] = set()
+            turn_scope = None
+
+            try:
+                async for kind, data in stream_remote_replies(
+                    conversation_id=str(conv_id),
+                    org_id=self.scoped.scope.org_id,
+                    user_id=self.scoped.scope.user_id,
+                    input_text=input_text,
+                    model=model,
+                    turn_id=turn_id,
+                    # Producer session, NOT self.scoped: this coroutine is detached
+                    # and the request session may be closed by the time it runs.
+                    history=self._remote_history(producer_session, conv_id),
+                    # Skills and memory are NOT sent: the pod reads them off the
+                    # shared mount. Only the org-relative project path travels.
+                    **self._remote_workspace(producer_session, conv_id),
+                    correlation_id=(turn_llm or {}).get("correlation_id"),
+                    llm=(turn_llm or {}).get("llm"),
+                ):
+                    if kind == "turn_delta":
+                        yield StreamTextDelta(text=data.get("text", ""))
+                    elif kind == "turn_step":
+                        for event in step_stream_events(data):
+                            yield event
+                    elif kind == "turn_memory":
+                        self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                    elif kind == "turn_skill":
+                        # Not persisted like memory: a draft is the user's decision.
+                        # Yielding SkillCreated puts it through the same formatter the
+                        # in-process path uses, so the card renders — and replays off
+                        # the events log — identically to a desktop one. A rejected
+                        # draft, or a sibling file quietly excluded from an otherwise
+                        # saved one, also gets a StreamTaskProgress notice — the
+                        # generic "thought_progress" role already rendered inline,
+                        # so a loss is visible in the turn instead of only in the
+                        # server log.
+                        for entry in data.get("entries") or []:
+                            payload, reasons = remote_skill_draft_result(entry)
+                            if payload is not None:
+                                yield SkillCreated(payload)
+                            for reason in reasons:
+                                yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
+                    elif kind == "turn_completed":
+                        # `break`, not `return`: the publish/card block below the
+                        # try must still run on a clean finish.
+                        break
+                    elif kind == "turn_failed":
+                        failure.update(data)
+                        raise _RemoteTurnFailed()
+            finally:
+                # Mirrors the in-process harness: indexing runs on EVERY exit so
+                # an artifact the worker wrote is recorded even when the turn
+                # failed or was stopped, and it is synchronous because an await
+                # in a generator's finally is skipped on cancellation.
+                if artifacts is not None:
+                    new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
+                        artifacts[0], conv_id, artifacts[2], artifacts[1],
+                        before_slugs, before_mtimes,
+                    )
+
+            # Clean completion only — a raise inside the try skips this, matching
+            # the in-process path where Stop/error produce no cards and the next
+            # turn in the project heals the publish.
+            if artifacts is not None:
+                for card in await publish_and_card_turn_artifacts(
+                    artifacts[1],
+                    new_slugs=new_slugs,
+                    touched_slugs=touched_slugs,
+                    scope=turn_scope,
+                    project_id=artifacts[2],
+                    project_name=artifacts[3],
+                ):
+                    yield ArtifactCreated(card)
 
         def persist() -> None:
             nonlocal persisted
@@ -878,7 +1018,7 @@ class ResponsesHandler:
             ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=conv, input=harness_input, disabled_connections=disabled,
+                conversation=conv, input=harness_input, model=model, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0

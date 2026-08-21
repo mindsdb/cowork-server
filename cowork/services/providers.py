@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -58,14 +59,29 @@ def is_minds_host(url: str | None) -> bool:
     limitation `build_llm_client` documents where it states the MindsHub flavor
     outright instead of deriving it from the URL. The consequence here is only
     that such a caller keeps today's generic default.
+
+    Matching the `mdb.ai` host chooses the model, not the path. The
+    openai-compatible probe appends `/v1` generically and never applies
+    minds_chat_base_url's `mdb.ai` -> `/api/v1` rule, so a bare `mdb.ai` base
+    with no version segment is still probed at a path that host does not serve.
     """
     raw = (url or "").strip()
     if not raw:
         return False
     # A bare `api.mindshub.ai/v1` has no scheme, so urlparse would read the whole
     # thing as a path and find no hostname. Prefixing `//` makes it a netloc.
-    parsed = urlparse(raw if "//" in raw else f"//{raw}")
-    host = (parsed.hostname or "").lower()
+    #
+    # The try is load-bearing, not defensive: `.hostname` raises ValueError on an
+    # unbalanced `[` or `]`, this runs in validate_provider OUTSIDE
+    # validate_openai_compatible's except, and base_url is free text off the
+    # provider card. Without it, `baseUrl: "["` leaves the service layer and the
+    # endpoint answers 500 where it used to answer ok:false. The TypeScript copy
+    # guards the same case with try/catch around `new URL`.
+    try:
+        parsed = urlparse(raw if "//" in raw else f"//{raw}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
     return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
 
 
@@ -92,6 +108,7 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
     return PUBLISH_FAILSAFE_URL
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
 
 
 def provider_base_url(
@@ -145,6 +162,12 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
+# Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
+# `follow_redirects` chains and trickled responses (each chunk under the per-op
+# read timeout) can otherwise run far past it — minutes, unbounded. This fetch
+# sits on the desktop boot path before the socket binds, so it must have a real
+# ceiling; the outer asyncio.wait_for below enforces it.
+_MINDS_MODELS_TIMEOUT_S = 6.0
 
 
 class MindsModelListing(NamedTuple):
@@ -259,7 +282,11 @@ async def fetch_minds_models(
     A cached *failure* is still honored under ``force_refresh``: the negative
     TTL exists so an unreachable MindsHub isn't re-probed on every call, and
     the picker opens on demand, so bypassing it would make every open pay the
-    full HTTP timeout for as long as the outage lasts.
+    fetch budget for as long as the outage lasts.
+
+    Never raises and never runs longer than ``_MINDS_MODELS_TIMEOUT_S`` — a
+    slow/degraded gateway (hang, redirect loop, trickled body) returns an empty
+    listing that is negatively cached, so callers on the boot path can't hang.
     """
     if not minds_url or not api_key:
         return _empty_listing()
@@ -280,9 +307,15 @@ async def fetch_minds_models(
         _minds_models_cache[cache_key] = (time.monotonic(), val)
         return val
 
-    try:
+    async def _fetch() -> httpx.Response:
+        # `max_redirects` low (not the httpx default of 20) so a same-origin
+        # redirect loop can't multiply the per-op timeout into a long stall;
+        # the endpoint is hit directly at `/models/` so no real redirect is
+        # expected. The outer wait_for is the true ceiling.
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(6.0), follow_redirects=True
+            timeout=httpx.Timeout(_MINDS_MODELS_TIMEOUT_S),
+            follow_redirects=True,
+            max_redirects=2,
         ) as client:
             # Trailing slash is required: the MindsHub router serves the
             # listing at `/models/` and a recent minds-inference release
@@ -290,10 +323,17 @@ async def fetch_minds_models(
             # left this fetch empty and emptied the model picker. Hitting
             # `/models/` directly is what the other frameworks' shared
             # model-catalog helper already does.
-            r = await client.get(
+            return await client.get(
                 f"{base}/models/",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
+
+    try:
+        # Hard TOTAL budget: httpx.Timeout is per-operation, so it alone does
+        # not bound a redirect chain or a trickled response. asyncio.wait_for
+        # cancels the whole fetch at the ceiling and the TimeoutError falls
+        # through to the negative-cache path below.
+        r = await asyncio.wait_for(_fetch(), _MINDS_MODELS_TIMEOUT_S)
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
             return _remember(_empty_listing())
@@ -584,6 +624,99 @@ async def model_value_rejection(
     )
 
 
+def persist_cached_map(
+    session, scope, key: str, prior_json: str | None, live: dict, *, ordered: bool
+) -> bool:
+    """Guarded write of a map cached off ``/v1/models``.
+
+    Two settings come through here — ``minds_model_enabled`` and
+    ``minds_role_defaults`` — and every writer of either uses it (the
+    recommended-models endpoint and the startup / credential-sync warm below) so
+    the invariants can't drift between them:
+
+    - Never clobber a known-good map with an empty one. Callers must already
+      have a non-empty ``live`` (a gateway that returns ids without ``enabled``
+      flags yields ``{}`` for the availability map, which would silently re-lock
+      the canonical default; one that predates ``default_for`` yields ``{}`` for
+      the role defaults, which would drop every role back to a constant only a
+      release can change). The guard here is belt-and-suspenders.
+    - Write only on a real change: ``upsert_setting`` commits a row and
+      invalidates the settings cache, so an unconditional write churns every
+      ``UserSettings`` reader.
+
+    ``ordered`` says whether the map's insertion order carries meaning, and it
+    decides both what is stored and what counts as a change.
+
+    Order-preserving (``ordered=True``, the availability map): never
+    ``sort_keys``. The first-enabled fallback (``_enabled_aware_default``)
+    iterates the map in insertion order and returns the first *enabled* model,
+    which must stay the gateway's own /v1/models ranking (a remote order we don't
+    control or pin — e.g. today prod lists ``fable`` first, and the free
+    ``mindshub_air`` is reached only because the paid aliases ahead of it are
+    marked disabled). Alphabetizing would substitute our ordering for the
+    gateway's and could promote a different enabled model. The compare is
+    order-sensitive to match, so a gateway re-ranking the same set is a real
+    change and refreshes the map.
+
+    Sorted (``ordered=False``, the role defaults): the map is looked up by role
+    name and nothing reads its order, so it is stored sorted and a re-ranking
+    stops counting as a change.
+
+    Returns True iff the stored map was updated.
+    """
+    from cowork.services.settings import SettingService
+
+    if not live:
+        return False
+    desired = json.dumps(live, sort_keys=not ordered)
+    try:
+        stored = json.dumps(json.loads(prior_json or "{}"), sort_keys=not ordered)
+    except (ValueError, TypeError):
+        stored = "{}"
+    if desired == stored:
+        return False
+    SettingService(session, scope).upsert_setting(key, desired)
+    return True
+
+
+async def warm_enabled_model_map(session, scope=None) -> bool:
+    """Desktop: populate `minds_model_enabled` from /v1/models so the FIRST turn
+    resolves an affordable model for a free-tier user with a stored paid pin
+    (ENG-748).
+
+    Since ENG-1652 the minds-cloud role defaults are the free model in both
+    modes, so the UNSET default is already affordable (floored by
+    ``role_defaults``). A stored PAID pin is the case left: it is steered off an
+    unaffordable model only by the availability map, via the wallet-aware
+    fallback in ``_resolved_model``. That map is refreshed lazily on GET
+    /recommended-models, so a brand-new sign-in that sends before the picker ever
+    loads resolves the pin against an EMPTY map — an empty map is no evidence, so
+    the pin is kept and MindsHub denies the empty free-tier wallet
+    (``wallet_empty`` 402) on message one. Warming the map at the two
+    guaranteed-pre-first-turn seams (server startup with a stored key, and
+    immediately after a credential sync) closes that race without touching the
+    turn path.
+
+    Fail-open: ``fetch_minds_models`` never raises and returns an empty listing
+    on any error, bounded by a hard total budget (``_MINDS_MODELS_TIMEOUT_S``)
+    so a degraded gateway can't stall the caller, and ``persist_cached_map``
+    never writes an empty map — so an unreachable MindsHub leaves the stored map
+    untouched and is never worse than today. Returns True iff the map was
+    updated.
+    """
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services.settings import SettingService
+
+    scope = scope if scope is not None else LOCAL_SCOPE
+    s = SettingService(session, scope).load()
+    if s.minds_api_key is None or not s.minds_url:
+        return False
+    listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
+    return persist_cached_map(
+        session, scope, "minds_model_enabled", s.minds_model_enabled, listing.enabled, ordered=True
+    )
+
+
 # ── Config readiness ─────────────────────────────────────────────────
 
 
@@ -803,16 +936,38 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
 
 
 async def validate_openai_compatible(api_key: str, base_url: str = "https://api.openai.com/v1",
-                                     model: str | None = None) -> dict[str, Any]:
+                                     model: str | None = None,
+                                     max_tokens: int | None = None) -> dict[str, Any]:
+    """Probe an openai-compatible chat endpoint.
+
+    `max_tokens` is opt-in, and deliberately not sent by default. It belongs on a
+    probe we know the shape of: MindsHub bills per model, so an uncapped probe
+    draws a full-length completion from the included allowance every time
+    onboarding runs. It does not belong on an arbitrary endpoint, because
+    `max_tokens` is not universal — OpenAI's reasoning models reject it and want
+    `max_completion_tokens`, and `o3`/`o4-mini` are both in RECOMMENDED_MODELS, so
+    sending it unconditionally would report a working key as invalid for exactly
+    the models this ticket is about. `validate_provider` passes it on the MindsHub
+    fallback only.
+
+    `follow_redirects` matches validate_minds and _chat_probe. Safe on a
+    user-supplied base URL because httpx strips `Authorization` on a redirect that
+    leaves the origin (`_redirect_headers`), so the key cannot follow a bounce to
+    another host.
+    """
     try:
         normalized = base_url.rstrip("/")
         chat_url = f"{normalized}/chat/completions" if re.search(r"/v\d", normalized) else f"{normalized}/v1/chat/completions"
         timeout = httpx.Timeout(15.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        payload: dict[str, Any] = {"model": model or "gpt-5.5",
+                                   "messages": [{"role": "user", "content": "ping"}]}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(
                 chat_url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model or "gpt-5.5", "messages": [{"role": "user", "content": "ping"}]},
+                json=payload,
             )
             if r.status_code in (200, 201):
                 return {"ok": True}
@@ -852,6 +1007,13 @@ async def validate_provider(provider: str, api_key: str,
         # validate a different one and report a pass the user cannot trust.
         if not model and is_minds_host(resolved_base):
             model = MINDS_PROBE_MODEL
+            # Cap it the way validate_minds and _chat_probe do: this probe is
+            # MindsHub-bound and otherwise draws a full-length completion from the
+            # included allowance on every onboarding attempt. 20 rather than 1 for
+            # the reason _chat_probe documents. Only here, because max_tokens is
+            # not safe to send to an arbitrary endpoint (see
+            # validate_openai_compatible).
+            return await validate_openai_compatible(api_key, resolved_base, model, max_tokens=20)
         return await validate_openai_compatible(api_key, resolved_base, model)
     return {"ok": False, "error": "Unknown provider"}
 
@@ -920,6 +1082,21 @@ def build_llm_client():
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            # A local endpoint authenticates by being reachable, so an
+            # openai-compatible provider with a base URL and no key is a valid
+            # config, not a broken one.
+            #
+            # Passing a non-empty string matters: anton drops a falsy api_key,
+            # and the SDK then falls back to an ambient OPENAI_API_KEY — which
+            # must never be sent to whatever machine the user pointed us at.
+            # Derived from the role rather than written as a literal, so it is
+            # what it looks like — a marker for an endpoint that authenticates
+            # nobody — rather than something a reader or a scanner has to take
+            # on trust as "not really a credential".
+            if key is None and role == Provider.OPENAI_COMPATIBLE and base:
+                return OpenAIProvider(
+                    api_key=f"{role.value}-no-auth", base_url=base, **effort_kw
+                )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
             # No base for openai-compatible → OpenAIProvider would silently

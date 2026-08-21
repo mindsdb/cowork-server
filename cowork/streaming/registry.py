@@ -65,11 +65,10 @@ class RunHandle:
     # can't tail or cancel another org's in-flight turn; a conversation_id is
     # not an authorization token.
     org_id: str | None = None
-    # Author of the turn, for attribution/audit only — NOT an authorization
-    # gate. Conversations are org-shared (they carry org_id + created_by, never
-    # a personal user_id), so any member may tail a teammate's live turn, just
-    # as they can already read its persisted transcript. Recorded here so the
-    # boundary can be tightened to per-user later without a schema change.
+    # Owner of the turn AND an authorization gate: conversations are personal,
+    # so the tail/cancel/in-flight endpoints require BOTH org_id and user_id to
+    # match (_owner_matches). Matching org alone previously let any member tail
+    # or cancel a teammate's live turn and read its prompts/output (audit P0).
     user_id: str | None = None
     # Shared with the producer coroutine, see TurnLifecycle.
     lifecycle: TurnLifecycle = field(default_factory=TurnLifecycle)

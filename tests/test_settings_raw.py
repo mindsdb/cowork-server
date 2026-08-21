@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -46,11 +47,18 @@ def test_raw_settings_write_syncs_credentials_but_not_models(tmp_path, monkeypat
     )
     monkeypatch.setattr(settings_endpoint, "_ENV_PATH", env_path)
 
+    async def _no_warm(session, scope=None):
+        return False
+
+    monkeypatch.setattr(settings_endpoint, "warm_enabled_model_map", _no_warm)
+
     session = get_open_session()
     try:
         _delete_settings(session, "minds_api_key", "planning_provider", "planning_model")
 
-        response = write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session, _local_request())
+        response = asyncio.run(
+            write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session, _local_request())
+        )
 
         assert response == {"ok": True}
         raw = settings_endpoint.read_raw_settings(_local_request())
@@ -87,7 +95,7 @@ def test_raw_settings_write_rejects_invalid_db_values_before_env_write(tmp_path,
         _delete_settings(session, "planning_provider", "planning_model")
 
         with pytest.raises(HTTPException) as exc:
-            write_raw_settings(
+            asyncio.run(write_raw_settings(
                 _RawSettingsBody(
                     content="\n".join(
                         [
@@ -98,7 +106,7 @@ def test_raw_settings_write_rejects_invalid_db_values_before_env_write(tmp_path,
                 ),
                 session,
                 _local_request(),
-            )
+            ))
 
         assert exc.value.status_code == 400
         assert env_path.read_text(encoding="utf-8") == "ANTON_PLANNING_PROVIDER=anthropic\n"

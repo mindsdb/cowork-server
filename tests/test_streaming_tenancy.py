@@ -49,22 +49,25 @@ class TestAuthorizedHandle:
     def test_local_mode_never_filters(self):
         # A handle carrying an org is still visible in local mode (desktop):
         # local callers own everything on the instance.
-        h = SimpleNamespace(org_id=ORG_A)
+        h = SimpleNamespace(org_id=ORG_A, user_id="author")
         assert _authorized_handle(h, LOCAL_SCOPE) is h
 
-    def test_org_match_returns_handle(self):
-        h = SimpleNamespace(org_id=ORG_A)
-        assert _authorized_handle(h, _org_scope(ORG_A)) is h
+    def test_owner_match_returns_handle(self):
+        h = SimpleNamespace(org_id=ORG_A, user_id="alice")
+        scope = TenantScope(org_mode=True, org_id=ORG_A, user_id="alice")
+        assert _authorized_handle(h, scope) is h
 
     def test_org_mismatch_reads_as_absent(self):
-        h = SimpleNamespace(org_id=ORG_A)
-        assert _authorized_handle(h, _org_scope(ORG_B)) is None
+        h = SimpleNamespace(org_id=ORG_A, user_id="alice")
+        scope = TenantScope(org_mode=True, org_id=ORG_B, user_id="alice")
+        assert _authorized_handle(h, scope) is None
 
-    def test_user_is_not_an_authorization_gate(self):
-        # Conversations are org-shared: a handle authored by one user is
-        # visible to any caller in the same org.
-        h = SimpleNamespace(org_id=ORG_A, user_id="author")
-        assert _authorized_handle(h, _org_scope(ORG_A)) is h
+    def test_same_org_other_user_reads_as_absent(self):
+        # Turns are personal: matching org is not enough, the owning user must
+        # match too (staging audit P0).
+        h = SimpleNamespace(org_id=ORG_A, user_id="alice")
+        scope = TenantScope(org_mode=True, org_id=ORG_A, user_id="bob")
+        assert _authorized_handle(h, scope) is None
 
 
 class TestRequireStreamingScope:
@@ -192,11 +195,19 @@ def test_cancel_unknown_id_is_also_404(client):
     assert resp.status_code == 404
 
 
-def test_same_org_other_user_can_see_and_cancel(client):
-    # Point 1: conversations are org-shared — a teammate (different user) in the
-    # same org may tail and cancel a turn another member started.
+def test_same_org_other_user_cannot_see_or_cancel(client):
+    # Staging audit P0: turns are personal. A teammate (different user) in the
+    # same org must NOT tail/cancel a turn another member started — matching org
+    # alone is not enough; the owning user must match too.
     handle = _register(CID_A, ORG_A, user_id="alice")
     client.set_scope(TenantScope(org_mode=True, org_id=ORG_A, user_id="bob"))
+    assert client.get("/api/v1/responses/tail", params={"conversation_id": CID_A}).status_code == 404
+    resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
+    assert resp.status_code == 404
+    assert handle.cancelled is False  # Alice's turn keeps running
+
+    # The owner (alice) still can.
+    client.set_scope(TenantScope(org_mode=True, org_id=ORG_A, user_id="alice"))
     assert client.get("/api/v1/responses/tail", params={"conversation_id": CID_A}).status_code == 200
     resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
     assert resp.status_code == 200 and resp.json()["cancelled"] is True

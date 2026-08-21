@@ -31,8 +31,12 @@ COMPILED = MODEL_ROLE_DEFAULTS["minds_cloud"]
 # A catalog that moves the roles somewhere the compiled table does not name, so a
 # passing assertion cannot be the compiled value by coincidence.
 MOVED = json.dumps({"planning": "sonnet", "coding": "haiku", "router": "kimi"})
+# `opus` is here because the explicit-pick test stores it. Since ENG-1632 all
+# three roles resolve wallet-aware, so a stored id the map does not affirm is
+# substituted for the first enabled alias — a pick absent from a non-empty map
+# would read as "the user's choice was overwritten" when it was healed.
 EVERYTHING_ENABLED = json.dumps(
-    {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True}
+    {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True, "opus": True}
 )
 
 

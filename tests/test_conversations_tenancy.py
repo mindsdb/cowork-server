@@ -70,6 +70,25 @@ def test_creation_stamps_org_and_author(db):
     assert conv.created_by == "alice"
 
 
+def test_creation_persists_harness_and_model(db):
+    svc = _svc(db, _scope(ORG_A, "alice"))
+    conv = svc.create_conversation(
+        topic="hello",
+        project_id=_project_id(db, "a-proj"),
+        harness="claude-code",
+        model="kimi",
+    )
+    assert conv.harness == "claude-code"
+    assert conv.model == "kimi"
+
+
+def test_creation_defaults_harness_and_model_to_none(db):
+    svc = _svc(db, _scope(ORG_A, "alice"))
+    conv = svc.create_conversation(topic="hello", project_id=_project_id(db, "a-proj"))
+    assert conv.harness is None
+    assert conv.model is None
+
+
 def test_creation_rejects_another_orgs_project(db):
     # Linking to a foreign project would leak its name/path via serialization.
     b = _svc(db, _scope(ORG_B, "bob"))
@@ -182,3 +201,29 @@ def test_background_scope_fails_closed_in_org_mode(db, monkeypatch):
             assert s.exec(select(Conversation)).all() == []
     finally:
         get_app_settings.cache_clear()
+
+
+def test_same_org_users_cannot_see_each_others_conversations(db):
+    """The staging leak (Aug-20): conversations are personal, but the list was
+    scoped by org only, so every member saw every member's tasks. A member must
+    see only their own — list, and get-by-id."""
+    pid = _project_id(db, "a-proj")
+    alice = _svc(db, _scope(ORG_A, "alice"))
+    bob = _svc(db, _scope(ORG_A, "bob"))
+
+    a_conv = alice.create_conversation(topic="alice secret", project_id=pid)
+    b_conv = bob.create_conversation(topic="bob secret", project_id=pid)
+
+    # List: each sees only their own, though they share org + project.
+    alice_ids = {c.id for c in alice.list_conversations(all_projects=True)}
+    bob_ids = {c.id for c in bob.list_conversations(all_projects=True)}
+    assert alice_ids == {a_conv.id}
+    assert bob_ids == {b_conv.id}
+
+    # Get-by-id: bob cannot open alice's conversation by guessing its id.
+    with pytest.raises(ValueError):
+        bob.get_conversation(a_conv.id)
+
+    # Delete-by-id: bob cannot delete alice's conversation.
+    assert bob.delete_conversation(a_conv.id) is False
+    assert alice.get_conversation(a_conv.id).id == a_conv.id  # still there

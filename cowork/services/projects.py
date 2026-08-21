@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import logging
 import re
-import shutil
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
-from sqlmodel import select
 
-from cowork.common.paths import safe_join
+from cowork.common.paths import (
+    PinnedDir,
+    dir_mkdir,
+    dir_rename_into,
+    dir_rmtree,
+    pinned_dir,
+    safe_join,
+)
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
 from cowork.models.project import Project
@@ -56,7 +64,7 @@ class ProjectService:
             return existing
 
         path = self._project_path(GENERAL_PROJECT)
-        path.mkdir(parents=True, exist_ok=True)
+        self._mkdir_in_root(path, exist_ok=True)
         self._insert_general_if_absent(path)
         return self.get_project_by_name_or_none(GENERAL_PROJECT)
 
@@ -197,7 +205,7 @@ class ProjectService:
             return
         if safe.resolve() != Path(project.path).resolve():
             return
-        safe.mkdir(parents=True, exist_ok=True)
+        self._mkdir_in_root(safe, exist_ok=True)
         logger.info("provisioned missing project directory: %s", safe)
 
     def _root_dir(self) -> Path:
@@ -210,6 +218,63 @@ class ProjectService:
         return scoped_storage_root(
             Path(get_app_settings().project.root_dir), self.session.scope, store="projects"
         )
+
+    # --- Symlink-safe filesystem ops on the projects root -------------------
+    #
+    # _project_path proves a path is contained, but the proof expires the moment
+    # it returns: the caller's mkdir/rename/rmtree makes the kernel walk the
+    # path again, and the agent can replace a component in between. Its pod
+    # mounts this org's subtree read-write, so it can swap `projects` itself for
+    # a symlink into another org and redirect the operation.
+    #
+    # These pin the root by descriptor once, with O_NOFOLLOW so opening it can't
+    # traverse a symlink either, and act relative to that descriptor. The kernel
+    # then resolves only the final component, against the inode we opened, so
+    # there is nothing left to swap. Safe because _project_path already
+    # guarantees a project dir is a DIRECT child of root.
+
+    @contextmanager
+    def _root_fd(self) -> "Iterator[PinnedDir]":
+        """A handle for the projects root, refusing to follow a symlink (POSIX)."""
+        with pinned_dir(self._root_dir(), create=True, nofollow_base=True) as d:
+            yield d
+
+    def _child_name(self, path: Path) -> str:
+        """The single component *path* adds to the projects root.
+
+        Refuses anything that is not a direct child, so a caller cannot smuggle
+        a nested or absolute path into an operation that assumes one level:
+        dir_fd only makes the FINAL component safe.
+        """
+        root = self._root_dir()
+        if path.parent != root and path.parent.resolve() != root.resolve():
+            raise ValueError(f"{path} is not a direct child of the projects root")
+        return path.name
+
+    def _mkdir_in_root(self, path: Path, *, exist_ok: bool = False) -> None:
+        with self._root_fd() as root:
+            try:
+                dir_mkdir(root, self._child_name(path))
+            except FileExistsError:
+                if not exist_ok:
+                    raise
+
+    def _rename_in_root(self, old: Path, new: Path) -> None:
+        """Rename *old* to *new*, where *new* is a direct child of the root.
+
+        Only the DESTINATION is pinned. The source is passed absolute on
+        purpose: a legacy row still on a pre-org-keyed path lives outside this
+        root entirely, and that path is one we already hold rather than one an
+        agent can redirect us into. The destination is the side an attacker
+        would aim at another org, so that is the side that must not be
+        re-walked.
+        """
+        with self._root_fd() as root:
+            dir_rename_into(root, old, self._child_name(new))
+
+    def _rmtree_in_root(self, path: Path) -> None:
+        with self._root_fd() as root:
+            dir_rmtree(root, self._child_name(path))
 
     def _project_path(self, name: str) -> Path:
         # Containment guard: a project dir is always a direct child of the
@@ -294,7 +359,7 @@ class ProjectService:
         for attempt in range(2, 52):
             path = self._project_path(candidate)
             try:
-                path.mkdir(parents=True)  # raises if it already exists
+                self._mkdir_in_root(path)  # raises if it already exists
                 return candidate, path
             except FileExistsError:
                 candidate = self._unique_name(f"{base}-{attempt}")
@@ -350,8 +415,7 @@ class ProjectService:
                     # The org's root may not exist yet (a legacy row still on an
                     # un-keyed path): rename would raise FileNotFoundError, which
                     # the endpoint's `except ValueError` turns into a 500.
-                    new_path.parent.mkdir(parents=True, exist_ok=True)
-                    old_path.rename(new_path)
+                    self._rename_in_root(old_path, new_path)
                 project.name = final_name
                 project.path = str(new_path)
 
@@ -407,7 +471,15 @@ class ProjectService:
             # the whole project delete and leave it half-cascaded. Log and move
             # on — a skipped conversation just retains today's orphan behavior.
             try:
-                conv_svc.delete_conversation(cid)
+                # Owner-AGNOSTIC: a project is org-shared and may hold several
+                # members' conversations. Fetch org-scoped (session.get validates
+                # org, not owner) and delete the row directly — the request-facing
+                # delete_conversation is owner-scoped and would skip foreign rows,
+                # re-orphaning them (ENG-701).
+                conv = self.session.get(Conversation, cid)
+                if conv is None:
+                    continue
+                conv_svc.delete_conversation_row(conv)
             except Exception:
                 # Roll back the failed conversation's partial work FIRST.
                 # delete_conversation stages its row deletes (messages, events,
@@ -432,7 +504,7 @@ class ProjectService:
             safe = None
         if path.exists():
             if safe is not None and safe.resolve() == path.resolve():
-                shutil.rmtree(path)
+                self._rmtree_in_root(path)
             else:
                 logger.warning(
                     "delete_project: stored path %s does not match the derived "
