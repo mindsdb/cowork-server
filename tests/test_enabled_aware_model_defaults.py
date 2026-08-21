@@ -92,7 +92,7 @@ def test_drained_wallet_keeps_a_still_served_default():
 
 
 def test_retired_default_with_nothing_enabled_falls_back_to_first_served():
-    # ENG-1820: default absent from a non-empty catalogue (retired) and nothing
+    # Default absent from a non-empty catalogue (retired) and nothing
     # enabled — the removed id would 404 every turn, so hand out a served model.
     s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
     assert s.planning_model == "kimi"
@@ -255,7 +255,7 @@ def test_fully_drained_map_keeps_a_still_served_pin():
 
 
 def test_retired_pin_with_nothing_enabled_falls_back_to_first_served():
-    # ENG-1820 hard-block: pin absent from a non-empty catalogue (retired/foreign)
+    # Hard-block: pin absent from a non-empty catalogue (retired/foreign)
     # and nothing enabled — the removed id 404s every turn, so fall back to a
     # served model. The stored row is still never rewritten.
     all_off = json.dumps({"sonnet": False, "haiku": False, "kimi": False})
