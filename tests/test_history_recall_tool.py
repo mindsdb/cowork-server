@@ -136,8 +136,10 @@ class TestHandler:
 
         answer = _call(_tool(svc, conv), query="quarterly forecast")
 
-        assert "different words" in answer
-        assert "do not repeat this query" in answer
+        # The reply has to teach the retry, not just refuse: the match rule is
+        # prefix-based, which the model cannot infer from an empty result.
+        assert "word beginnings" in answer
+        assert "Do not repeat this query" in answer
 
     def test_reports_an_empty_archive(self, svc):
         conv = _conversation_with_turns(svc, [("q1", "a1")])
