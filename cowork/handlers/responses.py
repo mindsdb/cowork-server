@@ -131,30 +131,24 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
 
 async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id) -> None:
     """Guarantee a terminal record so a producer that ended WITHOUT closing its
-    buffer can't leave the client's tail hanging forever (ENG-1717).
+    buffer can't leave the client's tail (and its shared stream slot) hanging
+    forever.
 
     Every producer branch closes the buffer on its own path, but the terminal is
-    not actually guaranteed: an exception escaping the ``except Exception``
-    handler — e.g. the error-classification helpers (``friendly_turn_error``,
-    provider resolution) raising — or a ``BaseException`` that matches neither
-    ``except`` clause skips ``buffer.close()`` entirely. The buffer then stays
-    open with no terminal record, the in-process FileStreamBuffer tail (the
-    desktop path) blocks forever, the client holds its single shared stream
-    slot, and every later message strands at "Queued". Unlike the duration bound
-    in RunRegistry (#345), this covers a turn that FAILS FAST — it never reaches
-    the timeout — which is the likely cause of the reporter's silent first-turn
-    failures.
+    not guaranteed: an exception escaping the ``except Exception`` handler (e.g.
+    the error-classification helpers raising), or a ``BaseException`` that
+    matches no ``except`` clause, skips ``buffer.close()`` — the buffer stays
+    open with no terminal, the desktop's in-process tail blocks forever, and
+    every later message strands at "Queued". Unlike the duration bound, this
+    covers a turn that FAILS FAST, well before any timeout.
 
-    ``close()`` is idempotent (``if self._closed: return``), so this is a no-op
-    on every normal path. The ``discarded`` path is skipped: its buffer file was
-    already deleted by ``discard_conversation`` and closing would recreate it
-    (see the discarded branches above). Both awaits are guarded so a seal
-    failure can never mask the original exception propagating out of ``finally``.
-
-    Only seals when it can positively confirm the buffer is still open:
-    ``is_closed`` is abstract on ``StreamBuffer`` so every real buffer exposes
-    it, but a minimal test double may not — treat an absent flag as
-    already-terminated so a stub can never trigger a spurious second terminal.
+    ``close()`` is idempotent, so this is a no-op on every normal path. The
+    ``discarded`` path is skipped: its buffer file was already deleted and
+    closing would recreate it. Both awaits are guarded so a seal failure can't
+    mask the original exception propagating out of ``finally``. ``is_closed`` is
+    abstract on ``StreamBuffer`` but a minimal test double may lack it — treat an
+    absent flag as already-terminated so a stub can't trigger a spurious second
+    terminal.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
