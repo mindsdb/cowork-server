@@ -28,32 +28,19 @@ from cowork.streaming.buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
 
-# A turn is reaped only after it makes NO progress — writes no buffer record —
-# for this long. A hung producer (wedged tool call, stalled model stream)
-# otherwise runs forever: its handle stays `is_running`, no terminal record is
-# ever written, and an in-process FileStreamBuffer tail — the desktop path —
-# blocks indefinitely, holding the client's shared stream slot so sends wedge in
-# every conversation (ENG-1717). Boot recovery (`seal_orphan_buffers`) only
-# covers a genuine process restart; a re-adopted crash-orphan sidecar keeps the
-# same hung task alive, so the bound has to be enforced at runtime.
+# Reap a turn only after it makes NO progress (writes no buffer record) for this
+# long. A hung producer otherwise runs forever, holding the client's shared
+# stream slot so sends wedge in every conversation; boot recovery only covers a
+# real restart, not a re-adopted crash-orphan sidecar, so the bound is enforced
+# at runtime.
 #
-# This is an IDLE bound, not a total-duration one: it resets on every record the
-# producer writes (`buffer.latest_seq` advances), so it never reaps a turn that
-# is actively streaming. It also never reaps one legitimately blocked on the
-# user: an `ask_user` card blocks the producer with no writes for up to
-# elicitor.DEFAULT_TIMEOUT_S (300s), which sits well inside this window, and a
-# multi-question turn writes a frame between questions so human wait never
-# accumulates toward the bound. A total-duration cap — the scheduler's model,
-# for non-interactive runs with no human in the loop — would instead reap a long
-# deliberate turn mid-conversation and surface a spurious error to an engaged
-# user.
+# IDLE, not total duration: `buffer.latest_seq` advances on every frame, so an
+# actively-streaming turn — or one blocked on an `ask_user` card (up to 300s,
+# within this window) — resets the window and is never reaped. A total-duration
+# cap would kill a long deliberate turn mid-conversation.
 #
-# Configurable via COWORK_MAX_TURN_IDLE_SECONDS as a pressure-release valve: a
-# deployment that runs legitimately long silent tool calls (slow builds, big
-# network fetches that emit no progress frames) can widen the window rather than
-# have them reaped. The real fix for those is a periodic progress frame from the
-# tool — which resets this window by design — but the knob is the escape hatch
-# until then. A non-positive or unparseable value falls back to the default.
+# COWORK_MAX_TURN_IDLE_SECONDS widens the window for deployments with long silent
+# tool calls; a non-positive or unparseable value falls back to the default.
 def _idle_bound_seconds() -> int:
     raw = os.environ.get("COWORK_MAX_TURN_IDLE_SECONDS")
     if raw is None:
@@ -198,27 +185,14 @@ class RunRegistry:
     async def _run_bounded(
         self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
     ) -> None:
-        """Run a producer under an idle bound on turn duration (ENG-1717).
+        """Run a producer under the idle bound (see module comment).
 
-        A watchdog reaps the producer only after it goes fully silent — writes
-        no buffer record — for ``_MAX_TURN_IDLE_SECONDS``. On reap the producer
-        is cancelled; every producer's CancelledError handler persists its
-        pending state and closes the buffer with a terminal record (the same
-        path a user Stop takes), so the tail ends and the client releases its
-        shared stream slot instead of wedging every conversation's sends behind
-        a turn that will never finish.
-
-        The bound is on IDLE time, not total duration: ``buffer.latest_seq``
-        advances on every frame the producer emits, so an actively-streaming
-        turn — or one legitimately blocked on an ``ask_user`` card, which
-        resumes with more frames — resets the window and is never reaped. Only a
-        producer that stops emitting entirely trips it.
-
-        An external cancel/discard cancels this wrapper; the ``await task`` below
-        forwards that into the producer, so ``RunHandle.cancel`` and ``discard``
-        keep working as before. A producer that raises on its own propagates
-        here exactly as it did when it was the registered task directly — no
-        swallowing.
+        On reap the producer is cancelled; its CancelledError handler seals the
+        buffer with a terminal record (the user-Stop path), so the tail ends and
+        the client releases its slot. An external cancel/discard cancels this
+        wrapper and ``await task`` forwards it into the producer, so
+        ``RunHandle.cancel``/``discard`` still work; a producer that raises on
+        its own propagates unchanged.
         """
         loop = asyncio.get_running_loop()
         task = asyncio.ensure_future(producer_coro)
@@ -258,18 +232,15 @@ class RunRegistry:
         try:
             await task
         except asyncio.CancelledError:
-            # A watchdog reap surfaces here as the producer's own cancellation.
-            # Unlike an external cancel/discard — which must propagate so
-            # RunHandle.cancel observes it — a reap is terminal on its own (the
-            # buffer is already sealed), so swallow it and let the wrapper end
-            # normally.
+            # A reap surfaces as the producer's cancellation. Unlike an external
+            # cancel (which must propagate for RunHandle.cancel to observe), a
+            # reap is already terminal — its buffer is sealed — so swallow it.
             if not reaped:
                 raise
         finally:
-            # Retrieve the watchdog's result without ever propagating it: its
-            # outcome (cancelled, or a fail-open exception) must not overwrite
-            # the turn's own result — including a cancellation RunHandle.cancel
-            # is waiting to observe.
+            # Reap the watchdog without propagating its outcome — it must never
+            # overwrite the turn's own result (including a cancellation
+            # RunHandle.cancel is waiting to observe).
             watchdog.cancel()
             await asyncio.gather(watchdog, return_exceptions=True)
 
