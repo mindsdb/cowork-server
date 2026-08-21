@@ -891,8 +891,13 @@ _RECALL_HISTORY_SCHEMA = {
         "query": {
             "type": "string",
             "description": (
-                "Words to look for in the earlier turns. Use the wording of the "
-                "detail you need (names, paths, values, topic), not a question."
+                "Words to look for in the earlier turns — the wording of the "
+                "detail you need (names, paths, values, topic), not a question. "
+                "Matching is on the START of each word, so drop endings and "
+                "keep the stem: “passwo” finds “password(s)”, and the same "
+                "applies to inflected endings in any other language. Keep "
+                "every term at least 4 characters, and prefer 2-4 distinctive "
+                "words over a sentence."
             ),
         },
         "limit": {
@@ -949,9 +954,9 @@ async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
     if not turns:
         return (
             f"recall_history: no earlier turn matches “{query}”. Try once more "
-            "with different words (the archive is searched literally, so use "
-            "terms that would appear in the turn itself) — do not repeat this "
-            "query."
+            "with fewer, more distinctive words, cut to their stems (matching "
+            "is on word beginnings, minimum 4 characters) — then move on. Do "
+            "not repeat this query."
         )
     return format_turns(turns)
 
@@ -970,9 +975,11 @@ def build_cowork_recall_history_tool(load_archive):
             "into the summary you were given. Use it when you need a specific "
             "detail the summary dropped (an exact value, path, name, or what "
             "was decided and why). Returns the matching turns verbatim, best "
-            "match first, truncated to fit. One call is normally enough "
-            "— if nothing matches, rephrase once, then move on. Not for "
-            "searching files or data in the workspace: use the scratchpad."
+            "match first, truncated to fit. The archive is searched literally, "
+            "by word beginnings — it finds word forms, not synonyms, so query "
+            "with words that would actually appear in the turn. One call is "
+            "normally enough; if nothing matches, rephrase once, then move on. "
+            "Not for searching files or data in the workspace: use the scratchpad."
         ),
         input_schema=_RECALL_HISTORY_SCHEMA,
         handler=handler,
