@@ -374,6 +374,33 @@ class ConversationService:
         self.session.add(conversation)
         self.session.commit()
 
+    def archived_messages(self, conversation_id: UUID) -> list[dict]:
+        """The messages the saved summary replaced, oldest first, as plain dicts.
+
+        These are the turns the agent no longer receives, so they are the only
+        ones worth searching (ENG-735). Empty on every path where there is no
+        archive to search:
+        - nothing compacted yet — the whole history is already in context
+        - the cutoff row is gone (deleted/truncated history), which also makes
+          the saved summary stale and the replay fall back to full history
+        """
+        conversation = self.get_conversation(conversation_id)
+        cutoff_id = conversation.history_summary_cutoff_id
+        if not conversation.history_summary or cutoff_id is None:
+            return []
+
+        # Same filter the replay applies (see AntonHarness._seed_history): the
+        # cutoff id refers to a position in the user/assistant stream, so a
+        # thought row must not shift it.
+        archived: list[dict] = []
+        for message in self.get_ordered_messages(conversation_id):
+            if message.role not in (Role.user, Role.assistant):
+                continue
+            archived.append({"role": message.role.value, "content": message.content})
+            if message.id == cutoff_id:
+                return archived
+        return []
+
     def delete_conversation(self, conversation_id: UUID) -> bool:
         conversation = self.session.get(Conversation, conversation_id)
         if conversation is None:

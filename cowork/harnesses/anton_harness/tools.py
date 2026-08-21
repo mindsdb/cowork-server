@@ -875,3 +875,107 @@ def build_cowork_create_skill_draft_tool():
         handler=_cowork_create_skill_draft,
     )
 
+
+####################
+# History Recall Tool
+####################
+
+# The summary that replaces older turns drops detail by design (ENG-664). This
+# tool is the backstop: it searches the raw turns the summary covers, so a fact
+# the summary flattened is still reachable without replaying the whole history
+# (ENG-735). Registered only once a summary exists — see AntonHarness.
+
+_RECALL_HISTORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": (
+                "Words to look for in the earlier turns. Use the wording of the "
+                "detail you need (names, paths, values, topic), not a question."
+            ),
+        },
+        "limit": {
+            "type": "integer",
+            "description": "How many matching turns to return (default 3, max 10).",
+        },
+    },
+    "required": ["query"],
+}
+
+_RECALL_HISTORY_PROMPT = (
+    "The earlier part of this conversation is replaced by a compacted summary, "
+    "and the raw turns behind it are archived. When you need a detail the "
+    "summary dropped — an exact value, a path, a name, what was decided and "
+    "why — call `recall_history` instead of guessing or asking the user to "
+    "repeat something they already said."
+)
+
+_RECALL_HISTORY_LIMIT_DEFAULT = 3
+_RECALL_HISTORY_LIMIT_MAX = 10
+
+
+async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
+    """Tool handler for `recall_history` — search the archived earlier turns.
+
+    `load_archive` returns the archive as plain message dicts, so the handler
+    stays a presentation layer: it never touches the DB, and the hosted path
+    can supply the same archive off the shared mount instead.
+    """
+    from cowork.services.history_recall import format_turns, search_turns
+
+    query = str(tc_input.get("query") or "").strip()
+    if not query:
+        return "recall_history: `query` is required."
+    try:
+        limit = int(tc_input.get("limit") or _RECALL_HISTORY_LIMIT_DEFAULT)
+    except (TypeError, ValueError):
+        limit = _RECALL_HISTORY_LIMIT_DEFAULT
+    limit = max(1, min(limit, _RECALL_HISTORY_LIMIT_MAX))
+
+    try:
+        messages = load_archive()
+    except Exception as exc:
+        logger.exception("Cowork recall_history failed")
+        return f"recall_history: could not read the archive ({type(exc).__name__})."
+
+    if not messages:
+        return (
+            "recall_history: nothing is archived for this conversation — every "
+            "turn so far is already in your context."
+        )
+
+    turns = search_turns(messages, query, limit=limit)
+    if not turns:
+        return (
+            f"recall_history: no earlier turn matches “{query}”. Try once more "
+            "with different words (the archive is searched literally, so use "
+            "terms that would appear in the turn itself) — do not repeat this "
+            "query."
+        )
+    return format_turns(turns)
+
+
+def build_cowork_recall_history_tool(load_archive):
+    """`load_archive` is called per tool call and returns the archived messages."""
+    from anton.core.tools.tool_defs import ToolDef
+
+    async def handler(_session, tc_input: dict) -> str:
+        return await _cowork_recall_history(load_archive, tc_input)
+
+    return ToolDef(
+        name="recall_history",
+        description=(
+            "Search the earlier turns of THIS conversation that were compacted "
+            "into the summary you were given. Use it when you need a specific "
+            "detail the summary dropped (an exact value, path, name, or what "
+            "was decided and why). Returns the matching turns verbatim, best "
+            "match first, truncated to fit. One call is normally enough "
+            "— if nothing matches, rephrase once, then move on. Not for "
+            "searching files or data in the workspace: use the scratchpad."
+        ),
+        input_schema=_RECALL_HISTORY_SCHEMA,
+        handler=handler,
+        prompt=_RECALL_HISTORY_PROMPT,
+    )
+
