@@ -97,11 +97,17 @@ def stage_project_instructions(project_path: str | Path, conversation_id: str | 
         return False
     src = Path(project_path) / ".anton" / "anton.md"
     if not src.is_file():
-        # Instructions removed at the project → drop the stale staged copy so
-        # the agent stops seeing them.
+        # Instructions removed at the project → clear the stale staged copy so
+        # the agent stops seeing them. Cleared by truncating IN PLACE, never by
+        # unlink: the sandbox pod caches NFS handles for this file (gVisor
+        # gofer), and deleting the inode leaves the pod failing every stat
+        # with ESTALE until the pod is recycled — retries inside the pod
+        # cannot recover it (ENG-1817). Truncation keeps the inode, so the
+        # pod's cached handle stays valid and reads empty content instead.
         try:
-            if dest.is_file():
-                dest.unlink()
+            if dest.is_file() and dest.stat().st_size > 0:
+                with open(dest, "w"):
+                    pass
         except OSError:
             pass
         return False
