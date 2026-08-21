@@ -153,3 +153,26 @@ async def test_external_cancel_still_propagates_through_the_bound(monkeypatch):
 
     assert await handle.cancel() is True
     assert buffer.closed == "cancelled"
+
+
+# The idle bound is env-configurable (COWORK_MAX_TURN_IDLE_SECONDS) as a
+# pressure-release valve for deployments with legitimately long silent tool
+# calls; a bad value must never disable the bound (ENG-1717).
+class TestIdleBoundConfig:
+    def test_defaults_to_600_when_unset(self, monkeypatch):
+        monkeypatch.delenv("COWORK_MAX_TURN_IDLE_SECONDS", raising=False)
+        assert _REGISTRY_MODULE._idle_bound_seconds() == 600
+
+    def test_honors_a_valid_override(self, monkeypatch):
+        monkeypatch.setenv("COWORK_MAX_TURN_IDLE_SECONDS", "1800")
+        assert _REGISTRY_MODULE._idle_bound_seconds() == 1800
+
+    def test_falls_back_on_unparseable(self, monkeypatch):
+        monkeypatch.setenv("COWORK_MAX_TURN_IDLE_SECONDS", "soon")
+        assert _REGISTRY_MODULE._idle_bound_seconds() == 600
+
+    def test_falls_back_on_non_positive(self, monkeypatch):
+        monkeypatch.setenv("COWORK_MAX_TURN_IDLE_SECONDS", "0")
+        assert _REGISTRY_MODULE._idle_bound_seconds() == 600
+        monkeypatch.setenv("COWORK_MAX_TURN_IDLE_SECONDS", "-30")
+        assert _REGISTRY_MODULE._idle_bound_seconds() == 600
