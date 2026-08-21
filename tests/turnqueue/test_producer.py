@@ -403,3 +403,26 @@ async def test_turn_skill_reaches_the_caller(monkeypatch):
     items = await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
     assert items == [("turn_skill", {"entries": [draft]}), ("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_turn_history_reaches_the_caller(monkeypatch):
+    """The kind filter is a whitelist, so this is the one place a frame that
+    already passed TurnReply validation can still be dropped — silently, with
+    no log line. It needs its own test because the behavioural _produce_remote
+    tests patch stream_remote_replies out and never exercise the filter."""
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "1"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "1"}]},
+    ]
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_history", {"rows": rows})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    assert items == [("turn_history", {"rows": rows}), ("turn_completed", {})]
