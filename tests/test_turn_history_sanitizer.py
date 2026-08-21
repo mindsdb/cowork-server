@@ -215,9 +215,26 @@ def test_placeholders_can_bring_a_turn_back_under_the_budget():
 
 # --- logging ---------------------------------------------------------------
 
-def test_a_rejection_logs_at_warning(caplog):
-    """staging runs at LOG_LEVEL=WARNING, so an INFO-level notice is invisible."""
-    with caplog.at_level("WARNING", logger="cowork.handlers._turn_history"):
-        assert sanitize_turn_history_rows([_pair()[0]]) == []
-    assert caplog.records
-    assert caplog.records[0].levelname == "WARNING"
+def test_a_rejection_logs_at_warning_not_info(monkeypatch):
+    """staging runs at LOG_LEVEL=WARNING, so an INFO-level notice is invisible —
+    a silently dropped turn is exactly what we would need the log for.
+
+    Asserted through the module logger rather than caplog on purpose: cowork's
+    setup_logging() calls logging.basicConfig(force=True) at import time, which
+    drops pytest's root capture handler. caplog therefore sees nothing in a
+    full-suite run (it works in isolation), so it cannot express this.
+    """
+    from cowork.handlers import _turn_history
+
+    warnings: list[str] = []
+    infos: list[str] = []
+    monkeypatch.setattr(_turn_history.logger, "warning",
+                        lambda msg, *a: warnings.append(msg % a if a else msg))
+    monkeypatch.setattr(_turn_history.logger, "info",
+                        lambda msg, *a: infos.append(msg % a if a else msg))
+
+    assert sanitize_turn_history_rows([_pair()[0]]) == []
+
+    assert len(warnings) == 1
+    assert "do not pair" in warnings[0]
+    assert infos == []
