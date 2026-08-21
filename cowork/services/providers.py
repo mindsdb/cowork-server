@@ -585,7 +585,9 @@ async def model_value_rejection(
     )
 
 
-def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabled: dict) -> bool:
+def persist_enabled_model_map(
+    session, scope, prior_json: str | None, live_enabled: dict, live_ids: list[str] | None = None
+) -> bool:
     """Guarded write of the `minds_model_enabled` availability map.
 
     Shared by every writer (the recommended-models endpoint and the startup /
@@ -595,14 +597,26 @@ def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabl
       have a non-empty ``live_enabled`` (a gateway that returns ids without
       ``enabled`` flags yields ``{}``, which would silently re-lock the
       canonical default). The guard here is belt-and-suspenders.
+    - Persist the FULL served catalogue, not just the flagged rows.
+      ``fetch_minds_models`` only records rows that publish the optional
+      ``enabled`` field, so ``live_enabled`` alone is sparse: a served model
+      that omits the flag (``missing = available``) is absent from it. The
+      resolution logic (``_enabled_aware_default`` / ``_resolved_model``) reads
+      key ABSENCE from a non-empty stored map as "retired from the catalogue"
+      and steers off it — so a sparse map would misread a working free model as
+      retired and resolve a ``mindshub_air`` default/pin to a locked paid model.
+      Once we actually have availability metadata (``live_enabled`` non-empty),
+      fold every served id in with the flag it published, defaulting the
+      unflagged ones to ``True``, so key absence means genuinely-not-served.
     - Persist ORDER-PRESERVING JSON — never ``sort_keys``. The first-enabled
       fallback (``_enabled_aware_default``) iterates the map in insertion order
       and returns the first *enabled* model, which must stay the gateway's own
       /v1/models ranking (a remote order we don't control or pin — e.g. today
       prod lists ``fable`` first, and the free ``mindshub_air`` is reached only
-      because the paid aliases ahead of it are marked disabled). Alphabetizing
-      would substitute our ordering for the gateway's and could promote a
-      different enabled model.
+      because the paid aliases ahead of it are marked disabled). Densifying over
+      ``live_ids`` (already in that ranking) preserves it; alphabetizing would
+      substitute our ordering for the gateway's and could promote a different
+      enabled model.
     - Write only on a real change (the compare is order-sensitive too, so a
       gateway re-ranking also refreshes): ``upsert_setting`` commits a row and
       invalidates the settings cache, so an unconditional write churns every
@@ -614,6 +628,8 @@ def persist_enabled_model_map(session, scope, prior_json: str | None, live_enabl
 
     if not live_enabled:
         return False
+    if live_ids:
+        live_enabled = {mid: live_enabled.get(mid, True) for mid in live_ids}
     desired = json.dumps(live_enabled)
     try:
         stored = json.dumps(json.loads(prior_json or "{}"))
@@ -658,7 +674,9 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     if s.minds_api_key is None or not s.minds_url:
         return False
     listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
-    return persist_enabled_model_map(session, scope, s.minds_model_enabled, listing.enabled)
+    return persist_enabled_model_map(
+        session, scope, s.minds_model_enabled, listing.enabled, listing.ids
+    )
 
 
 # ── Config readiness ─────────────────────────────────────────────────
