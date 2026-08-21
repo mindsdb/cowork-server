@@ -570,6 +570,29 @@ def test_stage_instructions_clears_removed_instructions_in_place(tmp_path):
     assert dest.stat().st_ino == inode   # same inode: cached pod handles stay valid
 
 
+def test_stage_instructions_clear_does_not_follow_a_symlink_planted_after_the_check(
+    tmp_path, monkeypatch
+):
+    """TOCTOU at the use site: safe_join resolves and checks, but is documented
+    as non-atomic — a symlink the pod swaps in after the check must fail the
+    truncate (O_NOFOLLOW → ELOOP), not empty the file it points at. unlink
+    didn't follow symlinks; the in-place clear must not either."""
+    import cowork.services.files as files_mod
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    victim = tmp_path / "victim.md"
+    victim.write_text("another tenant's data")
+    link = proj / "conversations" / conv / ".anton" / "anton.md"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(victim)
+    # Simulate the swap landing after the containment check: hand the caller
+    # the unresolved path, as if the link appeared a moment later.
+    monkeypatch.setattr(files_mod, "safe_join", lambda base, *parts: link)
+
+    assert files_mod.stage_project_instructions(proj, conv) is False
+    assert victim.read_text() == "another tenant's data"
+
+
 def test_stage_instructions_removal_does_not_rewrite_an_empty_copy(tmp_path):
     """The clear runs before every turn — an already-empty copy must be left
     untouched, not truncated again (mtime churn on every turn)."""

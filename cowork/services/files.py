@@ -104,10 +104,14 @@ def stage_project_instructions(project_path: str | Path, conversation_id: str | 
         # with ESTALE until the pod is recycled — retries inside the pod
         # cannot recover it (ENG-1817). Truncation keeps the inode, so the
         # pod's cached handle stays valid and reads empty content instead.
+        # O_NOFOLLOW + no O_CREAT: the workspace is writable by the untrusted
+        # pod and safe_join is not atomic, so a symlink planted at dest after
+        # the check must fail (ELOOP) rather than truncate its target, and a
+        # file that vanished in between must not be recreated here.
         try:
             if dest.is_file() and dest.stat().st_size > 0:
-                with open(dest, "w"):
-                    pass
+                fd = os.open(dest, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+                os.close(fd)
         except OSError:
             pass
         return False
