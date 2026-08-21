@@ -144,3 +144,38 @@ def test_the_real_resolver_returns_a_string_not_none():
 
     got = health._anton_install_id()
     assert isinstance(got, str)
+
+
+def test_health_does_not_serve_the_unknown_sentinel():
+    """`get_installation_id` returns the literal "unknown" when it cannot
+    fingerprint the machine — a container with stripped networking whose
+    fallback file is unwritable, or any getnode exception.
+
+    anton stamps that SAME string on its own events, so passing it through
+    would produce a join key that matches across every unfingerprintable
+    machine and merges them into one identity. That is ENG-713's over-merge
+    outcome reached without an alias, and worse than an absent key because the
+    value looks valid.
+    """
+    from unittest.mock import patch
+
+    import anton.analytics
+
+    from cowork.api.v1.endpoints import health
+
+    with patch.object(anton.analytics, "get_installation_id", return_value="unknown"):
+        assert health._anton_install_id() == ""
+
+
+def test_health_serves_a_real_looking_id_unchanged():
+    """Control for the test above: the filter must reject only the sentinel,
+    not mangle a genuine id.
+    """
+    from unittest.mock import patch
+
+    import anton.analytics
+
+    from cowork.api.v1.endpoints import health
+
+    with patch.object(anton.analytics, "get_installation_id", return_value="a1b2c3d4e5f60718"):
+        assert health._anton_install_id() == "a1b2c3d4e5f60718"

@@ -15,6 +15,11 @@ def _pkg_version(name: str) -> str | None:
         return None
 
 
+# What anton returns when it cannot fingerprint the machine at all. Not a valid
+# id: every such machine reports the same string, so it would join them together.
+_AID_SENTINEL = "unknown"
+
+
 def _anton_install_id() -> str:
     """anton's own analytics install id, so the desktop app can join its
     anonymous per-turn cost events to an identified user (ENG-1689).
@@ -36,11 +41,22 @@ def _anton_install_id() -> str:
     Returns "" rather than raising. This is the readiness probe the desktop app
     polls before mounting the renderer; it must not fail because an analytics
     identifier could not be resolved.
+
+    **The sentinel must not escape.** ``get_installation_id`` returns the
+    literal string ``"unknown"`` when it cannot fingerprint the machine at all
+    — a container with stripped networking whose fallback file is unwritable,
+    or any exception from ``uuid.getnode()``. anton stamps that same
+    ``"unknown"`` on its own events, so passing it through would produce a join
+    key that *matches* across every unfingerprintable machine and silently
+    merges them into one identity. That is ENG-713's over-merge outcome reached
+    without an alias, and it is worse than no key at all because the value looks
+    valid. Absent beats colliding.
     """
     try:
         from anton.analytics import get_installation_id
 
-        return get_installation_id() or ""
+        aid = get_installation_id() or ""
+        return "" if aid == _AID_SENTINEL else aid
     except Exception:  # pragma: no cover - defensive
         return ""
 
@@ -57,6 +73,9 @@ def _anton_install_id() -> str:
 @router.get("/", response_model=dict)
 def health() -> dict:
     settings = get_user_settings()
+    # Read once: `org_mode` and the `aid` gate are the same decision, and two
+    # separate reads could in principle disagree within one response.
+    _org_mode = get_app_settings().tenancy_mode == "org"
     return {
         "status": "ok",
         "anton_available": True,
@@ -67,13 +86,13 @@ def health() -> dict:
         # Provider config is org-owned (admin-only writes) in org mode, so the
         # client must not finalize onboarding by writing it. `config_ready` can't
         # express this: it says the deployment can run, not who may configure it.
-        "org_mode": get_app_settings().tenancy_mode == "org",
+        "org_mode": _org_mode,
         # anton's analytics install id, desktop only (ENG-1689). Empty in org
         # mode deliberately: there the id fingerprints the SERVER, identical for
         # every user of the deployment, so publishing it would answer no
         # question and would expose one host's fingerprint to all of them. It is
         # also useless for the join it exists for — web turns execute in a
         # scratchpad pod, so the machine that ran the turn is not this one.
-        "aid": "" if get_app_settings().tenancy_mode == "org" else _anton_install_id(),
+        "aid": "" if _org_mode else _anton_install_id(),
         **settings.config_status,
     }
