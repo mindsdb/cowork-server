@@ -34,6 +34,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
     "google-analytics": ("google_analytics_client_id",  "google_analytics_client_secret"),
     "linear":           ("linear_client_id",            "linear_client_secret"),
     "github":           ("github_client_id",            "github_client_secret"),
+    "supabase":         ("supabase_client_id",          "supabase_client_secret"),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -79,6 +80,20 @@ def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
     return {"email": email or login, "name": name or login}
 
 
+def _fetch_userinfo_supabase(access_token: str) -> dict[str, Any]:
+    """Supabase Management API has no userinfo endpoint. Use the first
+    accessible organization as a stable, non-secret account identity."""
+    result = _json_request(
+        "https://api.supabase.com/v1/organizations",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    organizations = result if isinstance(result, list) else result.get("organizations", [])
+    first = organizations[0] if organizations else {}
+    slug = str(first.get("slug") or "").strip()
+    name = str(first.get("name") or slug).strip()
+    return {"email": f"org:{slug}" if slug else "", "name": name}
+
+
 # engine → identity-fetch function. The one piece of connector onboarding
 # that can't be pure spec-JSON data — response shape (REST vs GraphQL) is
 # genuinely provider-specific code, not configuration. New OAuth-builtin
@@ -91,6 +106,7 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "google_analytics_4": _fetch_userinfo_google,
     "linear": _fetch_userinfo_linear,
     "github": _fetch_userinfo_github,
+    "supabase": _fetch_userinfo_supabase,
 }
 
 
@@ -303,6 +319,7 @@ class OAuthService:
                 client_secret=client_secret,
                 redirect_uri=str(pending.get("redirectUri") or self._redirect_uri(service, settings)),
                 verifier=str(pending.get("verifier", "")),
+                token_auth_style=oauth_cfg.token_auth_style,
             )
             access_token = str(token_data.get("access_token", "")).strip()
             if not access_token:
@@ -483,19 +500,21 @@ class OAuthService:
         client_secret: str,
         redirect_uri: str,
         verifier: str,
+        token_auth_style: str = "body",
     ) -> dict[str, Any]:
-        return _json_request(
-            token_url,
-            method="POST",
-            data={
-                "code": code,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-                "code_verifier": verifier,
-            },
-        )
+        data = {
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+            "code_verifier": verifier,
+        }
+        headers = None
+        if token_auth_style == "basic":
+            credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+            headers = {"Authorization": f"Basic {credentials}"}
+        else:
+            data.update({"client_id": client_id, "client_secret": client_secret})
+        return _json_request(token_url, method="POST", data=data, headers=headers)
 
 
 def _json_request(
