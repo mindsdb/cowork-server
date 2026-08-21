@@ -538,6 +538,29 @@ class AppSettings(Settings):
             "the frontend is rolled out."
         ),
     )
+    surface_override: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_SURFACE"),
+        description=(
+            "Deployer-declared surface for trace attribution (ENG-1459), "
+            "overriding the tenancy-based inference. Inference reads org "
+            "tenancy as 'web' and anything else as 'desktop', which is right "
+            "for the two surfaces that matter and wrong for deployments that "
+            "are neither: the hub snapshot instances being deprecated run "
+            "local tenancy but are not desktops, and the enterprise container "
+            "is self-hosted. Those pass their own value here rather than "
+            "inflating the desktop population they are measured against. "
+            "Plain str, not a Literal, for the same reason as the channel "
+            "above: an invalid value must never fail settings load over "
+            "telemetry. It does NOT fall back to inference — an unrecognised "
+            "value logs a warning and leaves the surface absent (#357 review). "
+            "Inferring would be actively wrong for the deployments this "
+            "override exists for: a typo from a hub snapshot or the enterprise "
+            "container would relabel it 'desktop' and inflate the very "
+            "baseline web is measured against, silently. Absent is honestly "
+            "unknown; guessed is not. Empty (default) = infer."
+        ),
+    )
     install_channel_override: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_INSTALL_CHANNEL"),
