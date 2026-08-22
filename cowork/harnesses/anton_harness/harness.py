@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
@@ -1077,6 +1078,11 @@ class AntonHarness:
             # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
             # are attributed to the active harness. self.id == "anton".
             harness=self.id,
+            # WHERE the user is, which `harness` cannot say: this one server
+            # serves both the desktop sidecar and the multi-tenant web build,
+            # and both report harness="anton" (ENG-1459). Only the deployment
+            # knows which, so it is resolved here rather than by anton.
+            **surface_kwarg(ChatSessionConfig),
             proactive_dashboards=anton_settings.proactive_dashboards,
             act_first=anton_settings.act_first,
             # "Conversation started" stamp for the cache-stable prompt prefix

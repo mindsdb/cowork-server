@@ -36,7 +36,8 @@ from cowork.services.providers import (
     fetch_minds_models,
     fetch_org_model_catalog,
     model_value_rejection,
-    persist_cached_map,
+    persist_enabled_model_map,
+    persist_role_defaults_map,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
@@ -478,7 +479,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # canonical defaults on the next settings load. The guarded write
             # (never clobber a good map with {}, order-preserving, change-only)
             # is shared with the startup / credential-sync warm via
-            # persist_cached_map so the invariants can't drift.
+            # persist_enabled_model_map so the invariants can't drift.
             #
             # Guard on `live_enabled` (the map we actually write), NOT `live`
             # (the id list): a gateway that returns ids without `enabled` flags
@@ -490,29 +491,21 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # system-derived (MindsHub, via admin-set key/URL), so a member can
             # trigger this refresh but can't steer what's stored — and gating it
             # would leave the map stale.
-            #
-            # Ordered, because the first-enabled fallback reads this map by
-            # position; see persist_cached_map.
-            persist_cached_map(
-                session, scope, "minds_model_enabled", s.minds_model_enabled,
-                live_enabled, ordered=True,
-            )
-        # Cache the catalog's declared per-role defaults on the same terms, so a
-        # default moved in the config reaches this install on its next settings
-        # load with no client release (UserSettings._minds_role_default_map).
+            persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled, live)
+        # Cache the catalog's declared per-role defaults, so a default moved in
+        # the config reaches this install on its next settings load with no client
+        # release (UserSettings._minds_role_default_map).
         #
-        # Its OWN call and its own guard, deliberately NOT folded into the block
-        # above: that one is gated on `live_enabled`, and a gateway that lists
-        # ids without `enabled` flags yields an empty map there while still
-        # publishing perfectly good role defaults. Nested, the defaults would be
-        # silently dropped for exactly that gateway.
+        # Its own writer rather than the one above, because the availability map
+        # carries rules this one has no use for: that map is densified over the
+        # served catalogue and pruned of retired ids, since resolution reads key
+        # absence there as "not served". Here every key is a role we serve.
         #
-        # Sorted rather than ordered: this map is looked up by role name and
-        # nothing reads its order, so a gateway re-ranking is not a change.
-        persist_cached_map(
-            session, scope, "minds_role_defaults", s.minds_role_defaults,
-            live_role_defaults, ordered=False,
-        )
+        # Outside the `if live:` block on purpose. That block is gated on the id
+        # list, and a gateway can publish role defaults while listing nothing we
+        # recognise; nested, the defaults would be dropped for exactly that
+        # gateway.
+        persist_role_defaults_map(session, scope, s.minds_role_defaults, live_role_defaults)
         # The picker asks the server which model each role starts on, so it has to
         # be told the same answer resolution will give. Left on the compiled table,
         # the two disagree the moment a default moves in config and the user sees
