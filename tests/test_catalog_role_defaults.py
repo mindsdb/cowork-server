@@ -485,6 +485,78 @@ def test_the_pair_follows_the_cache_when_the_gateway_stops_declaring(monkeypatch
     assert payload["recommendedPair"]["minds-cloud"][0] == "sonnet"
 
 
+# ── The guarded writer ────────────────────────────────────────────────
+
+
+def test_an_empty_declaration_is_never_written():
+    """A gateway that predates `default_for` must not wipe a good map.
+
+    Writing {} would drop every role back to a constant only a client release can
+    change, so an empty declaration is not evidence of anything and is skipped.
+    """
+    from cowork.db.session import get_open_session
+    from cowork.services.providers import persist_role_defaults_map
+
+    session = get_open_session()
+    try:
+        assert persist_role_defaults_map(session, LOCAL_SCOPE, "{}", {}) is False
+    finally:
+        session.close()
+
+
+def test_the_writer_only_writes_on_a_real_change():
+    """`upsert_setting` commits a row and busts the settings cache.
+
+    This endpoint is hit on every boot and every settings open, so an
+    unconditional write churns every UserSettings reader.
+    """
+    from cowork.db.session import get_open_session
+    from cowork.services.providers import persist_role_defaults_map
+    from cowork.services.settings import SettingService
+
+    declared = {"planning": "sonnet", "coding": "haiku", "router": "kimi"}
+    session = get_open_session()
+    try:
+        prior = json.dumps(declared, sort_keys=True)
+        assert persist_role_defaults_map(session, LOCAL_SCOPE, prior, declared) is False
+        assert persist_role_defaults_map(session, LOCAL_SCOPE, prior, {"planning": "opus"}) is True
+        assert json.loads(SettingService(session).load().minds_role_defaults) == {"planning": "opus"}
+    finally:
+        try:
+            SettingService(session).delete_setting("minds_role_defaults")
+        except ValueError:
+            pass
+        session.close()
+
+
+def test_the_writer_stores_sorted_so_a_re_ranking_is_not_a_change():
+    """The opposite of the availability map, and for a stated reason.
+
+    That map is stored in the gateway's order because the first-enabled fallback
+    reads it by position. This one is looked up by role name, so sorting it means a
+    gateway that re-ranks the same declarations does not trigger a write.
+    """
+    from cowork.db.session import get_open_session
+    from cowork.services.providers import persist_role_defaults_map
+    from cowork.services.settings import SettingService
+
+    session = get_open_session()
+    try:
+        persist_role_defaults_map(session, LOCAL_SCOPE, "{}", {"router": "kimi", "coding": "haiku"})
+        stored = SettingService(session).load().minds_role_defaults
+        assert list(json.loads(stored)) == ["coding", "router"]
+        # Same declarations, gateway order reversed: not a change.
+        assert persist_role_defaults_map(
+            session, LOCAL_SCOPE, stored, {"coding": "haiku", "router": "kimi"}
+        ) is False
+    finally:
+        try:
+            SettingService(session).delete_setting("minds_role_defaults")
+        except ValueError:
+            pass
+        session.close()
+
+
 # ── Writing the map by hand ───────────────────────────────────────────
 
 
