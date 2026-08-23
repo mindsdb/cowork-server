@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from cowork.api.v1.endpoints import (
     artifacts,
     comments,
+    coding,
     conversations,
     files,
     health,
@@ -78,6 +79,7 @@ api_router.include_router(comments.router, prefix="/artifact-comments", tags=["a
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(search.router, prefix="/search", tags=["search"])
+api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])
