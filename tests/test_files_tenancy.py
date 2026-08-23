@@ -547,6 +547,66 @@ def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
     assert dest.read_text() == "be funny"            # re-staged despite the tie
 
 
+def test_stage_instructions_clears_removed_instructions_in_place(tmp_path):
+    """Instructions removed at the project → the staged copy is emptied, but
+    NEVER unlinked: the sandbox pod caches NFS handles for this file (gVisor
+    gofer), and deleting the inode leaves the pod failing every stat with
+    ESTALE until the pod is recycled (ENG-1817). Same inode before and after
+    is the contract this test pins."""
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    (proj / ".anton").mkdir(parents=True)
+    src = proj / ".anton" / "anton.md"
+    src.write_text("be terse")
+    assert stage_project_instructions(proj, conv) is True
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    inode = dest.stat().st_ino
+
+    src.unlink()  # user removes the project instructions
+    assert stage_project_instructions(proj, conv) is False
+    assert dest.is_file()                # still exists…
+    assert dest.read_text() == ""        # …but the agent stops seeing them
+    assert dest.stat().st_ino == inode   # same inode: cached pod handles stay valid
+
+
+def test_stage_instructions_clear_does_not_follow_a_symlink_planted_after_the_check(
+    tmp_path, monkeypatch
+):
+    """TOCTOU at the use site: safe_join resolves and checks, but is documented
+    as non-atomic — a symlink the pod swaps in after the check must fail the
+    truncate (O_NOFOLLOW → ELOOP), not empty the file it points at. unlink
+    didn't follow symlinks; the in-place clear must not either."""
+    import cowork.services.files as files_mod
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    victim = tmp_path / "victim.md"
+    victim.write_text("another tenant's data")
+    link = proj / "conversations" / conv / ".anton" / "anton.md"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(victim)
+    # Simulate the swap landing after the containment check: hand the caller
+    # the unresolved path, as if the link appeared a moment later.
+    monkeypatch.setattr(files_mod, "safe_join", lambda base, *parts: link)
+
+    assert files_mod.stage_project_instructions(proj, conv) is False
+    assert victim.read_text() == "another tenant's data"
+
+
+def test_stage_instructions_removal_does_not_rewrite_an_empty_copy(tmp_path):
+    """The clear runs before every turn — an already-empty copy must be left
+    untouched, not truncated again (mtime churn on every turn)."""
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    dest.parent.mkdir(parents=True)
+    dest.write_text("")
+    before = dest.stat().st_mtime_ns
+    assert stage_project_instructions(proj, conv) is False
+    assert dest.stat().st_mtime_ns == before
+
+
 def test_same_org_users_cannot_see_each_others_files(engine):
     """Staging audit P0: files are personal (created_by) but list/get/delete
     filtered by org only, so coworkers saw/read/deleted each other's files."""

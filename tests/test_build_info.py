@@ -46,6 +46,7 @@ def _patch_channel_inputs(
     class _Settings:
         tenancy_mode = tenancy
         install_channel_override = override
+        surface_override = ""
 
     monkeypatch.setattr(
         "cowork.common.settings.app_settings.get_app_settings", lambda: _Settings()
@@ -234,3 +235,111 @@ class TestStampReachesTheHarness:
         assert metadata[KEY_SERVER_VERSION]
         assert metadata[KEY_ANTON_VERSION]
         assert metadata[KEY_INSTALL_CHANNEL]
+
+
+# ---------------------------------------------------------------------------
+# ENG-1459: which surface this deployment serves. One codebase and one server
+# run both the desktop sidecar and the multi-tenant web build, and both report
+# harness="anton" — so without this, "are web users behaving differently?" has
+# no answer.
+# ---------------------------------------------------------------------------
+
+
+def _patch_surface_inputs(monkeypatch, *, tenancy: str = "local", override: str = ""):
+    class _Settings:
+        tenancy_mode = tenancy
+        install_channel_override = ""
+        surface_override = override
+
+    monkeypatch.setattr(
+        "cowork.common.settings.app_settings.get_app_settings", lambda: _Settings()
+    )
+
+
+class TestSurface:
+    def test_org_tenancy_is_the_web_signal(self, monkeypatch):
+        # COWORK_TENANCY_MODE=org is set only on the k8s deployment, so it is
+        # the one fact that already distinguishes web from desktop.
+        _patch_surface_inputs(monkeypatch, tenancy="org")
+        assert build_info.surface() == "web"
+
+    def test_anything_else_is_a_desktop_sidecar(self, monkeypatch):
+        _patch_surface_inputs(monkeypatch, tenancy="local")
+        assert build_info.surface() == "desktop"
+
+    def test_explicit_override_beats_tenancy_inference(self, monkeypatch):
+        # The populations inference gets wrong on purpose: the hub snapshot
+        # instances being deprecated run local tenancy but are not desktops,
+        # and would otherwise inflate the baseline web is measured against.
+        _patch_surface_inputs(monkeypatch, tenancy="local", override="web")
+        assert build_info.surface() == "web"
+
+    def test_override_is_normalised(self, monkeypatch):
+        _patch_surface_inputs(monkeypatch, tenancy="local", override="  WEB ")
+        assert build_info.surface() == "web"
+
+    def test_an_invalid_override_yields_no_surface_rather_than_a_guess(
+        self, monkeypatch, caplog
+    ):
+        # Deliberately NOT falling back to inference here: a deployer that
+        # bothered to declare a surface and got it wrong should show up as
+        # unknown, not be silently filed under desktop.
+        _patch_surface_inputs(monkeypatch, tenancy="local", override="cowork")
+        with caplog.at_level("WARNING"):
+            assert build_info.surface() is None
+        assert any("cowork" in r.getMessage() for r in caplog.records)
+
+    def test_surface_is_not_cached_across_settings_changes(self, monkeypatch):
+        # install_channel() is memoized because it describes how the process
+        # was installed. This reads settings, which a reload can change — a
+        # stale cache here would report the wrong surface for the process life.
+        _patch_surface_inputs(monkeypatch, tenancy="local")
+        assert build_info.surface() == "desktop"
+        _patch_surface_inputs(monkeypatch, tenancy="org")
+        assert build_info.surface() == "web"
+
+    def test_resolution_never_raises(self, monkeypatch):
+        """Telemetry must not be able to fail a turn."""
+
+        def _boom():
+            raise RuntimeError("settings exploded")
+
+        monkeypatch.setattr(
+            "cowork.common.settings.app_settings.get_app_settings", _boom
+        )
+        assert build_info.surface() is None
+
+
+class TestTheWebSurfaceIsNotReachableYet:
+    """Pins a known GAP, not desired behaviour (ENG-1459).
+
+    `surface()` returns "web" exactly when `tenancy_mode == "org"`, and
+    `AntonHarness.stream_response` refuses to run in-process under that same
+    condition — the web deployment routes turns to a scratchpad-controller pod
+    instead (`COWORK_TURN_BACKEND=remote`). So the only consumer of a "web"
+    surface has already raised by the time one exists, and this PR delivers
+    `desktop` only.
+
+    This test exists so the gap is visible in the suite rather than living in a
+    docstring nobody reads. **If it starts failing, that is progress** — either
+    the in-process refusal was lifted or the surface now reaches the pod. Update
+    this test and the `surface()` warning together; do not just delete it.
+    """
+
+    def test_web_and_the_in_process_refusal_share_one_condition(self, monkeypatch):
+        import inspect
+
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        _patch_surface_inputs(monkeypatch, tenancy="org")
+        assert build_info.surface() == "web", "the web answer comes from org tenancy"
+
+        # …and the same tenancy check gates the in-process path off.
+        src = inspect.getsource(AntonHarness.stream_response)
+        assert 'tenancy_mode == "org"' in src
+        assert "in-process execution is disabled" in src
+
+    def test_desktop_is_the_half_that_actually_works(self, monkeypatch):
+        # Local tenancy runs in-process, so the kwarg reaches a real turn.
+        _patch_surface_inputs(monkeypatch, tenancy="local")
+        assert build_info.surface() == "desktop"

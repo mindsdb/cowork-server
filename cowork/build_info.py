@@ -51,6 +51,112 @@ def _dist_version(name: str) -> str | None:
         return None
 
 
+def surface() -> str | None:
+    """Which surface this deployment serves: ``web`` / ``desktop`` / other.
+
+    ENG-1459. Web and desktop are one codebase and one server, so nothing on a
+    trace distinguished them — and "are web users behaving differently?" is the
+    question the SaaS launch needs answered.
+
+    Resolution mirrors :func:`install_channel`: an explicit ``COWORK_SURFACE``
+    wins, because a deployer declaring what it serves knows more than any
+    inference from inside the process. Failing that, **org tenancy is the
+    signal** — it is set only on the multi-tenant cloud deployment, so it means
+    web; anything else is a desktop sidecar.
+
+    .. warning::
+
+       **``web`` is currently unreachable through the in-process turn path, so
+       this only delivers ``desktop`` in practice.** The web deployment sets
+       ``COWORK_TURN_BACKEND=remote`` (``deployment/cowork-server/values.yaml``),
+       and :meth:`AntonHarness.stream_response` refuses to run in-process when
+       ``tenancy_mode == "org"`` — the *same* condition under which this function
+       returns ``web``. So whenever the answer is ``web``, the only consumer of
+       it has already raised, and the turn is executing in a scratchpad-controller
+       pod via ``anton.cloud_turn`` instead.
+
+       Reaching the pod means carrying the surface over the Redis job contract:
+       cowork-server puts it in ``ScratchpadJobPayload.params``,
+       scratchpad-controller forwards it in ``anton_turn._build_request`` (an
+       explicit allowlist), and anton adds it to ``TurnRequestV1`` and passes it
+       into the pod's ``ChatSessionConfig``. Four repos, tracked on ENG-1459.
+
+       Not urgent as of 2026-08-19: the web surface has no real traffic yet
+       (scratchpad-controller has no GitHub Release, and prod deploys only on
+       one), so nothing is being mis-measured today — the desktop half is
+       correct and the web half is absent rather than wrong.
+
+    Deliberately NOT cached, unlike ``install_channel``: the channel is a fact
+    about how the process was installed, while this reads settings that tests
+    and a reload can legitimately change.
+
+    Returns None when an explicit override is unrecognised — anton drops an
+    unknown value anyway, and an absent surface is honestly unknown where a
+    guessed one would silently join the population it is being compared with.
+
+    Two populations inference gets wrong on purpose, both expected to declare
+    themselves via the override: the hub snapshot instances being deprecated
+    (local tenancy, but not desktops — they would otherwise inflate the very
+    baseline web is measured against) and the enterprise container.
+    """
+    try:
+        # anton owns the canonical vocabulary. Guarded because cowork-server
+        # pins anton to a branch: a lock predating anton's half of ENG-1459 has
+        # no such name, and telemetry must not raise on the way past.
+        try:
+            from anton.core.llm.tracing import VALID_SURFACES
+        except ImportError:
+            VALID_SURFACES = frozenset({"desktop", "web", "cli"})
+
+        from cowork.common.settings.app_settings import get_app_settings
+
+        settings = get_app_settings()
+        override = (settings.surface_override or "").strip().lower()
+        if override:
+            if override in VALID_SURFACES:
+                return override
+            logger.warning(
+                "build_info: ignoring COWORK_SURFACE=%r (expected one of %s)",
+                override,
+                sorted(VALID_SURFACES),
+            )
+            return None
+        return "web" if settings.tenancy_mode == "org" else "desktop"
+    except Exception:  # pragma: no cover - defensive: never fail a turn over telemetry
+        logger.warning("build_info: could not resolve surface", exc_info=True)
+        return None
+
+
+def surface_kwarg(config_cls) -> dict[str, str]:
+    """``{"surface": ...}`` for ``ChatSessionConfig``, or ``{}`` — never raises.
+
+    Lives here rather than in one harness because every path that ORIGINATES a
+    turn needs it, and there is more than one: the anton harness serves the UI
+    and the channel bots, and the connector probe runs its own turn (the
+    datasource-connection path, which is one of the things ENG-1459 wants
+    measured per surface). ``tests/test_trace_stamp_seams.py`` enforces that
+    every such call site passes it.
+
+    cowork-server pins anton to a *branch*, so the installed copy can predate
+    anton's half of ENG-1459. Passing an unexpected keyword would then raise on
+    **every turn**, which a telemetry field must never be able to do — so the
+    kwarg is only produced when the installed dataclass actually declares it.
+
+    Returns ``{}`` when the surface is unresolvable, so an unknown surface stays
+    absent rather than being sent as a guess.
+    """
+    import dataclasses
+
+    try:
+        if not any(f.name == "surface" for f in dataclasses.fields(config_cls)):
+            return {}
+        resolved = surface()
+        return {"surface": resolved} if resolved else {}
+    except Exception:  # pragma: no cover - defensive: never fail a turn over telemetry
+        logger.warning("could not resolve the trace surface", exc_info=True)
+        return {}
+
+
 @lru_cache(maxsize=None)
 def install_channel() -> str:
     """How this server was installed: hosted / git / pypi / local / unknown.

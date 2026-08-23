@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -10,7 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from cowork.common.settings.app_settings import default_minds_api_host
+from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
@@ -109,6 +110,7 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
+
 def provider_base_url(
     provider: str, *, openai_base_url: str = "", minds_url: str = ""
 ) -> str | None:
@@ -160,6 +162,12 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
+# Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
+# `follow_redirects` chains and trickled responses (each chunk under the per-op
+# read timeout) can otherwise run far past it — minutes, unbounded. This fetch
+# sits on the desktop boot path before the socket binds, so it must have a real
+# ceiling; the outer asyncio.wait_for below enforces it.
+_MINDS_MODELS_TIMEOUT_S = 6.0
 
 
 class MindsModelListing(NamedTuple):
@@ -190,18 +198,31 @@ class MindsModelListing(NamedTuple):
     # what the picker tags "latest"; anything else names the moving alias this
     # row is a frozen version of.
     families: dict[str, str]
+    # Agent role -> the model id the catalog declares as that role's default,
+    # inverted from the per-row ``default_for`` list. Keyed by role rather than by
+    # model id, unlike every other map here, because that is the question asked of
+    # it: resolution wants "what starts the planning role", not "which roles does
+    # this model lead". Empty whenever the gateway publishes no defaults, which
+    # includes every gateway that predates the field and every plain
+    # OpenAI-compatible endpoint.
+    #
+    # Required rather than defaulted, like every other field here. A NamedTuple
+    # default is one object shared by every instance that omits it, which is the
+    # hazard ``_empty_listing`` is a factory to avoid; a default would reintroduce
+    # it for the sake of not touching three test fakes.
+    role_defaults: dict[str, str]
 
 
 def _empty_listing() -> MindsModelListing:
     """The "we got nothing" listing: ``ids`` None, every map empty.
 
-    One place to build it, so the failure paths don't each repeat six literals
+    One place to build it, so the failure paths don't each repeat the literals
     that have to agree. A factory rather than a shared constant because a
-    failure is also cached, per base URL: handing every entry the same five dict
+    failure is also cached, per base URL: handing every entry the same dict
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {})
 
 
 # Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
@@ -261,7 +282,11 @@ async def fetch_minds_models(
     A cached *failure* is still honored under ``force_refresh``: the negative
     TTL exists so an unreachable MindsHub isn't re-probed on every call, and
     the picker opens on demand, so bypassing it would make every open pay the
-    full HTTP timeout for as long as the outage lasts.
+    fetch budget for as long as the outage lasts.
+
+    Never raises and never runs longer than ``_MINDS_MODELS_TIMEOUT_S`` — a
+    slow/degraded gateway (hang, redirect loop, trickled body) returns an empty
+    listing that is negatively cached, so callers on the boot path can't hang.
     """
     if not minds_url or not api_key:
         return _empty_listing()
@@ -282,9 +307,15 @@ async def fetch_minds_models(
         _minds_models_cache[cache_key] = (time.monotonic(), val)
         return val
 
-    try:
+    async def _fetch() -> httpx.Response:
+        # `max_redirects` low (not the httpx default of 20) so a same-origin
+        # redirect loop can't multiply the per-op timeout into a long stall;
+        # the endpoint is hit directly at `/models/` so no real redirect is
+        # expected. The outer wait_for is the true ceiling.
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(6.0), follow_redirects=True
+            timeout=httpx.Timeout(_MINDS_MODELS_TIMEOUT_S),
+            follow_redirects=True,
+            max_redirects=2,
         ) as client:
             # Trailing slash is required: the MindsHub router serves the
             # listing at `/models/` and a recent minds-inference release
@@ -292,10 +323,17 @@ async def fetch_minds_models(
             # left this fetch empty and emptied the model picker. Hitting
             # `/models/` directly is what the other frameworks' shared
             # model-catalog helper already does.
-            r = await client.get(
+            return await client.get(
                 f"{base}/models/",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
+
+    try:
+        # Hard TOTAL budget: httpx.Timeout is per-operation, so it alone does
+        # not bound a redirect chain or a trickled response. asyncio.wait_for
+        # cancels the whole fetch at the ceiling and the TimeoutError falls
+        # through to the negative-cache path below.
+        r = await asyncio.wait_for(_fetch(), _MINDS_MODELS_TIMEOUT_S)
         if r.status_code >= 400:
             logger.debug("minds /models fetch returned HTTP %s", r.status_code)
             return _remember(_empty_listing())
@@ -318,6 +356,7 @@ async def fetch_minds_models(
     labels: dict[str, str] = {}
     providers: dict[str, str] = {}
     families: dict[str, str] = {}
+    role_defaults: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -375,8 +414,24 @@ async def fetch_minds_models(
             # version "latest" — the one claim it must never make. Recorded, the
             # app sees a pin whose head it cannot find and lists it plainly.
             families[model_id] = family
+        # Which agent roles this model is the catalog's default for. Inverted
+        # here, at the single place every row is parsed, so resolution can ask
+        # "what starts the planning role" without walking the catalog.
+        #
+        # A role we do not serve is dropped rather than recorded. The catalog is
+        # editable in a console, so an unknown role is a typo far more often than
+        # a role a newer client understands, and carrying it would mean a stored
+        # map whose keys nothing reads. The gateway-side gate rejects that typo
+        # before it ships; this is what keeps a live one out of the settings row.
+        # First declaration wins, which cannot arise against a validated catalog
+        # and keeps the parse total when it does.
+        for role in row.get("default_for") or ():
+            if isinstance(role, str) and role in AGENT_ROLE_NAMES:
+                role_defaults.setdefault(role, model_id)
     return _remember(
-        MindsModelListing((ids or None), efforts, enabled, labels, providers, families)
+        MindsModelListing(
+            (ids or None), efforts, enabled, labels, providers, families, role_defaults
+        )
     )
 
 
@@ -429,6 +484,15 @@ async def fetch_org_model_catalog(
 #       hence the legacy-prefix allowance in model_value_rejection;
 #     - cowork-kinaxis-preview's divergent inline `syncOnboardingModels`;
 #     - anything hand-rolled (curl, scripts, a console surface).
+#
+#   GATED FOR SHAPE ONLY: `minds_role_defaults`, the cached role -> model id map
+#     this endpoint's own writer fills from the catalog. `PUT /settings/{key}`
+#     accepts it like any declared field, and its values become the model an
+#     unset role starts on, so `_reject_malformed_role_defaults` 400s a body that
+#     is not role -> non-empty id. Catalog membership is NOT checked: the value
+#     comes from the catalog to begin with, and `_enabled_aware_default` discards
+#     a model the availability map does not affirm, so an id that no longer
+#     resolves costs a role its declared default rather than a turn.
 #
 #   NOT GATED, because they cannot carry a model key at all — the ENG-739
 #   carve-out keeps planning/coding/router models out of `SETTING_ENV_ALIASES`,
@@ -557,6 +621,170 @@ async def model_value_rejection(
     return (
         f"'{value}' is not a model this provider offers. "
         f"Pick one from the model list in Settings (for example: {known})."
+    )
+
+
+def persist_enabled_model_map(
+    session, scope, prior_json: str | None, live_enabled: dict, live_ids: list[str] | None = None
+) -> bool:
+    """Guarded write of the `minds_model_enabled` availability map.
+
+    Shared by every writer (the recommended-models endpoint and the startup /
+    credential-sync warm below) so the invariants can't drift between them:
+
+    - Only ever write with real evidence. A fetch failure yields neither a
+      catalogue nor flags (``live_ids`` None and ``live_enabled`` ``{}``); with
+      nothing to go on we hold the known-good map rather than clobber it with an
+      empty one — silently re-locking the canonical default is the ENG-597 bug.
+      But a real catalogue is evidence on its own: a gateway that returns ids
+      WITHOUT ``enabled`` flags (version skew / a plain OpenAI-compatible
+      endpoint) still tells us which ids are served, so we prune the ids it
+      dropped — preserving the flags already stored for the survivors, since we
+      can't re-derive which paid aliases are locked from a flag-less response.
+      Otherwise a retired id (a ``mindshub_air`` MindsHub stopped serving)
+      lingers as "still served" and resolution keeps selecting a model that
+      404s.
+    - Persist the FULL served catalogue, not just the flagged rows.
+      ``fetch_minds_models`` only records rows that publish the optional
+      ``enabled`` field, so ``live_enabled`` alone is sparse: a served model
+      that omits the flag (``missing = available``) is absent from it. The
+      resolution logic (``_enabled_aware_default`` / ``_resolved_model``) reads
+      key ABSENCE from a non-empty stored map as "retired from the catalogue"
+      and steers off it — so a sparse map would misread a working free model as
+      retired and resolve a ``mindshub_air`` default/pin to a locked paid model.
+      Once we actually have availability metadata (``live_enabled`` non-empty),
+      fold every served id in with the flag it published, defaulting the
+      unflagged ones to ``True``, so key absence means genuinely-not-served.
+    - Persist ORDER-PRESERVING JSON — never ``sort_keys``. The first-enabled
+      fallback (``_enabled_aware_default``) iterates the map in insertion order
+      and returns the first *enabled* model, which must stay the gateway's own
+      /v1/models ranking (a remote order we don't control or pin, and which
+      changes per deployment — a paid alias often ranks ahead of the free
+      ``mindshub_air``, which is then reached only because those aliases are
+      marked disabled). Densifying over
+      ``live_ids`` (already in that ranking) preserves it; alphabetizing would
+      substitute our ordering for the gateway's and could promote a different
+      enabled model.
+    - Write only on a real change (the compare is order-sensitive too, so a
+      gateway re-ranking also refreshes): ``upsert_setting`` commits a row and
+      invalidates the settings cache, so an unconditional write churns every
+      ``UserSettings`` reader.
+
+    Returns True iff the stored map was updated.
+    """
+    from cowork.services.settings import SettingService
+
+    try:
+        prior = json.loads(prior_json or "{}")
+        if not isinstance(prior, dict):
+            prior = {}
+    except (ValueError, TypeError):
+        prior = {}
+
+    if live_enabled:
+        # Gateway published availability: densify over the served catalogue so
+        # key ABSENCE means genuinely not-served — every served id folded in
+        # with the flag it published, unflagged rows defaulting to available
+        # (missing = available), in the gateway's own /v1/models order.
+        live_enabled = {mid: live_enabled.get(mid, True) for mid in (live_ids or live_enabled)}
+    elif live_ids:
+        # A real catalogue that published NO enabled flags (gateway version
+        # skew / a plain OpenAI-compatible endpoint). We can't re-derive which
+        # paid aliases are locked, so PRESERVE the flags already stored for the
+        # ids that survive — but still PRUNE the ids the catalogue dropped.
+        # Otherwise a retired id (a ``mindshub_air`` MindsHub stopped serving)
+        # lingers as "still served" and resolution keeps selecting a model that
+        # 404s. A never-before-seen served id defaults to available.
+        live_enabled = {mid: prior.get(mid, True) for mid in live_ids}
+    else:
+        # No flags AND no catalogue — no evidence at all (a fetch failure), so
+        # hold the known-good map rather than clobber it with an empty one.
+        return False
+
+    desired = json.dumps(live_enabled)
+    if desired == json.dumps(prior):
+        return False
+    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+    return True
+def persist_role_defaults_map(session, scope, prior_json: str | None, live_role_defaults: dict) -> bool:
+    """Guarded write of the `minds_role_defaults` map the catalogue declares.
+
+    The sibling of ``persist_enabled_model_map``, and deliberately NOT the same
+    function. That one carries rules this map has no use for: it densifies over
+    the served catalogue and prunes retired ids, because resolution reads key
+    ABSENCE from the availability map as "not served". This map is keyed by agent
+    role, every key is a role we serve, and absence just means the catalogue
+    declared no default for that role.
+
+    Two rules it does share, for its own reasons:
+
+    - Never clobber a known-good map with an empty one. A gateway that predates
+      ``default_for`` publishes nothing, and writing ``{}`` would drop every role
+      back to a constant only a client release can change. So an empty
+      declaration leaves the stored map alone, and resolution keeps using it.
+    - Write only on a real change: ``upsert_setting`` commits a row and
+      invalidates the settings cache, so an unconditional write churns every
+      ``UserSettings`` reader, and this endpoint is hit on every boot and every
+      settings open.
+
+    Stored SORTED, unlike the availability map. Nothing reads this map's order,
+    so sorting means a gateway that re-ranks the same declarations does not count
+    as a change and does not trigger a write.
+
+    Returns True iff the stored map was updated.
+    """
+    from cowork.services.settings import SettingService
+
+    if not live_role_defaults:
+        return False
+    desired = json.dumps(live_role_defaults, sort_keys=True)
+    try:
+        prior = json.loads(prior_json or "{}")
+        if not isinstance(prior, dict):
+            prior = {}
+    except (ValueError, TypeError):
+        prior = {}
+    if desired == json.dumps(prior, sort_keys=True):
+        return False
+    SettingService(session, scope).upsert_setting("minds_role_defaults", desired)
+    return True
+
+
+async def warm_enabled_model_map(session, scope=None) -> bool:
+    """Desktop: populate `minds_model_enabled` from /v1/models so the FIRST turn
+    resolves an affordable model for a free-tier user with a stored paid pin
+    (ENG-748).
+
+    Since ENG-1652 the minds-cloud role defaults are the free model in both
+    modes, so the UNSET default is already affordable (floored by
+    ``role_defaults``). A stored PAID pin is the case left: it is steered off an
+    unaffordable model only by the availability map, via the wallet-aware
+    fallback in ``_resolved_model``. That map is refreshed lazily on GET
+    /recommended-models, so a brand-new sign-in that sends before the picker ever
+    loads resolves the pin against an EMPTY map — an empty map is no evidence, so
+    the pin is kept and MindsHub denies the empty free-tier wallet
+    (``wallet_empty`` 402) on message one. Warming the map at the two
+    guaranteed-pre-first-turn seams (server startup with a stored key, and
+    immediately after a credential sync) closes that race without touching the
+    turn path.
+
+    Fail-open: ``fetch_minds_models`` never raises and returns an empty listing
+    on any error, bounded by a hard total budget (``_MINDS_MODELS_TIMEOUT_S``)
+    so a degraded gateway can't stall the caller, and ``persist_enabled_model_map``
+    never writes an empty map — so an unreachable MindsHub leaves the stored map
+    untouched and is never worse than today. Returns True iff the map was
+    updated.
+    """
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services.settings import SettingService
+
+    scope = scope if scope is not None else LOCAL_SCOPE
+    s = SettingService(session, scope).load()
+    if s.minds_api_key is None or not s.minds_url:
+        return False
+    listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
+    return persist_enabled_model_map(
+        session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
 
 
@@ -925,6 +1153,21 @@ def build_llm_client():
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            # A local endpoint authenticates by being reachable, so an
+            # openai-compatible provider with a base URL and no key is a valid
+            # config, not a broken one.
+            #
+            # Passing a non-empty string matters: anton drops a falsy api_key,
+            # and the SDK then falls back to an ambient OPENAI_API_KEY — which
+            # must never be sent to whatever machine the user pointed us at.
+            # Derived from the role rather than written as a literal, so it is
+            # what it looks like — a marker for an endpoint that authenticates
+            # nobody — rather than something a reader or a scanner has to take
+            # on trust as "not really a credential".
+            if key is None and role == Provider.OPENAI_COMPATIBLE and base:
+                return OpenAIProvider(
+                    api_key=f"{role.value}-no-auth", base_url=base, **effort_kw
+                )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
             # No base for openai-compatible → OpenAIProvider would silently

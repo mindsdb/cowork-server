@@ -129,6 +129,44 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
     return synthesized
 
 
+async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id) -> None:
+    """Guarantee a terminal record so a producer that ended WITHOUT closing its
+    buffer can't leave the client's tail (and its shared stream slot) hanging
+    forever.
+
+    Every producer branch closes the buffer on its own path, but the terminal is
+    not guaranteed: an exception escaping the ``except Exception`` handler (e.g.
+    the error-classification helpers raising), or a ``BaseException`` that
+    matches no ``except`` clause, skips ``buffer.close()`` — the buffer stays
+    open with no terminal, the desktop's in-process tail blocks forever, and
+    every later message strands at "Queued". Unlike the duration bound, this
+    covers a turn that FAILS FAST, well before any timeout.
+
+    ``close()`` is idempotent, so this is a no-op on every normal path. The
+    ``discarded`` path is skipped: its buffer file was already deleted and
+    closing would recreate it. Both awaits are guarded so a seal failure can't
+    mask the original exception propagating out of ``finally``. ``is_closed`` is
+    abstract on ``StreamBuffer`` but a minimal test double may lack it — treat an
+    absent flag as already-terminated so a stub can't trigger a spurious second
+    terminal.
+    """
+    if lifecycle.discarded or getattr(buffer, "is_closed", True):
+        return
+    logger.error(
+        "[responses] turn for conversation %s ended without a terminal record; "
+        "sealing the buffer so the client releases its stream slot", conv_id,
+    )
+    try:
+        await buffer.append("sse", {"sse": response_failed_sse(
+            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+    except Exception:
+        logger.exception("[responses] could not emit terminal error frame while sealing")
+    try:
+        await buffer.close("error")
+    except Exception:
+        logger.exception("[responses] could not seal unterminated turn buffer")
+
+
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
@@ -533,6 +571,7 @@ class ResponsesHandler:
             await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
             await buffer.close("error")
         finally:
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
             if producer_session is not None:
                 producer_session.close()
 
@@ -925,6 +964,7 @@ class ResponsesHandler:
             persist()
             await buffer.close("error")
         finally:
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
             producer_session.close()
 
     async def _produce(self, **kwargs) -> None:
@@ -1158,6 +1198,7 @@ class ResponsesHandler:
             persist()
             await buffer.close("error")
         finally:
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
             producer_session.close()
 
     @staticmethod

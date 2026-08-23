@@ -7,6 +7,7 @@ app-layer auth they only answer a loopback client. The desktop sidecar + UI
 talk over 127.0.0.1, so the legitimate flow is unaffected.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -68,7 +69,7 @@ def test_raw_endpoints_are_disabled_in_org_mode(monkeypatch):
             read_raw_settings(request=_request("127.0.0.1"))
         assert exc.value.status_code == 501
         with pytest.raises(HTTPException) as exc:
-            write_raw_settings(body=None, session=None, request=_request("127.0.0.1"))
+            asyncio.run(write_raw_settings(body=None, session=None, request=_request("127.0.0.1")))
         assert exc.value.status_code == 501
     finally:
         get_app_settings.cache_clear()

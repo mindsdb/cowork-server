@@ -82,10 +82,21 @@ def test_explicit_model_choice_is_never_rewritten():
     assert s.planning_model == "sonnet"
 
 
-def test_all_disabled_map_keeps_canonical_default():
-    # Degenerate metadata (nothing enabled) must not invent a model.
-    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
+def test_drained_wallet_keeps_a_still_served_default():
+    # Nothing enabled but the default is still served (locked). Keep it — it 402s
+    # with a top-up path and re-enables when credits return.
+    s = _minds(
+        minds_model_enabled=json.dumps({"mindshub_air": False, "kimi": False})
+    )
     assert s.planning_model == "mindshub_air"
+
+
+def test_retired_default_with_nothing_enabled_falls_back_to_first_served():
+    # Default absent from a non-empty catalogue (retired) and nothing
+    # enabled — the removed id would 404 every turn, so hand out a served model.
+    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
+    assert s.planning_model == "kimi"
+    assert s.coding_model == "kimi"
 
 
 def test_default_missing_from_nonempty_map_falls_back_to_first_enabled():
@@ -233,14 +244,24 @@ def test_funded_pin_is_kept():
     assert s.resolved_router_model == "kimi"
 
 
-def test_fully_drained_map_keeps_the_pin():
-    # Nothing enabled (drained wallet AND spent allowance) → no fallback
-    # exists; keep the stored value and let anton's verifier deny quietly.
+def test_fully_drained_map_keeps_a_still_served_pin():
+    # Nothing enabled but the pin is still served (locked) → keep it; the stored
+    # row is never rewritten.
     all_off = json.dumps(
         {"mindshub_air": False, "sonnet": False, "haiku": False, "kimi": False}
     )
     s = _pinned(minds_model_enabled=all_off, coding_model="haiku")
     assert s.resolved_coding_model == "haiku"
+
+
+def test_retired_pin_with_nothing_enabled_falls_back_to_first_served():
+    # Hard-block: pin absent from a non-empty catalogue (retired/foreign)
+    # and nothing enabled — the removed id 404s every turn, so fall back to a
+    # served model. The stored row is still never rewritten.
+    all_off = json.dumps({"sonnet": False, "haiku": False, "kimi": False})
+    s = _pinned(minds_model_enabled=all_off, coding_model="mindshub_air")
+    assert s.coding_model == "mindshub_air"
+    assert s.resolved_coding_model == "sonnet"
 
 
 def test_absent_map_keeps_the_pin():
@@ -309,7 +330,7 @@ def test_recommended_models_caches_enabled_map(monkeypatch):
         from cowork.services.providers import MindsModelListing
 
         return MindsModelListing(
-            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}
+            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}, {}
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
