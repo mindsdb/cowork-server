@@ -90,21 +90,37 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
         "router": MINDS_FREE_MODEL,
     },
 }
-PLANNING_MODEL_DEFAULTS: dict[str, str] = {p: r["planning"] for p, r in MODEL_ROLE_DEFAULTS.items()}
-CODING_MODEL_DEFAULTS: dict[str, str] = {p: r["coding"] for p, r in MODEL_ROLE_DEFAULTS.items()}
-ROUTER_MODEL_DEFAULTS: dict[str, str] = {p: r["router"] for p, r in MODEL_ROLE_DEFAULTS.items()}
+# The agent roles a model is resolved for, in the order the picker's
+# `recommendedPair` lists them. One declaration, because three places used to
+# spell it out: this order, the derived dicts below, and the pair overlay in the
+# recommended-models endpoint. Mirrors the role enum in the MindsHub model
+# policy's JSON Schema; the two are a cross-repo contract and a role in one and
+# not the other is silently dropped at the parse in fetch_minds_models.
+# `test_role_default_dicts_match_the_source_table` holds it to the table above.
+AGENT_ROLE_ORDER: tuple[str, ...] = ("planning", "coding", "router")
+AGENT_ROLE_NAMES: frozenset[str] = frozenset(AGENT_ROLE_ORDER)
+
+# The table above, pivoted: role -> provider -> model. Anything that resolves a
+# role it was handed the name of reads this, so no caller has to line a role up
+# against a positional list of the three dicts below.
+ROLE_MODEL_DEFAULTS: dict[str, dict[str, str]] = {
+    role: {p: r[role] for p, r in MODEL_ROLE_DEFAULTS.items()} for role in AGENT_ROLE_ORDER
+}
+PLANNING_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["planning"]
+CODING_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["coding"]
+ROUTER_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["router"]
 
 # Per-provider default model tuple served to the picker as `recommendedPair`.
-# Order: (planning, coding, router); derived from MODEL_ROLE_DEFAULTS above.
+# Order: AGENT_ROLE_ORDER; values derived from MODEL_ROLE_DEFAULTS above.
 # openai-compatible has no canonical default, so it's a literal special case.
 # The frontend falls back to the coding slot when the 3rd is absent, so an
 # older client still works.
-RECOMMENDED_PAIR: dict[str, tuple[str, str, str]] = {
+RECOMMENDED_PAIR: dict[str, tuple[str, ...]] = {
     **{
-        provider.replace("_", "-"): (roles["planning"], roles["coding"], roles["router"])
+        provider.replace("_", "-"): tuple(roles[role] for role in AGENT_ROLE_ORDER)
         for provider, roles in MODEL_ROLE_DEFAULTS.items()
     },
-    "openai-compatible": ("", "", ""),
+    "openai-compatible": ("",) * len(AGENT_ROLE_ORDER),
 }
 
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud

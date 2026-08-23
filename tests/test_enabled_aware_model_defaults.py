@@ -330,7 +330,7 @@ def test_recommended_models_caches_enabled_map(monkeypatch):
         from cowork.services.providers import MindsModelListing
 
         return MindsModelListing(
-            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}
+            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}, {}
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)

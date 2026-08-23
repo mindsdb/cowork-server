@@ -40,7 +40,7 @@ PAID_ENABLED = {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": Tru
 def _listing(enabled):
     from cowork.services.providers import MindsModelListing
 
-    return MindsModelListing(list(enabled), {}, enabled, {}, {}, {})
+    return MindsModelListing(list(enabled), {}, enabled, {}, {}, {}, {})
 
 
 def _empty():

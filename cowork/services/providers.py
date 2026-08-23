@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from cowork.common.settings.app_settings import default_minds_api_host
+from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
@@ -198,18 +198,31 @@ class MindsModelListing(NamedTuple):
     # what the picker tags "latest"; anything else names the moving alias this
     # row is a frozen version of.
     families: dict[str, str]
+    # Agent role -> the model id the catalog declares as that role's default,
+    # inverted from the per-row ``default_for`` list. Keyed by role rather than by
+    # model id, unlike every other map here, because that is the question asked of
+    # it: resolution wants "what starts the planning role", not "which roles does
+    # this model lead". Empty whenever the gateway publishes no defaults, which
+    # includes every gateway that predates the field and every plain
+    # OpenAI-compatible endpoint.
+    #
+    # Required rather than defaulted, like every other field here. A NamedTuple
+    # default is one object shared by every instance that omits it, which is the
+    # hazard ``_empty_listing`` is a factory to avoid; a default would reintroduce
+    # it for the sake of not touching three test fakes.
+    role_defaults: dict[str, str]
 
 
 def _empty_listing() -> MindsModelListing:
     """The "we got nothing" listing: ``ids`` None, every map empty.
 
-    One place to build it, so the failure paths don't each repeat six literals
+    One place to build it, so the failure paths don't each repeat the literals
     that have to agree. A factory rather than a shared constant because a
-    failure is also cached, per base URL: handing every entry the same five dict
+    failure is also cached, per base URL: handing every entry the same dict
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {})
 
 
 # Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
@@ -343,6 +356,7 @@ async def fetch_minds_models(
     labels: dict[str, str] = {}
     providers: dict[str, str] = {}
     families: dict[str, str] = {}
+    role_defaults: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -400,8 +414,24 @@ async def fetch_minds_models(
             # version "latest" — the one claim it must never make. Recorded, the
             # app sees a pin whose head it cannot find and lists it plainly.
             families[model_id] = family
+        # Which agent roles this model is the catalog's default for. Inverted
+        # here, at the single place every row is parsed, so resolution can ask
+        # "what starts the planning role" without walking the catalog.
+        #
+        # A role we do not serve is dropped rather than recorded. The catalog is
+        # editable in a console, so an unknown role is a typo far more often than
+        # a role a newer client understands, and carrying it would mean a stored
+        # map whose keys nothing reads. The gateway-side gate rejects that typo
+        # before it ships; this is what keeps a live one out of the settings row.
+        # First declaration wins, which cannot arise against a validated catalog
+        # and keeps the parse total when it does.
+        for role in row.get("default_for") or ():
+            if isinstance(role, str) and role in AGENT_ROLE_NAMES:
+                role_defaults.setdefault(role, model_id)
     return _remember(
-        MindsModelListing((ids or None), efforts, enabled, labels, providers, families)
+        MindsModelListing(
+            (ids or None), efforts, enabled, labels, providers, families, role_defaults
+        )
     )
 
 
@@ -454,6 +484,15 @@ async def fetch_org_model_catalog(
 #       hence the legacy-prefix allowance in model_value_rejection;
 #     - cowork-kinaxis-preview's divergent inline `syncOnboardingModels`;
 #     - anything hand-rolled (curl, scripts, a console surface).
+#
+#   GATED FOR SHAPE ONLY: `minds_role_defaults`, the cached role -> model id map
+#     this endpoint's own writer fills from the catalog. `PUT /settings/{key}`
+#     accepts it like any declared field, and its values become the model an
+#     unset role starts on, so `_reject_malformed_role_defaults` 400s a body that
+#     is not role -> non-empty id. Catalog membership is NOT checked: the value
+#     comes from the catalog to begin with, and `_enabled_aware_default` discards
+#     a model the availability map does not affirm, so an id that no longer
+#     resolves costs a role its declared default rather than a turn.
 #
 #   NOT GATED, because they cannot carry a model key at all — the ENG-739
 #   carve-out keeps planning/coding/router models out of `SETTING_ENV_ALIASES`,
@@ -666,6 +705,48 @@ def persist_enabled_model_map(
     if desired == json.dumps(prior):
         return False
     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+    return True
+def persist_role_defaults_map(session, scope, prior_json: str | None, live_role_defaults: dict) -> bool:
+    """Guarded write of the `minds_role_defaults` map the catalogue declares.
+
+    The sibling of ``persist_enabled_model_map``, and deliberately NOT the same
+    function. That one carries rules this map has no use for: it densifies over
+    the served catalogue and prunes retired ids, because resolution reads key
+    ABSENCE from the availability map as "not served". This map is keyed by agent
+    role, every key is a role we serve, and absence just means the catalogue
+    declared no default for that role.
+
+    Two rules it does share, for its own reasons:
+
+    - Never clobber a known-good map with an empty one. A gateway that predates
+      ``default_for`` publishes nothing, and writing ``{}`` would drop every role
+      back to a constant only a client release can change. So an empty
+      declaration leaves the stored map alone, and resolution keeps using it.
+    - Write only on a real change: ``upsert_setting`` commits a row and
+      invalidates the settings cache, so an unconditional write churns every
+      ``UserSettings`` reader, and this endpoint is hit on every boot and every
+      settings open.
+
+    Stored SORTED, unlike the availability map. Nothing reads this map's order,
+    so sorting means a gateway that re-ranks the same declarations does not count
+    as a change and does not trigger a write.
+
+    Returns True iff the stored map was updated.
+    """
+    from cowork.services.settings import SettingService
+
+    if not live_role_defaults:
+        return False
+    desired = json.dumps(live_role_defaults, sort_keys=True)
+    try:
+        prior = json.loads(prior_json or "{}")
+        if not isinstance(prior, dict):
+            prior = {}
+    except (ValueError, TypeError):
+        prior = {}
+    if desired == json.dumps(prior, sort_keys=True):
+        return False
+    SettingService(session, scope).upsert_setting("minds_role_defaults", desired)
     return True
 
 
