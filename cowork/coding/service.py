@@ -29,14 +29,23 @@ from cowork.coding.contracts import (
     SessionPage,
     SessionStatus,
     SessionUpdateRequest,
+    TaskWorkspace,
     TerminalPage,
     WorkspaceInspection,
     WorkspaceKind,
     utc_now,
 )
+from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
-from cowork.coding.runtime import RuntimeManager
+from cowork.coding.integrations import DeveloperIntegrationService
+from cowork.coding.runtime import RuntimeManager, engine_workspace_path
+from cowork.coding.playbooks import PlaybookService
+from cowork.coding.project_models import DraftPullRequestRequest
+from cowork.coding.project_service import CodeProjectService
+from cowork.coding.project_store import CodeProjectStore
+from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.session_factory import CodingSessionFactory, project_instructions
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn, mark_running
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
@@ -56,11 +65,25 @@ class CodingService:
         self.registry = registry or engine_registry
         self.store = store or CodingStore(root)
         self.workspaces = workspaces or WorkspaceManager(root)
+        self.project_store = CodeProjectStore(root)
+        self.projects = CodeProjectService(root, self.project_store, self.workspaces)
+        self.playbooks = PlaybookService(root, self.project_store, self.workspaces.git)
+        self.project_workspaces = ProjectWorkspaceManager(self.workspaces)
+        self.delivery = ProjectDeliveryService(self.workspaces.git)
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
         self._maintenance: set[str] = set()
         self.approvals = ApprovalBroker(self._approval_opened, self._approval_closed)
         self.runtimes = RuntimeManager(root, self.registry, self.approvals.request)
+        self.session_factory = CodingSessionFactory(
+            self.registry,
+            self.store,
+            self.workspaces,
+            self.projects,
+            self.playbooks,
+            self.project_workspaces,
+            self._emit,
+        )
         self.commands = CodingCommandHandler(
             self.registry,
             self.runtimes,
@@ -79,6 +102,8 @@ class CodingService:
             self.run_next_queued,
         )
         self.store.reconcile_interrupted()
+        for session in self.store.list_sessions():
+            self.project_workspaces.restore_ports(session.id, session.allocated_ports)
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
@@ -96,6 +121,11 @@ class CodingService:
         except (FileNotFoundError, ValueError) as exc:
             raise KeyError("coding session not found") from exc
 
+    def delete_project(self, project_id: str) -> None:
+        task_count = sum(1 for item in self.store.list_sessions() if item.project_id == project_id)
+        self.projects.delete(project_id, task_count)
+        self.playbooks.cleanup(project_id)
+
     def delete_session(self, session_id: str) -> None:
         runtime_lock = self.runtimes.session_lock(session_id)
         with runtime_lock, self._maintenance_session(
@@ -103,13 +133,16 @@ class CodingService:
             "Stop the active turn before deleting this coding task",
         ) as session:
             self.runtimes.close_locked(session_id)
-            self.workspaces.cleanup(
-                session.id,
-                session.source_path,
-                session.workspace_path,
-                session.workspace_kind,
-                session.base_revision,
-            )
+            if session.workspaces:
+                self.project_workspaces.cleanup(session.id, session.workspaces)
+            else:
+                self.workspaces.cleanup(
+                    session.id,
+                    session.source_path,
+                    session.workspace_path,
+                    session.workspace_kind,
+                    session.base_revision,
+                )
             self.store.delete_session(session.id)
 
     def rename_session(self, session_id: str, title: str) -> CodingSession:
@@ -132,27 +165,63 @@ class CodingService:
                 "Wait for the active turn to finish before forking this coding task",
             ) as parent:
                 new_id = str(uuid.uuid4())
-                prepared = self.workspaces.fork(
-                    new_id,
-                    parent.source_path,
-                    parent.workspace_path,
-                    parent.workspace_kind,
-                    parent.base_revision,
-                )
+                project = self.projects.get(parent.project_id) if parent.project_id else None
+                if project and parent.workspaces:
+                    prepared_project = self.project_workspaces.fork(new_id, project, parent.workspaces)
+                    prepared = prepared_project.primary
+                    child_workspaces = list(prepared_project.workspaces)
+                    child_ports = prepared_project.ports
+                    parent_project_paths = {item.workspace_path for item in parent.workspaces[1:]}
+                    external_dirs = [path for path in parent.additional_dirs if path not in parent_project_paths]
+                    child_dirs = [item.workspace_path for item in child_workspaces[1:]] + external_dirs
+                    child_environment = {
+                        **project.environment.variables,
+                        **{name: str(port) for name, port in child_ports.items()},
+                    }
+                    try:
+                        guidance, _ = self.playbooks.guidance(project.id) if project.playbook else ("", None)
+                    except Exception:
+                        self.project_workspaces.cleanup(new_id, child_workspaces)
+                        raise
+                    instructions = project_instructions(
+                        project,
+                        child_workspaces,
+                        parent.source_contexts,
+                        guidance,
+                    )
+                else:
+                    prepared = self.workspaces.fork(
+                        new_id,
+                        parent.source_path,
+                        parent.workspace_path,
+                        parent.workspace_kind,
+                        parent.base_revision,
+                    )
+                    child_workspaces = []
+                    child_ports = {}
+                    child_dirs = parent.additional_dirs
+                    child_environment = parent.environment
+                    instructions = parent.developer_instructions
+                prepared_kind = prepared.workspace_kind if isinstance(prepared, TaskWorkspace) else prepared.kind
+                prepared_warning = None if isinstance(prepared, TaskWorkspace) else prepared.warning
                 try:
                     parent_runtime = self.runtimes.open_locked(parent, credentials)
-                    engine_session_id = parent_runtime.fork(str(prepared.workspace_path))
                     child = parent.model_copy(
                         update={
                             "id": new_id,
                             "title": f"{parent.title} (fork)"[:200],
                             "workspace_path": str(prepared.workspace_path),
-                            "workspace_kind": prepared.kind,
+                            "workspace_kind": prepared_kind,
                             "repository_root": str(prepared.repository_root) if prepared.repository_root else None,
                             "base_revision": prepared.base_revision,
                             "source_dirty": prepared.source_dirty,
-                            "workspace_warning": prepared.warning,
-                            "engine_session_id": engine_session_id,
+                            "workspace_warning": prepared_warning,
+                            "workspaces": child_workspaces,
+                            "additional_dirs": child_dirs,
+                            "allocated_ports": child_ports,
+                            "environment": child_environment,
+                            "developer_instructions": instructions,
+                            "engine_session_id": None,
                             "active_turn_id": None,
                             "pending_approval": None,
                             "queued_instructions": [],
@@ -163,6 +232,11 @@ class CodingService:
                             "updated_at": utc_now(),
                         }
                     )
+                    engine_session_id = parent_runtime.fork(
+                        engine_workspace_path(child),
+                        tuple(child.additional_dirs),
+                    )
+                    child.engine_session_id = engine_session_id
                     self.store.save_session(child)
                     self.store.copy_event_history(parent.id, child)
                     self._emit(
@@ -177,13 +251,16 @@ class CodingService:
                     )
                     return self.get_session(child.id)
                 except Exception:
-                    self.workspaces.cleanup(
-                        new_id,
-                        str(prepared.source_path),
-                        str(prepared.workspace_path),
-                        prepared.kind,
-                        prepared.base_revision,
-                    )
+                    if child_workspaces:
+                        self.project_workspaces.cleanup(new_id, child_workspaces)
+                    else:
+                        self.workspaces.cleanup(
+                            new_id,
+                            str(prepared.source_path),
+                            str(prepared.workspace_path),
+                            prepared_kind,
+                            prepared.base_revision,
+                        )
                     try:
                         self.store.delete_session(new_id)
                     except FileNotFoundError:
@@ -201,73 +278,11 @@ class CodingService:
         return EventPage(items=items, next_seq=items[-1].seq if items else max(0, after))
 
     def create_session(self, request: SessionCreateRequest, credentials: EngineCredentials, default_engine: str, default_model: str) -> CodingSession:
-        engine_id = request.engine_id or default_engine
-        model = request.model or default_model
-        engine = self.registry.get(engine_id)
-        caps = engine.capabilities()
-        if not caps.available:
-            raise RuntimeError(caps.reason or f"{caps.label} is unavailable")
-        if not credentials.minds_api_key:
-            raise RuntimeError("MindsHub is not connected. Sign in or configure a MindsHub API key first.")
-
-        additional_dirs = validate_directories(request.additional_dirs)
-        session_id = str(uuid.uuid4())
-        prepared = self.workspaces.prepare(session_id, request.path, request.allow_direct_folder)
-        title = " ".join(request.prompt.strip().split())[:72] or "Coding task"
-        session = CodingSession(
-            id=session_id,
-            title=title,
-            engine_id=engine_id,
-            engine_adapter_version=caps.adapter_version,
-            model=model,
-            permission_mode=request.permission_mode,
-            reasoning_effort=request.reasoning_effort,
-            service_tier=request.service_tier,
-            personality=request.personality,
-            network_access=request.network_access or request.permission_mode.value == "full_access",
-            web_search=request.web_search,
-            additional_dirs=additional_dirs,
-            source_path=str(prepared.source_path),
-            workspace_path=str(prepared.workspace_path),
-            workspace_kind=prepared.kind,
-            repository_root=str(prepared.repository_root) if prepared.repository_root else None,
-            base_revision=prepared.base_revision,
-            source_dirty=prepared.source_dirty,
-            workspace_warning=prepared.warning,
-        )
+        session = self.session_factory.create(request, credentials, default_engine, default_model)
         try:
-            self.store.save_session(session)
-            workspace_message = prepared.warning
-            if workspace_message is None:
-                workspace_message = (
-                    "Using the selected local folder for this task."
-                    if prepared.kind == WorkspaceKind.direct_folder
-                    else "Created an isolated detached worktree for this task."
-                )
-            self._emit(
-                session.id,
-                CodingEvent(
-                    type=EventType.session,
-                    title="Task workspace ready",
-                    text=workspace_message,
-                    phase="completed",
-                    data={"workspaceKind": prepared.kind.value, "baseRevision": prepared.base_revision},
-                ),
-            )
             self.submit_turn(session.id, request.prompt, credentials, request.attachments)
         except Exception:
-            if prepared.kind == WorkspaceKind.git_worktree:
-                self.workspaces.cleanup(
-                    session.id,
-                    session.source_path,
-                    session.workspace_path,
-                    session.workspace_kind,
-                    session.base_revision,
-                )
-            try:
-                self.store.delete_session(session.id)
-            except FileNotFoundError:
-                pass
+            self.session_factory.discard(session)
             raise
         return self.get_session(session.id)
 
@@ -447,6 +462,12 @@ class CodingService:
         The queue is persisted with the task. This method is also exposed to the
         renderer so an interrupted desktop restart can resume a pending queue.
         """
+        # Completing an ordinary turn should not briefly reserve the task just
+        # to discover that its queue is empty. The fast path keeps a freshly
+        # completed task immediately available for the user's next message.
+        session = self.get_session(session_id)
+        if not session.queued_instructions:
+            return session
         with self._maintenance_session(
             session_id,
             "Wait for the active turn to finish before resuming queued work",
@@ -510,29 +531,73 @@ class CodingService:
 
     def git_state(self, session_id: str):
         session = self.get_session(session_id)
+        if session.workspaces:
+            return self.project_workspaces.git_states(session.workspaces)[0]
         return self.workspaces.git_state(session.source_path, session.workspace_path)
+
+    def git_states(self, session_id: str):
+        session = self.get_session(session_id)
+        if session.workspaces:
+            return self.project_workspaces.git_states(session.workspaces)
+        return [self.workspaces.git_state(session.source_path, session.workspace_path)]
 
     def diff(self, session_id: str):
         session = self.get_session(session_id)
+        if session.workspaces:
+            return self.project_workspaces.diff(session.workspaces)
         return self.workspaces.diff(session.workspace_path, session.base_revision)
 
     def create_branch(self, session_id: str, name: str):
-        with self._lock:
-            session = self._require_idle_git_session(session_id)
+        with self._maintenance_session(
+            session_id,
+            "Wait for the active turn to finish before changing task branches",
+        ) as session:
+            if session.workspaces:
+                states = []
+                for workspace in session.workspaces:
+                    if workspace.workspace_kind != WorkspaceKind.git_worktree:
+                        continue
+                    state = self.workspaces.create_branch(workspace.workspace_path, name)
+                    states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
+                if not states:
+                    raise WorkspaceError("This project does not contain a Git folder")
+                self._emit(session.id, CodingEvent(type=EventType.session, title="Branches created", text=name, phase="completed"))
+                return states[0]
+            if session.base_revision is None:
+                raise WorkspaceError("This task is not using a Git worktree")
             state = self.workspaces.create_branch(session.workspace_path, name)
             self._emit(session.id, CodingEvent(type=EventType.session, title="Branch created", text=name, phase="completed"))
         return state
 
     def commit(self, session_id: str, message: str):
-        with self._lock:
-            session = self._require_idle_git_session(session_id)
+        with self._maintenance_session(
+            session_id,
+            "Wait for the active turn to finish before committing task changes",
+        ) as session:
+            if session.workspaces:
+                states = self.project_workspaces.commit(session.workspaces, message)
+                if not states:
+                    raise WorkspaceError("This project does not contain a Git folder")
+                self._emit(session.id, CodingEvent(type=EventType.session, title="Changes committed", text=message.strip(), phase="completed"))
+                return states[0]
+            if session.base_revision is None:
+                raise WorkspaceError("This task is not using a Git worktree")
             state = self.workspaces.commit(session.workspace_path, message)
             self._emit(session.id, CodingEvent(type=EventType.session, title="Changes committed", text=message.strip(), phase="completed"))
         return state
 
     def apply_to_source(self, session_id: str) -> dict[str, str | None]:
-        with self._lock:
-            session = self._require_idle_git_session(session_id)
+        with self._maintenance_session(
+            session_id,
+            "Wait for the active turn to finish before applying task changes",
+        ) as session:
+            if session.workspaces:
+                applied = self.project_workspaces.apply(session.id, session.workspaces)
+                text = "No changes to apply." if not applied else f"Applied reviewed changes across {len(applied)} project folders."
+                self._emit(session.id, CodingEvent(type=EventType.session, title="Handoff complete", text=text, phase="completed"))
+                return {"status": "applied" if applied else "no_changes", "snapshot": None}
+            if session.workspace_kind == WorkspaceKind.direct_folder:
+                raise WorkspaceError("This legacy task uses its source folder directly and has no isolated handoff")
             snapshot = self.workspaces.apply_to_source(
                 session.id,
                 session.source_path,
@@ -542,6 +607,75 @@ class CodingService:
             text = "No changes to apply." if snapshot is None else "Applied the task diff to the source working tree. A recovery patch was saved first."
             self._emit(session.id, CodingEvent(type=EventType.session, title="Handoff complete", text=text, phase="completed"))
         return {"status": "no_changes" if snapshot is None else "applied", "snapshot": str(snapshot) if snapshot else None}
+
+    def validate_project(self, session_id: str) -> list[dict]:
+        with self._maintenance_session(
+            session_id,
+            "Wait for the active turn to finish before running project checks",
+        ) as session:
+            if not session.project_id or not session.workspaces:
+                return []
+            project = self.projects.get(session.project_id)
+            results = self.project_workspaces.run_commands(
+                project,
+                session.workspaces,
+                "validate",
+                session.allocated_ports,
+            )
+            for result in results:
+                self._emit(
+                    session.id,
+                    CodingEvent(
+                        type=EventType.command,
+                        title=result.label,
+                        text=result.output,
+                        phase="completed" if result.return_code == 0 else "failed",
+                        data={"folderId": result.folder_id, "returnCode": result.return_code, "phase": "validate"},
+                    ),
+                )
+            return [result.__dict__ for result in results]
+
+    def delivery_plan(
+        self,
+        session_id: str,
+        integrations: DeveloperIntegrationService | None = None,
+    ):
+        session = self.get_session(session_id)
+        if not session.project_id or not session.workspaces:
+            raise WorkspaceError("This task is not linked to a Code Project")
+        project = self.projects.get(session.project_id)
+        return self.delivery.plan(session, project, integrations)
+
+    def create_draft_pull_requests(
+        self,
+        session_id: str,
+        request: DraftPullRequestRequest,
+        integrations: DeveloperIntegrationService,
+    ):
+        with self._maintenance_session(
+            session_id,
+            "Wait for the active turn to finish before publishing draft pull requests",
+        ) as session:
+            if not session.project_id or not session.workspaces:
+                raise WorkspaceError("This task is not linked to a Code Project")
+            project = self.projects.get(session.project_id)
+            records = self.delivery.create_draft_pull_requests(session, project, request, integrations)
+            self.store.update_session(
+                session.id,
+                lambda current: current.deliveries.extend(records),
+            )
+            published = sum(item.status == "published" for item in records)
+            failed = sum(item.status == "failed" for item in records)
+            self._emit(
+                session.id,
+                CodingEvent(
+                    type=EventType.session,
+                    title="Draft pull requests prepared",
+                    text=f"Created {published} draft pull request(s)." + (f" {failed} folder(s) need attention." if failed else ""),
+                    phase="failed" if failed and not published else "completed",
+                ),
+            )
+            return records
 
     def discover_models(self, engine_id: str, credentials: EngineCredentials) -> list[str]:
         return self.registry.get(engine_id).discover_models(credentials)
@@ -619,6 +753,11 @@ class CodingService:
 
     def close_all(self) -> None:
         """Stop every task-owned engine runtime during application shutdown."""
+        self.prepare_shutdown()
+        self.runtimes.close_all()
+
+    def prepare_shutdown(self) -> int:
+        """Checkpoint active turns before the desktop terminates the sidecar tree."""
         with self._lock:
             active_sessions = list(self._running)
         for session_id in active_sessions:
@@ -628,7 +767,7 @@ class CodingService:
                 # Shutdown must continue releasing the remaining tasks and
                 # runtimes even if one persisted approval cannot be updated.
                 pass
-        self.runtimes.close_all()
+        return self.turns.interrupt(active_sessions)
 
     def _approval_opened(self, session_id: str, pending: PendingApproval) -> None:
         self._emit(
@@ -712,15 +851,6 @@ class CodingService:
         finally:
             with self._lock:
                 self._maintenance.discard(session_id)
-
-    def _require_idle_git_session(self, session_id: str) -> CodingSession:
-        session = self.get_session(session_id)
-        with self._lock:
-            if session_id in self._running:
-                raise RuntimeError("Wait for the active turn to finish before changing Git state")
-        if session.base_revision is None:
-            raise WorkspaceError("This task is using a direct folder, not an isolated Git worktree")
-        return session
 
 @lru_cache(maxsize=1)
 def get_coding_service() -> CodingService:
