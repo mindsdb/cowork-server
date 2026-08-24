@@ -117,6 +117,7 @@ def _remote_handler(monkeypatch, saved):
             saved["assistant"] = text
             saved["events"] = events
             saved["harness"] = harness
+            saved["tool_rows"] = tool_rows
 
     class FakeSession:
         def commit(self):
@@ -662,3 +663,108 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
 
     assert indexed.get("ran") is True
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+
+
+# ── turn history ─────────────────────────────────────────────────────────────
+
+_TOOL_ROWS = [
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "1"}}]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "1"}]},
+]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_persists_the_pods_tool_rows(monkeypatch):
+    """The whole point of ENG-1808: a cloud turn's tool calls must reach the
+    messages table, so the NEXT turn's replayed history contains them."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "done"}
+        yield "turn_history", {"rows": _TOOL_ROWS}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert saved["assistant"] == "done"
+    assert saved["tool_rows"] == _TOOL_ROWS
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_sanitizes_the_pods_tool_rows(monkeypatch):
+    """Rows cross a trust boundary; a set that cannot pair is dropped whole and
+    the turn degrades to text-only rather than poisoning later turns."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "done"}
+        # tool_use with no matching tool_result
+        yield "turn_history", {"rows": [_TOOL_ROWS[0]]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert saved["assistant"] == "done"
+    assert not saved["tool_rows"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_turn_persists_no_tool_rows(monkeypatch):
+    """Rows arrive BEFORE the terminal event, so a turn can carry rows and then
+    fail. persist() runs on failure too, so the clean flag is what keeps a
+    failed turn text-only — matching the in-process path, where the harness
+    guards simply never hand rows over on error."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_history", {"rows": _TOOL_ROWS}
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error",
+                              "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert saved["assistant"] == "partial"
+    assert saved["tool_rows"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_second_history_frame_replaces_rather_than_appends(monkeypatch):
+    """The pod emits one frame per turn; a duplicate must not double the rows."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_history", {"rows": _TOOL_ROWS}
+        yield "turn_history", {"rows": _TOOL_ROWS}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert saved["tool_rows"] == _TOOL_ROWS
