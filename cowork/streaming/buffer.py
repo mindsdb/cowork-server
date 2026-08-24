@@ -266,8 +266,12 @@ class RedisStreamBuffer(StreamBuffer):
     async def close(self, reason: TerminalReason, extra: dict | None = None) -> None:
         if self._closed:
             return
-        self._closed = True
+        # Flip _closed only AFTER the terminal record is appended: is_closed is
+        # the seal backstop's (handlers/responses.py) proof a terminal exists, so
+        # if the append fails the buffer must stay open for the backstop to
+        # re-seal it. Matches FileStreamBuffer.close ordering.
         await self.append(REASON_TO_TYPE[reason], {"reason": reason, **(extra or {})})
+        self._closed = True
 
     _BLOCK_MS = 5000
 

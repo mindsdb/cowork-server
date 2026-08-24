@@ -194,6 +194,23 @@ class TestOrgModeCreditAwareDefaults:
         s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: True, "sonnet": listed}))
         assert s.resolved_planning_model == ("sonnet" if listed else MINDS_FREE_MODEL)
 
+    def test_org_retired_free_default_fills_a_served_model(self, org_mode):
+        # ENG-1820, the org headline case: the free default IS the retired id.
+        # A non-empty catalogue that no longer lists MINDS_FREE_MODEL means the
+        # canonical default itself would 404 every turn — the one path the
+        # role_defaults floor can't save, because the floor is the dead id. The
+        # org arm of _enabled_aware_default must fill a served model instead of
+        # handing back the retired free model.
+        #
+        # Asserts the STORED default (set by apply_model_defaults straight from
+        # _enabled_aware_default), which is what this branch decides. resolved_*
+        # would mask a revert here — the wallet-aware layer self-heals the dead
+        # id on its own — so only the construction-time fill pins the branch.
+        s = _settings(minds_model_enabled=json.dumps({"gpt-codex": True, "sonnet": False}))
+        assert s.planning_model == "gpt-codex"
+        assert s.coding_model == "gpt-codex"
+        assert s.router_model == "gpt-codex"
+
     def test_org_explicit_stored_choice_survives_the_default_fill(self, org_mode):
         # apply_model_defaults only fills a None model at construction time. An
         # explicitly stored value is never touched there, whatever
@@ -223,14 +240,22 @@ class TestOrgModeCreditAwareDefaults:
         )
         assert s.resolved_planning_model == MINDS_FREE_MODEL
 
-    def test_org_keeps_an_explicit_choice_when_nothing_is_enabled(self, org_mode):
-        # The one case the fallback above deliberately does not cover: with no
-        # enabled entry anywhere there is nothing to fall back TO, so the stored
-        # value stays. Degraded metadata must not change behaviour, and this is
-        # the arm that keeps a drained account on the model the user picked
-        # instead of inventing one.
+    def test_org_retired_pin_falls_back_to_a_served_model_when_nothing_enabled(self, org_mode):
+        # A pin absent from a non-empty catalogue (retired/foreign) with
+        # nothing enabled used to be kept, but that id 404s every turn. Fall back to
+        # a served model (here the locked free model); the stored row is never rewritten.
         s = _settings(
             minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False}), planning_model="opus"
+        )
+        assert s.planning_model == "opus"
+        assert s.resolved_planning_model == MINDS_FREE_MODEL
+
+    def test_org_keeps_a_still_served_pin_when_nothing_is_enabled(self, org_mode):
+        # A pin still served (locked) is kept even with nothing enabled — it 402s
+        # with a top-up path and re-enables when credits return.
+        s = _settings(
+            minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False, "opus": False}),
+            planning_model="opus",
         )
         assert s.resolved_planning_model == "opus"
 
