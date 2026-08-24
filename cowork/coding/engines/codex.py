@@ -106,8 +106,12 @@ class CodexEngine:
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                 continue
-            if row.get("enabled") is False:
+            if row.get("embedding") is True:
                 continue
+            # Discovery describes what the MindsHub Responses API can run, not
+            # what the current wallet can start right now. Keep disabled rows
+            # so Code can mirror Cowork's catalogue and explain "Needs
+            # credits" instead of making paid models appear not to exist.
             models.append(row["id"])
         return models
 
