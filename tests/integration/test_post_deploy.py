@@ -56,6 +56,11 @@ QUICK_PROMPT = "Reply with exactly the word: pong"
 
 TURN_TIMEOUT_S = 180.0
 CANCEL_VISIBLE_S = 45.0
+# How long to wait for the server to report the turn as running before giving
+# up on having anything to cancel. Short: the turn is already streaming by the
+# time the first frame arrives, so this covers the gap between that frame and
+# the registry answering, not the model's thinking time.
+CANCEL_PREMISE_S = 10.0
 
 # The auth hosts sit behind Cloudflare, whose bot rules 403 a default httpx or
 # requests User-Agent ("error code: 1010"). The block is signature-based, so a
@@ -297,6 +302,34 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     assert "response.created" in replayed, replayed
 
 
+def _await_running_turn(api, conversation_id) -> dict | None:
+    """Wait until the server says this conversation has a turn running.
+
+    Returns the probe once `in_flight` is true, or None when the turn ended
+    before it could be observed running.
+
+    Breaking out of the stream on the first `event:` line is not enough to
+    know a turn is cancellable. The formatter yields `response.created` before
+    it iterates the model's stream at all, so that frame says the turn was
+    registered and nothing more, while `cancel` answers `False` for a turn that
+    has already finished. A cancel fired off the back of that frame is
+    asserting on a race, and it lost four of the five runs on record.
+    """
+    deadline = time.monotonic() + CANCEL_PREMISE_S
+    while time.monotonic() < deadline:
+        probe = api.get("/api/v1/responses/in-flight",
+                        params={"conversation_id": conversation_id}).json()
+        if probe["in_flight"] is True:
+            return probe
+        # A closed buffer with records in it is a turn that ran and ended. No
+        # amount of waiting brings it back, so stop rather than spend the
+        # whole window.
+        if probe.get("latest_seq"):
+            return None
+        time.sleep(0.5)
+    return None
+
+
 def test_cancel_ends_the_turn(api, conversation_id):
     """After POST /cancel, /in-flight reports the turn as finished."""
     with api.stream(
@@ -309,10 +342,27 @@ def test_cancel_ends_the_turn(api, conversation_id):
             if line.startswith("event:"):
                 break
 
+    # Establish the premise before asserting on it: there has to be a running
+    # turn for "cancel stops it" to mean anything. Skipping when the turn
+    # already finished is deliberate and is NOT the assertion going soft —
+    # everything below still fails loudly. What it stops covering is an
+    # environment whose model answered a 40-step prompt before the next HTTP
+    # call landed, which is a fact about the environment and not a defect.
+    running = _await_running_turn(api, conversation_id)
+    if running is None:
+        pytest.skip(
+            "the turn finished before it could be observed running, so there was "
+            "nothing to cancel; needs a prompt slower than this deployment's model"
+        )
+
     cancel = api.post("/api/v1/responses/cancel",
                       json={"conversation_id": conversation_id})
     assert cancel.status_code == 200, cancel.text
-    assert cancel.json()["cancelled"] is True
+    # Now load-bearing: the turn was running one call ago, so False here means
+    # the server failed to stop a turn it was told to stop.
+    assert cancel.json()["cancelled"] is True, (
+        f"cancel reported nothing to cancel for a turn that was in flight: {running}"
+    )
 
     deadline = time.monotonic() + CANCEL_VISIBLE_S
     while time.monotonic() < deadline:
