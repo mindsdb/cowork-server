@@ -354,18 +354,13 @@ class ProjectService:
         ).first()
 
     def get_or_provision_by_name_or_none(self, name: str) -> Project | None:
-        """Resolve a project by name, provisioning the org's default on a `general` miss.
+        """Resolve a name, provisioning the org's default on a `general` miss.
 
-        The default project is created lazily per org (`ensure_general_for_scope`), so a
-        plain by-name lookup of `general` can 404 before the org's first `GET /projects/`
-        has provisioned its row — a send or task-create that names `general` would fail on
-        a project that is supposed to always exist. Provision the reserved name
-        here instead of missing; every other name stays an exact match.
-
-        The single home for the reserved-name self-heal: name-lookup callers that must
-        not auto-provision (`get_project_by_name`, project-files, compat stubs) stay on the
-        plain primitives. Can't fold into those primitives — `ensure_general_for_scope`
-        calls `get_project_by_name_or_none`, so self-healing there would recurse.
+        `general` is lazily created per org, so a plain by-name lookup can 404 before the
+        org's first `GET /projects/` provisions its row. Every other name stays exact.
+        The single home for this self-heal: callers that must not auto-provision stay on
+        the plain primitives, and it can't fold into those (`ensure_general_for_scope`
+        calls `get_project_by_name_or_none`, so self-healing there would recurse).
         """
         if name == GENERAL_PROJECT:
             return self.ensure_general_for_scope()
