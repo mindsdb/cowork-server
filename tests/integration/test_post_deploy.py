@@ -325,12 +325,14 @@ def _await_running_turn(api, conversation_id) -> dict | None:
     asserting on a race, and it lost four of the five runs on record.
 
     Two things answer `in_flight: false` and they are not the same. A turn that
-    ran and ended has a buffer with records in it, and no amount of waiting
-    brings it back. A replica that never saw this turn has no buffer at all,
-    and the answer changes as soon as the shared store catches up. Only the
-    first is a reason to give up: `latest_seq` alone cannot tell them apart,
-    because it is absent in both, which is how a routing problem would have
-    been reported as "the model was too fast".
+    ran and ended has a buffer on this replica, and no amount of waiting brings
+    it back. A replica that never saw this turn has no buffer, and the answer
+    changes as soon as the shared store catches up. `has_buffer` is what
+    separates them, and it is the only thing that does: the endpoint always
+    sends `latest_seq`, as 0 when there is no buffer, so a turn that ended
+    having written no records is indistinguishable by that field from a turn
+    this replica never heard of. Reading it would report a routing problem as
+    "the model was too fast", and a zero-record turn as no buffer at all.
     """
     deadline = time.monotonic() + CANCEL_PREMISE_S
     probe = None
@@ -339,7 +341,9 @@ def _await_running_turn(api, conversation_id) -> dict | None:
                         params={"conversation_id": conversation_id}).json()
         if probe.get("in_flight") is True:
             return probe
-        if probe.get("has_buffer") is True and probe.get("latest_seq"):
+        # Not running, and this replica has the turn: it ended. `latest_seq`
+        # deliberately does not appear here, see above.
+        if probe.get("has_buffer") is True:
             return None
         time.sleep(0.5)
     # Ran out of window without ever seeing a buffer. That is not a fast model,
