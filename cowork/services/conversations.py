@@ -352,9 +352,8 @@ class ConversationService:
     def project_by_name(self, name: str | None) -> Project | None:
         if not name:
             return None
-        # Delegate so the reserved-name self-heal lives in one place: this resolves
-        # `general` by provisioning the org's default when its row hasn't been created
-        # yet. Lazy import: projects imports this module.
+        # Delegate so the `general` self-heal lives in one place.
+        # Lazy import: projects imports this module.
         from cowork.services.projects import ProjectService
 
         return ProjectService(self.session).get_or_provision_by_name_or_none(name)
