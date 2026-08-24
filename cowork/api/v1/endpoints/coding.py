@@ -43,6 +43,12 @@ from cowork.coding.project_models import (
     PullRequestActionRequest,
     SourceContextRequest,
 )
+from cowork.coding.skill_models import (
+    SkillLibraryPage,
+    SkillLibrarySource,
+    SkillSourceCreateRequest,
+    SkillSourceItemsRequest,
+)
 from cowork.coding.redaction import redact_text
 from cowork.coding.service import CodingService, get_coding_service
 from cowork.coding.workspace import WorkspaceError
@@ -50,6 +56,7 @@ from cowork.common.settings.user_settings import Provider, provider_api_key_str
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.services.settings import SettingService
+from cowork.services.skills import SkillService
 
 router = APIRouter(dependencies=[Depends(require_local), Depends(require_local_tenancy)])
 logger = logging.getLogger(__name__)
@@ -207,6 +214,48 @@ def inspect_workspace(path: str):
     return _service().inspect_workspace(path)
 
 
+@router.get("/skills/library", response_model=SkillLibraryPage)
+def code_skill_library(
+    scope: ScopeDep,
+    project_id: str | None = Query(default=None, alias="projectId"),
+):
+    return _call(_service().skill_library.catalog, SkillService(scope), project_id)
+
+
+@router.post("/skills/sources", response_model=SkillLibrarySource)
+def add_code_skill_source(body: SkillSourceCreateRequest):
+    return _call(_service().skill_library.add, body.repository, body.branch, body.name)
+
+
+@router.post("/skills/sources/{source_id}/refresh", response_model=SkillLibrarySource)
+def refresh_code_skill_source(source_id: str):
+    return _call(_service().skill_library.refresh, source_id)
+
+
+@router.post("/skills/sources/{source_id}/apply", response_model=SkillLibrarySource)
+def apply_code_skill_source(source_id: str):
+    return _call(_service().skill_library.apply_update, source_id)
+
+
+@router.delete("/skills/sources/{source_id}", status_code=204)
+def remove_code_skill_source(source_id: str):
+    _call(_service().skill_library.remove, source_id)
+
+
+@router.put("/projects/{project_id}/skills/{source_id}", response_model=SkillLibraryPage)
+def update_code_project_skill_source(
+    project_id: str,
+    source_id: str,
+    body: SkillSourceItemsRequest,
+):
+    return _call(
+        _service().skill_library.set_project_items,
+        project_id,
+        source_id,
+        body.enabled_paths,
+    )
+
+
 @router.get("/projects", response_model=ProjectPage)
 def list_code_projects():
     return _service().projects.list()
@@ -293,6 +342,7 @@ def create_session(body: SessionCreateRequest, session: SessionDep, scope: Scope
         _credentials(settings),
         default_engine=settings.coding_agent_engine,
         default_model=settings.coding_agent_model,
+        personal_skills=SkillService(scope),
     )
 
 
