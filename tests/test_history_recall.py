@@ -34,6 +34,18 @@ def _tool_result(text: str) -> dict:
     return {"role": "user", "content": [{"type": "tool_result", "content": text}]}
 
 
+def _tool_result_parts(*texts: str) -> dict:
+    # The shape a tool_result takes once it had image parts scrubbed at replay
+    # time: content is a list of parts, not a string.
+    return {
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "content": [{"type": "text", "text": t} for t in texts],
+        }],
+    }
+
+
 class TestGroupTurns:
     def test_user_message_starts_a_turn(self):
         turns = group_turns([_user("one"), _assistant("a"), _user("two"), _assistant("b")])
@@ -141,6 +153,20 @@ class TestRanking:
         found = search_turns(messages, "db-staging-7", limit=1)
 
         assert [t.number for t in found] == [1]
+
+    def test_list_shaped_tool_output_is_read_as_text(self):
+        messages = [
+            _user("check the database"),
+            _tool_result_parts("host=db-staging-7 port=5432", "status=ok"),
+            _assistant("looks healthy"),
+        ]
+
+        rendered = format_turns(search_turns(messages, "db-staging-7", limit=1))
+
+        assert "host=db-staging-7 port=5432" in rendered
+        assert "status=ok" in rendered
+        # Not the Python repr of the parts list.
+        assert "'type':" not in rendered
 
 
 class TestFormatting:

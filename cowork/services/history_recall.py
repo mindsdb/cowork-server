@@ -56,6 +56,26 @@ class Turn:
         return "\n".join(e.text for e in self.entries if e.text)
 
 
+def _result_text(content: object) -> str:
+    """Text of a tool_result's payload, which is a string or a list of parts.
+
+    The list shape is what reaches the DB whenever a tool returned image parts
+    (they are swapped for a text marker at replay time), so rendering it with
+    str() would store the Python repr — search would hit the repr's syntax and
+    the output cap would be spent on it instead of on the result itself.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return str(content or "")
+    return "\n".join(
+        part.get("text") or "" if isinstance(part, dict) else str(part)
+        for part in content
+    ).strip()
+
+
 def _flatten(content: object) -> tuple[str, bool]:
     """Plain text of one stored message, and whether it is a tool block row.
 
@@ -82,7 +102,7 @@ def _flatten(content: object) -> tuple[str, bool]:
             parts.append(f"{block.get('name', '')}({block.get('input', '')})")
         elif btype == "tool_result":
             is_tool = True
-            parts.append(str(block.get("content", "")))
+            parts.append(_result_text(block.get("content", "")))
         else:
             parts.append(str(block.get("text") or ""))
     return "\n".join(p for p in parts if p), is_tool
