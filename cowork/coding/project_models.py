@@ -5,7 +5,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from cowork.coding.contracts import DeliveryRecord, PermissionMode, SourceContext, utc_now
+# DeliveryRecord and SourceContext remain available from this long-standing
+# public model module for compatibility with existing callers.
+from cowork.coding.contracts import (  # noqa: F401
+    DeliveryRecord,
+    PermissionMode,
+    SourceContext,
+    utc_now,
+)
 
 
 def _valid_environment_name(name: str) -> bool:
@@ -183,17 +190,61 @@ class PublishRequest(BaseModel):
     confirmed: bool = False
 
 
+class DraftPullRequestSpec(BaseModel):
+    folder_id: str = Field(min_length=1, max_length=120)
+    title: str = Field(min_length=1, max_length=256)
+    body: str = Field(default="", max_length=100_000)
+
+
 class DraftPullRequestRequest(BaseModel):
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(default="", max_length=100_000)
+    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, max_length=24)
     connection_name: str | None = Field(default=None, max_length=512)
     confirmed: bool = False
+
+    @field_validator("drafts")
+    @classmethod
+    def validate_unique_drafts(cls, value: list[DraftPullRequestSpec]) -> list[DraftPullRequestSpec]:
+        folder_ids = [draft.folder_id for draft in value]
+        if len(folder_ids) != len(set(folder_ids)):
+            raise ValueError("each folder can have only one pull request specification")
+        return value
+
+
+class PullRequestActionRequest(BaseModel):
+    action: Literal["ready", "merge"]
+    target_url: str = Field(min_length=1, max_length=8_192)
+    connection_name: str | None = Field(default=None, max_length=512)
+    confirmed: bool = False
+
+
+class PullRequestCheck(BaseModel):
+    name: str = Field(max_length=512)
+    state: Literal["passing", "failing", "pending", "neutral"]
+    url: str = Field(default="", max_length=8_192)
+
+
+class PullRequestFeedback(BaseModel):
+    id: str = Field(default="", max_length=512)
+    author: str = Field(default="", max_length=512)
+    state: str = Field(default="commented", max_length=120)
+    body: str = Field(default="", max_length=20_000)
+    url: str = Field(default="", max_length=8_192)
+    path: str = Field(default="", max_length=4_096)
+    created_at: str = Field(default="", max_length=120)
 
 
 class PullRequestStatus(BaseModel):
     state: Literal["draft", "open", "merged", "closed"]
     review_state: Literal["approved", "changes_requested", "pending", "none"]
     ci_state: Literal["passing", "failing", "pending", "none"]
+    number: int | None = None
+    title: str = Field(default="", max_length=512)
+    url: str = Field(default="", max_length=8_192)
+    updated_at: str = Field(default="", max_length=120)
+    checks: list[PullRequestCheck] = Field(default_factory=list, max_length=200)
+    feedback: list[PullRequestFeedback] = Field(default_factory=list, max_length=200)
     detail: str = ""
 
 
@@ -207,12 +258,9 @@ class DeliveryPlanItem(BaseModel):
     status: Literal["ready", "needs_commit", "no_changes", "unavailable", "published"]
     detail: str = ""
     external_url: str | None = None
+    connection_name: str | None = None
     pull_request_status: PullRequestStatus | None = None
     status_error: str | None = None
-
-
-class DeliveryPlan(BaseModel):
-    items: list[DeliveryPlanItem] = Field(default_factory=list)
 
 
 class IntegrationStatus(BaseModel):
@@ -221,3 +269,8 @@ class IntegrationStatus(BaseModel):
     label: str
     status: Literal["connected", "reconnect", "missing"]
     detail: str = ""
+
+
+class DeliveryPlan(BaseModel):
+    items: list[DeliveryPlanItem] = Field(default_factory=list)
+    integrations: list[IntegrationStatus] = Field(default_factory=list)

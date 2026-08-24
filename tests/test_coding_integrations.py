@@ -12,6 +12,7 @@ from cowork.coding.project_models import (
     ProjectConnection,
     ProjectFolder,
     PublishRequest,
+    PullRequestActionRequest,
     SourceContextRequest,
 )
 from cowork.coding.workspace import WorkspaceError
@@ -53,12 +54,22 @@ def service(handler, fields: dict[tuple[str, str], dict]) -> DeveloperIntegratio
 
 def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/repos/mindsdb/cowork/issues/42"
         assert request.headers["Authorization"] == "Bearer secret"
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[{
+                "id": 7,
+                "body": "Design: [mockup](https://github.com/user-attachments/assets/mockup.png)",
+                "html_url": "https://github.com/mindsdb/cowork/issues/42#issuecomment-7",
+                "created_at": "2026-08-24T09:00:00Z",
+                "user": {"login": "reviewer"},
+            }])
+        assert request.url.path == "/repos/mindsdb/cowork/issues/42"
         return httpx.Response(200, json={
             "title": "Make Code projects first class",
             "body": "Project context should persist.",
             "html_url": "https://github.com/mindsdb/cowork/issues/42",
+            "state": "open",
+            "user": {"login": "ian"},
         })
 
     integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
@@ -74,6 +85,10 @@ def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path
     assert context.external_id == "mindsdb/cowork#42"
     assert context.title == "Make Code projects first class"
     assert context.connection_name == "github-work"
+    assert context.state == "open"
+    assert context.author == "ian"
+    assert context.comments[0].author == "reviewer"
+    assert context.attachments[0].url.endswith("mockup.png")
 
 
 def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) -> None:
@@ -104,7 +119,7 @@ def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) 
         provider="slack", kind="conversation", url="https://workspace.slack.com/archives/C123/p1234567890123456",
     ))
 
-    assert linear.external_id == "linear-id"
+    assert linear.external_id == "ENG-19"
     assert slack.body == "First\n\nSecond"
     assert len(requests) == 2
 
@@ -231,14 +246,27 @@ def test_github_pull_request_status_condenses_review_and_ci_state(tmp_path: Path
         if request.url.path.endswith("/pulls/99"):
             return httpx.Response(200, json={
                 "state": "open", "draft": False, "merged": False, "head": {"sha": "head-sha"},
+                "title": "Project delivery", "html_url": "https://github.com/mindsdb/cowork/pull/99",
+                "updated_at": "2026-08-24T10:00:00Z",
             })
         if request.url.path.endswith("/pulls/99/reviews"):
             return httpx.Response(200, json=[{
-                "id": 1, "state": "APPROVED", "user": {"login": "reviewer"},
+                "id": 1, "state": "APPROVED", "body": "Looks good.",
+                "html_url": "https://github.com/mindsdb/cowork/pull/99#pullrequestreview-1",
+                "user": {"login": "reviewer"},
+            }])
+        if request.url.path.endswith("/pulls/99/comments"):
+            return httpx.Response(200, json=[{
+                "id": 2, "body": "Please keep this typed.", "path": "src/app.ts",
+                "html_url": "https://github.com/mindsdb/cowork/pull/99#discussion_r2",
+                "user": {"login": "maintainer"},
             }])
         if request.url.path.endswith("/commits/head-sha/check-runs"):
             return httpx.Response(200, json={
-                "check_runs": [{"status": "completed", "conclusion": "success"}],
+                "check_runs": [{
+                    "name": "test", "status": "completed", "conclusion": "success",
+                    "details_url": "https://github.com/mindsdb/cowork/actions/runs/1",
+                }],
             })
         if request.url.path.endswith("/commits/head-sha/status"):
             return httpx.Response(200, json={"state": "success"})
@@ -254,6 +282,48 @@ def test_github_pull_request_status_condenses_review_and_ci_state(tmp_path: Path
     assert status.state == "open"
     assert status.review_state == "approved"
     assert status.ci_state == "passing"
+    assert status.title == "Project delivery"
+    assert status.updated_at == "2026-08-24T10:00:00Z"
+    assert [(item.name, item.state) for item in status.checks] == [("test", "passing")]
+    assert [(item.author, item.path) for item in status.feedback] == [
+        ("reviewer", ""),
+        ("maintainer", "src/app.ts"),
+    ]
+
+
+def test_github_pull_request_actions_require_confirmation_and_refresh_status(tmp_path: Path) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path.endswith("/pulls/99/merge"):
+            return httpx.Response(200, json={"merged": True})
+        if request.url.path.endswith("/pulls/99"):
+            return httpx.Response(200, json={
+                "state": "closed", "merged": True, "draft": False,
+                "title": "Project delivery", "html_url": "https://github.com/mindsdb/cowork/pull/99",
+                "head": {"sha": ""},
+            })
+        if request.url.path.endswith("/pulls/99/reviews") or request.url.path.endswith("/pulls/99/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
+    request = PullRequestActionRequest(
+        action="merge",
+        target_url="https://github.com/mindsdb/cowork/pull/99",
+        connection_name="github-work",
+    )
+    with pytest.raises(WorkspaceError, match="Confirm"):
+        integration.pull_request_action(project(tmp_path), request)
+
+    status = integration.pull_request_action(
+        project(tmp_path),
+        request.model_copy(update={"confirmed": True}),
+    )
+
+    assert status.state == "merged"
+    assert requests[0] == ("PUT", "/repos/mindsdb/cowork/pulls/99/merge")
 
 
 def test_github_delivery_rejects_a_remote_from_another_host(tmp_path: Path) -> None:
