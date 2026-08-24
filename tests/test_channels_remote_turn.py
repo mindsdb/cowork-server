@@ -11,7 +11,6 @@ import cowork.channels.runtime as runtime_mod
 from cowork.channels.runtime import AntonChannelRuntime
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_open_session
-from cowork.turnqueue.remote_turn import RemoteTurnFailed
 
 
 class _FakeHarnessLocal:

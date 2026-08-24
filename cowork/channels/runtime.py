@@ -26,6 +26,7 @@ from cowork.models.message import Message as DBMessage
 from cowork.models.project import Project
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
+from cowork.services.artifact_roots import conversation_artifacts_base
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
@@ -69,7 +70,7 @@ TYPING_REFRESH_S = 4.0
 MAX_TURN_ATTACHMENTS = 3
 
 
-def artifacts_since(project_path: str, since: float) -> list[tuple[str, str]]:
+def artifacts_since(project_path: str, conversation_id, since: float) -> list[tuple[str, str]]:
     """(path, filename) of artifact primaries created/updated after ``since``
     in this project. Time-window based: concurrent turns in the same project
     could cross-attribute — acceptable for the single-operator v1."""
@@ -77,7 +78,7 @@ def artifacts_since(project_path: str, since: float) -> list[tuple[str, str]]:
     # This runs for one known project, so the root is built directly rather than
     # resolved — the channel already holds the project it is answering for.
     source = ProjectArtifacts(
-        base=Path(project_path) / ".anton" / "artifacts",
+        base=conversation_artifacts_base(project_path, conversation_id),
         project_id=None,
         project_name=Path(project_path).name,
     )
@@ -477,6 +478,8 @@ class AntonChannelRuntime:
         await asyncio.to_thread(
             ResponsesHandler._stage_remote_workspace_files, scoped, conversation.id,
         )
+        # Known gap: channel_context (group/DM framing, per-channel instructions) has no
+        # remote job field yet, so it's dropped here — unused on this path in org mode.
         return remote_turn_events(
             session=scoped,
             conv_id=conversation.id,
@@ -562,7 +565,10 @@ class AntonChannelRuntime:
 
     async def build_input_blocks(self, scoped: ScopedSession, adapter: Any, event: Any, text: str) -> list[dict]:
         """Harness input from the inbound event: stored media become image/file
-        blocks (same shapes the responses handler builds), text rides last."""
+        blocks (same shapes the responses handler builds), text rides last.
+
+        Known gap: these blocks aren't staged for the remote worker in org mode
+        (only browser-uploaded attachments are), so channel media is silently unavailable to the model there."""
         blocks: list[dict] = []
         fetch = getattr(adapter, "fetch_attachment", None) if adapter is not None else None
         for attachment in (event.message.attachments or []):
@@ -598,7 +604,7 @@ class AntonChannelRuntime:
         project = conversation.project
         if project is None:
             return
-        for path, filename in artifacts_since(project.path, since)[:MAX_TURN_ATTACHMENTS]:
+        for path, filename in artifacts_since(project.path, conversation.id, since)[:MAX_TURN_ATTACHMENTS]:
             try:
                 await sender(address=event.address, path=path, filename=filename)
             except Exception:

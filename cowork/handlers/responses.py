@@ -429,7 +429,7 @@ class ResponsesHandler:
         """Hosted orgs keep no stored Minds key (remote turns mint one), so the
         gate mints its own per-turn key here and hands it back for the
         delegated turn to reuse. Everywhere else the stored settings apply."""
-        if TurnQueueSettings().backend != "remote":
+        if not TurnQueueSettings().is_remote:
             return None, None
         settings = get_user_settings(self.scope)
         if (settings.resolved_router_provider is not Provider.MINDS_CLOUD
