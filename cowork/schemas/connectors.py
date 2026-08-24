@@ -197,7 +197,15 @@ class DirectSaveRequest(BaseModel):
     connector_id: str
     method: str | None = None
     name: str = ""
+    replace_existing: bool = False
     values: dict[str, Any] = Field(default_factory=dict)
+
+
+class DirectSaveResponse(BaseModel):
+    ok: bool
+    name: str
+    label: str
+    user_label: str | None = None
 
 
 class PickedFile(BaseModel):
