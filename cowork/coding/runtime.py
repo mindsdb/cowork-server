@@ -18,6 +18,22 @@ from cowork.coding.terminal import TerminalBuffer
 ApprovalRequest = Callable[[str, str, dict[str, Any] | None], dict[str, str]]
 
 
+def engine_workspace_path(session: CodingSession) -> str:
+    """Return the narrow task root presented to an agent runtime.
+
+    The persisted ``workspace_path`` remains the primary folder for review and
+    handoff. Project runtimes instead start at the common, task-owned parent so
+    thread-level operations such as Codex goals can write every project folder.
+    """
+    if not session.workspaces:
+        return session.workspace_path
+    parents = {Path(item.workspace_path).resolve().parent for item in session.workspaces}
+    if len(parents) != 1:
+        return session.workspace_path
+    root = parents.pop()
+    return str(root) if root.name == session.id else session.workspace_path
+
+
 class RuntimeManager:
     """Own persistent engine runtimes and task terminals.
 
@@ -59,9 +75,10 @@ class RuntimeManager:
             self._runtimes.pop(session.id, None)
 
         engine = self._registry.get(session.engine_id)
+        runtime_workspace = engine_workspace_path(session)
         opened = engine.open_session(
             cowork_root=str(self._root),
-            workspace=session.workspace_path,
+            workspace=runtime_workspace,
             config=EngineSessionConfig(
                 model=session.model,
                 permission_mode=session.permission_mode,
@@ -71,6 +88,10 @@ class RuntimeManager:
                 network_access=session.network_access,
                 web_search=session.web_search,
                 additional_dirs=tuple(session.additional_dirs),
+                developer_instructions=session.developer_instructions,
+                environment=tuple(session.environment.items()),
+                session_id=session.id,
+                cowork_root=str(self._root),
             ),
             credentials=credentials,
             existing_session_id=session.engine_session_id,
