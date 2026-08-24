@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from cowork.coding.contracts import ExtensionInventory, PermissionMode
 from cowork.coding.engines import codex as codex_module
 from cowork.coding.engines import codex_config, codex_events
-from cowork.coding.engines.base import EngineInputReference, EngineSessionConfig
+from cowork.coding.engines.base import EngineCredentials, EngineInputReference, EngineSessionConfig
 from cowork.coding.engines.codex_extensions import add_extension_response
 from cowork.coding.redaction import sanitize
 
@@ -36,6 +36,42 @@ def test_permission_mode_maps_to_codex_approval_policy() -> None:
 
 def test_codex_uses_the_loopback_inference_proxy() -> None:
     assert codex_config.local_inference_base_url(26866) == "http://127.0.0.1:26866/api/v1/coding/inference"
+
+
+def test_codex_model_discovery_keeps_models_that_need_credits(monkeypatch) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "data": [
+                    {"id": "mindshub_air", "enabled": True},
+                    {"id": "fable", "enabled": False},
+                    {"id": "gpt-codex", "enabled": False},
+                    {"id": "embed-small", "enabled": False, "embedding": True},
+                ],
+            }
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, url: str, *, headers: dict[str, str]) -> FakeResponse:
+            assert url == "https://api.mindshub.ai/v1/models"
+            assert headers == {"Authorization": "Bearer mdb_test"}
+            return FakeResponse()
+
+    monkeypatch.setattr(codex_module.httpx, "Client", lambda **_kwargs: FakeClient())
+
+    models = codex_module.CodexEngine().discover_models(
+        EngineCredentials(minds_url="https://api.mindshub.ai", minds_api_key="mdb_test"),
+    )
+
+    assert models == ["mindshub_air", "fable", "gpt-codex"]
 
 
 def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
