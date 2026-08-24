@@ -11,15 +11,15 @@ from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.playbooks import PlaybookService
 from cowork.coding.project_models import (
     CodeProject,
+    ProjectCommand,
     ProjectConnection,
     ProjectCreateRequest,
-    ProjectCommand,
     ProjectEnvironment,
     ProjectFolder,
     ProjectUpdateRequest,
 )
-from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_service import CodeProjectService
+from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.session_factory import project_instructions, task_title
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
@@ -89,6 +89,9 @@ def test_project_workspace_isolates_git_and_non_git_folders_and_hands_off_togeth
 
     first = manager.prepare("session-one", project)
     second = manager.prepare("session-two", project)
+    first_task_root = Path(first.primary.workspace_path).parent
+    (first_task_root / ".DS_Store").write_bytes(b"Finder metadata")
+    (first_task_root / "Thumbs.db").write_bytes(b"Explorer metadata")
 
     assert first.primary.workspace_kind == WorkspaceKind.git_worktree
     assert first.workspaces[1].workspace_kind == WorkspaceKind.local_copy
@@ -112,6 +115,10 @@ def test_project_workspace_isolates_git_and_non_git_folders_and_hands_off_togeth
 
     manager.cleanup("session-one", list(first.workspaces))
     manager.cleanup("session-two", list(second.workspaces))
+    assert not first_task_root.exists()
+    assert not Path(second.primary.workspace_path).parent.exists()
+    assert not (tmp_path / "coding" / "baselines" / "session-one").exists()
+    assert not (tmp_path / "coding" / "baselines" / "session-two").exists()
 
 
 def test_multi_folder_handoff_preflights_every_folder_before_changing_any_source(tmp_path: Path) -> None:
@@ -136,6 +143,25 @@ def test_multi_folder_handoff_preflights_every_folder_before_changing_any_source
 
     assert (first_repo / "README.md").read_text(encoding="utf-8") == "first\n"
     assert (second_repo / "README.md").read_text(encoding="utf-8") == "user\n"
+
+
+def test_project_cleanup_preserves_real_files_at_the_task_root(tmp_path: Path) -> None:
+    repo = repository(tmp_path, "app")
+    project = CodeProject(
+        id="project-root-file",
+        name="Root file",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = manager.prepare("session-root-file", project)
+    task_root = Path(prepared.primary.workspace_path).parent
+    task_file = task_root / "task-notes.txt"
+    task_file.write_text("Keep this recovery note.\n", encoding="utf-8")
+
+    manager.cleanup("session-root-file", list(prepared.workspaces))
+
+    assert not Path(prepared.primary.workspace_path).exists()
+    assert task_file.read_text(encoding="utf-8") == "Keep this recovery note.\n"
 
 
 def test_local_copy_detects_external_conflicts_and_never_edits_source_early(tmp_path: Path) -> None:
