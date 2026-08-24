@@ -315,6 +315,7 @@ class TestDisplayName:
 
     def test_helper_priority(self):
         assert connection_display_name({"_label": "Support", "email": "a@x.com"}) == "a@x.com"
+        assert connection_display_name({"account_name": "Acme", "account_email": "org:acme"}) == "Acme"
         assert connection_display_name({"email": "a@x.com"}) == "a@x.com"
         assert connection_display_name({"account_email": "o@x.com"}) == "o@x.com"
         assert connection_display_name({"host": "h", "database": "d"}) == "h/d"

@@ -121,15 +121,15 @@ def spec_secret_fields(connector_id: str, method: str | None) -> list[str]:
 def connection_display_name(fields: dict) -> str | None:
     """Human-facing identity for a saved connection, or None.
 
-    Non-secret identity only (``email`` / ``account_email``, else ``host``
-    [+ ``database``]) — no longer prefers ``_label``/``_user_label``, since
+    Non-secret identity only (``account_name`` / ``email`` / ``account_email``,
+    else ``host`` [+ ``database``]) — no longer prefers ``_label``/``_user_label``, since
     the connection's title in cowork now comes from ``user_label`` directly
     (see ``ConnectionSummaryResponse.user_label``); this function is the
     *subtitle* source only. Returns None when there's nothing meaningful —
     the caller then falls back to the slug.
     """
     f = fields or {}
-    for key in ("email", "account_email"):
+    for key in ("account_name", "email", "account_email"):
         val = str(f.get(key, "")).strip()
         if val:
             return val

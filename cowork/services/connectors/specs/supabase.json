@@ -21,6 +21,7 @@
   "category": "database",
   "logo": "database",
   "logo_color": "#3ECF8E",
+  "featured": true,
   "form": {
     "form_id": "supabase-connector",
     "title": "Connect Supabase",
@@ -34,7 +35,7 @@
         "description": "Sign in to Supabase in your browser and authorize access. No database credentials are required.",
         "recommended": true,
         "hidden": false,
-        "how_to": "Click **Connect**, sign in to Supabase, and click **Authorize**. OAuth access is granted according to the scopes configured on the Supabase OAuth app.",
+        "how_to": "Click **Connect**, sign in to Supabase, and click **Authorize**. OAuth access is granted according to the scopes configured on the Supabase OAuth app. Use `http://localhost:47292/callback` as the OAuth app redirect URI.",
         "fields": [],
         "oauth": {
           "auth_url": "https://api.supabase.com/v1/oauth/authorize",
@@ -43,7 +44,9 @@
           "service_id": "supabase",
           "token_auth_style": "basic",
           "supports_refresh": true,
-          "supports_revoke": false
+          "supports_revoke": false,
+          "redirect_port": 47292,
+          "redirect_host": "localhost"
         }
       },
       {
