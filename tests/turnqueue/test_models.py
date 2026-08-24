@@ -31,7 +31,8 @@ def test_turn_reply_accepts_every_kind_the_controller_publishes():
 
     published = {
         "progress", "cell", "error", "turn_delta", "turn_step",
-        "turn_memory", "turn_skill", "turn_completed", "turn_failed",
+        "turn_memory", "turn_skill", "turn_history", "turn_completed",
+        "turn_failed",
     }
     accepted = set(typing.get_args(TurnReply.model_fields["kind"].annotation))
     assert published == accepted
@@ -60,3 +61,20 @@ def test_deadline_ms_is_a_duration_not_an_epoch():
         TurnJob(**base, deadline_ms=1_790_000_000_000)
     with pytest.raises(ValidationError, match="must be positive"):
         TurnJob(**base, deadline_ms=0)
+
+
+def test_turn_reply_parses_turn_history_rows():
+    """List-shaped block content must survive the round trip untouched — these
+    rows are replayed into the next turn's LLM history verbatim.
+
+    (The Literal itself is covered exhaustively by
+    test_turn_reply_accepts_every_kind_the_controller_publishes.)"""
+    reply = TurnReply.model_validate_json(
+        '{"correlation_id":"r","kind":"turn_history","data":{"rows":['
+        '{"role":"assistant","content":[{"type":"tool_use","id":"t1",'
+        '"name":"scratchpad","input":{"code":"1"}}]},'
+        '{"role":"user","content":[{"type":"tool_result",'
+        '"tool_use_id":"t1","content":"1"}]}]}}')
+    rows = reply.data["rows"]
+    assert rows[0]["content"][0]["input"] == {"code": "1"}
+    assert rows[1]["content"][0]["tool_use_id"] == "t1"
