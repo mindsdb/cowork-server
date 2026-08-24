@@ -456,6 +456,41 @@ class CodingService:
             )
         return self.get_session(session_id)
 
+    def steer_queued_turn(self, session_id: str, instruction_id: str) -> CodingSession:
+        """Promote one persisted queued instruction into the active turn.
+
+        The instruction is removed before crossing the engine boundary so a
+        turn completing concurrently cannot also start it as the next turn. If
+        the engine rejects the steer, the queue entry is restored in place for
+        an explicit retry or normal queued execution.
+        """
+        queue_index = 0
+        with self._lock:
+            session = self.get_session(session_id)
+            try:
+                queue_index, instruction = next(
+                    (index, item)
+                    for index, item in enumerate(session.queued_instructions)
+                    if item.id == instruction_id
+                )
+            except StopIteration as exc:
+                raise KeyError("queued instruction not found") from exc
+            if session_id not in self._running:
+                raise RuntimeError("There is no active turn to steer")
+            self.store.update_session(
+                session_id,
+                lambda current: self._remove_queued_instruction(current, instruction_id),
+            )
+        try:
+            return self.steer(session_id, instruction.prompt, instruction.attachments)
+        except Exception:
+            with self._lock:
+                self.store.update_session(
+                    session_id,
+                    lambda current: self._restore_queued_instruction(current, instruction, queue_index),
+                )
+            raise
+
     def run_next_queued(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
         """Start the oldest queued instruction once the task is idle.
 
@@ -831,6 +866,16 @@ class CodingService:
         session.queued_instructions = [
             item for item in session.queued_instructions if item.id != instruction_id
         ]
+
+    @staticmethod
+    def _restore_queued_instruction(
+        session: CodingSession,
+        instruction: QueuedInstruction,
+        index: int,
+    ) -> None:
+        if any(item.id == instruction.id for item in session.queued_instructions):
+            return
+        session.queued_instructions.insert(min(index, len(session.queued_instructions)), instruction)
 
     @contextmanager
     def _maintenance_session(

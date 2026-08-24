@@ -422,6 +422,11 @@ def remove_queued_turn(session_id: str, instruction_id: str):
     return _call(_service().remove_queued_turn, session_id, instruction_id)
 
 
+@router.post("/sessions/{session_id}/queue/{instruction_id}/steer")
+def steer_queued_turn(session_id: str, instruction_id: str):
+    return _call(_service().steer_queued_turn, session_id, instruction_id)
+
+
 @router.post("/sessions/{session_id}/queue/run")
 def run_next_queued(session_id: str, session: SessionDep, scope: ScopeDep):
     return _call(
