@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import subprocess
 import threading
 import time
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from cowork.coding.contracts import (
     CodingEvent,
-    EngineCapabilities,
-    EngineCommand,
     EventType,
     InputReference,
     PermissionMode,
@@ -18,224 +17,11 @@ from cowork.coding.contracts import (
     SessionStatus,
     SessionUpdateRequest,
 )
-from cowork.coding.engines.base import EngineCredentials
-from cowork.coding.engines.registry import CodingEngineRegistry
-from cowork.coding.service import CodingService
+from cowork.coding.project_models import DraftPullRequestRequest, ProjectCommand, ProjectCreateRequest, ProjectFolder
 from cowork.coding.turns import EventBuffer, terminal_status
+from cowork.coding.workspace import WorkspaceError
 
-CREDS = EngineCredentials(minds_url="https://example.invalid", minds_api_key="test-key")
-
-
-def git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def repository(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    git(repo, "init")
-    git(repo, "config", "user.email", "cowork@example.invalid")
-    git(repo, "config", "user.name", "Cowork Test")
-    (repo / "README.md").write_text("base\n", encoding="utf-8")
-    git(repo, "add", ".")
-    git(repo, "commit", "-m", "base")
-    return repo
-
-
-def wait_for_status(service: CodingService, session_id: str, status: SessionStatus) -> None:
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        if service.get_session(session_id).status == status:
-            return
-        time.sleep(0.01)
-    assert service.get_session(session_id).status == status
-
-
-def wait_for_steers(engine: FakeEngine) -> None:
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not engine.steers:
-        time.sleep(0.01)
-
-
-class FakeSession:
-    def __init__(self, engine: FakeEngine, existing: str | None) -> None:
-        self.engine = engine
-        self._session_id = existing or "engine-session-1"
-        self.cancelled = threading.Event()
-
-    @property
-    def session_id(self) -> str:
-        return self._session_id
-
-    @property
-    def is_closed(self) -> bool:
-        return self.engine.is_closed
-
-    def start_turn(self, prompt: str, attachments=()) -> str:
-        self.engine.prompts.append(prompt)
-        self.engine.attachments.append(attachments)
-        self.engine.started.set()
-        return f"turn-{len(self.engine.prompts)}"
-
-    def start_goal(self, objective: str) -> str:
-        self.engine.goals.append(objective)
-        self.engine.goal = {"objective": objective, "status": "active"}
-        self.engine.started.set()
-        return f"goal-{len(self.engine.goals)}"
-
-    def resume_goal(self) -> str:
-        self.engine.goal_resumes += 1
-        if self.engine.goal is not None:
-            self.engine.goal["status"] = "active"
-        self.engine.started.set()
-        return f"goal-resume-{self.engine.goal_resumes}"
-
-    def update_goal(self, action: str, objective: str | None = None):
-        if action == "clear":
-            self.engine.goal = None
-        elif action == "pause":
-            if self.engine.goal is None:
-                raise RuntimeError("There is no goal to update")
-            self.engine.goal["status"] = "paused"
-        elif action == "edit":
-            if self.engine.goal is None:
-                raise RuntimeError("There is no goal to update")
-            self.engine.goal["objective"] = objective
-        return self.engine.goal
-
-    def start_review(self) -> str:
-        self.engine.reviews += 1
-        self.engine.started.set()
-        return f"review-{self.engine.reviews}"
-
-    def events(self, turn_id: str):
-        if self.engine.events_error:
-            raise RuntimeError("adapter stream disconnected")
-        if self.engine.block_until_release:
-            self.engine.release_events.wait(timeout=2)
-        if self.engine.block_until_cancel:
-            self.cancelled.wait(timeout=2)
-            yield CodingEvent(type=EventType.session, data={"status": "interrupted"})
-            return
-        yield CodingEvent(type=EventType.agent_message, text="done", item_id="message-1")
-        yield CodingEvent(type=EventType.session, data={"status": "completed"})
-
-    def steer(self, turn_id: str, prompt: str, attachments=()) -> None:
-        self.engine.steers.append((turn_id, prompt))
-        self.engine.steer_attachments.append(attachments)
-
-    def cancel(self, turn_id: str) -> None:
-        self.engine.cancels.append(turn_id)
-        self.cancelled.set()
-
-    def compact(self) -> None:
-        if self.engine.block_compact:
-            self.engine.compact_started.set()
-            self.engine.release_compact.wait(timeout=2)
-        self.engine.compactions += 1
-
-    def goal_status(self):
-        return self.engine.goal
-
-    def fork(self, workspace: str) -> str:
-        self.engine.forked_workspaces.append(workspace)
-        return f"forked-engine-session-{len(self.engine.forked_workspaces)}"
-
-    def start_terminal(self, process_id, cols, rows, output_handler, exit_handler) -> None:
-        if self.engine.terminal_start_error:
-            raise RuntimeError("terminal secret-ish failure")
-        self.engine.terminal_process_id = process_id
-        self.engine.terminal_size = (cols, rows)
-        self.engine.terminal_output = output_handler
-        self.engine.terminal_exit = exit_handler
-
-    def write_terminal(self, process_id: str, data_base64: str) -> None:
-        self.engine.terminal_writes.append((process_id, data_base64))
-
-    def resize_terminal(self, process_id: str, cols: int, rows: int) -> None:
-        self.engine.terminal_size = (cols, rows)
-
-    def stop_terminal(self, process_id: str) -> None:
-        self.engine.terminal_stops.append(process_id)
-
-    def close(self) -> None:
-        if not self.engine.is_closed:
-            self.engine.is_closed = True
-            self.engine.closed += 1
-
-
-class FakeEngine:
-    id = "fake"
-
-    def __init__(self, *, block_open: bool = False, block_until_cancel: bool = False) -> None:
-        self.block_open = block_open
-        self.block_until_cancel = block_until_cancel
-        self.block_until_release = False
-        self.events_error = False
-        self.block_compact = False
-        self.compact_started = threading.Event()
-        self.release_compact = threading.Event()
-        self.release_events = threading.Event()
-        self.opened = threading.Event()
-        self.release_open = threading.Event()
-        self.started = threading.Event()
-        self.existing_ids: list[str | None] = []
-        self.permission_modes: list[PermissionMode] = []
-        self.configs = []
-        self.prompts: list[str] = []
-        self.attachments = []
-        self.goals: list[str] = []
-        self.goal_resumes = 0
-        self.reviews = 0
-        self.goal: dict | None = None
-        self.forked_workspaces: list[str] = []
-        self.compactions = 0
-        self.steers: list[tuple[str, str]] = []
-        self.steer_attachments = []
-        self.cancels: list[str] = []
-        self.closed = 0
-        self.is_closed = False
-        self.terminal_process_id: str | None = None
-        self.terminal_size: tuple[int, int] | None = None
-        self.terminal_output = None
-        self.terminal_exit = None
-        self.terminal_writes: list[tuple[str, str]] = []
-        self.terminal_stops: list[str] = []
-        self.terminal_start_error = False
-
-    def capabilities(self) -> EngineCapabilities:
-        return EngineCapabilities(
-            id=self.id,
-            label="Fake",
-            adapter_version="1",
-            available=True,
-            commands=[
-                EngineCommand(name="goal", label="Goal", description="Goal", action="goal"),
-                EngineCommand(name="review", label="Review", description="Review", action="turn"),
-                EngineCommand(name="compact", label="Compact", description="Compact", action="compact"),
-                EngineCommand(name="status", label="Status", description="Status", action="status"),
-                EngineCommand(name="init", label="Init", description="Init", action="turn"),
-                EngineCommand(name="permissions", label="Permissions", description="Permissions", action="client", client_action="controls"),
-            ],
-        )
-
-    def open_session(self, *, existing_session_id: str | None, **_kwargs) -> FakeSession:
-        self.existing_ids.append(existing_session_id)
-        self.permission_modes.append(_kwargs["config"].permission_mode)
-        self.configs.append(_kwargs["config"])
-        self.opened.set()
-        if self.block_open:
-            self.release_open.wait(timeout=2)
-        return FakeSession(self, existing_session_id)
-
-    def discover_models(self, _credentials: EngineCredentials) -> list[str]:
-        return ["fake-model"]
-
-
-def service_with(tmp_path: Path, engine: FakeEngine) -> CodingService:
-    registry = CodingEngineRegistry()
-    registry.register(engine)
-    return CodingService(tmp_path / "coding", registry=registry)
+from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status, wait_for_steers
 
 
 def test_event_buffer_preserves_terminal_phase_when_coalescing_deltas() -> None:
@@ -255,6 +41,13 @@ def test_event_buffer_preserves_terminal_phase_when_coalescing_deltas() -> None:
 def test_terminal_status_distinguishes_interruption_from_user_cancel() -> None:
     assert terminal_status("interrupted", cancel_requested=False) == SessionStatus.interrupted
     assert terminal_status("interrupted", cancel_requested=True) == SessionStatus.cancelled
+
+
+def test_task_creation_requires_exactly_one_project_or_folder() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        SessionCreateRequest(prompt="Build it")
+    with pytest.raises(ValueError, match="exactly one"):
+        SessionCreateRequest(path="/folder", project_id="project", prompt="Build it")
 
 
 def test_completed_task_persists_events_and_reuses_live_engine_runtime(tmp_path: Path) -> None:
@@ -292,7 +85,7 @@ def test_failed_adapter_stream_closes_the_runtime_before_another_turn_can_reuse_
     assert service.get_session(created.id).last_error == "adapter stream disconnected"
 
 
-def test_direct_folder_session_reports_the_workspace_it_actually_uses(tmp_path: Path) -> None:
+def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None:
     folder = tmp_path / "plain-folder"
     folder.mkdir()
     service = service_with(tmp_path, FakeEngine())
@@ -311,8 +104,10 @@ def test_direct_folder_session_reports_the_workspace_it_actually_uses(tmp_path: 
 
     ready = service.events(created.id).items[0]
     assert ready.title == "Task workspace ready"
-    assert ready.text == "Using the selected local folder for this task."
-    assert ready.data["workspaceKind"] == "direct_folder"
+    assert ready.text == "Created an isolated task workspace."
+    assert ready.data["workspaceKind"] == "local_copy"
+    assert created.workspace_path != str(folder.resolve())
+    assert created.source_path == str(folder.resolve())
 
 
 def test_git_mutation_cannot_race_a_new_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -338,17 +133,15 @@ def test_git_mutation_cannot_race_a_new_turn(tmp_path: Path, monkeypatch: pytest
     branch_thread.start()
     assert entered_mutation.wait(timeout=1)
 
-    submit_thread = threading.Thread(target=lambda: service.submit_turn(created.id, "Second turn", CREDS))
-    submit_thread.start()
-    time.sleep(0.05)
-    assert submit_thread.is_alive()
-    assert engine.prompts == ["First turn"]
+    try:
+        with pytest.raises(RuntimeError, match="being updated"):
+            service.submit_turn(created.id, "Second turn", CREDS)
+        assert engine.prompts == ["First turn"]
+    finally:
+        release_mutation.set()
+        branch_thread.join(timeout=1)
 
-    release_mutation.set()
-    branch_thread.join(timeout=1)
-    submit_thread.join(timeout=1)
-    wait_for_status(service, created.id, SessionStatus.completed)
-    assert engine.prompts == ["First turn", "Second turn"]
+    assert not branch_thread.is_alive()
 
 
 def test_permission_mode_persists_and_reaches_engine(tmp_path: Path) -> None:
@@ -422,6 +215,31 @@ def test_task_runtime_closes_on_delete_and_service_shutdown(tmp_path: Path) -> N
     wait_for_status(service, second.id, SessionStatus.completed)
     service.close_all()
     assert engine.closed == 2
+
+
+def test_service_shutdown_marks_an_active_turn_interrupted(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.block_until_release = True
+    service = service_with(tmp_path, engine)
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Long-running turn"), CREDS, "fake", "fake-model"
+    )
+    assert engine.started.wait(timeout=1)
+
+    assert service.prepare_shutdown() == 1
+    assert service.prepare_shutdown() == 0
+    service.close_all()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and created.id in service._running:
+        time.sleep(0.01)
+
+    restored = service.get_session(created.id)
+    assert restored.status == SessionStatus.interrupted
+    assert restored.last_error is None
+    assert created.id not in service._running
+    assert sum(event.title == "Task interrupted" for event in service.events(created.id).items) == 1
 
 
 def test_terminal_replays_output_and_shares_runtime_across_turns(tmp_path: Path) -> None:
@@ -881,3 +699,254 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
 
     service.delete_session(parent.id)
     assert Path(child.workspace_path).is_dir()
+
+
+def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "plan.txt").write_text("base\n", encoding="utf-8")
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Product",
+            folders=[
+                ProjectFolder(id="app", name="App", path=str(repo)),
+                ProjectFolder(id="notes", name="Notes", path=str(notes)),
+            ],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    parent = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, parent.id, SessionStatus.completed)
+    (Path(parent.workspaces[0].workspace_path) / "README.md").write_text("parent app\n", encoding="utf-8")
+    (Path(parent.workspaces[1].workspace_path) / "plan.txt").write_text("parent notes\n", encoding="utf-8")
+
+    child = service.fork_session(parent.id, CREDS)
+
+    assert child.project_id == project.id
+    assert len(child.workspaces) == 2
+    assert all(item.workspace_path != parent.workspaces[index].workspace_path for index, item in enumerate(child.workspaces))
+    assert (Path(child.workspaces[0].workspace_path) / "README.md").read_text(encoding="utf-8") == "parent app\n"
+    assert (Path(child.workspaces[1].workspace_path) / "plan.txt").read_text(encoding="utf-8") == "parent notes\n"
+    assert {(item.folder_name, item.path) for item in service.diff(child.id)} == {
+        ("App", "README.md"),
+        ("Notes", "plan.txt"),
+    }
+    assert child.allocated_ports["PORT"] != parent.allocated_ports["PORT"]
+    assert child.workspaces[1].workspace_path in child.additional_dirs
+    assert child.workspaces[1].workspace_path in child.developer_instructions
+    assert engine.forked_workspaces[-1] == str(Path(child.workspaces[0].workspace_path).parent)
+    assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
+
+
+def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "plan.txt").write_text("base\n", encoding="utf-8")
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Product",
+            folders=[
+                ProjectFolder(id="app", name="App", path=str(repo)),
+                ProjectFolder(id="notes", name="Notes", path=str(notes)),
+            ],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+
+    task = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, task.id, SessionStatus.completed)
+
+    expected_root = Path(task.workspaces[0].workspace_path).parent
+    assert expected_root.name == task.id
+    assert {Path(item.workspace_path).parent for item in task.workspaces} == {expected_root}
+    assert engine.opened_workspaces[-1] == str(expected_root)
+
+
+def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Delivery",
+            folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    task = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Prepare delivery"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, task.id, SessionStatus.completed)
+    (Path(task.workspace_path) / "README.md").write_text("delivery\n", encoding="utf-8")
+
+    assert service.delivery_plan(task.id).items[0].status == "needs_commit"
+    service.commit(task.id, "Prepare delivery")
+    assert service.delivery_plan(task.id).items[0].status == "ready"
+
+    class Integrations:
+        calls: list[dict] = []
+
+        def create_draft_pull_request(self, _project, **kwargs):
+            self.calls.append(kwargs)
+            return "https://github.example/draft/1"
+
+        def git_push_credentials(self, _project, repository_url, _connection_name):
+            return SimpleNamespace(remote_url=repository_url, environment={})
+
+    integrations = Integrations()
+    with pytest.raises(WorkspaceError, match="Confirm"):
+        service.create_draft_pull_requests(
+            task.id,
+            DraftPullRequestRequest(title="Delivery"),
+            integrations,  # type: ignore[arg-type]
+        )
+    records = service.create_draft_pull_requests(
+        task.id,
+        DraftPullRequestRequest(title="Delivery", confirmed=True),
+        integrations,  # type: ignore[arg-type]
+    )
+
+    assert records[0].status == "published"
+    assert records[0].external_url == "https://github.example/draft/1"
+    assert integrations.calls[0]["head"] == task.workspaces[0].task_branch
+    assert service.get_session(task.id).deliveries[0].action == "draft_pull_request"
+    assert service.delivery_plan(task.id).items[0].status == "published"
+
+
+def test_deleting_a_project_removes_its_managed_playbook_cache(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    (repo / "AGENTS.md").write_text("Keep tests green.\n", encoding="utf-8")
+    git(repo, "add", "AGENTS.md")
+    git(repo, "commit", "-m", "guidance")
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Playbook",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    service.playbooks.configure(project.id, str(repo), branch)
+    cache = service.playbooks.root / project.id
+
+    service.delete_project(project.id)
+
+    assert not cache.exists()
+    with pytest.raises(KeyError):
+        service.projects.get(project.id)
+
+
+def test_failed_project_setup_is_visible_to_the_agent_without_stranding_the_task(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Recoverable",
+            folders=[ProjectFolder(
+                id="app",
+                name="App",
+                path=str(repo),
+                commands=[ProjectCommand(
+                    id="setup",
+                    label="Install dependencies",
+                    argv=["git", "definitely-not-a-command"],
+                    phase="setup",
+                )],
+            )],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+
+    task = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Recover and finish the feature"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, task.id, SessionStatus.completed)
+
+    restored = service.get_session(task.id)
+    assert engine.prompts == ["Recover and finish the feature"]
+    assert "Install dependencies" in engine.configs[0].developer_instructions
+    assert Path(restored.workspace_path).is_dir()
+    assert any(event.title == "Install dependencies" and event.phase == "failed" for event in service.events(task.id).items)
+
+
+def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    engine = FakeEngine()
+    first = service_with(tmp_path, engine)
+    project = first.projects.create(
+        ProjectCreateRequest(
+            name="Restart",
+            folders=[
+                ProjectFolder(id="app", name="App", path=str(repo)),
+                ProjectFolder(id="notes", name="Notes", path=str(notes)),
+            ],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    task = first.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="First turn"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(first, task.id, SessionStatus.completed)
+    original_paths = [item.workspace_path for item in first.get_session(task.id).workspaces]
+    original_ports = first.get_session(task.id).allocated_ports
+    original_engine_session_id = first.get_session(task.id).engine_session_id
+    first.close_all()
+
+    restarted_engine = FakeEngine()
+    restarted = service_with(tmp_path, restarted_engine)
+    loaded = restarted.get_session(task.id)
+    restarted.submit_turn(task.id, "Continue", CREDS)
+    wait_for_status(restarted, task.id, SessionStatus.completed)
+    next_task = restarted.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Parallel task"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+
+    assert [item.workspace_path for item in loaded.workspaces] == original_paths
+    assert loaded.allocated_ports == original_ports
+    assert restarted_engine.existing_ids[0] == original_engine_session_id
+    assert next_task.allocated_ports["PORT"] != original_ports["PORT"]
