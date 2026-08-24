@@ -49,6 +49,50 @@ async def _start_channels(app: FastAPI) -> None:
         )
 
 
+# Hard ceiling on the boot-time model-map warm. This runs during lifespan
+# startup, i.e. BEFORE uvicorn binds the port, so an unbounded fetch against a
+# degraded MindsHub would make the desktop app unreachable — and past the
+# client's 180s start cap (see cowork src/shared/server-status.ts), a hard
+# start failure. Bounded, the worst case is a short boot delay after which we
+# bind with the last-known-good map and let GET /recommended-models warm it.
+_BOOT_WARM_TIMEOUT_S = 3.0
+
+
+async def _warm_model_map_on_boot() -> bool:
+    """Warm the MindsHub availability map at boot when a key is already stored
+    (desktop, returning user), so the FIRST turn heals a stored paid pin instead
+    of 402'ing against an empty map (ENG-748). Since ENG-1652 the unset default
+    is already free (floored by ``role_defaults``); the map is what steers a
+    stored *paid pin* off an unaffordable model on a free-tier wallet.
+
+    Desktop only: org mode stores no key and is floored by ``role_defaults``.
+
+    Bounded (``_BOOT_WARM_TIMEOUT_S``) and fail-open — never raises, never blocks
+    the socket bind past the ceiling, and never clobbers a known-good map. On a
+    fresh desktop sign-in the credential is written to ``.env`` before the server
+    (re)starts, so ``run_dev_setup``'s env→DB migration seeds the key ahead of
+    this warm; the returning-user case already has the key stored. Returns True
+    iff the stored map was updated.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return False
+    from cowork.db.session import get_open_session
+    from cowork.services.providers import warm_enabled_model_map
+
+    warm_session = get_open_session()
+    try:
+        return await asyncio.wait_for(
+            warm_enabled_model_map(warm_session), timeout=_BOOT_WARM_TIMEOUT_S
+        )
+    except Exception as exc:
+        # Message only, never exc_info: the warm frames hold the MindsHub API
+        # key, and RICH_LOGGING's tracebacks_show_locals would render it.
+        logger.warning("model-map boot warm failed (non-fatal): %s", exc)
+        return False
+    finally:
+        warm_session.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
@@ -94,6 +138,12 @@ async def lifespan(app: FastAPI):
             recovery_session.close()
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
+    # Warm the MindsHub availability map at boot (desktop, returning or
+    # freshly-signed-in user) so the empty-map state — which keeps a stored
+    # paid pin and 402s the first message on a free-tier wallet (ENG-748) —
+    # is closed before the first turn. Bounded and fail-open; see the helper.
+    if await _warm_model_map_on_boot():
+        logger.info("warmed MindsHub model-availability map on boot")
     start_scheduler()
     await _start_channels(app)
     app.state.channel_ingress_reconciler = None
