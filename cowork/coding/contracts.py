@@ -186,6 +186,20 @@ class TaskWorkspace(BaseModel):
     source_dirty: bool = False
 
 
+class SourceComment(BaseModel):
+    id: str = Field(default="", max_length=512)
+    author: str = Field(default="", max_length=512)
+    body: str = Field(default="", max_length=20_000)
+    url: str = Field(default="", max_length=8_192)
+    created_at: str = Field(default="", max_length=120)
+
+
+class SourceAttachment(BaseModel):
+    id: str = Field(default="", max_length=512)
+    title: str = Field(default="", max_length=512)
+    url: str = Field(min_length=1, max_length=8_192)
+
+
 class SourceContext(BaseModel):
     provider: Literal["github", "linear", "slack"]
     kind: Literal["issue", "pull_request", "conversation"]
@@ -194,6 +208,10 @@ class SourceContext(BaseModel):
     external_id: str = Field(default="", max_length=512)
     connection_name: str | None = Field(default=None, max_length=512)
     body: str = Field(default="", max_length=100_000)
+    state: str = Field(default="", max_length=120)
+    author: str = Field(default="", max_length=512)
+    comments: list[SourceComment] = Field(default_factory=list, max_length=100)
+    attachments: list[SourceAttachment] = Field(default_factory=list, max_length=100)
 
 
 class DeliveryRecord(BaseModel):
