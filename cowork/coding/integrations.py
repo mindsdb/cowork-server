@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import base64
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from cowork.coding.contracts import SourceAttachment, SourceComment
+from cowork.coding.github_pull_requests import GitHubPullRequests
 from cowork.coding.project_models import (
     CodeProject,
     DeliveryRecord,
     IntegrationStatus,
     ProjectConnection,
     PublishRequest,
+    PullRequestActionRequest,
     PullRequestStatus,
     SourceContext,
     SourceContextRequest,
@@ -174,46 +178,40 @@ class DeveloperIntegrationService:
         owner, repository, resource, number = self._github_target(url, host)
         if resource != "pulls":
             raise WorkspaceError("The linked GitHub delivery is not a pull request")
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-        pull = self._request("GET", f"{api}/repos/{owner}/{repository}/pulls/{number}", headers=headers).json()
-        head = str((pull.get("head") or {}).get("sha") or "")
-        unavailable: list[str] = []
-        try:
-            reviews = self._request(
-                "GET",
-                f"{api}/repos/{owner}/{repository}/pulls/{number}/reviews",
-                headers=headers,
-                params={"per_page": 100},
-            ).json()
-        except WorkspaceError:
-            reviews = []
-            unavailable.append("review status")
-        checks: dict[str, Any] = {}
-        combined: dict[str, Any] = {}
-        if head:
-            try:
-                checks = self._request(
-                    "GET",
-                    f"{api}/repos/{owner}/{repository}/commits/{head}/check-runs",
-                    headers=headers,
-                    params={"per_page": 100},
-                ).json()
-            except WorkspaceError:
-                unavailable.append("check runs")
-            try:
-                combined = self._request(
-                    "GET",
-                    f"{api}/repos/{owner}/{repository}/commits/{head}/status",
-                    headers=headers,
-                ).json()
-            except WorkspaceError:
-                unavailable.append("commit status")
-        return PullRequestStatus(
-            state=self._pull_request_state(pull),
-            review_state=self._review_state(reviews if isinstance(reviews, list) else []),
-            ci_state=self._ci_state(checks, combined),
-            detail=f"Could not load {', '.join(unavailable)}" if unavailable else "",
+        return GitHubPullRequests(
+            self._request,
+            api=api,
+            token=token,
+            host=host,
+            owner=owner,
+            repository=repository,
+            number=number,
+            url=url,
+        ).status()
+
+    def pull_request_action(
+        self,
+        project: CodeProject,
+        request: PullRequestActionRequest,
+    ) -> PullRequestStatus:
+        if not request.confirmed:
+            raise WorkspaceError("Confirm this GitHub action before publishing it")
+        _, fields = self._connection(project, "github", request.connection_name)
+        api, token, host = self._github_credentials(fields)
+        owner, repository, resource, number = self._github_target(request.target_url, host)
+        if resource != "pulls":
+            raise WorkspaceError("The linked GitHub delivery is not a pull request")
+        pull_requests = GitHubPullRequests(
+            self._request,
+            api=api,
+            token=token,
+            host=host,
+            owner=owner,
+            repository=repository,
+            number=number,
+            url=request.target_url,
         )
+        return pull_requests.mark_ready() if request.action == "ready" else pull_requests.merge()
 
     def _connection(
         self,
@@ -244,12 +242,30 @@ class DeveloperIntegrationService:
     ) -> SourceContext:
         api, token, host = self._github_credentials(fields)
         owner, repository, resource, number = self._github_target(request.url, host)
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
         response = self._request(
             "GET",
             f"{api}/repos/{owner}/{repository}/{resource}/{number}",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            headers=headers,
         )
         payload = response.json()
+        comments_payload = self._request(
+            "GET",
+            f"{api}/repos/{owner}/{repository}/issues/{number}/comments",
+            headers=headers,
+            params={"per_page": 50},
+        ).json()
+        comments = [
+            SourceComment(
+                id=str(item.get("id") or ""),
+                author=str((item.get("user") or {}).get("login") or ""),
+                body=str(item.get("body") or "")[:20_000],
+                url=str(item.get("html_url") or ""),
+                created_at=str(item.get("created_at") or ""),
+            )
+            for item in (comments_payload if isinstance(comments_payload, list) else [])[:50]
+        ]
+        attachment_texts = [str(payload.get("body") or ""), *(comment.body for comment in comments)]
         return SourceContext(
             provider="github",
             kind="pull_request" if resource == "pulls" else "issue",
@@ -258,6 +274,10 @@ class DeveloperIntegrationService:
             external_id=f"{owner}/{repository}#{number}",
             connection_name=connection.name,
             body=str(payload.get("body") or ""),
+            state=str(payload.get("state") or ""),
+            author=str((payload.get("user") or {}).get("login") or ""),
+            comments=comments,
+            attachments=self._markdown_attachments(attachment_texts),
         )
 
     def _read_linear(
@@ -274,9 +294,31 @@ class DeveloperIntegrationService:
             kind="issue",
             url=str(issue.get("url") or request.url),
             title=str(issue.get("title") or ""),
-            external_id=str(issue.get("id") or issue.get("identifier") or identifier),
+            external_id=str(issue.get("identifier") or issue.get("id") or identifier),
             connection_name=connection.name,
             body=str(issue.get("description") or ""),
+            state=str((issue.get("state") or {}).get("name") or ""),
+            author=str((issue.get("creator") or {}).get("name") or ""),
+            comments=[
+                SourceComment(
+                    id=str(item.get("id") or ""),
+                    author=str((item.get("user") or {}).get("name") or ""),
+                    body=str(item.get("body") or "")[:20_000],
+                    url=str(item.get("url") or ""),
+                    created_at=str(item.get("createdAt") or ""),
+                )
+                for item in ((issue.get("comments") or {}).get("nodes") or [])[:50]
+                if isinstance(item, dict)
+            ],
+            attachments=[
+                SourceAttachment(
+                    id=str(item.get("id") or ""),
+                    title=str(item.get("title") or "Attachment"),
+                    url=str(item.get("url") or ""),
+                )
+                for item in ((issue.get("attachments") or {}).get("nodes") or [])[:50]
+                if isinstance(item, dict) and item.get("url")
+            ],
         )
 
     def _linear_issue(self, identifier: str, token: str) -> dict[str, Any]:
@@ -285,7 +327,7 @@ class DeveloperIntegrationService:
             "https://api.linear.app/graphql",
             headers={"Authorization": token, "Content-Type": "application/json"},
             json={
-                "query": "query CodeIssue($id: String!) { issue(id: $id) { id identifier title description url } }",
+                "query": "query CodeIssue($id: String!) { issue(id: $id) { id identifier title description url state { name } creator { name } comments(first: 50) { nodes { id body createdAt user { name } } } attachments(first: 50) { nodes { id title url } } } }",
                 "variables": {"id": identifier},
             },
         )
@@ -391,43 +433,22 @@ class DeveloperIntegrationService:
         return response
 
     @staticmethod
-    def _pull_request_state(payload: dict[str, Any]) -> str:
-        if payload.get("merged") or payload.get("merged_at"):
-            return "merged"
-        if payload.get("draft"):
-            return "draft"
-        return "closed" if payload.get("state") == "closed" else "open"
-
-    @staticmethod
-    def _review_state(reviews: list[dict[str, Any]]) -> str:
-        latest: dict[str, str] = {}
-        for review in reviews:
-            actor = str((review.get("user") or {}).get("login") or review.get("id") or "")
-            state = str(review.get("state") or "").upper()
-            if actor and state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
-                latest[actor] = state
-        if "CHANGES_REQUESTED" in latest.values():
-            return "changes_requested"
-        if "APPROVED" in latest.values():
-            return "approved"
-        return "pending" if reviews else "none"
-
-    @staticmethod
-    def _ci_state(checks: dict[str, Any], combined: dict[str, Any]) -> str:
-        runs = checks.get("check_runs") if isinstance(checks, dict) else []
-        runs = runs if isinstance(runs, list) else []
-        combined_statuses = combined.get("statuses") if isinstance(combined, dict) else []
-        has_combined_status = isinstance(combined_statuses, list) and bool(combined_statuses)
-        combined_state = str(combined.get("state") or "").lower() if has_combined_status else ""
-        conclusions = {str(item.get("conclusion") or "").lower() for item in runs if isinstance(item, dict)}
-        statuses = {str(item.get("status") or "").lower() for item in runs if isinstance(item, dict)}
-        if combined_state in {"failure", "error"} or conclusions & {"failure", "timed_out", "cancelled", "action_required", "stale"}:
-            return "failing"
-        if combined_state == "pending" or statuses & {"queued", "in_progress", "pending"}:
-            return "pending"
-        if runs or combined_state:
-            return "passing"
-        return "none"
+    def _markdown_attachments(texts: list[str]) -> list[SourceAttachment]:
+        pattern = re.compile(r"(?:!\[[^\]]*\]\(|\[[^\]]+\]\()(?P<url>https?://[^)\s]+)\)")
+        result: list[SourceAttachment] = []
+        seen: set[str] = set()
+        for text in texts:
+            for match in pattern.finditer(text):
+                url = match.group("url")
+                path = urlparse(url).path
+                if url in seen or not ("/user-attachments/" in path or "." in path.rsplit("/", 1)[-1]):
+                    continue
+                seen.add(url)
+                title = path.rsplit("/", 1)[-1] or "Attachment"
+                result.append(SourceAttachment(id=url, title=title[:512], url=url))
+                if len(result) >= 100:
+                    return result
+        return result
 
     @staticmethod
     def _secret(fields: dict[str, Any], *names: str) -> str:
