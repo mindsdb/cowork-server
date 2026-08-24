@@ -387,6 +387,11 @@ class TurnQueueSettings(Settings):
         default="inprocess",
         description="Turn-queue backend: 'inprocess' (single-instance, default) or 'remote' (Redis-backed, multi-instance).",
     )
+
+    @property
+    def is_remote(self) -> bool:
+        return self.backend == "remote"
+
     redis_url: str = Field(
         default="redis://localhost:6379/0",
         description="Redis connection URL used when backend is 'remote'.",

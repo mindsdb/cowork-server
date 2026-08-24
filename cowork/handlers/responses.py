@@ -606,7 +606,7 @@ class ResponsesHandler:
         read.
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-        if TurnQueueSettings().backend == "remote":
+        if TurnQueueSettings().is_remote:
             return self._produce_remote(
                 lifecycle=lifecycle,
                 conv_id=conv_id,
