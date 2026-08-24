@@ -119,13 +119,21 @@ def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
 
 
 def _fetch_userinfo_supabase(access_token: str) -> dict[str, Any]:
-    """Supabase Management API has no userinfo endpoint. Use the first
-    accessible organization as a stable, non-secret account identity."""
-    result = _json_request(
-        "https://api.supabase.com/v1/organizations",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    organizations = result if isinstance(result, list) else result.get("organizations", [])
+    """Resolve a Supabase OAuth grant to a stable organization identity."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    organizations: list[dict[str, Any]] = []
+    try:
+        result = _json_request("https://api.supabase.com/v1/organizations", headers=headers)
+        organizations = result if isinstance(result, list) else result.get("organizations", [])
+    except HTTPException:
+        pass
+    if not organizations:
+        result = _json_request("https://api.supabase.com/v1/projects", headers=headers)
+        projects = result if isinstance(result, list) else result.get("projects", [])
+        organizations = [
+            {"slug": project.get("organization_slug"), "name": project.get("organization_name")}
+            for project in projects if project.get("organization_slug")
+        ]
     first = organizations[0] if organizations else {}
     slug = str(first.get("slug") or "").strip()
     name = str(first.get("name") or slug).strip()
@@ -172,6 +180,27 @@ def _revoke_github(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_supabase(token: str, client_id: str, client_secret: str) -> None:
+    """Supabase's OAuth revoke endpoint doesn't fit the generic RFC-7009
+    form-body pattern the other connectors use: it requires a JSON body
+    naming `client_id`, `client_secret`, and the `refresh_token` specifically
+    (revoking only an access_token isn't supported and wouldn't remove
+    mindshub from the user's Supabase-side Authorized Apps list, since that
+    list reflects the underlying grant, not any one short-lived token)."""
+    request = Request(
+        "https://api.supabase.com/v1/oauth/revoke",
+        data=json.dumps({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": token,
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
 def _revoke_posthog(token: str, client_id: str, client_secret: str) -> None:
     """PostHog is a public client — there's no client_secret to authenticate
     the revoke call with (unlike GitHub's Basic-auth grant-revoke above), so
@@ -195,6 +224,7 @@ def _revoke_posthog(token: str, client_id: str, client_secret: str) -> None:
 _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
     "posthog": _revoke_posthog,
+    "supabase": _revoke_supabase,
 }
 
 

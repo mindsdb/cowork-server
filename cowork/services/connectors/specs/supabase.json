@@ -40,11 +40,12 @@
         "oauth": {
           "auth_url": "https://api.supabase.com/v1/oauth/authorize",
           "token_url": "https://api.supabase.com/v1/oauth/token",
+          "revoke_url": "https://api.supabase.com/v1/oauth/revoke",
           "scopes": ["projects:read", "organizations:read"],
           "service_id": "supabase",
           "token_auth_style": "basic",
           "supports_refresh": true,
-          "supports_revoke": false,
+          "supports_revoke": true,
           "redirect_port": 47292,
           "redirect_host": "localhost"
         }
