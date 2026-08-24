@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,12 +39,20 @@ def user_skills_root() -> Path:
     return (Path(codex_home).expanduser() if codex_home else Path.home() / ".codex") / "skills"
 
 
-def client_environment(codex_home: Path) -> dict[str, str]:
+def client_environment(
+    codex_home: Path,
+    project_environment: tuple[tuple[str, str], ...] = (),
+) -> dict[str, str]:
     """Build the child env without placing the user's MindsHub key in it."""
-    return {
+    environment = dict(project_environment)
+    # Runtime-owned values win over project configuration. Otherwise a project
+    # could accidentally point Codex at a different home or break the private
+    # loopback credential used by the inference proxy.
+    environment.update({
         "CODEX_HOME": str(codex_home),
         "MINDSHUB_CODEX_API_KEY": LOCAL_PROXY_TOKEN,
-    }
+    })
+    return environment
 
 
 def turn_input(
@@ -113,6 +122,10 @@ def toml_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def toml_array(values: tuple[str, ...]) -> str:
+    return "[" + ",".join(toml_string(value) for value in values) + "]"
+
+
 def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) -> CodexLaunchConfig:
     """Translate Cowork runtime controls into one consistent Codex launch policy."""
     resolved_approval = approval_policy(config.permission_mode)
@@ -140,18 +153,31 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         overrides.append(f'service_tier="{config.service_tier}"')
     if config.personality and config.personality != "none":
         overrides.append(f'personality="{config.personality}"')
+    if config.session_id and config.cowork_root:
+        overrides.extend([
+            f"mcp_servers.mindshub_code.command={toml_string(sys.executable)}",
+            "mcp_servers.mindshub_code.args=" + toml_array((
+                "-m",
+                "cowork.coding.integration_mcp",
+                config.cowork_root,
+                config.session_id,
+            )),
+        ])
+    thread_params = {
+        "cwd": str(workspace),
+        "model": config.model,
+        "modelProvider": "mindshub",
+        "approvalPolicy": resolved_approval,
+        "approvalsReviewer": "user",
+        "sandbox": resolved_sandbox,
+        "serviceTier": config.service_tier,
+        "personality": config.personality,
+    }
+    if config.developer_instructions:
+        thread_params["developerInstructions"] = config.developer_instructions
     return CodexLaunchConfig(
         approval_policy=resolved_approval,
         sandbox_policy=resolved_policy,
         config_overrides=tuple(overrides),
-        thread_params={
-            "cwd": str(workspace),
-            "model": config.model,
-            "modelProvider": "mindshub",
-            "approvalPolicy": resolved_approval,
-            "approvalsReviewer": "user",
-            "sandbox": resolved_sandbox,
-            "serviceTier": config.service_tier,
-            "personality": config.personality,
-        },
+        thread_params=thread_params,
     )
