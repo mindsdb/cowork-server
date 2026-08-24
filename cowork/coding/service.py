@@ -41,6 +41,8 @@ from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.playbooks import PlaybookService
+from cowork.coding.skill_library import SkillLibraryService
+from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PullRequestActionRequest,
@@ -55,6 +57,7 @@ from cowork.coding.store import CodingStore
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn, mark_running
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from cowork.common.paths import cowork_home
+from cowork.services.skills import SkillService
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +78,8 @@ class CodingService:
         self.project_store = CodeProjectStore(root)
         self.projects = CodeProjectService(root, self.project_store, self.workspaces)
         self.playbooks = PlaybookService(root, self.project_store, self.workspaces.git)
+        self.skill_library = SkillLibraryService(root, self.project_store, self.workspaces.git)
+        self.skill_runtime = SkillRuntimeResolver(self.skill_library)
         self.project_workspaces = ProjectWorkspaceManager(self.workspaces)
         self.delivery = ProjectDeliveryService(self.workspaces.git)
         self._lock = threading.RLock()
@@ -88,6 +93,7 @@ class CodingService:
             self.workspaces,
             self.projects,
             self.playbooks,
+            self.skill_runtime,
             self.project_workspaces,
             self._emit,
         )
@@ -151,6 +157,7 @@ class CodingService:
                     session.base_revision,
                 )
             self.store.delete_session(session.id)
+            self.skill_runtime.cleanup(session.id)
 
     def rename_session(self, session_id: str, title: str) -> CodingSession:
         normalized = " ".join(title.split())
@@ -213,6 +220,7 @@ class CodingService:
                 prepared_kind = prepared.workspace_kind if isinstance(prepared, TaskWorkspace) else prepared.kind
                 prepared_warning = None if isinstance(prepared, TaskWorkspace) else prepared.warning
                 try:
+                    child_skill_roots = self.skill_runtime.clone(parent.id, new_id)
                     parent_runtime = self.runtimes.open_locked(parent, credentials)
                     child = parent.model_copy(
                         update={
@@ -229,6 +237,7 @@ class CodingService:
                             "allocated_ports": child_ports,
                             "environment": child_environment,
                             "developer_instructions": instructions,
+                            "skill_roots": child_skill_roots,
                             "engine_session_id": None,
                             "active_turn_id": None,
                             "pending_approval": None,
@@ -259,6 +268,7 @@ class CodingService:
                     )
                     return self.get_session(child.id)
                 except Exception:
+                    self.skill_runtime.cleanup(new_id)
                     if child_workspaces:
                         self.project_workspaces.cleanup(new_id, child_workspaces)
                     else:
@@ -285,8 +295,21 @@ class CodingService:
         items = self.store.wait_for_events(session_id, max(0, after), timeout)
         return EventPage(items=items, next_seq=items[-1].seq if items else max(0, after))
 
-    def create_session(self, request: SessionCreateRequest, credentials: EngineCredentials, default_engine: str, default_model: str) -> CodingSession:
-        session = self.session_factory.create(request, credentials, default_engine, default_model)
+    def create_session(
+        self,
+        request: SessionCreateRequest,
+        credentials: EngineCredentials,
+        default_engine: str,
+        default_model: str,
+        personal_skills: SkillService | None = None,
+    ) -> CodingSession:
+        session = self.session_factory.create(
+            request,
+            credentials,
+            default_engine,
+            default_model,
+            personal_skills,
+        )
         try:
             self.submit_turn(session.id, request.prompt, credentials, request.attachments)
         except Exception:

@@ -13,6 +13,7 @@ from cowork.coding.contracts import (  # noqa: F401
     SourceContext,
     utc_now,
 )
+from cowork.coding.skill_models import ProjectSkillSource
 
 
 def _valid_environment_name(name: str) -> bool:
@@ -100,6 +101,7 @@ class CodeProject(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     folders: list[ProjectFolder] = Field(min_length=1, max_length=24)
     playbook: PlaybookReference | None = None
+    skill_sources: list[ProjectSkillSource] = Field(default_factory=list, max_length=24)
     connections: list[ProjectConnection] = Field(default_factory=list, max_length=24)
     environment: ProjectEnvironment = Field(default_factory=ProjectEnvironment)
     default_engine_id: str = "codex"
@@ -119,6 +121,9 @@ class CodeProject(BaseModel):
         connections = [(item.provider, item.name) for item in self.connections]
         if len(connections) != len(set(connections)):
             raise ValueError("the same connection cannot be added twice")
+        source_ids = [item.source_id for item in self.skill_sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("the same skill source cannot be added twice")
         return self
 
 

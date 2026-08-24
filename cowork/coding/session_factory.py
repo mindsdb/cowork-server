@@ -22,7 +22,9 @@ from cowork.coding.project_models import CodeProject
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.store import CodingStore
+from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.workspace import WorkspaceManager
+from cowork.services.skills import SkillService
 
 EventEmitter = Callable[[str, CodingEvent], CodingEvent]
 TASK_TITLE_MAX_LENGTH = 72
@@ -87,6 +89,7 @@ class CodingSessionFactory:
         workspaces: WorkspaceManager,
         projects: CodeProjectService,
         playbooks: PlaybookService,
+        skills: SkillRuntimeResolver,
         project_workspaces: ProjectWorkspaceManager,
         emit: EventEmitter,
     ) -> None:
@@ -95,6 +98,7 @@ class CodingSessionFactory:
         self.workspaces = workspaces
         self.projects = projects
         self.playbooks = playbooks
+        self.skills = skills
         self.project_workspaces = project_workspaces
         self.emit = emit
 
@@ -104,6 +108,7 @@ class CodingSessionFactory:
         credentials: EngineCredentials,
         default_engine: str,
         default_model: str,
+        personal_skills: SkillService | None = None,
     ) -> CodingSession:
         project = self.projects.get(request.project_id) if request.project_id else None
         engine_id = request.engine_id or (project.default_engine_id if project else default_engine)
@@ -125,7 +130,7 @@ class CodingSessionFactory:
                 task_workspaces = list(prepared_project.workspaces)
                 project_dirs = [workspace.workspace_path for workspace in task_workspaces[1:]]
                 allocated_ports = prepared_project.ports
-                guidance, guidance_summary = self.playbooks.guidance(project.id) if project.playbook else ("", None)
+                guidance, playbook_summary = self.playbooks.guidance(project.id) if project.playbook else ("", None)
                 permission_mode = request.permission_mode if "permission_mode" in request.model_fields_set else project.permission_mode
                 environment = {
                     **project.environment.variables,
@@ -144,9 +149,16 @@ class CodingSessionFactory:
                     source_dirty=prepared_single.source_dirty,
                 )
                 single_workspace = prepared
-                project_dirs, allocated_ports, guidance, guidance_summary, environment = [], {}, "", None, {}
+                project_dirs, allocated_ports, guidance, playbook_summary, environment = [], {}, "", None, {}
                 permission_mode = request.permission_mode
             contexts = list(request.source_contexts)
+            skill_resolution = self.skills.resolve(session_id, project, personal_skills)
+            guidance_summary = " · ".join(
+                part for part in (playbook_summary, skill_resolution.summary) if part
+            ) or None
+            instructions = project_instructions(project, task_workspaces, contexts, guidance)
+            if skill_resolution.developer_instructions:
+                instructions = f"{instructions}\n\n{skill_resolution.developer_instructions}".strip()
             session = CodingSession(
                 id=session_id,
                 title=task_title(request.prompt),
@@ -170,7 +182,10 @@ class CodingSessionFactory:
                 base_revision=prepared.base_revision,
                 source_dirty=prepared.source_dirty,
                 guidance_summary=guidance_summary,
-                developer_instructions=project_instructions(project, task_workspaces, contexts, guidance),
+                developer_instructions=instructions,
+                resolved_skills=skill_resolution.items,
+                skill_roots=skill_resolution.roots,
+                skill_instructions=skill_resolution.developer_instructions,
                 environment=environment,
                 allocated_ports=allocated_ports,
                 source_contexts=contexts,
@@ -181,6 +196,7 @@ class CodingSessionFactory:
                 self._run_setup(session, project)
             return self.store.load_session(session.id)
         except Exception:
+            self.skills.cleanup(session_id)
             self.discard_by_id(session_id, task_workspaces, single_workspace)
             raise
 
@@ -213,6 +229,7 @@ class CodingSessionFactory:
             self.store.delete_session(session_id)
         except FileNotFoundError:
             pass
+        self.skills.cleanup(session_id)
 
     def _emit_workspace_ready(self, session: CodingSession) -> None:
         count = len(session.workspaces) or 1
