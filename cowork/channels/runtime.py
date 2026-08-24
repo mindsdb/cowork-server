@@ -18,12 +18,13 @@ from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context
 from cowork.db.session import get_open_session
-from cowork.harnesses.base import ChannelContext, get_harness
+from cowork.handlers.responses import ResponsesHandler
+from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.models.project import Project
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
 from cowork.services.channel_bindings import ChannelBindingService
@@ -31,6 +32,7 @@ from cowork.services.channels import ChannelConfigService, resolve_installation_
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.skills import SkillService
+from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 log = logging.getLogger(__name__)
 
@@ -460,6 +462,31 @@ class AntonChannelRuntime:
             return pinned
         return (get_user_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
 
+    async def _turn_stream(
+        self, harness: HarnessProvider, harness_id: str, scoped: ScopedSession,
+        conversation: Conversation, blocks: list[dict], text: str,
+        channel_context: ChannelContext | None, turn_rows: list,
+    ):
+        """The one place a channel turn picks in-process vs remote-worker
+        execution; the rest of _run_anton is identical either way."""
+        if not TurnQueueSettings().is_remote:
+            return harness.stream_response(
+                conversation=conversation, input=blocks, channel_context=channel_context,
+                trace_metadata=build_trace_metadata(),
+            )
+        await asyncio.to_thread(
+            ResponsesHandler._stage_remote_workspace_files, scoped, conversation.id,
+        )
+        return remote_turn_events(
+            session=scoped,
+            conv_id=conversation.id,
+            org_id=scoped.scope.org_id,
+            user_id=None,  # channel turns are org-scoped, not per-member
+            input_text=text,
+            model=None,  # deployment default, same as browser turns with no override
+            turn_rows=turn_rows,
+        )
+
     async def _run_anton(
         self, scoped: ScopedSession, conversation: Conversation, event: Any, adapter: Any = None,
         *, channel_context: ChannelContext | None = None,
@@ -503,18 +530,15 @@ class AntonChannelRuntime:
             if event_type == "response.output_text.delta":
                 collected.append(data.get("delta", ""))
 
-        stream = harness.stream_response(
-            conversation=conversation,
-            input=blocks,
-            channel_context=channel_context,
-            # Channel turns don't pass through ResponsesHandler, so they need
-            # their own build stamp (ENG-1279) — a bot turn is otherwise
-            # unattributable to the release that produced it.
-            trace_metadata=build_trace_metadata(),
+        stream = await self._turn_stream(
+            harness, harness_id, scoped, conversation, blocks, text, channel_context, turn_rows,
         )
+        remote_failure: RemoteTurnFailed | None = None
         try:
             async for _chunk in harness.formatter(stream, harness_id, event_sink):
                 pass
+        except RemoteTurnFailed as exc:
+            remote_failure = exc
         finally:
             # Persist the user message only after the harness has read this
             # turn's history (it reads via a fresh query). Persisting earlier
@@ -525,7 +549,7 @@ class AntonChannelRuntime:
                 conversation.id, content, created_at=sent_at
             )
 
-        reply = "".join(collected)
+        reply = remote_failure.message if remote_failure is not None else "".join(collected)
         ConversationService(scoped).save_assistant_turn(
             conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
         )
