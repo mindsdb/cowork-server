@@ -7,9 +7,9 @@ next turn's LLM history so the agent remembers what it did.
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
-from cowork.harnesses.anton_harness.harness import (
-    _sanitize_tool_result,
-    _split_turn_into_rows,
+from anton.cloud_turn.history_rows import (
+    sanitize_tool_result as _sanitize_tool_result,
+    split_turn_into_rows as _split_turn_into_rows,
 )
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.models.conversation import Conversation
