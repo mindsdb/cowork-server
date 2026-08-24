@@ -32,17 +32,18 @@ from cowork.coding.contracts import (
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
 from cowork.coding.integrations import DeveloperIntegrationService
-from cowork.coding.redaction import redact_text
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PlaybookConfigureRequest,
     PlaybookItemsRequest,
-    PublishRequest,
     ProjectCreateRequest,
     ProjectPage,
     ProjectUpdateRequest,
+    PublishRequest,
+    PullRequestActionRequest,
     SourceContextRequest,
 )
+from cowork.coding.redaction import redact_text
 from cowork.coding.service import CodingService, get_coding_service
 from cowork.coding.workspace import WorkspaceError
 from cowork.common.settings.user_settings import Provider, provider_api_key_str
@@ -563,6 +564,11 @@ def create_draft_pull_requests(session_id: str, body: DraftPullRequestRequest, i
             integrations,
         )
     }
+
+
+@router.post("/sessions/{session_id}/pull-request-action")
+def pull_request_action(session_id: str, body: PullRequestActionRequest, integrations: IntegrationsDep):
+    return _call(_service().pull_request_action, session_id, body, integrations)
 
 
 @router.post("/sessions/{session_id}/publish")

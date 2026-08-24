@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -39,17 +40,23 @@ from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
 from cowork.coding.integrations import DeveloperIntegrationService
-from cowork.coding.runtime import RuntimeManager, engine_workspace_path
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_models import DraftPullRequestRequest
+from cowork.coding.project_models import (
+    DraftPullRequestRequest,
+    PullRequestActionRequest,
+    PullRequestStatus,
+)
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.runtime import RuntimeManager, engine_workspace_path
 from cowork.coding.session_factory import CodingSessionFactory
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn, mark_running
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from cowork.common.paths import cowork_home
+
+logger = logging.getLogger(__name__)
 
 
 class CodingService:
@@ -513,9 +520,10 @@ class CodingService:
                 if not session.queued_instructions:
                     return session
                 instruction = session.queued_instructions[0]
+                instruction_id = instruction.id
                 self.store.update_session(
                     session_id,
-                    lambda current: self._remove_queued_instruction(current, instruction.id),
+                    lambda current, target_id=instruction_id: self._remove_queued_instruction(current, target_id),
                 )
                 try:
                     result = self._submit_turn(
@@ -526,9 +534,10 @@ class CodingService:
                         maintenance_reserved=True,
                     )
                 except Exception:
+                    queued_instruction = instruction
                     self.store.update_session(
                         session_id,
-                        lambda current: current.queued_instructions.insert(0, instruction),
+                        lambda current, queued=queued_instruction: current.queued_instructions.insert(0, queued),
                     )
                     raise
                 if result.status in {SessionStatus.running, SessionStatus.awaiting_approval}:
@@ -713,6 +722,31 @@ class CodingService:
             )
             return records
 
+    def pull_request_action(
+        self,
+        session_id: str,
+        request: PullRequestActionRequest,
+        integrations: DeveloperIntegrationService,
+    ) -> PullRequestStatus:
+        with self._maintenance_session(
+            session_id,
+            "Wait for the active turn to finish before updating a pull request",
+        ) as session:
+            if not session.project_id:
+                raise WorkspaceError("This task is not linked to a Code Project")
+            project = self.projects.get(session.project_id)
+            status = integrations.pull_request_action(project, request)
+            self._emit(
+                session.id,
+                CodingEvent(
+                    type=EventType.session,
+                    title="Pull request updated",
+                    text="Marked ready for review." if request.action == "ready" else "Merged on GitHub.",
+                    phase="completed",
+                ),
+            )
+            return status
+
     def discover_models(self, engine_id: str, credentials: EngineCredentials) -> list[str]:
         return self.registry.get(engine_id).discover_models(credentials)
 
@@ -808,7 +842,7 @@ class CodingService:
             except Exception:
                 # Shutdown must continue releasing the remaining tasks and
                 # runtimes even if one persisted approval cannot be updated.
-                pass
+                logger.exception("Could not cancel approval while shutting down task %s", session_id)
         return self.turns.interrupt(active_sessions)
 
     def _approval_opened(self, session_id: str, pending: PendingApproval) -> None:
