@@ -42,6 +42,10 @@ class _FakeBuffer:
         self.records: list[tuple] = []
         self.closed: str | None = None
 
+    @property
+    def latest_seq(self) -> int:
+        return len(self.records)
+
     async def append(self, type_, data):
         self.records.append((type_, data))
         return len(self.records)

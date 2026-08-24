@@ -28,4 +28,5 @@ OAUTH_SERVICES: dict[str, OAuthServiceConfig] = {
     "linear": OAuthServiceConfig(engine="linear"),
     "github": OAuthServiceConfig(engine="github"),
     "supabase": OAuthServiceConfig(engine="supabase"),
+    "posthog": OAuthServiceConfig(engine="posthog"),
 }
