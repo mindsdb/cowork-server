@@ -465,6 +465,44 @@ def test_ensure_dir_never_creates_a_path_outside_the_sanitizer(db, tmp_path):
     assert not escape.exists()  # the tampered path was never created
 
 
+# ── Resolving `general` by name before it is provisioned (ENG-1847) ─────────
+
+def test_get_or_provision_by_name_provisions_general_before_first_list(db):
+    """The bug: a send/task-create names `general` on an org whose default row has
+    not been provisioned yet (no prior GET /projects/). A plain by-name lookup 404s;
+    get_or_provision_by_name must create it instead."""
+    a = _svc(db, _scope(ORG_A))
+    # No GET /projects/ ran for this org, so the exact-match lookup still misses.
+    with pytest.raises(ValueError, match="not found"):
+        a.get_project_by_name(GENERAL_PROJECT)
+
+    general = a.get_or_provision_by_name(GENERAL_PROJECT)
+
+    assert general.name == GENERAL_PROJECT
+    assert general.org_id == ORG_A
+    assert Path(general.path).is_dir()
+
+
+def test_get_or_provision_by_name_still_404s_for_a_real_missing_project(db):
+    """Only the reserved default self-heals; every other name stays an exact match."""
+    a = _svc(db, _scope(ORG_A))
+    with pytest.raises(ValueError, match="not found"):
+        a.get_or_provision_by_name("does-not-exist")
+
+
+def test_conversation_project_by_name_provisions_general(db):
+    """The create/update/move task endpoints resolve the project name through
+    ConversationService.project_by_name — it must provision `general` too, so a task
+    created in the default project on a fresh org doesn't 404."""
+    from cowork.services.conversations import ConversationService
+
+    svc = ConversationService(ScopedSession(Session(db), _scope(ORG_A)))
+    project = svc.project_by_name(GENERAL_PROJECT)
+
+    assert project is not None
+    assert project.name == GENERAL_PROJECT and project.org_id == ORG_A
+
+
 def test_delete_project_cascades_all_members_conversations(db):
     """Regression (owner-scoping PR): delete_project is org-wide cleanup, so it
     must delete EVERY member's conversation in the project — owner-scoping the
