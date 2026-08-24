@@ -353,6 +353,22 @@ class ProjectService:
             .order_by(Project.created_at, Project.id)
         ).first()
 
+    def get_or_provision_by_name(self, name: str) -> Project:
+        """Resolve a project by name, provisioning the org's default on a `general` miss.
+
+        The default project is created lazily per org (`ensure_general_for_scope`), so a
+        plain by-name lookup of `general` can 404 before the org's first `GET /projects/`
+        has provisioned its row — a send or task-create that names `general` would fail on
+        a project that is supposed to always exist (ENG-1847). Provision the reserved name
+        here instead of raising; every other name stays an exact match.
+        """
+        if name == GENERAL_PROJECT:
+            project = self.ensure_general_for_scope()
+            if project is None:
+                raise ValueError("Project not found")
+            return project
+        return self.get_project_by_name(name)
+
     def _allocate_project_dir(self, base: str) -> tuple[str, Path]:
         """Claim a directory by creating it, bumping the name on collision."""
         candidate = self._unique_name(base)

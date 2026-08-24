@@ -1370,7 +1370,9 @@ class ResponsesHandler:
             return request.project_id
         if request.project:
             try:
-                return service.get_project_by_name(request.project).id
+                # Provisions the org's default when the name is `general` — a fresh
+                # org may not have its row yet on the turn that first names it (ENG-1847).
+                return service.get_or_provision_by_name(request.project).id
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=f"Project not found: {request.project}") from exc
         # Bootstrap site: a turn can be the org's first request, and each org has

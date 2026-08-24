@@ -352,6 +352,13 @@ class ConversationService:
     def project_by_name(self, name: str | None) -> Project | None:
         if not name:
             return None
+        # Provision the org's default lazily so a by-name lookup of the reserved
+        # `general` project can't 404 before the org's first GET /projects/ has
+        # created its row (ENG-1847). Lazy import: projects imports this module.
+        from cowork.services.projects import GENERAL_PROJECT, ProjectService
+
+        if name == GENERAL_PROJECT:
+            return ProjectService(self.session).ensure_general_for_scope()
         return self.session.exec(
             self.session.select(Project).where(Project.name == name)
         ).first()
