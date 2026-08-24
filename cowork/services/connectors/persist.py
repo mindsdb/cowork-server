@@ -46,6 +46,7 @@ def persist_connection(
     *,
     label: str | None = None,
     user_label: str | None = None,
+    replace_existing: bool = False,
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -66,6 +67,10 @@ def persist_connection(
     replacement for ``label``; stored as ``_user_label`` and carried forward
     the same way. A brand-new connection that doesn't set one gets a computed
     default (the engine id, de-duplicated).
+
+    ``replace_existing`` is reserved for an explicit reconnect of the named
+    record. It replaces that record atomically after the caller has validated
+    the new credential, while retaining its label and picked-file metadata.
     """
     if vault is None:
         vault = vault_for_scope(scope)
@@ -99,7 +104,8 @@ def persist_connection(
         if method:
             payload["_method"] = method
         secure_keys = secure_keys_for(connector_id, method, payload)
-        if is_edit:
+        reconnecting_named_record = replace_existing and bool((name or "").strip()) and target is not None
+        if is_edit or reconnecting_named_record:
             slug = base_slug  # an edit targets the named connection — update in place
         else:
             slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
