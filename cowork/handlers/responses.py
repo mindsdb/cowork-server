@@ -43,6 +43,7 @@ from cowork.schemas.responses import (
     ResponsesRequest,
     Role,
 )
+from cowork.handlers._turn_history import sanitize_turn_history_rows
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     GENERIC_TURN_ERROR_CODE,
@@ -779,6 +780,10 @@ class ResponsesHandler:
         producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
+        # This turn's tool block-rows, for LLM-history persistence only. Kept
+        # out of collected_events: the client rebuilds its UI from those, and
+        # tool rows are hidden from the UI (mirrors _run_turn's event_sink).
+        turn_rows: list[dict] = []
         persisted = False
         pending_message_id: UUID | None = None
         failure: dict = {}
@@ -846,6 +851,13 @@ class ResponsesHandler:
                             yield event
                     elif kind == "turn_memory":
                         self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                    elif kind == "turn_history":
+                        # Slice-assign, not extend: the pod emits one frame per
+                        # turn, so a repeated frame must replace the rows rather
+                        # than double them. Sanitized at the boundary — the pod
+                        # is semi-trusted and these rows reach both the DB and
+                        # every later turn's LLM context.
+                        turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
                     elif kind == "turn_skill":
                         # Not persisted like memory: a draft is the user's decision.
                         # Yielding SkillCreated puts it through the same formatter the
@@ -894,7 +906,7 @@ class ResponsesHandler:
                 ):
                     yield ArtifactCreated(card)
 
-        def persist() -> None:
+        def persist(*, clean: bool = False) -> None:
             nonlocal persisted
             if persisted:
                 return
@@ -915,6 +927,12 @@ class ResponsesHandler:
                     svc.finalize_pending(conv_id, pending_message_id)
                 svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
+                    # Tool rows only on a clean finish. They arrive before the
+                    # terminal event, so a turn can carry rows and then fail or
+                    # be cancelled — and this is called on those paths too. The
+                    # default is False so a future except-branch inherits
+                    # text-only instead of silently persisting a torn turn.
+                    tool_rows=turn_rows if clean else None,
                 )
             except Exception:
                 logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
@@ -938,7 +956,7 @@ class ResponsesHandler:
                     sse = self._inject_created(sse, conv_id, harness_id)
                     first = False
                 await buffer.append("sse", {"sse": sse})
-            persist()
+            persist(clean=True)
             await buffer.close("completed")
         except _RemoteTurnFailed:
             message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
