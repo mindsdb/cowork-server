@@ -639,6 +639,69 @@ def test_queued_instruction_can_be_removed_before_it_runs(tmp_path: Path) -> Non
     assert engine.prompts == ["Long turn"]
 
 
+def test_queued_instruction_can_be_promoted_to_the_active_turn(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine(block_until_cancel=True)
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
+    )
+    assert engine.started.wait(timeout=1)
+
+    queued = service.queue_turn(created.id, "Focus on the Windows build now")
+    instruction_id = queued.queued_instructions[0].id
+    updated = service.steer_queued_turn(created.id, instruction_id)
+
+    wait_for_steers(engine)
+    assert updated.queued_instructions == []
+    assert engine.steers == [("turn-1", "Focus on the Windows build now")]
+    assert service.events(created.id).items[-1].text == "Focus on the Windows build now"
+    service.cancel(created.id)
+    wait_for_status(service, created.id, SessionStatus.cancelled)
+
+
+def test_non_steerable_queued_command_remains_queued(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine(block_until_cancel=True)
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
+    )
+    assert engine.started.wait(timeout=1)
+
+    queued = service.queue_turn(created.id, "/review")
+    instruction_id = queued.queued_instructions[0].id
+    with pytest.raises(RuntimeError, match=r"Queue /review"):
+        service.steer_queued_turn(created.id, instruction_id)
+
+    assert [item.id for item in service.get_session(created.id).queued_instructions] == [instruction_id]
+    assert engine.steers == []
+    service.cancel(created.id)
+    wait_for_status(service, created.id, SessionStatus.cancelled)
+
+
+def test_failed_queue_promotion_restores_the_instruction(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine(block_until_cancel=True)
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
+    )
+    assert engine.started.wait(timeout=1)
+
+    queued = service.queue_turn(created.id, "Try this immediately")
+    instruction_id = queued.queued_instructions[0].id
+    engine.steer_error = True
+    with pytest.raises(RuntimeError, match="adapter rejected steer"):
+        service.steer_queued_turn(created.id, instruction_id)
+
+    restored = service.get_session(created.id).queued_instructions
+    assert [item.id for item in restored] == [instruction_id]
+    assert engine.steers == []
+    service.cancel(created.id)
+    wait_for_status(service, created.id, SessionStatus.cancelled)
+
+
 def test_turn_accepts_native_file_references_and_workspace_mentions(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     source = repo / "src"
