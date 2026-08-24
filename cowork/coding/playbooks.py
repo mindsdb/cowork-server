@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import re
 import shutil
 from pathlib import Path
 
 from cowork.coding.contracts import utc_now
+from cowork.coding.guidance_items import discover_guidance_items, read_guidance_text
 from cowork.coding.project_models import (
     CodeProject,
     PlaybookItem,
@@ -13,11 +13,6 @@ from cowork.coding.project_models import (
 )
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.workspace import GitRunner, WorkspaceError
-
-_INSTRUCTION_FILES = {"agents.md", "claude.md", "instructions.md"}
-_WORKFLOW_SUFFIXES = {".yml", ".yaml"}
-_FRONTMATTER_DESCRIPTION = re.compile(r"^description:\s*['\"]?(.*?)['\"]?\s*$", re.MULTILINE)
-
 
 class PlaybookService:
     """Cache, inspect, and normalize a project's Git-backed team playbook."""
@@ -143,10 +138,8 @@ class PlaybookService:
         for item in items:
             if not item.enabled or item.kind not in {"instructions", "skill"}:
                 continue
-            path = cache / item.path
-            try:
-                content = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
+            content = read_guidance_text(cache, item.path, limit=120_000)
+            if not content:
                 continue
             remaining = 120_000 - sum(len(section) for section in sections)
             if remaining <= 0:
@@ -211,28 +204,7 @@ class PlaybookService:
         return project, project.playbook, cache
 
     def _discover(self, cache: Path) -> list[PlaybookItem]:
-        items: list[PlaybookItem] = []
-        for path in sorted(cache.rglob("*")):
-            # Playbook repositories are shared input. Do not follow a
-            # checked-in symlink and accidentally pull a local file outside
-            # the managed cache into the agent's instructions.
-            if path.is_symlink() or not path.is_file() or ".git" in path.parts:
-                continue
-            relative = path.relative_to(cache).as_posix()
-            lower_name = path.name.casefold()
-            if lower_name == "skill.md":
-                description = ""
-                try:
-                    match = _FRONTMATTER_DESCRIPTION.search(path.read_text(encoding="utf-8")[:8_000])
-                    description = match.group(1).strip() if match else ""
-                except (OSError, UnicodeError):
-                    pass
-                items.append(PlaybookItem(kind="skill", name=path.parent.name, path=relative, description=description))
-            elif lower_name in _INSTRUCTION_FILES:
-                items.append(PlaybookItem(kind="instructions", name=path.name, path=relative))
-            elif ".github" in path.parts and path.suffix.casefold() in _WORKFLOW_SUFFIXES:
-                items.append(PlaybookItem(kind="workflow", name=path.stem, path=relative))
-        return items[:250]
+        return [PlaybookItem(**item.__dict__) for item in discover_guidance_items(cache)]
 
     def _items(self, project: CodeProject, cache: Path) -> list[PlaybookItem]:
         disabled = set(project.playbook.disabled_items if project.playbook else [])

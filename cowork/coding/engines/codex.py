@@ -152,6 +152,7 @@ class CodexEngineSession:
         )
         self._client = CodexClient(config=client_config, approval_handler=approval_handler)
         self._workspace = workspace
+        self._skill_roots = tuple(config.skill_roots)
         self._model = config.model
         self._reasoning_effort = config.reasoning_effort
         self._service_tier = config.service_tier
@@ -451,11 +452,15 @@ class CodexEngineSession:
     def _register_skill_roots(self) -> None:
         from openai_codex.generated.v2_all import SkillsExtraRootsSetResponse
 
-        cowork_root = Path(get_app_settings().skill.root_dir).expanduser()
-        cowork_root.mkdir(parents=True, exist_ok=True)
-        roots = [cowork_root]
+        roots = [Path(root).expanduser() for root in getattr(self, "_skill_roots", [])]
+        if not roots:
+            # Backward compatibility for sessions created before task-scoped
+            # skill snapshots existed.
+            cowork_root = Path(get_app_settings().skill.root_dir).expanduser()
+            cowork_root.mkdir(parents=True, exist_ok=True)
+            roots.append(cowork_root)
         user_root = codex_config.user_skills_root()
-        if user_root.is_dir() and user_root.resolve() != cowork_root.resolve():
+        if user_root.is_dir() and all(user_root.resolve() != root.resolve() for root in roots):
             roots.append(user_root)
         self._client.request(
             "skills/extraRoots/set",

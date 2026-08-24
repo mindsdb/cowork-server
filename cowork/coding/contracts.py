@@ -229,6 +229,19 @@ class DeliveryRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ResolvedSkill(BaseModel):
+    id: str
+    kind: Literal["skill", "instructions", "workflow"]
+    name: str
+    description: str = ""
+    origin: Literal["team", "personal", "built_in"]
+    source_id: str | None = None
+    source_name: str
+    source_path: str
+    version: str | None = None
+    content_hash: str
+
+
 class CodingSession(BaseModel):
     schema_version: int = SCHEMA_VERSION
     id: str
@@ -256,6 +269,9 @@ class CodingSession(BaseModel):
     workspace_warning: str | None = None
     guidance_summary: str | None = None
     developer_instructions: str = ""
+    resolved_skills: list[ResolvedSkill] = Field(default_factory=list)
+    skill_roots: list[str] = Field(default_factory=list)
+    skill_instructions: str = ""
     environment: dict[str, str] = Field(default_factory=dict)
     allocated_ports: dict[str, int] = Field(default_factory=dict)
     source_contexts: list[SourceContext] = Field(default_factory=list)
