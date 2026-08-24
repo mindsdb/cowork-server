@@ -5,11 +5,15 @@ import socket
 import subprocess
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
 from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectFolder
-from cowork.coding.workspace import PreparedWorkspace, WorkspaceError, WorkspaceManager, _org_mode
+from cowork.coding.workspace import (
+    PreparedWorkspace,
+    WorkspaceError,
+    WorkspaceManager,
+    _org_mode,
+)
 
 
 @dataclass(frozen=True)
@@ -265,6 +269,7 @@ class ProjectWorkspaceManager:
             self.ports.release(session_id)
             if failures:
                 raise WorkspaceError("; ".join(failures))
+            self.workspaces.prune_task_root(session_id)
 
     def _cleanup_one(self, session_id: str, workspace: TaskWorkspace) -> None:
         self.workspaces.cleanup(

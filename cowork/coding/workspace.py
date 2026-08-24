@@ -14,9 +14,9 @@ from cowork.coding.contracts import (
     WorkspaceInspection,
     WorkspaceKind,
 )
-from cowork.common.settings.app_settings import get_app_settings
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.workspace_key import managed_key
+from cowork.common.settings.app_settings import get_app_settings
 
 
 class WorkspaceError(RuntimeError):
@@ -26,6 +26,7 @@ class WorkspaceError(RuntimeError):
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024
+_TASK_ROOT_METADATA = (".DS_Store", "Thumbs.db", "desktop.ini")
 
 
 def _org_mode() -> bool:
@@ -486,6 +487,35 @@ class WorkspaceManager:
                     self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch")
                 self.git.run(source, "worktree", "remove", "--force", str(actual))
             self.git.run(source, "worktree", "prune")
+
+    def prune_task_root(self, session_id: str) -> None:
+        """Remove an empty project-task parent without discarding task files."""
+        relative = managed_key(session_id)
+        if len(relative.parts) != 1:
+            raise WorkspaceError("Invalid project task workspace key")
+        managed_roots = (
+            self.worktrees_root,
+            self.legacy_worktrees_root,
+            self.local_copies.legacy_copies_root,
+            self.local_copies.baselines_root,
+        )
+        for workspace_root in managed_roots:
+            task_root = workspace_root / relative
+            if task_root.is_symlink() or not task_root.is_dir():
+                continue
+            for filename in _TASK_ROOT_METADATA:
+                metadata = task_root / filename
+                try:
+                    if metadata.is_file() or metadata.is_symlink():
+                        metadata.unlink()
+                except OSError:
+                    # A concurrent OS metadata write must not make task deletion fail.
+                    pass
+            try:
+                task_root.rmdir()
+            except OSError:
+                # Preserve the root when it still contains any real task files.
+                pass
 
     def _snapshot_changes(
         self,
