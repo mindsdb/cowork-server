@@ -36,6 +36,7 @@ class PlaybookService:
         backup = self.root / f".{project.id}.previous"
         shutil.rmtree(staging, ignore_errors=True)
         shutil.rmtree(backup, ignore_errors=True)
+        installed = False
         try:
             self.git.run(
                 self.root,
@@ -51,22 +52,25 @@ class PlaybookService:
             if cache.exists():
                 cache.rename(backup)
             staging.rename(cache)
+            installed = True
+            reference = PlaybookReference(
+                repository=repository,
+                branch=branch,
+                applied_revision=revision,
+                available_revision=revision,
+                cache_path=str(cache),
+                last_checked_at=utc_now(),
+            )
+            self.projects.update(project.id, lambda current: setattr(current, "playbook", reference))
         except Exception:
-            if backup.exists() and not cache.exists():
+            if installed:
+                shutil.rmtree(cache, ignore_errors=True)
+            if backup.exists():
                 backup.rename(cache)
             shutil.rmtree(staging, ignore_errors=True)
             raise
         else:
             shutil.rmtree(backup, ignore_errors=True)
-        reference = PlaybookReference(
-            repository=repository,
-            branch=branch,
-            applied_revision=revision,
-            available_revision=revision,
-            cache_path=str(cache),
-            last_checked_at=utc_now(),
-        )
-        self.projects.update(project.id, lambda current: setattr(current, "playbook", reference))
         return self.status(project.id)
 
     def refresh(self, project_id: str) -> PlaybookStatus:
@@ -100,7 +104,16 @@ class PlaybookService:
             current.playbook.available_revision = available
             current.playbook.last_checked_at = utc_now()
 
-        self.projects.update(project.id, record)
+        try:
+            self.projects.update(project.id, record)
+        except Exception as exc:
+            if reference.applied_revision:
+                rollback = self.git.run(cache, "switch", "--detach", reference.applied_revision, check=False)
+                if rollback.returncode != 0:
+                    raise WorkspaceError(
+                        "The playbook metadata could not be saved and its cache could not be restored; reconnect the playbook"
+                    ) from exc
+            raise
         return self.status(project.id)
 
     def status(self, project_id: str) -> PlaybookStatus:

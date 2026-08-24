@@ -282,6 +282,77 @@ def test_playbook_refresh_shows_diff_before_applying_and_normalizes_guidance(tmp
     assert source.is_dir()
 
 
+def test_playbook_configure_restores_the_previous_cache_when_metadata_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = repository(tmp_path, "playbook-source")
+    (source / "AGENTS.md").write_text("First guidance.\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "first guidance")
+    branch = git(source, "branch", "--show-current")
+    root = tmp_path / "coding"
+    store = CodeProjectStore(root)
+    store.create(CodeProject(
+        id="playbook-rollback",
+        name="Playbook rollback",
+        folders=[ProjectFolder(id="source", name="Source", path=str(source))],
+    ))
+    playbooks = PlaybookService(root, store)
+    initial = playbooks.configure("playbook-rollback", str(source), branch)
+    cache = root / "playbooks" / "playbook-rollback"
+    (source / "AGENTS.md").write_text("Second guidance.\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "second guidance")
+
+    def fail_update(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "update", fail_update)
+
+    with pytest.raises(OSError, match="disk full"):
+        playbooks.configure("playbook-rollback", str(source), branch)
+
+    assert git(cache, "rev-parse", "HEAD") == initial.current_revision
+    assert (cache / "AGENTS.md").read_text(encoding="utf-8") == "First guidance.\n"
+
+
+def test_playbook_apply_restores_the_applied_revision_when_metadata_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = repository(tmp_path, "playbook-source")
+    (source / "AGENTS.md").write_text("First guidance.\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "first guidance")
+    branch = git(source, "branch", "--show-current")
+    root = tmp_path / "coding"
+    store = CodeProjectStore(root)
+    store.create(CodeProject(
+        id="playbook-apply-rollback",
+        name="Playbook apply rollback",
+        folders=[ProjectFolder(id="source", name="Source", path=str(source))],
+    ))
+    playbooks = PlaybookService(root, store)
+    initial = playbooks.configure("playbook-apply-rollback", str(source), branch)
+    (source / "AGENTS.md").write_text("Second guidance.\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "second guidance")
+    playbooks.refresh("playbook-apply-rollback")
+    cache = root / "playbooks" / "playbook-apply-rollback"
+
+    def fail_update(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "update", fail_update)
+
+    with pytest.raises(OSError, match="disk full"):
+        playbooks.apply_update("playbook-apply-rollback")
+
+    assert git(cache, "rev-parse", "HEAD") == initial.current_revision
+    assert (cache / "AGENTS.md").read_text(encoding="utf-8") == "First guidance.\n"
+
+
 def test_playbook_discovery_never_follows_file_symlinks_outside_the_cache(tmp_path: Path) -> None:
     source = repository(tmp_path, "playbook-source")
     secret = tmp_path / "outside-secret.txt"
