@@ -1371,7 +1371,7 @@ class ResponsesHandler:
         if request.project:
             try:
                 # Provisions the org's default when the name is `general` — a fresh
-                # org may not have its row yet on the turn that first names it (ENG-1847).
+                # org may not have its row yet on the turn that first names it.
                 return service.get_or_provision_by_name(request.project).id
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=f"Project not found: {request.project}") from exc

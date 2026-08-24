@@ -465,7 +465,7 @@ def test_ensure_dir_never_creates_a_path_outside_the_sanitizer(db, tmp_path):
     assert not escape.exists()  # the tampered path was never created
 
 
-# ── Resolving `general` by name before it is provisioned (ENG-1847) ─────────
+# ── Resolving `general` by name before it is provisioned ────────────────────
 
 def test_get_or_provision_by_name_provisions_general_before_first_list(db):
     """The bug: a send/task-create names `general` on an org whose default row has

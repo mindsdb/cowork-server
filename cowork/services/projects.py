@@ -359,7 +359,7 @@ class ProjectService:
         The default project is created lazily per org (`ensure_general_for_scope`), so a
         plain by-name lookup of `general` can 404 before the org's first `GET /projects/`
         has provisioned its row — a send or task-create that names `general` would fail on
-        a project that is supposed to always exist (ENG-1847). Provision the reserved name
+        a project that is supposed to always exist. Provision the reserved name
         here instead of missing; every other name stays an exact match.
 
         The single home for the reserved-name self-heal: name-lookup callers that must
