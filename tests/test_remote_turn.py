@@ -1,11 +1,5 @@
-"""remote_turn_events: the channel-turn counterpart of _produce_remote's own
-inner generator (cowork/handlers/responses.py) — same stream_remote_replies
-kind-dispatch, built separately rather than shared (see the plan's
-correction note). Every test replaces ResponsesHandler wholesale with a
-fake stand-in (all 4 methods remote_turn_events actually calls), so these
-tests exercise remote_turn_events's OWN dispatch logic in isolation — the
-real ResponsesHandler helpers already have their own coverage in
-tests/test_responses_remote_backend.py, no need to re-prove them here."""
+"""remote_turn_events tests: verify its own dispatch logic in isolation.
+ResponsesHandler is replaced wholesale per test; its helpers have coverage elsewhere."""
 from __future__ import annotations
 
 from uuid import uuid4
@@ -26,10 +20,8 @@ class _FakeSession:
 
 
 def _fake_handler(monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None):
-    """Replace ResponsesHandler in remote_turn_mod's own namespace with a
-    stand-in exposing only the 4 staticmethods remote_turn_events calls —
-    monkeypatching the bare name it was imported under, resolved at call
-    time, exactly like every other name this plan's tests stub out."""
+    """Replace ResponsesHandler with a stand-in exposing only the 4 methods
+    remote_turn_events calls, resolved at call time like every other name here."""
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),

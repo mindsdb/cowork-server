@@ -1,15 +1,5 @@
-"""Channel turns on the remote worker: the same stream_remote_replies
-kind-dispatch _produce_remote's own inner generator does for browser turns
-(cowork/handlers/responses.py), built separately for channels rather than
-shared — sharing it would mean migrating the monkeypatch target of nearly
-every one of that file's ~20 existing tests across a module boundary, for
-one bounded, rarely-changing translation loop. Not worth the risk.
-
-The five DB-touching helpers below ARE reused unchanged, via ResponsesHandler
-directly — plain @staticmethods with no other class dependency, so calling
-them through the class from here carries none of that risk: a class
-attribute lookup always sees the class's current (possibly monkeypatched)
-state, regardless of which module is asking."""
+"""Channel turns on the remote worker, mirroring _produce_remote's own generator
+but built separately, since sharing it would move ~20 tests' patch targets."""
 from __future__ import annotations
 
 from uuid import UUID
@@ -41,14 +31,8 @@ async def remote_turn_events(
     correlation_id: str | None = None,
     llm: dict | None = None,
 ):
-    """Run one channel turn on the remote worker, yielding the same
-    StreamTextDelta / StreamTaskProgress / ArtifactCreated / SkillCreated
-    stream format_responses_stream already knows how to render — identical
-    output shape to a local-mode turn, so callers downstream are unchanged.
-    Mutates turn_rows in place on a turn_history reply (mirrors
-    _produce_remote's own closure-captured turn_rows, as an explicit param
-    since this isn't a closure). Raises RemoteTurnFailed on a worker-reported
-    failure; the caller decides how to surface that."""
+    """Yields the same stream format_responses_stream renders for local turns.
+    Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import sanitize_turn_history_rows
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated
