@@ -52,10 +52,24 @@ SLOW_PROMPT = (
     "Count slowly from 1 to 40, one number per line, "
     "pausing to think between each one."
 )
+# The cancel test needs a turn that is still running one HTTP call later, which
+# SLOW_PROMPT does not guarantee: a fast deployment answered all 40 lines before
+# the next call landed, and the test skipped rather than cancelling anything.
+# Ten times the output buys that margin without making a failure hang CI — the
+# turn is cancelled or abandoned either way, so the extra tokens are never
+# actually generated.
+CANCEL_PROMPT = (
+    "Count slowly from 1 to 400, one number per line, "
+    "pausing to think between each one."
+)
 QUICK_PROMPT = "Reply with exactly the word: pong"
 
 TURN_TIMEOUT_S = 180.0
 CANCEL_VISIBLE_S = 45.0
+# How long to wait for the server to report the turn as running before giving
+# up on having anything to cancel. This covers the gap between the caller
+# disconnecting and the registry answering, not the model's thinking time.
+CANCEL_PREMISE_S = 10.0
 
 # The auth hosts sit behind Cloudflare, whose bot rules 403 a default httpx or
 # requests User-Agent ("error code: 1010"). The block is signature-based, so a
@@ -297,22 +311,92 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     assert "response.created" in replayed, replayed
 
 
+def _await_running_turn(api, conversation_id) -> dict | None:
+    """Wait until the server says this conversation has a turn running.
+
+    Returns the probe once `in_flight` is true, or None when the turn provably
+    ran to completion before it could be observed running.
+
+    Breaking out of the stream on the first `event:` line is not enough to
+    know a turn is cancellable. The formatter yields `response.created` before
+    it iterates the model's stream at all, so that frame says the turn was
+    registered and nothing more, while `cancel` answers `False` for a turn that
+    has already finished. A cancel fired off the back of that frame is
+    asserting on a race, and it lost four of the five runs on record.
+
+    Two things answer `in_flight: false` and they are not the same. A turn that
+    ran and ended has a buffer on this replica, and no amount of waiting brings
+    it back. A replica that never saw this turn has no buffer, and the answer
+    changes as soon as the shared store catches up. `has_buffer` is what
+    separates them, and it is the only thing that does: the endpoint always
+    sends `latest_seq`, as 0 when there is no buffer, so a turn that ended
+    having written no records is indistinguishable by that field from a turn
+    this replica never heard of. Reading it would report a routing problem as
+    "the model was too fast", and a zero-record turn as no buffer at all.
+    """
+    deadline = time.monotonic() + CANCEL_PREMISE_S
+    probe = None
+    while time.monotonic() < deadline:
+        probe = api.get("/api/v1/responses/in-flight",
+                        params={"conversation_id": conversation_id}).json()
+        if probe.get("in_flight") is True:
+            return probe
+        # Not running, and this replica has the turn: it ended. `latest_seq`
+        # deliberately does not appear here, see above.
+        if probe.get("has_buffer") is True:
+            return None
+        time.sleep(0.5)
+    # Ran out of window without ever seeing a buffer. That is not a fast model,
+    # so say so rather than letting the caller blame one.
+    raise AssertionError(
+        f"no turn was ever visible for this conversation within {CANCEL_PREMISE_S:.0f}s, "
+        f"and no buffer appeared either — the turn never reached this replica: {probe}"
+    )
+
+
 def test_cancel_ends_the_turn(api, conversation_id):
     """After POST /cancel, /in-flight reports the turn as finished."""
     with api.stream(
         "POST", "/api/v1/responses/",
-        json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
+        json={"input": CANCEL_PROMPT, "conversation": conversation_id, "stream": True},
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
         assert resp.status_code == 200
+        # Wait for a frame the MODEL produced, not just the one the formatter
+        # emits before it touches the model's stream. `response.created` arrives
+        # whether or not anything is generating yet, so disconnecting on it is
+        # what put the whole race here in the first place. A second event means
+        # the turn is mid-stream at the moment this connection drops.
+        seen = 0
         for line in resp.iter_lines():
             if line.startswith("event:"):
-                break
+                seen += 1
+                if seen >= 2:
+                    break
+        assert seen >= 2, "the turn produced no frame beyond response.created"
+
+    # Establish the premise before asserting on it: there has to be a running
+    # turn for "cancel stops it" to mean anything. A skip here means the model
+    # finished a 400-step prompt between two HTTP calls, which is a fact about
+    # the deployment and not a defect — but it also means this test covered
+    # nothing on this run, so read the outcome line and not the job's colour:
+    #   gh run view <id> --log | grep test_cancel_ends_the_turn
+    running = _await_running_turn(api, conversation_id)
+    if running is None:
+        pytest.skip(
+            "the turn ran to completion before it could be observed running, so "
+            "there was nothing to cancel and this run proved nothing; the prompt "
+            "needs to outlast two HTTP calls on this deployment"
+        )
 
     cancel = api.post("/api/v1/responses/cancel",
                       json={"conversation_id": conversation_id})
     assert cancel.status_code == 200, cancel.text
-    assert cancel.json()["cancelled"] is True
+    # Now load-bearing: the turn was running one call ago, so False here means
+    # the server failed to stop a turn it was told to stop.
+    assert cancel.json()["cancelled"] is True, (
+        f"cancel reported nothing to cancel for a turn that was in flight: {running}"
+    )
 
     deadline = time.monotonic() + CANCEL_VISIBLE_S
     while time.monotonic() < deadline:

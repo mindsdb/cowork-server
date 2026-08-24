@@ -22,7 +22,7 @@ import pytest
 
 import sys
 
-from cowork.streaming.registry import registry
+from cowork.streaming.registry import RunHandle, registry
 
 # The submodule name `cowork.streaming.registry` is shadowed on the package by
 # the re-exported `registry` instance, so reach the real module (to patch its
@@ -153,6 +153,69 @@ async def test_external_cancel_still_propagates_through_the_bound(monkeypatch):
 
     assert await handle.cancel() is True
     assert buffer.closed == "cancelled"
+
+
+async def test_cancel_reports_success_even_when_the_teardown_raises():
+    """A cancel that stops the turn answers True even if unwinding then fails.
+
+    Every producer catches CancelledError to persist its partial turn and close
+    its buffer. If either step raises, the exception escapes the producer and
+    lands on the `await self.task` inside cancel(), which used to translate it
+    into False. That is the same answer as "there was nothing to cancel", for a
+    turn that had just been stopped.
+
+    Built on a bare RunHandle rather than through `registry.start`: the unit
+    here is `RunHandle.cancel`, and routing through the idle-bound wrapper made
+    which branch runs depend on task scheduling.
+
+    The `logger.exception` the fix also adds is deliberately not asserted. The
+    record never reaches a handler under the full suite, including caplog's own,
+    while it does in isolation, so asserting it buys a test that fails for
+    reasons unrelated to the behaviour. The return value is the contract; the
+    log is diagnostics.
+    """
+    async def _producer():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # Stands in for persist() or buffer.close() failing on the
+            # cancellation path: a DB write or a Redis call, either of which can
+            # fail independently of the cancel itself succeeding.
+            raise RuntimeError("persist failed while unwinding")
+
+    task = asyncio.ensure_future(_producer())
+    await asyncio.sleep(0)  # let it reach the sleep, so there is a cancel to make
+    handle = RunHandle(
+        conversation_id="conv-cancel-teardown-raises",
+        turn_id=0,
+        buffer=_FakeBuffer(),
+        task=task,
+    )
+
+    assert await handle.cancel() is True
+    assert handle.is_running is False
+
+
+async def test_cancel_still_reports_false_for_a_turn_that_already_finished():
+    """The one meaning False keeps: there was no running turn to stop.
+
+    Pinned beside the case above so the two cannot collapse into each other —
+    that is exactly what made a stopped turn indistinguishable from a finished
+    one.
+    """
+    async def _producer():
+        return None
+
+    task = asyncio.ensure_future(_producer())
+    await asyncio.wait_for(task, timeout=5)
+    handle = RunHandle(
+        conversation_id="conv-cancel-already-done",
+        turn_id=0,
+        buffer=_FakeBuffer(),
+        task=task,
+    )
+
+    assert await handle.cancel() is False
 
 
 # The idle bound is env-configurable (COWORK_MAX_TURN_IDLE_SECONDS) as a
