@@ -236,9 +236,8 @@ def test_a_funded_wallet_restores_the_stored_pin_on_every_role():
     substitution acceptable, so a role that stopped restoring would be a silent
     downgrade nobody could undo.
     """
-    funded = json.dumps({"mindshub_air": True, "sonnet": True, "opus": True, "haiku": True, "kimi": True})
     s = _pinned(
-        minds_model_enabled=funded,
+        minds_model_enabled=PAID_MAP,
         planning_model="sonnet",
         coding_model="haiku",
         router_model="kimi",
@@ -251,9 +250,15 @@ def test_a_funded_wallet_restores_the_stored_pin_on_every_role():
 def test_the_same_pins_are_substituted_while_the_wallet_is_empty():
     """The before half of the pair above, on identical pins.
 
-    Same three stored models, same three roles, only the availability map
-    differs. Without this next to it, the restore test passes just as well
-    against a build that never substituted anything.
+    Same three stored models, same three roles, same module-level maps, only the
+    availability one differs — so the pair reads as one rule with two directions
+    rather than two facts that happen to sit together.
+
+    The three single-role tests above already pin the substitution one role at a
+    time, so this is not the only guard against a build that stopped
+    substituting. What it adds is all three at once: a role that kept
+    substituting only because another role's pin was doing the work would pass
+    each of those and fail here.
     """
     s = _pinned(
         minds_model_enabled=LOCKED_MAP,
