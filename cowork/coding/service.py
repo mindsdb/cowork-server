@@ -765,7 +765,11 @@ class CodingService:
                 CodingEvent(
                     type=EventType.session,
                     title="Pull request updated",
-                    text="Marked ready for review." if request.action == "ready" else "Merged on GitHub.",
+                    text={
+                        "ready": "Marked ready for review.",
+                        "merge": "Merged on GitHub.",
+                        "resolve_thread": "Resolved a GitHub review thread.",
+                    }[request.action],
                     phase="completed",
                 ),
             )

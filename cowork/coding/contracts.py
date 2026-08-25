@@ -216,7 +216,7 @@ class SourceContext(BaseModel):
 
 class DeliveryRecord(BaseModel):
     provider: Literal["github", "linear", "slack"]
-    action: Literal["progress", "result", "draft_pull_request"]
+    action: Literal["progress", "result", "draft_pull_request", "complete_source"]
     target_url: str
     status: Literal["pending", "published", "failed"] = "pending"
     external_url: str | None = None
@@ -227,6 +227,29 @@ class DeliveryRecord(BaseModel):
     task_branch: str | None = None
     connection_name: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class DeliveryAutomationPolicy(BaseModel):
+    fix_failing_checks: bool = False
+    mark_ready_when_passing: bool = False
+    merge_when_approved: bool = False
+    complete_source_after_merge: bool = False
+    archive_after_merge: bool = False
+    max_fix_attempts: int = Field(default=2, ge=1, le=5)
+
+
+class DeliveryAutomationState(BaseModel):
+    fix_attempts: dict[str, int] = Field(default_factory=dict, max_length=128)
+
+
+class DeliveryAutomationClaimRequest(BaseModel):
+    fingerprint: str = Field(min_length=1, max_length=512)
+
+
+class DeliveryAutomationClaim(BaseModel):
+    claimed: bool
+    attempts: int
+    limit: int
 
 
 class ResolvedSkill(BaseModel):
@@ -276,6 +299,8 @@ class CodingSession(BaseModel):
     allocated_ports: dict[str, int] = Field(default_factory=dict)
     source_contexts: list[SourceContext] = Field(default_factory=list)
     deliveries: list[DeliveryRecord] = Field(default_factory=list)
+    delivery_policy: DeliveryAutomationPolicy = Field(default_factory=DeliveryAutomationPolicy)
+    delivery_automation: DeliveryAutomationState = Field(default_factory=DeliveryAutomationState)
     engine_session_id: str | None = None
     active_turn_id: str | None = None
     pending_approval: PendingApproval | None = None
