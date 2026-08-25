@@ -225,6 +225,32 @@ async def test_produce_remote_mints_a_request_id_when_none_was_resolved_upstream
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_request_id_matches_the_turns_own_correlation_id(monkeypatch):
+    # The whole point of request_id is that it's a lookup key into THIS turn's
+    # own server-side logs/Redis keys — which are all keyed off the exact
+    # correlation_id stream_remote_replies was called with. A mismatch here
+    # would make the "Reference: ..." the user sees point at nothing.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert captured["correlation_id"]
+    assert saved["events"][-1]["request_id"] == captured["correlation_id"]
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_unclassified_crash_still_carries_a_request_id(monkeypatch):
     # A crash in cowork-server's OWN consumption of the reply stream (a bug in
     # the formatter, a dropped Redis connection) never goes through
