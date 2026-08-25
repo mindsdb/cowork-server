@@ -820,8 +820,8 @@ class ResponsesHandler:
             # what makes it a genuine "before": stream_remote_replies below only
             # enqueues the job once this generator is first iterated.
             artifacts = self._remote_artifacts_context(producer_session, conv_id)
-            before_slugs, before_mtimes = (
-                snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
+            before_slugs, before_mtimes, before_revision_heads = (
+                snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {}, {})
             )
             new_slugs: list[str] = []
             touched_slugs: set[str] = set()
@@ -889,7 +889,7 @@ class ResponsesHandler:
                 if artifacts is not None:
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
-                        before_slugs, before_mtimes,
+                        before_slugs, before_mtimes, before_revision_heads,
                     )
 
             # Clean completion only — a raise inside the try skips this, matching

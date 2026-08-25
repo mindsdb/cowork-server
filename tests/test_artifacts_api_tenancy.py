@@ -1,8 +1,7 @@
 """The artifact HTTP surface in org mode.
 
-Only two endpoints are exposed, both addressed by project id and slug — never by a
-server filesystem path, because a path carries no tenant and these endpoints
-previously had no Principal to compare it against.
+Every org-capable endpoint is addressed by project id plus stable artifact id —
+never by a server filesystem path, because a path carries no tenant.
 
 The org cases call the handlers directly with an explicitly built ScopedSession:
 `cowork.server.app` is created at import time and only wires the principal
@@ -13,6 +12,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
+from unittest.mock import MagicMock
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -20,10 +22,13 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints import artifacts as ep
+from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.services import artifacts as ep_artifacts
+from cowork.services.artifact_identity import ensure_stable_id
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
+from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
@@ -56,26 +61,38 @@ def session():
         yield s
 
 
-def _scoped(session, org_id: str) -> ScopedSession:
-    return ScopedSession(session, TenantScope(org_mode=True, org_id=org_id, user_id="u-1"))
+def _scoped(session, org_id: str, user_id: str = "u-1") -> ScopedSession:
+    return ScopedSession(session, TenantScope(org_mode=True, org_id=org_id, user_id=user_id))
 
 
 def _project_with_artifact(session, tmp_path, *, name, org_id, slug, conversation=None):
     path = tmp_path / (org_id or "local") / name
+    row = Project(id=uuid.uuid4(), name=name, path=str(path), org_id=org_id)
+    session.add(row)
+    session.commit()
     # Org projects carry the conversation segment the cloud pod writes under
     # (artifact_roots.CONVERSATIONS_DIRNAME); desktop projects do not. Mirroring
     # both real layouts here is what makes these tests exercise the resolver
     # rather than a shape only the tests believe in.
-    workspace = path / "conversations" / (conversation or "c1") if org_id is not None else path
+    conversation_id = UUID(str(conversation)) if conversation else uuid.uuid4()
+    if org_id is not None:
+        session.add(
+            Conversation(
+                id=conversation_id,
+                topic=f"{name} task",
+                project_id=row.id,
+                org_id=org_id,
+                created_by="u-1",
+            )
+        )
+        session.commit()
+    workspace = path / "conversations" / str(conversation_id) if org_id is not None else path
     folder = workspace / ".anton" / "artifacts" / slug
     folder.mkdir(parents=True)
     (folder / "index.html").write_text("<html></html>")
     (folder / "metadata.json").write_text(
         json.dumps({"slug": slug, "name": slug, "type": "html-app"})
     )
-    row = Project(id=uuid.uuid4(), name=name, path=str(path), org_id=org_id)
-    session.add(row)
-    session.commit()
     return row, folder
 
 
@@ -177,6 +194,173 @@ async def test_card_omits_owner_side_access_fields_in_org_mode(session, tmp_path
     assert "accessEmails" not in card
 
 
+async def test_card_has_one_stable_identity_for_draft_and_comments(session, tmp_path, org_mode):
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
+    )
+
+    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+
+    assert str(UUID(card["stableId"])) == card["stableId"]
+    assert card["artifactKey"] == f"artifact/{card['stableId']}"
+    assert card["draftUrl"].startswith(
+        f"/api/v1/artifacts/drafts/{row.id}/{card['stableId']}/"
+    )
+    assert json.loads((folder / "metadata.json").read_text())["stableId"] == card["stableId"]
+
+
+async def test_org_source_read_and_manual_edit_are_project_scoped(
+    session, tmp_path, org_mode
+):
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
+    )
+    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+
+    source = await workspace_ep.artifact_source(
+        str(row.id), card["stableId"], _scoped(session, ORG_A), path="index.html"
+    )
+    saved = await workspace_ep.update_artifact_source(
+        str(row.id),
+        card["stableId"],
+        workspace_ep._SourceUpdateBody(
+            content="<html><h1>Edited</h1></html>",
+            expectedRevisionId=source["revision"]["id"],
+            path="index.html",
+            summary="Edit heading",
+        ),
+        _scoped(session, ORG_A),
+    )
+
+    assert saved["revision"]["actor"] == {"kind": "manual", "id": "u-1"}
+    assert (folder / "index.html").read_text() == "<html><h1>Edited</h1></html>"
+
+
+async def test_org_source_read_cannot_cross_org(session, tmp_path, org_mode):
+    row, _folder = _project_with_artifact(
+        session, tmp_path, name="theirs", org_id=ORG_B, slug="secret"
+    )
+    card = ep.artifacts_for_request(_scoped(session, ORG_B), project_id=row.id)[0]
+
+    # A raw SQLAlchemy session is intentionally single-tenant once wrapped.
+    # Use another request-like session for the foreign caller.
+    with Session(session.get_bind()) as foreign_session:
+        with pytest.raises(HTTPException) as err:
+            await workspace_ep.artifact_source(
+                str(row.id), card["stableId"], _scoped(foreign_session, ORG_A), path="index.html"
+            )
+
+        assert err.value.status_code == 404
+
+
+async def test_same_org_reviewer_can_preview_but_cannot_edit_source(
+    session, tmp_path, org_mode
+):
+    row, _folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
+    )
+    owner_card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    assert owner_card["capabilities"]["role"] == "owner"
+    with Session(session.get_bind()) as reviewer_session:
+        reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
+        card = ep.artifacts_for_request(reviewer, project_id=row.id)[0]
+        assert card["capabilities"]["role"] == "reviewer"
+        assert card["capabilities"]["canEdit"] is False
+
+        draft = await workspace_ep.serve_private_draft(
+            str(row.id), card["stableId"], "index.html", MagicMock(query_params={}), reviewer
+        )
+        assert draft.status_code == 200
+
+        with pytest.raises(HTTPException) as err:
+            await workspace_ep.artifact_source(
+                str(row.id), card["stableId"], reviewer, path="index.html"
+            )
+        assert err.value.status_code == 403
+
+
+async def test_same_org_reviewer_receives_the_current_revision_for_comments(
+    session, tmp_path, org_mode, monkeypatch
+):
+    row, _folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
+    )
+    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+
+    async def fake_provision(*_args, **_kwargs):
+        return card["artifactKey"]
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_access.provision_draft_review_access",
+        fake_provision,
+    )
+    with Session(session.get_bind()) as reviewer_session:
+        result = await workspace_ep.enable_artifact_comments(
+            str(row.id),
+            card["stableId"],
+            _scoped(reviewer_session, ORG_A, user_id="u-2"),
+        )
+
+    assert result["capabilities"]["role"] == "reviewer"
+    assert result["capabilities"]["canEdit"] is False
+    assert result["currentRevision"]["artifactId"] == card["stableId"]
+    assert result["currentRevision"]["path"] == "index.html"
+
+
+async def test_fullstack_draft_preview_cannot_read_backend_source(
+    session, tmp_path, org_mode
+):
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="app"
+    )
+    (folder / "static").mkdir()
+    (folder / "index.html").replace(folder / "static" / "index.html")
+    (folder / "static" / "app.js").write_text("console.log('safe')")
+    (folder / "backend.py").write_text("API_SECRET = 'server-only'")
+    (folder / "metadata.json").write_text(json.dumps({
+        "slug": "app",
+        "name": "app",
+        "type": "fullstack-stateless-app",
+        "primary": "static/index.html",
+    }))
+    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    with Session(session.get_bind()) as reviewer_session:
+        reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
+        asset = await workspace_ep.serve_private_draft(
+            str(row.id), card["stableId"], "static/app.js", MagicMock(query_params={}), reviewer
+        )
+        assert asset.status_code == 200
+
+        with pytest.raises(HTTPException) as err:
+            await workspace_ep.serve_private_draft(
+                str(row.id), card["stableId"], "backend.py", MagicMock(query_params={}), reviewer
+            )
+        assert err.value.status_code == 404
+
+
+async def test_fullstack_draft_preview_refuses_a_root_level_primary(
+    session, tmp_path, org_mode
+):
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="legacy-app"
+    )
+    (folder / "backend.py").write_text("API_SECRET = 'server-only'")
+    (folder / "metadata.json").write_text(json.dumps({
+        "slug": "legacy-app",
+        "name": "legacy-app",
+        "type": "fullstack-stateless-app",
+        "primary": "index.html",
+    }))
+    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    with Session(session.get_bind()) as reviewer_session:
+        reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
+        with pytest.raises(HTTPException) as err:
+            await workspace_ep.serve_private_draft(
+                str(row.id), card["stableId"], "index.html", MagicMock(query_params={}), reviewer
+            )
+        assert err.value.status_code == 404
+
+
 # ── delete ────────────────────────────────────────────────────────────────
 
 async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, publish_key):
@@ -185,6 +369,71 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
 
     assert not folder.exists()
+
+
+async def test_delete_by_stable_id_selects_the_exact_duplicate_slug(
+    session, tmp_path, org_mode, publish_key
+):
+    row, first_folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="same"
+    )
+    first_metadata = json.loads((first_folder / "metadata.json").read_text())
+    first_metadata["id"] = "first-artifact"
+    (first_folder / "metadata.json").write_text(json.dumps(first_metadata))
+    second_conversation_id = uuid.uuid4()
+    session.add(
+        Conversation(
+            id=second_conversation_id,
+            topic="second task",
+            project_id=row.id,
+            org_id=ORG_A,
+            created_by="u-1",
+        )
+    )
+    session.commit()
+    second_folder = (
+        Path(row.path)
+        / "conversations"
+        / str(second_conversation_id)
+        / ".anton"
+        / "artifacts"
+        / "same"
+    )
+    second_folder.mkdir(parents=True)
+    (second_folder / "index.html").write_text("<html>second</html>")
+    (second_folder / "metadata.json").write_text(
+        json.dumps({
+            "id": "second-artifact",
+            "slug": "same",
+            "name": "same",
+            "type": "html-app",
+        })
+    )
+    second_stable_id, _metadata = ensure_stable_id(second_folder)
+
+    await ep.delete_artifact_for_request(
+        _scoped(session, ORG_A), second_stable_id, project_id=row.id
+    )
+
+    assert first_folder.exists()
+    assert not second_folder.exists()
+
+
+async def test_reviewer_cannot_delete_an_owners_artifact(
+    session, tmp_path, org_mode, publish_key
+):
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
+    )
+    stable_id, _metadata = ensure_stable_id(folder)
+
+    with pytest.raises(HTTPException) as err:
+        await ep.delete_artifact_for_request(
+            _scoped(session, ORG_A, user_id="u-2"), stable_id, project_id=row.id
+        )
+
+    assert err.value.status_code == 403
+    assert folder.exists()
 
 
 async def test_delete_in_foreign_project_is_404_and_keeps_files(

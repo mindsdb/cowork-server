@@ -405,6 +405,15 @@ def publish_artifact(
     # changed so previously issued viewer grants invalidate.
     effective_access, pwd_version, access_version, owner_side = _resolve_access(password, access, previous)
 
+    # One identity spans private drafts, published versions, and comments. A
+    # legacy loose file has no metadata and keeps the service-generated key.
+    canonical_artifact_key: str | None = None
+    if (published_dir / "metadata.json").is_file():
+        from cowork.services.artifact_identity import artifact_key, ensure_stable_id
+
+        stable_id, _metadata = ensure_stable_id(published_dir)
+        canonical_artifact_key = artifact_key(stable_id)
+
     # Markdown is rendered to a throwaway index.html that we hand to the
     # publisher; `.html` and fullstack publish their real target directly.
     # `publish_target` stays the original artifact so the registry, history,
@@ -426,6 +435,7 @@ def publish_artifact(
             access=effective_access,
             access_version=access_version,
             pwd_version=pwd_version,
+            artifact_key=canonical_artifact_key,
             # Resolve datasource secrets from cowork's own vault
             # (`~/.cowork/data-vault`), not anton's default
             # (`~/.anton/data_vault`) — otherwise secrets are missed and
@@ -470,7 +480,7 @@ def publish_artifact(
             "url": view_url,
             # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
             # so the comments panel can key threads after an app restart.
-            "artifact_key": result.get("artifact_key", ""),
+            "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
             "last_md5": result.get("md5", ""),
             # Snapshot of the artifact's content mtime at publish time — the
             # cheap gate for the `modified` badge (see card_for_folder). Uses
@@ -493,7 +503,7 @@ def publish_artifact(
         "accessEmails": owner_side.get("emails", []),
         "orgAllowed": bool(owner_side.get("org_allowed")),
         # Composite comments scope for the panel (Plan 5).
-        "artifactKey": result.get("artifact_key", ""),
+        "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
         "result": {k: v for k, v in result.items() if k != "file_payload"},
     }
 

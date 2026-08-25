@@ -1,8 +1,8 @@
 """Turn-boundary artifact state: what appeared and what changed.
 
-The pre-turn snapshot carries content mtimes, not just folder names, so an
-artifact the agent EDITED (rather than created) is reported as touched. The
-autopublish reconciler's first phase depends on that distinction.
+The pre-turn snapshot carries content mtimes and primary-source hashes, not
+just folder names, so an artifact the agent EDITED (rather than created) is
+reported as touched even inside one whole-second mtime bucket.
 """
 from __future__ import annotations
 
@@ -50,27 +50,29 @@ def test_snapshot_carries_slugs_and_content_mtimes(tmp_path):
     base = tmp_path / "artifacts"
     _make_artifact(base, "one", files={"a.md": "x"}, meta={"slug": "one", "type": "document"})
 
-    slugs, mtimes = t.snapshot_artifact_state(base)
+    slugs, mtimes, revision_heads = t.snapshot_artifact_state(base)
 
     assert slugs == {"one"}
     assert mtimes["one"] > 0
+    assert revision_heads["one"]
 
 
 def test_snapshot_of_missing_dir_is_empty(tmp_path):
-    slugs, mtimes = t.snapshot_artifact_state(tmp_path / "nope")
+    slugs, mtimes, revision_heads = t.snapshot_artifact_state(tmp_path / "nope")
     assert slugs == set()
     assert mtimes == {}
+    assert revision_heads == {}
 
 
 def test_index_reports_new_slug_as_new_and_touched(conv, tmp_path):
     base = tmp_path / "artifacts"
     base.mkdir()
-    before, before_mtimes = t.snapshot_artifact_state(base)
+    before, before_mtimes, before_heads = t.snapshot_artifact_state(base)
 
     _make_artifact(base, "fresh", files={"r.md": "hi"}, meta={"slug": "fresh", "type": "document"})
 
     new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        conv, conv.id, conv.project_id, base, before, before_mtimes, before_heads,
     )
     assert new == ["fresh"]
     assert touched == {"fresh"}
@@ -79,14 +81,37 @@ def test_index_reports_new_slug_as_new_and_touched(conv, tmp_path):
 def test_index_reports_edited_existing_slug_as_touched_not_new(conv, tmp_path):
     base = tmp_path / "artifacts"
     _make_artifact(base, "old", files={"a.md": "v1"}, meta={"slug": "old", "type": "document"})
-    before, before_mtimes = t.snapshot_artifact_state(base)
+    before, before_mtimes, before_heads = t.snapshot_artifact_state(base)
 
     (base / "old" / "a.md").write_text("v2")
     _bump_mtime(base / "old" / "a.md", 120)
 
     new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        conv, conv.id, conv.project_id, base, before, before_mtimes, before_heads,
     )
+    assert new == []
+    assert touched == {"old"}
+
+    from cowork.services.artifact_revisions import list_revisions
+
+    latest = list_revisions(base / "old")[0]
+    assert latest["actor"]["kind"] == "agent"
+    assert latest["conversationId"] == str(conv.id)
+
+
+def test_index_detects_same_second_same_size_agent_edit(conv, tmp_path):
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "old", files={"a.md": "v1"}, meta={"slug": "old", "type": "document"})
+    before, before_mtimes, before_heads = t.snapshot_artifact_state(base)
+    original_stat = (base / "old" / "a.md").stat()
+
+    (base / "old" / "a.md").write_text("v2")
+    os.utime(base / "old" / "a.md", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes, before_heads,
+    )
+
     assert new == []
     assert touched == {"old"}
 
@@ -94,13 +119,52 @@ def test_index_reports_edited_existing_slug_as_touched_not_new(conv, tmp_path):
 def test_index_leaves_untouched_slug_out_of_touched(conv, tmp_path):
     base = tmp_path / "artifacts"
     _make_artifact(base, "old", files={"a.md": "v1"}, meta={"slug": "old", "type": "document"})
-    before, before_mtimes = t.snapshot_artifact_state(base)
+    before, before_mtimes, before_heads = t.snapshot_artifact_state(base)
 
     new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        conv, conv.id, conv.project_id, base, before, before_mtimes, before_heads,
     )
     assert new == []
     assert touched == set()
+
+
+def test_index_finishes_no_change_repair_without_marking_artifact_touched(conv, tmp_path):
+    from cowork.services.artifact_identity import ensure_stable_id
+    from cowork.services.artifact_revisions import (
+        agent_repair_detail,
+        create_agent_repair,
+        current_source,
+    )
+
+    base = tmp_path / "artifacts"
+    _make_artifact(
+        base,
+        "old",
+        files={"a.md": "v1"},
+        meta={"slug": "old", "type": "document", "primary": "a.md"},
+    )
+    folder = base / "old"
+    stable_id, metadata = ensure_stable_id(folder)
+    current = current_source(folder, metadata, stable_id)
+    repair = create_agent_repair(
+        folder,
+        metadata,
+        stable_id,
+        expected_revision_id=current["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Check this"}],
+        conversation_id=str(conv.id),
+    )
+    before, before_mtimes, before_heads = t.snapshot_artifact_state(base)
+
+    _new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes, before_heads,
+    )
+
+    assert touched == set()
+    detail = agent_repair_detail(folder, repair["repair"]["id"])
+    assert detail["repair"]["status"] == "no_change"
 
 
 def test_index_never_raises_and_degrades_to_empty(conv):

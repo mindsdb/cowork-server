@@ -477,7 +477,7 @@ class AntonHarness:
         artifacts_base = project_path / ".anton" / "artifacts"
         # Names AND content mtimes: a name diff only reveals artifacts the turn
         # CREATED, and the reconciler must also see the ones it EDITED.
-        before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
+        before_slugs, before_mtimes, before_revision_heads = snapshot_artifact_state(artifacts_base)
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
@@ -565,7 +565,7 @@ class AntonHarness:
             # skipped on cancellation, so anything awaited would silently not run.
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 conversation, conv_id, conv_project_id, artifacts_base,
-                before_slugs, before_mtimes,
+                before_slugs, before_mtimes, before_revision_heads,
             )
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,

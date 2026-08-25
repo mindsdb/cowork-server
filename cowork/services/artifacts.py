@@ -129,7 +129,7 @@ BG_CYCLE = [
 # backend's runtime log (`backend.log`) is excluded from the published
 # bundle there, so it must not count toward content mtime here either,
 # or it would constantly trip the gate and force a false badge.
-_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json"}
+_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json", ".revisions"}
 
 TEXT_EXTENSIONS = {
     ".html", ".md", ".txt", ".csv", ".json", ".py", ".js",
@@ -691,6 +691,13 @@ def card_for_folder(
     meta = _load_metadata(folder)
     if meta is None:
         return None
+    from cowork.services.artifact_identity import artifact_key, ensure_stable_id
+
+    try:
+        stable_id, meta = ensure_stable_id(folder, meta)
+    except (OSError, ValueError):
+        logger.warning("Skipping artifact with invalid stable identity: %s", folder, exc_info=True)
+        return None
     files = _user_files(folder)
     primary = _pick_primary(folder, files, primary_hint=meta.get("primary"))
     primary_path = str(primary) if primary is not None else str(folder)
@@ -713,6 +720,7 @@ def card_for_folder(
 
     card = {
         "id": meta.get("id") or folder.name,
+        "stableId": stable_id,
         "slug": meta.get("slug") or folder.name,
         "title": meta.get("name") or folder.name,
         "description": meta.get("description") or "",
@@ -741,6 +749,17 @@ def card_for_folder(
         **_published_access_for(folder, primary),
         "serveUrl": serve_url_for(primary_path),
     }
+    # Drafts and every published version share this key. A legacy
+    # `.published.json` key is intentionally overridden here so comments do not
+    # fork when an artifact is re-published under a different report URL.
+    card["artifactKey"] = artifact_key(stable_id)
+    if primary is not None:
+        project_ref = project_id or "local"
+        rel = primary.relative_to(folder).as_posix()
+        card["draftUrl"] = (
+            f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
+            f"{quote(stable_id)}/{quote(rel, safe='/')}"
+        )
     if _org_mode():
         # Dropped at the single card builder so inline chat cards are covered
         # too: they call this function as well, and a filter applied only at the
