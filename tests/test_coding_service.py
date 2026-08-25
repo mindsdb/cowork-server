@@ -25,6 +25,7 @@ from cowork.coding.contracts import (
     SessionCreateRequest,
     SessionStatus,
     SessionUpdateRequest,
+    WorkspaceKind,
 )
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
@@ -121,6 +122,26 @@ def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None
     assert ready.data["workspaceKind"] == "local_copy"
     assert created.workspace_path != str(folder.resolve())
     assert created.source_path == str(folder.resolve())
+
+
+def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -> None:
+    repo = tmp_path / "unborn-repo"
+    repo.mkdir()
+    git(repo, "init")
+    (repo / "README.md").write_text("uncommitted source\n", encoding="utf-8")
+    service = service_with(tmp_path, FakeEngine())
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Start from this folder"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.workspace_kind == WorkspaceKind.local_copy
+    assert created.workspace_path != str(repo.resolve())
+    assert Path(created.workspace_path, "README.md").read_text(encoding="utf-8") == "uncommitted source\n"
 
 
 def test_git_mutation_cannot_race_a_new_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

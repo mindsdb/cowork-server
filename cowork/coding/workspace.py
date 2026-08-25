@@ -114,7 +114,7 @@ class WorkspaceManager:
         status = self._status_lines(root)
         branch_result = self.git.run(root, "symbolic-ref", "--short", "-q", "HEAD", check=False)
         branch = branch_result.stdout.strip() or None
-        revision = self.git.run(root, "rev-parse", "HEAD").stdout.strip()
+        revision = self._head_revision(root)
         return WorkspaceInspection(
             path=str(path),
             exists=True,
@@ -126,7 +126,7 @@ class WorkspaceManager:
             dirty=bool(status),
             warning=(
                 "The source repository has local changes. The task starts from the current HEAD in an isolated worktree; uncommitted source changes are not copied."
-                if status
+                if status and revision
                 else None
             ),
         )
@@ -146,31 +146,25 @@ class WorkspaceManager:
             if not inspection.is_git:
                 if not allow_direct_folder:
                     raise WorkspaceError("Local folder isolation was not enabled for this request")
-                try:
-                    prepared = self.local_copies.prepare(session_id, source)
-                except LocalCopyError as exc:
-                    raise WorkspaceError(str(exc)) from exc
-                return PreparedWorkspace(
-                    source_path=source,
-                    workspace_path=prepared.workspace,
-                    kind=WorkspaceKind.local_copy,
-                    repository_root=None,
-                    base_revision=None,
-                    source_dirty=False,
-                    warning=None,
-                )
+                return self._prepare_local_copy(session_id, source)
 
             repo = Path(inspection.repository_root or inspection.path)
+            revision = inspection.revision
+            if base_branch:
+                revision = self.branch_revision(repo, base_branch)
+                if revision is None:
+                    raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
+            # Git cannot create a detached worktree until the repository has a
+            # commit. Preserve the same isolation guarantee with the existing
+            # conflict-checkable folder-copy engine; no source mutation or
+            # synthetic commit is required.
+            if revision is None:
+                return self._prepare_local_copy(session_id, repo)
+
             worktree = self.worktrees_root / managed_key(session_id)
             if worktree.exists():
                 raise WorkspaceError("A managed worktree already exists for this task")
             worktree.parent.mkdir(parents=True, exist_ok=True)
-            revision = inspection.revision or "HEAD"
-            if base_branch:
-                resolved = self.branch_revision(repo, base_branch)
-                if resolved is None:
-                    raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
-                revision = resolved
             self.git.run(repo, "worktree", "add", "--detach", str(worktree), revision)
             return PreparedWorkspace(
                 source_path=repo,
@@ -189,7 +183,7 @@ class WorkspaceManager:
             return GitState(is_git=False, worktree_path=str(workspace), source_path=source_path)
         branch_result = self.git.run(root, "symbolic-ref", "--short", "-q", "HEAD", check=False)
         branch = branch_result.stdout.strip() or None
-        revision = self.git.run(root, "rev-parse", "HEAD").stdout.strip()
+        revision = self._head_revision(root)
         status_lines = self._status_lines(root)
         return GitState(
             is_git=True,
@@ -575,6 +569,25 @@ class WorkspaceManager:
         if result.returncode != 0:
             return None
         return Path(result.stdout.strip()).resolve()
+
+    def _head_revision(self, root: Path) -> str | None:
+        result = self.git.run(root, "rev-parse", "--verify", "HEAD", check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def _prepare_local_copy(self, session_id: str, source: Path) -> PreparedWorkspace:
+        try:
+            prepared = self.local_copies.prepare(session_id, source)
+        except LocalCopyError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        return PreparedWorkspace(
+            source_path=source,
+            workspace_path=prepared.workspace,
+            kind=WorkspaceKind.local_copy,
+            repository_root=None,
+            base_revision=None,
+            source_dirty=False,
+            warning=None,
+        )
 
     @staticmethod
     def _resolve_existing(raw_path: str) -> Path | None:

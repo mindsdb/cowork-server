@@ -158,6 +158,51 @@ def test_non_git_folder_requires_isolation_and_uses_a_managed_copy(tmp_path: Pat
     assert prepared.workspace_path.is_dir()
 
 
+def test_repository_without_commits_uses_an_isolated_copy(tmp_path: Path) -> None:
+    repo = tmp_path / "empty-repository"
+    repo.mkdir()
+    git(repo, "init")
+    (repo / "untracked.txt").write_text("source\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    inspection = manager.inspect(str(repo))
+    prepared = manager.prepare("unborn-1", str(repo), False)
+
+    assert inspection.is_git is True
+    assert inspection.revision is None
+    assert inspection.warning is None
+    assert prepared.kind == WorkspaceKind.local_copy
+    assert prepared.workspace_path != repo.resolve()
+    assert (prepared.workspace_path / "untracked.txt").read_text(encoding="utf-8") == "source\n"
+    assert manager.git_state(str(repo), str(prepared.workspace_path)).revision is None
+
+
+def test_unborn_repository_copy_never_reviews_or_hands_off_git_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "repository-container"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    git(source, "init")
+    git(nested, "init")
+    (nested / "file.txt").write_text("base\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("container-1", str(source), False)
+
+    assert prepared.kind == WorkspaceKind.local_copy
+    git(prepared.workspace_path / "nested", "add", "file.txt")
+    (prepared.workspace_path / "nested" / "file.txt").write_text("changed\n", encoding="utf-8")
+    changed = manager.diff(str(prepared.workspace_path), prepared.base_revision)
+
+    assert [item.path for item in changed] == ["nested/file.txt"]
+    manager.apply_to_source(
+        "container-1",
+        str(source),
+        str(prepared.workspace_path),
+        prepared.base_revision,
+    )
+    assert (nested / "file.txt").read_text(encoding="utf-8") == "changed\n"
+    assert git(nested, "status", "--short") == "?? file.txt"
+
+
 def test_cleanup_only_removes_the_managed_task_worktree(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")

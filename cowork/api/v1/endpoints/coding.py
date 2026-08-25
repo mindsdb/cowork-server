@@ -218,7 +218,7 @@ async def inference_proxy(path: str, request: Request, session: SessionDep, scop
 
 @router.get("/workspace/inspect")
 def inspect_workspace(path: str):
-    return _service().inspect_workspace(path)
+    return _call(_service().inspect_workspace, path)
 
 
 @router.get("/skills/library", response_model=SkillLibraryPage)
