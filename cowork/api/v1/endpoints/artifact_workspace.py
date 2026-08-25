@@ -11,12 +11,30 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from cowork.api.v1.endpoints.artifacts import (
-    _html_with_layer,
-    _wants_comment_layer,
-    _workspace_artifact,
+from cowork.api.v1.artifact_preview import (
+    html_with_comment_layer,
+    wants_comment_layer,
 )
+from cowork.api.v1.artifact_scope import workspace_artifact_for_request
 from cowork.db.scoped import ScopedSessionDep
+from cowork.services.artifact_permissions import (
+    artifact_capabilities,
+    artifact_owner_id,
+    require_artifact_owner,
+)
+from cowork.services.artifact_revisions import (
+    RevisionConflict,
+    RevisionValidationError,
+    active_agent_repair,
+    agent_repair_detail,
+    cancel_agent_repair,
+    create_agent_repair,
+    current_source,
+    finalize_agent_repair,
+    list_revisions,
+    revision_with_content,
+    save_source,
+)
 
 router = APIRouter()
 
@@ -55,6 +73,13 @@ class _RepairDecisionBody(BaseModel):
     status: Literal["accepted", "rejected"]
 
 
+def _owner_workspace(session, project_ref: str, stable_id: str):
+    """Resolve one scoped artifact and enforce its source-mutation boundary."""
+    source, folder, metadata = workspace_artifact_for_request(session, project_ref, stable_id)
+    capabilities = require_artifact_owner(session, source)
+    return source, folder, metadata, capabilities
+
+
 @router.get("/workspace/{project_ref}/{stable_id}")
 async def artifact_source(
     project_ref: str,
@@ -63,24 +88,11 @@ async def artifact_source(
     path: str | None = Query(default=None),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS."""
-    from cowork.services.artifact_revisions import (
-        RevisionValidationError,
-        current_source,
+    _source, folder, metadata, capabilities = _owner_workspace(
+        session, project_ref, stable_id
     )
-
-    source, folder, metadata = _workspace_artifact(session, project_ref, stable_id)
-    from cowork.services.artifact_permissions import artifact_capabilities
-
-    capabilities = artifact_capabilities(session, source)
-    if not capabilities["canEdit"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the artifact owner can edit source",
-        )
     try:
         result = await run_in_threadpool(current_source, folder, metadata, stable_id, path)
-        from cowork.services.artifact_revisions import active_agent_repair
-
         repair = await run_in_threadpool(active_agent_repair, folder)
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -97,16 +109,9 @@ async def update_artifact_source(
     session: ScopedSessionDep,
 ):
     """Optimistic, atomic manual edit. A stale tab receives 409, never overwrite."""
-    from cowork.services.artifact_revisions import (
-        RevisionConflict,
-        RevisionValidationError,
-        save_source,
+    _source, folder, metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
     )
-
-    source, folder, metadata = _workspace_artifact(session, project_ref, stable_id)
-    from cowork.services.artifact_permissions import require_artifact_owner
-
-    require_artifact_owner(session, source)
     scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
     try:
@@ -140,12 +145,9 @@ async def artifact_revisions(
     session: ScopedSessionDep,
     path: str | None = Query(default=None),
 ):
-    from cowork.services.artifact_revisions import list_revisions
-
-    source, folder, _metadata = _workspace_artifact(session, project_ref, stable_id)
-    from cowork.services.artifact_permissions import require_artifact_owner
-
-    require_artifact_owner(session, source)
+    _source, folder, _metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
+    )
     return {"revisions": await run_in_threadpool(list_revisions, folder, rel_path=path)}
 
 
@@ -161,9 +163,7 @@ async def enable_artifact_comments(
         provision_draft_review_access,
     )
 
-    source, folder, metadata = _workspace_artifact(session, project_ref, stable_id)
-    from cowork.services.artifact_permissions import artifact_capabilities, artifact_owner_id
-
+    source, folder, metadata = workspace_artifact_for_request(session, project_ref, stable_id)
     capabilities = artifact_capabilities(session, source)
     owner_user_id = artifact_owner_id(session, source)
     try:
@@ -179,8 +179,6 @@ async def enable_artifact_comments(
         ) from exc
     current_revision = None
     try:
-        from cowork.services.artifact_revisions import current_source
-
         draft = await run_in_threadpool(current_source, folder, metadata, stable_id)
         current_revision = draft.get("revision")
     except (FileNotFoundError, OSError, ValueError, TimeoutError):
@@ -202,12 +200,9 @@ async def artifact_revision(
     revision_id: str,
     session: ScopedSessionDep,
 ):
-    from cowork.services.artifact_revisions import RevisionValidationError, revision_with_content
-
-    source, folder, _metadata = _workspace_artifact(session, project_ref, stable_id)
-    from cowork.services.artifact_permissions import require_artifact_owner
-
-    require_artifact_owner(session, source)
+    _source, folder, _metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
+    )
     try:
         return await run_in_threadpool(revision_with_content, folder, revision_id)
     except FileNotFoundError as exc:
@@ -224,17 +219,9 @@ async def restore_artifact_revision(
     body: _RestoreBody,
     session: ScopedSessionDep,
 ):
-    from cowork.services.artifact_revisions import (
-        RevisionConflict,
-        RevisionValidationError,
-        revision_with_content,
-        save_source,
+    _source, folder, metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
     )
-
-    source, folder, metadata = _workspace_artifact(session, project_ref, stable_id)
-    from cowork.services.artifact_permissions import require_artifact_owner
-
-    require_artifact_owner(session, source)
     try:
         restored = await run_in_threadpool(revision_with_content, folder, revision_id)
         scope = getattr(session, "scope", None)
@@ -269,15 +256,9 @@ async def request_agent_repair(
     body: _AgentRepairBody,
     session: ScopedSessionDep,
 ):
-    from cowork.services.artifact_permissions import require_artifact_owner
-    from cowork.services.artifact_revisions import (
-        RevisionConflict,
-        RevisionValidationError,
-        create_agent_repair,
+    _source, folder, metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
     )
-
-    source, folder, metadata = _workspace_artifact(session, project_ref, stable_id)
-    require_artifact_owner(session, source)
     try:
         return await run_in_threadpool(
             create_agent_repair,
@@ -306,11 +287,9 @@ async def get_agent_repair(
     repair_id: str,
     session: ScopedSessionDep,
 ):
-    from cowork.services.artifact_permissions import require_artifact_owner
-    from cowork.services.artifact_revisions import RevisionValidationError, agent_repair_detail
-
-    source, folder, _metadata = _workspace_artifact(session, project_ref, stable_id)
-    require_artifact_owner(session, source)
+    _source, folder, _metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
+    )
     try:
         return await run_in_threadpool(agent_repair_detail, folder, repair_id)
     except FileNotFoundError as exc:
@@ -327,14 +306,9 @@ async def cancel_queued_agent_repair(
     session: ScopedSessionDep,
 ):
     """Release a queued repair when its agent turn could not be started."""
-    from cowork.services.artifact_permissions import require_artifact_owner
-    from cowork.services.artifact_revisions import (
-        RevisionValidationError,
-        cancel_agent_repair,
+    _source, folder, _metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
     )
-
-    source, folder, _metadata = _workspace_artifact(session, project_ref, stable_id)
-    require_artifact_owner(session, source)
     try:
         return await run_in_threadpool(cancel_agent_repair, folder, repair_id)
     except FileNotFoundError as exc:
@@ -351,15 +325,9 @@ async def decide_agent_repair(
     body: _RepairDecisionBody,
     session: ScopedSessionDep,
 ):
-    from cowork.services.artifact_permissions import require_artifact_owner
-    from cowork.services.artifact_revisions import (
-        RevisionConflict,
-        RevisionValidationError,
-        finalize_agent_repair,
+    _source, folder, metadata, _capabilities = _owner_workspace(
+        session, project_ref, stable_id
     )
-
-    source, folder, metadata = _workspace_artifact(session, project_ref, stable_id)
-    require_artifact_owner(session, source)
     try:
         scope = getattr(session, "scope", None)
         actor_id = str(scope.user_id) if scope and scope.user_id else None
@@ -392,7 +360,7 @@ async def serve_private_draft(
     session: ScopedSessionDep,
 ):
     """Authenticated draft preview with project/org containment and relative assets."""
-    _source, folder, metadata = _workspace_artifact(session, project_ref, stable_id)
+    _source, folder, metadata = workspace_artifact_for_request(session, project_ref, stable_id)
     if not rel_path or "\x00" in rel_path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path")
     try:
@@ -432,8 +400,8 @@ async def serve_private_draft(
     if not target.is_file() or target.is_symlink():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    if _wants_comment_layer(media_type, request):
-        resp = await run_in_threadpool(_html_with_layer, target)
+    if wants_comment_layer(media_type, request):
+        resp = await run_in_threadpool(html_with_comment_layer, target)
         if resp is not None:
             resp.headers["Cache-Control"] = "private, no-store"
             resp.headers["X-Content-Type-Options"] = "nosniff"

@@ -214,32 +214,28 @@ def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     }
 
 
-def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int], dict[str, str]]:
-    """Pre-turn snapshot: folder names, content mtimes, and revision hashes.
+def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
+    """Pre-turn snapshot of folder names and nanosecond content mtimes.
 
     Names alone only reveal artifacts the turn CREATED. The autopublish
     reconciler also needs the ones it EDITED, and those are invisible to a name
     diff, so the snapshot carries `content_mtime` per slug and the diff compares
     both.
 
-    The primary-source hash closes the whole-second mtime gap: source edits made
-    immediately after this snapshot are still attributed to this turn and become
-    agent revisions. Unsupported/non-text artifacts keep the mtime path.
+    Nanosecond precision closes the former whole-second gap without hashing the
+    full primary source of every artifact before and after every agent turn.
     """
-    from cowork.services.artifacts import content_mtime
-    from cowork.services.artifact_revisions import snapshot_revision_head
+    from cowork.services.artifacts import content_mtime_ns
 
     base = Path(artifacts_base)
     slugs = snapshot_artifact_slugs(base)
     mtimes: dict[str, int] = {}
-    revision_heads: dict[str, str] = {}
     for slug in slugs:
         try:
-            mtimes[slug] = content_mtime(base / slug)
+            mtimes[slug] = content_mtime_ns(base / slug)
         except OSError:
             mtimes[slug] = 0
-        revision_heads[slug] = snapshot_revision_head(base / slug)
-    return slugs, mtimes, revision_heads
+    return slugs, mtimes
 
 
 def _recover_turn_scope(conversation) -> TenantScope | None:
@@ -301,7 +297,6 @@ def index_turn_artifacts(
     artifacts_base,
     before: set[str],
     before_mtimes: dict[str, int],
-    before_revision_heads: dict[str, str] | None = None,
 ) -> tuple[list[str], set[str], TenantScope | None]:
     """End-of-turn artifact bookkeeping from a SINGLE artifacts-dir diff.
 
@@ -323,11 +318,10 @@ def index_turn_artifacts(
     ([], set(), None) and the next turn picks the work up.
     """
     try:
-        from cowork.services.artifacts import content_mtime
+        from cowork.services.artifacts import content_mtime_ns
         from cowork.services.artifact_revisions import (
             capture_agent_revision,
             has_queued_agent_repair,
-            primary_source_hash,
         )
 
         base = Path(artifacts_base)
@@ -339,12 +333,8 @@ def index_turn_artifacts(
             if previous is None:
                 continue  # appeared this turn — already in `new`
             try:
-                if content_mtime(base / slug) > previous:
+                if content_mtime_ns(base / slug) > previous:
                     touched.add(slug)
-                elif before_revision_heads is not None:
-                    current_head = primary_source_hash(base / slug)
-                    if current_head and current_head != before_revision_heads.get(slug, ""):
-                        touched.add(slug)
             except OSError:
                 continue
         for slug in touched:
@@ -413,7 +403,7 @@ def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts
     callers need — they do not publish.
     """
     new, _touched, _scope = index_turn_artifacts(
-        conversation, conversation_id, project_id, artifacts_base, before, {}, {},
+        conversation, conversation_id, project_id, artifacts_base, before, {},
     )
     return cards_for_slugs(artifacts_base, new)
 

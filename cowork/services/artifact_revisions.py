@@ -47,6 +47,10 @@ def _manifest_path(folder: Path) -> Path:
     return _journal(folder) / "manifest.json"
 
 
+def _pending_path(folder: Path) -> Path:
+    return _journal(folder) / "pending-source-write.json"
+
+
 def _repairs_dir(folder: Path) -> Path:
     return _journal(folder) / "repairs"
 
@@ -67,10 +71,26 @@ def _atomic_bytes(path: Path, content: bytes, *, mode: int | None = None) -> Non
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_bytes(content)
+        with tmp.open("wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
         if mode is not None:
             os.chmod(tmp, mode)
         os.replace(tmp, path)
+        # `fsync` above durably writes the file bytes; syncing the containing
+        # directory makes the rename itself durable across a host crash on
+        # filesystems that support directory descriptors. Windows does not,
+        # so it safely keeps the atomic-replace guarantee without this extra
+        # durability step.
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -81,6 +101,20 @@ def _atomic_bytes(path: Path, content: bytes, *, mode: int | None = None) -> Non
 def _write_manifest(folder: Path, payload: dict) -> None:
     encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     _atomic_bytes(_manifest_path(folder), encoded)
+
+
+def _write_pending(folder: Path, payload: dict) -> None:
+    encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _atomic_bytes(_pending_path(folder), encoded, mode=0o600)
+
+
+def _clear_pending(folder: Path) -> None:
+    try:
+        _pending_path(folder).unlink(missing_ok=True)
+    except OSError:
+        # The transaction is already committed or deliberately abandoned. A
+        # stale marker is harmless and will be recognized on the next read.
+        pass
 
 
 def _write_repair(folder: Path, repair: dict) -> None:
@@ -167,6 +201,7 @@ def _finish_queued_repairs(
 
 def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) -> tuple[Path, str]:
     """Resolve an editable source without accepting an absolute/client path."""
+    canonical_folder = folder.resolve(strict=False)
     candidate_rel = (rel_path or metadata.get("primary") or "").strip().replace("\\", "/")
     if not candidate_rel:
         candidates = sorted(
@@ -182,16 +217,16 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
         parts = Path(candidate_rel).parts
         if Path(candidate_rel).is_absolute() or ".." in parts or JOURNAL_DIRNAME in parts:
             raise RevisionValidationError("Invalid artifact source path")
-        target = (folder / candidate_rel).resolve(strict=False)
+        target = (canonical_folder / candidate_rel).resolve(strict=False)
         try:
-            target.relative_to(folder.resolve())
+            target.relative_to(canonical_folder)
         except ValueError as exc:
             raise RevisionValidationError("Invalid artifact source path") from exc
     if not target.is_file() or target.is_symlink():
         raise FileNotFoundError("Artifact source not found")
     if target.suffix.lower() not in EDITABLE_EXTENSIONS:
         raise RevisionValidationError("This artifact type is not source-editable")
-    return target, target.relative_to(folder).as_posix()
+    return target, target.resolve(strict=False).relative_to(canonical_folder).as_posix()
 
 
 def _content_for_revision(folder: Path, revision: dict) -> str:
@@ -202,8 +237,7 @@ def _content_for_revision(folder: Path, revision: dict) -> str:
         raise RevisionValidationError("Revision content is unavailable") from exc
 
 
-def _append_revision(
-    folder: Path,
+def _new_revision(
     manifest: dict,
     *,
     stable_id: str,
@@ -217,11 +251,8 @@ def _append_revision(
     comment_thread_ids: list[str] | None = None,
 ) -> dict:
     content_hash = _sha(content)
-    blob = _journal(folder) / "blobs" / content_hash
-    if not blob.exists():
-        _atomic_bytes(blob, content, mode=0o600)
     revisions = manifest["revisions"]
-    entry = {
+    return {
         "id": str(uuid.uuid4()),
         "number": (int(revisions[-1].get("number", 0)) + 1) if revisions else 1,
         "artifactId": stable_id,
@@ -235,6 +266,24 @@ def _append_revision(
         "conversationId": conversation_id,
         "commentThreadIds": list(dict.fromkeys(comment_thread_ids or [])),
     }
+
+
+def _persist_revision(folder: Path, manifest: dict, entry: dict, content: bytes) -> dict:
+    """Persist an idempotent revision entry and its content-addressed blob."""
+    content_hash = str(entry.get("contentHash") or "")
+    if content_hash != _sha(content):
+        raise RevisionValidationError("Revision content hash is invalid")
+    blob = _journal(folder) / "blobs" / content_hash
+    if not blob.exists():
+        _atomic_bytes(blob, content, mode=0o600)
+    elif _sha(blob.read_bytes()) != content_hash:
+        raise RevisionValidationError("Stored revision content is corrupt")
+    revisions = manifest["revisions"]
+    existing = next((item for item in revisions if item.get("id") == entry.get("id")), None)
+    if existing is not None:
+        return existing
+    if revisions and int(entry.get("number", 0)) <= int(revisions[-1].get("number", 0)):
+        entry = {**entry, "number": int(revisions[-1].get("number", 0)) + 1}
     revisions.append(entry)
     pruned = len(revisions) > MAX_REVISIONS
     if pruned:
@@ -253,10 +302,144 @@ def _append_revision(
     return entry
 
 
+def _append_revision(
+    folder: Path,
+    manifest: dict,
+    *,
+    stable_id: str,
+    rel_path: str,
+    content: bytes,
+    actor_kind: str,
+    actor_id: str | None,
+    summary: str,
+    base_revision_id: str | None,
+    conversation_id: str | None = None,
+    comment_thread_ids: list[str] | None = None,
+) -> dict:
+    entry = _new_revision(
+        manifest,
+        stable_id=stable_id,
+        rel_path=rel_path,
+        content=content,
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+        summary=summary,
+        base_revision_id=base_revision_id,
+        conversation_id=conversation_id,
+        comment_thread_ids=comment_thread_ids,
+    )
+    return _persist_revision(folder, manifest, entry, content)
+
+
+def _recover_pending_source_write(folder: Path) -> None:
+    """Finish or safely abandon a source/revision transaction after a crash.
+
+    The artifact lock must be held. A pending edit is completed only while its
+    recorded base is still the manifest head and the source is either the old
+    or intended content. An unrelated external write always wins.
+    """
+    pending_path = _pending_path(folder)
+    try:
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RevisionValidationError("Pending artifact edit is unreadable") from exc
+    if not isinstance(pending, dict) or pending.get("version") != 1:
+        raise RevisionValidationError("Pending artifact edit is invalid")
+    entry = pending.get("revision")
+    rel_path = pending.get("path")
+    before_hash = pending.get("beforeContentHash")
+    if not isinstance(entry, dict) or not isinstance(rel_path, str) or entry.get("path") != rel_path:
+        raise RevisionValidationError("Pending artifact edit is invalid")
+    parts = Path(rel_path).parts
+    if Path(rel_path).is_absolute() or ".." in parts or JOURNAL_DIRNAME in parts:
+        raise RevisionValidationError("Pending artifact edit path is invalid")
+    target = (folder / rel_path).resolve(strict=False)
+    try:
+        target.relative_to(folder.resolve())
+        content = (_journal(folder) / "blobs" / str(entry.get("contentHash") or "")).read_bytes()
+        current = target.read_bytes()
+    except (OSError, ValueError) as exc:
+        raise RevisionValidationError("Pending artifact edit cannot be recovered") from exc
+    if _sha(content) != entry.get("contentHash"):
+        raise RevisionValidationError("Pending artifact edit content is invalid")
+
+    manifest = _read_manifest(folder)
+    revisions = manifest["revisions"]
+    if any(item.get("id") == entry.get("id") for item in revisions):
+        # The commit reached the manifest. A later external source edit must not
+        # be overwritten merely because cleanup was interrupted.
+        _clear_pending(folder)
+        return
+
+    latest = next((item for item in reversed(revisions) if item.get("path") == rel_path), None)
+    latest_id = latest.get("id") if latest else None
+    current_hash = _sha(current)
+    if latest_id != entry.get("baseRevisionId") or current_hash not in {
+        before_hash,
+        entry.get("contentHash"),
+    }:
+        _clear_pending(folder)
+        return
+    if current_hash == before_hash:
+        _atomic_bytes(target, content, mode=target.stat().st_mode & 0o777)
+    _persist_revision(folder, manifest, entry, content)
+    _clear_pending(folder)
+
+
+def _commit_source_revision(
+    folder: Path,
+    manifest: dict,
+    target: Path,
+    *,
+    stable_id: str,
+    rel_path: str,
+    before_content: bytes,
+    content: bytes,
+    actor_kind: str,
+    actor_id: str | None,
+    summary: str,
+    base_revision_id: str,
+    conversation_id: str | None = None,
+    comment_thread_ids: list[str] | None = None,
+) -> dict:
+    """Atomically couple a source replacement to its attributed revision."""
+    entry = _new_revision(
+        manifest,
+        stable_id=stable_id,
+        rel_path=rel_path,
+        content=content,
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+        summary=summary,
+        base_revision_id=base_revision_id,
+        conversation_id=conversation_id,
+        comment_thread_ids=comment_thread_ids,
+    )
+    blob = _journal(folder) / "blobs" / entry["contentHash"]
+    if not blob.exists():
+        _atomic_bytes(blob, content, mode=0o600)
+    _write_pending(
+        folder,
+        {
+            "version": 1,
+            "path": rel_path,
+            "beforeContentHash": _sha(before_content),
+            "revision": entry,
+        },
+    )
+    _atomic_bytes(target, content, mode=target.stat().st_mode & 0o777)
+    _persist_revision(folder, manifest, entry, content)
+    _clear_pending(folder)
+    return entry
+
+
 def _current_source_locked(
     folder: Path, metadata: dict, stable_id: str, rel_path: str | None = None
 ) -> dict:
     """Read/capture source while the caller holds the artifact revision lock."""
+    _recover_pending_source_write(folder)
     target, relative = resolve_source(folder, metadata, rel_path)
     content = target.read_bytes()
     if len(content) > MAX_SOURCE_BYTES:
@@ -315,6 +498,7 @@ def save_source(
     if len(encoded) > MAX_SOURCE_BYTES:
         raise RevisionValidationError("Artifact source is too large to edit")
     with artifact_lock(folder):
+        _recover_pending_source_write(folder)
         target, relative = resolve_source(folder, metadata, rel_path)
         existing = target.read_bytes()
         manifest = _read_manifest(folder)
@@ -339,13 +523,13 @@ def save_source(
         if latest.get("contentHash") == _sha(encoded):
             return {"artifactId": stable_id, "path": relative, "content": content, "revision": latest}
 
-        mode = target.stat().st_mode & 0o777
-        _atomic_bytes(target, encoded, mode=mode)
-        entry = _append_revision(
+        entry = _commit_source_revision(
             folder,
             manifest,
+            target,
             stable_id=stable_id,
             rel_path=relative,
+            before_content=existing,
             content=encoded,
             actor_kind=actor_kind,
             actor_id=actor_id,
@@ -358,14 +542,16 @@ def save_source(
 
 
 def list_revisions(folder: Path, *, rel_path: str | None = None) -> list[dict]:
-    manifest = _read_manifest(folder)
-    revisions = manifest["revisions"]
-    if rel_path is not None:
-        revisions = [r for r in revisions if r.get("path") == rel_path]
-    return list(reversed(revisions))
+    with artifact_lock(folder):
+        _recover_pending_source_write(folder)
+        manifest = _read_manifest(folder)
+        revisions = manifest["revisions"]
+        if rel_path is not None:
+            revisions = [r for r in revisions if r.get("path") == rel_path]
+        return list(reversed(revisions))
 
 
-def revision_with_content(folder: Path, revision_id: str) -> dict:
+def _revision_with_content_locked(folder: Path, revision_id: str) -> dict:
     manifest = _read_manifest(folder)
     revision = next((r for r in manifest["revisions"] if r.get("id") == revision_id), None)
     if revision is None:
@@ -373,38 +559,10 @@ def revision_with_content(folder: Path, revision_id: str) -> dict:
     return {**revision, "content": _content_for_revision(folder, revision)}
 
 
-def snapshot_revision_head(folder: Path) -> str:
-    """Ensure the primary source has a baseline and return its content hash.
-
-    Used at the turn boundary so an agent write can be attributed even when it
-    lands within the same whole-second mtime bucket as the pre-turn snapshot.
-    Unsupported/big artifacts return an empty token and keep the legacy mtime
-    path working.
-    """
-    from cowork.services.artifact_identity import ensure_stable_id
-
-    try:
-        stable_id, metadata = ensure_stable_id(folder)
-        source = current_source(folder, metadata, stable_id)
-        return str(source["revision"]["contentHash"])
-    except (OSError, ValueError, RevisionValidationError, TimeoutError):
-        return ""
-
-
-def primary_source_hash(folder: Path) -> str:
-    """Current primary-source hash without mutating the revision journal."""
-    from cowork.services.artifact_identity import ensure_stable_id
-
-    try:
-        _stable_id, metadata = ensure_stable_id(folder)
-        target, _relative = resolve_source(folder, metadata)
-        content = target.read_bytes()
-        if len(content) > MAX_SOURCE_BYTES:
-            return ""
-        content.decode("utf-8")
-        return _sha(content)
-    except (OSError, UnicodeDecodeError, ValueError, RevisionValidationError):
-        return ""
+def revision_with_content(folder: Path, revision_id: str) -> dict:
+    with artifact_lock(folder):
+        _recover_pending_source_write(folder)
+        return _revision_with_content_locked(folder, revision_id)
 
 
 def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) -> dict | None:
@@ -414,6 +572,7 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
     try:
         stable_id, metadata = ensure_stable_id(folder)
         with artifact_lock(folder):
+            _recover_pending_source_write(folder)
             target, relative = resolve_source(folder, metadata)
             content = target.read_bytes()
             if len(content) > MAX_SOURCE_BYTES:
@@ -525,15 +684,17 @@ def create_agent_repair(
 
 
 def agent_repair_detail(folder: Path, repair_id: str) -> dict:
-    repair = _read_repair(folder, repair_id)
-    result = {"repair": repair}
-    if repair.get("status") == "ready" and repair.get("revisionId"):
-        before = revision_with_content(folder, repair["baseRevisionId"])
-        after = revision_with_content(folder, repair["revisionId"])
-        if before.get("path") != repair.get("path") or after.get("path") != repair.get("path"):
-            raise RevisionValidationError("Agent repair revision path is inconsistent")
-        result["compare"] = {"before": before, "after": after}
-    return result
+    with artifact_lock(folder):
+        _recover_pending_source_write(folder)
+        repair = _read_repair(folder, repair_id)
+        result = {"repair": repair}
+        if repair.get("status") == "ready" and repair.get("revisionId"):
+            before = _revision_with_content_locked(folder, repair["baseRevisionId"])
+            after = _revision_with_content_locked(folder, repair["revisionId"])
+            if before.get("path") != repair.get("path") or after.get("path") != repair.get("path"):
+                raise RevisionValidationError("Agent repair revision path is inconsistent")
+            result["compare"] = {"before": before, "after": after}
+        return result
 
 
 def active_agent_repair(folder: Path) -> dict | None:
@@ -593,23 +754,37 @@ def finalize_agent_repair(
             raise RevisionValidationError("Agent repair is not ready for review")
         source = _current_source_locked(folder, metadata, stable_id, repair.get("path"))
         current = source["revision"]
+        if (
+            decision == "rejected"
+            and current.get("baseRevisionId") == repair.get("revisionId")
+            and current.get("summary") == "Rejected agent suggestion"
+            and repair.get("commentThreadId") in current.get("commentThreadIds", [])
+        ):
+            # The source/revision transaction committed but a process failure
+            # interrupted the final repair-status write. Retrying the decision
+            # completes that last idempotent step instead of reporting a false
+            # edit conflict and stranding the repair in `ready`.
+            repair["status"] = decision
+            repair["updatedAt"] = _now()
+            _write_repair(folder, repair)
+            return repair
         if current.get("id") != repair.get("revisionId"):
             raise RevisionConflict(current)
 
         if decision == "rejected":
-            before = revision_with_content(folder, repair["baseRevisionId"])
+            before = _revision_with_content_locked(folder, repair["baseRevisionId"])
             if before.get("path") != repair.get("path"):
                 raise RevisionValidationError("Agent repair revision path is inconsistent")
             encoded = before["content"].encode("utf-8")
             target, relative = resolve_source(folder, metadata, repair["path"])
-            mode = target.stat().st_mode & 0o777
-            _atomic_bytes(target, encoded, mode=mode)
             manifest = _read_manifest(folder)
-            _append_revision(
+            _commit_source_revision(
                 folder,
                 manifest,
+                target,
                 stable_id=stable_id,
                 rel_path=relative,
+                before_content=source["content"].encode("utf-8"),
                 content=encoded,
                 actor_kind="manual",
                 actor_id=actor_id,

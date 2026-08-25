@@ -12,11 +12,10 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from anton.core.artifacts.models import legacy_stable_id
+
 if TYPE_CHECKING:
     from cowork.services.artifacts import ProjectArtifacts
-
-_LEGACY_ARTIFACT_NAMESPACE = uuid.UUID("4ba9bdf8-3f0e-4ce5-beb0-8f00a8d955e7")
-
 
 class ArtifactIdentityConflict(RuntimeError):
     """More than one scoped folder claims the same stable identity."""
@@ -25,7 +24,7 @@ class ArtifactIdentityConflict(RuntimeError):
 def _legacy_stable_id(metadata: dict, folder: Path) -> str:
     legacy_id = str(metadata.get("id") or metadata.get("slug") or folder.name)
     created_at = str(metadata.get("createdAt") or "")
-    return str(uuid.uuid5(_LEGACY_ARTIFACT_NAMESPACE, f"{legacy_id}:{created_at}"))
+    return legacy_stable_id(legacy_id, created_at)
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -50,15 +49,31 @@ def ensure_stable_id(folder: Path, metadata: dict | None = None) -> tuple[str, d
     if metadata is None:
         metadata = json.loads(path.read_text(encoding="utf-8"))
     raw = metadata.get("stableId")
-    try:
-        stable_id = str(uuid.UUID(str(raw))) if raw else ""
-    except (ValueError, TypeError, AttributeError):
-        stable_id = ""
-    if stable_id:
-        return stable_id, metadata
+    if raw not in (None, ""):
+        try:
+            return str(uuid.UUID(str(raw))), metadata
+        except (ValueError, TypeError, AttributeError) as exc:
+            # A present-but-invalid identity is corruption, not a legacy
+            # record. Replacing it would silently detach published versions
+            # and existing comment threads from the artifact.
+            raise ValueError("Artifact stable identity is invalid") from exc
 
     stable_id = _legacy_stable_id(metadata, folder)
-    updated = dict(metadata)
+
+    # The caller may have loaded metadata before another subsystem updated it.
+    # Merge into the latest durable document instead of writing the stale
+    # snapshot back over unrelated metadata fields.
+    try:
+        latest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Artifact metadata is unreadable") from exc
+    latest_raw = latest.get("stableId")
+    if latest_raw not in (None, ""):
+        try:
+            return str(uuid.UUID(str(latest_raw))), latest
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("Artifact stable identity is invalid") from exc
+    updated = dict(latest)
     updated["stableId"] = stable_id
     _atomic_json(path, updated)
     return stable_id, updated

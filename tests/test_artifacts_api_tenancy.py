@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
+from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts as ep
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.services import artifacts as ep_artifacts
@@ -508,7 +509,7 @@ async def test_desktop_project_path_narrows_to_that_project(
     mine_project_dir = mine.parent.parent.parent
 
     monkeypatch.setattr(
-        ep, "_sources_for_scan",
+        artifact_scope, "artifacts_sources_for_scan",
         lambda: [
             ep_artifacts.ProjectArtifacts(
                 base=p / ".anton" / "artifacts", project_id=None, project_name=p.name,
@@ -529,7 +530,7 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
 ):
     _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="dash")
     monkeypatch.setattr(
-        ep, "_sources_for_scan",
+        artifact_scope, "artifacts_sources_for_scan",
         lambda: [
             ep_artifacts.ProjectArtifacts(
                 base=(tmp_path / "local" / "mine") / ".anton" / "artifacts",

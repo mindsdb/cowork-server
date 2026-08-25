@@ -6,6 +6,7 @@ can be discovered inside these functions.
 """
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
@@ -19,6 +20,17 @@ from cowork.services import publish as p
 # author two independent grants — owner-by-FK and org membership — instead of
 # depending on the owner check alone.
 AUTOPUBLISH_ACCESS = {"mode": "restricted", "emails": [], "org_allowed": True}
+
+
+def test_installed_publisher_accepts_stable_artifact_key():
+    """Pin the cross-repository contract that publish_artifact relies on.
+
+    Most publish tests replace Anton with a ``**kwargs`` fake, which cannot
+    detect a stale lockfile resolving a publisher that rejects this argument.
+    """
+    from anton.publisher import publish
+
+    assert "artifact_key" in inspect.signature(publish).parameters
 
 
 def _make_artifact(base, slug, *, files: dict[str, str], meta: dict):

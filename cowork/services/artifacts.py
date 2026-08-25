@@ -308,6 +308,19 @@ def _content_mtime(folder: Path) -> int:
 content_mtime = _content_mtime
 
 
+def content_mtime_ns(folder: Path) -> int:
+    """Nanosecond content clock for efficient before/after turn snapshots.
+
+    This uses the same user-file set as :func:`content_mtime` but preserves the
+    filesystem's full timestamp precision, avoiding whole-file hashing merely
+    to notice two edits that landed in the same second.
+    """
+    try:
+        return max((p.stat().st_mtime_ns for p in _user_files(folder)), default=0)
+    except OSError:
+        return 0
+
+
 def load_published_map(folder: Path) -> dict:
     """The `.published.json` record for an artifact folder, `{}` when absent or
     unreadable. Public because the autopublish reconciler needs the same view of
@@ -755,7 +768,12 @@ def card_for_folder(
     card["artifactKey"] = artifact_key(stable_id)
     if primary is not None:
         project_ref = project_id or "local"
-        rel = primary.relative_to(folder).as_posix()
+        # macOS commonly exposes the same temporary directory through both
+        # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
+        # the URL path so an absolute primary hint cannot fail on that alias.
+        rel = primary.resolve(strict=False).relative_to(
+            folder.resolve(strict=False)
+        ).as_posix()
         card["draftUrl"] = (
             f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
             f"{quote(stable_id)}/{quote(rel, safe='/')}"
