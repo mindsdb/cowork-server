@@ -34,6 +34,17 @@ class _FakeVault:
         }
 
 
+class _FakeVaultNoRefreshToken:
+    def __init__(self, path):
+        self._path = path
+
+    def load(self, engine, name):
+        return {
+            "auth_type": "oauth",
+            "access_token": "sb-access-123",
+        }
+
+
 class _FakeResponse:
     def __enter__(self):
         return self
@@ -80,3 +91,21 @@ def test_revoke_skips_network_call_without_oauth_settings(monkeypatch):
     svc = OAuthService()
     # Should not raise, just log and return.
     svc.revoke("supabase", "my-supabase-conn", ConnectorSettings(), None)
+
+
+def test_revoke_skips_network_call_without_refresh_token(monkeypatch):
+    # Without a stored refresh_token, revoke() used to fall back to the
+    # access_token and send it to Supabase under the "refresh_token" label.
+    # Supabase rejects it, and the failure was only logged as a warning —
+    # disconnect looked like it worked while the grant stayed live.
+    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVaultNoRefreshToken)
+
+    def _boom(request, timeout=10):
+        raise AssertionError("must not call Supabase's revoke endpoint without a refresh_token")
+
+    monkeypatch.setattr(google_module, "urlopen", _boom)
+
+    settings = OAuthSettings(_env_file=None, SUPABASE_CLIENT_ID="cid-123", SUPABASE_CLIENT_SECRET="csecret-456")
+    svc = OAuthService()
+    # Should not raise, just log and return without hitting the network.
+    svc.revoke("supabase", "my-supabase-conn", ConnectorSettings(), settings)
