@@ -891,6 +891,7 @@ def response_failed_payload(
     retry_after: float | None = None,
     retry_at: str | None = None,
     reset_at: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
@@ -901,6 +902,12 @@ def response_failed_payload(
     ``rate_limited`` so the card can time-gate its Retry — omitted otherwise to
     keep the shape unchanged for every other failure. All additive: an older
     client ignores fields it doesn't read.
+
+    ``request_id`` is the remote turn's own correlation id — present on every
+    remote-backend failure regardless of code, including the fully generic
+    ``anton_error`` bucket, so a user report of "An unexpected error
+    occurred" can still be pinned to this turn's server-side logs. The
+    in-process path has no such id to offer and omits it.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:
@@ -915,6 +922,8 @@ def response_failed_payload(
         payload["retry_at"] = retry_at
     if reset_at is not None:
         payload["reset_at"] = reset_at
+    if request_id is not None:
+        payload["request_id"] = request_id
     return payload
 
 
@@ -928,6 +937,7 @@ def response_failed_sse(
     retry_after: float | None = None,
     retry_at: str | None = None,
     reset_at: str | None = None,
+    request_id: str | None = None,
 ) -> str:
     """Build a ``response.failed`` SSE frame (same wire shape the renderer's
     parser already handles, plus the optional auth/model/retry-after fields)."""
@@ -940,5 +950,6 @@ def response_failed_sse(
         retry_after=retry_after,
         retry_at=retry_at,
         reset_at=reset_at,
+        request_id=request_id,
     )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"

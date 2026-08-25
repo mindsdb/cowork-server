@@ -789,6 +789,10 @@ class ResponsesHandler:
         persisted = False
         pending_message_id: UUID | None = None
         failure: dict = {}
+        # Resolved once, up front — not left for stream_remote_replies to mint
+        # internally on a None — so every failure branch below (classified or
+        # not) can attach the SAME id a support/log lookup would use.
+        corr = (turn_llm or {}).get("correlation_id") or str(uuid4())
 
         def event_sink(event_type: str, data: dict) -> None:
             # Same event log the in-process path records, so the client
@@ -843,7 +847,7 @@ class ResponsesHandler:
                     # Skills and memory are NOT sent: the pod reads them off the
                     # shared mount. Only the org-relative project path travels.
                     **self._remote_workspace(producer_session, conv_id),
-                    correlation_id=(turn_llm or {}).get("correlation_id"),
+                    correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
                 ):
                     if kind == "turn_delta":
@@ -963,8 +967,8 @@ class ResponsesHandler:
         except _RemoteTurnFailed:
             message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
-            collected_events.append(response_failed_payload(message, code))
-            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            collected_events.append(response_failed_payload(message, code, request_id=corr))
+            await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
             persist()
             await buffer.close("error")
         except asyncio.CancelledError:
@@ -978,9 +982,9 @@ class ResponsesHandler:
         except Exception:
             logger.exception("[responses] remote turn failed for conversation %s", conv_id)
             collected_events.append(response_failed_payload(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE))
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr)})
             persist()
             await buffer.close("error")
         finally:
