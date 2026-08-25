@@ -25,6 +25,7 @@ from cowork.models.message import Message as DBMessage
 from cowork.models.project import Project
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
+from cowork.services.artifact_roots import _project_artifact_bases
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService
@@ -70,16 +71,17 @@ MAX_TURN_ATTACHMENTS = 3
 def artifacts_since(project_path: str, since: float) -> list[tuple[str, str]]:
     """(path, filename) of artifact primaries created/updated after ``since``
     in this project. Time-window based: concurrent turns in the same project
-    could cross-attribute — acceptable for the single-operator v1."""
+    could still cross-attribute within a shared root — acceptable for the
+    single-operator v1. Scans every artifact root for the project (the legacy
+    project-wide folder plus each conversation's own) since the harness that
+    actually ran this turn writes into its conversation-scoped folder like any
+    other turn (see services.artifact_roots)."""
     out: list[tuple[str, str]] = []
-    # This runs for one known project, so the root is built directly rather than
-    # resolved — the channel already holds the project it is answering for.
-    source = ProjectArtifacts(
-        base=Path(project_path) / ".anton" / "artifacts",
-        project_id=None,
-        project_name=Path(project_path).name,
-    )
-    for card in list_artifacts([source]):
+    sources = [
+        ProjectArtifacts(base=base, project_id=None, project_name=Path(project_path).name)
+        for base in _project_artifact_bases(project_path)
+    ]
+    for card in list_artifacts(sources):
         folder = Path(card.get("folder") or "")
         try:
             if (folder / "metadata.json").stat().st_mtime < since:

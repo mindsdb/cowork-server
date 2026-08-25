@@ -203,7 +203,11 @@ class HermesHarness:
 
         # Snapshot the artifacts dir before the run so we can index + surface
         # any artifacts this turn produces — the same diff the Anton harness
-        # uses, so both harnesses behave identically.
+        # uses, so both harnesses behave identically. Conversation-scoped (not
+        # the whole project) so a concurrent sibling conversation's own new
+        # artifact can never land in this turn's diff — see
+        # services.artifact_roots.conversation_artifacts_base (ENG-1933).
+        from cowork.services.artifact_roots import conversation_artifacts_base
         from cowork.services.task_objects import (
             finalize_turn_artifacts,
             finalize_turn_skill_drafts,
@@ -211,7 +215,7 @@ class HermesHarness:
             snapshot_skill_drafts,
             snapshot_stray_skills,
         )
-        artifacts_base = Path(project_path) / ".anton" / "artifacts"
+        artifacts_base = conversation_artifacts_base(project_path, conversation.id)
         before_slugs = snapshot_artifact_slugs(artifacts_base)
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
@@ -334,7 +338,10 @@ class HermesHarness:
 
         # Same folder-per-artifact convention as the Anton harness, so
         # Hermes outputs surface in the (harness-agnostic) Artifacts UI.
-        artifacts_root = Path(project_path) / ".anton" / "artifacts"
+        # Conversation-scoped like the Anton harness (ENG-1933) — `session_id`
+        # is the real cowork conversation id (see the call site in `_run_turn`).
+        from cowork.services.artifact_roots import conversation_artifacts_base
+        artifacts_root = conversation_artifacts_base(project_path, session_id)
         artifacts_root.mkdir(parents=True, exist_ok=True)
 
         # Skills the agent builds for the user stage here (a sibling of the
@@ -400,8 +407,10 @@ class HermesHarness:
 
         project_context = (
             f"You are operating in the project {project_name}."
-            f"You have access to all of the files in the project at {str(project_path)} except for the .anton/ directory."
-            "They are off limits. Do not mention the .anton/ directory in your responses."
+            f"You have access to all of the files in the project at {str(project_path)} except for the "
+            ".anton/ and conversations/ directories."
+            "They are off limits (internal bookkeeping, including other conversations' own artifacts). "
+            "Do not mention them in your responses."
             "You can perform operations on these files by executing code."
             "You can freely read any of these project files."
             "If you need to perform any actions on these files, ask the user for permission first."

@@ -462,8 +462,12 @@ class AntonHarness:
         temp_vault_dir: Path | None = None
         # Attribute + surface any artifact created during this turn. Anton runs
         # with its own session id and doesn't tag artifacts with the cowork
-        # conversation_id, so we diff the project's artifacts dir around the run
-        # (see services.task_objects.finalize_turn_artifacts).
+        # conversation_id, so we diff this conversation's OWN artifacts dir
+        # around the run (see services.task_objects.finalize_turn_artifacts).
+        # Conversation-scoped (not the whole project) so a concurrent sibling
+        # conversation's own new artifact can never land in this turn's diff —
+        # see services.artifact_roots.conversation_artifacts_base (ENG-1933).
+        from cowork.services.artifact_roots import conversation_artifacts_base
         from cowork.services.task_objects import (
             finalize_turn_skill_drafts,
             index_turn_artifacts,
@@ -473,7 +477,7 @@ class AntonHarness:
             snapshot_stray_skills,
         )
         project_path = Path(conversation.project.path)
-        artifacts_base = project_path / ".anton" / "artifacts"
+        artifacts_base = conversation_artifacts_base(str(project_path), conversation.id)
         # Names AND content mtimes: a name diff only reveals artifacts the turn
         # CREATED, and the reconciler must also see the ones it EDITED.
         before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
@@ -505,6 +509,7 @@ class AntonHarness:
                 model=model,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
+                artifacts_base=artifacts_base,
             )
             # Length of the seeded history — everything anton appends past this
             # index is this turn's block-messages (tool_use / tool_result / text).
@@ -724,6 +729,7 @@ class AntonHarness:
         model: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
+        artifacts_base: Path | None = None,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -759,6 +765,11 @@ class AntonHarness:
             LocalDataVault = None
 
         base = Path(conversation.project.path)
+        if artifacts_base is None:
+            # Defensive fallback for a caller that doesn't pass it explicitly —
+            # the normal turn path always does (see _run_turn).
+            from cowork.services.artifact_roots import conversation_artifacts_base
+            artifacts_base = conversation_artifacts_base(str(base), conversation.id)
 
         # Build AntonSettings for workspace/path resolution (fields only
         # in AntonSettings like memory_dir, context_dir, artifacts_dir).
@@ -816,7 +827,7 @@ class AntonHarness:
 
         _apply_model_override(anton_settings, model)
 
-        workspace = Workspace(base)
+        workspace = Workspace(base, artifacts_dir=artifacts_base)
         workspace.initialize()
         _apply_workspace_env_if_safe(workspace)
 
@@ -829,7 +840,7 @@ class AntonHarness:
             path = Path(raw).expanduser()
             return path if path.is_absolute() else base / path
 
-        artifacts_dir = anton_dir / "artifacts"
+        artifacts_dir = workspace.artifacts_dir
         # Skills the agent builds stage here (sibling of artifacts, under the
         # off-limits .anton/) — never the live skills store, so a built skill is
         # surfaced as a draft card rather than auto-saved.
@@ -875,8 +886,10 @@ class AntonHarness:
 
         project_context = (
             f"You are operating in the project {conversation.project.name}."
-            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
-            "They are off limits. Do not mention the .anton/ directory in your responses."
+            f"You have access to all of the files in the project at {str(base)} except for the "
+            ".anton/ and conversations/ directories."
+            "They are off limits (internal bookkeeping, including other conversations' own artifacts). "
+            "Do not mention them in your responses."
             "You can perform operations on these files via the scratchpad."
             "You can freely read any of these project files."
             "If you need to perform any actions on these files, ask the user for permission first."

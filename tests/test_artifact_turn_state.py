@@ -103,6 +103,44 @@ def test_index_leaves_untouched_slug_out_of_touched(conv, tmp_path):
     assert touched == set()
 
 
+def test_concurrent_sibling_conversation_never_leaks_into_this_diff(session, tmp_path):
+    """ENG-1933 regression: two conversations running in the same project must
+    never see each other's new artifact in their own turn's diff.
+
+    Before the fix, both turns diffed one shared project-wide folder, so a
+    sibling's artifact created mid-window showed up as "new" in this turn's
+    diff and got misattributed. Each conversation now gets its own root via
+    `conversation_artifacts_base`, so there is nothing shared left to race
+    over."""
+    from cowork.services.artifact_roots import conversation_artifacts_base
+
+    scoped = ScopedSession(session, LOCAL_SCOPE)
+    convs = ConversationService(scoped)
+    conv_a = convs.create_conversation(topic="a")
+    conv_b = convs.create_conversation(topic="b")
+    assert conv_a.project_id == conv_b.project_id  # same project, sibling tasks
+
+    project_path = str(tmp_path)
+    base_a = conversation_artifacts_base(project_path, conv_a.id)
+    base_b = conversation_artifacts_base(project_path, conv_b.id)
+    assert base_a != base_b
+
+    before_a, before_mtimes_a = t.snapshot_artifact_state(base_a)
+
+    # B's turn creates its own artifact while A's turn is still in flight.
+    _make_artifact(
+        base_b, "bs-dashboard", files={"index.html": "<html></html>"},
+        meta={"slug": "bs-dashboard", "type": "html-app"},
+    )
+
+    # A's turn ends and diffs its OWN root — B's artifact must not appear.
+    new_a, touched_a, _ = t.index_turn_artifacts(
+        conv_a, conv_a.id, conv_a.project_id, base_a, before_a, before_mtimes_a,
+    )
+    assert new_a == []
+    assert touched_a == set()
+
+
 def test_index_never_raises_and_degrades_to_empty(conv):
     # A non-path artifacts_base makes the very first operation blow up; the
     # caller runs this right after a turn's finally and must not get an
