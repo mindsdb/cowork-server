@@ -12,14 +12,14 @@ tenant boundary instead of admitting a missing capability. The two lifecycle
 apart.
 
 TestClient is enough: the guard reads the tenancy setting at request time, so
-the app's build-time mode does not matter. The principal middleware is only
-wired when the process itself started in org mode, so these requests run under
-LOCAL_SCOPE and the guard, not the scope resolver, is what refuses them.
+the app's build-time mode does not matter. The scope resolver reads it at
+request time too, so these requests carry an org scope with no org id rather
+than LOCAL_SCOPE. The guard still refuses first on every guarded route, because
+it is the first statement of each handler body and building a ScopedSession
+touches no table. Move a guard below a `scoped.select(...)` and that route
+answers 401 from the scope layer instead.
 """
 from __future__ import annotations
-
-import inspect
-import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -46,16 +46,29 @@ GUARDED = [
 # The catalogue and bindings routes sit outside the guard on purpose: they carry
 # a tenant scope of their own and expose no credentials. They are the negative
 # case, so the guard cannot quietly grow to cover the whole router.
+#
+# Their statuses are pinned rather than asserted "not 403". A TestClient request
+# carries no gateway identity headers, so the fail-closed scope layer refuses the
+# two org-scoped routes with a 401; "not 403" would pass on that refusal and read
+# as though those routes were reachable.
 UNGUARDED = [
-    "/api/v1/channels/plugins",
-    "/api/v1/channels/installations",
-    "/api/v1/channels/bindings",
+    ("/api/v1/channels/plugins", 200),  # catalogue only, no tenant data
+    ("/api/v1/channels/installations", 401),
+    ("/api/v1/channels/bindings", 401),
 ]
 
 
 @pytest.fixture
 def org_mode(monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def local_mode(monkeypatch):
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
     get_app_settings.cache_clear()
     yield
     get_app_settings.cache_clear()
@@ -77,25 +90,27 @@ def test_channel_config_routes_are_403_in_org_mode(org_mode, method, path, body)
     assert res.json()["detail"] == DETAIL
 
 
-@pytest.mark.parametrize("path", UNGUARDED)
-def test_unguarded_channel_routes_are_not_refused_in_org_mode(org_mode, path):
+@pytest.mark.parametrize("path,expected", UNGUARDED)
+def test_unguarded_channel_routes_are_not_refused_by_the_guard(org_mode, path, expected):
     from cowork.server import app
 
-    assert TestClient(app).get(path).status_code != 403
+    assert TestClient(app).get(path).status_code == expected
 
 
-def test_lifecycle_refusals_keep_their_501():
+@pytest.mark.parametrize("action", ["setup", "teardown"])
+def test_lifecycle_refusals_keep_their_501(local_mode, action):
     """A channel plugin that ships no setup or teardown is a real missing
     capability, so those two raises keep their 501 while the tenancy guard moves
-    to 403. This is the tripwire for a blanket status sweep over the module."""
-    from cowork.api.v1.endpoints import channels
+    to 403. `slack` ships no lifecycle, so it is the live case; a blanket status
+    sweep over the module turns these into 403 and fails here.
 
-    src = inspect.getsource(channels)
-    for action in ("setup", "teardown"):
-        pattern = (
-            r"HTTP_501_NOT_IMPLEMENTED,\s*\n\s*detail=f\"" + action + r" not implemented for channel"
-        )
-        assert re.search(pattern, src), f"the {action} lifecycle refusal is no longer a 501"
-    # The tenancy guard is the first statement of the helper both lifecycle
-    # routes use, so an org-mode caller never reaches either 501.
-    assert "_require_local_channels()" in inspect.getsource(channels._lifecycle_service)
+    Builds its own app instead of importing the module-level one: whichever test
+    imports `cowork.server` first fixes the app's build-time tenancy mode for the
+    session, and an app built in org mode loads no plugins, which would answer
+    404 here rather than 501.
+    """
+    from cowork.server import create_app
+
+    res = TestClient(create_app()).post(f"/api/v1/channels/slack/{action}")
+    assert res.status_code == 501
+    assert res.json()["detail"] == f"{action} not implemented for channel: slack"
