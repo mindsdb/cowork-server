@@ -186,11 +186,44 @@ class SourceContextRequest(BaseModel):
     connection_name: str | None = Field(default=None, max_length=512)
 
 
+class WorkItemSearchRequest(BaseModel):
+    provider: Literal["github", "linear"]
+    query: str = Field(default="", max_length=256)
+    connection_name: str | None = Field(default=None, max_length=512)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class WorkItemSummary(BaseModel):
+    provider: Literal["github", "linear"]
+    kind: Literal["issue", "pull_request"]
+    url: str = Field(min_length=1, max_length=8_192)
+    title: str = Field(default="", max_length=512)
+    external_id: str = Field(default="", max_length=512)
+    state: str = Field(default="", max_length=120)
+    scope: str = Field(default="", max_length=512)
+    assignee: str = Field(default="", max_length=512)
+    updated_at: str = Field(default="", max_length=120)
+    connection_name: str = Field(min_length=1, max_length=512)
+
+
+class WorkItemPage(BaseModel):
+    items: list[WorkItemSummary] = Field(default_factory=list, max_length=50)
+    incomplete: bool = False
+
+
 class PublishRequest(BaseModel):
     provider: Literal["github", "linear", "slack"]
     action: Literal["progress", "result"]
     target_url: str = Field(min_length=1, max_length=8_192)
     text: str = Field(min_length=1, max_length=100_000)
+    connection_name: str | None = Field(default=None, max_length=512)
+    confirmed: bool = False
+
+
+class SourceActionRequest(BaseModel):
+    provider: Literal["github", "linear"]
+    action: Literal["complete"]
+    target_url: str = Field(min_length=1, max_length=8_192)
     connection_name: str | None = Field(default=None, max_length=512)
     confirmed: bool = False
 
@@ -218,16 +251,35 @@ class DraftPullRequestRequest(BaseModel):
 
 
 class PullRequestActionRequest(BaseModel):
-    action: Literal["ready", "merge"]
+    action: Literal["ready", "merge", "resolve_thread"]
     target_url: str = Field(min_length=1, max_length=8_192)
     connection_name: str | None = Field(default=None, max_length=512)
+    thread_id: str | None = Field(default=None, max_length=512)
     confirmed: bool = False
+
+    @model_validator(mode="after")
+    def require_thread_identity(self) -> PullRequestActionRequest:
+        if (self.action == "resolve_thread") != bool(self.thread_id):
+            raise ValueError("resolve_thread actions require exactly one review thread identity")
+        return self
+
+
+class PullRequestAnnotation(BaseModel):
+    path: str = Field(default="", max_length=4_096)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    level: Literal["notice", "warning", "failure"] = "notice"
+    title: str = Field(default="", max_length=512)
+    message: str = Field(default="", max_length=20_000)
 
 
 class PullRequestCheck(BaseModel):
+    id: str = Field(default="", max_length=512)
     name: str = Field(max_length=512)
     state: Literal["passing", "failing", "pending", "neutral"]
     url: str = Field(default="", max_length=8_192)
+    detail: str = Field(default="", max_length=20_000)
+    annotations: list[PullRequestAnnotation] = Field(default_factory=list, max_length=50)
 
 
 class PullRequestFeedback(BaseModel):
@@ -237,7 +289,11 @@ class PullRequestFeedback(BaseModel):
     body: str = Field(default="", max_length=20_000)
     url: str = Field(default="", max_length=8_192)
     path: str = Field(default="", max_length=4_096)
+    line: int | None = Field(default=None, ge=1)
     created_at: str = Field(default="", max_length=120)
+    thread_id: str = Field(default="", max_length=512)
+    resolved: bool = False
+    outdated: bool = False
 
 
 class PullRequestStatus(BaseModel):
