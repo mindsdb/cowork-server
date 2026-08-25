@@ -44,6 +44,7 @@ from cowork.coding.project_models import (
     SourceContextRequest,
 )
 from cowork.coding.skill_models import (
+    SkillLibraryDocument,
     SkillLibraryPage,
     SkillLibrarySource,
     SkillSourceCreateRequest,
@@ -220,6 +221,15 @@ def code_skill_library(
     project_id: str | None = Query(default=None, alias="projectId"),
 ):
     return _call(_service().skill_library.catalog, SkillService(scope), project_id)
+
+
+@router.get("/skills/library/content", response_model=SkillLibraryDocument)
+def code_skill_document(
+    scope: ScopeDep,
+    item_id: str = Query(alias="itemId", min_length=1, max_length=2_000),
+    path: str | None = Query(default=None, max_length=2_000),
+):
+    return _call(_service().skill_library.document, SkillService(scope), item_id, path)
 
 
 @router.post("/skills/sources", response_model=SkillLibrarySource)
