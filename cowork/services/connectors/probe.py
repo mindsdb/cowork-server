@@ -48,10 +48,17 @@ def _probe_tmp_dir() -> Path:
 # either fails a test instead of silently splitting one population in two.
 PROBE_HARNESS = "anton"
 
-# Langfuse tag on every probe turn so probe calls stay separable from user
-# turns in cost / health queries now that both report harness="anton"
-# (ENG-1941). `.claude/skills/harness-measure` excludes this tag from its
-# turn denominator — rename both or neither.
+# Langfuse tag on every probe turn so probe traces stay separable from user
+# turns now that both report harness="anton" (ENG-1941). Rides the
+# `Langfuse-Tags` header, so it lands on every trace family the gateway
+# creates for the turn (`anton:turn-N`, `tool:*`, `llm-usage`).
+# `.claude/skills/harness-measure` excludes this tag from its turn
+# denominator — rename both or neither.
+#
+# Langfuse ONLY. anton's PostHog events (`turn_completed`, `tool_completed`)
+# carry no trace tags; there the probe is separable by a different fact —
+# it is the one anton turn with NO `conversation_id` and `llm_calls > 0`
+# (the quadrant ENG-1692 / anton#379 documented as "the connector probe").
 PROBE_TRACE_TAG = "connector-probe"
 
 
@@ -496,11 +503,12 @@ class CredentialProbe:
 
         try:
             async def _drive():
-                # Tagged so probe calls can be told apart from user turns in
-                # cost / health queries now that both report harness="anton"
-                # (ENG-1941). A tag, not a distinct harness value: the harness
-                # vocabulary is agent identity, and a fourth value would be one
-                # the dashboards and turns.py don't know.
+                # Tagged so probe traces can be told apart from user turns in
+                # Langfuse now that both report harness="anton" (ENG-1941). A
+                # tag, not a distinct harness value: the harness vocabulary is
+                # agent identity, and a fourth value would be one the
+                # dashboards and turns.py don't know. See PROBE_TRACE_TAG for
+                # why this does not cover PostHog.
                 async for event in probe_session.turn_stream(
                     prompt, trace_tags=[PROBE_TRACE_TAG]
                 ):
