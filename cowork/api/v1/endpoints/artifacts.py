@@ -141,7 +141,48 @@ def artifacts_for_request(
     # Owner-side fields are stripped inside `card_for_folder`, not here: inline chat
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
-    return _list_artifacts(_sources(session, project_id, project_path))
+    sources = _sources(session, project_id, project_path)
+    cards = _list_artifacts(sources)
+    from cowork.services.artifact_permissions import artifact_capabilities
+
+    for card in cards:
+        folder = Path(str(card.get("folder") or ""))
+        source = next(
+            (candidate for candidate in sources if folder.parent == Path(candidate.base)),
+            None,
+        )
+        if source is not None:
+            card["capabilities"] = artifact_capabilities(session, source)
+    return cards
+
+
+def _sources_for_project_ref(session: ScopedSession, project_ref: str):
+    """Resolve the URL's project capability without ever accepting a path."""
+    if project_ref == "local":
+        if _org_mode():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
+        return _sources_for_scan()
+    try:
+        project_id = UUID(project_ref)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project") from exc
+    return _sources(session, project_id, None)
+
+
+def _workspace_artifact(session: ScopedSession, project_ref: str, stable_id: str):
+    from cowork.services.artifact_identity import (
+        ArtifactIdentityConflict,
+        resolve_artifact_folder,
+    )
+
+    try:
+        return resolve_artifact_folder(_sources_for_project_ref(session, project_ref), stable_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ArtifactIdentityConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact identity") from exc
 
 
 @router.get("/")
@@ -151,6 +192,7 @@ async def list_artifacts(
     project_path: str | None = Query(default=None),
 ):
     return artifacts_for_request(session, project_id=project_id, project_path=project_path)
+
 
 
 @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
@@ -169,23 +211,39 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
     from cowork.services.artifact_publish_key import PublishKey
     from cowork.services.publish import _resolve_publish_endpoint
 
-    # A project can have several artifacts roots in org mode (one per
-    # conversation — see artifact_roots.CONVERSATIONS_DIRNAME), so the slug alone
-    # does not name a directory. Pick the root that actually holds it.
-    #
-    # MVP limitation: the slug is only unique WITHIN a conversation, so two
-    # conversations can both produce e.g. `untitled-artifact` and this deletes
-    # whichever sorts first. Addressing by the artifact's own `metadata.json` id
-    # (already on the card) is the fix; deliberately deferred.
-    bases = [source.base for source in _sources(session, project_id, None)]
-    base = next((b for b in bases if (b / slug).is_dir()), None)
-    if base is None:
-        # No root holds it. Report against the first one so the message names a
-        # real location; with no roots at all there is nothing to delete.
-        if not bases:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
-        base = bases[0]
-    folder = base / slug
+    # New clients address deletion by stable id. Keep the slug fallback for
+    # older desktop clients, but never use it when the caller supplied a UUID:
+    # two conversations in one project can legitimately produce the same slug.
+    sources = _sources(session, project_id, None)
+    source = None
+    folder = None
+    try:
+        stable_ref = str(UUID(slug))
+    except ValueError:
+        stable_ref = None
+    if stable_ref:
+        from cowork.services.artifact_identity import (
+            ArtifactIdentityConflict,
+            resolve_artifact_folder,
+        )
+
+        try:
+            source, folder, _metadata = resolve_artifact_folder(sources, stable_ref)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ArtifactIdentityConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    else:
+        source = next((candidate for candidate in sources if (candidate.base / slug).is_dir()), None)
+        if source is not None:
+            folder = source.base / slug
+    if source is None or folder is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+
+    from cowork.services.artifact_permissions import require_artifact_owner
+
+    require_artifact_owner(session, source)
+    base = source.base
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():
         # `ScopedSession.scope` is the wrapper's own attribute — the same one
@@ -202,6 +260,20 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Could not mint a publish credential",
             )
+        from cowork.services.artifact_access import (
+            ArtifactAccessUnavailable,
+            revoke_draft_review_access,
+        )
+        from cowork.services.artifact_identity import ensure_stable_id
+
+        try:
+            stable_id, _metadata = await run_in_threadpool(ensure_stable_id, folder)
+            await revoke_draft_review_access(stable_id)
+        except ArtifactAccessUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
     try:
         await run_in_threadpool(
             _delete_artifact, folder,
