@@ -70,7 +70,7 @@ class ScheduleRun(BaseSQLModel, table=True):
         # IntegrityError instead of double-running the schedule. Only 'running'
         # rows are constrained, so finished runs pile up freely. Partial index;
         # created for Postgres and SQLite alike. Full rationale: ScheduleRun-
-        # Service.try_claim_run and migration a7e4c2f1b9d3 (ENG-1733).
+        # Service.try_claim_run and migration a7e4c2f1b9d3.
         Index(
             "uq_schedule_runs_one_active",
             "schedule_id",

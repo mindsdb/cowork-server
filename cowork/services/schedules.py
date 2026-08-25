@@ -187,8 +187,8 @@ class ScheduleRunService:
         shared single-flight guard for both the cron dispatch and the manual
         run-now path, closing the select-then-run TOCTOU where overlapping
         ticks — or a manual click racing a cron tick — could double-dispatch
-        the same schedule (ENG-1733). The pre-existing ``has_active_run`` checks
-        are a non-atomic fast path; this is the atomic backstop.
+        the same schedule. The pre-existing ``has_active_run`` checks are a
+        non-atomic fast path; this is the atomic backstop.
         """
         run = ScheduleRun(
             schedule_id=schedule_id,

@@ -103,9 +103,9 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     # Single-flight: claim the run before creating anything so a manual click
     # can't race a concurrent cron dispatch (or a double-click) into two
     # overlapping runs of the same schedule. _due_schedules gates the cron path
-    # on has_active_run; this gives the manual path the same guard, atomically
-    # (ENG-1733 #4). The claim also means no orphan conversation is created when
-    # a run is already in flight.
+    # on has_active_run; this gives the manual path the same guard, atomically.
+    # The claim also means no orphan conversation is created when a run is
+    # already in flight.
     run_service = ScheduleRunService(scoped)
     run = run_service.try_claim_run(schedule_id, is_manual=True)
     if run is None:
