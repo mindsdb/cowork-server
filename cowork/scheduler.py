@@ -258,7 +258,9 @@ async def execute_schedule(
             session.add(schedule)
         else:
             schedule.last_run_at = datetime.now(timezone.utc)
-            schedule.last_result_conversation_id = conversation_id
+            # The user can delete this chat while the run is still going, so
+            # check before pointing the schedule back at it.
+            schedule.last_result_conversation_id = run_service.still_exists(conversation_id)
             schedule.last_error = None
             schedule.missed_runs = 0
             session.add(schedule)

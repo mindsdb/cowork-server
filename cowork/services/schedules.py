@@ -6,6 +6,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
+from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
@@ -224,13 +225,33 @@ class ScheduleRunService:
         finished = run.finished_at
         return finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
 
+    def still_exists(self, conversation_id: UUID | None) -> UUID | None:
+        """The conversation id back, or None once the conversation is gone.
+
+        A run holds its conversation id in a local for the whole run and writes
+        it back at the end, so a user who deletes that chat mid-run leaves every
+        later write pointing at a row that no longer exists. On Postgres each
+        one raises, and the scheduler swallows the exception, which strands the
+        run at `running`: `has_active_run` then reports the schedule busy and
+        the due-check skips it on every poll until a restart reaps it. Writing
+        NULL instead loses only the link to a conversation the user deleted on
+        purpose.
+
+        Read on the raw session so the org filter cannot answer "gone" for a
+        conversation that is merely out of scope, which would drop a live link.
+        """
+        if conversation_id is None:
+            return None
+        raw = unsafe_unscoped_session(self.session)
+        return conversation_id if raw.get(Conversation, conversation_id) is not None else None
+
     def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> None:
         """Attach the run's conversation as soon as it is known — before the
         turn executes — so the UI can open a run that is still in flight."""
         run = self.session.get(ScheduleRun, run_id)
         if run is None:
             return
-        run.conversation_id = conversation_id
+        run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
         self.session.commit()
 
@@ -251,7 +272,7 @@ class ScheduleRunService:
         run.status = status or (RunStatus.failed if error else RunStatus.success)
         run.error = error
         if conversation_id is not None:
-            run.conversation_id = conversation_id
+            run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
         self.session.commit()
         self.session.refresh(run)

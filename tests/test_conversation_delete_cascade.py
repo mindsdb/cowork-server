@@ -363,6 +363,7 @@ from sqlmodel import SQLModel, create_engine  # noqa: E402
 
 from cowork.models.channel import ChannelBinding, ChannelSession  # noqa: E402
 from cowork.models.schedule import Schedule, ScheduleRun  # noqa: E402
+from cowork.schemas.schedules import RunStatus  # noqa: E402
 from cowork.services.channel_bindings import ChannelBindingService  # noqa: E402
 from cowork.services.schedules import ScheduleRunService, ScheduleService  # noqa: E402
 
@@ -382,7 +383,7 @@ def _schedule(session, project_id=GENERAL_PROJECT_ID, title="Daily report") -> S
 
 def _finished_run(session, schedule_id, conversation_id) -> ScheduleRun:
     """A run that produced a conversation, built the way the scheduler builds
-    one — create_run then finish_run — so the row carries a real status and
+    one, create_run then finish_run, so the row carries a real status and
     duration rather than hand-set values."""
     runs = ScheduleRunService(ScopedSession(session, LOCAL_SCOPE))
     run = runs.create_run(schedule_id, is_manual=True)
@@ -435,7 +436,7 @@ def test_delete_conversation_releases_its_schedule_and_binding(session):
         session.expire_all()
 
         assert session.get(Conversation, conv.id) is None, "the conversation is gone"
-        # The run survives with its verdict intact — only the link is released.
+        # The run survives with its verdict intact. Only the link is released.
         kept_run = session.get(ScheduleRun, run.id)
         assert kept_run is not None, "run history must outlive the chat it produced"
         assert kept_run.conversation_id is None
@@ -449,7 +450,7 @@ def test_delete_conversation_releases_its_schedule_and_binding(session):
         assert kept_binding is not None
         assert kept_binding.anton_conversation_id is None
         assert kept_binding.anton_project_id == GENERAL_PROJECT_ID
-        # Its session rows go with the pointer, as in every other detach —
+        # Its session rows go with the pointer, as in every other detach.
         # anton_session_id would otherwise name a conversation that is gone.
         assert session.exec(
             select(ChannelSession).where(ChannelSession.binding_id == binding.id)
@@ -531,3 +532,35 @@ def test_delete_conversation_does_not_violate_a_foreign_key(tmp_path):
         assert s.get(ScheduleRun, run.id).conversation_id is None
         assert s.get(Schedule, schedule.id).last_result_conversation_id is None
         assert s.get(ChannelBinding, binding.id).anton_conversation_id is None
+
+
+def test_finishing_a_run_whose_conversation_was_deleted_mid_flight(tmp_path):
+    """A run holds its conversation id for the whole run and writes it back at
+    the end, so deleting the chat mid-run used to point the run at a row that
+    was already gone. On Postgres that write raises, the scheduler logs and
+    moves on, and the run is stranded at `running` forever: has_active_run then
+    reports the schedule busy and the due-check skips it on every poll.
+    """
+    engine = _fk_enforcing_engine()
+    with Session(engine, autoflush=False, expire_on_commit=False) as s:
+        project = Project(name="midflight", path=str(tmp_path / "midflight"))
+        s.add(project)
+        s.commit()
+        scoped = ScopedSession(s, LOCAL_SCOPE)
+        conv = ConversationService(scoped).create_conversation("in flight", project_id=project.id)
+        schedule = _schedule(s, project_id=project.id, title="Mid-flight schedule")
+        runs = ScheduleRunService(scoped)
+        run = runs.create_run(schedule.id, is_manual=True)
+        runs.set_run_conversation(run.id, conv.id)
+
+        # The user deletes the chat while the turn is still streaming.
+        assert ConversationService(scoped).delete_conversation(conv.id) is True
+
+        # The scheduler's finally block still reports the outcome, with the id
+        # it captured before the delete.
+        finished = runs.finish_run(run.id, conversation_id=conv.id)
+
+        assert finished.status == RunStatus.success, "the run must not be left running"
+        assert finished.conversation_id is None
+        assert _orphaned_run_count(s) == 0
+        assert runs.has_active_run(schedule.id) is False, "a stranded run would wedge the schedule"
