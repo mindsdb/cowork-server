@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 from uuid import UUID
 
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -143,6 +144,44 @@ class ChannelBindingService:
         if reset:
             self.session.commit()
         return reset
+
+    def release_conversation(self, conversation_id: UUID) -> None:
+        """Unpin every binding pinned to a conversation that is being deleted.
+
+        Same outcome as `detach_conversation`, reached from the other side: here
+        the conversation is the thing going away, so the binding is looked up by
+        what it points at. The binding survives, so a Telegram or Slack group
+        stays bound to its project, and the next inbound message starts a fresh
+        conversation (`ChannelRuntime._ensure_conversation` already handles an
+        empty pointer). The session rows go with the pointer, exactly as they do
+        in every other detach: `anton_session_id` would otherwise keep naming a
+        conversation that no longer exists.
+
+        Staged into the caller's transaction, unlike `detach_conversation`,
+        which commits. The conversation delete commits once so a crash cannot
+        leave a conversation whose contents are gone, and committing here would
+        flush that half-finished work.
+
+        Keyed on the conversation id alone, and run on the raw session, for the
+        same reason `ScheduleService.release_conversation` is: the scoped select
+        adds an org filter for `ChannelBinding`, and a row it hides is a row
+        left pointing at a deleted conversation, which is the foreign-key
+        violation this exists to stop.
+        """
+        raw = unsafe_unscoped_session(self.session)
+        pinned = raw.execute(
+            sa.select(ChannelBinding.id).where(
+                ChannelBinding.anton_conversation_id == conversation_id
+            )
+        ).scalars().all()
+        if not pinned:
+            return
+        raw.execute(sa.delete(ChannelSession).where(ChannelSession.binding_id.in_(pinned)))
+        raw.execute(
+            sa.update(ChannelBinding)
+            .where(ChannelBinding.id.in_(pinned))
+            .values(anton_conversation_id=None)
+        )
 
     def delete(self, binding_id: UUID) -> bool:
         binding = self.session.get(ChannelBinding, binding_id)

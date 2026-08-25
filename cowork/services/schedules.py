@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID
 
-from cowork.db.scoped import ScopedSession
+import sqlalchemy as sa
+
+from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
@@ -102,6 +104,42 @@ class ScheduleService:
         self.session.delete(schedule)
         self.session.commit()
         return True
+
+    def release_conversation(self, conversation_id: UUID) -> None:
+        """Let go of a conversation that is being deleted, keeping the rows.
+
+        Two columns point at a conversation: a run records the one it produced,
+        and a schedule records the one its last run produced. Neither is the
+        run's own data, and both are nullable, so tidying a chat releases the
+        link and leaves the run history it is an audit trail of. Nothing reads
+        either column, and the desktop already renders a run with no
+        conversation.
+
+        Staged into the caller's transaction, never committed here: whoever is
+        deleting the conversation commits once, so a crash cannot leave a
+        conversation whose contents are gone.
+
+        Keyed on the conversation id alone, and run on the raw session on
+        purpose. Both `select` helpers would narrow this: the scoped layer adds
+        an org filter for `Schedule`, and `_owned_select` adds an owner filter
+        on top. A conversation id is already the narrowest possible key, and a
+        project delete cascades conversations belonging to several members, so
+        either filter can only hide a row that still has to be released. Hiding
+        one puts the foreign-key violation straight back. A core UPDATE also
+        keeps the flush hook out of it, which would otherwise adopt a row whose
+        org_id is NULL into whoever triggered the delete.
+        """
+        raw = unsafe_unscoped_session(self.session)
+        raw.execute(
+            sa.update(ScheduleRun)
+            .where(ScheduleRun.conversation_id == conversation_id)
+            .values(conversation_id=None)
+        )
+        raw.execute(
+            sa.update(Schedule)
+            .where(Schedule.last_result_conversation_id == conversation_id)
+            .values(last_result_conversation_id=None)
+        )
 
     def pause_schedule(self, schedule_id: UUID) -> Schedule:
         schedule = self.get_schedule(schedule_id)
