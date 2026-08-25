@@ -416,10 +416,19 @@ class CredentialProbe:
 
         config = ChatSessionConfig(
             llm_client=self.llm_client,
-            # This runs a real turn (see turn_stream below), so it needs the
-            # same surface attribution as a UI turn — the connector path is
-            # explicitly one of the things ENG-1459 wants compared between web
-            # and desktop.
+            # WHICH agent ran: anton, same as a UI turn — the probe is anton
+            # doing a job, not a different agent (ENG-1694's definition of
+            # `harness` as agent identity). Without this the probe's traces
+            # reached Langfuse with a surface and an EMPTY harness, the only
+            # anton-originated traffic that did, and read as direct-API
+            # callers in every harness filter (ENG-1941). Probe calls stay
+            # separable from user turns via the `connector-probe` trace tag
+            # passed to turn_stream below.
+            harness="anton",
+            # WHERE the user was. This runs a real turn (see turn_stream
+            # below), so it needs the same surface attribution as a UI turn —
+            # the connector path is explicitly one of the things ENG-1459
+            # wants compared between web and desktop.
             **surface_kwarg(ChatSessionConfig),
             system_prompt_context=SystemPromptContext(
                 runtime_context="",
@@ -472,7 +481,14 @@ class CredentialProbe:
 
         try:
             async def _drive():
-                async for event in probe_session.turn_stream(prompt):
+                # Tagged so probe calls can be told apart from user turns in
+                # cost / health queries now that both report harness="anton"
+                # (ENG-1941). A tag, not a distinct harness value: the harness
+                # vocabulary is agent identity, and a fourth value would be one
+                # the dashboards and turns.py don't know.
+                async for event in probe_session.turn_stream(
+                    prompt, trace_tags=["connector-probe"]
+                ):
                     while self._pending:
                         yield self._pending.pop(0)
 

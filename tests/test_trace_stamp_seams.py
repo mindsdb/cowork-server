@@ -176,6 +176,46 @@ def test_the_matcher_catches_an_attribute_qualified_construction():
     assert not _is_config_call(not_a_call)
 
 
+# ---------------------------------------------------------------------------
+# The same rule, for the harness (ENG-1941).
+#
+# The connector probe got the ENG-1459 `surface` plumbing and never the older
+# `harness` field, so every probe trace reached Langfuse with a surface and an
+# empty harness — the only anton-originated traffic that did, and therefore
+# indistinguishable from direct-API callers in any harness filter. The surface
+# rule above was sitting one line away and could not see it, because it keys on
+# a different kwarg. Same seam, same guard, second field.
+# ---------------------------------------------------------------------------
+
+
+def _declares_harness(call: ast.Call) -> bool:
+    return any(kw.arg == "harness" for kw in call.keywords)
+
+
+def test_every_turn_originator_declares_its_harness():
+    offenders = [
+        f"{path.relative_to(COWORK_ROOT.parent)}:{call.lineno}"
+        for path, call in _config_sites()
+        if not _declares_harness(call)
+    ]
+    assert not offenders, (
+        "These ChatSessionConfig call sites originate a turn without declaring a "
+        "harness, so their traces carry an empty `harness` and read as direct-API "
+        "traffic in Langfuse (ENG-1941). Pass harness=... — see "
+        f"cowork/harnesses/anton_harness/harness.py: {offenders}"
+    )
+
+
+def test_the_harness_predicate_actually_rejects_a_bare_call():
+    """Positive control on `_declares_harness` — a predicate weakened to
+    `return True` must fail here, not report green forever."""
+    accepted = ast.parse("ChatSessionConfig(harness='anton')").body[0].value
+    bare = ast.parse("ChatSessionConfig(llm_client=x)").body[0].value
+
+    assert _declares_harness(accepted)
+    assert not _declares_harness(bare), "the predicate accepts a call site with no harness"
+
+
 def test_the_surface_predicate_actually_rejects_a_bare_call():
     """Positive control on `_declares_surface` itself.
 
