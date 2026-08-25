@@ -196,7 +196,24 @@ class LocalCopyManager:
         result: dict[str, str] = {}
         if not root.is_dir():
             return result
-        for path in sorted(root.rglob("*")):
+        paths: list[Path] = []
+        # Keep Git metadata in isolated copies so nested repositories remain
+        # usable, but never scan it as source content for review or handoff.
+        for directory, directories, filenames in os.walk(root, topdown=True, followlinks=False):
+            current = Path(directory)
+            retained: list[str] = []
+            for name in sorted(directories):
+                path = current / name
+                if name == ".git":
+                    continue
+                if path.is_symlink():
+                    paths.append(path)
+                else:
+                    retained.append(name)
+            directories[:] = retained
+            paths.extend(current / name for name in sorted(filenames) if name != ".git")
+
+        for path in sorted(paths):
             relative = path.relative_to(root).as_posix()
             try:
                 info = path.lstat()
