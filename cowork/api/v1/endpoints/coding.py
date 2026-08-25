@@ -18,6 +18,9 @@ from cowork.coding.contracts import (
     ApprovalRequest,
     BranchRequest,
     CommitRequest,
+    DeliveryAutomationClaim,
+    DeliveryAutomationClaimRequest,
+    DeliveryAutomationPolicy,
     EventPage,
     RenameSessionRequest,
     SessionCreateRequest,
@@ -31,6 +34,7 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
+from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
@@ -42,6 +46,8 @@ from cowork.coding.project_models import (
     PublishRequest,
     PullRequestActionRequest,
     SourceContextRequest,
+    SourceActionRequest,
+    WorkItemSearchRequest,
 )
 from cowork.coding.redaction import redact_text
 from cowork.coding.service import CodingService, get_coding_service
@@ -338,6 +344,12 @@ def read_code_project_source(project_id: str, body: SourceContextRequest, integr
     return _call(integrations.read, project, body)
 
 
+@router.post("/projects/{project_id}/work-items/search")
+def search_code_project_work(project_id: str, body: WorkItemSearchRequest, integrations: IntegrationsDep):
+    project = _call(_service().projects.get, project_id)
+    return _call(integrations.search, project, body)
+
+
 @router.get("/sessions", response_model=SessionPage)
 def list_sessions(include_archived: bool = Query(default=False, alias="includeArchived")):
     return _service().list_sessions(include_archived)
@@ -400,6 +412,16 @@ def setup_windows_sandbox(session_id: str, session: SessionDep, scope: ScopeDep)
 @router.patch("/sessions/{session_id}")
 def update_session(session_id: str, body: SessionUpdateRequest):
     return _call(_service().update_session_config, session_id, body)
+
+
+@router.put("/sessions/{session_id}/delivery-policy")
+def update_delivery_policy(session_id: str, body: DeliveryAutomationPolicy):
+    return _call(DeliveryAutomationService(_service().store).update_policy, session_id, body)
+
+
+@router.post("/sessions/{session_id}/delivery-automation/claim", response_model=DeliveryAutomationClaim)
+def claim_delivery_automation(session_id: str, body: DeliveryAutomationClaimRequest):
+    return _call(DeliveryAutomationService(_service().store).claim_fix, session_id, body)
 
 
 @router.post("/sessions/{session_id}/rename")
@@ -643,4 +665,16 @@ def publish_task_update(session_id: str, body: PublishRequest, integrations: Int
         task.id,
         lambda current: current.deliveries.append(delivery),
     )
+    return delivery
+
+
+@router.post("/sessions/{session_id}/source-action")
+def source_action(session_id: str, body: SourceActionRequest, integrations: IntegrationsDep):
+    coding = _service()
+    task = _call(coding.get_session, session_id)
+    if not task.project_id:
+        raise HTTPException(status_code=409, detail="This task is not linked to a Code Project")
+    project = _call(coding.projects.get, task.project_id)
+    delivery = _call(integrations.complete_source, project, body)
+    coding.store.update_session(task.id, lambda current: current.deliveries.append(delivery))
     return delivery

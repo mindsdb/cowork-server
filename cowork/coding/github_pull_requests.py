@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from cowork.coding.project_models import (
+    PullRequestAnnotation,
     PullRequestCheck,
     PullRequestFeedback,
     PullRequestStatus,
@@ -55,6 +56,7 @@ class GitHubPullRequests:
             f"{self._pull_url}/comments",
             params={"per_page": 100},
         )
+        threads, threads_unavailable = self._review_threads()
         checks: dict[str, Any] = {}
         combined: dict[str, Any] = {}
         unavailable = [
@@ -62,6 +64,7 @@ class GitHubPullRequests:
             for label, missing in (
                 ("review status", review_unavailable),
                 ("review comments", comments_unavailable),
+                ("review threads", threads_unavailable),
             )
             if missing
         ]
@@ -91,7 +94,7 @@ class GitHubPullRequests:
             url=str(pull.get("html_url") or self._url),
             updated_at=str(pull.get("updated_at") or datetime.now(UTC).isoformat()),
             checks=self._checks(checks, combined),
-            feedback=self._feedback(review_items, comment_items),
+            feedback=self._feedback(review_items, comment_items, threads),
             detail=f"Could not load {', '.join(unavailable)}" if unavailable else "",
         )
 
@@ -137,6 +140,17 @@ class GitHubPullRequests:
             raise WorkspaceError(str(payload.get("message") or "GitHub could not merge this pull request"))
         return self.status()
 
+    def resolve_thread(self, thread_id: str) -> PullRequestStatus:
+        payload = self._graphql(
+            "mutation CodeResolve($thread: ID!) { "
+            "resolveReviewThread(input: {threadId: $thread}) { thread { id isResolved } } }",
+            {"thread": thread_id},
+        )
+        resolved = ((payload.get("data") or {}).get("resolveReviewThread") or {}).get("thread") or {}
+        if not resolved.get("isResolved"):
+            raise WorkspaceError("GitHub did not resolve this review thread")
+        return self.status()
+
     @property
     def _repo_url(self) -> str:
         return f"{self._api}/repos/{self._owner}/{self._repository}"
@@ -150,6 +164,37 @@ class GitHubPullRequests:
             return self._request("GET", url, headers=self._headers, **kwargs).json(), False
         except WorkspaceError:
             return {}, True
+
+    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        graph_url = (
+            "https://api.github.com/graphql"
+            if self._host == "github.com"
+            else f"https://{self._host}/api/graphql"
+        )
+        payload = self._request(
+            "POST",
+            graph_url,
+            headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
+            json={"query": query, "variables": variables},
+        ).json()
+        if payload.get("errors"):
+            raise WorkspaceError(str(payload["errors"][0].get("message") or "GitHub GraphQL request failed"))
+        return payload
+
+    def _review_threads(self) -> tuple[list[dict[str, Any]], bool]:
+        try:
+            payload = self._graphql(
+                "query CodeThreads($owner: String!, $repository: String!, $number: Int!) { "
+                "repository(owner: $owner, name: $repository) { pullRequest(number: $number) { "
+                "reviewThreads(first: 100) { nodes { id isResolved isOutdated path line comments(first: 100) { "
+                "nodes { databaseId author { login } body url createdAt } } } } } } }",
+                {"owner": self._owner, "repository": self._repository, "number": int(self._number)},
+            )
+        except WorkspaceError:
+            return [], True
+        pull = (((payload.get("data") or {}).get("repository") or {}).get("pullRequest") or {})
+        nodes = ((pull.get("reviewThreads") or {}).get("nodes") or [])
+        return [item for item in nodes if isinstance(item, dict)], False
 
     @staticmethod
     def _state(payload: dict[str, Any]) -> str:
@@ -192,8 +237,7 @@ class GitHubPullRequests:
             return "passing"
         return "none"
 
-    @staticmethod
-    def _checks(checks: dict[str, Any], combined: dict[str, Any]) -> list[PullRequestCheck]:
+    def _checks(self, checks: dict[str, Any], combined: dict[str, Any]) -> list[PullRequestCheck]:
         result: list[PullRequestCheck] = []
         for item in checks.get("check_runs", []) if isinstance(checks, dict) else []:
             if not isinstance(item, dict):
@@ -204,10 +248,19 @@ class GitHubPullRequests:
                 "passing" if conclusion in {"success", "skipped"} else
                 "neutral" if conclusion == "neutral" else "failing"
             )
+            output = item.get("output") if isinstance(item.get("output"), dict) else {}
+            annotations = self._annotations(item) if state == "failing" else []
             result.append(PullRequestCheck(
+                id=str(item.get("id") or ""),
                 name=str(item.get("name") or "GitHub check"),
                 state=state,
                 url=str(item.get("details_url") or item.get("html_url") or ""),
+                detail="\n\n".join(
+                    str(output.get(key) or "").strip()
+                    for key in ("title", "summary", "text")
+                    if str(output.get(key) or "").strip()
+                )[:20_000],
+                annotations=annotations,
             ))
         for item in combined.get("statuses", []) if isinstance(combined, dict) else []:
             if not isinstance(item, dict):
@@ -221,10 +274,35 @@ class GitHubPullRequests:
             ))
         return result[:200]
 
+    def _annotations(self, run: dict[str, Any]) -> list[PullRequestAnnotation]:
+        count = int(((run.get("output") or {}).get("annotations_count") or 0))
+        run_id = str(run.get("id") or "")
+        if not count or not run_id:
+            return []
+        payload, unavailable = self._optional_json(
+            f"{self._repo_url}/check-runs/{run_id}/annotations",
+            params={"per_page": min(count, 50)},
+        )
+        if unavailable or not isinstance(payload, list):
+            return []
+        return [
+            PullRequestAnnotation(
+                path=str(item.get("path") or ""),
+                start_line=item.get("start_line") if isinstance(item.get("start_line"), int) else None,
+                end_line=item.get("end_line") if isinstance(item.get("end_line"), int) else None,
+                level=str(item.get("annotation_level") or "notice"),
+                title=str(item.get("title") or ""),
+                message=str(item.get("message") or item.get("raw_details") or "")[:20_000],
+            )
+            for item in payload[:50]
+            if isinstance(item, dict)
+        ]
+
     @staticmethod
     def _feedback(
         reviews: list[dict[str, Any]],
         comments: list[dict[str, Any]],
+        threads: list[dict[str, Any]],
     ) -> list[PullRequestFeedback]:
         result = [
             PullRequestFeedback(
@@ -240,16 +318,35 @@ class GitHubPullRequests:
                 item.get("body") or str(item.get("state") or "").upper() == "CHANGES_REQUESTED"
             )
         ]
-        result.extend(
-            PullRequestFeedback(
-                id=str(item.get("id") or ""),
-                author=str((item.get("user") or {}).get("login") or ""),
-                body=str(item.get("body") or "")[:20_000],
-                url=str(item.get("html_url") or ""),
-                path=str(item.get("path") or ""),
-                created_at=str(item.get("created_at") or ""),
+        if threads:
+            for thread in threads:
+                thread_comments = ((thread.get("comments") or {}).get("nodes") or [])
+                comment = next((item for item in reversed(thread_comments) if isinstance(item, dict)), {})
+                if not comment:
+                    continue
+                result.append(PullRequestFeedback(
+                    id=str(comment.get("databaseId") or thread.get("id") or ""),
+                    author=str((comment.get("author") or {}).get("login") or ""),
+                    body=str(comment.get("body") or "")[:20_000],
+                    url=str(comment.get("url") or ""),
+                    path=str(thread.get("path") or ""),
+                    line=thread.get("line") if isinstance(thread.get("line"), int) else None,
+                    created_at=str(comment.get("createdAt") or ""),
+                    thread_id=str(thread.get("id") or ""),
+                    resolved=bool(thread.get("isResolved")),
+                    outdated=bool(thread.get("isOutdated")),
+                ))
+        else:
+            result.extend(
+                PullRequestFeedback(
+                    id=str(item.get("id") or ""),
+                    author=str((item.get("user") or {}).get("login") or ""),
+                    body=str(item.get("body") or "")[:20_000],
+                    url=str(item.get("html_url") or ""),
+                    path=str(item.get("path") or ""),
+                    created_at=str(item.get("created_at") or ""),
+                )
+                for item in comments
+                if isinstance(item, dict) and item.get("body")
             )
-            for item in comments
-            if isinstance(item, dict) and item.get("body")
-        )
         return result[:200]
