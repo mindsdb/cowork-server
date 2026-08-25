@@ -4,6 +4,12 @@ Org mode resolves from the DB through a ScopedSession, so a project belonging to
 another organization simply is not found. Desktop keeps the filesystem scan but
 still resolves by id, which is what keeps a slug-addressed delete from acting on
 whichever project happens to sort first.
+
+Both modes isolate artifacts per conversation on disk (ENG-1933): desktop used
+to share one project-wide folder across every conversation, which let a
+concurrent sibling conversation's new artifact get misattributed to the wrong
+turn's before/after diff. The project-wide folder is kept as a fallback root so
+anything written before this change stays reachable.
 """
 from __future__ import annotations
 
@@ -107,17 +113,36 @@ def test_sources_for_scope_covers_only_own_org(session, tmp_path, org_mode):
 
 def test_source_for_project_works_in_desktop_mode_too(session, tmp_path, monkeypatch):
     """Desktop resolves by id as well — that is what keeps slug-addressed delete
-    from acting on whichever project sorts first."""
+    from acting on whichever project sorts first. Desktop now also isolates
+    per-conversation folders, so a project with only a legacy (pre-migration)
+    folder yields exactly that one root."""
     monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
     row = _project(session, tmp_path, name="solo", org_id=None)
+    (Path(row.path) / ".anton" / "artifacts").mkdir(parents=True)
     scoped = ScopedSession(session, LOCAL_SCOPE)
 
     sources = artifacts_sources_for_project(scoped, row.id)
 
-    # Exactly one, and no `conversations` segment: on the desktop the workspace IS
-    # the project directory and every conversation shares one artifacts folder.
     assert [s.base for s in sources] == [tmp_path / "local" / "solo" / ".anton" / "artifacts"]
     assert sources[0].project_id == str(row.id)
+
+
+def test_source_for_project_includes_desktop_conversation_folders(session, tmp_path, monkeypatch):
+    """A desktop project with per-conversation folders (post-fix artifacts)
+    lists the legacy folder AND each conversation's own — same shape org mode
+    already uses."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+    row = _project(session, tmp_path, name="mixed", org_id=None)
+    (Path(row.path) / ".anton" / "artifacts").mkdir(parents=True)
+    (Path(row.path) / "conversations" / "conv-1" / ".anton" / "artifacts").mkdir(parents=True)
+    scoped = ScopedSession(session, LOCAL_SCOPE)
+
+    sources = artifacts_sources_for_project(scoped, row.id)
+
+    assert [s.base for s in sources] == [
+        Path(row.path) / ".anton" / "artifacts",
+        Path(row.path) / "conversations" / "conv-1" / ".anton" / "artifacts",
+    ]
 
 
 def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monkeypatch):
@@ -148,14 +173,15 @@ def test_conversation_base_is_scoped_to_the_conversation_in_org_mode(org_mode, t
     assert base == tmp_path / "proj" / "conversations" / "conv-7" / ".anton" / "artifacts"
 
 
-def test_conversation_base_ignores_the_conversation_on_desktop(monkeypatch, tmp_path):
-    """Desktop's workspace IS the project dir — every conversation shares one
-    artifacts folder, so the id is accepted and dropped rather than refused."""
+def test_conversation_base_is_scoped_to_the_conversation_on_desktop_too(monkeypatch, tmp_path):
+    """Desktop conversations get their own folder now too (ENG-1933) — a
+    concurrent sibling conversation's new artifact must never land in this
+    conversation's before/after diff."""
     monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
 
     base = conversation_artifacts_base(str(tmp_path / "proj"), "conv-7")
 
-    assert base == tmp_path / "proj" / ".anton" / "artifacts"
+    assert base == tmp_path / "proj" / "conversations" / "conv-7" / ".anton" / "artifacts"
 
 
 def test_conversation_base_agrees_with_the_listed_roots(session, tmp_path, org_mode):

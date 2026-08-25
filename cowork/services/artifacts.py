@@ -182,12 +182,45 @@ def _registered_project_dirs() -> list[Path]:
     return out
 
 
+# Desktop conversations used to share one project-wide artifacts folder.
+# They now each get their own, under `conversations/<conversation_id>/`,
+# matching how org mode has always isolated a pod's artifacts per
+# conversation (see services.artifact_roots.conversation_artifacts_base) —
+# closing a race where a concurrent sibling conversation's new artifact
+# could be misattributed to the wrong turn (ENG-1933). The project-wide
+# folder is kept as a fallback root so artifacts written before this change
+# stay listable, servable, and publishable.
+CONVERSATIONS_DIRNAME = "conversations"
+_ARTIFACTS_SUBPATH = (".anton", "artifacts")
+
+
+def _artifact_roots_for_project_dir(project_dir: Path) -> list[Path]:
+    """Every existing artifacts root under one project dir: the legacy
+    project-wide folder first, then one per conversation that has actually
+    written something (the directory only exists once a turn has created
+    it, so an absent `conversations/` dir is not an error)."""
+    roots: list[Path] = []
+    legacy = project_dir.joinpath(*_ARTIFACTS_SUBPATH)
+    if legacy.is_dir():
+        roots.append(legacy)
+    try:
+        children = sorted((project_dir / CONVERSATIONS_DIRNAME).iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        if not child.is_dir():
+            continue
+        candidate = child.joinpath(*_ARTIFACTS_SUBPATH)
+        if candidate.is_dir():
+            roots.append(candidate)
+    return roots
+
+
 def _scan_artifact_dirs() -> list[Path]:
-    """Every project's `.anton/artifacts/` dir that exists."""
+    """Every project's artifact roots that exist (legacy + per-conversation)."""
     dirs: dict[str, Path] = {}
     for project_dir in _registered_project_dirs():
-        candidate = project_dir / ".anton" / "artifacts"
-        if candidate.is_dir():
+        for candidate in _artifact_roots_for_project_dir(project_dir):
             dirs[str(candidate.resolve())] = candidate
     return list(dirs.values())
 
@@ -430,24 +463,23 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
     return out
 
 
-def _project_artifacts_base(project_name: str) -> Path | None:
-    """Resolve a project name to its `.anton/artifacts` dir, only when it
-    maps to a registered project. Returns None for unknown projects or
-    path-traversal attempts."""
+def _project_artifact_roots(project_name: str) -> list[Path]:
+    """Resolve a project name to its artifact roots (legacy + per-
+    conversation), only when it maps to a registered project. Empty for
+    unknown projects or path-traversal attempts."""
     if (not project_name or "\x00" in project_name
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
-        return None
+        return []
     registered = set(_registered_project_dirs())
     root = _projects_root().resolve(strict=False)
     try:
         candidate = (root / project_name).resolve(strict=False)
     except (OSError, ValueError):
-        return None
+        return []
     if candidate not in registered:
-        return None
-    base = candidate / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+        return []
+    return _artifact_roots_for_project_dir(candidate)
 
 
 def serve_url_for(path: str | Path) -> str:
@@ -466,15 +498,15 @@ def serve_url_for(path: str | Path) -> str:
     except (OSError, ValueError):
         return ""
     for project_dir in _registered_project_dirs():
-        base = project_dir / ".anton" / "artifacts"
-        try:
-            rel = p.relative_to(base.resolve())
-        except (ValueError, OSError):
-            continue
-        if not rel.parts:
-            return ""
-        rel_str = "/".join(quote(part) for part in rel.parts)
-        return f"/api/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
+        for base in _artifact_roots_for_project_dir(project_dir):
+            try:
+                rel = p.relative_to(base.resolve())
+            except (ValueError, OSError):
+                continue
+            if not rel.parts:
+                return ""
+            rel_str = "/".join(quote(part) for part in rel.parts)
+            return f"/api/v1/artifacts/serve/{quote(project_dir.name)}/{rel_str}"
     return ""
 
 

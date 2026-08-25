@@ -47,7 +47,7 @@ def _run_harness(monkeypatch, session):
 
     monkeypatch.setattr(autopublish, "autopublish_project_artifacts", _no_autopublish)
 
-    async def _fake_build(self, conversation, model=None, disabled_connections=None, channel_context=None):
+    async def _fake_build(self, conversation, model=None, disabled_connections=None, channel_context=None, artifacts_base=None):
         return session, None, None
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)

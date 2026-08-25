@@ -12,6 +12,14 @@ filesystem path belongs to.
 Desktop keeps the pre-existing filesystem scan: one user per machine, so the scan
 IS the authorization boundary there. It still resolves a project by id when given
 one, so both modes address artifacts the same way.
+
+Both modes now isolate artifacts per conversation on disk (see
+`conversation_artifacts_base`/`_project_artifact_bases` below) — desktop used to
+share one project-wide folder across every conversation, which let a concurrent
+sibling conversation's new artifact get misattributed to the wrong turn's
+before/after diff (ENG-1933). The project-wide folder is kept as a fallback root
+everywhere artifacts are listed/served/published, so anything written before this
+change stays reachable.
 """
 from __future__ import annotations
 
@@ -20,39 +28,18 @@ from uuid import UUID
 
 from cowork.db.scoped import ScopedSession
 from cowork.services.artifacts import (
+    CONVERSATIONS_DIRNAME,
     ProjectArtifacts,
+    _ARTIFACTS_SUBPATH,
+    _artifact_roots_for_project_dir,
     _org_mode,
-    _scan_artifact_dirs,
+    _registered_project_dirs,
 )
-
-_ARTIFACTS_SUBPATH = (".anton", "artifacts")
-
-#: Org mode only. The agent's workspace on the cloud is one conversation, not the
-#: project: scratchpad-controller mounts `<project>/conversations/<conversation_id>`
-#: at the pod's workspace root and anton writes artifacts under
-#: `<workspace>/.anton/artifacts` exactly as it does on the desktop, so the tree
-#: gains a segment cowork-server has to know about. The isolation is deliberate on
-#: the controller's side — the workspace lands on the scratchpad's `sys.path`, so a
-#: project-wide mount would let a cell in one conversation plant a module that
-#: imports in a co-user's pod (see live_pod.py).
-#:
-#: Desktop has no such segment: there the workspace IS the project directory, every
-#: conversation shares one artifacts folder, and nothing below changes.
-CONVERSATIONS_DIRNAME = "conversations"
-
-
-def _artifacts_base(project_path: str) -> Path:
-    return Path(project_path).joinpath(*_ARTIFACTS_SUBPATH)
 
 
 def conversation_artifacts_base(project_path: str, conversation_id) -> Path:
-    """The artifacts root one org-mode turn writes into.
-
-    Local mode ignores `conversation_id` and returns the project-wide root, so a
-    caller can hand its conversation id over unconditionally.
-    """
-    if not _org_mode():
-        return _artifacts_base(project_path)
+    """The artifacts root one turn writes into: its own conversation's
+    folder, in both modes."""
     return (
         Path(project_path)
         / CONVERSATIONS_DIRNAME
@@ -61,21 +48,13 @@ def conversation_artifacts_base(project_path: str, conversation_id) -> Path:
 
 
 def _project_artifact_bases(project_path: str) -> list[Path]:
-    """Every artifacts root belonging to one project.
-
-    One on the desktop. In org mode, one per conversation that has actually
-    written something — the directory only exists once a pod has mounted it, so an
-    absent `conversations/` dir means the project has no cloud artifacts yet and
-    is not an error.
-    """
-    if not _org_mode():
-        return [_artifacts_base(project_path)]
-    conversations = Path(project_path) / CONVERSATIONS_DIRNAME
-    try:
-        children = sorted(conversations.iterdir())
-    except OSError:
-        return []
-    return [child.joinpath(*_ARTIFACTS_SUBPATH) for child in children if child.is_dir()]
+    """Every artifacts root belonging to one project: the legacy project-
+    wide folder (pre-existing artifacts, in either mode) plus one per
+    conversation that has actually written something — the directory only
+    exists once a turn has created it, so an absent `conversations/` dir
+    means the project has no per-conversation artifacts yet and is not an
+    error."""
+    return _artifact_roots_for_project_dir(Path(project_path))
 
 
 def _sources_for(project) -> list[ProjectArtifacts]:
@@ -116,9 +95,9 @@ def artifacts_sources_for_project(session: ScopedSession, project_id: UUID) -> l
     including another organization's project, which the scoped read does not
     return at all.
 
-    A LIST, not one root: in org mode a project's artifacts are spread across its
-    conversations, so a caller that addresses by slug has to look in each. Desktop
-    always yields exactly one.
+    A LIST, not one root: in both modes a project's artifacts are spread across
+    its conversations (plus, on desktop, the legacy project-wide folder), so a
+    caller that addresses by slug has to look in each.
 
     Works in BOTH modes: `ProjectService.get_project` is a plain scoped read and
     resolves fine on desktop too. That is deliberate — without it the desktop
@@ -131,15 +110,19 @@ def artifacts_sources_for_project(session: ScopedSession, project_id: UUID) -> l
 
 
 def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
-    """Desktop: the registered `.anton/artifacts` dirs found by scanning the
-    projects root.
+    """Desktop: every registered project's artifact roots (legacy +
+    per-conversation) found by scanning the projects root.
 
     `project_id` is None here — desktop cards stay path-addressed. The directory
     name IS the project name: `create_project` builds both from one sanitized
     string, and a rename moves the directory and updates the row together
-    (services/projects.py).
+    (services/projects.py). Walking `_registered_project_dirs()` directly (rather
+    than inferring the project dir back out of each root's ancestors) is what
+    keeps this correct now that a root can sit two or four segments below its
+    project dir depending on whether it's the legacy folder or a conversation's.
     """
     return [
-        ProjectArtifacts(base=base, project_id=None, project_name=base.parent.parent.name)
-        for base in _scan_artifact_dirs()
+        ProjectArtifacts(base=base, project_id=None, project_name=project_dir.name)
+        for project_dir in _registered_project_dirs()
+        for base in _artifact_roots_for_project_dir(project_dir)
     ]

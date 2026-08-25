@@ -30,7 +30,7 @@ from cowork.services.artifact_roots import (
 from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
 from cowork.services.artifacts import (
     ExecutionRefused,
-    _project_artifacts_base,
+    _project_artifact_roots,
     artifact_status as _artifact_status,
     delete_artifact as _delete_artifact,
     get_preview_mount,
@@ -343,18 +343,24 @@ async def preview_asset(token: str, rel_path: str, request: Request):
 
 @router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy)])
 def serve_artifact_file(project_name: str, file_path: str, request: Request):
-    """Serve a file from `<project>/.anton/artifacts/<file_path>` over
-    HTTP. Stateless, origin-relative, frame-able so the in-app iframe
-    and new-tab open both work in web deployments."""
-    base = _project_artifacts_base(project_name)
-    if base is None:
+    """Serve a file from one of a project's artifact roots (the legacy
+    project-wide folder, or a conversation's own folder) over HTTP.
+    Stateless, origin-relative, frame-able so the in-app iframe and
+    new-tab open both work in web deployments."""
+    roots = _project_artifact_roots(project_name)
+    if not roots:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
-    try:
-        target = (base / file_path).resolve()
-        target.relative_to(base.resolve())
-    except (ValueError, OSError) as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
-    if not target.is_file():
+    target: Path | None = None
+    for base in roots:
+        try:
+            candidate = (base / file_path).resolve()
+            candidate.relative_to(base.resolve())
+        except (ValueError, OSError):
+            continue
+        if candidate.is_file():
+            target = candidate
+            break
+    if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
