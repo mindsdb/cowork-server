@@ -12,6 +12,7 @@ from cowork.coding.project_models import CodeProject
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.skill_models import (
     ProjectSkillSource,
+    SkillLibraryDocument,
     SkillLibraryItem,
     SkillLibraryPage,
     SkillLibrarySource,
@@ -20,6 +21,9 @@ from cowork.coding.skill_models import (
 from cowork.coding.skill_source_store import SkillSourceStore
 from cowork.coding.workspace import GitRunner, WorkspaceError
 from cowork.services.skills import BUILTIN_SKILLS_DIR, SkillService
+
+_MAX_DOCUMENT_BYTES = 512_000
+_MAX_DOCUMENT_FILES = 100
 
 
 class SkillLibraryService:
@@ -104,6 +108,48 @@ class SkillLibraryService:
                 )
             )
         return page
+
+    def document(
+        self,
+        personal: SkillService,
+        item_id: str,
+        selected_path: str | None = None,
+    ) -> SkillLibraryDocument:
+        """Return one library item's readable source without exposing arbitrary files."""
+        page = self.catalog(personal)
+        item = next((candidate for candidate in page.items if candidate.id == item_id), None)
+        if item is None:
+            raise KeyError("Skill library item not found")
+
+        if item.origin == "team":
+            if not item.source_id:
+                raise WorkspaceError("This team item has no source")
+            _, cache = self.cache_for(item.source_id)
+            source_file = self._contained_file(cache, item.path)
+        else:
+            source_file = self._contained_file(personal.root, f"{item.path}/SKILL.md")
+
+        if item.kind == "skill":
+            root = source_file.parent
+            files = self._readable_files(root)
+            default_path = "SKILL.md"
+        else:
+            root = source_file.parent
+            files = [source_file.name]
+            default_path = source_file.name
+        if not files:
+            raise WorkspaceError("This skill has no readable files")
+
+        path = selected_path or default_path
+        if path not in files:
+            raise WorkspaceError("That file is not part of this skill")
+        content = self._read_document(self._contained_file(root, path))
+        return SkillLibraryDocument(
+            item=item,
+            files=files,
+            selected_path=path,
+            content=content,
+        )
 
     def add(self, repository: str, branch: str = "main", name: str | None = None) -> SkillLibrarySource:
         repository = repository.strip()
@@ -337,6 +383,60 @@ class SkillLibraryService:
         if cache != expected or not cache.is_dir():
             raise WorkspaceError("The managed skill source cache is unavailable; reconnect the source")
         return cache
+
+    @staticmethod
+    def _contained_file(root: Path, relative: str) -> Path:
+        boundary = root.resolve()
+        candidate = boundary / relative
+        if candidate.is_symlink():
+            raise WorkspaceError("The requested skill file is unavailable")
+        path = candidate.resolve()
+        if not path.is_relative_to(boundary) or not path.is_file():
+            raise WorkspaceError("The requested skill file is unavailable")
+        return path
+
+    @classmethod
+    def _readable_files(cls, root: Path) -> list[str]:
+        boundary = root.resolve()
+        files: list[str] = []
+        for path in sorted(root.rglob("*")):
+            if len(files) >= _MAX_DOCUMENT_FILES:
+                break
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            if any(part.startswith(".") for part in relative.parts) or relative.name == "stats.json":
+                continue
+            resolved = path.resolve()
+            if not resolved.is_relative_to(boundary) or path.stat().st_size > _MAX_DOCUMENT_BYTES:
+                continue
+            try:
+                sample = path.read_bytes()
+                if b"\x00" in sample:
+                    continue
+                sample.decode("utf-8")
+            except (OSError, UnicodeError):
+                continue
+            files.append(relative.as_posix())
+        if "SKILL.md" in files:
+            files.remove("SKILL.md")
+            files.insert(0, "SKILL.md")
+        return files
+
+    @staticmethod
+    def _read_document(path: Path) -> str:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise WorkspaceError("The requested skill file could not be read") from exc
+        if len(data) > _MAX_DOCUMENT_BYTES:
+            raise WorkspaceError("That skill file is too large to preview")
+        if b"\x00" in data:
+            raise WorkspaceError("That skill file is not text")
+        try:
+            return data.decode("utf-8")
+        except UnicodeError as exc:
+            raise WorkspaceError("That skill file is not UTF-8 text") from exc
 
     def _cache(self, source_id: str) -> Path:
         return self.caches / source_id

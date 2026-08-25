@@ -11,6 +11,7 @@ from cowork.coding.guidance_items import discover_guidance_items
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
 from cowork.coding.skill_models import TeamSkillSource
 from cowork.coding.workspace import WorkspaceError
+from cowork.services.skills import SkillService
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -170,6 +171,39 @@ def test_task_receives_an_immutable_agent_neutral_skill_snapshot(tmp_path: Path)
 
     service.delete_session(first.id)
     assert not first_root.exists()
+
+
+def test_skill_document_exposes_contained_text_files_for_read_only_preview(tmp_path: Path) -> None:
+    skills_repo = repository(tmp_path, "engineering-skills")
+    add_skill(skills_repo, "Review version one.")
+    reference = skills_repo / "skills" / "review" / "references" / "checklist.md"
+    reference.parent.mkdir()
+    reference.write_text("# Review checklist\n\nCheck the boundaries.\n", encoding="utf-8")
+    binary = skills_repo / "skills" / "review" / "fixture.bin"
+    binary.write_bytes(b"\x00\x01\x02")
+    git(skills_repo, "add", ".")
+    git(skills_repo, "commit", "-m", "add review reference")
+    service = service_with(tmp_path, FakeEngine())
+    source = service.skill_library.add(
+        str(skills_repo),
+        git(skills_repo, "branch", "--show-current"),
+        "Engineering standards",
+    )
+    item = service.skill_library.list().items[0]
+
+    main = service.skill_library.document(SkillService(), item.id)
+    reference_document = service.skill_library.document(
+        SkillService(), item.id, "references/checklist.md"
+    )
+
+    assert main.item.source_id == source.id
+    assert main.selected_path == "SKILL.md"
+    assert main.files == ["SKILL.md", "references/checklist.md"]
+    assert "Review version one." in main.content
+    assert "Check the boundaries." in reference_document.content
+
+    with pytest.raises(WorkspaceError, match="not part of this skill"):
+        service.skill_library.document(SkillService(), item.id, "../../README.md")
 
 
 def test_team_instructions_flow_through_the_agent_neutral_runtime_contract(tmp_path: Path) -> None:

@@ -61,6 +61,13 @@ class SkillLibraryPage(BaseModel):
     items: list[SkillLibraryItem] = Field(default_factory=list)
 
 
+class SkillLibraryDocument(BaseModel):
+    item: SkillLibraryItem
+    files: list[str] = Field(min_length=1, max_length=100)
+    selected_path: str
+    content: str
+
+
 class SkillSourceCreateRequest(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     repository: str = Field(min_length=1, max_length=32_768)
