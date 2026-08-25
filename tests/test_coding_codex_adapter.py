@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from cowork.coding.contracts import ExtensionInventory, PermissionMode
 from cowork.coding.engines import codex as codex_module
 from cowork.coding.engines import codex_config, codex_events
-from cowork.coding.engines.base import EngineCredentials, EngineInputReference, EngineSessionConfig
+from cowork.coding.engines.base import (
+    EngineCredentials,
+    EngineInputReference,
+    EngineSessionConfig,
+)
 from cowork.coding.engines.codex_extensions import add_extension_response
 from cowork.coding.redaction import sanitize
 
@@ -189,30 +193,32 @@ def test_extension_inventory_normalizes_codex_skills_and_mcp_servers() -> None:
     assert inventory.mcp_servers[0].detail == "2 tools · 0 resources"
 
 
-def test_cowork_and_user_skill_roots_use_current_codex_rpc_name(monkeypatch, tmp_path: Path) -> None:
+def test_code_and_user_skill_roots_use_current_codex_rpc_name(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, dict[str, object], object]] = []
 
     class FakeClient:
         def request(self, method: str, params: dict[str, object], *, response_model: object) -> None:
             calls.append((method, params, response_model))
 
-    skill_root = tmp_path / "skills"
+    cowork_skill_root = tmp_path / "skills"
+    code_skill_root = tmp_path / "code-skills"
     user_skill_root = tmp_path / "user-codex" / "skills"
     user_skill_root.mkdir(parents=True)
     monkeypatch.setenv("CODEX_HOME", str(user_skill_root.parent))
     monkeypatch.setattr(
         codex_module,
         "get_app_settings",
-        lambda: SimpleNamespace(skill=SimpleNamespace(root_dir=str(skill_root))),
+        lambda: SimpleNamespace(skill=SimpleNamespace(root_dir=str(cowork_skill_root))),
     )
     engine_session = object.__new__(codex_module.CodexEngineSession)
     engine_session._client = FakeClient()
 
     engine_session._register_skill_roots()
 
-    assert skill_root.is_dir()
+    assert code_skill_root.is_dir()
+    assert not cowork_skill_root.exists()
     assert calls[0][0] == "skills/extraRoots/set"
-    assert calls[0][1] == {"extraRoots": [str(skill_root), str(user_skill_root)]}
+    assert calls[0][1] == {"extraRoots": [str(code_skill_root), str(user_skill_root)]}
 
 
 def test_nested_codex_error_maps_to_safe_text() -> None:

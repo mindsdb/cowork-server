@@ -7,7 +7,7 @@ import os
 import shutil
 import tempfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from anton.core.tools.skill_format import (
@@ -17,10 +17,10 @@ from anton.core.tools.skill_format import (
     parse_skill_dir,
     validate_name,
 )
+
 from cowork.common.paths import safe_join
 from cowork.common.settings import get_app_settings
 from cowork.db.scoped import TenantScope, scoped_storage_root
-from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
 from cowork.models.skill import (
     META_CREATED_AT,
     META_DISPLAY_NAME,
@@ -29,7 +29,7 @@ from cowork.models.skill import (
     META_UPDATED_AT,
     Skill,
 )
-
+from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,15 @@ BUILTIN_SKILLS_VERSION = 2
 #: Org-mode version marker, a file in the org's own store. See
 #: ``SkillService.ensure_builtin_skills`` for why this is not a Setting row.
 BUILTIN_SKILLS_MARKER = ".builtins_seeded"
+
+# Skills in this set belong to the coding product, not the general Cowork
+# assistant. They remain packaged beside the other builtins for now, but are
+# seeded into a separate store and are never exposed by ``SkillService``.
+CODE_ONLY_BUILTIN_SKILL_NAMES = frozenset({
+    "thermo-nuclear-code-quality-review",
+})
+CODE_BUILTIN_SKILLS_VERSION = 1
+CODE_BUILTIN_SKILLS_MARKER = ".builtins_seeded"
 
 
 def _wire_len(text: str) -> int:
@@ -130,6 +139,8 @@ def build_turn_skills(scope: TenantScope | None, project_path: str | None = None
     root = svc.root
     for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         slug = skill_dir.name
+        if not svc.allows_skill(slug):
+            continue
         if skill_dir.is_symlink():
             # is_dir() follows the link, so a symlinked dir could point into
             # another org's store — reject it.
@@ -175,17 +186,54 @@ class SkillService:
     Org mode keys the store per org (``<shared_root>/<org_id>/skills``); local
     mode uses the shared root unchanged."""
 
+    store_name = "skills"
+    seed_builtins_in_local_mode = False
+
     def __init__(self, scope: TenantScope | None = None) -> None:
         settings = get_app_settings()
         self._scope = scope
-        self.root = scoped_storage_root(Path(settings.skill.root_dir), scope, store="skills")
+        base = Path(settings.skill.root_dir)
+        if self.store_name != "skills":
+            base = base.parent / self.store_name
+        self.root = scoped_storage_root(base, scope, store=self.store_name)
         # Symlink distribution is desktop-only (skill_links resolves the unkeyed
         # root and scans all project dirs). Keyed on deployment mode, not just
         # scope — an unscoped service (migration, seeding) must not fan symlinks
         # out of the unkeyed root in org mode either.
-        self._link_projects = settings.tenancy_mode != "org" and (
+        self._link_projects = self.store_name == "skills" and settings.tenancy_mode != "org" and (
             scope is None or not scope.org_mode
         )
+
+    @property
+    def builtin_skills_dir(self) -> Path:
+        return BUILTIN_SKILLS_DIR
+
+    @property
+    def builtin_skills_version(self) -> int:
+        return BUILTIN_SKILLS_VERSION
+
+    @property
+    def builtin_skills_marker(self) -> str:
+        return BUILTIN_SKILLS_MARKER
+
+    def allows_skill(self, slug: str) -> bool:
+        """Whether this store owns ``slug`` at its product boundary."""
+        return slug not in CODE_ONLY_BUILTIN_SKILL_NAMES
+
+    def includes_packaged_builtin(self, slug: str) -> bool:
+        return self.allows_skill(slug)
+
+    def builtin_skill_names(self) -> set[str]:
+        root = self.builtin_skills_dir
+        if not root.is_dir():
+            return set()
+        return {
+            path.name
+            for path in root.iterdir()
+            if path.is_dir()
+            and (path / SKILL_FILE).exists()
+            and self.includes_packaged_builtin(path.name)
+        }
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _skill_dir(self, slug: str) -> Path:
@@ -249,7 +297,7 @@ class SkillService:
             return []
         skills: list[Skill] = []
         for entry in self.root.iterdir():
-            if entry.is_dir() and (entry / SKILL_FILE).exists():
+            if self.allows_skill(entry.name) and entry.is_dir() and (entry / SKILL_FILE).exists():
                 skill = _skill_from_dir(entry)
                 if skill is not None:
                     skills.append(skill)
@@ -257,6 +305,8 @@ class SkillService:
         return skills
 
     def get_skill(self, slug: str) -> Skill:
+        if not self.allows_skill(slug):
+            raise ValueError(f"Skill {slug!r} not found.")
         skill_dir = self._skill_dir(slug)
         skill = _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).exists() else None
         if skill is None:
@@ -274,10 +324,12 @@ class SkillService:
         projects: list[str] | None = None,
     ) -> Skill:
         label = self._slug_from_label(label)
+        if not self.allows_skill(label):
+            raise ValueError(f"Skill name {label!r} is reserved for MindsHub Code.")
         if self._skill_dir(label).exists():
             raise ValueError(f"A skill named '{label}' already exists.")
 
-        metadata = self._build_metadata(label, name, datetime.now(timezone.utc))
+        metadata = self._build_metadata(label, name, datetime.now(UTC))
         self._apply_metadata_flags(metadata, enabled, projects)
         skill = Skill(
             name=label,
@@ -380,11 +432,13 @@ class SkillService:
             raise ValueError("Could not find a parseable SKILL.md in the upload.")
         if not skill.name:
             raise ValueError("Skill name is missing or invalid.")
+        if not self.allows_skill(skill.name):
+            raise ValueError(f"Skill name {skill.name!r} is reserved for MindsHub Code.")
         if self._skill_dir(skill.name).exists():
             raise FileExistsError(f"A skill named '{skill.name}' already exists.")
 
         metadata = dict(skill.metadata)
-        metadata.setdefault(META_CREATED_AT, datetime.now(timezone.utc).isoformat())
+        metadata.setdefault(META_CREATED_AT, datetime.now(UTC).isoformat())
         metadata.pop(META_PROJECTS, None)
         skill.metadata = metadata
         if not skill.description.strip():
@@ -465,7 +519,7 @@ class SkillService:
     # ── low-level fs ─────────────────────────────────────────────────────────
     def _write(self, skill: Skill) -> None:
         self._ensure_root()
-        skill.metadata[META_UPDATED_AT] = datetime.now(timezone.utc).isoformat()
+        skill.metadata[META_UPDATED_AT] = datetime.now(UTC).isoformat()
         skill_dir = self._skill_dir(skill.name)
         skill_dir.mkdir(parents=True, exist_ok=True)
         target = skill_dir / SKILL_FILE
@@ -487,12 +541,15 @@ class SkillService:
         Returns how many were copied. Never overwrites, so a skill the user
         edited or deleted stays as they left it.
         """
-        if not BUILTIN_SKILLS_DIR.exists():
+        builtin_dir = self.builtin_skills_dir
+        if not builtin_dir.exists():
             return 0
         self._ensure_root()
         copied = 0
-        for src in sorted(BUILTIN_SKILLS_DIR.iterdir()):
+        for src in sorted(builtin_dir.iterdir()):
             if not src.is_dir() or not (src / SKILL_FILE).exists():
+                continue
+            if not self.includes_packaged_builtin(src.name):
                 continue
             try:
                 dest = self._skill_dir(src.name)
@@ -519,11 +576,12 @@ class SkillService:
         return copied
 
     def ensure_builtin_skills(self) -> bool:
-        """Seed this org's skill store with the packaged builtins, on first use.
+        """Seed this product-specific skill store with its packaged builtins.
 
-        Org mode only: desktop seeds once at boot via ``migrations.seed_builtin_skills``,
-        and its store is unkeyed so there is nothing per-tenant to do. There is no
-        org-creation hook to hang this on, so it runs lazily where skills are read.
+        Cowork seeds lazily only in org mode; desktop Cowork still seeds once at
+        boot via ``migrations.seed_builtin_skills``. Code uses a separate store and
+        seeds lazily in both local and org mode so its engineering catalogue never
+        depends on, or leaks into, the general Cowork catalogue.
 
         The version marker is a FILE in the org's store rather than a Setting row,
         so marker and skills share fate:
@@ -535,28 +593,52 @@ class SkillService:
         Returns True if seeding ran. Fail-soft: a filesystem problem leaves the org
         unseeded and retries on the next read rather than failing the request.
         """
-        if self._scope is None or not self._scope.org_mode:
+        if (
+            not self.seed_builtins_in_local_mode
+            and (self._scope is None or not self._scope.org_mode)
+        ):
             return False
         try:
-            marker = self.root / BUILTIN_SKILLS_MARKER
+            marker = self.root / self.builtin_skills_marker
             current = 0
             if marker.is_file():
                 raw = marker.read_text(encoding="utf-8").strip()
                 current = int(raw) if raw.isdigit() else 0
-            if current >= BUILTIN_SKILLS_VERSION:
+            if current >= self.builtin_skills_version:
                 return False
-            if not BUILTIN_SKILLS_DIR.exists():
+            if not self.builtin_skills_dir.exists():
                 # Nothing to seed from — a packaging fault, not a seeded org. Writing
                 # the marker here would record "done" against an empty store, and the
                 # org would stay empty forever once the image is fixed.
                 logger.warning("Builtin skills are missing from this build (%s); not marking %s seeded",
-                               BUILTIN_SKILLS_DIR, self.root)
+                               self.builtin_skills_dir, self.root)
                 return False
             copied = self._copy_builtin_skills()
-            marker.write_text(f"{BUILTIN_SKILLS_VERSION}\n", encoding="utf-8")
+            marker.write_text(f"{self.builtin_skills_version}\n", encoding="utf-8")
         except OSError:
             logger.warning("Could not seed builtin skills for org %s",
                            getattr(self._scope, "org_id", None), exc_info=True)
             return False
         logger.info("Seeded %d builtin skill(s) into %s", copied, self.root)
         return True
+
+
+class CodeSkillService(SkillService):
+    """Code-only skill store, isolated from the general Cowork catalogue."""
+
+    store_name = "code-skills"
+    seed_builtins_in_local_mode = True
+
+    @property
+    def builtin_skills_version(self) -> int:
+        return CODE_BUILTIN_SKILLS_VERSION
+
+    @property
+    def builtin_skills_marker(self) -> str:
+        return CODE_BUILTIN_SKILLS_MARKER
+
+    def allows_skill(self, slug: str) -> bool:
+        return True
+
+    def includes_packaged_builtin(self, slug: str) -> bool:
+        return slug in CODE_ONLY_BUILTIN_SKILL_NAMES

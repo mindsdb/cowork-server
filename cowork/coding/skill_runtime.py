@@ -11,7 +11,7 @@ from cowork.coding.guidance_items import discover_guidance_items, read_guidance_
 from cowork.coding.project_models import CodeProject
 from cowork.coding.skill_library import SkillLibraryService
 from cowork.coding.skill_models import SkillResolution
-from cowork.services.skills import BUILTIN_SKILLS_DIR, SkillService
+from cowork.services.skills import CodeSkillService
 
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_INSTRUCTION_BYTES = 120_000
@@ -29,7 +29,7 @@ class SkillRuntimeResolver:
         self,
         session_id: str,
         project: CodeProject | None,
-        personal: SkillService | None = None,
+        code_skills: CodeSkillService | None = None,
     ) -> SkillResolution:
         target = self.snapshots / session_id
         staging = self.snapshots / f".{session_id}.next"
@@ -87,13 +87,11 @@ class SkillRuntimeResolver:
                                 instruction_sections.append(section)
                                 instruction_bytes += section_bytes
 
-            if personal:
-                personal.ensure_builtin_skills()
+            if code_skills:
+                code_skills.ensure_builtin_skills()
                 project_keys = {project.id, project.name} if project else set()
-                builtin_names = {
-                    path.name for path in BUILTIN_SKILLS_DIR.iterdir() if path.is_dir()
-                } if BUILTIN_SKILLS_DIR.is_dir() else set()
-                for skill in personal.list_skills():
+                builtin_names = code_skills.builtin_skill_names()
+                for skill in code_skills.list_skills():
                     if not skill.enabled:
                         continue
                     if skill.projects and not project_keys.intersection(skill.projects):
@@ -101,7 +99,7 @@ class SkillRuntimeResolver:
                     key = skill.name.casefold()
                     if key in used_names:
                         continue
-                    source_dir = personal.root / skill.name
+                    source_dir = code_skills.root / skill.name
                     item_id = f"personal:{skill.name}"
                     origin = "built_in" if skill.name in builtin_names else "personal"
                     items.append(

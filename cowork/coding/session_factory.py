@@ -21,10 +21,10 @@ from cowork.coding.playbooks import PlaybookService
 from cowork.coding.project_models import CodeProject
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
-from cowork.coding.store import CodingStore
 from cowork.coding.skill_runtime import SkillRuntimeResolver
+from cowork.coding.store import CodingStore
 from cowork.coding.workspace import WorkspaceManager
-from cowork.services.skills import SkillService
+from cowork.services.skills import CodeSkillService
 
 EventEmitter = Callable[[str, CodingEvent], CodingEvent]
 TASK_TITLE_MAX_LENGTH = 72
@@ -108,7 +108,7 @@ class CodingSessionFactory:
         credentials: EngineCredentials,
         default_engine: str,
         default_model: str,
-        personal_skills: SkillService | None = None,
+        code_skills: CodeSkillService | None = None,
     ) -> CodingSession:
         project = self.projects.get(request.project_id) if request.project_id else None
         engine_id = request.engine_id or (project.default_engine_id if project else default_engine)
@@ -152,7 +152,7 @@ class CodingSessionFactory:
                 project_dirs, allocated_ports, guidance, playbook_summary, environment = [], {}, "", None, {}
                 permission_mode = request.permission_mode
             contexts = list(request.source_contexts)
-            skill_resolution = self.skills.resolve(session_id, project, personal_skills)
+            skill_resolution = self.skills.resolve(session_id, project, code_skills)
             guidance_summary = " · ".join(
                 part for part in (playbook_summary, skill_resolution.summary) if part
             ) or None
