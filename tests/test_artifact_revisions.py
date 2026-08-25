@@ -5,6 +5,7 @@ from uuid import UUID
 
 import pytest
 
+from cowork.services import artifact_revisions as revision_service
 from cowork.services.artifact_identity import artifact_key, ensure_stable_id
 from cowork.services.artifact_revisions import (
     RevisionConflict,
@@ -49,6 +50,32 @@ def test_legacy_identity_is_persisted_and_is_comment_key(artifact):
     assert artifact_key(stable_id) == f"artifact/{stable_id}"
 
 
+def test_invalid_stable_identity_fails_closed_without_rewriting(tmp_path):
+    folder = tmp_path / "broken"
+    folder.mkdir()
+    metadata = {"id": "legacy", "createdAt": "2026-08-25", "stableId": "not-a-uuid"}
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="stable identity is invalid"):
+        ensure_stable_id(folder, metadata)
+
+    assert json.loads((folder / "metadata.json").read_text(encoding="utf-8")) == metadata
+
+
+def test_legacy_identity_backfill_merges_latest_metadata(tmp_path):
+    folder = tmp_path / "legacy"
+    folder.mkdir()
+    stale = {"id": "legacy", "createdAt": "2026-08-25", "name": "Before"}
+    latest = {**stale, "name": "After", "description": "Concurrent update"}
+    (folder / "metadata.json").write_text(json.dumps(latest), encoding="utf-8")
+
+    stable_id, merged = ensure_stable_id(folder, stale)
+
+    assert merged["stableId"] == stable_id
+    assert merged["name"] == "After"
+    assert merged["description"] == "Concurrent update"
+
+
 def test_manual_save_is_atomic_and_records_revision(artifact):
     folder, metadata, stable_id = artifact
     initial = current_source(folder, metadata, stable_id)
@@ -69,6 +96,41 @@ def test_manual_save_is_atomic_and_records_revision(artifact):
     assert saved["revision"]["actor"] == {"kind": "manual", "id": "user-1"}
     assert [r["number"] for r in list_revisions(folder)] == [2, 1]
     assert revision_with_content(folder, initial["revision"]["id"])["content"] == "# First\n"
+
+
+def test_interrupted_save_recovers_source_and_attribution(artifact, monkeypatch):
+    folder, metadata, stable_id = artifact
+    initial = current_source(folder, metadata, stable_id)
+    write_manifest = revision_service._write_manifest
+    failed = False
+
+    def fail_once(folder_arg, payload):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("simulated manifest interruption")
+        return write_manifest(folder_arg, payload)
+
+    monkeypatch.setattr(revision_service, "_write_manifest", fail_once)
+    with pytest.raises(OSError, match="simulated manifest interruption"):
+        save_source(
+            folder,
+            metadata,
+            stable_id,
+            content="# Recovered\n",
+            expected_revision_id=initial["revision"]["id"],
+            actor_kind="manual",
+            actor_id="user-1",
+            summary="Recovered edit",
+        )
+
+    assert (folder / ".revisions" / "pending-source-write.json").is_file()
+    recovered = current_source(folder, metadata, stable_id)
+
+    assert recovered["content"] == "# Recovered\n"
+    assert recovered["revision"]["actor"] == {"kind": "manual", "id": "user-1"}
+    assert recovered["revision"]["summary"] == "Recovered edit"
+    assert not (folder / ".revisions" / "pending-source-write.json").exists()
 
 
 def test_stale_save_returns_conflict_without_overwriting(artifact):
@@ -300,6 +362,59 @@ def test_reject_agent_repair_restores_source_as_a_new_revision(artifact):
     assert restored["baseRevisionId"] == agent_revision["id"]
     assert restored["actor"] == {"kind": "manual", "id": "owner-1"}
     assert restored["commentThreadIds"] == ["thread-1"]
+
+
+def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monkeypatch):
+    folder, metadata, stable_id = artifact
+    initial = current_source(folder, metadata, stable_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        stable_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Try a different title"}],
+        conversation_id="conversation-1",
+    )
+    (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+    write_repair = revision_service._write_repair
+    failed = False
+
+    def fail_once(folder_arg, repair):
+        nonlocal failed
+        if not failed and repair.get("status") == "rejected":
+            failed = True
+            raise OSError("simulated repair status interruption")
+        return write_repair(folder_arg, repair)
+
+    monkeypatch.setattr(revision_service, "_write_repair", fail_once)
+    with pytest.raises(OSError, match="simulated repair status interruption"):
+        finalize_agent_repair(
+            folder,
+            metadata,
+            stable_id,
+            requested["repair"]["id"],
+            "rejected",
+            actor_id="owner-1",
+        )
+
+    decided = finalize_agent_repair(
+        folder,
+        metadata,
+        stable_id,
+        requested["repair"]["id"],
+        "rejected",
+        actor_id="owner-1",
+    )
+
+    assert decided["status"] == "rejected"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# First\n"
+    assert len([
+        revision for revision in list_revisions(folder)
+        if revision["summary"] == "Rejected agent suggestion"
+    ]) == 1
 
 
 def test_agent_repair_decision_refuses_a_changed_head(artifact):

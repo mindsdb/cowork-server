@@ -15,21 +15,22 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
-from cowork.services.artifact_roots import (
-    artifacts_sources_for_project as _sources_for_project,
-    artifacts_sources_for_scan as _sources_for_scan,
-    artifacts_sources_for_scope as _sources_for_scope,
+from cowork.api.v1.artifact_preview import (
+    NO_CACHE_HEADERS,
+    html_with_comment_layer,
+    wants_comment_layer,
 )
-from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
+from cowork.api.v1.artifact_scope import artifact_sources_for_request
 from cowork.services.artifacts import (
     ExecutionRefused,
+    _org_mode,
     _project_artifacts_base,
     artifact_status as _artifact_status,
     delete_artifact as _delete_artifact,
@@ -52,84 +53,6 @@ class _PathBody(BaseModel):
 
 # ``no-cache`` mirrors the FileResponse headers used elsewhere so a rebuilt
 # artifact is always re-fetched.
-_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
-
-
-def _wants_comment_layer(media_type: str, request: Request) -> bool:
-    """The comment marker layer is injected only into the top-level HTML
-    document, and only when the renderer opts in via the activation query flag.
-    Asset requests and flag-less loads stream untouched."""
-    return media_type == "text/html" and ACTIVATION_PARAM in request.query_params
-
-
-def _html_with_layer(target: Path):
-    """Read an HTML file and return an HTMLResponse with the marker layer
-    injected, or None when it can't be read as text (caller falls back to a
-    plain FileResponse)."""
-    try:
-        html = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    return HTMLResponse(inject_layer(html), headers=_NO_CACHE)
-
-
-def _org_mode() -> bool:
-    from cowork.common.settings.app_settings import get_app_settings
-
-    return get_app_settings().tenancy_mode == "org"
-
-
-def _sources(session, project_id: UUID | None, project_path: str | None):
-    """The artifact roots this request may read.
-
-    `project_id` is honored in BOTH modes. That is not cosmetic: the delete handler
-    acts on `sources[0]`, so a desktop branch that ignored it would delete a
-    same-named slug from whichever project sorted first — and inline chat cards
-    carry a `project_id` in every mode, so that path is reachable from the UI.
-
-    Org mode additionally refuses `project_path`: a filesystem path from the client
-    carries no tenant, and these endpoints have no other way to tell which
-    organization it belongs to.
-    """
-    if _org_mode() and project_path is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="project_path is not accepted in org deployments; use project_id",
-        )
-
-    if project_id is not None:
-        try:
-            return _sources_for_project(session, project_id)
-        except ValueError:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
-
-    if _org_mode():
-        return _sources_for_scope(session)
-
-    sources = _sources_for_scan()
-    if project_path is not None:
-        # The client value is normalized as a STRING and never resolved through the
-        # filesystem. Nothing here opens it — it only selects from roots the server
-        # discovered itself, so the result is always a subset of the scan — but
-        # `Path.resolve()` on untrusted input is a filesystem access driven by that
-        # input, which is a path-injection sink whether or not it is reachable
-        # (CodeQL py/path-injection). Comparing against both the raw and the
-        # resolved form of each server-side root keeps symlinked project dirs
-        # matching; those paths are ours, so resolving them is fine.
-        wanted = os.path.normpath(os.path.expanduser(project_path))
-        sources = [s for s in sources if _project_dir_matches(s, wanted)]
-    return sources
-
-
-def _project_dir_matches(source, wanted: str) -> bool:
-    project_dir = source.base.parent.parent
-    try:
-        resolved = str(project_dir.resolve(strict=False))
-    except OSError:
-        resolved = ""
-    return wanted in (str(project_dir), resolved)
-
-
 # The two functions below hold the logic; the routes under them are thin adapters.
 # Keeping them separate means the tenancy behavior is testable without FastAPI's
 # Query sentinels standing in for the defaults.
@@ -141,7 +64,7 @@ def artifacts_for_request(
     # Owner-side fields are stripped inside `card_for_folder`, not here: inline chat
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
-    sources = _sources(session, project_id, project_path)
+    sources = artifact_sources_for_request(session, project_id, project_path)
     cards = _list_artifacts(sources)
     from cowork.services.artifact_permissions import artifact_capabilities
 
@@ -154,35 +77,6 @@ def artifacts_for_request(
         if source is not None:
             card["capabilities"] = artifact_capabilities(session, source)
     return cards
-
-
-def _sources_for_project_ref(session: ScopedSession, project_ref: str):
-    """Resolve the URL's project capability without ever accepting a path."""
-    if project_ref == "local":
-        if _org_mode():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
-        return _sources_for_scan()
-    try:
-        project_id = UUID(project_ref)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project") from exc
-    return _sources(session, project_id, None)
-
-
-def _workspace_artifact(session: ScopedSession, project_ref: str, stable_id: str):
-    from cowork.services.artifact_identity import (
-        ArtifactIdentityConflict,
-        resolve_artifact_folder,
-    )
-
-    try:
-        return resolve_artifact_folder(_sources_for_project_ref(session, project_ref), stable_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ArtifactIdentityConflict as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact identity") from exc
 
 
 @router.get("/")
@@ -214,7 +108,7 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
     # New clients address deletion by stable id. Keep the slug fallback for
     # older desktop clients, but never use it when the caller supplied a UUID:
     # two conversations in one project can legitimately produce the same slug.
-    sources = _sources(session, project_id, None)
+    sources = artifact_sources_for_request(session, project_id, None)
     source = None
     folder = None
     try:
@@ -404,13 +298,13 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    if _wants_comment_layer(media_type, request):
+    if wants_comment_layer(media_type, request):
         # Offload the (potentially large) synchronous read so it doesn't stall
         # the event loop / other in-flight SSE streams — this endpoint is async.
-        resp = await run_in_threadpool(_html_with_layer, target)
+        resp = await run_in_threadpool(html_with_comment_layer, target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=_NO_CACHE)
+    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
 @router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy)])
@@ -431,11 +325,11 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
     # — the blocking read here doesn't touch the event loop.
-    if _wants_comment_layer(media_type, request):
-        resp = _html_with_layer(target)
+    if wants_comment_layer(media_type, request):
+        resp = html_with_comment_layer(target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=_NO_CACHE)
+    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
 @router.post("/open", dependencies=[Depends(require_local_tenancy)])
