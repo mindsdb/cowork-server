@@ -337,9 +337,9 @@ class OAuthSettings(Settings):
     github_client_id: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_ID"))
     github_client_secret: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_SECRET"))
 
-    # PostHog is a public, PKCE-only OAuth client (Client ID Metadata
-    # Document) — there is no client_secret to configure, unlike every
-    # other provider above.
+    supabase_client_id: str = Field(default="", validation_alias=AliasChoices("SUPABASE_CLIENT_ID"))
+    supabase_client_secret: str = Field(default="", validation_alias=AliasChoices("SUPABASE_CLIENT_SECRET"))
+
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
     # Browser-side key for the Google Picker widget (drive.file scope only
