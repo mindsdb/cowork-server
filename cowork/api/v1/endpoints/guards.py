@@ -13,7 +13,7 @@ def require_local(request: Request) -> None:
     deployment (e.g. the self-host compose that binds 0.0.0.0) can't hand
     secrets to a remote peer (ENG-457, ENG-868). The desktop sidecar, UI, and
     Electron main process all talk over 127.0.0.1, so the legitimate flows are
-    unaffected; hosted-web builds never call these endpoints and treat the 403
+    unaffected; hosted-web builds call `/settings/raw` on boot and treat the 403
     as expected (ENG-817).
     """
     client = request.client.host if request.client else ""
