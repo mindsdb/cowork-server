@@ -352,9 +352,11 @@ class ConversationService:
     def project_by_name(self, name: str | None) -> Project | None:
         if not name:
             return None
-        return self.session.exec(
-            self.session.select(Project).where(Project.name == name)
-        ).first()
+        # Delegate so the `general` self-heal lives in one place.
+        # Lazy import: projects imports this module.
+        from cowork.services.projects import ProjectService
+
+        return ProjectService(self.session).get_or_provision_by_name_or_none(name)
 
     def update_conversation(
         self,
