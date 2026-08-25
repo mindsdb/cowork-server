@@ -1034,6 +1034,27 @@ def test_remote_error_auth():
     assert code == AUTH_ERROR_CODE
 
 
+def test_remote_error_turn_interrupted_keeps_its_curated_copy():
+    # The pod's own no-terminal-event fallback (a pod torn down mid-turn).
+    # Same generic code as any unmapped failure — no dedicated card exists
+    # for this — but the curated sentence must survive instead of being
+    # discarded for the fully generic message.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "TurnInterrupted: The turn ended unexpectedly. Please try again.")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+
+
+def test_remote_error_worker_unresponsive_keeps_its_curated_copy():
+    # producer.py's UNRESPONSIVE_WORKER_ERROR, synthesized on idle timeout.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "TurnWorkerUnresponsive: the turn worker stopped responding")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "the turn worker stopped responding"
+
+
 def test_remote_error_unknown_is_redacted():
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
     code, msg = remote_turn_error("RuntimeError: secret internals")

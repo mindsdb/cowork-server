@@ -869,6 +869,15 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if type_name == "ConnectionError" and "api key" in message.lower():
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
+    # TurnInterrupted (the pod's own no-terminal-event fallback) and
+    # TurnWorkerUnresponsive (producer.py's idle-timeout synthesis) are both
+    # our own authored strings, never provider/attacker text — safe to pass
+    # through. Same generic code as any other unmapped failure (no card
+    # exists for either), but the curated sentence survives instead of being
+    # discarded for the fully generic message just because it lacked a
+    # dedicated mapping.
+    if type_name in ("TurnInterrupted", "TurnWorkerUnresponsive"):
+        return GENERIC_TURN_ERROR_CODE, message or GENERIC_TURN_ERROR_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
 
