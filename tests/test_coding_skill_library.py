@@ -11,7 +11,8 @@ from cowork.coding.guidance_items import discover_guidance_items
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
 from cowork.coding.skill_models import TeamSkillSource
 from cowork.coding.workspace import WorkspaceError
-from cowork.services.skills import SkillService
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.skills import CodeSkillService, SkillService
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -46,6 +47,30 @@ def add_skill(repo: Path, body: str, name: str = "review") -> str:
     git(repo, "add", ".")
     git(repo, "commit", "-m", f"skill: {body}")
     return f"skills/{name}/SKILL.md"
+
+
+def test_code_catalogue_never_inherits_cowork_skills(tmp_path: Path, monkeypatch) -> None:
+    storage = tmp_path / "storage"
+    monkeypatch.setenv("COWORK_HOME", str(storage))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(storage / "skills"))
+    get_app_settings.cache_clear()
+    try:
+        cowork_skills = SkillService()
+        cowork_skills.create_skill(
+            label="prepare-documents",
+            description="Prepare a polished document.",
+            instructions="Use the document workflow.",
+        )
+        code_skills = CodeSkillService()
+        service = service_with(tmp_path / "coding", FakeEngine())
+
+        names = {item.path for item in service.skill_library.catalog(code_skills).items}
+
+        assert code_skills.root != cowork_skills.root
+        assert "thermo-nuclear-code-quality-review" in names
+        assert "prepare-documents" not in names
+    finally:
+        get_app_settings.cache_clear()
 
 
 def test_team_source_is_discoverable_versioned_and_project_scoped(tmp_path: Path) -> None:
@@ -191,9 +216,9 @@ def test_skill_document_exposes_contained_text_files_for_read_only_preview(tmp_p
     )
     item = service.skill_library.list().items[0]
 
-    main = service.skill_library.document(SkillService(), item.id)
+    main = service.skill_library.document(CodeSkillService(), item.id)
     reference_document = service.skill_library.document(
-        SkillService(), item.id, "references/checklist.md"
+        CodeSkillService(), item.id, "references/checklist.md"
     )
 
     assert main.item.source_id == source.id
@@ -203,7 +228,7 @@ def test_skill_document_exposes_contained_text_files_for_read_only_preview(tmp_p
     assert "Check the boundaries." in reference_document.content
 
     with pytest.raises(WorkspaceError, match="not part of this skill"):
-        service.skill_library.document(SkillService(), item.id, "../../README.md")
+        service.skill_library.document(CodeSkillService(), item.id, "../../README.md")
 
 
 def test_team_instructions_flow_through_the_agent_neutral_runtime_contract(tmp_path: Path) -> None:

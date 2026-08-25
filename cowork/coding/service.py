@@ -41,8 +41,6 @@ from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.skill_library import SkillLibraryService
-from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PullRequestActionRequest,
@@ -53,11 +51,13 @@ from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.runtime import RuntimeManager, engine_workspace_path
 from cowork.coding.session_factory import CodingSessionFactory
+from cowork.coding.skill_library import SkillLibraryService
+from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn, mark_running
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from cowork.common.paths import cowork_home
-from cowork.services.skills import SkillService
+from cowork.services.skills import CodeSkillService
 
 logger = logging.getLogger(__name__)
 
@@ -301,14 +301,14 @@ class CodingService:
         credentials: EngineCredentials,
         default_engine: str,
         default_model: str,
-        personal_skills: SkillService | None = None,
+        code_skills: CodeSkillService | None = None,
     ) -> CodingSession:
         session = self.session_factory.create(
             request,
             credentials,
             default_engine,
             default_model,
-            personal_skills,
+            code_skills,
         )
         try:
             self.submit_turn(session.id, request.prompt, credentials, request.attachments)

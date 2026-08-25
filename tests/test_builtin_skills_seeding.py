@@ -14,9 +14,10 @@ import pytest
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services.skills import (
-    BUILTIN_SKILLS_DIR,
     BUILTIN_SKILLS_MARKER,
     BUILTIN_SKILLS_VERSION,
+    CODE_ONLY_BUILTIN_SKILL_NAMES,
+    CodeSkillService,
     SkillService,
     build_turn_skills,
 )
@@ -52,8 +53,7 @@ def _store(org: str = ORG_A) -> Path:
 
 
 def _packaged_slugs() -> set[str]:
-    return {p.name for p in BUILTIN_SKILLS_DIR.iterdir()
-            if p.is_dir() and (p / "SKILL.md").exists()}
+    return SkillService(_org()).builtin_skill_names()
 
 
 def test_a_fresh_org_gets_the_packaged_builtins(skills_root):
@@ -62,14 +62,32 @@ def test_a_fresh_org_gets_the_packaged_builtins(skills_root):
     assert _packaged_slugs()  # the set is non-empty, or this proves nothing
 
 
-def test_thermo_nuclear_review_is_a_mindshub_maintained_builtin(skills_root):
-    assert "thermo-nuclear-code-quality-review" in _packaged_slugs()
+def test_thermo_nuclear_review_is_code_only(skills_root):
+    slug = "thermo-nuclear-code-quality-review"
+    assert slug in CODE_ONLY_BUILTIN_SKILL_NAMES
+    assert slug not in _packaged_slugs()
     ensure_builtin_skills(_org())
+    with pytest.raises(ValueError, match="not found"):
+        SkillService(_org()).get_skill(slug)
+    with pytest.raises(ValueError, match="reserved for MindsHub Code"):
+        SkillService(_org()).create_skill(slug, "Do a strict review.")
+    assert slug not in build_turn_skills(_org(), None)
 
-    skill = SkillService(_org()).get_skill("thermo-nuclear-code-quality-review")
+    code_skills = CodeSkillService(_org())
+    assert code_skills.ensure_builtin_skills() is True
+    skill = code_skills.get_skill(slug)
 
     assert skill.display_name == "Thermo-Nuclear Code Quality Review"
     assert "code judo" in skill.instructions
+
+
+def test_code_builtins_seed_lazily_in_local_mode(skills_root):
+    code_skills = CodeSkillService(LOCAL_SCOPE)
+
+    assert code_skills.root == skills_root.parent / "code-skills"
+    assert code_skills.list_skills() == []
+    assert code_skills.ensure_builtin_skills() is True
+    assert {skill.name for skill in code_skills.list_skills()} == CODE_ONLY_BUILTIN_SKILL_NAMES
 
 
 def test_seeding_is_per_org(skills_root):
@@ -88,7 +106,7 @@ def test_a_deleted_builtin_does_not_come_back(skills_root):
     """The marker outlives the skills, so a deliberate delete sticks."""
     ensure_builtin_skills(_org())
     svc = SkillService(_org())
-    victim = sorted(_packaged_slugs())[0]
+    victim = min(_packaged_slugs())
     assert svc.delete_skill(victim) is True
 
     ensure_builtin_skills(_org())
@@ -174,7 +192,7 @@ def test_a_poisoned_slug_does_not_break_the_org(skills_root, tmp_path):
     escaped = tmp_path / "escaped"
     store = _store()
     store.mkdir(parents=True, exist_ok=True)
-    victim = sorted(_packaged_slugs())[0]
+    victim = min(_packaged_slugs())
     (store / victim).symlink_to(escaped, target_is_directory=True)
 
     ensure_builtin_skills(_org())
@@ -211,7 +229,7 @@ def test_a_symlink_planted_under_dest_does_not_break_the_org(skills_root, tmp_pa
     rejects it with ValueError, which must not escape and 500 the org."""
     escaped = tmp_path / "escaped.md"
     store = _store()
-    victim = sorted(_packaged_slugs())[0]
+    victim = min(_packaged_slugs())
     (store / victim).mkdir(parents=True)
     (store / victim / "SKILL.md").symlink_to(escaped)   # dangling: exists() is False
 

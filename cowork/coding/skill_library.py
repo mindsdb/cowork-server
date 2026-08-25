@@ -20,7 +20,7 @@ from cowork.coding.skill_models import (
 )
 from cowork.coding.skill_source_store import SkillSourceStore
 from cowork.coding.workspace import GitRunner, WorkspaceError
-from cowork.services.skills import BUILTIN_SKILLS_DIR, SkillService
+from cowork.services.skills import CodeSkillService
 
 _MAX_DOCUMENT_BYTES = 512_000
 _MAX_DOCUMENT_FILES = 100
@@ -83,15 +83,13 @@ class SkillLibraryService:
             sources.append(self._source_status(source, len(source_items), len(enabled_projects)))
         return SkillLibraryPage(sources=sources, items=items)
 
-    def catalog(self, personal: SkillService, project_id: str | None = None) -> SkillLibraryPage:
+    def catalog(self, code_skills: CodeSkillService, project_id: str | None = None) -> SkillLibraryPage:
         page = self.list(project_id)
         selected = self.projects.get(project_id) if project_id else None
         selected_keys = {selected.id, selected.name} if selected else set()
-        personal.ensure_builtin_skills()
-        builtin_names = {
-            path.name for path in BUILTIN_SKILLS_DIR.iterdir() if path.is_dir()
-        } if BUILTIN_SKILLS_DIR.is_dir() else set()
-        for skill in personal.list_skills():
+        code_skills.ensure_builtin_skills()
+        builtin_names = code_skills.builtin_skill_names()
+        for skill in code_skills.list_skills():
             origin = "built_in" if skill.name in builtin_names else "personal"
             page.items.append(
                 SkillLibraryItem(
@@ -111,12 +109,12 @@ class SkillLibraryService:
 
     def document(
         self,
-        personal: SkillService,
+        code_skills: CodeSkillService,
         item_id: str,
         selected_path: str | None = None,
     ) -> SkillLibraryDocument:
         """Return one library item's readable source without exposing arbitrary files."""
-        page = self.catalog(personal)
+        page = self.catalog(code_skills)
         item = next((candidate for candidate in page.items if candidate.id == item_id), None)
         if item is None:
             raise KeyError("Skill library item not found")
@@ -127,7 +125,7 @@ class SkillLibraryService:
             _, cache = self.cache_for(item.source_id)
             source_file = self._contained_file(cache, item.path)
         else:
-            source_file = self._contained_file(personal.root, f"{item.path}/SKILL.md")
+            source_file = self._contained_file(code_skills.root, f"{item.path}/SKILL.md")
 
         if item.kind == "skill":
             root = source_file.parent
