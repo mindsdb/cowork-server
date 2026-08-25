@@ -351,10 +351,12 @@ class ResponsesHandler:
         # AntonHarness.stream_response refuses in org mode because doing so
         # would execute agent-written code here. Without this check that
         # refusal surfaces as an unhandled RuntimeError from _collect and the
-        # client sees an opaque 500. 501 with a concrete instruction instead,
-        # matching how endpoints/channels.py reports "configured off in org
-        # deployments". `stream` defaults to False in ResponsesRequest, so a
-        # client can land here by simply omitting the field.
+        # client sees an opaque 500. 501 with a concrete instruction instead:
+        # this deployment really does not implement a non-streaming turn, which
+        # is a statement about what the server can do. The org-mode tenancy
+        # guards answer 403 because they refuse a caller rather than admit a
+        # missing capability. `stream` defaults to False in ResponsesRequest, so
+        # a client can land here by simply omitting the field.
         if not in_process_agent_allowed():
             raise HTTPException(
                 status_code=501,

@@ -33,8 +33,8 @@ async def _start_channels(app: FastAPI) -> None:
     """Build live adapters from stored credentials and start ingress.
 
     Org mode: channels are local-mode only — no adapters, no provider
-    connections, no ingress (the config endpoints 501 and webhook routes are
-    not mounted, see _install_channels)."""
+    connections, no ingress (the config endpoints answer 403 and webhook
+    routes are not mounted, see _install_channels)."""
     if get_app_settings().tenancy_mode == "org":
         return
     await app.state.channel_adapters.refresh_all()
