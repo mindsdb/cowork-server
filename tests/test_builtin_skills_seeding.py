@@ -62,6 +62,16 @@ def test_a_fresh_org_gets_the_packaged_builtins(skills_root):
     assert _packaged_slugs()  # the set is non-empty, or this proves nothing
 
 
+def test_thermo_nuclear_review_is_a_mindshub_maintained_builtin(skills_root):
+    assert "thermo-nuclear-code-quality-review" in _packaged_slugs()
+    ensure_builtin_skills(_org())
+
+    skill = SkillService(_org()).get_skill("thermo-nuclear-code-quality-review")
+
+    assert skill.display_name == "Thermo-Nuclear Code Quality Review"
+    assert "code judo" in skill.instructions
+
+
 def test_seeding_is_per_org(skills_root):
     ensure_builtin_skills(_org(ORG_A))
     assert SkillService(_org(ORG_B)).list_skills() == []
