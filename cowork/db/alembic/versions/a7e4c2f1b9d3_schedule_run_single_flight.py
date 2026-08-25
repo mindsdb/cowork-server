@@ -3,9 +3,9 @@
 The scheduler selects due schedules and then dispatches them, and the manual
 run-now endpoint dispatches independently. Neither claim was atomic, so
 overlapping cron ticks — or a manual click racing a cron tick — could create
-two concurrent 'running' rows for the same schedule and double-run it
-(ENG-1733 #3/#4). Add a partial unique index enforcing at most one 'running'
-row per schedule; the INSERT then becomes the atomic claim
+two concurrent 'running' rows for the same schedule and double-run it. Add a
+partial unique index enforcing at most one 'running' row per schedule; the
+INSERT then becomes the atomic claim
 (ScheduleRunService.try_claim_run turns the resulting IntegrityError into a
 "lost the race, skip" signal). Finished runs (success/failed/cancelled) are
 unconstrained and accumulate freely.

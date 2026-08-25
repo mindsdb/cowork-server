@@ -103,8 +103,8 @@ def _consume_slot(schedule: Schedule, is_manual: bool, session) -> None:
     A cron run consumes every cadence (recurring advances to its next
     occurrence, a one-off is disabled). A manual "run now" consumes only a
     one-off — otherwise the one-off's real scheduled slot would still fire a
-    second time (ENG-1733 #2) — and never shifts a recurring schedule, whose
-    imminent cron slot is instead suppressed by the freshness guard (ENG-688).
+    second time — and never shifts a recurring schedule, whose imminent cron
+    slot is instead suppressed by the freshness guard.
 
     An already-disabled schedule needs no consuming: it won't be re-selected,
     so leave its slot where it is. This also preserves the corrupt-row handling
@@ -206,7 +206,7 @@ async def execute_schedule(
     if run_id is None:
         # Cron dispatch: claim the slot atomically. If a concurrent dispatch
         # (overlapping tick, or a manual run-now) already claimed it, don't
-        # double-run — the other run owns this slot (ENG-1733 #3).
+        # double-run — the other run owns this slot.
         run = run_service.try_claim_run(schedule_id, is_manual=is_manual)
         if run is None:
             logger.info(
@@ -328,8 +328,7 @@ async def execute_schedule(
         # loop would immediately restart the run the user killed (a
         # cancelled/failed run isn't a success, so the freshness guard wouldn't
         # block the restart). A manual run consumes only a one-off's slot, so a
-        # preview "run now" doesn't leave the real scheduled slot to fire again
-        # (ENG-1733 #2).
+        # preview "run now" doesn't leave the real scheduled slot to fire again.
         _consume_slot(schedule, is_manual, session)
 
         try:
@@ -360,9 +359,9 @@ async def execute_schedule(
             session.add(schedule)
             # Consume the slot on failure too. Without this a due one-off is
             # left enabled with its slot in the past, so it is re-selected and
-            # re-run on every 30s poll until the catch-up window disables it
-            # (ENG-1733 #1); a recurring slot would likewise restart at once. A
-            # failed run isn't a success, so the freshness guard can't stand in.
+            # re-run on every 30s poll until the catch-up window disables it;
+            # a recurring slot would likewise restart at once. A failed run
+            # isn't a success, so the freshness guard can't stand in.
             _consume_slot(schedule, is_manual, session)
             session.commit()
         except Exception:

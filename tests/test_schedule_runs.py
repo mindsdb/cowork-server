@@ -98,8 +98,8 @@ def test_last_successful_finish_ignores_failures_and_running():
     running = run_service.create_run(schedule.id, is_manual=False)  # still running
     assert run_service.last_successful_finish(schedule.id) is None
     # Release the running row before the next run: the single-flight index
-    # (ENG-1733) allows only one running run per schedule. Finishing it as a
-    # failure keeps the "ignores failures" half of this test intact.
+    # allows only one running run per schedule. Finishing it as a failure keeps
+    # the "ignores failures" half of this test intact.
     run_service.finish_run(running.id, error="boom")
 
     ok = run_service.create_run(schedule.id, is_manual=True)
@@ -821,8 +821,8 @@ def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
     get_app_settings.cache_clear()
 
 
-# --- ENG-1733: single-flight claim (items 3/4) and consuming a `once` slot on
-# the non-happy paths (failure item 1, manual run item 2).
+# --- Single-flight claim and dispatch TOCTOU, plus consuming a `once` slot on
+# the non-happy paths (a failed run, and a manual run-now).
 
 def test_try_claim_run_is_single_flight():
     session = _session()
@@ -841,9 +841,9 @@ def test_try_claim_run_is_single_flight():
 
 
 def test_execute_schedule_skips_when_run_already_active(monkeypatch):
-    """Dispatch TOCTOU (item 3): if a run is already in flight when a cron
-    dispatch fires, the claim loses and execute_schedule must not run a second
-    turn or create a second run."""
+    """Dispatch TOCTOU: if a run is already in flight when a cron dispatch
+    fires, the claim loses and execute_schedule must not run a second turn or
+    create a second run."""
     import asyncio
 
     import cowork.handlers.responses as responses_mod
@@ -902,7 +902,7 @@ def test_execute_schedule_skips_when_run_already_active(monkeypatch):
 
 
 def test_execute_schedule_exception_consumes_once_slot(monkeypatch):
-    """Item 1: a `once` run that raises must be consumed (disabled), else it is
+    """A `once` run that raises must be consumed (disabled), else it is
     re-selected and re-run on every poll until the catch-up window expires."""
     import asyncio
 
@@ -950,16 +950,16 @@ def test_execute_schedule_exception_consumes_once_slot(monkeypatch):
 
 
 def test_manual_run_consumes_once_slot(monkeypatch):
-    """Item 2: a manual "run now" of a one-off uses up its single firing, so
-    the real scheduled slot can't also fire later."""
+    """A manual "run now" of a one-off uses up its single firing, so the real
+    scheduled slot can't also fire later."""
     state = _execute_with_terminal(monkeypatch, "completed", is_manual=True, cadence="once")
     assert state["run_status"] == RunStatus.success
     assert state["enabled"] is False
 
 
 def test_manual_run_leaves_recurring_slot_to_freshness_guard(monkeypatch):
-    """Item 2 boundary: a manual run must NOT shift a recurring schedule — the
-    freshness guard (ENG-688) suppresses the imminent cron slot instead."""
+    """A manual run must NOT shift a recurring schedule — the freshness guard
+    suppresses the imminent cron slot instead."""
     state = _execute_with_terminal(monkeypatch, "completed", is_manual=True, cadence="daily")
     assert state["run_status"] == RunStatus.success
     assert state["enabled"] is True
@@ -967,9 +967,9 @@ def test_manual_run_leaves_recurring_slot_to_freshness_guard(monkeypatch):
 
 
 def test_run_now_rejects_when_run_already_active():
-    """Item 4: the manual endpoint must refuse to start a run that races a
-    concurrent (cron or manual) run of the same schedule — and not leave an
-    orphan run/conversation behind."""
+    """The manual endpoint must refuse to start a run that races a concurrent
+    (cron or manual) run of the same schedule — and not leave an orphan
+    run/conversation behind."""
     from fastapi import BackgroundTasks, HTTPException
 
     from cowork.api.v1.endpoints.schedules import run_schedule_now
@@ -991,8 +991,8 @@ def test_run_now_rejects_when_run_already_active():
 
 
 def test_run_now_claims_and_blocks_double_click():
-    """Item 4 happy path: the endpoint claims exactly one run, links it to the
-    new conversation, queues the dispatch, and rejects a second click while the
+    """Happy path: the endpoint claims exactly one run, links it to the new
+    conversation, queues the dispatch, and rejects a second click while the
     first run is still in flight."""
     from fastapi import BackgroundTasks, HTTPException
 
