@@ -19,8 +19,12 @@ from cowork.coding.project_models import (
     PullRequestActionRequest,
     PullRequestStatus,
     SourceContext,
+    SourceActionRequest,
     SourceContextRequest,
+    WorkItemPage,
+    WorkItemSearchRequest,
 )
+from cowork.coding.work_discovery import DeveloperWorkDiscovery
 from cowork.coding.workspace import WorkspaceError
 from cowork.db.scoped import TenantScope
 from cowork.services.connectors.connections import ConnectionsService
@@ -84,6 +88,52 @@ class DeveloperIntegrationService:
             return self._read_linear(request, connection, fields)
         return self._read_slack(request, connection, fields)
 
+    def search(self, project: CodeProject, request: WorkItemSearchRequest) -> WorkItemPage:
+        # Discovery is account-scoped: opening the picker must not silently
+        # mutate a project. The chosen account is added to the project only
+        # when the user actually links one of its work items.
+        connection, fields = self._account_connection(request.provider, request.connection_name)
+        discovery = DeveloperWorkDiscovery(self._request)
+        if request.provider == "github":
+            api, token, _ = self._github_credentials(fields)
+            return discovery.github(
+                api=api,
+                token=token,
+                query=request.query,
+                limit=request.limit,
+                connection_name=connection.name,
+            )
+        return discovery.linear(
+            token=self._secret(fields, "access_token", "api_key", "token"),
+            query=request.query,
+            limit=request.limit,
+            connection_name=connection.name,
+        )
+
+    def _account_connection(
+        self,
+        provider: str,
+        requested_name: str | None,
+    ) -> tuple[ProjectConnection, dict[str, Any]]:
+        candidates = [item for item in self.connections.list() if item.engine == provider]
+        summary = next((item for item in candidates if item.name == requested_name), None) if requested_name else None
+        summary = summary or (candidates[0] if len(candidates) == 1 else None)
+        provider_label = "GitHub" if provider == "github" else provider.title()
+        if summary is None:
+            if candidates:
+                raise WorkspaceError(f"Choose which {provider_label} connection to use")
+            raise WorkspaceError(f"Connect {provider_label} in Cowork before searching its work")
+        fields = self.connections.runtime_fields(provider, summary.name)
+        if fields is None:
+            raise WorkspaceError(f"The {provider_label} connection is unavailable")
+        if fields.get("status") == "needs_reconnect":
+            raise WorkspaceError(f"Reconnect {provider_label} before searching its work")
+        return ProjectConnection(
+            provider=provider,
+            name=summary.name,
+            label=summary.user_label or summary.display_name or summary.name,
+        ), fields
+
     def publish(self, project: CodeProject, request: PublishRequest) -> DeliveryRecord:
         if not request.confirmed:
             raise WorkspaceError("Confirm this external update before publishing it")
@@ -101,6 +151,24 @@ class DeveloperIntegrationService:
             status="published",
             external_url=external_url,
             detail=f"Published with {connection.label or connection.name}",
+        )
+
+    def complete_source(self, project: CodeProject, request: SourceActionRequest) -> DeliveryRecord:
+        if not request.confirmed:
+            raise WorkspaceError("Confirm this external work-item update before publishing it")
+        connection, fields = self._connection(project, request.provider, request.connection_name)
+        if request.provider == "github":
+            self._complete_github_source(request, fields)
+        else:
+            self._complete_linear_source(request, fields)
+        return DeliveryRecord(
+            provider=request.provider,
+            action="complete_source",
+            target_url=request.target_url,
+            status="published",
+            external_url=request.target_url,
+            detail=f"Marked complete with {connection.label or connection.name}",
+            connection_name=connection.name,
         )
 
     def create_draft_pull_request(
@@ -211,7 +279,11 @@ class DeveloperIntegrationService:
             number=number,
             url=request.target_url,
         )
-        return pull_requests.mark_ready() if request.action == "ready" else pull_requests.merge()
+        if request.action == "ready":
+            return pull_requests.mark_ready()
+        if request.action == "merge":
+            return pull_requests.merge()
+        return pull_requests.resolve_thread(request.thread_id or "")
 
     def _connection(
         self,
@@ -418,6 +490,57 @@ class DeveloperIntegrationService:
         if not payload.get("ok"):
             raise WorkspaceError(f"Slack could not publish this update: {payload.get('error') or 'unknown error'}")
         return request.target_url
+
+    def _complete_github_source(self, request: SourceActionRequest, fields: dict[str, Any]) -> None:
+        api, token, host = self._github_credentials(fields)
+        owner, repository, resource, number = self._github_target(request.target_url, host)
+        if resource != "issues":
+            raise WorkspaceError("Complete the originating GitHub issue, not its pull request")
+        self._request(
+            "PATCH",
+            f"{api}/repos/{owner}/{repository}/issues/{number}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            json={"state": "closed"},
+        )
+
+    def _complete_linear_source(self, request: SourceActionRequest, fields: dict[str, Any]) -> None:
+        identifier = urlparse(request.target_url).path.rstrip("/").split("/")[-1]
+        token = self._secret(fields, "access_token", "api_key", "token")
+        issue = self._linear_issue(identifier, token)
+        response = self._request(
+            "POST",
+            "https://api.linear.app/graphql",
+            headers={"Authorization": token, "Content-Type": "application/json"},
+            json={
+                "query": (
+                    "query CodeCompletion($id: String!) { issue(id: $id) { id team { states(first: 50) { "
+                    "nodes { id name type } } } } }"
+                ),
+                "variables": {"id": str(issue.get("id") or identifier)},
+            },
+        ).json()
+        if response.get("errors"):
+            raise WorkspaceError(str(response["errors"][0].get("message") or "Linear could not load completion states"))
+        loaded = (response.get("data") or {}).get("issue") or {}
+        states = (((loaded.get("team") or {}).get("states") or {}).get("nodes") or [])
+        completed = next(
+            (item for item in states if str((item or {}).get("type") or "").casefold() == "completed"),
+            None,
+        )
+        if not completed:
+            raise WorkspaceError("This Linear team does not have a completed workflow state")
+        update = self._request(
+            "POST",
+            "https://api.linear.app/graphql",
+            headers={"Authorization": token, "Content-Type": "application/json"},
+            json={
+                "query": "mutation CodeComplete($id: String!, $stateId: String!) { issueUpdate(id: $id, input: {stateId: $stateId}) { success } }",
+                "variables": {"id": str(loaded.get("id") or issue.get("id")), "stateId": str(completed.get("id") or "")},
+            },
+        ).json()
+        if update.get("errors") or not (((update.get("data") or {}).get("issueUpdate") or {}).get("success")):
+            message = ((update.get("errors") or [{}])[0].get("message") or "Linear could not complete this issue")
+            raise WorkspaceError(str(message))
 
     def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         try:
