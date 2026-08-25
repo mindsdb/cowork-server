@@ -495,6 +495,14 @@ class OAuthService:
         token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
         if not token:
             return
+        if engine == "supabase" and not fields.get("refresh_token", "").strip():
+            # Supabase's revoke endpoint only accepts a refresh_token (see
+            # _revoke_supabase) — falling back to the access_token here and
+            # sending it under the "refresh_token" label just gets rejected
+            # by Supabase, and that failure is logged as a warning below, so
+            # disconnect would look like it worked while the grant stays live.
+            _log.warning("Cannot revoke %s/%s remotely — no refresh_token stored", engine, name)
+            return
         _log.info("Revoking OAuth token for %s/%s", engine, name)
         if custom_revoke is not None:
             if oauth_settings is None:

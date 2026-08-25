@@ -315,11 +315,22 @@ class TestDisplayName:
 
     def test_helper_priority(self):
         assert connection_display_name({"_label": "Support", "email": "a@x.com"}) == "a@x.com"
-        assert connection_display_name({"account_name": "Acme", "account_email": "org:acme"}) == "Acme"
         assert connection_display_name({"email": "a@x.com"}) == "a@x.com"
         assert connection_display_name({"account_email": "o@x.com"}) == "o@x.com"
         assert connection_display_name({"host": "h", "database": "d"}) == "h/d"
         assert connection_display_name({"client_id": "x"}) is None
+
+    def test_account_name_preferred_only_for_supabase(self):
+        # Supabase's account_email is a synthetic `org:<slug>` placeholder, so
+        # the human org name is the more useful subtitle there.
+        fields = {"account_name": "Acme", "account_email": "org:acme"}
+        assert connection_display_name(fields, "supabase") == "Acme"
+        # Every other engine populates a real account_email — account_name is
+        # just a free-text display name there, and preferring it would make
+        # two accounts with the same name but different emails
+        # indistinguishable (e.g. google/github/linear/posthog).
+        assert connection_display_name(fields, "google") == "org:acme"
+        assert connection_display_name(fields) == "org:acme"
 
     def test_list_display_name(self, tmp_path, monkeypatch):
         vault = LocalDataVault(tmp_path)
