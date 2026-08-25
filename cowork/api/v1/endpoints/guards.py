@@ -28,11 +28,17 @@ def require_local_tenancy() -> None:
     ``.env`` dotenv sync): they carry no tenant scope and their writes land in
     global rows every org falls back to, so loopback alone isn't enough of a
     boundary once the deployment serves many orgs.
+
+    The refusal answers 403, not 501. Turning a caller away at a tenant
+    boundary is an authorization decision, and the artifact routes that
+    decline to serve an org deployment already answer 403. A 501 puts a
+    deliberate refusal in the 5xx class, where nginx books it as a server
+    fault and the ingress alerts page on it.
     """
     from cowork.common.settings.app_settings import get_app_settings
 
     if get_app_settings().tenancy_mode == "org":
         raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="not available in org deployments",
         )
