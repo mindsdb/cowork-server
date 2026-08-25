@@ -206,6 +206,18 @@ def test_every_turn_originator_declares_its_harness():
     )
 
 
+def test_the_probe_reports_the_same_harness_as_the_anton_harness():
+    """The probe declares its harness as a literal (the connectors service
+    does not import the harness package). Pin it to `AntonHarness.id`: if
+    either side is renamed alone, probe traces silently become a second
+    population under a name nothing filters on — the exact failure ENG-1941
+    fixed, reintroduced by a refactor."""
+    from cowork.harnesses.anton_harness.harness import AntonHarness
+    from cowork.services.connectors.probe import PROBE_HARNESS
+
+    assert PROBE_HARNESS == AntonHarness.id
+
+
 def test_the_harness_predicate_actually_rejects_a_bare_call():
     """Positive control on `_declares_harness` — a predicate weakened to
     `return True` must fail here, not report green forever."""

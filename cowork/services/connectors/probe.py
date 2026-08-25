@@ -40,6 +40,21 @@ def _probe_tmp_dir() -> Path:
     return pod_local_only(cowork_home() / "tmp", "tmp")
 
 
+# WHICH agent runs the probe, as reported on its traces. Must equal
+# `AntonHarness.id` — the probe is anton doing a job, not a different agent
+# (ENG-1694's agent-identity vocabulary). A literal rather than an import
+# because the harness package is not a dependency of the connectors service;
+# `tests/test_trace_stamp_seams.py` pins the two values equal so a rename of
+# either fails a test instead of silently splitting one population in two.
+PROBE_HARNESS = "anton"
+
+# Langfuse tag on every probe turn so probe calls stay separable from user
+# turns in cost / health queries now that both report harness="anton"
+# (ENG-1941). `.claude/skills/harness-measure` excludes this tag from its
+# turn denominator — rename both or neither.
+PROBE_TRACE_TAG = "connector-probe"
+
+
 @dataclass
 class ProbeOutcome:
     status: str = "unresolved"   # success | failure | needs_input | unresolved
@@ -424,7 +439,7 @@ class CredentialProbe:
             # callers in every harness filter (ENG-1941). Probe calls stay
             # separable from user turns via the `connector-probe` trace tag
             # passed to turn_stream below.
-            harness="anton",
+            harness=PROBE_HARNESS,
             # WHERE the user was. This runs a real turn (see turn_stream
             # below), so it needs the same surface attribution as a UI turn —
             # the connector path is explicitly one of the things ENG-1459
@@ -487,7 +502,7 @@ class CredentialProbe:
                 # vocabulary is agent identity, and a fourth value would be one
                 # the dashboards and turns.py don't know.
                 async for event in probe_session.turn_stream(
-                    prompt, trace_tags=["connector-probe"]
+                    prompt, trace_tags=[PROBE_TRACE_TAG]
                 ):
                     while self._pending:
                         yield self._pending.pop(0)
