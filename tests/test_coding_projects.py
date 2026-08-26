@@ -194,6 +194,87 @@ def test_multi_folder_handoff_preflights_every_folder_before_changing_any_source
     assert (second_repo / "README.md").read_text(encoding="utf-8") == "user\n"
 
 
+def test_multi_folder_handoff_restores_every_source_after_an_apply_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = repository(tmp_path, "app")
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "plan.txt").write_text("original\n", encoding="utf-8")
+    project = CodeProject(
+        id="project-rollback",
+        name="Rollback",
+        folders=[
+            ProjectFolder(id="app", name="App", path=str(repo)),
+            ProjectFolder(id="notes", name="Notes", path=str(notes)),
+        ],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = manager.prepare("session-rollback", project)
+    (Path(prepared.workspaces[0].workspace_path) / "README.md").write_text("task\n", encoding="utf-8")
+    (Path(prepared.workspaces[1].workspace_path) / "plan.txt").write_text("task\n", encoding="utf-8")
+
+    def fail_after_partial_local_apply(source: Path, workspace: Path, changed: list[str]) -> list[str]:
+        (source / "plan.txt").write_text("partial\n", encoding="utf-8")
+        raise LocalCopyError("simulated handoff failure")
+
+    monkeypatch.setattr(
+        manager.workspaces.local_copies,
+        "apply_checked",
+        fail_after_partial_local_apply,
+    )
+
+    with pytest.raises(WorkspaceError, match="Every source folder was restored"):
+        manager.apply("session-rollback", list(prepared.workspaces))
+
+    assert (repo / "README.md").read_text(encoding="utf-8") == "app\n"
+    assert (notes / "plan.txt").read_text(encoding="utf-8") == "original\n"
+    assert (Path(prepared.workspaces[0].workspace_path) / "README.md").read_text(encoding="utf-8") == "task\n"
+    assert (Path(prepared.workspaces[1].workspace_path) / "plan.txt").read_text(encoding="utf-8") == "task\n"
+
+
+def test_multi_repository_commit_rolls_back_commits_without_losing_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repositories = [repository(tmp_path, name) for name in ("frontend", "server")]
+    project = CodeProject(
+        id="project-commit-rollback",
+        name="Commit rollback",
+        folders=[
+            ProjectFolder(id=name, name=name.title(), path=str(repo))
+            for name, repo in zip(("frontend", "server"), repositories, strict=True)
+        ],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = manager.prepare("session-commit-rollback", project)
+    for workspace in prepared.workspaces:
+        (Path(workspace.workspace_path) / "README.md").write_text("task\n", encoding="utf-8")
+    original_revisions = {
+        workspace.folder_id: git(Path(workspace.workspace_path), "rev-parse", "HEAD")
+        for workspace in prepared.workspaces
+    }
+    second_path = prepared.workspaces[1].workspace_path
+    real_commit = manager.workspaces.commit
+
+    def fail_second_commit(workspace_path: str, message: str):
+        if workspace_path == second_path:
+            raise WorkspaceError("simulated commit failure")
+        return real_commit(workspace_path, message)
+
+    monkeypatch.setattr(manager.workspaces, "commit", fail_second_commit)
+
+    with pytest.raises(WorkspaceError, match="No repositories were committed"):
+        manager.commit(list(prepared.workspaces), "Prepare change")
+
+    for workspace in prepared.workspaces:
+        root = Path(workspace.workspace_path)
+        assert git(root, "rev-parse", "HEAD") == original_revisions[workspace.folder_id]
+        assert (root / "README.md").read_text(encoding="utf-8") == "task\n"
+        assert git(root, "status", "--short") == "M README.md"
+
+
 def test_project_cleanup_preserves_real_files_at_the_task_root(tmp_path: Path) -> None:
     repo = repository(tmp_path, "app")
     project = CodeProject(
