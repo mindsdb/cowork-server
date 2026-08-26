@@ -13,7 +13,7 @@ import pytest
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.services import task_objects as t
 from cowork.services.conversations import ConversationService
@@ -222,6 +222,49 @@ def test_cards_carry_project_identity_when_given(tmp_path):
 
     assert card["projectId"] == "p-1"
     assert card["projectName"] == "Alpha"
+
+
+async def test_local_mode_cards_an_edited_slug_without_publishing(tmp_path):
+    # Desktop/local mode never publishes (autopublish_project_artifacts is a
+    # no-op outside org mode), so an edited artifact must still card off the
+    # local folder alone — gating it on `republished` would mean local edits
+    # never card at all.
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "dash", files={"index.html": "v2"},
+                   meta={"slug": "dash", "name": "Dash", "type": "html-app"})
+
+    cards = await t.publish_and_card_turn_artifacts(
+        base, new_slugs=[], touched_slugs={"dash"}, scope=LOCAL_SCOPE,
+    )
+
+    assert [c["slug"] for c in cards] == ["dash"]
+
+
+async def test_org_mode_still_requires_a_successful_republish_to_card_an_edit(
+    tmp_path, monkeypatch,
+):
+    # Org mode keeps the original guarantee: an edited artifact only cards once
+    # its republish this turn actually succeeded (a card without a fresh URL
+    # would be useless there, and self-heal publishes of unrelated slugs must
+    # never attach to this answer).
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "dash", files={"index.html": "v2"},
+                   meta={"slug": "dash", "name": "Dash", "type": "html-app"})
+
+    async def fake_autopublish(*args, **kwargs):
+        return set()  # republish did not succeed this turn
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+    org_scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
+
+    cards = await t.publish_and_card_turn_artifacts(
+        base, new_slugs=[], touched_slugs={"dash"}, scope=org_scope,
+    )
+
+    assert cards == []
 
 
 def test_scope_falls_back_to_the_ambient_turn_scope(conv, tmp_path, monkeypatch):
