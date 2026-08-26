@@ -223,6 +223,22 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
+# Curated copy for two scratchpad-controller literals that carry no
+# "TypeName:" prefix at all (main.py's own turn_failed publishes), so the
+# type-name parse in remote_turn_error never sees them. Both are matched by
+# prefix rather than passed through verbatim: each can carry an optional
+# "; stderr tail: ..." suffix, which must never reach the user.
+POD_STREAM_ENDED_PREFIX = "pod stream ended without a terminal event"
+POD_STREAM_ENDED_USER_MESSAGE = "The turn ended unexpectedly. Please try again."
+TURN_ABORTED_TIMEOUT_PREFIX = "turn aborted: hard turn timeout"
+TURN_ABORTED_TIMEOUT_USER_MESSAGE = (
+    "This turn took too long and was stopped. Try again with a smaller request."
+)
+TURN_ABORTED_STALL_PREFIX = "turn aborted: no output within stall window"
+TURN_ABORTED_STALL_USER_MESSAGE = (
+    "This turn stopped producing output and was ended. Please try again."
+)
+
 
 def is_image_format_error(exc: Exception) -> bool:
     """Detect the Anthropic 400 raised when an image reaches the model as
@@ -842,6 +858,17 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     gets the generic redacted message — never the raw provider text.
     """
     text = (error or "").strip()
+    # Matched ahead of the type-name parse below: none of these carry a
+    # "TypeName:" prefix, so that parse would never recognize them. Prefix
+    # matched (not exact), each can carry an optional "; stderr tail: ..."
+    # suffix that must never reach the user — so a fixed message is
+    # returned rather than any part of the wire text.
+    if text.startswith(POD_STREAM_ENDED_PREFIX):
+        return GENERIC_TURN_ERROR_CODE, POD_STREAM_ENDED_USER_MESSAGE
+    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+        return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
+    if text.startswith(TURN_ABORTED_STALL_PREFIX):
+        return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
     type_name, _, message = text.partition(":")
     message = message.strip()
     if type_name == "TokenLimitExceeded":
@@ -869,14 +896,15 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if type_name == "ConnectionError" and "api key" in message.lower():
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
-    # TurnInterrupted (the pod's own no-terminal-event fallback) and
-    # TurnWorkerUnresponsive (producer.py's idle-timeout synthesis) are both
-    # our own authored strings, never provider/attacker text — safe to pass
-    # through. Same generic code as any other unmapped failure (no card
-    # exists for either), but the curated sentence survives instead of being
-    # discarded for the fully generic message just because it lacked a
-    # dedicated mapping.
-    if type_name in ("TurnInterrupted", "TurnWorkerUnresponsive"):
+    # TurnInterrupted (the pod's own no-terminal-event fallback),
+    # TurnWorkerUnresponsive (producer.py's idle-timeout synthesis), and
+    # TurnWorkerLost (scratchpad-controller's pel_reclaim.py, a fixed
+    # constant with no interpolation) are all our own authored strings,
+    # never provider/attacker text — safe to pass through. Same generic code
+    # as any other unmapped failure (no card exists for any of them), but
+    # the curated sentence survives instead of being discarded for the fully
+    # generic message just because it lacked a dedicated mapping.
+    if type_name in ("TurnInterrupted", "TurnWorkerUnresponsive", "TurnWorkerLost"):
         return GENERIC_TURN_ERROR_CODE, message or GENERIC_TURN_ERROR_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 

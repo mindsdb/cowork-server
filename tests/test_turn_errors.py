@@ -1055,6 +1055,54 @@ def test_remote_error_worker_unresponsive_keeps_its_curated_copy():
     assert msg == "the turn worker stopped responding"
 
 
+def test_remote_error_turn_worker_lost_keeps_its_curated_copy():
+    # pel_reclaim.py's ORPHANED_ERROR — a worker died mid-turn and the entry
+    # was reclaimed from Redis's PEL rather than retried (retrying would bill
+    # the tenant's tokens twice). Already correctly shaped; just missing from
+    # the allowlist.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "TurnWorkerLost: the worker running this turn stopped before it "
+        "finished; the turn was not retried")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "the turn was not retried" in msg
+
+
+def test_remote_error_pod_stream_ended_without_terminal_gets_curated_copy():
+    # scratchpad-controller's own literal (main.py) — an OOM-killed pod or a
+    # dropped exec channel. No "TypeName:" prefix at all, so the generic
+    # type_name parse below would never match it; matched directly instead.
+    # The optional stderr tail must never reach the user verbatim.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error("pod stream ended without a terminal event")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+
+    code, msg = remote_turn_error(
+        "pod stream ended without a terminal event; stderr tail: Traceback ...")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+    assert "Traceback" not in msg
+
+
+def test_remote_error_turn_aborted_on_hard_timeout_gets_curated_copy():
+    # scratchpad-controller's with_limits() hard wall-clock deadline.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error("turn aborted: hard turn timeout")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "too long" in msg
+
+
+def test_remote_error_turn_aborted_on_stall_gets_curated_copy():
+    # scratchpad-controller's with_limits() no-output stall detector.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "turn aborted: no output within stall window; stderr tail: boom")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "stopped producing output" in msg
+    assert "boom" not in msg
+
+
 def test_remote_error_unknown_is_redacted():
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
     code, msg = remote_turn_error("RuntimeError: secret internals")
