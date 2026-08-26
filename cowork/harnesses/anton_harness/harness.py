@@ -118,9 +118,8 @@ def _apply_model_override(anton_settings, model: str | None) -> list[str]:
     return applied
 
 
-def _apply_workspace_env_if_safe(workspace) -> bool:
-    """Load `<project>/.anton/.env` into this process's environment, unless
-    org mode. Returns whether it applied.
+def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
+    """Read `<project>/.anton/.env`, unless org mode. Returns {} in org mode.
 
     `workspace` is an `anton.workspace.Workspace`; left unannotated since that
     type is only ever imported locally in `_build_chat_session`, not at
@@ -129,19 +128,19 @@ def _apply_workspace_env_if_safe(workspace) -> bool:
     Extracted from `_build_chat_session` so the guard is testable without
     constructing a full ChatSession.
 
-    `Workspace.apply_env_to_process` (anton's workspace.py) loads every key
-    from that file that isn't already set into THIS PROCESS's os.environ,
-    not a child process's, cowork-server's own, for the rest of its life. In
-    org mode that .env lives on shared EFS and any org's agent can write it;
-    a PYTHONPATH or LD_PRELOAD entry there would turn the next subprocess
-    this pod spawns into arbitrary code execution, and the mutation outlives
-    this turn, reaching every later request from every tenant this pod
-    serves.
+    Does NOT call `Workspace.apply_env_to_process()` — that would load every
+    key from the file into THIS PROCESS's os.environ, not a child process's,
+    cowork-server's own, for the rest of its life, which two turns on
+    different projects can race on. `Workspace.load_env()` reads the file
+    without touching os.environ; the returned dict is threaded to the
+    scratchpad subprocess instead (see `ChatSessionConfig.workspace_env_
+    overlay`). The org-mode guard stays even though `_build_chat_session`
+    itself is already unreachable in org mode (`stream_response`'s own
+    check) — this is defense in depth, not the only line of defense.
     """
     if get_app_settings().tenancy_mode == "org":
-        return False
-    workspace.apply_env_to_process()
-    return True
+        return {}
+    return workspace.load_env()
 
 
 settings = AntonHarnessSettings()
@@ -807,7 +806,7 @@ class AntonHarness:
 
         workspace = Workspace(base)
         workspace.initialize()
-        _apply_workspace_env_if_safe(workspace)
+        workspace_env_overlay = _load_workspace_env_if_safe(workspace)
 
         anton_dir = base / ".anton"
 
@@ -1059,6 +1058,7 @@ class AntonHarness:
             ),
             workspace=workspace,
             data_vault=data_vault,
+            workspace_env_overlay=workspace_env_overlay,
             initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),
