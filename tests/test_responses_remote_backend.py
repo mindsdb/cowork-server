@@ -251,6 +251,42 @@ async def test_produce_remote_request_id_matches_the_turns_own_correlation_id(mo
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_failure(monkeypatch):
+    # scratchpad-controller publishes the literal string "cancelled" (no type
+    # prefix at all) when a /cancel reaches the wrong replica and it discards
+    # the pod after the fact. Without this, remote_turn_error("cancelled")
+    # falls to the fully generic anton_error and a routine Stop persists as a
+    # red error row that survives reload — the opposite of the live path,
+    # which silently swallows a cancel.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": "cancelled"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+
+    assert frames[-1] == "CLOSE:cancelled"
+    assert not any("response.failed" in f for f in frames)
+    assert saved["assistant"] == "partial"
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_unclassified_crash_still_carries_a_request_id(monkeypatch):
     # A crash in cowork-server's OWN consumption of the reply stream (a bug in
     # the formatter, a dropped Redis connection) never goes through

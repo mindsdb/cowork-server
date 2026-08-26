@@ -885,6 +885,19 @@ class ResponsesHandler:
                         # try must still run on a clean finish.
                         break
                     elif kind == "turn_failed":
+                        if data.get("error") == "cancelled":
+                            # The controller's own cancel path — a /cancel
+                            # that reached a replica which doesn't own the
+                            # producer sets the Redis flag only, so the
+                            # controller discards the pod and reports it as
+                            # a turn_failed with this exact literal string
+                            # (no type prefix; never passes through
+                            # remote_turn_error, which would otherwise
+                            # collapse it to anton_error). Route it through
+                            # the same path a locally-aborted turn takes:
+                            # partial text persists, no response.failed
+                            # frame, no error bubble on reload.
+                            raise asyncio.CancelledError()
                         failure.update(data)
                         raise _RemoteTurnFailed()
             finally:
