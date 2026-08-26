@@ -436,10 +436,14 @@ class AntonHarness:
                 "in-process execution is disabled."
             )
         temp_vault_dir: Path | None = None
-        # Attribute + surface any artifact created during this turn. Anton runs
-        # with its own session id and doesn't tag artifacts with the cowork
-        # conversation_id, so we diff the project's artifacts dir around the run
-        # (see services.task_objects.finalize_turn_artifacts).
+        # Attribute + surface any artifact this turn created or edited. Anton's
+        # artifact tools record what they touch as they run
+        # (ChatSession.artifacts_touched), and that set — not a bare diff of the
+        # artifacts dir — is what bounds the turn's cards: every conversation in
+        # a project shares one artifacts directory, so a concurrent sibling
+        # turn's brand-new artifact would otherwise land in this turn's diff and
+        # be carded onto the wrong conversation (ENG-1933). The dir snapshot is
+        # still taken, to tell CREATED from EDITED within that set.
         from cowork.services.task_objects import (
             finalize_turn_skill_drafts,
             index_turn_artifacts,
@@ -541,6 +545,15 @@ class AntonHarness:
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 conversation, conv_id, conv_project_id, artifacts_base,
                 before_slugs, before_mtimes,
+                # Anton reports both: `create_artifact` and `open_artifact`
+                # (the only way to get a path to write into) both record, so
+                # the same set bounds created AND edited. Read defensively —
+                # on an early failure `session` is None, and an anton build
+                # predating the field has no `artifacts_touched`; both degrade
+                # to the pre-existing diff-only behaviour rather than dropping
+                # the turn's cards entirely.
+                tracked_new=getattr(session, "artifacts_touched", None),
+                tracked_edits=getattr(session, "artifacts_touched", None),
             )
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,
