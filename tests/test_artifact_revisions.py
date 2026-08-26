@@ -5,16 +5,23 @@ from uuid import UUID
 
 import pytest
 
+from cowork.services import artifact_identity as identity_service
 from cowork.services import artifact_revisions as revision_service
-from cowork.services.artifact_identity import artifact_key, ensure_stable_id
+from cowork.services.artifact_identity import (
+    artifact_key,
+    ensure_stable_id,
+    resolve_artifact_folder,
+)
+from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.artifact_revisions import (
     RevisionConflict,
+    active_agent_repair,
     agent_repair_detail,
+    cancel_agent_repair,
     capture_agent_revision,
     create_agent_repair,
-    cancel_agent_repair,
-    active_agent_repair,
     current_source,
+    current_workspace,
     finalize_agent_repair,
     list_revisions,
     revision_with_content,
@@ -76,6 +83,91 @@ def test_legacy_identity_backfill_merges_latest_metadata(tmp_path):
     assert merged["description"] == "Concurrent update"
 
 
+def test_stable_identity_resolution_reuses_the_container_index(artifact, monkeypatch):
+    folder, _metadata, stable_id = artifact
+    unrelated = folder.parent / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "metadata.json").write_text(json.dumps({
+        "id": "unrelated",
+        "createdAt": "2026-08-25T12:01:00+00:00",
+        "stableId": "22222222-2222-4222-8222-222222222222",
+    }), encoding="utf-8")
+    source = ProjectArtifacts(folder.parent, None, "test")
+    identity_service._clear_identity_indexes()
+    original = identity_service.ensure_stable_id
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(identity_service, "ensure_stable_id", counted)
+
+    assert resolve_artifact_folder([source], stable_id)[1] == folder
+    first_lookup_calls = calls
+    assert resolve_artifact_folder([source], stable_id)[1] == folder
+
+    assert first_lookup_calls == 3  # two indexed folders + target revalidation
+    assert calls == first_lookup_calls + 1  # hot lookup reads only its target
+
+
+def test_stable_identity_miss_refreshes_existing_folder_metadata(artifact):
+    folder, _metadata, _stable_id = artifact
+    pending = folder.parent / "pending"
+    pending.mkdir()
+    source = ProjectArtifacts(folder.parent, None, "test")
+    wanted = "33333333-3333-4333-8333-333333333333"
+    identity_service._clear_identity_indexes()
+
+    with pytest.raises(FileNotFoundError):
+        resolve_artifact_folder([source], wanted)
+
+    # Adding metadata inside `pending` may leave the parent artifacts directory
+    # clock untouched; a cached negative result must not hide the new artifact.
+    (pending / "metadata.json").write_text(
+        json.dumps({
+            "id": "pending",
+            "createdAt": "2026-08-25T12:02:00+00:00",
+            "stableId": wanted,
+        }),
+        encoding="utf-8",
+    )
+
+    assert resolve_artifact_folder([source], wanted)[1] == pending
+
+
+def test_stable_identity_refreshes_when_cached_identity_moves(artifact):
+    folder, _metadata, stable_id = artifact
+    replacement = folder.parent / "replacement"
+    replacement.mkdir()
+    replacement_id = "44444444-4444-4444-8444-444444444444"
+    replacement_metadata = {
+        "id": "replacement",
+        "createdAt": "2026-08-25T12:03:00+00:00",
+        "stableId": replacement_id,
+    }
+    replacement_path = replacement / "metadata.json"
+    replacement_path.write_text(json.dumps(replacement_metadata), encoding="utf-8")
+    source = ProjectArtifacts(folder.parent, None, "test")
+    identity_service._clear_identity_indexes()
+
+    assert resolve_artifact_folder([source], stable_id)[1] == folder
+
+    original_path = folder / "metadata.json"
+    original_metadata = json.loads(original_path.read_text(encoding="utf-8"))
+    original_path.write_text(
+        json.dumps({**original_metadata, "stableId": replacement_id}),
+        encoding="utf-8",
+    )
+    replacement_path.write_text(
+        json.dumps({**replacement_metadata, "stableId": stable_id}),
+        encoding="utf-8",
+    )
+
+    assert resolve_artifact_folder([source], stable_id)[1] == replacement
+
+
 def test_manual_save_is_atomic_and_records_revision(artifact):
     folder, metadata, stable_id = artifact
     initial = current_source(folder, metadata, stable_id)
@@ -96,6 +188,24 @@ def test_manual_save_is_atomic_and_records_revision(artifact):
     assert saved["revision"]["actor"] == {"kind": "manual", "id": "user-1"}
     assert [r["number"] for r in list_revisions(folder)] == [2, 1]
     assert revision_with_content(folder, initial["revision"]["id"])["content"] == "# First\n"
+
+
+def test_workspace_snapshot_bundles_source_and_filtered_history(artifact):
+    folder, metadata, stable_id = artifact
+    initial = current_source(folder, metadata, stable_id)
+    save_source(
+        folder,
+        metadata,
+        stable_id,
+        content="# Revised\n",
+        expected_revision_id=initial["revision"]["id"],
+    )
+
+    snapshot = current_workspace(folder, metadata, stable_id)
+
+    assert snapshot["content"] == "# Revised\n"
+    assert snapshot["revision"] == snapshot["revisions"][0]
+    assert [revision["number"] for revision in snapshot["revisions"]] == [2, 1]
 
 
 def test_interrupted_save_recovers_source_and_attribution(artifact, monkeypatch):

@@ -30,6 +30,7 @@ from cowork.services.artifact_revisions import (
     cancel_agent_repair,
     create_agent_repair,
     current_source,
+    current_workspace,
     finalize_agent_repair,
     list_revisions,
     revision_with_content,
@@ -92,7 +93,7 @@ async def artifact_source(
         session, project_ref, stable_id
     )
     try:
-        result = await run_in_threadpool(current_source, folder, metadata, stable_id, path)
+        result = await run_in_threadpool(current_workspace, folder, metadata, stable_id, path)
         repair = await run_in_threadpool(active_agent_repair, folder)
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:

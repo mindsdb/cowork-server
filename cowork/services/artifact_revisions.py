@@ -480,6 +480,26 @@ def current_source(folder: Path, metadata: dict, stable_id: str, rel_path: str |
         return _current_source_locked(folder, metadata, stable_id, rel_path)
 
 
+def current_workspace(
+    folder: Path, metadata: dict, stable_id: str, rel_path: str | None = None
+) -> dict:
+    """Read editable source and its history under one artifact lock.
+
+    The viewer needs both values before its revision chrome is complete.  A
+    single snapshot avoids a second HTTP request, a second stable-id lookup,
+    and a race where an edit lands between the source and history reads.
+    """
+    with artifact_lock(folder):
+        source = _current_source_locked(folder, metadata, stable_id, rel_path)
+        manifest = _read_manifest(folder)
+        revisions = [
+            revision
+            for revision in manifest["revisions"]
+            if revision.get("path") == source["path"]
+        ]
+        return {**source, "revisions": list(reversed(revisions))}
+
+
 def save_source(
     folder: Path,
     metadata: dict,
