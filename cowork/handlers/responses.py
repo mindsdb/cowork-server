@@ -130,7 +130,9 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
     return synthesized
 
 
-async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id) -> None:
+async def _seal_unterminated_buffer(
+    buffer, lifecycle: "TurnLifecycle", conv_id, *, request_id: str | None = None,
+) -> None:
     """Guarantee a terminal record so a producer that ended WITHOUT closing its
     buffer can't leave the client's tail (and its shared stream slot) hanging
     forever.
@@ -150,6 +152,12 @@ async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id)
     abstract on ``StreamBuffer`` but a minimal test double may lack it — treat an
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
+
+    ``request_id`` is the remote producer's own correlation id, passed by
+    ``_produce_remote`` only — this is the hardest-failing turn (one that
+    escaped every named ``except``), so it's exactly the one a user is most
+    likely to report; omitted (``None``) by the in-process/direct producers,
+    which have no such id to offer.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
@@ -159,7 +167,7 @@ async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id)
     )
     try:
         await buffer.append("sse", {"sse": response_failed_sse(
-            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)})
     except Exception:
         logger.exception("[responses] could not emit terminal error frame while sealing")
     try:
@@ -791,8 +799,16 @@ class ResponsesHandler:
         failure: dict = {}
         # Resolved once, up front — not left for stream_remote_replies to mint
         # internally on a None — so every failure branch below (classified or
-        # not) can attach the SAME id a support/log lookup would use.
+        # not) can attach the SAME id a support/log lookup would use. Logged
+        # here too, not only on failure: a turn that fails before
+        # stream_remote_replies is ever called (workspace staging, artifact
+        # context resolution) would otherwise mint an id that appears in no
+        # log line at all, making the request_id a client shows the user
+        # unfindable.
         corr = (turn_llm or {}).get("correlation_id") or str(uuid4())
+        logger.info(
+            "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
+        )
 
         def event_sink(event_type: str, data: dict) -> None:
             # Same event log the in-process path records, so the client
@@ -993,7 +1009,10 @@ class ResponsesHandler:
             persist()
             await buffer.close("cancelled")
         except Exception:
-            logger.exception("[responses] remote turn failed for conversation %s", conv_id)
+            logger.exception(
+                "[responses] remote turn failed for conversation %s correlation_id=%s",
+                conv_id, corr,
+            )
             collected_events.append(response_failed_payload(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(
@@ -1001,7 +1020,7 @@ class ResponsesHandler:
             persist()
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
             producer_session.close()
 
     async def _produce(self, **kwargs) -> None:
