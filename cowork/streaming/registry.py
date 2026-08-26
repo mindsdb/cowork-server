@@ -114,7 +114,18 @@ class RunHandle:
 
     async def cancel(self) -> bool:
         """Request cancellation of the producer task. Returns True if a
-        cancel was issued (task still running), False if already done."""
+        cancel was issued, False if the turn had already finished.
+
+        The one thing this answers is "did this call stop a running turn". It
+        does NOT report whether the producer's own teardown went cleanly, and
+        it used to: an exception from `persist()` or `buffer.close()` on the
+        cancellation path escaped the producer, arrived here, and was turned
+        into `False`. That reads identically to "there was nothing to cancel"
+        while the turn had in fact been stopped, and it discarded the
+        exception, so the only symptom was a caller being told the turn was
+        still running. The turn is stopped either way, so a failed teardown is
+        logged and the answer stays True.
+        """
         if self.task.done():
             return False
         self.task.cancel()
@@ -124,7 +135,15 @@ class RunHandle:
         except asyncio.CancelledError:
             return True
         except Exception:
-            return False
+            # The producer was cancelled and then failed while unwinding. The
+            # `finally` in the producer still seals the buffer, so the client
+            # is not left hanging; what is lost is whatever persist() or
+            # close() was doing, which is worth a log rather than silence.
+            logger.exception(
+                "[registry] producer for conversation %s raised while unwinding a cancel",
+                self.conversation_id,
+            )
+            return True
         # The task finished without surfacing the cancellation — it either
         # absorbed it (every producer catches CancelledError to persist and
         # close its buffer) or was already on its last step. A cancel was

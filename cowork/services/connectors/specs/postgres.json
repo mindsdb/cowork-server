@@ -112,5 +112,5 @@
     "logo_url": "logos/postgres.svg"
   },
   "logo_url": "logos/postgres.svg",
-  "featured": true
+  "featured": false
 }

@@ -165,7 +165,7 @@ class ChannelConfigService:
 
     def _fetch_setting(self, key: str) -> Setting | None:
         # Channel creds are global (key-only) rows here, bypassing SettingService
-        # scope routing — safe only because channels are 501-gated in org mode.
+        # scope routing — safe only because org mode refuses these routes (403).
         return self.session.exec(
             self.session.select(Setting).where(Setting.key == key)
         ).first()
