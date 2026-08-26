@@ -547,16 +547,15 @@ class AppSettings(Settings):
         ),
     )
     ask_user_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
         description=(
             "Whether the agent may ask interactive multiple-choice questions "
-            "(the `ask_user` tool). Off by default because the renderer must "
-            "ship first: the frontend and this server are versioned "
-            "independently, and a client that does not know the "
-            "`response.ask_user` event drops it silently, leaving the agent "
-            "apparently hung until the question times out. Turn on only after "
-            "the frontend is rolled out."
+            "(the `ask_user` tool). On by default now that the renderer "
+            "support (the `response.ask_user` card) has shipped; kept as a "
+            "kill switch because a renderer that does not know the event "
+            "drops it silently, stalling the agent until the question times "
+            "out. Set to false to degrade to plain-text questions (ENG-1984)."
         ),
     )
     surface_override: str = Field(
