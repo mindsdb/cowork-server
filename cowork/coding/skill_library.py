@@ -12,6 +12,7 @@ from cowork.coding.project_models import CodeProject
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.skill_models import (
     ProjectSkillSource,
+    SkillProjectAssignment,
     SkillLibraryDocument,
     SkillLibraryItem,
     SkillLibraryPage,
@@ -275,6 +276,37 @@ class SkillLibraryService:
 
         self.projects.update(project.id, update)
         return self.list(project.id)
+
+    def set_project_assignments(
+        self,
+        source_id: str,
+        assignments: list[SkillProjectAssignment],
+    ) -> SkillLibraryPage:
+        """Apply one source's project assignments without exposing partial saves."""
+        source = self.store.get(source_id)
+        available = {item.path for item in discover_guidance_items(self._validated_cache(source))}
+        operations = {}
+        for assignment in assignments:
+            selected = set(assignment.enabled_paths)
+            if selected - available:
+                raise WorkspaceError("One or more selected library items are no longer available")
+
+            def update(current: CodeProject, *, selected_paths=selected) -> None:
+                retained = [binding for binding in current.skill_sources if binding.source_id != source_id]
+                if selected_paths:
+                    retained.append(
+                        ProjectSkillSource(source_id=source_id, enabled_paths=sorted(selected_paths))
+                    )
+                self._validate_project_bindings(current, retained)
+                current.skill_sources = retained
+
+            operations[assignment.project_id] = update
+        self.projects.update_many(operations)
+        return self.list()
+
+    def validate_project(self, project: CodeProject) -> None:
+        """Validate a complete project configuration before its single-file save."""
+        self._validate_project_bindings(project, project.skill_sources)
 
     def cache_for(self, source_id: str) -> tuple[TeamSkillSource, Path]:
         source = self.store.get(source_id)

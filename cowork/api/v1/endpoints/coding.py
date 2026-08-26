@@ -55,6 +55,7 @@ from cowork.coding.skill_models import (
     SkillLibraryDocument,
     SkillLibraryPage,
     SkillLibrarySource,
+    SkillSourceAssignmentsRequest,
     SkillSourceCreateRequest,
     SkillSourceItemsRequest,
 )
@@ -269,6 +270,18 @@ def update_code_project_skill_source(
         project_id,
         source_id,
         body.enabled_paths,
+    )
+
+
+@router.put("/skills/sources/{source_id}/projects", response_model=SkillLibraryPage)
+def update_code_skill_source_projects(
+    source_id: str,
+    body: SkillSourceAssignmentsRequest,
+):
+    return _call(
+        _service().skill_library.set_project_assignments,
+        source_id,
+        body.assignments,
     )
 
 

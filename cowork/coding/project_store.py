@@ -3,11 +3,20 @@ from __future__ import annotations
 import json
 import os
 import threading
+import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from cowork.coding.contracts import utc_now
 from cowork.coding.project_models import CodeProject
+
+
+@dataclass(frozen=True)
+class _JournalEntry:
+    project_id: str
+    before: dict[str, object]
+    stage: str | None
 
 
 class CodeProjectStore:
@@ -17,6 +26,7 @@ class CodeProjectStore:
         self.root = root / "projects"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._recover_transaction()
 
     def save(self, project: CodeProject) -> CodeProject:
         with self._lock:
@@ -57,6 +67,17 @@ class CodeProjectStore:
             operation(project)
             return self.save(project)
 
+    def update_many(self, operations: dict[str, Callable[[CodeProject], None]]) -> list[CodeProject]:
+        """Validate and persist a related set of project edits as one recoverable unit."""
+        with self._lock:
+            projects: list[CodeProject] = []
+            for project_id, operation in operations.items():
+                project = self.get(project_id)
+                operation(project)
+                # Revalidate mutations performed by callers before any file is staged.
+                projects.append(CodeProject.model_validate(project.model_dump(mode="python")))
+            return self._save_many(projects)
+
     def delete(self, project_id: str) -> None:
         with self._lock:
             try:
@@ -71,6 +92,76 @@ class CodeProjectStore:
         ):
             raise ValueError("invalid Code Project id")
         return self.root / f"{project_id}.json"
+
+    def _save_many(self, projects: list[CodeProject]) -> list[CodeProject]:
+        if not projects:
+            return []
+        transaction_id = uuid.uuid4().hex
+        journal = self.root / ".transaction.json"
+        journal_temp = self.root / ".transaction.tmp"
+        entries: list[dict[str, object]] = []
+        staged: list[tuple[Path, Path]] = []
+        timestamp = utc_now()
+        try:
+            for project in projects:
+                project.updated_at = timestamp
+                target = self._path(project.id)
+                before = json.loads(target.read_text(encoding="utf-8"))
+                stage = self.root / f".{project.id}.{transaction_id}.tmp"
+                stage.write_text(project.model_dump_json(indent=2) + "\n", encoding="utf-8")
+                entries.append({"project_id": project.id, "before": before, "stage": stage.name})
+                staged.append((stage, target))
+
+            journal_temp.write_text(
+                json.dumps({"schema_version": 1, "entries": entries}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(journal_temp, journal)
+            for stage, target in staged:
+                os.replace(stage, target)
+            journal.unlink()
+        except Exception:
+            if journal.exists():
+                self._recover_transaction()
+            raise
+        finally:
+            journal_temp.unlink(missing_ok=True)
+            for stage, _ in staged:
+                stage.unlink(missing_ok=True)
+        return projects
+
+    def _recover_transaction(self) -> None:
+        journal = self.root / ".transaction.json"
+        try:
+            payload = json.loads(journal.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        if payload.get("schema_version") != 1 or not isinstance(payload.get("entries"), list):
+            raise ValueError("unsupported Code Project transaction journal")
+        entries = [self._journal_entry(entry) for entry in payload["entries"]]
+        for entry in entries:
+            target = self._path(entry.project_id)
+            restore = self.root / f".{entry.project_id}.restore.tmp"
+            restore.write_text(json.dumps(entry.before, indent=2) + "\n", encoding="utf-8")
+            os.replace(restore, target)
+            if entry.stage:
+                (self.root / entry.stage).unlink(missing_ok=True)
+        journal.unlink()
+
+    @staticmethod
+    def _journal_entry(raw: object) -> _JournalEntry:
+        if not isinstance(raw, dict):
+            raise ValueError("invalid Code Project transaction journal")
+        project_id = raw.get("project_id")
+        before = raw.get("before")
+        stage = raw.get("stage")
+        if (
+            not isinstance(project_id, str)
+            or not isinstance(before, dict)
+            or (stage is not None and (not isinstance(stage, str) or Path(stage).name != stage))
+        ):
+            raise ValueError("invalid Code Project transaction journal")
+        return _JournalEntry(project_id=project_id, before=before, stage=stage)
 
     @staticmethod
     def _load(raw: dict) -> CodeProject:

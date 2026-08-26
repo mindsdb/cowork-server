@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from cowork.coding.project_models import (
@@ -21,9 +22,11 @@ class CodeProjectService:
         root: Path,
         store: CodeProjectStore | None = None,
         workspaces: WorkspaceManager | None = None,
+        validator: Callable[[CodeProject], None] | None = None,
     ) -> None:
         self.store = store or CodeProjectStore(root)
         self.workspaces = workspaces or WorkspaceManager(root)
+        self.validator = validator
 
     def list(self) -> ProjectPage:
         return ProjectPage(items=self.store.list())
@@ -38,11 +41,12 @@ class CodeProjectService:
             folders=request.folders,
             connections=request.connections,
             environment=request.environment,
+            skill_sources=request.skill_sources,
             default_engine_id=request.default_engine_id,
             default_model=request.default_model,
             permission_mode=request.permission_mode,
         )
-        return self.store.create(self._normalize(project))
+        return self.store.create(self._validated(project))
 
     def update(self, project_id: str, request: ProjectUpdateRequest) -> CodeProject:
         project = self.get(project_id)
@@ -50,7 +54,7 @@ class CodeProjectService:
         if values.get("name") is not None:
             values["name"] = self._name(values["name"])
         candidate = CodeProject.model_validate({**project.model_dump(), **values})
-        return self.store.save(self._normalize(candidate))
+        return self.store.save(self._validated(candidate))
 
     def delete(self, project_id: str, active_session_count: int) -> None:
         if active_session_count:
@@ -95,6 +99,12 @@ class CodeProjectService:
                 seen_repositories.add(repository)
             normalized.append(folder.model_copy(update={"path": path}))
         return project.model_copy(update={"folders": normalized})
+
+    def _validated(self, project: CodeProject) -> CodeProject:
+        normalized = self._normalize(project)
+        if self.validator:
+            self.validator(normalized)
+        return normalized
 
     @staticmethod
     def _name(value: str) -> str:

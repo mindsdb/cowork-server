@@ -76,9 +76,14 @@ class CodingService:
         self.store = store or CodingStore(root)
         self.workspaces = workspaces or WorkspaceManager(root)
         self.project_store = CodeProjectStore(root)
-        self.projects = CodeProjectService(root, self.project_store, self.workspaces)
-        self.playbooks = PlaybookService(root, self.project_store, self.workspaces.git)
         self.skill_library = SkillLibraryService(root, self.project_store, self.workspaces.git)
+        self.projects = CodeProjectService(
+            root,
+            self.project_store,
+            self.workspaces,
+            self.skill_library.validate_project,
+        )
+        self.playbooks = PlaybookService(root, self.project_store, self.workspaces.git)
         self.skill_runtime = SkillRuntimeResolver(self.skill_library)
         self.project_workspaces = ProjectWorkspaceManager(self.workspaces)
         self.delivery = ProjectDeliveryService(self.workspaces.git)
