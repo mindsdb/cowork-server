@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
 from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectFolder
 from cowork.coding.workspace import (
+    ApplyPlan,
     PreparedWorkspace,
     WorkspaceError,
     WorkspaceManager,
@@ -236,14 +237,28 @@ class ProjectWorkspaceManager:
 
     def commit(self, workspaces: list[TaskWorkspace], message: str) -> list[GitState]:
         states: list[GitState] = []
-        for workspace in workspaces:
-            if workspace.workspace_kind != WorkspaceKind.git_worktree:
-                continue
-            state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path)
-            if state.dirty:
-                state = self.workspaces.commit(workspace.workspace_path, message)
-            states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
-        return states
+        checkpoints: list[tuple[TaskWorkspace, str]] = []
+        try:
+            for workspace in workspaces:
+                if workspace.workspace_kind != WorkspaceKind.git_worktree:
+                    continue
+                state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path)
+                if state.dirty:
+                    checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
+                    checkpoints.append((workspace, checkpoint))
+                    state = self.workspaces.commit(workspace.workspace_path, message)
+                states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
+            return states
+        except Exception as exc:
+            failures = self._rollback_commits(checkpoints)
+            if failures:
+                raise WorkspaceError(
+                    "Some repository commits could not be restored; open the task workspaces to recover them: "
+                    + "; ".join(failures)
+                ) from exc
+            raise WorkspaceError(
+                "No repositories were committed. All task changes remain available to retry."
+            ) from exc
 
     def apply(self, session_id: str, workspaces: list[TaskWorkspace]) -> list[str]:
         """Preflight every folder before mutating any source folder."""
@@ -258,16 +273,31 @@ class ProjectWorkspaceManager:
                 for workspace in workspaces
             ]
             applied: list[str] = []
-            for workspace, plan in zip(workspaces, plans, strict=True):
-                self.workspaces.apply_checked(
-                    workspace.source_path,
-                    workspace.workspace_path,
-                    workspace.base_revision,
-                    plan,
-                )
-                if plan:
-                    applied.append(workspace.folder_name)
-            return applied
+            rollback: list[tuple[TaskWorkspace, ApplyPlan]] = []
+            try:
+                for workspace, plan in zip(workspaces, plans, strict=True):
+                    if plan.kind == WorkspaceKind.local_copy and plan.has_changes:
+                        rollback.append((workspace, plan))
+                    self.workspaces.apply_checked(
+                        workspace.source_path,
+                        workspace.workspace_path,
+                        plan,
+                    )
+                    if plan.kind == WorkspaceKind.git_worktree and plan.has_changes:
+                        rollback.append((workspace, plan))
+                    if plan.has_changes:
+                        applied.append(workspace.folder_name)
+                return applied
+            except Exception as exc:
+                failures = self._rollback_handoffs(rollback)
+                if failures:
+                    raise WorkspaceError(
+                        "Handoff failed and some source folders could not be restored; recover them from the task workspaces: "
+                        + "; ".join(failures)
+                    ) from exc
+                raise WorkspaceError(
+                    "Handoff failed before completion. Every source folder was restored; the task changes remain available to retry."
+                ) from exc
 
     def cleanup(self, session_id: str, workspaces: list[TaskWorkspace]) -> None:
         with self._lock:
@@ -290,6 +320,28 @@ class ProjectWorkspaceManager:
             workspace.workspace_kind,
             workspace.base_revision,
         )
+
+    def _rollback_commits(self, checkpoints: list[tuple[TaskWorkspace, str]]) -> list[str]:
+        failures: list[str] = []
+        for workspace, revision in reversed(checkpoints):
+            try:
+                self.workspaces.rollback_commit(workspace.workspace_path, revision)
+            except WorkspaceError as exc:
+                failures.append(f"{workspace.folder_name}: {exc}")
+        return failures
+
+    def _rollback_handoffs(self, attempts: list[tuple[TaskWorkspace, ApplyPlan]]) -> list[str]:
+        failures: list[str] = []
+        for workspace, plan in reversed(attempts):
+            try:
+                self.workspaces.rollback_checked(
+                    workspace.source_path,
+                    workspace.workspace_path,
+                    plan,
+                )
+            except WorkspaceError as exc:
+                failures.append(f"{workspace.folder_name}: {exc}")
+        return failures
 
     def _task_workspace(
         self,
