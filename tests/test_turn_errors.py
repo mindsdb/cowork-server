@@ -1120,6 +1120,21 @@ def test_remote_error_missing_organization_gets_curated_copy():
     assert "corr-123" not in msg
 
 
+def test_remote_error_live_pod_terminal_before_running_gets_curated_copy():
+    # scratchpad-controller's live_pod.py — a pod that reached Failed (or any
+    # other terminal phase) before ever reaching Running, i.e. it never
+    # scheduled/started. Raised as a bare RuntimeError with no type prefix,
+    # caught by _handle_anton_turn_k8s's own generic `except Exception`. The
+    # pod name and phase are both k8s-controlled (safe), but a fixed message
+    # is still returned rather than echoing them to the user.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "live pod sp-abc123 reached terminal phase 'Failed' before Running")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "sandbox" in msg
+    assert "sp-abc123" not in msg
+
+
 def test_remote_error_unknown_is_redacted():
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
     code, msg = remote_turn_error("RuntimeError: secret internals")

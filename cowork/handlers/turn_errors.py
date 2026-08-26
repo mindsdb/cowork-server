@@ -251,6 +251,17 @@ MISSING_ORGANIZATION_USER_MESSAGE = (
     "This task's workspace couldn't be set up. Please try again — if it "
     "keeps happening, contact support."
 )
+# live_pod.py: "live pod {pod_name} reached terminal phase {phase!r} before
+# Running" — a RuntimeError raised when the pod never reaches Running (a
+# scheduling/startup failure), caught by _handle_anton_turn_k8s's own
+# generic except Exception, so it carries no type prefix. pod_name/phase are
+# both k8s-controlled (safe), but returned as a fixed message anyway rather
+# than echoing internal names to the user.
+LIVE_POD_TERMINAL_BEFORE_RUNNING_MARKER = "reached terminal phase"
+LIVE_POD_TERMINAL_BEFORE_RUNNING_SUFFIX = "before Running"
+LIVE_POD_TERMINAL_BEFORE_RUNNING_USER_MESSAGE = (
+    "This task's sandbox failed to start. Please try again."
+)
 
 
 def is_image_format_error(exc: Exception) -> bool:
@@ -884,6 +895,9 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
     if text.endswith(MISSING_ORGANIZATION_SUFFIX):
         return GENERIC_TURN_ERROR_CODE, MISSING_ORGANIZATION_USER_MESSAGE
+    if (LIVE_POD_TERMINAL_BEFORE_RUNNING_MARKER in text
+            and text.endswith(LIVE_POD_TERMINAL_BEFORE_RUNNING_SUFFIX)):
+        return GENERIC_TURN_ERROR_CODE, LIVE_POD_TERMINAL_BEFORE_RUNNING_USER_MESSAGE
     type_name, _, message = text.partition(":")
     message = message.strip()
     if type_name == "TokenLimitExceeded":
