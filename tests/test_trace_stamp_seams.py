@@ -189,6 +189,24 @@ def test_the_matcher_catches_an_attribute_qualified_construction():
 
 
 def _declares_harness(call: ast.Call) -> bool:
+    """A literal ``harness=`` keyword — deliberately NOT the ``**helper()``
+    shape that :func:`_declares_surface` also accepts.
+
+    The asymmetry is intentional and load-bearing. ``surface`` is **absent**
+    from the pinned anton (``uv.lock`` → ``466520b``, v2.26.8.20.3), so passing
+    it unconditionally would raise ``TypeError`` on every turn — hence the
+    defensive ``**surface_kwarg(ChatSessionConfig)``. ``harness`` *is* declared
+    at that same commit, so it can be passed as a plain keyword, and requiring
+    the literal keeps this guard exact.
+
+    If a future change ever needs harness passed defensively too, this
+    predicate will reject that shape and must be widened the way
+    ``_declares_surface`` was — matching on the **inner helper name**, not
+    merely on a ``**``-unpack. Matching any unpack would make the guard
+    satisfiable by any ``**kwargs`` that happens not to contain a harness,
+    which is the vacuous-guard failure this file exists to prevent
+    (#386 review).
+    """
     return any(kw.arg == "harness" for kw in call.keywords)
 
 
