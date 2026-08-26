@@ -33,7 +33,6 @@ from cowork.coding.contracts import (
     TaskWorkspace,
     TerminalPage,
     WorkspaceInspection,
-    WorkspaceKind,
     utc_now,
 )
 from cowork.coding.delivery import ProjectDeliveryService
@@ -48,6 +47,7 @@ from cowork.coding.project_models import (
 )
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
+from cowork.coding.project_tasks import ProjectTaskOperations
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.runtime import RuntimeManager, engine_workspace_path
 from cowork.coding.session_factory import CodingSessionFactory, project_instructions
@@ -55,7 +55,7 @@ from cowork.coding.skill_library import SkillLibraryService
 from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn, mark_running
-from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import WorkspaceManager
 from cowork.common.paths import cowork_home
 from cowork.services.skills import CodeSkillService
 
@@ -92,6 +92,16 @@ class CodingService:
         self._maintenance: set[str] = set()
         self.approvals = ApprovalBroker(self._approval_opened, self._approval_closed)
         self.runtimes = RuntimeManager(root, self.registry, self.approvals.request)
+        self.project_tasks = ProjectTaskOperations(
+            get_session=self.get_session,
+            maintenance_session=self._maintenance_session,
+            emit=self._emit,
+            store=self.store,
+            workspaces=self.workspaces,
+            project_workspaces=self.project_workspaces,
+            projects=self.projects,
+            delivery=self.delivery,
+        )
         self.session_factory = CodingSessionFactory(
             self.registry,
             self.store,
@@ -604,121 +614,32 @@ class CodingService:
         return self.get_session(session_id)
 
     def git_state(self, session_id: str):
-        session = self.get_session(session_id)
-        if session.workspaces:
-            return self.project_workspaces.git_states(session.workspaces)[0]
-        return self.workspaces.git_state(session.source_path, session.workspace_path)
+        return self.project_tasks.git_state(session_id)
 
     def git_states(self, session_id: str):
-        session = self.get_session(session_id)
-        if session.workspaces:
-            return self.project_workspaces.git_states(session.workspaces)
-        return [self.workspaces.git_state(session.source_path, session.workspace_path)]
+        return self.project_tasks.git_states(session_id)
 
     def diff(self, session_id: str):
-        session = self.get_session(session_id)
-        if session.workspaces:
-            return self.project_workspaces.diff(session.workspaces)
-        return self.workspaces.diff(session.workspace_path, session.base_revision)
+        return self.project_tasks.diff(session_id)
 
     def create_branch(self, session_id: str, name: str):
-        with self._maintenance_session(
-            session_id,
-            "Wait for the active turn to finish before changing task branches",
-        ) as session:
-            if session.workspaces:
-                states = []
-                for workspace in session.workspaces:
-                    if workspace.workspace_kind != WorkspaceKind.git_worktree:
-                        continue
-                    state = self.workspaces.create_branch(workspace.workspace_path, name)
-                    states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
-                if not states:
-                    raise WorkspaceError("This project does not contain a Git folder")
-                self._emit(session.id, CodingEvent(type=EventType.session, title="Branches created", text=name, phase="completed"))
-                return states[0]
-            if session.base_revision is None:
-                raise WorkspaceError("This task is not using a Git worktree")
-            state = self.workspaces.create_branch(session.workspace_path, name)
-            self._emit(session.id, CodingEvent(type=EventType.session, title="Branch created", text=name, phase="completed"))
-        return state
+        return self.project_tasks.create_branch(session_id, name)
 
     def commit(self, session_id: str, message: str):
-        with self._maintenance_session(
-            session_id,
-            "Wait for the active turn to finish before committing task changes",
-        ) as session:
-            if session.workspaces:
-                states = self.project_workspaces.commit(session.workspaces, message)
-                if not states:
-                    raise WorkspaceError("This project does not contain a Git folder")
-                self._emit(session.id, CodingEvent(type=EventType.session, title="Changes committed", text=message.strip(), phase="completed"))
-                return states[0]
-            if session.base_revision is None:
-                raise WorkspaceError("This task is not using a Git worktree")
-            state = self.workspaces.commit(session.workspace_path, message)
-            self._emit(session.id, CodingEvent(type=EventType.session, title="Changes committed", text=message.strip(), phase="completed"))
-        return state
+        return self.project_tasks.commit(session_id, message)
 
     def apply_to_source(self, session_id: str) -> dict[str, str | None]:
-        with self._maintenance_session(
-            session_id,
-            "Wait for the active turn to finish before applying task changes",
-        ) as session:
-            if session.workspaces:
-                applied = self.project_workspaces.apply(session.id, session.workspaces)
-                text = "No changes to apply." if not applied else f"Applied reviewed changes across {len(applied)} project folders."
-                self._emit(session.id, CodingEvent(type=EventType.session, title="Handoff complete", text=text, phase="completed"))
-                return {"status": "applied" if applied else "no_changes", "snapshot": None}
-            if session.workspace_kind == WorkspaceKind.direct_folder:
-                raise WorkspaceError("This legacy task uses its source folder directly and has no isolated handoff")
-            snapshot = self.workspaces.apply_to_source(
-                session.id,
-                session.source_path,
-                session.workspace_path,
-                session.base_revision,
-            )
-            text = "No changes to apply." if snapshot is None else "Applied the task diff to the source working tree. A recovery patch was saved first."
-            self._emit(session.id, CodingEvent(type=EventType.session, title="Handoff complete", text=text, phase="completed"))
-        return {"status": "no_changes" if snapshot is None else "applied", "snapshot": str(snapshot) if snapshot else None}
+        return self.project_tasks.apply_to_source(session_id)
 
     def validate_project(self, session_id: str) -> list[dict]:
-        with self._maintenance_session(
-            session_id,
-            "Wait for the active turn to finish before running project checks",
-        ) as session:
-            if not session.project_id or not session.workspaces:
-                return []
-            project = self.projects.get(session.project_id)
-            results = self.project_workspaces.run_commands(
-                project,
-                session.workspaces,
-                "validate",
-                session.allocated_ports,
-            )
-            for result in results:
-                self._emit(
-                    session.id,
-                    CodingEvent(
-                        type=EventType.command,
-                        title=result.label,
-                        text=result.output,
-                        phase="completed" if result.return_code == 0 else "failed",
-                        data={"folderId": result.folder_id, "returnCode": result.return_code, "phase": "validate"},
-                    ),
-                )
-            return [result.__dict__ for result in results]
+        return self.project_tasks.validate_project(session_id)
 
     def delivery_plan(
         self,
         session_id: str,
         integrations: DeveloperIntegrationService | None = None,
     ):
-        session = self.get_session(session_id)
-        if not session.project_id or not session.workspaces:
-            raise WorkspaceError("This task is not linked to a Code Project")
-        project = self.projects.get(session.project_id)
-        return self.delivery.plan(session, project, integrations)
+        return self.project_tasks.delivery_plan(session_id, integrations)
 
     def create_draft_pull_requests(
         self,
@@ -726,30 +647,7 @@ class CodingService:
         request: DraftPullRequestRequest,
         integrations: DeveloperIntegrationService,
     ):
-        with self._maintenance_session(
-            session_id,
-            "Wait for the active turn to finish before publishing draft pull requests",
-        ) as session:
-            if not session.project_id or not session.workspaces:
-                raise WorkspaceError("This task is not linked to a Code Project")
-            project = self.projects.get(session.project_id)
-            records = self.delivery.create_draft_pull_requests(session, project, request, integrations)
-            self.store.update_session(
-                session.id,
-                lambda current: current.deliveries.extend(records),
-            )
-            published = sum(item.status == "published" for item in records)
-            failed = sum(item.status == "failed" for item in records)
-            self._emit(
-                session.id,
-                CodingEvent(
-                    type=EventType.session,
-                    title="Draft pull requests prepared",
-                    text=f"Created {published} draft pull request(s)." + (f" {failed} folder(s) need attention." if failed else ""),
-                    phase="failed" if failed and not published else "completed",
-                ),
-            )
-            return records
+        return self.project_tasks.create_draft_pull_requests(session_id, request, integrations)
 
     def pull_request_action(
         self,
@@ -757,28 +655,7 @@ class CodingService:
         request: PullRequestActionRequest,
         integrations: DeveloperIntegrationService,
     ) -> PullRequestStatus:
-        with self._maintenance_session(
-            session_id,
-            "Wait for the active turn to finish before updating a pull request",
-        ) as session:
-            if not session.project_id:
-                raise WorkspaceError("This task is not linked to a Code Project")
-            project = self.projects.get(session.project_id)
-            status = integrations.pull_request_action(project, request)
-            self._emit(
-                session.id,
-                CodingEvent(
-                    type=EventType.session,
-                    title="Pull request updated",
-                    text={
-                        "ready": "Marked ready for review.",
-                        "merge": "Merged on GitHub.",
-                        "resolve_thread": "Resolved a GitHub review thread.",
-                    }[request.action],
-                    phase="completed",
-                ),
-            )
-            return status
+        return self.project_tasks.pull_request_action(session_id, request, integrations)
 
     def discover_models(self, engine_id: str, credentials: EngineCredentials) -> list[str]:
         return self.registry.get(engine_id).discover_models(credentials)
