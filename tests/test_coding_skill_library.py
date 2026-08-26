@@ -9,7 +9,7 @@ from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_statu
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus
 from cowork.coding.guidance_items import discover_guidance_items
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
-from cowork.coding.skill_models import TeamSkillSource
+from cowork.coding.skill_models import ProjectSkillSource, SkillProjectAssignment, TeamSkillSource
 from cowork.coding.workspace import WorkspaceError
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.skills import CodeSkillService, SkillService
@@ -119,6 +119,80 @@ def test_team_source_is_discoverable_versioned_and_project_scoped(tmp_path: Path
 
     with pytest.raises(WorkspaceError, match="Remove this source from Product"):
         service.skill_library.remove(source.id)
+
+
+def test_project_creation_saves_validated_skill_configuration_once(tmp_path: Path) -> None:
+    skills_repo = repository(tmp_path, "engineering-skills")
+    skill_path = add_skill(skills_repo, "Review standard.")
+    project_repo = repository(tmp_path, "product")
+    service = service_with(tmp_path, FakeEngine())
+    source = service.skill_library.add(
+        str(skills_repo),
+        git(skills_repo, "branch", "--show-current"),
+        "Engineering standards",
+    )
+
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Product",
+            folders=[ProjectFolder(id="product", name="Product", path=str(project_repo))],
+            skill_sources=[ProjectSkillSource(source_id=source.id, enabled_paths=[skill_path])],
+        )
+    )
+
+    assert project.skill_sources == [
+        ProjectSkillSource(source_id=source.id, enabled_paths=[skill_path])
+    ]
+    assert service.skill_library.list(project.id).items[0].enabled is True
+
+    with pytest.raises(KeyError, match="Skill source not found"):
+        service.projects.create(
+            ProjectCreateRequest(
+                name="Invalid",
+                folders=[ProjectFolder(id="invalid", name="Invalid", path=str(project_repo))],
+                skill_sources=[ProjectSkillSource(source_id="missing", enabled_paths=[skill_path])],
+            )
+        )
+    assert [item.name for item in service.projects.list().items] == ["Product"]
+
+
+def test_project_skill_assignments_are_atomic_across_projects(tmp_path: Path) -> None:
+    skills_repo = repository(tmp_path, "engineering-skills")
+    skill_path = add_skill(skills_repo, "Review standard.")
+    service = service_with(tmp_path, FakeEngine())
+    source = service.skill_library.add(
+        str(skills_repo),
+        git(skills_repo, "branch", "--show-current"),
+        "Engineering standards",
+    )
+    projects = [
+        service.projects.create(
+            ProjectCreateRequest(
+                name=name,
+                folders=[ProjectFolder(id=name.lower(), name=name, path=str(repository(tmp_path, name.lower())))],
+            )
+        )
+        for name in ("Product", "Inference")
+    ]
+
+    service.skill_library.set_project_assignments(
+        source.id,
+        [
+            SkillProjectAssignment(project_id=project.id, enabled_paths=[skill_path])
+            for project in projects
+        ],
+    )
+    assert all(service.projects.get(project.id).skill_sources for project in projects)
+
+    with pytest.raises(KeyError, match="Code Project not found"):
+        service.skill_library.set_project_assignments(
+            source.id,
+            [
+                SkillProjectAssignment(project_id=projects[0].id, enabled_paths=[]),
+                SkillProjectAssignment(project_id="missing", enabled_paths=[skill_path]),
+            ],
+        )
+    assert service.projects.get(projects[0].id).skill_sources
 
 
 def test_source_catalogue_enforces_repository_branch_uniqueness(tmp_path: Path) -> None:
