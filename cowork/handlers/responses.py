@@ -46,6 +46,7 @@ from cowork.schemas.responses import (
 from cowork.handlers._turn_history import sanitize_turn_history_rows
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
+    CONTENT_RECOVERY_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
@@ -965,6 +966,23 @@ class ResponsesHandler:
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
             collected_events.append(response_failed_payload(message, code))
             await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            if code == CONTENT_RECOVERY_CODE:
+                # ENG-1992: the remote/org path's twin of the streaming
+                # handler's repair — producer.py already classified this via
+                # remote_turn_error from the pod's scrubbed error string, so
+                # `code` alone is enough to act on here.
+                try:
+                    repaired = ConversationService(producer_session).repair_image_content(conv_id)
+                    logger.warning(
+                        "[responses] content validation error on remote conversation %s — "
+                        "repaired %d message(s) with image content: %s",
+                        conv_id, len(repaired), failure.get("error"),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to repair conversation %s after remote content validation error",
+                        conv_id,
+                    )
             persist()
             await buffer.close("error")
         except asyncio.CancelledError:
@@ -1121,6 +1139,24 @@ class ResponsesHandler:
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
+            if code == CONTENT_RECOVERY_CODE:
+                # ENG-1992: the provider permanently rejected an image block in
+                # this conversation's stored history — repair the DATA once,
+                # here, rather than special-case every future replay. Never
+                # lets a repair failure mask the turn's real outcome; the
+                # user-facing message above already went out either way.
+                try:
+                    repaired = ConversationService(producer_session).repair_image_content(conv_id)
+                    logger.warning(
+                        "[responses] content validation error on conversation %s — "
+                        "repaired %d message(s) with image content: %s",
+                        conv_id, len(repaired), exc,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to repair conversation %s after content validation error",
+                        conv_id,
+                    )
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
             # re-provision the key in place), "Open Settings" for a BYOK key the
@@ -1269,8 +1305,24 @@ class ResponsesHandler:
             # leak. (cowork PR #156.)
             friendly = friendly_turn_error(exc)
             if friendly is not None:
-                _, message = friendly
+                code, message = friendly
                 logger.info("[responses] user-facing turn error: %s", exc)
+                if code == CONTENT_RECOVERY_CODE:
+                    # ENG-1992: see the streaming path's twin for the full
+                    # rationale — repair the conversation's stored history
+                    # once here rather than special-case every future replay.
+                    try:
+                        repaired = ConversationService(self.scoped).repair_image_content(conversation_id)
+                        logger.warning(
+                            "[responses] content validation error on conversation %s — "
+                            "repaired %d message(s) with image content: %s",
+                            conversation_id, len(repaired), exc,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[responses] failed to repair conversation %s after content validation error",
+                            conversation_id,
+                        )
                 raise HTTPException(status_code=400, detail=message)
             logger.exception("[responses] turn failed")
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
