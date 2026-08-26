@@ -37,6 +37,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev \
+    && v="$(.venv/bin/python -c 'from importlib.metadata import version; print(version("cowork-server"))')" \
+    && echo "cowork-server version: $v" \
+    && case "$v" in 0.0.0*) \
+         echo "ERROR: version resolved to $v - the checkout has no tags, so hatch-vcs" >&2; \
+         echo "       had nothing to describe against. Build with fetch-depth: 0 (ENG-1796)." >&2; \
+         exit 1 ;; \
+       esac \
     && rm -rf /app/.git
 
 
