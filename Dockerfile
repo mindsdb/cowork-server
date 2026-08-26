@@ -26,9 +26,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
 # Then the project source and a full sync (installs cowork-server into the venv).
+#
+# .git rides along in the context on purpose — hatch-vcs reads it to derive the
+# version, which is baked into the installed dist-info by this sync. It is then
+# deleted: the build workflow now checks out full history for that version
+# (ENG-1796), and the final stage COPYs this whole directory, so leaving it
+# would ship every commit of this repo inside the runtime image. Deleting it in
+# the same layer keeps it out of the image rather than merely out of the last
+# one. Order matters: the sync must resolve the version before .git is gone.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev \
+    && rm -rf /app/.git
 
 
 # Final: slim runtime with just the venv + source.
