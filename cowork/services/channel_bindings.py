@@ -153,9 +153,10 @@ class ChannelBindingService:
         what it points at. The binding survives, so a Telegram or Slack group
         stays bound to its project, and the next inbound message starts a fresh
         conversation (`ChannelRuntime._ensure_conversation` already handles an
-        empty pointer). The session rows go with the pointer, exactly as they do
-        in every other detach: `anton_session_id` would otherwise keep naming a
-        conversation that no longer exists.
+        empty pointer). The session rows go with the pointer, matching
+        `detach_conversation` and `reset_conversations` (`update`'s explicit
+        repoint is the one path that keeps them): `anton_session_id` would
+        otherwise keep naming a conversation that no longer exists.
 
         Staged into the caller's transaction, unlike `detach_conversation`,
         which commits. The conversation delete commits once so a crash cannot

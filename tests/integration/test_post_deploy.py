@@ -437,3 +437,60 @@ def test_deleting_a_conversation_leaves_no_replayable_buffer(api, conversation_i
     probe = api.get("/api/v1/responses/in-flight",
                     params={"conversation_id": conversation_id}).json()
     assert probe["has_buffer"] is False, probe
+
+
+def test_deleting_a_scheduled_runs_conversation_keeps_the_run(api):
+    """Deleting a conversation a scheduled run produced must release
+    schedule_runs.conversation_id and schedules.last_result_conversation_id
+    instead of FK-violating into a 500 (ENG-1950), and the run history must
+    survive with its verdict intact. The unit suite pins this on an
+    FK-enforcing SQLite engine; this is the same cascade against the
+    deployment's real alembic-built Postgres."""
+    created = api.post("/api/v1/schedules/", json={
+        "title": "post-deploy delete cascade",
+        "prompt": QUICK_PROMPT,
+        "cadence": "daily",
+        "nextRunAt": "2030-01-01T00:00:00Z",
+        "enabled": False,  # run-now only; the cron loop must not pick it up
+    })
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["id"]
+    try:
+        run_now = api.post(f"/api/v1/schedules/{schedule_id}/run-now")
+        assert run_now.status_code == 202, run_now.text
+        conversation_id = run_now.json()["conversation_id"]
+
+        # Wait for the run to reach a terminal status. Which terminal status
+        # is the turn's business (test_a_turn_runs_end_to_end owns that);
+        # the cascade below must hold for any of them.
+        deadline = time.time() + TURN_TIMEOUT_S
+        run = None
+        while time.time() < deadline:
+            listing = api.get(f"/api/v1/schedules/{schedule_id}/runs")
+            assert listing.status_code == 200, listing.text
+            run = next(
+                (r for r in listing.json()["runs"]
+                 if r.get("conversationId") == conversation_id),
+                None,
+            )
+            if run is not None and run["status"] != "running":
+                break
+            time.sleep(2)
+        assert run is not None and run["status"] != "running", (
+            f"run never reached a terminal status: {run}"
+        )
+
+        deleted = api.delete(f"/api/v1/conversations/{conversation_id}")
+        assert deleted.status_code in (200, 204), deleted.text
+
+        after = api.get(f"/api/v1/schedules/{schedule_id}/runs").json()["runs"]
+        kept = next((r for r in after if r["id"] == run["id"]), None)
+        assert kept is not None, "run history must outlive the chat it produced"
+        assert kept["conversationId"] is None
+        assert (kept["status"], kept["durationMs"]) == (run["status"], run["durationMs"])
+
+        schedule = api.get(f"/api/v1/schedules/{schedule_id}")
+        assert schedule.status_code == 200, schedule.text
+        assert schedule.json()["lastResultConversationId"] is None
+    finally:
+        api.delete(f"/api/v1/schedules/{schedule_id}")
