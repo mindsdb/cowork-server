@@ -89,7 +89,10 @@ def _make_project(tmp: str):
 
 def test_serve_injects_only_with_flag():
     with tempfile.TemporaryDirectory() as tmp:
-        project_dir = _make_project(tmp)
+        # Resolved because the stub must honour the contract of the function it
+        # replaces — see `_registered_project_dirs`. Without it this fails on
+        # macOS only, where tempfile's /var path is a symlink.
+        project_dir = _make_project(tmp).resolve()
         with patch(
             "cowork.services.artifacts._registered_project_dirs",
             return_value=[project_dir],

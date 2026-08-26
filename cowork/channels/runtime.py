@@ -260,7 +260,7 @@ class AntonChannelRuntime:
         self._adapters = adapters
         # None = resolve per scope. A fixed id only resolves for the seeded
         # desktop row; each org has its own, so pinning one here would 404 the
-        # day channels are enabled in cloud (they are 501-gated today).
+        # day channels are enabled in cloud (they are 403-gated today).
         self._default_project_id = default_project_id
         self._locks = _KeyedLocks()
 

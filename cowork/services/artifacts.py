@@ -162,7 +162,18 @@ def _projects_root() -> Path:
 
 
 def _registered_project_dirs() -> list[Path]:
-    """All project directories under the projects root."""
+    """All project directories under the projects root, **resolved**.
+
+    The resolution is part of the contract, not an implementation detail.
+    ``_artifact_root_for_project`` matches these against a resolved candidate
+    with bare set membership, so an unresolved path here simply fails to match
+    and the caller 404s.
+
+    **A test that patches this function must return resolved paths too.** On
+    macOS ``tempfile`` hands back ``/var/folders/...``, a symlink to
+    ``/private/var/folders/...``; a stub returning the raw temp path passes on
+    Linux and fails on a Mac, which is how that state went unnoticed.
+    """
     root = _projects_root().resolve(strict=False)
     if not root.is_dir():
         return []
