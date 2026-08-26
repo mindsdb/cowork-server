@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from cowork.coding import project_store as project_store_module
 from cowork.coding.contracts import SourceContext, WorkspaceKind
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.playbooks import PlaybookService
@@ -59,6 +61,53 @@ def test_new_code_projects_default_to_the_live_gpt_5_6_sol_catalog_id(tmp_path: 
     )
 
     assert project.default_model == "gpt"
+
+
+def test_related_project_updates_roll_back_after_a_mid_write_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = CodeProjectStore(tmp_path / "coding")
+    first_folder = tmp_path / "first"
+    second_folder = tmp_path / "second"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    first = store.create(
+        CodeProject(
+            id="first",
+            name="First",
+            folders=[ProjectFolder(id="first", name="First", path=str(first_folder))],
+        )
+    )
+    second = store.create(
+        CodeProject(
+            id="second",
+            name="Second",
+            folders=[ProjectFolder(id="second", name="Second", path=str(second_folder))],
+        )
+    )
+    second_target = store.root / "second.json"
+    real_replace = os.replace
+    failed = False
+
+    def fail_second_project_once(source, target) -> None:
+        nonlocal failed
+        if Path(target) == second_target and not failed:
+            failed = True
+            raise OSError("simulated storage failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(project_store_module.os, "replace", fail_second_project_once)
+
+    def rename(value: str):
+        return lambda project: setattr(project, "name", value)
+
+    with pytest.raises(OSError, match="simulated storage failure"):
+        store.update_many({first.id: rename("Changed first"), second.id: rename("Changed second")})
+
+    assert store.get(first.id).name == "First"
+    assert store.get(second.id).name == "Second"
+    assert not (store.root / ".transaction.json").exists()
 
 
 def test_task_titles_are_compact_and_end_cleanly() -> None:
