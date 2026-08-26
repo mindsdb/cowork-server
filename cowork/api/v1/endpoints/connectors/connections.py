@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -15,6 +15,7 @@ from cowork.schemas.connectors import (
     PatchPickedFilesBody,
 )
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry
@@ -114,12 +115,21 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
 
 
 @router.patch("/{engine}/{name}/picked-files")
-def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody, scope: ScopeDep):
+async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody, scope: ScopeDep, request: Request):
     """Merge Google-Picker-granted files into the connection's persisted
-    `_picked_files` list. Called by Electron Main right after the user
-    picks files — drive.file scope only covers files the app created, so
-    this is the record of what else the user has explicitly granted."""
+    `_picked_files` list. Called right after the user picks files —
+    drive.file scope only covers files the app created, so this is the
+    record of what else the user has explicitly granted.
+
+    Org mode: the local vault file this otherwise writes to isn't durable
+    or shared across replicas, so the merge happens in auth's Data Vault
+    instead — same forwarded-credential proxy mechanism as the OAuth
+    Connector Lifecycle endpoints. See cowork-server's Google Drive File
+    Picker blueprint item."""
     files = [f.model_dump(by_alias=True, exclude_none=True) for f in body.files]
+    if scope.org_mode:
+        merged = await auth_proxy.proxy_picked_files(engine, name, files, request, OAuthSettings())
+        return {"ok": True, "files": merged}
     merged = ConnectionsService(scope).merge_picked_files(engine, name, files)
     if merged is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")

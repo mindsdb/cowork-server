@@ -16,7 +16,7 @@ import uuid
 from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
 from cowork.handlers.turn_errors import remote_turn_error
 from cowork.services.providers import minds_chat_base_url
-from cowork.turnqueue.auth_keys import mint_turn_key
+from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import get_redis
@@ -117,6 +117,52 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     return block
 
 
+async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
+                            turn_key: str, disabled: list[dict] | None,
+                            settings: TurnQueueSettings) -> dict | None:
+    """Build the job's `oauth` block, sibling to `llm`: gives anton, at the
+    start of a cloud turn, the one thing it needs to fetch its own connector
+    tokens — its existing turn key (reused, not re-minted) plus the list of
+    connections it's allowed to use this turn. Anton presents the turn key
+    straight to auth's `POST /v1/oauth/{engine}/token`, no cowork-server hop
+    at token-fetch time; this function's only job is getting the block onto
+    the wire.
+
+    `disabled` mirrors the desktop path's `disabled_connections` — the same
+    general per-conversation concept (`cowork/schemas/conversations.py`),
+    just not previously threaded into this remote-producer path.
+
+    None when there's nothing to offer this turn: no org context (local/
+    desktop callers never reach this path), auth has no active connections
+    for this org, or every connection is disabled — an absent block is the
+    pod's existing signal for "no connector tokens available," same as
+    before this feature existed.
+    """
+    if not org_id or not user_id:
+        return None
+    try:
+        connections = await list_active_connections(org_id=org_id, user_id=user_id, settings=settings)
+    except Exception:
+        # Never block a turn over connector availability — see _trace_block's
+        # identical reasoning above. A turn that can't reach the connections
+        # list still runs, just without connector tools this time.
+        logger.warning(
+            "[producer] could not list active connections for org %s; oauth block omitted",
+            org_id, exc_info=True,
+        )
+        return None
+    if disabled:
+        disabled_keys = {(d.get("engine"), d.get("name")) for d in disabled}
+        connections = [c for c in connections if (c.get("engine"), c.get("name")) not in disabled_keys]
+    if not connections:
+        return None
+    return {
+        "turn_key": turn_key,
+        "base_url": settings.auth_internal_base_url,
+        "connections": connections,
+    }
+
+
 # What the reply loop reports when the worker stops answering. Shaped like the
 # pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
 # classify it (today: the generic redacted message and the generic error card).
@@ -188,7 +234,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 project_id: str | None = None,
                                 workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
-                                llm: dict | None = None):
+                                llm: dict | None = None,
+                                disabled: list[dict] | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -215,6 +262,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     llm_block = llm or await _mint_llm_block(
         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
     )
+    # Reuses the turn key already minted for llm_block — never mints a
+    # second one. Org/cloud mode only: local-mode turns build in-process
+    # and never reach this function at all.
+    oauth_block = await _mint_oauth_block(
+        org_id=org_id, user_id=user_id, turn_key=llm_block.get("api_key", ""),
+        disabled=disabled, settings=settings,
+    )
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
@@ -225,6 +279,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # mount, which also removes most of what _fit_request exists to trim.
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "model": model, "history": history or [], "llm": llm_block,
+              # Absent entirely (not an empty dict) when there's nothing to
+              # offer — see _mint_oauth_block's docstring for why.
+              **({"oauth": oauth_block} if oauth_block else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
