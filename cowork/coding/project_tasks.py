@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import AbstractContextManager
-from typing import Protocol
-
-from cowork.coding.contracts import CodingEvent, CodingSession, EventType, WorkspaceKind
+from cowork.coding.contracts import CodingEvent, EventType, WorkspaceKind
 from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.integrations import DeveloperIntegrationService
+from cowork.coding.operation_types import EventEmitter, GetSession, MaintenanceSession
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PullRequestActionRequest,
@@ -16,19 +13,6 @@ from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.store import CodingStore
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
-
-
-class EventEmitter(Protocol):
-    def __call__(
-        self,
-        session_id: str,
-        event: CodingEvent,
-        update: Callable[[CodingSession], None] | None = None,
-    ) -> CodingEvent: ...
-
-
-MaintenanceSession = Callable[[str, str], AbstractContextManager[CodingSession]]
-GetSession = Callable[[str], CodingSession]
 
 
 class ProjectTaskOperations:
