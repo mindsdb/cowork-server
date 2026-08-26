@@ -132,6 +132,7 @@ class ProjectCreateRequest(BaseModel):
     folders: list[ProjectFolder] = Field(min_length=1, max_length=24)
     connections: list[ProjectConnection] = Field(default_factory=list, max_length=24)
     environment: ProjectEnvironment = Field(default_factory=ProjectEnvironment)
+    skill_sources: list[ProjectSkillSource] = Field(default_factory=list, max_length=24)
     default_engine_id: str = "codex"
     default_model: str = "gpt"
     permission_mode: PermissionMode = PermissionMode.supervised
@@ -143,6 +144,7 @@ class ProjectUpdateRequest(BaseModel):
     playbook: PlaybookReference | None = None
     connections: list[ProjectConnection] | None = Field(default=None, max_length=24)
     environment: ProjectEnvironment | None = None
+    skill_sources: list[ProjectSkillSource] | None = Field(default=None, max_length=24)
     default_engine_id: str | None = None
     default_model: str | None = None
     permission_mode: PermissionMode | None = None
