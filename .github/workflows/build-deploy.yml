@@ -77,6 +77,17 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v5
+        with:
+          # hatch-vcs derives the version by describing against tags, and the
+          # default fetch-depth of 1 fetches none of them — so the image
+          # reported 0.0.0.dev1+g<sha> while the wheel from the same commit
+          # reported a real CalVer (ENG-1796). The publish job below already
+          # does this for exactly this reason.
+          #
+          # NOTE this makes .git full history rather than a single commit, and
+          # the Dockerfile COPYs the build context into the builder stage. It
+          # deletes .git after the sync so the runtime image does not carry it.
+          fetch-depth: 0
       - uses: mindsdb/github-actions/setup-env@main
       - id: build
         uses: mindsdb/github-actions/build-push-ecr@main
