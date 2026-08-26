@@ -15,10 +15,20 @@ trip is replaced with a plain `window.opener.postMessage(...)` call — see
     {source: "cowork-drive-picker", state, signal: "suspected-account-mismatch"}
 
 Escaping is a hard requirement, not a nice-to-have (mirrors the comments in
-the original TS): `_json_for_script` escapes `<` so a value containing
-`</script>` can't break out of the inline script (this page holds a live
-access token), and `escapeHtml` is additionally used anywhere a value is
-interpolated into visible markup/innerHTML.
+the original TS). Every dynamic value (`state`, `access_token`, `api_key`,
+`app_id`, `account_email`, `file_ids`) is carried into the page as an
+`html.escape()`'d HTML attribute — never interpolated directly into inline
+`<script>` source — and the client script reads them back via
+`dataset`/`JSON.parse` instead of bare embedded literals. `html.escape()`
+is a sanitizer static analysis tooling actually recognizes (unlike a
+bespoke JS-string-escaping helper), so this closes CodeQL's reflected-XSS
+finding for real rather than just being safe in practice: the values here
+were already correctly neutralized before this change (JSON-encoded, with
+every literal less-than sign additionally replaced by its unicode escape
+to block a `</script>` breakout), CodeQL just couldn't verify that itself
+since that substitution was bespoke, not a library call it recognizes.
+`escapeHtml` is additionally used client-side anywhere a value is written
+into innerHTML rather than read as a plain script value.
 
 Message shape posted back to the opener is `{type: "drive-picker-result",
 result: {...}}`, where `result` is exactly the `DrivePickerResult` shape
@@ -96,12 +106,22 @@ def render_picker_page(
     file_ids: list[str] | None = None,
 ) -> str:
     safe_account_email_html = html_lib.escape(account_email)
-    js_state = _json_for_script(state)
-    js_access_token = _json_for_script(access_token)
-    js_api_key = _json_for_script(api_key)
-    js_app_id = _json_for_script(app_id)
-    js_account_email = _json_for_script(account_email)
-    js_file_ids = _json_for_script(file_ids or [])
+
+    # Carried in as html.escape()'d attributes (a sanitizer static analysis
+    # recognizes) instead of interpolated into inline <script> source — see
+    # this module's docstring. json.dumps() on file_ids first so the client
+    # gets the same array back via JSON.parse(dataset.fileIds).
+    data_attrs = {
+        "data-state": state,
+        "data-access-token": access_token,
+        "data-api-key": api_key,
+        "data-app-id": app_id,
+        "data-account-email": account_email,
+        "data-file-ids": json.dumps(file_ids or []),
+    }
+    picker_attrs_html = " ".join(
+        f'{attr_name}="{html_lib.escape(value, quote=True)}"' for attr_name, value in data_attrs.items()
+    )
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Pick Google Drive files</title>
@@ -126,24 +146,30 @@ def render_picker_page(
   .err p {{ color: #d64545; }}
 </style></head>
 <body>
-  <div class="card" id="status">
+  <div class="card" id="status" {picker_attrs_html}>
     <h1><span class="dot"></span>Opening Google Drive picker…</h1>
     <p>A Google file picker will open in a moment, using your {safe_account_email_html} connection.</p>
   </div>
 <script src="https://apis.google.com/js/api.js"></script>
 <script>
 (function () {{
-  var STATE = {js_state};
-  var ACCESS_TOKEN = {js_access_token};
-  var API_KEY = {js_api_key};
-  var APP_ID = {js_app_id};
-  var ACCOUNT_EMAIL = {js_account_email};
-  var FILE_IDS = {js_file_ids};
+  var CARD = document.getElementById('status');
+  var STATE = CARD.dataset.state;
+  var ACCESS_TOKEN = CARD.dataset.accessToken;
+  var API_KEY = CARD.dataset.apiKey;
+  var APP_ID = CARD.dataset.appId;
+  var ACCOUNT_EMAIL = CARD.dataset.accountEmail;
+  var FILE_IDS = JSON.parse(CARD.dataset.fileIds);
   var OPENER_ORIGIN = window.location.origin;
 
-  // ACCOUNT_EMAIL ends up in innerHTML below (not just a JS string literal),
-  // so it needs HTML escaping too, on top of the <script>-breakout escaping
-  // jsonForScript already did when embedding it above.
+  // The browser HTML-decodes data-* attributes for us on the way into
+  // .dataset, so these are already the real values here — no separate
+  // <script>-breakout escaping step needed on this side (that was only
+  // ever a concern for interpolating values directly into script source,
+  // which this page no longer does). ACCOUNT_EMAIL still needs its own
+  // HTML escaping below wherever it's written into innerHTML (see
+  // escapeHtml()) — the attribute decode above only gets it back to its
+  // real value, it doesn't make it safe for a second HTML context.
   function escapeHtml(value) {{
     return String(value).replace(/[&<>"']/g, function (c) {{
       return {{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }}[c];
