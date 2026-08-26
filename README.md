@@ -95,7 +95,7 @@ A **harness** adapts an external agent library (Anton, Hermes, etc.) to the cowo
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
 
-A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`.
+A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
 
 ## Data Layer
 
