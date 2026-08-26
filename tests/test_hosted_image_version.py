@@ -67,6 +67,25 @@ def test_git_metadata_is_not_shipped_in_the_image() -> None:
     )
 
 
+def test_an_unresolvable_version_fails_the_build() -> None:
+    """The strongest guard here: a shallow checkout now FAILS instead of shipping.
+
+    The YAML assertion above pins the workflow, but only this survives someone
+    building the image by another route. It is also what makes the version
+    visible in the build log at all -- had it existed, this bug would have been
+    caught the day it was introduced rather than months later in a trace.
+    """
+    assert 'case "$v" in 0.0.0*)' in _DOCKERFILE, (
+        "the 0.0.0 assertion is gone; a tagless checkout would silently ship a "
+        "version no query can group by, which is the whole bug (ENG-1796)"
+    )
+    assert "exit 1" in _DOCKERFILE
+    assert 'echo "cowork-server version: $v"' in _DOCKERFILE, (
+        "the resolved version is no longer echoed, so a wrong one is invisible "
+        "in the build log"
+    )
+
+
 def test_the_version_is_resolved_before_git_is_deleted() -> None:
     """Ordering is the whole contract: delete first and the version is lost.
 
