@@ -103,6 +103,83 @@ def test_index_leaves_untouched_slug_out_of_touched(conv, tmp_path):
     assert touched == set()
 
 
+def test_concurrent_sibling_artifact_is_not_claimed_by_this_turn(conv, tmp_path):
+    """ENG-1933 regression: every conversation in a project shares one
+    artifacts dir, so a sibling conversation's brand-new artifact appears in
+    this turn's before/after diff too. `tracked_new` — what this turn's own
+    tools reported creating — is what keeps it out of this turn's cards."""
+    base = tmp_path / "artifacts"
+    base.mkdir()
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    _make_artifact(base, "mine", files={"a.md": "x"}, meta={"slug": "mine", "type": "document"})
+    # A concurrent turn in another conversation, writing the same directory.
+    _make_artifact(base, "theirs", files={"b.md": "y"}, meta={"slug": "theirs", "type": "document"})
+
+    new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        tracked_new={"mine"}, tracked_edits={"mine"},
+    )
+
+    assert new == ["mine"]
+    assert "theirs" not in touched
+
+
+def test_without_tracking_both_are_claimed(conv, tmp_path):
+    """The old behaviour, pinned so the fix above is not vacuous: with no
+    tracked set every folder that appeared is claimed — which is exactly the
+    bug when two conversations share a directory. Still the path org mode
+    takes, where a pod's dir cannot be written by another conversation."""
+    base = tmp_path / "artifacts"
+    base.mkdir()
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    _make_artifact(base, "mine", files={"a.md": "x"}, meta={"slug": "mine", "type": "document"})
+    _make_artifact(base, "theirs", files={"b.md": "y"}, meta={"slug": "theirs", "type": "document"})
+
+    new, _touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    )
+
+    assert new == ["mine", "theirs"]
+
+
+def test_tracked_edit_of_a_sibling_artifact_is_not_claimed(conv, tmp_path):
+    """A pre-existing artifact edited by a CONCURRENT turn must not be carded
+    onto this one either, even though its mtime grew during this turn."""
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "mine", files={"a.md": "v1"}, meta={"slug": "mine", "type": "document"})
+    _make_artifact(base, "theirs", files={"b.md": "v1"}, meta={"slug": "theirs", "type": "document"})
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    for slug, name in (("mine", "a.md"), ("theirs", "b.md")):
+        (base / slug / name).write_text("v2")
+        _bump_mtime(base / slug / name, 120)
+
+    _new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        tracked_new={"mine"}, tracked_edits={"mine"},
+    )
+
+    assert touched == {"mine"}
+
+
+def test_tracked_slug_that_never_appeared_is_ignored(conv, tmp_path):
+    """An artifact the agent opened and then deleted must not produce a card
+    for a folder that is no longer on disk."""
+    base = tmp_path / "artifacts"
+    base.mkdir()
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        tracked_new={"vanished"}, tracked_edits={"vanished"},
+    )
+
+    assert new == []
+    assert touched == set()
+
+
 def test_index_never_raises_and_degrades_to_empty(conv):
     # A non-path artifacts_base makes the very first operation blow up; the
     # caller runs this right after a turn's finally and must not get an
