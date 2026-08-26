@@ -449,17 +449,28 @@ async def publish_and_card_turn_artifacts(
     `handlers.responses._produce_remote` calls this against the same shared
     artifacts tree the worker wrote to.
 
-    Cards cover what THIS turn produced or touched. `republished` also carries
-    phase-two self-heal publishes — older artifacts from earlier conversations —
-    and the stream reducer dedupes only within one message, so including them
-    would attach last week's artifacts to this answer.
+    Cards cover what THIS turn produced or touched. In org mode, `republished`
+    also carries phase-two self-heal publishes — older artifacts from earlier
+    conversations — and the stream reducer dedupes only within one message, so
+    an edited (not new) artifact only cards there once its republish this turn
+    actually succeeds; that keeps a self-heal from attaching last week's
+    artifact to this answer.
+
+    Outside org mode nothing is ever published — `autopublish_project_artifacts`
+    is a no-op there — so `republished` is always empty, and gating touched
+    (non-new) slugs on it would mean a local edit never cards at all.
+    `cards_for_slugs` builds a card straight from the local folder regardless of
+    publish state, so every slug this turn touched is cardable there.
     """
     from cowork.services.artifact_autopublish import autopublish_project_artifacts
 
     republished = await autopublish_project_artifacts(
         artifacts_base, scope, touched=set(touched_slugs),
     )
-    carded = set(new_slugs) | (republished & set(touched_slugs))
+    if getattr(scope, "org_mode", False):
+        carded = set(new_slugs) | (republished & set(touched_slugs))
+    else:
+        carded = set(touched_slugs)
     return cards_for_slugs(
         artifacts_base, sorted(carded),
         project_id=project_id, project_name=project_name,
