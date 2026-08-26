@@ -44,6 +44,25 @@ class PreparedWorkspace:
     warning: str | None
 
 
+@dataclass(frozen=True)
+class ApplyPlan:
+    """A validated, typed handoff plan for one isolated workspace."""
+
+    kind: WorkspaceKind
+    git_patch: Path | None = None
+    local_paths: tuple[str, ...] = ()
+
+    @property
+    def has_changes(self) -> bool:
+        return self.git_patch is not None or bool(self.local_paths)
+
+    def __post_init__(self) -> None:
+        if self.kind == WorkspaceKind.git_worktree and self.local_paths:
+            raise ValueError("a Git handoff plan cannot contain local-copy paths")
+        if self.kind == WorkspaceKind.local_copy and self.git_patch is not None:
+            raise ValueError("a local-copy handoff plan cannot contain a Git patch")
+
+
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
@@ -424,11 +443,27 @@ class WorkspaceManager:
             self.git.run(root, "commit", "-m", message.strip())
             return self.git_state(str(root), str(root))
 
+    def commit_checkpoint(self, workspace_path: str) -> str:
+        root = Path(workspace_path)
+        revision = self._head_revision(root)
+        if revision is None:
+            raise WorkspaceError("This task repository has no commit to checkpoint")
+        return revision
+
+    def rollback_commit(self, workspace_path: str, revision: str) -> None:
+        """Remove a task commit while retaining its file changes for retry."""
+        self.git.run(Path(workspace_path), "reset", "--mixed", revision)
+
     def apply_to_source(self, session_id: str, source_path: str, workspace_path: str, base_revision: str | None) -> Path | None:
         with self._mutation_lock:
             plan = self.preflight_apply(session_id, source_path, workspace_path, base_revision)
-            self.apply_checked(source_path, workspace_path, base_revision, plan)
-            return plan if isinstance(plan, Path) else None
+            try:
+                self.apply_checked(source_path, workspace_path, plan)
+            except Exception:
+                if plan.kind == WorkspaceKind.local_copy:
+                    self.rollback_checked(source_path, workspace_path, plan)
+                raise
+            return plan.git_patch
 
     def preflight_apply(
         self,
@@ -436,49 +471,81 @@ class WorkspaceManager:
         source_path: str,
         workspace_path: str,
         base_revision: str | None,
-    ) -> Path | list[str] | None:
+    ) -> ApplyPlan:
         if not base_revision:
             try:
-                return self.local_copies.preflight(Path(source_path), Path(workspace_path))
+                paths = self.local_copies.preflight(Path(source_path), Path(workspace_path))
+                return ApplyPlan(kind=WorkspaceKind.local_copy, local_paths=tuple(paths))
             except LocalCopyError as exc:
                 raise WorkspaceError(str(exc)) from exc
         source = Path(source_path)
         workspace = Path(workspace_path)
         snapshot = self._snapshot_changes(session_id, workspace, base_revision, "handoff.patch")
         if snapshot is None:
-            return None
+            return ApplyPlan(kind=WorkspaceKind.git_worktree)
         patch = snapshot.read_text(encoding="utf-8")
         check = self.git.run(source, "apply", "--check", "--whitespace=nowarn", "-", check=False, input_text=patch)
         if check.returncode != 0:
             detail = (check.stderr or check.stdout or "The changes conflict with the source working tree").strip()
             raise WorkspaceError(f"Handoff stopped before changing the source: {detail[:2_000]}")
-        return snapshot
+        return ApplyPlan(kind=WorkspaceKind.git_worktree, git_patch=snapshot)
 
     def apply_checked(
         self,
         source_path: str,
         workspace_path: str,
-        base_revision: str | None,
-        plan: Path | list[str] | None,
+        plan: ApplyPlan,
     ) -> None:
-        if plan is None:
+        if not plan.has_changes:
             return
-        if not base_revision:
-            if not isinstance(plan, list):
-                raise WorkspaceError("Invalid local-copy handoff plan")
+        if plan.kind == WorkspaceKind.local_copy:
             try:
-                self.local_copies.apply_checked(Path(source_path), Path(workspace_path), plan)
+                self.local_copies.apply_checked(
+                    Path(source_path),
+                    Path(workspace_path),
+                    list(plan.local_paths),
+                )
             except LocalCopyError as exc:
                 raise WorkspaceError(str(exc)) from exc
             return
-        if not isinstance(plan, Path):
+        if plan.kind != WorkspaceKind.git_worktree or plan.git_patch is None:
             raise WorkspaceError("Invalid Git handoff plan")
         self.git.run(
             Path(source_path),
             "apply",
             "--whitespace=nowarn",
             "-",
-            input_text=plan.read_text(encoding="utf-8"),
+            input_text=plan.git_patch.read_text(encoding="utf-8"),
+        )
+
+    def rollback_checked(
+        self,
+        source_path: str,
+        workspace_path: str,
+        plan: ApplyPlan,
+    ) -> None:
+        """Undo an applied handoff plan without discarding task workspace changes."""
+        if not plan.has_changes:
+            return
+        if plan.kind == WorkspaceKind.local_copy:
+            try:
+                self.local_copies.rollback_checked(
+                    Path(source_path),
+                    Path(workspace_path),
+                    list(plan.local_paths),
+                )
+            except LocalCopyError as exc:
+                raise WorkspaceError(str(exc)) from exc
+            return
+        if plan.kind != WorkspaceKind.git_worktree or plan.git_patch is None:
+            raise WorkspaceError("Invalid Git handoff plan")
+        self.git.run(
+            Path(source_path),
+            "apply",
+            "--reverse",
+            "--whitespace=nowarn",
+            "-",
+            input_text=plan.git_patch.read_text(encoding="utf-8"),
         )
 
     def cleanup(
