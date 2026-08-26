@@ -1103,6 +1103,23 @@ def test_remote_error_turn_aborted_on_stall_gets_curated_copy():
     assert "boom" not in msg
 
 
+def test_remote_error_missing_organization_gets_curated_copy():
+    # scratchpad-controller's MissingOrganization (_scratchpad_id_for_job) —
+    # a job dispatched with no organization_id, so it can't be routed to an
+    # EFS access point. The message's own correlation_id prefix varies per
+    # job; matched on the static suffix, which never changes.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "job corr-123 has no organization_id; refusing to run a turn "
+        "without an organization-scoped workspace")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "workspace" in msg
+    assert "support" in msg
+    # The raw correlation_id in the source message must not leak — request_id
+    # already carries it, separately and reliably, on the payload.
+    assert "corr-123" not in msg
+
+
 def test_remote_error_unknown_is_redacted():
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
     code, msg = remote_turn_error("RuntimeError: secret internals")

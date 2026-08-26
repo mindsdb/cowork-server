@@ -223,11 +223,11 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
-# Curated copy for two scratchpad-controller literals that carry no
-# "TypeName:" prefix at all (main.py's own turn_failed publishes), so the
-# type-name parse in remote_turn_error never sees them. Both are matched by
-# prefix rather than passed through verbatim: each can carry an optional
-# "; stderr tail: ..." suffix, which must never reach the user.
+# Curated copy for scratchpad-controller literals that carry no "TypeName:"
+# prefix at all (main.py's own turn_failed publishes), so the type-name parse
+# in remote_turn_error never sees them. Matched by prefix/suffix rather than
+# passed through verbatim: some carry an optional "; stderr tail: ..." suffix
+# or an interpolated correlation_id, neither of which must reach the user.
 POD_STREAM_ENDED_PREFIX = "pod stream ended without a terminal event"
 POD_STREAM_ENDED_USER_MESSAGE = "The turn ended unexpectedly. Please try again."
 TURN_ABORTED_TIMEOUT_PREFIX = "turn aborted: hard turn timeout"
@@ -237,6 +237,19 @@ TURN_ABORTED_TIMEOUT_USER_MESSAGE = (
 TURN_ABORTED_STALL_PREFIX = "turn aborted: no output within stall window"
 TURN_ABORTED_STALL_USER_MESSAGE = (
     "This turn stopped producing output and was ended. Please try again."
+)
+# MissingOrganization (_scratchpad_id_for_job): "job {correlation_id} has no
+# organization_id; ...". The correlation_id prefix varies per job — matched
+# on the static suffix, which doesn't. A data-integrity condition, not
+# something a plain retry is guaranteed to fix, so the copy steers to
+# support rather than implying "just try again" will resolve it.
+MISSING_ORGANIZATION_SUFFIX = (
+    "has no organization_id; refusing to run a turn without an "
+    "organization-scoped workspace"
+)
+MISSING_ORGANIZATION_USER_MESSAGE = (
+    "This task's workspace couldn't be set up. Please try again — if it "
+    "keeps happening, contact support."
 )
 
 
@@ -869,6 +882,8 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
+    if text.endswith(MISSING_ORGANIZATION_SUFFIX):
+        return GENERIC_TURN_ERROR_CODE, MISSING_ORGANIZATION_USER_MESSAGE
     type_name, _, message = text.partition(":")
     message = message.strip()
     if type_name == "TokenLimitExceeded":
