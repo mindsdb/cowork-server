@@ -19,6 +19,20 @@ the original TS): `_json_for_script` escapes `<` so a value containing
 `</script>` can't break out of the inline script (this page holds a live
 access token), and `escapeHtml` is additionally used anywhere a value is
 interpolated into visible markup/innerHTML.
+
+Message shape posted back to the opener is `{type: "drive-picker-result",
+result: {...}}`, where `result` is exactly the `DrivePickerResult` shape
+`cowork`'s web `pickDriveFilesWeb()` (host.ts) resolves its promise with
+directly — `{ok: true, files: [...]}` or `{ok: false, reason: "..."}` — no
+separate "main process" step exists on the web side to translate a raw
+PICKED/CANCEL/ERROR event the way Electron's loopback server does, so this
+page has to emit the final, already-interpreted shape itself. The mapping
+mirrors Electron's own `/result` handler exactly for consistency between
+platforms (`drive-picker-service.ts`): a Cancel click inside the widget, and
+even the Google Picker script failing to load at all, both resolve as
+`{ok: true, files: []}` rather than an error — only a genuine in-widget
+Action.ERROR (most commonly an active-account mismatch) resolves as
+`{ok: false, reason: "..."}`.
 """
 from __future__ import annotations
 
@@ -28,6 +42,48 @@ import json
 
 def _json_for_script(value) -> str:
     return json.dumps(value).replace("<", "\\u003c")
+
+
+def render_picker_error_page(message: str) -> str:
+    """Shown in the popup itself when the session lookup fails (expired /
+    already-used / unknown picker link) — there's no live token to embed
+    here, so this never loads the Google Picker script at all."""
+    safe = html_lib.escape(message)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Pick Google Drive files</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  html, body {{ margin: 0; padding: 0; height: 100%; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: grid; place-items: center; padding: 40px;
+    background: #FAFAFA; color: #0E0F10;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ background: #080d18; color: #E8EDF7; }}
+  }}
+  .card {{ max-width: 420px; text-align: center; }}
+  h1 {{ font-size: 20px; font-weight: 600; margin: 0 0 10px; letter-spacing: -0.01em; color: #d64545; }}
+  p {{ font-size: 14px; line-height: 1.5; margin: 0; color: #6B6F73; }}
+  .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         background: #d64545; margin-right: 8px; vertical-align: middle; }}
+</style></head>
+<body>
+  <div class="card">
+    <h1><span class="dot"></span>Could not open Google Drive</h1>
+    <p>{safe}</p>
+  </div>
+<script>
+(function () {{
+  if (window.opener) {{
+    window.opener.postMessage(
+      {{ type: 'drive-picker-result', result: {{ ok: false, reason: {_json_for_script(message)} }} }},
+      window.location.origin
+    );
+  }}
+}})();
+</script>
+</body></html>"""
 
 
 def render_picker_page(
@@ -102,11 +158,14 @@ def render_picker_page(
 
   // Same-origin popup + opener, so the HTTP round trip desktop's loopback
   // server needed is unnecessary here — post straight back to the tab that
-  // opened this one, scoped to our own origin (never '*').
-  function reportResult(payload) {{
+  // opened this one, scoped to our own origin (never '*'). `result` is the
+  // final DrivePickerResult shape the opener's promise resolves with
+  // directly — see this module's docstring for the PICKED/CANCEL/ERROR
+  // mapping and why it has to be fully resolved here, not just relayed.
+  function reportResult(result) {{
     if (!window.opener) return;
     window.opener.postMessage(
-      Object.assign({{ source: 'cowork-drive-picker', state: STATE }}, payload),
+      {{ type: 'drive-picker-result', result: result }},
       OPENER_ORIGIN
     );
   }}
@@ -129,7 +188,7 @@ def render_picker_page(
     // Not escapeHtml(ACCOUNT_EMAIL) here — the receiving side renders this
     // as plain text, not innerHTML, so escaping would show literal HTML
     // entities in it.
-    reportResult({{ error: 'Google Picker could not open — the browser\\u2019s active Google account may not match ' + ACCOUNT_EMAIL + '.' }});
+    reportResult({{ ok: false, reason: 'Google Picker could not open — the browser\\u2019s active Google account may not match ' + ACCOUNT_EMAIL + '.' }});
   }}
 
   // A static Google 403 error page rendered inside the picker's iframe has
@@ -179,11 +238,11 @@ def render_picker_page(
             files.length + ' file' + (files.length === 1 ? '' : 's') + ' selected',
             'You can close this tab and return to MindsHub Cowork.'
           );
-          reportResult({{ files: files }});
+          reportResult({{ ok: true, files: files }});
         }} else if (data.action === google.picker.Action.CANCEL) {{
           markUserActed();
           setStatus('Picker closed', 'You can close this tab and return to MindsHub Cowork.');
-          reportResult({{ files: [] }});
+          reportResult({{ ok: true, files: [] }});
         }} else if (data.action === google.picker.Action.ERROR) {{
           markUserActed();
           reportPickerLoadFailure();
@@ -196,21 +255,34 @@ def render_picker_page(
     loadTimeoutId = setTimeout(function () {{
       if (userActed) return;
       loadTimeoutId = null;
-      reportResult({{ signal: 'suspected-account-mismatch' }});
+      // Advisory only — must NOT go through reportResult()/'drive-picker-
+      // result', which the opener treats as terminal. This is only a
+      // suspicion (see the comment above buildAndShowPicker on why it can't
+      // be told apart from a widget the user is just still browsing), and
+      // ending the flow here would drop an in-progress selection. Nothing
+      // consumes this distinct type today; it's a hook for the opener to
+      // surface a hint later without risking a false-terminal resolve.
+      if (window.opener) {{
+        window.opener.postMessage({{ type: 'drive-picker-suspected-mismatch' }}, OPENER_ORIGIN);
+      }}
     }}, PICKER_LOAD_TIMEOUT_MS);
   }}
 
   window.onload = function () {{
     if (!window.gapi) {{
       setStatus('Could not load Google Picker', 'Your connection to Google may be blocked. Close this tab and try again.', true);
-      reportResult({{ cancelled: true }});
+      // Matches desktop's own drive-picker-service.ts exactly: the script
+      // failing to load resolves as "picked nothing" (ok: true, no files),
+      // not an error — kept consistent across platforms even though the
+      // status card above visibly flags it.
+      reportResult({{ ok: true, files: [] }});
       return;
     }}
     window.gapi.load('picker', {{
       callback: buildAndShowPicker,
       onerror: function () {{
         setStatus('Could not load Google Picker', 'Close this tab and try again.', true);
-        reportResult({{ cancelled: true }});
+        reportResult({{ ok: true, files: [] }});
       }},
     }});
   }};
