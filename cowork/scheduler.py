@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from sqlalchemy.exc import IntegrityError
+
 from cowork.common.datetime_utils import ensure_utc
 from cowork.common.logger import get_logger
 from cowork.db.session import get_open_session
@@ -70,6 +72,27 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
         schedule.next_run_at,
         schedule.timezone,
     )
+    session.add(schedule)
+
+
+def _apply_success_write_back(
+    schedule: Schedule,
+    run_service: ScheduleRunService,
+    conversation_id: UUID | None,
+    session,
+) -> None:
+    """Stage the bookkeeping for a run that completed: last run time, the
+    pointer to the conversation it produced, and a clean error slate.
+
+    The user can delete this chat while the run is still going, so check
+    before pointing the schedule back at it. Staged only — the caller owns
+    the commit, and its IntegrityError retry re-runs this with no
+    conversation when the delete wins the race anyway.
+    """
+    schedule.last_run_at = datetime.now(timezone.utc)
+    schedule.last_result_conversation_id = run_service.still_exists(conversation_id)
+    schedule.last_error = None
+    schedule.missed_runs = 0
     session.add(schedule)
 
 
@@ -257,13 +280,7 @@ async def execute_schedule(
             schedule.last_error = error
             session.add(schedule)
         else:
-            schedule.last_run_at = datetime.now(timezone.utc)
-            # The user can delete this chat while the run is still going, so
-            # check before pointing the schedule back at it.
-            schedule.last_result_conversation_id = run_service.still_exists(conversation_id)
-            schedule.last_error = None
-            schedule.missed_runs = 0
-            session.add(schedule)
+            _apply_success_write_back(schedule, run_service, conversation_id, session)
 
         # Always consume the cron slot: the schedule stays due otherwise and
         # the loop would immediately restart the run the user killed (a
@@ -272,12 +289,29 @@ async def execute_schedule(
         if not is_manual:
             _advance_next_run_at(schedule, session)
 
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            # Only the success write-back stages a foreign-key write (the
+            # last_result pointer), so this is the user's delete landing
+            # between still_exists' read and this commit — the delete's
+            # release already nulled the column. Redo the write-back without
+            # the pointer so the bookkeeping and the consumed slot survive.
+            session.rollback()
+            schedule = schedule_service.get_schedule(schedule_id)
+            _apply_success_write_back(schedule, run_service, None, session)
+            if not is_manual:
+                _advance_next_run_at(schedule, session)
+            session.commit()
 
     except Exception as exc:
         error = str(exc)
         logger.exception(f"Schedule {schedule_id} run failed: {error}")
         try:
+            # The failed transaction blocks every later statement until it
+            # rolls back; without this the writes below die on
+            # PendingRollbackError and the error is never recorded.
+            session.rollback()
             schedule = schedule_service.get_schedule(schedule_id)
             schedule.last_error = error
             session.add(schedule)
@@ -286,6 +320,10 @@ async def execute_schedule(
             pass
     finally:
         try:
+            # Same guard for the run record: a swallowed failure above can
+            # leave the session unusable, and this write must always land or
+            # the run strands at `running` and wedges the schedule.
+            session.rollback()
             run_service.finish_run(
                 run.id, conversation_id=conversation_id, error=error, status=final_status
             )

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
@@ -112,8 +113,9 @@ class ScheduleService:
         Two columns point at a conversation: a run records the one it produced,
         and a schedule records the one its last run produced. Neither is the
         run's own data, and both are nullable, so tidying a chat releases the
-        link and leaves the run history it is an audit trail of. Nothing reads
-        either column, and the desktop already renders a run with no
+        link and leaves the run history it is an audit trail of. Every reader
+        tolerates the empty pointer: both response schemas declare the fields
+        `UUID | None`, and the desktop already renders a run with no
         conversation.
 
         Staged into the caller's transaction, never committed here: whoever is
@@ -239,11 +241,21 @@ class ScheduleRunService:
 
         Read on the raw session so the org filter cannot answer "gone" for a
         conversation that is merely out of scope, which would drop a live link.
+
+        A core SELECT, not `Session.get`: the session factory runs with
+        `expire_on_commit=False`, so `get` answers from the identity map with
+        no query at all, and the scheduler's session is the one that created
+        this conversation. `get` would report it alive for the whole run,
+        however long ago another session deleted it. Only a statement asks
+        the database.
         """
         if conversation_id is None:
             return None
         raw = unsafe_unscoped_session(self.session)
-        return conversation_id if raw.get(Conversation, conversation_id) is not None else None
+        row = raw.execute(
+            sa.select(Conversation.id).where(Conversation.id == conversation_id)
+        ).first()
+        return conversation_id if row is not None else None
 
     def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> None:
         """Attach the run's conversation as soon as it is known — before the
@@ -253,7 +265,13 @@ class ScheduleRunService:
             return
         run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # The delete landed between still_exists' read and this commit,
+            # and its release already nulled the column in the database. The
+            # run simply has no conversation to point at.
+            self.session.rollback()
 
     def finish_run(
         self,
@@ -274,7 +292,15 @@ class ScheduleRunService:
         if conversation_id is not None:
             run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # The delete landed between still_exists' read and this commit,
+            # and its release already nulled the column in the database.
+            # Rewrite without the pointer rather than stranding the run at
+            # `running`, which would wedge the schedule until a restart.
+            self.session.rollback()
+            return self.finish_run(run_id, error=error, status=status)
         self.session.refresh(run)
         return run
 
