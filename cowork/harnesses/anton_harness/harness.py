@@ -168,53 +168,28 @@ def build_elicitor(conversation_id: str):
     return CoworkElicitor(conversation_id, broker)
 
 
-_REPLAY_IMAGE_PLACEHOLDER = "[an image was returned here; omitted from replayed history]"
-
-
-def _sanitize_tool_result(block: dict) -> dict:
-    """Replace image parts inside a tool_result with a text marker.
-
-    Base64 image payloads would bloat the JSON column and add nothing to the
-    replayed history. The marker states the removal happened at replay time
-    (not that the tool returned it) so the model doesn't misread it.
-    """
-    content = block.get("content")
-    if not isinstance(content, list):
-        return block
-    scrubbed = [
-        {"type": "text", "text": _REPLAY_IMAGE_PLACEHOLDER}
-        if isinstance(part, dict) and part.get("type") == "image"
-        else part
-        for part in content
-    ]
-    return {**block, "content": scrubbed}
-
-
 def _split_turn_into_rows(history_slice: list) -> list[dict]:
-    """Extract the tool block-rows of one turn from anton's raw history slice.
+    """Extract this turn's tool block-rows from anton's raw history slice.
 
-    Keeps only `tool_use` (assistant) / `tool_result` (user) blocks as
-    `{role, content}` rows. Text blocks are dropped — the assistant's visible
-    text is persisted once in the display row — so a pure-text message yields
-    no row. Images inside tool_result are replaced with a replay marker.
+    Delegates to anton rather than reimplementing: the pod entrypoint
+    (`anton.cloud_turn.__main__`) builds the same rows for a cloud turn, and the
+    two must agree byte for byte. Desktop and SaaS read the same `messages`
+    table, so a divergence would not fail here — it would surface as an invalid
+    tool_use -> tool_result sequence many turns later, in whichever path did not
+    write the row. anton owns the implementation (ENG-1808); the slicing and the
+    compaction/cancel guards stay on this side, which is the only side that
+    knows whether a turn ended cleanly.
+
+    Imported inside the function, like every other anton import in this file.
+    `anton.cloud_turn.__init__` re-exports the pod entrypoint's contract and
+    session builder, so a module-level import here would pull
+    `anton.cloud_turn.session` into every process that merely loads this
+    harness — the pod's session machinery, which the desktop path never uses.
+    The function itself has no imports of its own beyond `__future__`.
     """
-    rows: list[dict] = []
-    for msg in history_slice:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        keep_type = "tool_use" if role == "assistant" else "tool_result"
-        blocks = [
-            _sanitize_tool_result(b) if keep_type == "tool_result" else b
-            for b in content
-            if isinstance(b, dict) and b.get("type") == keep_type
-        ]
-        if blocks:
-            rows.append({"role": role, "content": blocks})
-    return rows
+    from anton.cloud_turn.history_rows import split_turn_into_rows
+
+    return split_turn_into_rows(history_slice)
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
