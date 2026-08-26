@@ -48,10 +48,16 @@ def _require_local_channels() -> None:
     Until installations are org-owned, org mode must not expose them — any
     tenant could read/delete another's credentials or drive the shared
     adapter. The runtime side already fails closed; this closes the config
-    side."""
+    side.
+
+    Answers 403 for the reason require_local_tenancy does: refusing a caller
+    at a tenant boundary is an authorization decision, and a 501 would score
+    it as a server fault. The two lifecycle 501s below are different, and
+    they stay 501: they report that a channel plugin ships no setup or
+    teardown at all."""
     if get_app_settings().tenancy_mode == "org":
         raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="channels are not available in org deployments yet",
         )
 
@@ -99,7 +105,7 @@ def get_channel_agent() -> ChannelAgentResponse:
 def set_channel_agent(
     body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep
 ) -> ChannelAgentResponse:
-    # Channel config is local-only (_require_local_channels → 501 in org mode),
+    # Channel config is local-only (_require_local_channels → 403 in org mode),
     # so an unscoped SettingService writing the global row is correct here.
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService

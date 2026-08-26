@@ -95,7 +95,7 @@ A **harness** adapts an external agent library (Anton, Hermes, etc.) to the cowo
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
 
-A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`.
+A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
 
 ## Data Layer
 
@@ -199,6 +199,29 @@ explain why.
 An explicitly stored model is never rewritten by this. Paying for a better model
 is a pick in the Settings picker, and a funded wallet resolves to the same
 default as an empty one until that pick is made.
+
+### A stored model the wallet cannot pay for is swapped, not rewritten
+
+`/v1/models` marks a model the org cannot currently pay for as `enabled: false`,
+and the map is cached as `minds_model_enabled`. When a stored pin is flagged
+that way, `_resolved_model` resolves the role to the first affordable model in
+the map instead, for all three roles. The alternative is every turn failing on a
+denial the user may not be able to see.
+
+The stored row is left exactly as the user set it, which is the load-bearing
+half: the moment the wallet can pay again, the next settings load flips the
+alias back to `enabled: true` and the role resolves to the original pick with
+nothing to re-select.
+
+Two cases share that path and should not be confused. A pin the map flags
+`false` is a real MindsHub model that is merely unaffordable right now. A pin
+**absent** from a non-empty map is foreign or retired, so it would 404 on every
+turn rather than 402, and it is healed the same way with no route back.
+
+The desktop closes the loop at the other end: a model the map locks is not
+offered in either picker, so a swap only ever applies to a pin that was
+affordable when it was made. Allowing the pick meant the turn silently ran a
+different model from the one the picker named.
 
 #### Where the answer comes from, in order
 

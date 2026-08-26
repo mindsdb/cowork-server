@@ -353,6 +353,26 @@ class ProjectService:
             .order_by(Project.created_at, Project.id)
         ).first()
 
+    def get_or_provision_by_name_or_none(self, name: str) -> Project | None:
+        """Resolve a name, provisioning the org's default on a `general` miss.
+
+        `general` is lazily created per org, so a plain by-name lookup can 404 before the
+        org's first `GET /projects/` provisions its row. Every other name stays exact.
+        The single home for this self-heal: callers that must not auto-provision stay on
+        the plain primitives, and it can't fold into those (`ensure_general_for_scope`
+        calls `get_project_by_name_or_none`, so self-healing there would recurse).
+        """
+        if name == GENERAL_PROJECT:
+            return self.ensure_general_for_scope()
+        return self.get_project_by_name_or_none(name)
+
+    def get_or_provision_by_name(self, name: str) -> Project:
+        """`get_or_provision_by_name_or_none`, raising when the name is genuinely missing."""
+        project = self.get_or_provision_by_name_or_none(name)
+        if project is None:
+            raise ValueError("Project not found")
+        return project
+
     def _allocate_project_dir(self, base: str) -> tuple[str, Path]:
         """Claim a directory by creating it, bumping the name on collision."""
         candidate = self._unique_name(base)

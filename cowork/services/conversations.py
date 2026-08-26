@@ -22,6 +22,8 @@ from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
+from cowork.services.channel_bindings import ChannelBindingService
+from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
 
@@ -352,9 +354,11 @@ class ConversationService:
     def project_by_name(self, name: str | None) -> Project | None:
         if not name:
             return None
-        return self.session.exec(
-            self.session.select(Project).where(Project.name == name)
-        ).first()
+        # Delegate so the `general` self-heal lives in one place.
+        # Lazy import: projects imports this module.
+        from cowork.services.projects import ProjectService
+
+        return ProjectService(self.session).get_or_provision_by_name_or_none(name)
 
     def update_conversation(
         self,
@@ -449,6 +453,16 @@ class ConversationService:
         attachment_dirs = FileService(self.session).delete_by_purpose(
             attachment_purpose(str(conversation_id))
         )
+        # Three more tables point at this conversation, and unlike the rows above
+        # they are not the conversation's own data: a schedule and its runs record
+        # the conversation a run produced, and a channel binding records the one
+        # its external chat is pinned to. No foreign key in this schema declares
+        # an `ondelete`, so Postgres refuses the delete below while any of them
+        # still points here, and SQLite (desktop, and the whole test suite) runs
+        # with foreign keys off and orphans them instead. Each owning service
+        # releases its own link and keeps its rows, staged into this transaction.
+        ScheduleService(self.session).release_conversation(conversation_id)
+        ChannelBindingService(self.session).release_conversation(conversation_id)
         # anton snapshots the scratchpad namespace to
         # `<project>/.anton/scratchpad-sessions/<conversation_id>/` so variables survive
         # the pad process being replaced each turn (ENG-1124). Nothing else prunes those
