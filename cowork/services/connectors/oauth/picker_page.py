@@ -51,7 +51,7 @@ Action.ERROR (most commonly an active-account mismatch) resolves as
 """
 from __future__ import annotations
 
-import html as html_lib
+import html
 import json
 
 
@@ -63,7 +63,7 @@ def render_picker_error_page(message: str) -> str:
     """Shown in the popup itself when the session lookup fails (expired /
     already-used / unknown picker link) — there's no live token to embed
     here, so this never loads the Google Picker script at all."""
-    safe = html_lib.escape(message)
+    safe = html.escape(message)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Pick Google Drive files</title>
 <style>
@@ -110,7 +110,7 @@ def render_picker_page(
     state: str,
     file_ids: list[str] | None = None,
 ) -> str:
-    safe_account_email_html = html_lib.escape(account_email)
+    safe_account_email_html = html.escape(account_email)
 
     # Carried in as html.escape()'d attributes (a sanitizer static analysis
     # recognizes) instead of interpolated into inline <script> source — see
@@ -125,7 +125,7 @@ def render_picker_page(
         "data-file-ids": json.dumps(file_ids or []),
     }
     picker_attrs_html = " ".join(
-        f'{attr_name}="{html_lib.escape(value, quote=True)}"' for attr_name, value in data_attrs.items()
+        f'{attr_name}="{html.escape(value, quote=True)}"' for attr_name, value in data_attrs.items()
     )
 
     return f"""<!doctype html>
