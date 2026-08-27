@@ -1,3 +1,11 @@
+# Staging is the first environment to run the ingress restriction, and the
+# only one that can rehearse it: cowork-server has no deployment in the dev
+# namespace, and PR environments take base values only. Watch the pods stay
+# Ready through the rollout and watch the integration job's cross-replica
+# test, which reaches the pods by port-forward. Reverting is this key.
+networkPolicy:
+  enabled: true
+
 deployment:
   ingress:
     enabled: true

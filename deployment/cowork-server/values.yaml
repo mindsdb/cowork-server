@@ -14,6 +14,65 @@ sharedStorage:
   storageClassName: efs-cowork-env
   size: 1Gi
 
+# Who may open a connection to the cowork-server pods. See
+# templates/network-policy.yaml for why this is the boundary the identity
+# headers depend on.
+#
+# Off by default so a bare install, a desktop chart or an environment nobody
+# has validated yet cannot lock itself out. Turn it on one environment at a
+# time and watch pod readiness while it rolls: rule (b) is what keeps the
+# kubelet's probes working, and a wrong CIDR there fails the readiness probe
+# rather than anything a user would notice first.
+#
+# Enforcement is not the same on both clusters. newdev runs the AWS VPC CNI's
+# policy controller AND Cilium; newprod runs Cilium alone, installed
+# 2026-08-20. Cilium claims a pod when the pod is created, so in newprod a
+# policy only applies to pods that started after it. Roll the deployment after
+# enabling, then prove it rather than assuming.
+networkPolicy:
+  enabled: false
+
+  # Matches deployment.service.targetPort below.
+  port: 9010
+
+  # The subchart labels its pods `app: <deployment.name>` and emits no
+  # app.kubernetes.io/name, so this is the only selector that matches.
+  podSelectorLabels:
+    app: cowork-server
+
+  # The nginx ingress controller, which is the only thing that should ever
+  # reach these pods over the network. It runs in `infrastructure`, NOT in
+  # `ingress-nginx`. Kubernetes stamps kubernetes.io/metadata.name on every
+  # namespace, so that label needs nothing added to the cluster. Confirm with:
+  #   kubectl get ns -L kubernetes.io/metadata.name | grep -i infra
+  ingressController:
+    enabled: true
+    namespaceSelector:
+      kubernetes.io/metadata.name: infrastructure
+
+  # Escape hatch for traffic that arrives from a node rather than a pod, which
+  # is what kubelet probes and `kubectl port-forward` do. Empty on purpose, and
+  # it should stay empty.
+  #
+  # Both enforcers already allow a node to reach a pod it hosts, because a
+  # policy that refused the kubelet would fail every readiness probe in the
+  # cluster. So probes and port-forward are expected to keep working with no
+  # rule here. Verify that when enabling an environment rather than trusting
+  # it: watch the pods stay Ready, and watch the integration job's cross-replica
+  # test, which port-forwards to two pods.
+  #
+  # READ THIS BEFORE FILLING IT IN. The VPC CNI gives pods addresses out of the
+  # same VPC subnets the nodes use: in newdev both nodes and pods sit in
+  # 10.105.0.0/16. So "the node CIDR" is also every pod's CIDR, and putting it
+  # here re-admits the arbitrary in-cluster caller this whole policy exists to
+  # refuse. If probes really do need a rule, use the individual node addresses
+  # as /32s, and treat needing that at all as a reason to go back and find out
+  # why the CNI is not exempting host traffic.
+  nodeCidrs: []
+
+  # Verbatim extra ingress rules, for anything the three above do not cover.
+  extraIngress: []
+
 # Default values for deployment, this is necessary because we're using a unified helm subchart
 deployment:
   # This is the name of the deployment, this is used in a _lot_ of places in the helm charts so lets just specify it

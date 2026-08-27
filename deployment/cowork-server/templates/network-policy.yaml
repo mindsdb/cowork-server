@@ -1,0 +1,69 @@
+{{- if .Values.networkPolicy.enabled }}
+# The boundary cowork-server's whole identity model rests on.
+#
+# In org mode the pod does not authenticate anyone. The nginx ingress runs an
+# auth subrequest against the auth service and copies X-User-Id and
+# X-Organization-Id off the answer, and cowork-server validates the shape of
+# those headers and then trusts them. Enforcing identity in the application
+# refuses a caller carrying NO headers; it does nothing about a caller in the
+# cluster that sends two well-formed UUIDs of its own. Only the network can
+# refuse that caller, which is what this does.
+#
+# policyTypes: [Ingress] with no default rule is default-deny ingress; the rules
+# below re-allow the sources that have to reach the pod. Egress (Postgres,
+# Redis, the auth service, DNS, EFS) is deliberately left open.
+#
+# Ported from the same template in the auth chart, which the auth service has
+# carried disabled since its own hardening pass. One value differs and it
+# matters: the ingress controller runs in the `infrastructure` namespace here,
+# not in `ingress-nginx`, which is what the auth chart's default still says.
+#
+# Guarded by networkPolicy.enabled (default false) so no environment locks
+# itself by inheriting it. Enable one environment at a time and watch pod
+# readiness: a policy that refuses the kubelet takes the deployment down.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-allow-ingress
+  labels:
+    app: {{ .Values.deployment.name }}
+spec:
+  # The devops-nirvana `deployment` subchart labels its pods `app: <name>`; it
+  # does not emit app.kubernetes.io/name, so do not select on that.
+  podSelector:
+    matchLabels:
+{{ toYaml .Values.networkPolicy.podSelectorLabels | indent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+{{- if .Values.networkPolicy.ingressController.enabled }}
+    # (a) Every real request. The ALB targets the controller pods by IP, so
+    #     from the pod's side every legitimate caller is an ingress-nginx pod.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+{{ toYaml .Values.networkPolicy.ingressController.namespaceSelector | indent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.port }}
+{{- end }}
+{{- with .Values.networkPolicy.nodeCidrs }}
+    # (b) The nodes. Liveness and readiness probes come from the kubelet, and
+    #     so does port-forward, which the integration suite uses to reach two
+    #     replicas past the ingress's sticky cookie. Neither is a pod, so
+    #     neither matches a podSelector or a namespaceSelector.
+    - from:
+{{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          # `with` rebound the dot to the CIDR list, so this needs the root.
+          port: {{ $.Values.networkPolicy.port }}
+{{- end }}
+{{- with .Values.networkPolicy.extraIngress }}
+    # (c) Operator-supplied extra sources, verbatim ingress rules.
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- end }}
