@@ -118,6 +118,25 @@ def get_principal(request: Request) -> Principal | None:
     return getattr(request.state, "principal", None)
 
 
+def caller_bearer(request: Request | None) -> str:
+    """The caller's own bearer token, for a read this server makes on their behalf.
+
+    Every outbound MindsHub call that acts as the caller sends this and never the
+    stored provider key or ``minds_url``: both of those are tenant-settable, so
+    using either would let an org admin point a member's credential at a host
+    they chose. Empty string when there is no bearer, which callers turn into
+    their fail-closed answer rather than an anonymous request.
+
+    This is not an identity source. Nothing here decides who the caller is: in
+    org mode that is the gateway's injected headers, and this token is opaque to
+    us. It exists only to be forwarded to the service that can verify it.
+    """
+    if request is None:
+        return ""
+    header = request.headers.get("Authorization", "")
+    return header[7:].strip() if header.lower().startswith("bearer ") else ""
+
+
 # Keycloak org role that marks an organization admin (see auth's
 # role_context/authenticate: X-User-Roles carries realm + org roles).
 ORG_MANAGE_ROLE = "manage-organization"
