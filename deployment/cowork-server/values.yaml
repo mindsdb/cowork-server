@@ -29,26 +29,57 @@ sharedStorage:
 # 2026-08-20. Cilium claims a pod when the pod is created, so in newprod a
 # policy only applies to pods that started after it. Roll the deployment after
 # enabling, then prove it rather than assuming.
+#
+# TWO THINGS BLOCK ENABLING THIS, AND BOTH ARE OUTSIDE THIS CHART.
+#
+#   1. The CI deploy identity cannot create the kind. `helm upgrade` runs
+#      in-cluster as `system:serviceaccount:infrastructure:<env>-gha-runner`,
+#      and on newdev `auth can-i create networkpolicies -n staging` answers no
+#      (`ingresses` and `deployments` answer yes). Enabling this therefore fails
+#      the release, and `--atomic` rolls the whole deploy back with it. The
+#      runner ClusterRole in Kubernetes-Foundational-Services needs the verb
+#      first.
+#   2. There is no working canary. `kubectl port-forward` cannot observe this
+#      policy at all: containerd's CRI PortForward enters the pod's network
+#      namespace and dials localhost, so the bytes never cross the veth where
+#      Cilium or the VPC CNI agent enforces ingress. Pod readiness is a real
+#      signal; the integration job's cross-replica test is not, and it has been
+#      failing on every staging push for unrelated RBAC reasons anyway.
+#
+# So the probe that actually proves this works is the forged-header curl from a
+# pod in another namespace, run by hand after a rollout.
 networkPolicy:
   enabled: false
 
-  # Matches deployment.service.targetPort below.
-  port: 9010
-
-  # The subchart labels its pods `app: <deployment.name>` and emits no
-  # app.kubernetes.io/name, so this is the only selector that matches.
-  podSelectorLabels:
-    app: cowork-server
+  # Both default off the values the deployment itself uses, so neither can
+  # drift. Set them only to deviate deliberately.
+  #
+  # Drift in either fails SILENTLY and in opposite directions: a port nothing
+  # listens on drops every legitimate request, and a podSelector matching no pod
+  # makes the policy a no-op that still reads as enabled.
+  port: ""            # defaults to deployment.service.targetPort
+  podSelectorLabels: {}   # defaults to {app: deployment.name}
 
   # The nginx ingress controller, which is the only thing that should ever
   # reach these pods over the network. It runs in `infrastructure`, NOT in
   # `ingress-nginx`. Kubernetes stamps kubernetes.io/metadata.name on every
   # namespace, so that label needs nothing added to the cluster. Confirm with:
   #   kubectl get ns -L kubernetes.io/metadata.name | grep -i infra
+  #
+  # The podSelector is not optional in practice. A namespaceSelector on its own
+  # admits every pod in `infrastructure`, and that namespace also runs the
+  # GitHub Actions runners and openvpn, which MASQUERADEs VPN client traffic to
+  # its own pod IP. Either could then send forged identity headers, which is the
+  # exact caller this policy exists to refuse. The label below is stamped by
+  # Kubernetes-Foundational-Services (nginx-ingress values `controller.podLabels`)
+  # with no per-environment override, so nothing needs adding to the cluster:
+  #   kubectl -n infrastructure get pods -l nginx-ingress-controller=true
   ingressController:
     enabled: true
     namespaceSelector:
       kubernetes.io/metadata.name: infrastructure
+    podSelector:
+      nginx-ingress-controller: "true"
 
   # Escape hatch for traffic that arrives from a node rather than a pod, which
   # is what kubelet probes and `kubectl port-forward` do. Empty on purpose, and
@@ -56,10 +87,11 @@ networkPolicy:
   #
   # Both enforcers already allow a node to reach a pod it hosts, because a
   # policy that refused the kubelet would fail every readiness probe in the
-  # cluster. So probes and port-forward are expected to keep working with no
-  # rule here. Verify that when enabling an environment rather than trusting
-  # it: watch the pods stay Ready, and watch the integration job's cross-replica
-  # test, which port-forwards to two pods.
+  # cluster. So probes are expected to keep working with no rule here. Verify
+  # that when enabling an environment rather than trusting it: watch the pods
+  # stay Ready through the rollout. Do NOT read the integration job's
+  # cross-replica test as the signal, whichever way it goes, for the reason in
+  # the header above.
   #
   # READ THIS BEFORE FILLING IT IN. The VPC CNI gives pods addresses out of the
   # same VPC subnets the nodes use: in newdev both nodes and pods sit in
