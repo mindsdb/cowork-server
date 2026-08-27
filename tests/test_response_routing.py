@@ -70,7 +70,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
     monkeypatch.setattr(
         routing,
         "get_user_settings",
-        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="router-model"),
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
@@ -120,12 +120,15 @@ async def test_ineligible_request_shapes_delegate_without_router_call(
 
 
 @pytest.mark.asyncio
-async def test_model_override_wins_over_settings_router_model(monkeypatch):
-    """ENG-1656 follow-up: the composer's per-conversation model pick must
-    drive the router gate too, not just cosmetically label the response."""
+async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch):
+    """ENG-1851: the gate's model is `resolved_gate_model`, not the user's
+    router pick and not the client's router model. Both are chosen for chat
+    or summarization; a model picked for those is routinely too slow to gate
+    a turn inside the budget. (Reverses the ENG-1656 follow-up's routing half.)"""
     import cowork.handlers.response_routing as routing
 
     client = _Client(_response(content="The result was 42."))
+    client.router_model = "opus"  # the user's router pick, as the client sees it
     seen_models = []
 
     async def fake_gate(binding, *, history):
@@ -135,7 +138,11 @@ async def test_model_override_wins_over_settings_router_model(monkeypatch):
     monkeypatch.setattr(
         routing,
         "get_user_settings",
-        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="router-model"),
+        lambda: SimpleNamespace(
+            resolved_router_provider=_Provider(),
+            resolved_router_model="opus",
+            resolved_gate_model="mindshub_air",
+        ),
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
@@ -145,11 +152,10 @@ async def test_model_override_wins_over_settings_router_model(monkeypatch):
         has_non_text_input=False,
         has_attachments=False,
         has_disabled_connections=False,
-        model_override="picked-model",
     )
 
-    assert seen_models == ["picked-model"]
-    assert decision.model == "picked-model"
+    assert seen_models == ["mindshub_air"]
+    assert decision.model == "mindshub_air"
 
 
 @pytest.mark.asyncio
@@ -160,7 +166,7 @@ async def test_router_decline_delegates(monkeypatch):
     monkeypatch.setattr(
         routing,
         "get_user_settings",
-        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="router-model"),
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda: client)
     monkeypatch.setattr(
@@ -187,7 +193,7 @@ async def test_router_error_fails_open_to_anton(monkeypatch):
     monkeypatch.setattr(
         routing,
         "get_user_settings",
-        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="router-model"),
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda: (_ for _ in ()).throw(RuntimeError("down")))
 
@@ -212,7 +218,7 @@ async def test_slow_gate_times_out_and_fails_open(monkeypatch):
     monkeypatch.setattr(
         routing,
         "get_user_settings",
-        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="router-model"),
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda: _Client(_response(content="unused")))
 
@@ -290,8 +296,11 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_route_request_forwards_model_to_decide_route(monkeypatch):
-    """ENG-1656 follow-up: the composer's model pick must reach the gate."""
+async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeypatch):
+    """ENG-1851: the composer's per-conversation pick drives Anton's turn, not
+    the gate. `_route_request` no longer accepts or forwards it."""
+    import inspect
+
     import cowork.handlers.responses as responses
 
     handler = _routing_handler(monkeypatch)
@@ -303,7 +312,7 @@ async def test_route_request_forwards_model_to_decide_route(monkeypatch):
     seen = {}
 
     async def fake_decide_route(**kwargs):
-        seen["model_override"] = kwargs.get("model_override")
+        seen.update(kwargs)
         return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
 
     monkeypatch.setattr(responses, "decide_route", fake_decide_route)
@@ -313,10 +322,10 @@ async def test_route_request_forwards_model_to_decide_route(monkeypatch):
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
-        model="picked-model",
     )
 
-    assert seen["model_override"] == "picked-model"
+    assert "model_override" not in seen
+    assert "model" not in inspect.signature(handler._route_request).parameters
 
 
 @pytest.mark.asyncio
@@ -411,7 +420,8 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
         responses, "get_user_settings",
         lambda scope: SimpleNamespace(
             resolved_router_provider=Provider.MINDS_CLOUD,
-            resolved_router_model="kimi",
+            resolved_router_model="kimi",        # the user's summarization pick
+            resolved_gate_model="mindshub_air",  # what the gate actually runs on
         ),
     )
     block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
@@ -427,7 +437,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
 
     assert binding is not None
     assert binding.label == "minds_cloud"
-    assert binding.model == "kimi"
+    assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
 
@@ -615,7 +625,7 @@ async def test_router_unavailable_keeps_model_attribution(monkeypatch):
     monkeypatch.setattr(
         routing,
         "get_user_settings",
-        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="opus"),
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="opus"),
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda: _Boom())
 

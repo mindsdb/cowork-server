@@ -273,7 +273,6 @@ class ResponsesHandler:
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=bool(disabled),
-            model=request.model,
         )
         trace_metadata = {
             **trace_metadata,
@@ -387,9 +386,12 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
-        model: str | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        The composer's per-conversation model pick (`request.model`) is
+        deliberately not passed down: it drives Anton's turn, not the gate
+        (see `UserSettings.resolved_gate_model`).
 
         Returns the decision plus pre-minted turn credentials
         (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
@@ -418,7 +420,6 @@ class ResponsesHandler:
                     has_attachments=has_attachments,
                     has_disabled_connections=has_disabled_connections,
                     binding=binding,
-                    model_override=model,
                 )
             return decision, turn_llm
         except Exception:
@@ -455,7 +456,7 @@ class ResponsesHandler:
         )
         binding = RouterBinding(
             provider=provider,
-            model=settings.resolved_router_model or MINDS_FREE_MODEL,
+            model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
         return binding, {"correlation_id": corr, "llm": block}

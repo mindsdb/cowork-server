@@ -600,3 +600,68 @@ def test_a_role_the_catalog_omits_keeps_the_compiled_slot_in_the_pair(monkeypatc
         COMPILED["coding"],
         COMPILED["router"],
     ]
+
+
+# ── The gate's own model (ENG-1851) ─────────────────────────────────────
+#
+# The route gate runs ahead of every turn on a budget of seconds, so it takes the
+# router role's *default* — chosen for speed — and ignores the user's router pick,
+# which is really a summarization pick. openai-compatible is the one exception:
+# no canonical model exists there, so the user's own is the only one the gate can use.
+
+
+def test_gate_follows_the_declared_router_default_not_the_users_pick():
+    s = _minds(
+        minds_role_defaults=MOVED, minds_model_enabled=EVERYTHING_ENABLED,
+        router_provider=Provider.MINDS_CLOUD, router_model="opus",
+    )
+
+    assert s.resolved_router_model == "opus"   # summarization keeps the pick
+    assert s.resolved_gate_model == "kimi"     # the gate takes the declared default
+
+
+def test_gate_falls_back_to_the_compiled_router_default_without_a_catalog():
+    s = _minds(minds_role_defaults="{}", minds_model_enabled="{}", router_model="opus")
+
+    assert s.resolved_gate_model == COMPILED["router"]
+
+
+def test_gate_default_is_availability_adjusted():
+    """A declared default the wallet cannot pay for must not gate every turn
+    into a 402: the gate lands on the first enabled alias, like every default."""
+    s = _minds(
+        minds_role_defaults=MOVED,
+        minds_model_enabled=json.dumps({"mindshub_air": True, "kimi": False}),
+    )
+
+    assert s.resolved_gate_model == "mindshub_air"
+
+
+def test_gate_ignores_the_router_pick_on_a_direct_provider():
+    s = UserSettings(
+        planning_provider=Provider.ANTHROPIC,
+        coding_provider=Provider.ANTHROPIC,
+        router_provider=Provider.ANTHROPIC,
+        anthropic_api_key=SecretStr("sk-ant-test"),
+        router_model="claude-opus-4-8",
+    )
+
+    assert s.resolved_router_model == "claude-opus-4-8"
+    assert s.resolved_gate_model == MODEL_ROLE_DEFAULTS["anthropic"]["router"]
+
+
+def test_gate_uses_the_users_model_on_openai_compatible():
+    """No canonical model exists for a BYO endpoint, so the pick is the only
+    model the gate can run on. The Settings UI carries the speed note."""
+    s = UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE,
+        coding_provider=Provider.OPENAI_COMPATIBLE,
+        router_provider=Provider.OPENAI_COMPATIBLE,
+        planning_model="my-model",
+        coding_model="my-model",
+        router_model="my-fast-model",
+        openai_compatible_api_key=SecretStr("sk-compat"),
+        openai_base_url="https://my-proxy.example.com/v1",
+    )
+
+    assert s.resolved_gate_model == "my-fast-model"

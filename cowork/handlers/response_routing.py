@@ -77,20 +77,23 @@ async def _gate(binding: RouterBinding, *, history: list[dict]):
     return text or None
 
 
-def _settings_binding(model_override: str | None = None) -> RouterBinding | None:
+def _settings_binding() -> RouterBinding | None:
     """Router binding from stored settings (desktop / BYOK orgs).
 
-    `model_override` is the composer's per-conversation model pick, taking
-    precedence over the account-wide router_model for this turn only.
+    The model is ``resolved_gate_model``, not the user's router pick and not
+    the composer's per-conversation pick: both choose a model for the *chat*,
+    and a chat model is routinely too slow to gate a turn (ENG-1851). The
+    provider is still the user's router provider — the gate needs a key it
+    actually holds.
     """
     settings = get_user_settings()
-    model = model_override or settings.resolved_router_model
+    model = settings.resolved_gate_model
     if not model:
         return None
     client = build_llm_client()
     return RouterBinding(
         provider=client.router_provider,
-        model=model_override or client.router_model or model,
+        model=model,
         label=settings.resolved_router_provider.value,
     )
 
@@ -177,13 +180,11 @@ async def decide_route(
     has_attachments: bool,
     has_disabled_connections: bool,
     binding: RouterBinding | None = None,
-    model_override: str | None = None,
 ) -> RouteDecision:
-    """Choose a direct answer or safe delegation using the configured router role.
+    """Choose a direct answer or safe delegation on the gate's own model.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
-    per-turn key); when None the binding comes from stored settings, honoring
-    `model_override` (the composer's per-conversation model pick) if given.
+    per-turn key); when None the binding comes from stored settings.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
     """
@@ -201,7 +202,7 @@ async def decide_route(
 
     try:
         if binding is None:
-            binding = _settings_binding(model_override)
+            binding = _settings_binding()
         if binding is None:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
