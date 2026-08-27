@@ -112,21 +112,21 @@ def render_picker_page(
 ) -> str:
     safe_account_email_html = html.escape(account_email)
 
-    # Carried in as html.escape()'d attributes (a sanitizer static analysis
-    # recognizes) instead of interpolated into inline <script> source — see
-    # this module's docstring. json.dumps() on file_ids first so the client
-    # gets the same array back via JSON.parse(dataset.fileIds).
+    # Each value escaped directly and immediately, right where it's still a
+    # named parameter — html.escape()'d before it goes anywhere else, not via
+    # a loop over dict values (a static data-flow scanner can lose the link
+    # between a dict value and a sanitizer call made on a later loop
+    # variable). json.dumps() on file_ids first so the client gets the same
+    # array back via JSON.parse(dataset.fileIds).
     data_attrs = {
-        "data-state": state,
-        "data-access-token": access_token,
-        "data-api-key": api_key,
-        "data-app-id": app_id,
-        "data-account-email": account_email,
+        "data-state": html.escape(state, quote=True),
+        "data-access-token": html.escape(access_token, quote=True),
+        "data-api-key": html.escape(api_key, quote=True),
+        "data-app-id": html.escape(app_id, quote=True),
+        "data-account-email": html.escape(account_email, quote=True),
         "data-file-ids": json.dumps(file_ids or []),
     }
-    picker_attrs_html = " ".join(
-        f'{attr_name}="{html.escape(value, quote=True)}"' for attr_name, value in data_attrs.items()
-    )
+    picker_attrs_html = " ".join(f'{attr_name}="{value}"' for attr_name, value in data_attrs.items())
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Pick Google Drive files</title>
