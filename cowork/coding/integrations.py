@@ -358,7 +358,15 @@ class DeveloperIntegrationService:
         connection: ProjectConnection,
         fields: dict[str, Any],
     ) -> SourceContext:
-        identifier = urlparse(request.url).path.rstrip("/").split("/")[-1]
+        path_parts = urlparse(request.url).path.rstrip("/").split("/")
+        # Linear's canonical browser URL appends a human-readable title slug:
+        # /issue/ENG-289/schedule-task-state-is-not-accurate. Extract the issue
+        # identifier by shape so both canonical links and short pasted links
+        # resolve to the same GraphQL resource.
+        identifier = next(
+            (part for part in path_parts if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*-\d+", part)),
+            path_parts[-1],
+        )
         token = self._secret(fields, "access_token", "api_key", "token")
         issue = self._linear_issue(identifier, token)
         return SourceContext(
