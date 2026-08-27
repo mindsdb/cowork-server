@@ -146,8 +146,11 @@ def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str
         oldest = min(_PROJECT_PREVIEW_MOUNTS, key=lambda t: _PROJECT_PREVIEW_MOUNTS[t].expires_at)
         _PROJECT_PREVIEW_MOUNTS.pop(oldest, None)
     token = secrets.token_urlsafe(32)
+    # `target` is already fully resolved by `_safe_relpath`, so its parent is too.
+    # Resolving again would be a no-op, and it reads as a containment check that
+    # has in fact already happened one frame up.
     _PROJECT_PREVIEW_MOUNTS[token] = _PreviewMount(
-        parent=target.parent.resolve(),
+        parent=target.parent,
         project_base=base.resolve(),
         workspace=_mount_workspace(target, base),
         org_id=scope.org_id,
