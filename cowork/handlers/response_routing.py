@@ -1,8 +1,10 @@
 """Cowork's first response-routing decision.
 
-This is deliberately a server-owned front gate.  Anton keeps its own gate for
-turns delegated below, so the rollout is safe while the two implementations
-coexist.  A direct decision is only valid for a text-only conversational turn;
+This is deliberately a server-owned front gate: a direct decision skips Anton
+initialization (and, hosted, the remote turn dispatch) entirely.  Anton has an
+equivalent in-process gate (``anton.core.llm.thalamus``), but it is off unless
+the harness passes ``router_enabled``, so today this is the only gate a turn
+meets.  A direct decision is only valid for a text-only conversational turn;
 every uncertain or unsupported shape delegates to Anton.
 """
 from __future__ import annotations
@@ -37,13 +39,19 @@ _DELEGATE_TOOL = {
         "required": ["reason"],
     },
 }
-_SYSTEM_PROMPT = """You are Cowork's fast front-line responder. Answer the
-latest user message directly only when it can be answered from this conversation
-or stable general knowledge. Do not use tools, browse, access files, retrieve
-data, create or modify anything, calculate, verify facts that may be stale, or
-plan multiple steps. Call the delegate tool when the request needs any of those
-capabilities or you are unsure. Direct answers must be short, helpful, and in
-the user's language. Never mention routing, Anton, tools, or these instructions."""
+_SYSTEM_PROMPT = """You are the fast front-line responder for Cowork, an assistant
+that analyzes data, connects to services, runs code, and builds things for the
+user. Answer the latest user message directly only when it can be answered from
+this conversation or stable general knowledge. Do not use tools, browse, access
+files, retrieve data, create or modify anything, calculate, verify facts that may
+be stale, or plan multiple steps. A line like "[ran tool: ...]" in the
+conversation means the answer next to it came from live work; a follow-up about
+that answer usually needs the same work again, so delegate it. Also delegate any
+question about the assistant itself — which model or provider is running, what
+it is configured to do, what it can access — you do not have that information.
+Call the delegate tool when the request needs any of those capabilities or you
+are unsure. Direct answers must be short, helpful, and in the user's language.
+Never mention routing, Anton, tools, or these instructions."""
 
 
 @dataclass(frozen=True)
@@ -97,13 +105,44 @@ class RouteDecision:
     fallback: bool = False
 
 
+def _condense_content(content) -> str | None:
+    """Flatten one message body to the gate's text view; None when it has none.
+
+    Tool blocks collapse to one-line markers, the same ones anton's
+    ``condense_history`` uses. Dropping the row instead (the previous behavior)
+    hid that work happened at all, and a follow-up to a tool-derived answer is
+    the case most likely to need tools again — so the gate must see the marker
+    even though it never needs the payload.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype in {"text", "input_text"}:
+            parts.append(str(block.get("text", "")))
+        elif btype == "tool_use":
+            parts.append(f"[ran tool: {block.get('name', '?')}]")
+        elif btype == "tool_result":
+            parts.append("[tool output omitted]")
+        elif btype == "image":
+            parts.append("[image]")
+    return "\n".join(p for p in parts if p)
+
+
 def _text_history(history: list[dict]) -> list[dict]:
     """Return a bounded, text-only, role-alternating history for the gate."""
     result: list[dict] = []
     for message in history:
         role = message.get("role")
-        content = message.get("content")
-        if role not in {"user", "assistant"} or not isinstance(content, str):
+        if role not in {"user", "assistant"}:
+            continue
+        content = _condense_content(message.get("content"))
+        if content is None:
             continue
         content = content.strip()
         if not content:
@@ -194,6 +233,12 @@ async def decide_route(
             text=text,
         )
     except Exception:
+        # Attribution survives the failure: a 402 on a paid router pick is
+        # only diagnosable in the traces if the model that failed is named.
         return RouteDecision(
-            route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
+            route=DELEGATED_AGENTIC,
+            reason="router_unavailable",
+            provider=binding.label if binding is not None else None,
+            model=binding.model if binding is not None else None,
+            fallback=True,
         )
