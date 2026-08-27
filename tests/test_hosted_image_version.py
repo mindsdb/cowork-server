@@ -22,8 +22,37 @@ import re
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DOCKERFILE = (_ROOT / "Dockerfile").read_text()
 _WORKFLOW = (_ROOT / ".github/workflows/build-deploy.yml").read_text()
+
+
+def _strip_comments(text: str) -> str:
+    """Drop comment-only lines before matching. Load-bearing, not cosmetic.
+
+    An earlier revision asserted ``"fetch-depth: 0" in build`` over raw text.
+    The explanatory comment added alongside it contained that exact literal --
+    ``# already checks out with fetch-depth: 0 for exactly this reason`` -- and
+    it sits inside the build job, so the assertion was satisfied by prose. Both
+    mutations passed at that head: deleting the setting, and changing it to
+    ``fetch-depth: 1``. The guard against the precise bug this file exists to
+    catch was switched off by a sentence explaining the guard.
+
+    A comment must never be able to satisfy an assertion about configuration,
+    so the stripping happens here rather than at each call site -- a future
+    comment mentioning any asserted string then cannot silence anything.
+    """
+    # Truncate each line at its first `#` rather than dropping comment-only
+    # lines. A prefix check misses the likelier disabling pattern -- keeping the
+    # guard's text as a trailing note beside a no-op, e.g.
+    # `true # test ! -e /app/.git`, which reads as intact and is not. Verified:
+    # that exact mutation passed until this truncated instead.
+    #
+    # A `#` inside a quoted string would truncate a real line early, and that is
+    # the safe direction: the assertion fails loudly rather than passing on
+    # prose. None of the lines asserted on here contain one.
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+_DOCKERFILE = _strip_comments((_ROOT / "Dockerfile").read_text())
 
 
 def _job_block(name: str) -> str:
@@ -36,7 +65,7 @@ def _job_block(name: str) -> str:
     """
     match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  \S|\Z)", _WORKFLOW, re.M | re.S)
     assert match, f"no `{name}:` job in build-deploy.yml"
-    return match.group(1)
+    return _strip_comments(match.group(1))
 
 
 def test_the_image_build_fetches_tags() -> None:
@@ -57,7 +86,10 @@ def test_the_image_build_fetches_tags() -> None:
     """
     build = _job_block("build")
     assert "actions/checkout" in build, "the build job no longer checks out the repo"
-    assert "fetch-depth: 0" in build, (
+    # Exact line, not a substring: `in build` would also accept
+    # `fetch-depth: 10`, and matching the whole stripped line is what makes
+    # `fetch-depth: 1` a failure rather than a pass.
+    assert any(line.strip() == "fetch-depth: 0" for line in build.splitlines()), (
         "the image build must fetch tags — with fetch-depth 1 the version "
         "silently resolves to 0.0.0.dev1+g<sha> (ENG-1796)"
     )
