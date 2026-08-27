@@ -83,6 +83,27 @@ def test_legacy_identity_backfill_merges_latest_metadata(tmp_path):
     assert merged["description"] == "Concurrent update"
 
 
+def test_legacy_identity_backfill_preserves_metadata_mtime(tmp_path):
+    """Channel delivery (artifacts_since) reads metadata.json's mtime as "this
+    turn touched the artifact". A backfill is bookkeeping, not an update — if it
+    refreshed the mtime, the first card build after an upgrade would deliver
+    every legacy artifact to the chat as though it were new."""
+    import os
+
+    folder = tmp_path / "legacy"
+    folder.mkdir()
+    metadata = {"id": "legacy", "createdAt": "2026-08-25", "name": "Old"}
+    path = folder / "metadata.json"
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+    past_ns = path.stat().st_mtime_ns - 3_600_000_000_000  # one hour ago
+    os.utime(path, ns=(past_ns, past_ns))
+
+    ensure_stable_id(folder, metadata)
+
+    assert path.stat().st_mtime_ns == past_ns
+    assert json.loads(path.read_text(encoding="utf-8"))["stableId"]
+
+
 def test_stable_identity_resolution_reuses_the_container_index(artifact, monkeypatch):
     folder, _metadata, stable_id = artifact
     unrelated = folder.parent / "unrelated"
