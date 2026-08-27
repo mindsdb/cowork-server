@@ -495,3 +495,139 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
     assert created["harness"] == "cowork-direct"
     for frame in buffer.frames:
         assert frame.endswith("\n\n") and "\\n" not in frame
+
+
+# --- history view: tool rows become markers, not holes (ENG-1851) -----------
+
+
+def test_text_history_keeps_tool_rows_as_markers():
+    """Persisted tool block-rows reach the gate as one-line markers.
+
+    Before, any list-shaped content was dropped, so the gate saw a transcript
+    with the work removed — an answer that came from a live query looked like
+    something it could restate from context.
+    """
+    from cowork.handlers.response_routing import _text_history
+
+    history = [
+        {"role": "user", "content": "what was last month's revenue?"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "scratchpad",
+             "input": {"code": "select sum(amount) ..."}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "482913.44"},
+        ]},
+        {"role": "assistant", "content": "Last month's revenue was $482,913.44."},
+        {"role": "user", "content": "and the month before?"},
+    ]
+
+    seen = _text_history(history)
+
+    assert [m["role"] for m in seen] == ["user", "assistant", "user", "assistant", "user"]
+    assert seen[1]["content"] == "[ran tool: scratchpad]"
+    assert seen[2]["content"] == "[tool output omitted]"
+    # The payload never travels: the gate learns that work happened, not what it produced.
+    assert "482913.44" not in seen[1]["content"] + seen[2]["content"]
+    assert "select sum" not in seen[1]["content"]
+
+
+def test_text_history_flattens_mixed_text_and_tool_blocks():
+    from cowork.handlers.response_routing import _text_history
+
+    seen = _text_history([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Checking now."},
+            {"type": "tool_use", "id": "t1", "name": "web_search", "input": {}},
+        ]},
+    ])
+
+    assert seen[1]["content"] == "Checking now.\n[ran tool: web_search]"
+
+
+def test_text_history_drops_rows_with_nothing_sayable():
+    from cowork.handlers.response_routing import _text_history
+
+    seen = _text_history([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "unknown_block"}]},
+        {"role": "assistant", "content": 42},
+        {"role": "system", "content": "not for the gate"},
+    ])
+
+    assert seen == [{"role": "user", "content": "hi"}]
+
+
+def test_gate_sees_persisted_tool_rows_end_to_end():
+    """Pin the coupling to the persistence shape: rows exactly as
+    `save_assistant_turn` writes them, through `to_openai_message` (what
+    `_route_request` calls), reach the gate with markers intact."""
+    from uuid import uuid4
+
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.handlers.response_routing import _text_history
+    from cowork.schemas.responses import Role
+
+    cid = uuid4()
+    rows = [
+        Message(conversation_id=cid, role=Role.user, content="pull the sales table"),
+        Message(conversation_id=cid, role=Role.assistant, content=[
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "..."}},
+        ]),
+        Message(conversation_id=cid, role=Role.user, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "rows: 1204"},
+        ]),
+        Message(conversation_id=cid, role=Role.assistant, content="Pulled 1,204 rows."),
+    ]
+
+    history = [
+        m.to_openai_message().model_dump()
+        for m in rows
+        if m.role in {Role.user, Role.assistant}
+    ]
+    seen = _text_history(history)
+
+    assert len(seen) == len(rows)
+    assert seen[1]["content"] == "[ran tool: scratchpad]"
+    assert seen[2]["content"] == "[tool output omitted]"
+
+
+# --- attribution survives a failed gate call --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_router_unavailable_keeps_model_attribution(monkeypatch):
+    """A provider error (e.g. a 402 on a paid router pick) still fails open,
+    and the decision names the model that failed so the trace is diagnosable."""
+    import cowork.handlers.response_routing as routing
+
+    class _Boom:
+        router_model = "opus"
+
+        def __init__(self):
+            self.router_provider = self
+
+        async def complete(self, **kwargs):
+            raise RuntimeError("402 wallet_empty")
+
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_router_model="opus"),
+    )
+    monkeypatch.setattr(routing, "build_llm_client", lambda: _Boom())
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "Hello"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_unavailable"
+    assert decision.fallback is True
+    assert decision.provider == "minds_cloud"
+    assert decision.model == "opus"
