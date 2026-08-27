@@ -74,26 +74,26 @@ class _RepairDecisionBody(BaseModel):
     status: Literal["accepted", "rejected"]
 
 
-def _owner_workspace(session, project_ref: str, stable_id: str):
+def _owner_workspace(session, project_ref: str, artifact_id: str):
     """Resolve one scoped artifact and enforce its source-mutation boundary."""
-    source, folder, metadata = workspace_artifact_for_request(session, project_ref, stable_id)
+    source, folder, metadata = workspace_artifact_for_request(session, project_ref, artifact_id)
     capabilities = require_artifact_owner(session, source)
     return source, folder, metadata, capabilities
 
 
-@router.get("/workspace/{project_ref}/{stable_id}")
+@router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     session: ScopedSessionDep,
     path: str | None = Query(default=None),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS."""
     _source, folder, metadata, capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     try:
-        result = await run_in_threadpool(current_workspace, folder, metadata, stable_id, path)
+        result = await run_in_threadpool(current_workspace, folder, metadata, artifact_id, path)
         repair = await run_in_threadpool(active_agent_repair, folder)
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -102,16 +102,16 @@ async def artifact_source(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.put("/workspace/{project_ref}/{stable_id}")
+@router.put("/workspace/{project_ref}/{artifact_id}")
 async def update_artifact_source(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     body: _SourceUpdateBody,
     session: ScopedSessionDep,
 ):
     """Optimistic, atomic manual edit. A stale tab receives 409, never overwrite."""
     _source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
@@ -120,7 +120,7 @@ async def update_artifact_source(
             save_source,
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             content=body.content,
             expected_revision_id=body.expectedRevisionId,
             rel_path=body.path,
@@ -139,23 +139,23 @@ async def update_artifact_source(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.get("/workspace/{project_ref}/{stable_id}/revisions")
+@router.get("/workspace/{project_ref}/{artifact_id}/revisions")
 async def artifact_revisions(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     session: ScopedSessionDep,
     path: str | None = Query(default=None),
 ):
     _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     return {"revisions": await run_in_threadpool(list_revisions, folder, rel_path=path)}
 
 
-@router.post("/workspace/{project_ref}/{stable_id}/comments-access")
+@router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
 async def enable_artifact_comments(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     session: ScopedSessionDep,
 ):
     """Provision same-org draft review without broadening source-edit access."""
@@ -164,12 +164,12 @@ async def enable_artifact_comments(
         provision_draft_review_access,
     )
 
-    source, folder, metadata = workspace_artifact_for_request(session, project_ref, stable_id)
+    source, folder, metadata = workspace_artifact_for_request(session, project_ref, artifact_id)
     capabilities = artifact_capabilities(session, source)
     owner_user_id = artifact_owner_id(session, source)
     try:
         key = await provision_draft_review_access(
-            stable_id,
+            artifact_id,
             session.scope,
             owner_user_id=str(owner_user_id) if owner_user_id else None,
         )
@@ -180,7 +180,7 @@ async def enable_artifact_comments(
         ) from exc
     current_revision = None
     try:
-        draft = await run_in_threadpool(current_source, folder, metadata, stable_id)
+        draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
         current_revision = draft.get("revision")
     except (FileNotFoundError, OSError, ValueError, TimeoutError):
         # Binary/oversized artifacts still support general review comments.
@@ -194,15 +194,15 @@ async def enable_artifact_comments(
     }
 
 
-@router.get("/workspace/{project_ref}/{stable_id}/revisions/{revision_id}")
+@router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}")
 async def artifact_revision(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     revision_id: str,
     session: ScopedSessionDep,
 ):
     _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     try:
         return await run_in_threadpool(revision_with_content, folder, revision_id)
@@ -212,16 +212,16 @@ async def artifact_revision(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{stable_id}/revisions/{revision_id}/restore")
+@router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
 async def restore_artifact_revision(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     revision_id: str,
     body: _RestoreBody,
     session: ScopedSessionDep,
 ):
     _source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     try:
         restored = await run_in_threadpool(revision_with_content, folder, revision_id)
@@ -231,7 +231,7 @@ async def restore_artifact_revision(
             save_source,
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             content=restored["content"],
             expected_revision_id=body.expectedRevisionId,
             rel_path=restored["path"],
@@ -250,22 +250,22 @@ async def restore_artifact_revision(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{stable_id}/agent-repairs")
+@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs")
 async def request_agent_repair(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     body: _AgentRepairBody,
     session: ScopedSessionDep,
 ):
     _source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     try:
         return await run_in_threadpool(
             create_agent_repair,
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             expected_revision_id=body.expectedRevisionId,
             comment_thread_id=body.commentThreadId,
             selector=body.selector,
@@ -281,15 +281,15 @@ async def request_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.get("/workspace/{project_ref}/{stable_id}/agent-repairs/{repair_id}")
+@router.get("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}")
 async def get_agent_repair(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     repair_id: str,
     session: ScopedSessionDep,
 ):
     _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     try:
         return await run_in_threadpool(agent_repair_detail, folder, repair_id)
@@ -299,16 +299,16 @@ async def get_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{stable_id}/agent-repairs/{repair_id}/cancel")
+@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel")
 async def cancel_queued_agent_repair(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     repair_id: str,
     session: ScopedSessionDep,
 ):
     """Release a queued repair when its agent turn could not be started."""
     _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     try:
         return await run_in_threadpool(cancel_agent_repair, folder, repair_id)
@@ -318,16 +318,16 @@ async def cancel_queued_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{stable_id}/agent-repairs/{repair_id}/decision")
+@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision")
 async def decide_agent_repair(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     repair_id: str,
     body: _RepairDecisionBody,
     session: ScopedSessionDep,
 ):
     _source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, stable_id
+        session, project_ref, artifact_id
     )
     try:
         scope = getattr(session, "scope", None)
@@ -336,7 +336,7 @@ async def decide_agent_repair(
             finalize_agent_repair,
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             repair_id,
             body.status,
             actor_id=actor_id,
@@ -352,16 +352,16 @@ async def decide_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.get("/drafts/{project_ref}/{stable_id}/{rel_path:path}")
+@router.get("/drafts/{project_ref}/{artifact_id}/{rel_path:path}")
 async def serve_private_draft(
     project_ref: str,
-    stable_id: str,
+    artifact_id: str,
     rel_path: str,
     request: Request,
     session: ScopedSessionDep,
 ):
     """Authenticated draft preview with project/org containment and relative assets."""
-    _source, folder, metadata = workspace_artifact_for_request(session, project_ref, stable_id)
+    _source, folder, metadata = workspace_artifact_for_request(session, project_ref, artifact_id)
     if not rel_path or "\x00" in rel_path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path")
     try:

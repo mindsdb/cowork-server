@@ -14,18 +14,18 @@ class ArtifactAccessUnavailable(RuntimeError):
     pass
 
 
-def draft_review_access_key(stable_id: str) -> str:
+def draft_review_access_key(artifact_id: str) -> str:
     """Internal auth rule for draft collaborators, separate from sharing.
 
     Comments remain keyed by ``artifact/<uuid>``. This second key exists only
     inside the access service so enabling same-org draft review can never
     broaden an email-only or owner-only published link.
     """
-    return f"artifact-draft/{UUID(stable_id)}"
+    return f"artifact-draft/{UUID(artifact_id)}"
 
 
 async def provision_draft_review_access(
-    stable_id: str,
+    artifact_id: str,
     scope: TenantScope,
     *,
     owner_user_id: str | None = None,
@@ -38,8 +38,8 @@ async def provision_draft_review_access(
     Desktop keeps using the rule created by a restricted publish until a
     signed desktop ownership claim is available; it must never fabricate ids.
     """
-    key = artifact_key(stable_id)
-    access_key = draft_review_access_key(stable_id)
+    key = artifact_key(artifact_id)
+    access_key = draft_review_access_key(artifact_id)
     if not scope.org_mode or not scope.user_id or not scope.org_id:
         raise ArtifactAccessUnavailable("Draft collaboration requires a signed-in organization")
     if not owner_user_id:
@@ -73,7 +73,7 @@ async def provision_draft_review_access(
 
 
 async def revoke_draft_review_access(
-    stable_id: str,
+    artifact_id: str,
     *,
     settings: TurnQueueSettings | None = None,
     client: httpx.AsyncClient | None = None,
@@ -85,7 +85,7 @@ async def revoke_draft_review_access(
     service fails closed: the artifact remains available to its owner instead
     of leaving a comment capability orphaned after its files are gone.
     """
-    access_key = draft_review_access_key(stable_id)
+    access_key = draft_review_access_key(artifact_id)
     settings = settings or TurnQueueSettings()
     if not settings.auth_internal_base_url or not settings.auth_internal_secret:
         return False

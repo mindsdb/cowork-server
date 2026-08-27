@@ -240,7 +240,7 @@ def _content_for_revision(folder: Path, revision: dict) -> str:
 def _new_revision(
     manifest: dict,
     *,
-    stable_id: str,
+    artifact_id: str,
     rel_path: str,
     content: bytes,
     actor_kind: str,
@@ -255,7 +255,7 @@ def _new_revision(
     return {
         "id": str(uuid.uuid4()),
         "number": (int(revisions[-1].get("number", 0)) + 1) if revisions else 1,
-        "artifactId": stable_id,
+        "artifactId": artifact_id,
         "path": rel_path,
         "createdAt": _now(),
         "actor": {"kind": actor_kind, "id": actor_id},
@@ -306,7 +306,7 @@ def _append_revision(
     folder: Path,
     manifest: dict,
     *,
-    stable_id: str,
+    artifact_id: str,
     rel_path: str,
     content: bytes,
     actor_kind: str,
@@ -318,7 +318,7 @@ def _append_revision(
 ) -> dict:
     entry = _new_revision(
         manifest,
-        stable_id=stable_id,
+        artifact_id=artifact_id,
         rel_path=rel_path,
         content=content,
         actor_kind=actor_kind,
@@ -393,7 +393,7 @@ def _commit_source_revision(
     manifest: dict,
     target: Path,
     *,
-    stable_id: str,
+    artifact_id: str,
     rel_path: str,
     before_content: bytes,
     content: bytes,
@@ -407,7 +407,7 @@ def _commit_source_revision(
     """Atomically couple a source replacement to its attributed revision."""
     entry = _new_revision(
         manifest,
-        stable_id=stable_id,
+        artifact_id=artifact_id,
         rel_path=rel_path,
         content=content,
         actor_kind=actor_kind,
@@ -436,7 +436,7 @@ def _commit_source_revision(
 
 
 def _current_source_locked(
-    folder: Path, metadata: dict, stable_id: str, rel_path: str | None = None
+    folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None
 ) -> dict:
     """Read/capture source while the caller holds the artifact revision lock."""
     _recover_pending_source_write(folder)
@@ -457,7 +457,7 @@ def _current_source_locked(
         latest = _append_revision(
             folder,
             manifest,
-            stable_id=stable_id,
+            artifact_id=artifact_id,
             rel_path=relative,
             content=content,
             actor_kind="system",
@@ -466,7 +466,7 @@ def _current_source_locked(
             base_revision_id=latest.get("id") if latest else None,
         )
     return {
-        "artifactId": stable_id,
+        "artifactId": artifact_id,
         "path": relative,
         "content": text,
         "contentType": target.suffix.lower().lstrip("."),
@@ -474,23 +474,23 @@ def _current_source_locked(
     }
 
 
-def current_source(folder: Path, metadata: dict, stable_id: str, rel_path: str | None = None) -> dict:
+def current_source(folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None) -> dict:
     """Read source plus the revision token required by a subsequent save."""
     with artifact_lock(folder):
-        return _current_source_locked(folder, metadata, stable_id, rel_path)
+        return _current_source_locked(folder, metadata, artifact_id, rel_path)
 
 
 def current_workspace(
-    folder: Path, metadata: dict, stable_id: str, rel_path: str | None = None
+    folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None
 ) -> dict:
     """Read editable source and its history under one artifact lock.
 
     The viewer needs both values before its revision chrome is complete.  A
-    single snapshot avoids a second HTTP request, a second stable-id lookup,
+    single snapshot avoids a second HTTP request, a second identity lookup,
     and a race where an edit lands between the source and history reads.
     """
     with artifact_lock(folder):
-        source = _current_source_locked(folder, metadata, stable_id, rel_path)
+        source = _current_source_locked(folder, metadata, artifact_id, rel_path)
         manifest = _read_manifest(folder)
         revisions = [
             revision
@@ -503,7 +503,7 @@ def current_workspace(
 def save_source(
     folder: Path,
     metadata: dict,
-    stable_id: str,
+    artifact_id: str,
     *,
     content: str,
     expected_revision_id: str,
@@ -530,7 +530,7 @@ def save_source(
             latest = _append_revision(
                 folder,
                 manifest,
-                stable_id=stable_id,
+                artifact_id=artifact_id,
                 rel_path=relative,
                 content=existing,
                 actor_kind="system",
@@ -541,13 +541,13 @@ def save_source(
         if latest.get("id") != expected_revision_id:
             raise RevisionConflict(latest)
         if latest.get("contentHash") == _sha(encoded):
-            return {"artifactId": stable_id, "path": relative, "content": content, "revision": latest}
+            return {"artifactId": artifact_id, "path": relative, "content": content, "revision": latest}
 
         entry = _commit_source_revision(
             folder,
             manifest,
             target,
-            stable_id=stable_id,
+            artifact_id=artifact_id,
             rel_path=relative,
             before_content=existing,
             content=encoded,
@@ -558,7 +558,7 @@ def save_source(
             conversation_id=conversation_id,
             comment_thread_ids=comment_thread_ids,
         )
-        return {"artifactId": stable_id, "path": relative, "content": content, "revision": entry}
+        return {"artifactId": artifact_id, "path": relative, "content": content, "revision": entry}
 
 
 def list_revisions(folder: Path, *, rel_path: str | None = None) -> list[dict]:
@@ -587,10 +587,10 @@ def revision_with_content(folder: Path, revision_id: str) -> dict:
 
 def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) -> dict | None:
     """Record an agent edit and finish repair handoffs attributed to this turn."""
-    from cowork.services.artifact_identity import ensure_stable_id
+    from cowork.services.artifact_identity import ensure_full_id
 
     try:
-        stable_id, metadata = ensure_stable_id(folder)
+        artifact_id, metadata = ensure_full_id(folder)
         with artifact_lock(folder):
             _recover_pending_source_write(folder)
             target, relative = resolve_source(folder, metadata)
@@ -624,7 +624,7 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
             entry = _append_revision(
                 folder,
                 manifest,
-                stable_id=stable_id,
+                artifact_id=artifact_id,
                 rel_path=relative,
                 content=content,
                 actor_kind="agent",
@@ -652,7 +652,7 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
 def create_agent_repair(
     folder: Path,
     metadata: dict,
-    stable_id: str,
+    artifact_id: str,
     *,
     expected_revision_id: str,
     comment_thread_id: str,
@@ -662,7 +662,7 @@ def create_agent_repair(
 ) -> dict:
     """Persist a structured repair handoff and return the exact agent prompt."""
     with artifact_lock(folder):
-        source = _current_source_locked(folder, metadata, stable_id)
+        source = _current_source_locked(folder, metadata, artifact_id)
         current = source["revision"]
         if current.get("id") != expected_revision_id:
             raise RevisionConflict(current)
@@ -673,7 +673,7 @@ def create_agent_repair(
         repair_id = str(uuid.uuid4())
         repair = {
             "id": repair_id,
-            "artifactId": stable_id,
+            "artifactId": artifact_id,
             "path": source["path"],
             "baseRevisionId": current["id"],
             "baseContentHash": current["contentHash"],
@@ -690,7 +690,7 @@ def create_agent_repair(
     prompt = (
         "Address this artifact review thread. Work on the existing artifact source; "
         "do not create a replacement artifact and do not resolve the comment yourself.\n\n"
-        f"Artifact stable id: {stable_id}\n"
+        f"Artifact id: {artifact_id}\n"
         f"Source path: {source['path']}\n"
         f"Base revision: {current['id']}\n"
         f"Repair id: {repair_id}\n"
@@ -754,7 +754,7 @@ def cancel_agent_repair(folder: Path, repair_id: str) -> dict:
 def finalize_agent_repair(
     folder: Path,
     metadata: dict,
-    stable_id: str,
+    artifact_id: str,
     repair_id: str,
     decision: str,
     *,
@@ -772,7 +772,7 @@ def finalize_agent_repair(
         repair = _read_repair(folder, repair_id)
         if repair.get("status") != "ready":
             raise RevisionValidationError("Agent repair is not ready for review")
-        source = _current_source_locked(folder, metadata, stable_id, repair.get("path"))
+        source = _current_source_locked(folder, metadata, artifact_id, repair.get("path"))
         current = source["revision"]
         if (
             decision == "rejected"
@@ -802,7 +802,7 @@ def finalize_agent_repair(
                 folder,
                 manifest,
                 target,
-                stable_id=stable_id,
+                artifact_id=artifact_id,
                 rel_path=relative,
                 before_content=source["content"].encode("utf-8"),
                 content=encoded,

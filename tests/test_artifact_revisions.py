@@ -9,7 +9,7 @@ from cowork.services import artifact_identity as identity_service
 from cowork.services import artifact_revisions as revision_service
 from cowork.services.artifact_identity import (
     artifact_key,
-    ensure_stable_id,
+    ensure_full_id,
     resolve_artifact_folder,
 )
 from cowork.services.artifacts import ProjectArtifacts
@@ -29,6 +29,11 @@ from cowork.services.artifact_revisions import (
 )
 
 
+def _full_id(value: str) -> str:
+    """A dashed UUID spelled the way `metadata.json` stores an id."""
+    return UUID(value).hex
+
+
 @pytest.fixture
 def artifact(tmp_path):
     folder = tmp_path / "my-artifact"
@@ -43,79 +48,134 @@ def artifact(tmp_path):
     }
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     (folder / "brief.md").write_text("# First\n", encoding="utf-8")
-    stable_id, metadata = ensure_stable_id(folder, metadata)
-    return folder, metadata, stable_id
+    artifact_id, metadata = ensure_full_id(folder, metadata)
+    return folder, metadata, artifact_id
 
 
-def test_legacy_identity_is_persisted_and_is_comment_key(artifact):
-    folder, _metadata, stable_id = artifact
+def test_legacy_identity_is_widened_persisted_and_is_comment_key(artifact):
+    folder, _metadata, artifact_id = artifact
 
     persisted = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
 
-    assert persisted["stableId"] == stable_id
-    assert str(UUID(stable_id)) == stable_id
-    assert artifact_key(stable_id) == f"artifact/{stable_id}"
+    assert persisted["id"] == artifact_id
+    assert UUID(artifact_id).hex == artifact_id
+    # The old eight characters stay the prefix, so `<name>-<id[:8]>` folders
+    # keep addressing the same artifact after the widening.
+    assert artifact_id[:8] == "a1b2c3d4"
+    assert artifact_key(artifact_id) == f"artifact/{UUID(artifact_id)}"
 
 
-def test_invalid_stable_identity_fails_closed_without_rewriting(tmp_path):
-    folder = tmp_path / "broken"
+def test_widening_matches_antons_in_memory_derivation(artifact):
+    """anton never persists the widened id, so the two derivations have to agree
+    or a turn and a card build would mint different identities."""
+    from anton.core.artifacts.models import Artifact
+
+    folder, metadata, artifact_id = artifact
+    legacy = {
+        **metadata,
+        "id": "a1b2c3d4",
+        "description": "",
+        "updatedAt": metadata["createdAt"],
+    }
+
+    assert Artifact.model_validate(legacy).id == artifact_id
+
+
+def test_persisted_stable_id_is_adopted_as_the_artifact_id(tmp_path):
+    """Records from the two-field era already keyed published versions, auth
+    rules and comment threads by `stableId`; re-deriving would orphan them."""
+    folder = tmp_path / "two-field"
     folder.mkdir()
-    metadata = {"id": "legacy", "createdAt": "2026-08-25", "stableId": "not-a-uuid"}
+    minted = "55555555-5555-4555-8555-555555555555"
+    metadata = {"id": "a1b2c3d4", "createdAt": "2026-08-25", "stableId": minted}
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="stable identity is invalid"):
-        ensure_stable_id(folder, metadata)
+    artifact_id, merged = ensure_full_id(folder, metadata)
+
+    assert artifact_id == _full_id(minted)
+    assert merged["id"] == artifact_id
+    assert "stableId" not in merged
+    assert "stableId" not in json.loads(
+        (folder / "metadata.json").read_text(encoding="utf-8")
+    )
+
+
+def test_id_less_metadata_widens_from_its_long_slug(tmp_path):
+    """A record with no `id` falls back to the slug, and slugs run to 64
+    characters. Reading that width as "malformed UUID" would raise, and
+    `card_for_folder` drops an artifact whose identity raises — the artifact
+    would vanish from every listing instead of getting an identity."""
+    folder = tmp_path / "q3-launch-readiness-for-the-emea-region-rollout"
+    folder.mkdir()
+    metadata = {"slug": folder.name, "createdAt": "2026-08-25", "name": "Q3"}
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    artifact_id, merged = ensure_full_id(folder, metadata)
+
+    assert UUID(artifact_id).hex == artifact_id
+    assert merged["id"] == artifact_id
+    # Same value on a second, independent read.
+    assert ensure_full_id(folder)[0] == artifact_id
+
+
+def test_invalid_identity_fails_closed_without_rewriting(tmp_path):
+    folder = tmp_path / "broken"
+    folder.mkdir()
+    metadata = {"id": "d0d1d2d3", "createdAt": "2026-08-25", "stableId": "not-a-uuid"}
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="identity is invalid"):
+        ensure_full_id(folder, metadata)
 
     assert json.loads((folder / "metadata.json").read_text(encoding="utf-8")) == metadata
 
 
-def test_legacy_identity_backfill_merges_latest_metadata(tmp_path):
+def test_legacy_identity_widening_merges_latest_metadata(tmp_path):
     folder = tmp_path / "legacy"
     folder.mkdir()
-    stale = {"id": "legacy", "createdAt": "2026-08-25", "name": "Before"}
+    stale = {"id": "b0b1b2b3", "createdAt": "2026-08-25", "name": "Before"}
     latest = {**stale, "name": "After", "description": "Concurrent update"}
     (folder / "metadata.json").write_text(json.dumps(latest), encoding="utf-8")
 
-    stable_id, merged = ensure_stable_id(folder, stale)
+    artifact_id, merged = ensure_full_id(folder, stale)
 
-    assert merged["stableId"] == stable_id
+    assert merged["id"] == artifact_id
     assert merged["name"] == "After"
     assert merged["description"] == "Concurrent update"
 
 
-def test_legacy_identity_backfill_preserves_metadata_mtime(tmp_path):
+def test_legacy_identity_widening_preserves_metadata_mtime(tmp_path):
     """Channel delivery (artifacts_since) reads metadata.json's mtime as "this
-    turn touched the artifact". A backfill is bookkeeping, not an update — if it
-    refreshed the mtime, the first card build after an upgrade would deliver
-    every legacy artifact to the chat as though it were new."""
+    turn touched the artifact". Widening an id is bookkeeping, not an update —
+    if it refreshed the mtime, the first card build after an upgrade would
+    deliver every legacy artifact to the chat as though it were new."""
     import os
 
     folder = tmp_path / "legacy"
     folder.mkdir()
-    metadata = {"id": "legacy", "createdAt": "2026-08-25", "name": "Old"}
+    metadata = {"id": "c0c1c2c3", "createdAt": "2026-08-25", "name": "Old"}
     path = folder / "metadata.json"
     path.write_text(json.dumps(metadata), encoding="utf-8")
     past_ns = path.stat().st_mtime_ns - 3_600_000_000_000  # one hour ago
     os.utime(path, ns=(past_ns, past_ns))
 
-    ensure_stable_id(folder, metadata)
+    artifact_id, _merged = ensure_full_id(folder, metadata)
 
     assert path.stat().st_mtime_ns == past_ns
-    assert json.loads(path.read_text(encoding="utf-8"))["stableId"]
+    assert json.loads(path.read_text(encoding="utf-8"))["id"] == artifact_id
 
 
-def test_stable_identity_resolution_reuses_the_container_index(artifact, monkeypatch):
-    folder, _metadata, stable_id = artifact
+def test_identity_resolution_reuses_the_container_index(artifact, monkeypatch):
+    folder, _metadata, artifact_id = artifact
     unrelated = folder.parent / "unrelated"
     unrelated.mkdir()
     (unrelated / "metadata.json").write_text(json.dumps({
-        "id": "unrelated",
+        "id": _full_id("22222222-2222-4222-8222-222222222222"),
         "createdAt": "2026-08-25T12:01:00+00:00",
-        "stableId": "22222222-2222-4222-8222-222222222222",
     }), encoding="utf-8")
     source = ProjectArtifacts(folder.parent, None, "test")
     identity_service._clear_identity_indexes()
-    original = identity_service.ensure_stable_id
+    original = identity_service.ensure_full_id
     calls = 0
 
     def counted(*args, **kwargs):
@@ -123,22 +183,22 @@ def test_stable_identity_resolution_reuses_the_container_index(artifact, monkeyp
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(identity_service, "ensure_stable_id", counted)
+    monkeypatch.setattr(identity_service, "ensure_full_id", counted)
 
-    assert resolve_artifact_folder([source], stable_id)[1] == folder
+    assert resolve_artifact_folder([source], artifact_id)[1] == folder
     first_lookup_calls = calls
-    assert resolve_artifact_folder([source], stable_id)[1] == folder
+    assert resolve_artifact_folder([source], artifact_id)[1] == folder
 
     assert first_lookup_calls == 3  # two indexed folders + target revalidation
     assert calls == first_lookup_calls + 1  # hot lookup reads only its target
 
 
-def test_stable_identity_miss_refreshes_existing_folder_metadata(artifact):
-    folder, _metadata, _stable_id = artifact
+def test_identity_miss_refreshes_existing_folder_metadata(artifact):
+    folder, _metadata, _artifact_id = artifact
     pending = folder.parent / "pending"
     pending.mkdir()
     source = ProjectArtifacts(folder.parent, None, "test")
-    wanted = "33333333-3333-4333-8333-333333333333"
+    wanted = _full_id("33333333-3333-4333-8333-333333333333")
     identity_service._clear_identity_indexes()
 
     with pytest.raises(FileNotFoundError):
@@ -148,9 +208,8 @@ def test_stable_identity_miss_refreshes_existing_folder_metadata(artifact):
     # clock untouched; a cached negative result must not hide the new artifact.
     (pending / "metadata.json").write_text(
         json.dumps({
-            "id": "pending",
+            "id": wanted,
             "createdAt": "2026-08-25T12:02:00+00:00",
-            "stableId": wanted,
         }),
         encoding="utf-8",
     )
@@ -158,45 +217,44 @@ def test_stable_identity_miss_refreshes_existing_folder_metadata(artifact):
     assert resolve_artifact_folder([source], wanted)[1] == pending
 
 
-def test_stable_identity_refreshes_when_cached_identity_moves(artifact):
-    folder, _metadata, stable_id = artifact
+def test_identity_refreshes_when_cached_identity_moves(artifact):
+    folder, _metadata, artifact_id = artifact
     replacement = folder.parent / "replacement"
     replacement.mkdir()
-    replacement_id = "44444444-4444-4444-8444-444444444444"
+    replacement_id = _full_id("44444444-4444-4444-8444-444444444444")
     replacement_metadata = {
-        "id": "replacement",
+        "id": replacement_id,
         "createdAt": "2026-08-25T12:03:00+00:00",
-        "stableId": replacement_id,
     }
     replacement_path = replacement / "metadata.json"
     replacement_path.write_text(json.dumps(replacement_metadata), encoding="utf-8")
     source = ProjectArtifacts(folder.parent, None, "test")
     identity_service._clear_identity_indexes()
 
-    assert resolve_artifact_folder([source], stable_id)[1] == folder
+    assert resolve_artifact_folder([source], artifact_id)[1] == folder
 
     original_path = folder / "metadata.json"
     original_metadata = json.loads(original_path.read_text(encoding="utf-8"))
     original_path.write_text(
-        json.dumps({**original_metadata, "stableId": replacement_id}),
+        json.dumps({**original_metadata, "id": replacement_id}),
         encoding="utf-8",
     )
     replacement_path.write_text(
-        json.dumps({**replacement_metadata, "stableId": stable_id}),
+        json.dumps({**replacement_metadata, "id": artifact_id}),
         encoding="utf-8",
     )
 
-    assert resolve_artifact_folder([source], stable_id)[1] == replacement
+    assert resolve_artifact_folder([source], artifact_id)[1] == replacement
 
 
 def test_manual_save_is_atomic_and_records_revision(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
 
     saved = save_source(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         content="# Revised\n",
         expected_revision_id=initial["revision"]["id"],
         actor_kind="manual",
@@ -212,17 +270,17 @@ def test_manual_save_is_atomic_and_records_revision(artifact):
 
 
 def test_workspace_snapshot_bundles_source_and_filtered_history(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     save_source(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         content="# Revised\n",
         expected_revision_id=initial["revision"]["id"],
     )
 
-    snapshot = current_workspace(folder, metadata, stable_id)
+    snapshot = current_workspace(folder, metadata, artifact_id)
 
     assert snapshot["content"] == "# Revised\n"
     assert snapshot["revision"] == snapshot["revisions"][0]
@@ -230,8 +288,8 @@ def test_workspace_snapshot_bundles_source_and_filtered_history(artifact):
 
 
 def test_interrupted_save_recovers_source_and_attribution(artifact, monkeypatch):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     write_manifest = revision_service._write_manifest
     failed = False
 
@@ -247,7 +305,7 @@ def test_interrupted_save_recovers_source_and_attribution(artifact, monkeypatch)
         save_source(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             content="# Recovered\n",
             expected_revision_id=initial["revision"]["id"],
             actor_kind="manual",
@@ -256,7 +314,7 @@ def test_interrupted_save_recovers_source_and_attribution(artifact, monkeypatch)
         )
 
     assert (folder / ".revisions" / "pending-source-write.json").is_file()
-    recovered = current_source(folder, metadata, stable_id)
+    recovered = current_source(folder, metadata, artifact_id)
 
     assert recovered["content"] == "# Recovered\n"
     assert recovered["revision"]["actor"] == {"kind": "manual", "id": "user-1"}
@@ -265,12 +323,12 @@ def test_interrupted_save_recovers_source_and_attribution(artifact, monkeypatch)
 
 
 def test_stale_save_returns_conflict_without_overwriting(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     first = save_source(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         content="winner",
         expected_revision_id=initial["revision"]["id"],
     )
@@ -279,7 +337,7 @@ def test_stale_save_returns_conflict_without_overwriting(artifact):
         save_source(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             content="stale overwrite",
             expected_revision_id=initial["revision"]["id"],
         )
@@ -289,15 +347,15 @@ def test_stale_save_returns_conflict_without_overwriting(artifact):
 
 
 def test_out_of_band_change_is_captured_before_conflict(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     (folder / "brief.md").write_text("agent changed this", encoding="utf-8")
 
     with pytest.raises(RevisionConflict) as exc:
         save_source(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             content="manual change",
             expected_revision_id=initial["revision"]["id"],
         )
@@ -308,21 +366,21 @@ def test_out_of_band_change_is_captured_before_conflict(artifact):
 
 
 def test_revision_journal_is_private_housekeeping(artifact):
-    folder, metadata, stable_id = artifact
-    current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    current_source(folder, metadata, artifact_id)
 
     assert (folder / ".revisions" / "manifest.json").is_file()
     assert not any(p.name.endswith(".tmp") for p in (folder / ".revisions").rglob("*"))
 
 
 def test_revision_retention_prunes_unreferenced_blobs(artifact):
-    folder, metadata, stable_id = artifact
-    current = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    current = current_source(folder, metadata, artifact_id)
     for number in range(82):
         current = save_source(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             content=f"# Revision {number}\n",
             expected_revision_id=current["revision"]["id"],
         )
@@ -332,8 +390,8 @@ def test_revision_retention_prunes_unreferenced_blobs(artifact):
 
 
 def test_agent_repair_carries_context_and_requires_compare_before_accept(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     thread = [
         {"author": {"email": "reviewer@example.com"}, "text": "Use a clearer title"},
         {"author": {"email": "owner@example.com"}, "text": "Keep it concise"},
@@ -342,7 +400,7 @@ def test_agent_repair_carries_context_and_requires_compare_before_accept(artifac
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector="h1:nth-of-type(1)",
@@ -354,7 +412,7 @@ def test_agent_repair_carries_context_and_requires_compare_before_accept(artifac
         create_agent_repair(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             expected_revision_id=initial["revision"]["id"],
             comment_thread_id="thread-2",
             selector=None,
@@ -362,7 +420,7 @@ def test_agent_repair_carries_context_and_requires_compare_before_accept(artifac
             conversation_id="conversation-2",
         )
 
-    assert stable_id in requested["prompt"]
+    assert artifact_id in requested["prompt"]
     assert initial["revision"]["id"] in requested["prompt"]
     assert "h1:nth-of-type(1)" in requested["prompt"]
     assert "Use a clearer title" in requested["prompt"]
@@ -370,7 +428,7 @@ def test_agent_repair_carries_context_and_requires_compare_before_accept(artifac
         finalize_agent_repair(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             requested["repair"]["id"],
             "accepted",
         )
@@ -387,7 +445,7 @@ def test_agent_repair_carries_context_and_requires_compare_before_accept(artifac
         create_agent_repair(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             expected_revision_id=detail["repair"]["revisionId"],
             comment_thread_id="thread-2",
             selector=None,
@@ -397,19 +455,19 @@ def test_agent_repair_carries_context_and_requires_compare_before_accept(artifac
     assert finalize_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         requested["repair"]["id"],
         "accepted",
     )["status"] == "accepted"
 
 
 def test_queued_agent_repair_can_be_cancelled_when_turn_does_not_start(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
@@ -424,7 +482,7 @@ def test_queued_agent_repair_can_be_cancelled_when_turn_does_not_start(artifact)
     replacement = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-2",
         selector=None,
@@ -435,12 +493,12 @@ def test_queued_agent_repair_can_be_cancelled_when_turn_does_not_start(artifact)
 
 
 def test_active_agent_repair_survives_viewer_navigation(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
@@ -455,7 +513,7 @@ def test_active_agent_repair_survives_viewer_navigation(artifact):
     finalize_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         requested["repair"]["id"],
         "accepted",
     )
@@ -463,12 +521,12 @@ def test_active_agent_repair_survives_viewer_navigation(artifact):
 
 
 def test_reject_agent_repair_restores_source_as_a_new_revision(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
@@ -481,7 +539,7 @@ def test_reject_agent_repair_restores_source_as_a_new_revision(artifact):
     decided = finalize_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         requested["repair"]["id"],
         "rejected",
         actor_id="owner-1",
@@ -489,19 +547,19 @@ def test_reject_agent_repair_restores_source_as_a_new_revision(artifact):
 
     assert decided["status"] == "rejected"
     assert (folder / "brief.md").read_text(encoding="utf-8") == "# First\n"
-    restored = current_source(folder, metadata, stable_id)["revision"]
+    restored = current_source(folder, metadata, artifact_id)["revision"]
     assert restored["baseRevisionId"] == agent_revision["id"]
     assert restored["actor"] == {"kind": "manual", "id": "owner-1"}
     assert restored["commentThreadIds"] == ["thread-1"]
 
 
 def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monkeypatch):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
@@ -525,7 +583,7 @@ def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monke
         finalize_agent_repair(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             requested["repair"]["id"],
             "rejected",
             actor_id="owner-1",
@@ -534,7 +592,7 @@ def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monke
     decided = finalize_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         requested["repair"]["id"],
         "rejected",
         actor_id="owner-1",
@@ -549,12 +607,12 @@ def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monke
 
 
 def test_agent_repair_decision_refuses_a_changed_head(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
@@ -564,11 +622,11 @@ def test_agent_repair_decision_refuses_a_changed_head(artifact):
     (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
     capture_agent_revision(folder, conversation_id="conversation-1")
     ready = agent_repair_detail(folder, requested["repair"]["id"])["repair"]
-    current = current_source(folder, metadata, stable_id)
+    current = current_source(folder, metadata, artifact_id)
     save_source(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         content="# Owner follow-up\n",
         expected_revision_id=current["revision"]["id"],
     )
@@ -577,7 +635,7 @@ def test_agent_repair_decision_refuses_a_changed_head(artifact):
         finalize_agent_repair(
             folder,
             metadata,
-            stable_id,
+            artifact_id,
             ready["id"],
             "accepted",
         )
@@ -586,12 +644,12 @@ def test_agent_repair_decision_refuses_a_changed_head(artifact):
 
 
 def test_agent_repair_finishes_when_agent_makes_no_change(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
@@ -608,12 +666,12 @@ def test_agent_repair_finishes_when_agent_makes_no_change(artifact):
 
 
 def test_agent_repair_reports_conflict_when_base_moves_during_turn(artifact):
-    folder, metadata, stable_id = artifact
-    initial = current_source(folder, metadata, stable_id)
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=initial["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
@@ -623,7 +681,7 @@ def test_agent_repair_reports_conflict_when_base_moves_during_turn(artifact):
     save_source(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         content="# Owner update\n",
         expected_revision_id=initial["revision"]["id"],
     )

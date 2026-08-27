@@ -1,12 +1,18 @@
-"""Stable artifact identity and project-scoped resolution.
+"""Canonical artifact identity and project-scoped resolution.
 
 Artifact folders can move between projects and published URLs can change.  The
-UUID stored in ``metadata.json`` is the identity that survives those changes;
-filesystem paths and the legacy eight-character id are compatibility details.
+32-hex ``id`` stored in ``metadata.json`` is the identity that survives those
+changes; filesystem paths and the slug's eight-character ``id[:8]`` suffix are
+compatibility details.
+
+The widening rules live in ``anton.core.artifacts.models``: anton derives them
+in memory on every read, this service persists them. Both sides must agree on
+the value, so the derivation is imported rather than reimplemented.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from collections import OrderedDict
@@ -14,20 +20,56 @@ from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING
 
-from anton.core.artifacts.models import legacy_stable_id
+# Re-exported: `artifact_key()` is the canonical `artifact/<uuid>` key the
+# comments API, the auth rules and the upload lambda all agree on. Callers here
+# import it from this module because that is where the rest of the identity
+# vocabulary lives.
+from anton.core.artifacts.models import (
+    artifact_key,
+    canonical_artifact_id,
+    extend_legacy_id,
+    resolve_artifact_id,
+)
 
 if TYPE_CHECKING:
     from cowork.services.artifacts import ProjectArtifacts
 
 
+logger = logging.getLogger(__name__)
+
+
 class ArtifactIdentityConflict(RuntimeError):
-    """More than one scoped folder claims the same stable identity."""
+    """More than one scoped folder claims the same artifact identity."""
 
 
-def _legacy_stable_id(metadata: dict, folder: Path) -> str:
-    legacy_id = str(metadata.get("id") or metadata.get("slug") or folder.name)
+def _resolved_id(metadata: dict, folder: Path) -> str:
+    """The canonical id this metadata document should carry.
+
+    ``stableId`` is the retired second field of the two-field era; where it
+    exists it already keyed published versions, auth rules and comment threads,
+    so it decides for a record whose ``id`` is still the short form.
+    """
+    raw_id = str(metadata.get("id") or "")
+    inherited = str(metadata.get("stableId") or "")
     created_at = str(metadata.get("createdAt") or "")
-    return legacy_stable_id(legacy_id, created_at)
+    try:
+        if raw_id or inherited:
+            return resolve_artifact_id(raw_id, inherited, created_at)
+        # No identity field at all — a record anton itself would refuse to load.
+        # Derive one from whatever names the folder, deterministically, so the
+        # artifact still gets an identity instead of vanishing from every list.
+        # Not routed through `resolve_artifact_id`: a slug is not an id, so it
+        # must not be judged against the shapes a real id is allowed to take.
+        return extend_legacy_id(str(metadata.get("slug") or folder.name), created_at)
+    except (ValueError, TypeError, AttributeError) as exc:
+        # A present-but-invalid identity is corruption, not a legacy record.
+        # Replacing it would silently detach published versions and existing
+        # comment threads from the artifact.
+        raise ValueError("Artifact identity is invalid") from exc
+
+
+def _is_migrated(metadata: dict, resolved: str) -> bool:
+    return metadata.get("id") == resolved and not metadata.get("stableId")
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -42,26 +84,18 @@ def _atomic_json(path: Path, payload: dict) -> None:
             pass
 
 
-def ensure_stable_id(folder: Path, metadata: dict | None = None) -> tuple[str, dict]:
-    """Return the folder's canonical UUID, persisting a legacy backfill.
+def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dict]:
+    """Return the folder's canonical 32-hex id, persisting a legacy widening.
 
-    The fallback is deterministic, so concurrent readers choose the same value
+    The widening is deterministic, so concurrent readers choose the same value
     even before either atomic metadata write wins.
     """
     path = folder / "metadata.json"
     if metadata is None:
         metadata = json.loads(path.read_text(encoding="utf-8"))
-    raw = metadata.get("stableId")
-    if raw not in (None, ""):
-        try:
-            return str(uuid.UUID(str(raw))), metadata
-        except (ValueError, TypeError, AttributeError) as exc:
-            # A present-but-invalid identity is corruption, not a legacy
-            # record. Replacing it would silently detach published versions
-            # and existing comment threads from the artifact.
-            raise ValueError("Artifact stable identity is invalid") from exc
-
-    stable_id = _legacy_stable_id(metadata, folder)
+    resolved = _resolved_id(metadata, folder)
+    if _is_migrated(metadata, resolved):
+        return resolved, metadata
 
     # The caller may have loaded metadata before another subsystem updated it.
     # Merge into the latest durable document instead of writing the stale
@@ -70,17 +104,14 @@ def ensure_stable_id(folder: Path, metadata: dict | None = None) -> tuple[str, d
         latest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Artifact metadata is unreadable") from exc
-    latest_raw = latest.get("stableId")
-    if latest_raw not in (None, ""):
-        try:
-            return str(uuid.UUID(str(latest_raw))), latest
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise ValueError("Artifact stable identity is invalid") from exc
-    updated = dict(latest)
-    updated["stableId"] = stable_id
+    resolved = _resolved_id(latest, folder)
+    if _is_migrated(latest, resolved):
+        return resolved, latest
+    updated = {key: value for key, value in latest.items() if key != "stableId"}
+    updated["id"] = resolved
     # metadata.json's mtime is a turn-recency signal: channel delivery
     # (artifacts_since) treats a fresh mtime as "this turn touched the
-    # artifact". A backfill changes no user-visible content, so restore the
+    # artifact". Widening an id changes no user-visible content, so restore the
     # original timestamps or the first card/index build after an upgrade
     # would mark every legacy artifact as just-updated and deliver stale
     # attachments to the chat.
@@ -88,18 +119,23 @@ def ensure_stable_id(folder: Path, metadata: dict | None = None) -> tuple[str, d
         before = path.stat()
     except OSError:
         before = None
-    _atomic_json(path, updated)
+    try:
+        _atomic_json(path, updated)
+    except OSError:
+        # Persisting is an optimization, not the contract: the id is derived
+        # deterministically, so a read-only or full artifacts root still
+        # resolves to the same value on every read — exactly what anton does.
+        # Propagating would drop the artifact from every listing (both callers
+        # treat an identity error as "skip this folder"), which reads as a
+        # deletion of files that are sitting right there.
+        logger.warning("Could not persist widened artifact id for %s", folder, exc_info=True)
+        return resolved, updated
     if before is not None:
         try:
             os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         except OSError:
             pass
-    return stable_id, updated
-
-
-def artifact_key(stable_id: str) -> str:
-    """Canonical two-segment key accepted by the existing comments API."""
-    return f"artifact/{uuid.UUID(stable_id)}"
+    return resolved, updated
 
 
 def _directory_version(base: Path) -> tuple[int, int]:
@@ -119,7 +155,7 @@ _identity_indexes_lock = RLock()
 
 
 def _build_identity_index(base_value: str) -> dict[str, tuple[str, ...]]:
-    """Build a stable-id-to-folder index for one artifacts container."""
+    """Build an id-to-folder index for one artifacts container."""
     base = Path(base_value)
     matches: dict[str, list[str]] = {}
     try:
@@ -130,11 +166,11 @@ def _build_identity_index(base_value: str) -> dict[str, tuple[str, ...]]:
         if not folder.is_dir() or not (folder / "metadata.json").is_file():
             continue
         try:
-            found, _metadata = ensure_stable_id(folder)
+            found, _metadata = ensure_full_id(folder)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         matches.setdefault(found, []).append(str(folder))
-    return {stable_id: tuple(folders) for stable_id, folders in matches.items()}
+    return {artifact_id: tuple(folders) for artifact_id, folders in matches.items()}
 
 
 def _identity_index(
@@ -183,7 +219,7 @@ def _refresh_identity_index(
 
 def _validated_index_records(
     base: Path,
-    stable_id: str,
+    artifact_id: str,
     folder_values: tuple[str, ...],
 ) -> tuple[tuple[Path, dict], ...]:
     records: list[tuple[Path, dict]] = []
@@ -191,21 +227,21 @@ def _validated_index_records(
         folder = Path(folder_value)
         try:
             folder.resolve(strict=False).relative_to(base)
-            found, metadata = ensure_stable_id(folder)
+            found, metadata = ensure_full_id(folder)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if found == stable_id:
+        if found == artifact_id:
             records.append((folder, metadata))
     return tuple(records)
 
 
-def _indexed_artifacts(base: Path, stable_id: str) -> tuple[tuple[Path, dict], ...]:
+def _indexed_artifacts(base: Path, artifact_id: str) -> tuple[tuple[Path, dict], ...]:
     resolved = base.resolve(strict=False)
     cache_key = (str(resolved), _directory_version(resolved))
     index, was_cached = _identity_index(*cache_key)
-    folders = index.get(stable_id)
+    folders = index.get(artifact_id)
     if folders is not None:
-        records = _validated_index_records(resolved, stable_id, folders)
+        records = _validated_index_records(resolved, artifact_id, folders)
         if len(records) == len(folders):
             return records
 
@@ -219,14 +255,14 @@ def _indexed_artifacts(base: Path, stable_id: str) -> tuple[tuple[Path, dict], .
     # revalidation therefore rebuilds once before declaring the identity
     # absent. Positive lookups remain the one-target fast path.
     refreshed = _refresh_identity_index(cache_key)
-    return _validated_index_records(resolved, stable_id, refreshed.get(stable_id, ()))
+    return _validated_index_records(resolved, artifact_id, refreshed.get(artifact_id, ()))
 
 
 def resolve_artifact_folder(
-    sources: list["ProjectArtifacts"], stable_id: str
+    sources: list["ProjectArtifacts"], artifact_id: str
 ) -> tuple["ProjectArtifacts", Path, dict]:
-    """Resolve a UUID only inside roots already authorized for the caller."""
-    wanted = str(uuid.UUID(stable_id))
+    """Resolve an id only inside roots already authorized for the caller."""
+    wanted = canonical_artifact_id(artifact_id)
     matches: list[tuple["ProjectArtifacts", Path, dict]] = []
     for source in sources:
         base = Path(source.base).resolve(strict=False)
@@ -236,5 +272,5 @@ def resolve_artifact_folder(
     if not matches:
         raise FileNotFoundError("Artifact not found")
     if len(matches) > 1:
-        raise ArtifactIdentityConflict("Stable artifact identity is duplicated")
+        raise ArtifactIdentityConflict("Artifact identity is duplicated")
     return matches[0]

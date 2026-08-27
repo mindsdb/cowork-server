@@ -13,7 +13,7 @@ def _service(tmp_path, monkeypatch):
     monkeypatch.setattr(
         comments,
         "resolve_artifact_folder",
-        lambda _sources, _stable_id: (object(), folder, {}),
+        lambda _sources, _artifact_id: (object(), folder, {}),
     )
     return comments.LocalArtifactComments("11111111-1111-1111-1111-111111111111")
 

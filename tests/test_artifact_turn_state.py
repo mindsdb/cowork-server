@@ -127,7 +127,7 @@ def test_index_leaves_untouched_slug_out_of_touched(conv, tmp_path):
 
 
 def test_index_finishes_no_change_repair_without_marking_artifact_touched(conv, tmp_path):
-    from cowork.services.artifact_identity import ensure_stable_id
+    from cowork.services.artifact_identity import ensure_full_id
     from cowork.services.artifact_revisions import (
         agent_repair_detail,
         create_agent_repair,
@@ -142,12 +142,12 @@ def test_index_finishes_no_change_repair_without_marking_artifact_touched(conv, 
         meta={"slug": "old", "type": "document", "primary": "a.md"},
     )
     folder = base / "old"
-    stable_id, metadata = ensure_stable_id(folder)
-    current = current_source(folder, metadata, stable_id)
+    artifact_id, metadata = ensure_full_id(folder)
+    current = current_source(folder, metadata, artifact_id)
     repair = create_agent_repair(
         folder,
         metadata,
-        stable_id,
+        artifact_id,
         expected_revision_id=current["revision"]["id"],
         comment_thread_id="thread-1",
         selector=None,
