@@ -195,9 +195,11 @@ def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) 
         requests.append(request)
         if request.url.host == "api.linear.app":
             assert request.headers["Authorization"] == "linear-secret"
+            assert json.loads(request.content)["variables"] == {"id": "ENG-19"}
             return httpx.Response(200, json={"data": {"issue": {
                 "id": "linear-id", "identifier": "ENG-19", "title": "Multi-repo delivery",
-                "description": "Ship both repositories.", "url": "https://linear.app/work/issue/ENG-19",
+                "description": "Ship both repositories.",
+                "url": "https://linear.app/work/issue/ENG-19/multi-repo-delivery",
             }}})
         assert request.url.path == "/api/conversations.replies"
         assert request.url.params["channel"] == "C123"
@@ -210,7 +212,9 @@ def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) 
     })
     current = project(tmp_path)
     linear = integration.read(current, SourceContextRequest(
-        provider="linear", kind="issue", url="https://linear.app/work/issue/ENG-19",
+        provider="linear",
+        kind="issue",
+        url="https://linear.app/work/issue/ENG-19/multi-repo-delivery",
     ))
     slack = integration.read(current, SourceContextRequest(
         provider="slack", kind="conversation", url="https://workspace.slack.com/archives/C123/p1234567890123456",
