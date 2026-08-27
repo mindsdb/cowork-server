@@ -1,0 +1,102 @@
+{{- if .Values.networkPolicy.enabled }}
+# The boundary cowork-server's whole identity model rests on.
+#
+# In org mode the pod does not authenticate anyone. The nginx ingress runs an
+# auth subrequest against the auth service and copies X-User-Id and
+# X-Organization-Id off the answer, and cowork-server validates the shape of
+# those headers and then trusts them. Enforcing identity in the application
+# refuses a caller carrying NO headers; it does nothing about a caller in the
+# cluster that sends two well-formed UUIDs of its own. Only the network can
+# refuse that caller, which is what this does.
+#
+# policyTypes: [Ingress] with no default rule is default-deny ingress; the rules
+# below re-allow the sources that have to reach the pod. Egress (Postgres,
+# Redis, the auth service, DNS, EFS) is deliberately left open.
+#
+# Ported from the same template in the auth chart, which the auth service has
+# carried disabled since its own hardening pass. One value differs and it
+# matters: the ingress controller runs in the `infrastructure` namespace here,
+# not in `ingress-nginx`, which is what the auth chart's default still says.
+#
+# Guarded by networkPolicy.enabled (default false) so no environment locks
+# itself by inheriting it. Enable one environment at a time and watch pod
+# readiness: a policy that refuses the kubelet takes the deployment down.
+#
+# BEFORE ENABLING THIS ANYWHERE: the CI deploy identity must be able to create
+# the kind. It cannot today. `helm upgrade` runs in-cluster as
+# `system:serviceaccount:infrastructure:<env>-gha-runner`, and on newdev
+# `auth can-i create networkpolicies -n staging` answers no while `ingresses`
+# and `deployments` answer yes, so enabling this fails the release and --atomic
+# rolls the whole deploy back. Check it, do not assume:
+#   kubectl --context newdev -n staging auth can-i create networkpolicies \
+#     --as=system:serviceaccount:infrastructure:newdev-gha-runner
+# A server-side dry-run under your own kubeconfig does NOT answer this: it tells
+# you the API server accepts the manifest, not that the deployer may create it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-allow-ingress
+  labels:
+    app: {{ .Values.deployment.name }}
+spec:
+  # The devops-nirvana `deployment` subchart labels its pods `app: <name>`; it
+  # does not emit app.kubernetes.io/name, so do not select on that. Defaulted
+  # off deployment.name rather than duplicated in values: a policy whose
+  # podSelector matches no pod is a silent no-op, so it would read as enabled
+  # and enforce nothing.
+  podSelector:
+    matchLabels:
+      {{- with .Values.networkPolicy.podSelectorLabels }}
+{{ toYaml . | indent 6 }}
+      {{- else }}
+      app: {{ .Values.deployment.name }}
+      {{- end }}
+  policyTypes:
+    - Ingress
+  ingress:
+{{- if .Values.networkPolicy.ingressController.enabled }}
+    # (a) Every real request. The ALB targets the controller pods by IP, so from
+    #     the pod's side every legitimate caller is an nginx ingress controller
+    #     pod. The namespace it runs in is `infrastructure` here, NOT
+    #     `ingress-nginx`, which is what the auth chart's default still says.
+    #
+    #     The podSelector is ANDed onto the namespaceSelector deliberately.
+    #     A namespaceSelector alone admits EVERY pod in `infrastructure`, and
+    #     that namespace also runs the GitHub Actions runners and openvpn, which
+    #     MASQUERADEs VPN client traffic to its own pod IP. Any of those could
+    #     then forge the identity headers, which is the one thing this policy
+    #     exists to stop.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+{{ toYaml .Values.networkPolicy.ingressController.namespaceSelector | indent 14 }}
+          {{- with .Values.networkPolicy.ingressController.podSelector }}
+          podSelector:
+            matchLabels:
+{{ toYaml . | indent 14 }}
+          {{- end }}
+      ports:
+        - protocol: TCP
+          # Defaults to the port the container actually listens on, so the two
+          # cannot drift: a policy naming a port nothing serves drops every
+          # legitimate request while `helm template` stays clean.
+          port: {{ .Values.networkPolicy.port | default .Values.deployment.service.targetPort }}
+{{- end }}
+{{- with .Values.networkPolicy.nodeCidrs }}
+    # (b) The nodes. Liveness and readiness probes come from the kubelet, so no
+    #     podSelector or namespaceSelector matches them.
+    - from:
+{{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          # `with` rebound the dot to the CIDR list, so this needs the root.
+          port: {{ $.Values.networkPolicy.port | default $.Values.deployment.service.targetPort }}
+{{- end }}
+{{- with .Values.networkPolicy.extraIngress }}
+    # (c) Operator-supplied extra sources, verbatim ingress rules.
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- end }}
