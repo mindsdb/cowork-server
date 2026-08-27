@@ -475,16 +475,28 @@ async def test_produce_direct_streams_chunks_then_persists_once_and_roots_metada
     monkeypatch.setattr(responses, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(responses, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None))
 
+    user_id = _uuid4()
+
+    def save_user_message(cid, content, pending=False):
+        calls.append("save_user")
+        saved.update(pending=pending)
+        return SimpleNamespace(id=user_id)
+
     def save_assistant_turn(cid, text, events, harness=None):
         calls.append("save_assistant")
         saved.update(text=text, events=events, harness=harness)
+
+    def finalize_pending(cid, message_id=None):
+        calls.append("finalize")
+        saved.update(finalized=message_id)
 
     monkeypatch.setattr(
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            save_user_message=lambda cid, content, pending=False: calls.append("save_user") or SimpleNamespace(id=_uuid4()),
+            save_user_message=save_user_message,
             save_assistant_turn=save_assistant_turn,
+            finalize_pending=finalize_pending,
         ),
     )
 
@@ -520,8 +532,11 @@ async def test_produce_direct_streams_chunks_then_persists_once_and_roots_metada
     )
 
     assert buffer.closed == "completed"
-    # created + 3 deltas + completed; persisted once, after the last delta, before completed.
-    assert calls == ["save_user", "emit", "emit", "emit", "emit", "save_assistant", "emit"]
+    # created + 3 deltas + completed; persisted once, after the last delta, before
+    # completed; the question is pending until then and finalized with the answer.
+    assert calls == ["save_user", "emit", "emit", "emit", "emit", "save_assistant", "finalize", "emit"]
+    assert saved["pending"] is True
+    assert saved["finalized"] == user_id
     payloads = [json.loads(f.split("data: ", 1)[1]) for f in buffer.frames]
     assert [p_["type"] for p_ in payloads] == [
         "response.created", "response.output_text.delta", "response.output_text.delta",
@@ -550,14 +565,16 @@ async def test_produce_direct_persists_what_was_said_when_stopped(monkeypatch):
 
     handler = _routing_handler(monkeypatch)
     saved = {}
+    user_id = _uuid4()
     monkeypatch.setattr(responses, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(responses, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            save_user_message=lambda cid, content, pending=False: SimpleNamespace(id=_uuid4()),
+            save_user_message=lambda cid, content, pending=False: SimpleNamespace(id=user_id),
             save_assistant_turn=lambda cid, text, events, harness=None: saved.update(text=text),
+            finalize_pending=lambda cid, message_id=None: saved.update(finalized=message_id),
         ),
     )
 
@@ -570,9 +587,14 @@ async def test_produce_direct_persists_what_was_said_when_stopped(monkeypatch):
         async def close(self, reason):
             self.closed = reason
 
+    closed = []
+
     async def tail():
-        yield " There"
-        raise asyncio.CancelledError  # Stop pressed mid-answer
+        try:
+            yield " There"
+            raise asyncio.CancelledError  # Stop pressed mid-answer
+        finally:
+            closed.append(True)
 
     buffer = _Buffer()
     route = RouteDecision(
@@ -590,6 +612,8 @@ async def test_produce_direct_persists_what_was_said_when_stopped(monkeypatch):
 
     assert buffer.closed == "cancelled"
     assert saved["text"] == "Hi. There"
+    assert saved["finalized"] == user_id  # what was said rejoins history
+    assert closed == [True]  # the gate's stream does not outlive the turn
 
 
 # --- history view: tool rows become markers, not holes (ENG-1851) -----------
@@ -826,10 +850,10 @@ async def test_gate_delegates_an_empty_or_truncated_answer():
 async def test_gate_commits_once_the_hold_fills_and_streams_the_rest():
     from cowork.handlers.response_routing import _gate
 
-    provider = _StreamProvider([_text(LONG), _text(" and"), _text(" more."), _complete()])
+    provider = _StreamProvider([_text("\n\n" + LONG), _text(" and"), _text(" more."), _complete()])
     head, rest = await _gate(_binding(provider), history=HISTORY)
 
-    assert head == LONG
+    assert head == LONG  # leading whitespace trimmed, as on the buffered path
     assert rest is not None
     assert [c async for c in rest] == [" and", " more."]
     assert provider.closed

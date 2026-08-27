@@ -133,7 +133,7 @@ async def _gate(
                 if len(head) >= _HOLD_CHARS:
                     rest = _rest_of(events)
                     events = None  # the tail owns the stream now
-                    return head, rest
+                    return head.lstrip(), rest
     finally:
         if events is not None:
             await _close(events)

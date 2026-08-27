@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import suppress
 import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
@@ -540,6 +541,7 @@ class ResponsesHandler:
         parts: list[str] = [route.text]
         seq = 1
         persisted = False
+        pending_message_id = None
 
         def persist() -> None:
             nonlocal persisted
@@ -547,11 +549,18 @@ class ResponsesHandler:
                 return
             persisted = True
             full = "".join(parts)
-            ConversationService(producer_session).save_assistant_turn(
+            svc = ConversationService(producer_session)
+            svc.save_assistant_turn(
                 conv_id, full,
                 [{**delta_base, "sequence_number": 2, "delta": full}, {"type": "response.completed"}],
                 harness="cowork-direct",
             )
+            # Only now does the question rejoin replayed history (ENG-1231):
+            # a crash between the pending persist and here leaves it pending —
+            # visible in the UI, excluded from history — rather than folded in
+            # as a question with no answer, exactly as the delegated producers.
+            if pending_message_id is not None:
+                svc.finalize_pending(conv_id, pending_message_id)
 
         async def emit_delta(chunk: str) -> None:
             nonlocal seq
@@ -562,7 +571,11 @@ class ResponsesHandler:
 
         try:
             producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
-            ConversationService(producer_session).save_user_message(conv_id, original_content)
+            # Pending until the answer is persisted, like the delegated producers:
+            # a mid-turn refresh shows the question, history does not replay it yet.
+            pending_message_id = ConversationService(producer_session).save_user_message(
+                conv_id, original_content, pending=True,
+            ).id
 
             response = Response(status=ResponseStatus.created, model=route.model)
             # conversation_id/harness sit at the event root, like both
@@ -606,6 +619,13 @@ class ResponsesHandler:
             await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
             await buffer.close("error")
         finally:
+            # Whatever ended the turn, the gate's stream must not outlive it:
+            # a Stop mid-answer would otherwise leave the provider request open
+            # until the generator is garbage-collected.
+            aclose = getattr(route.text_stream, "aclose", None)
+            if aclose is not None:
+                with suppress(Exception):
+                    await aclose()
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
             if producer_session is not None:
                 producer_session.close()
