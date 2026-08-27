@@ -23,7 +23,7 @@ from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
-from cowork.principal import Principal, can_manage_org, get_principal
+from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
     SettingResponse,
@@ -87,17 +87,6 @@ def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None
 @router.get("/", response_model=list[SettingResponse])
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()
-
-
-def _bearer_token(request: Request | None) -> str:
-    """The caller's own bearer, for the org catalog fetch. Mirrors
-    ``recommended_models``: never the stored key or the tenant-settable
-    ``minds_url``, or a member's JWT could be forwarded to an admin-chosen
-    host."""
-    if request is None:
-        return ""
-    header = request.headers.get("Authorization", "")
-    return header[7:].strip() if header.lower().startswith("bearer ") else ""
 
 
 def _reject_malformed_role_defaults(updates: dict[str, Any]) -> None:
@@ -182,7 +171,7 @@ async def _reject_unservable_models(
             key,
             value,
             org_id=scope.org_id if scope and scope.org_mode else None,
-            bearer_token=_bearer_token(request),
+            bearer_token=caller_bearer(request),
         )
         if rejection:
             raise HTTPException(
@@ -454,8 +443,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         # Org catalog: operator endpoint + the caller's own bearer, per org.
         # Never the stored key or s.minds_url (both tenant-settable), or a
         # member's JWT could be forwarded to an admin-chosen host.
-        bearer = request.headers.get("Authorization", "")
-        token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+        token = caller_bearer(request)
         if token and scope.org_id:
             listing = await fetch_org_model_catalog(
                 org_id=scope.org_id, bearer_token=token, refresh=refresh
