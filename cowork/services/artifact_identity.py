@@ -78,7 +78,22 @@ def ensure_stable_id(folder: Path, metadata: dict | None = None) -> tuple[str, d
             raise ValueError("Artifact stable identity is invalid") from exc
     updated = dict(latest)
     updated["stableId"] = stable_id
+    # metadata.json's mtime is a turn-recency signal: channel delivery
+    # (artifacts_since) treats a fresh mtime as "this turn touched the
+    # artifact". A backfill changes no user-visible content, so restore the
+    # original timestamps or the first card/index build after an upgrade
+    # would mark every legacy artifact as just-updated and deliver stale
+    # attachments to the chat.
+    try:
+        before = path.stat()
+    except OSError:
+        before = None
     _atomic_json(path, updated)
+    if before is not None:
+        try:
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        except OSError:
+            pass
     return stable_id, updated
 
 
