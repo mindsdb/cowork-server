@@ -33,7 +33,12 @@ into innerHTML rather than read as a plain script value.
 Message shape posted back to the opener is `{type: "drive-picker-result",
 result: {...}}`, where `result` is exactly the `DrivePickerResult` shape
 `cowork`'s web `pickDriveFilesWeb()` (host.ts) resolves its promise with
-directly — `{ok: true, files: [...]}` or `{ok: false, reason: "..."}` — no
+directly — `{ok: true, files: [...], newFiles: [...]}` or `{ok: false,
+reason: "..."}`. `files` and `newFiles` are the same array here: the web
+path has no persisted-grant merge step (unlike desktop's oauthPickDriveFiles
+in main/index.ts, where `files` is the connection's full accumulated grant
+and `newFiles` is just this pick), but useGoogleDrivePicker.js reads
+`newFiles` unconditionally, so it must always be present. No
 separate "main process" step exists on the web side to translate a raw
 PICKED/CANCEL/ERROR event the way Electron's loopback server does, so this
 page has to emit the final, already-interpreted shape itself. The mapping
@@ -264,11 +269,18 @@ def render_picker_page(
             files.length + ' file' + (files.length === 1 ? '' : 's') + ' selected',
             'You can close this tab and return to MindsHub Cowork.'
           );
-          reportResult({{ ok: true, files: files }});
+          // `newFiles` mirrors desktop's oauthPickDriveFiles shape (see
+          // main/index.ts): there, `files` is the connection's full
+          // accumulated grant and `newFiles` is just this pick. The web
+          // path has no persisted-grant merge step, so the two are the
+          // same array here — but useGoogleDrivePicker.js reads `newFiles`
+          // unconditionally (it's the "this action" scope), so it must
+          // always be present, not just `files`.
+          reportResult({{ ok: true, files: files, newFiles: files }});
         }} else if (data.action === google.picker.Action.CANCEL) {{
           markUserActed();
           setStatus('Picker closed', 'You can close this tab and return to MindsHub Cowork.');
-          reportResult({{ ok: true, files: [] }});
+          reportResult({{ ok: true, files: [], newFiles: [] }});
         }} else if (data.action === google.picker.Action.ERROR) {{
           markUserActed();
           reportPickerLoadFailure();
@@ -301,14 +313,14 @@ def render_picker_page(
       // failing to load resolves as "picked nothing" (ok: true, no files),
       // not an error — kept consistent across platforms even though the
       // status card above visibly flags it.
-      reportResult({{ ok: true, files: [] }});
+      reportResult({{ ok: true, files: [], newFiles: [] }});
       return;
     }}
     window.gapi.load('picker', {{
       callback: buildAndShowPicker,
       onerror: function () {{
         setStatus('Could not load Google Picker', 'Close this tab and try again.', true);
-        reportResult({{ ok: true, files: [] }});
+        reportResult({{ ok: true, files: [], newFiles: [] }});
       }},
     }});
   }};

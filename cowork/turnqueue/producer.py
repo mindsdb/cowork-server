@@ -8,6 +8,7 @@ heartbeat. Wired into the responses handler in a later task.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -118,15 +119,14 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
 
 
 async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
-                            turn_key: str, disabled: list[dict] | None,
+                            disabled: list[dict] | None,
                             settings: TurnQueueSettings) -> dict | None:
-    """Build the job's `oauth` block, sibling to `llm`: gives anton, at the
-    start of a cloud turn, the one thing it needs to fetch its own connector
-    tokens — its existing turn key (reused, not re-minted) plus the list of
-    connections it's allowed to use this turn. Anton presents the turn key
-    straight to auth's `POST /v1/oauth/{engine}/token`, no cowork-server hop
-    at token-fetch time; this function's only job is getting the block onto
-    the wire.
+    """Build everything the job's `oauth` block needs except the turn key —
+    the list of connections anton is allowed to use this turn. Deliberately
+    doesn't take the turn key `_mint_llm_block` mints: this function's own
+    network call (listing active connections) never uses it, only the final
+    block does, so the caller runs the two mints concurrently and folds the
+    turn key in afterward instead of sequencing this behind the llm mint.
 
     `disabled` mirrors the desktop path's `disabled_connections` — the same
     general per-conversation concept (`cowork/schemas/conversations.py`),
@@ -157,7 +157,6 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     if not connections:
         return None
     return {
-        "turn_key": turn_key,
         "base_url": settings.auth_internal_base_url,
         "connections": connections,
     }
@@ -259,16 +258,26 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         scope = TenantScope(org_mode=bool(org_id), org_id=org_id, user_id=user_id)
         model = get_user_settings(scope).resolved_planning_model
 
-    llm_block = llm or await _mint_llm_block(
-        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+    # Independent network round trips (llm's turn-key mint, oauth's active-
+    # connections list) — run concurrently rather than paying both latencies
+    # in sequence on every turn's hot path. Skipped for llm when a turn key
+    # was already minted upstream (the `llm` param), since there's nothing
+    # to overlap with in that case.
+    oauth_connections_coro = _mint_oauth_block(
+        org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
     )
+    if llm:
+        llm_block = llm
+        oauth_connections = await oauth_connections_coro
+    else:
+        llm_block, oauth_connections = await asyncio.gather(
+            _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
+            oauth_connections_coro,
+        )
     # Reuses the turn key already minted for llm_block — never mints a
     # second one. Org/cloud mode only: local-mode turns build in-process
     # and never reach this function at all.
-    oauth_block = await _mint_oauth_block(
-        org_id=org_id, user_id=user_id, turn_key=llm_block.get("api_key", ""),
-        disabled=disabled, settings=settings,
-    )
+    oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT

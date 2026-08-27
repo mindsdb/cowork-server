@@ -30,12 +30,43 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 @router.get("/", response_model=list[ConnectionSummaryResponse])
-def list_connections(scope: ScopeDep):
+async def list_connections(scope: ScopeDep, request: Request):
+    if scope.org_mode:
+        # No durable local vault to read in org mode — same forwarded-
+        # credential proxy as the OAuth Connector Lifecycle endpoints.
+        # auth's catalogue already carries every connection (it's the same
+        # data ConnectWorkflowView's org-mode connector list reads), so no
+        # separate "list connections" endpoint is needed on auth's side.
+        catalogue = await auth_proxy.proxy_catalogue(request, OAuthSettings())
+        return [
+            ConnectionSummaryResponse(engine=c["engine"], name=c["name"], user_label=c.get("user_label"))
+            for item in catalogue.get("items", [])
+            for c in item.get("connections", [])
+        ]
     return ConnectionsService(scope).list()
 
 
+# Non-secret fields surfaced from auth's live-token response — mirrors
+# anton's TurnKeyDataVault._TURNKEY_RESPONSE_FIELDS allowlist (minus
+# access_token, which this read-only detail view never needs to hold).
+_ORG_CONNECTION_DETAIL_FIELDS = ("account_email", "token_type", "scope", "expires_at")
+
+
 @router.get("/{engine}/{name}", response_model=ConnectionDetailResponse)
-def get_connection(engine: str, name: str, scope: ScopeDep):
+async def get_connection(engine: str, name: str, scope: ScopeDep, request: Request):
+    if scope.org_mode:
+        # auth has no standalone "read connection metadata" endpoint yet —
+        # the turn-key token endpoint is the only source for a connection's
+        # non-secret fields (account_email etc.), so reading connection
+        # detail here mints a live token as a side effect. Known limitation:
+        # a connection stuck needing reconnect surfaces as a 403 from auth
+        # rather than a normal detail response with a "needs_reconnect"
+        # status — the catalogue (list_connections) is the only place that
+        # can show that state today. See the OAuth Proxy + Data Vault
+        # blueprint for a follow-up "connection detail" auth endpoint.
+        token = await auth_proxy.proxy_token(engine, request, OAuthSettings(), name=name)
+        fields = {k: token[k] for k in _ORG_CONNECTION_DETAIL_FIELDS if token.get(k)}
+        return ConnectionDetailResponse(engine=engine, name=name, fields=fields)
     record = ConnectionsService(scope).get(engine, name)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
@@ -68,6 +99,17 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
 
 @router.delete("/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_connection(engine: str, name: str, scope: ScopeDep):
+    if scope.org_mode:
+        # auth has no revoke/disconnect endpoint yet (only start/token/
+        # catalogue/status/picked-files) — a fake 204 here would tell the
+        # user they disconnected while the connection and its live token
+        # stay fully active server-side. An honest error until that
+        # endpoint exists, rather than a silent no-op against the local
+        # vault (which 404s today since org mode never wrote there).
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Disconnecting a connector isn't available yet in this deployment.",
+        )
     try:
         oauth_service.revoke(engine, name, ConnectorSettings(), OAuthSettings(), scope=scope)
     except Exception:
@@ -99,7 +141,19 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
 
     Returns 404 if the vault entry does not exist (connection was deleted while
     Electron was mid-refresh; caller should discard silently).
+
+    Desktop-only: org mode's token lifecycle is auth's job — get_valid_access_token
+    auto-refreshes on read, there is no client-side refresh loop to report back
+    here. Electron main's own token-refresh.ts always targets the local desktop
+    sidecar, never cowork-server, so no org-mode caller reaches this route today.
+    Guarded explicitly so a future org-mode caller added here by mistake fails
+    loudly instead of silently writing to the wrong (non-durable) vault.
     """
+    if scope.org_mode:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Token refresh is not applicable in org mode; auth manages the token lifecycle server-side.",
+        )
     updates = {
         k: v for k, v in body.model_dump().items()
         if v is not None and k in _PATCH_TOKEN_VAULT_FIELDS

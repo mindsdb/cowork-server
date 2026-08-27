@@ -35,15 +35,16 @@ async def create(payload: dict) -> str:
 
 
 async def consume(session_id: str) -> dict | None:
-    """Single-use: read-then-delete. A picker session is opened by exactly
-    one popup that embeds the token directly into the page it renders, so
-    there is no legitimate reason for the same session id to be looked up
-    twice — treating it as single-use means a stale or replayed picker URL
-    fails cleanly instead of re-minting a live token."""
+    """Single-use: atomic get-and-delete. A picker session is opened by
+    exactly one popup that embeds the token directly into the page it
+    renders, so there is no legitimate reason for the same session id to be
+    looked up twice — treating it as single-use means a stale or replayed
+    picker URL fails cleanly instead of re-minting a live token. GETDEL
+    (not a separate GET then DELETE) so two concurrent lookups of the same
+    id — a duplicate/prefetched request, a back-forward-cache restore —
+    can't both read the live token before either deletes it."""
     redis = get_redis()
-    key = _key(session_id)
-    raw = await redis.get(key)
+    raw = await redis.getdel(_key(session_id))
     if raw is None:
         return None
-    await redis.delete(key)
     return json.loads(raw)

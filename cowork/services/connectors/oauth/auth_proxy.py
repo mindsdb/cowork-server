@@ -65,9 +65,13 @@ async def _relay(
     if resp.status_code >= 400:
         # Relay auth's own status + detail verbatim (e.g. 401 on a bad/expired
         # credential, 404 on an unknown service, 403 on needs_reconnect) rather
-        # than collapsing everything to a generic error.
+        # than collapsing everything to a generic error. A valid-JSON body
+        # that isn't an object (e.g. from a proxy/WAF in front of auth) falls
+        # back to the raw text same as a non-JSON body, rather than raising
+        # an unhandled AttributeError out of this relay.
         try:
-            detail = resp.json().get("detail", resp.text)
+            body = resp.json()
+            detail = body.get("detail", resp.text) if isinstance(body, dict) else resp.text
         except ValueError:
             detail = resp.text
         raise HTTPException(status_code=resp.status_code, detail=detail)
@@ -106,11 +110,17 @@ async def proxy_picked_files(engine: str, name: str, files: list[dict], request:
     return result.get("files", [])
 
 
-async def proxy_token(engine: str, request: Request, settings: OAuthSettings) -> dict:
+async def proxy_token(engine: str, request: Request, settings: OAuthSettings, *, name: str = "") -> dict:
     """Mint a live access token for `engine` via auth's turn-key endpoint,
     reused here (not just by anton) since its authorization is deliberately
     generic — "does an active connection exist for the resolved user/org."
-    Used by the Google Drive Picker route."""
+    Used by the Google Drive Picker route.
+
+    `name` disambiguates when an org has more than one connection for this
+    engine — auth auto-resolves a lone connection without it, but 400s on an
+    ambiguous one. Optional: callers that only ever have one connection to
+    pick from (or that intentionally let auth auto-resolve) can omit it."""
     return await _relay(
-        "POST", f"/v1/oauth/{engine}/token", request=request, settings=settings, json_body={},
+        "POST", f"/v1/oauth/{engine}/token", request=request, settings=settings,
+        json_body={"name": name} if name else {},
     )
