@@ -31,9 +31,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # version, which is baked into the installed dist-info by this sync. It is then
 # deleted: the build workflow now checks out full history for that version
 # (ENG-1796), and the final stage COPYs this whole directory, so leaving it
-# would ship every commit of this repo inside the runtime image. Deleting it in
-# the same layer keeps it out of the image rather than merely out of the last
-# one. Order matters: the sync must resolve the version before .git is gone.
+# would ship every commit of this repo inside the runtime image.
+#
+# What keeps it out is the STAGE boundary, not this layer — an earlier revision
+# of this comment credited the wrong mechanism. `.git` does exist in the builder
+# layer created by `COPY . /app` above, and this `rm` is a later layer, so it
+# does not erase that history. The final stage's `COPY --from=builder /app /app`
+# copies the builder's final filesystem STATE rather than its layer history,
+# which is what actually leaves `.git` behind. Worth stating precisely: the
+# classic form of this mistake — deleting in a later layer of the SHIPPED stage —
+# does leak, and reads identically to this.
+#
+# Order matters: the sync must resolve the version before .git is gone.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev \
