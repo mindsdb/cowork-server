@@ -232,6 +232,7 @@ class ResponsesHandler:
                         conversation_id=conv_id,
                         harness=self.harness_name,
                         model=request.model,
+                        reasoning_effort=request.reasoning_effort,
                     )
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
@@ -243,6 +244,7 @@ class ResponsesHandler:
                     project_id=self._resolve_project_id(request),
                     harness=self.harness_name,
                     model=request.model,
+                    reasoning_effort=request.reasoning_effort,
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
@@ -251,6 +253,7 @@ class ResponsesHandler:
                 project_id=self._resolve_project_id(request),
                 harness=self.harness_name,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
             )
 
         self.last_conversation_id = str(conversation.id)
@@ -325,6 +328,7 @@ class ResponsesHandler:
                 harness_input=harness_input,
                 original_content=original_content,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
                 disabled=disabled,
                 harness_name=self.harness_name,
                 harness_id=getattr(harness, "id", None),
@@ -374,6 +378,7 @@ class ResponsesHandler:
                 conversation=conversation,
                 input=harness_input,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
                 disabled_connections=disabled,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
@@ -586,6 +591,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         original_content,
         model: str,
+        reasoning_effort: str | None = None,
         disabled: list[dict] | None,
         harness_name: str,
         harness_id: str | None,
@@ -627,6 +633,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             original_content=original_content,
             model=model,
+            reasoning_effort=reasoning_effort,
             disabled=disabled,
             harness_name=harness_name,
             harness_id=harness_id,
@@ -1018,6 +1025,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         original_content,
         model: str,
+        reasoning_effort: str | None = None,
         disabled: list[dict] | None,
         harness_name: str,
         harness_id: str | None,
@@ -1096,7 +1104,8 @@ class ResponsesHandler:
             ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=conv, input=harness_input, model=model, disabled_connections=disabled,
+                conversation=conv, input=harness_input, model=model,
+                reasoning_effort=reasoning_effort, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0
