@@ -21,6 +21,17 @@
 # Guarded by networkPolicy.enabled (default false) so no environment locks
 # itself by inheriting it. Enable one environment at a time and watch pod
 # readiness: a policy that refuses the kubelet takes the deployment down.
+#
+# BEFORE ENABLING THIS ANYWHERE: the CI deploy identity must be able to create
+# the kind. It cannot today. `helm upgrade` runs in-cluster as
+# `system:serviceaccount:infrastructure:<env>-gha-runner`, and on newdev
+# `auth can-i create networkpolicies -n staging` answers no while `ingresses`
+# and `deployments` answer yes, so enabling this fails the release and --atomic
+# rolls the whole deploy back. Check it, do not assume:
+#   kubectl --context newdev -n staging auth can-i create networkpolicies \
+#     --as=system:serviceaccount:infrastructure:newdev-gha-runner
+# A server-side dry-run under your own kubeconfig does NOT answer this: it tells
+# you the API server accepts the manifest, not that the deployer may create it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -29,29 +40,51 @@ metadata:
     app: {{ .Values.deployment.name }}
 spec:
   # The devops-nirvana `deployment` subchart labels its pods `app: <name>`; it
-  # does not emit app.kubernetes.io/name, so do not select on that.
+  # does not emit app.kubernetes.io/name, so do not select on that. Defaulted
+  # off deployment.name rather than duplicated in values: a policy whose
+  # podSelector matches no pod is a silent no-op, so it would read as enabled
+  # and enforce nothing.
   podSelector:
     matchLabels:
-{{ toYaml .Values.networkPolicy.podSelectorLabels | indent 6 }}
+      {{- with .Values.networkPolicy.podSelectorLabels }}
+{{ toYaml . | indent 6 }}
+      {{- else }}
+      app: {{ .Values.deployment.name }}
+      {{- end }}
   policyTypes:
     - Ingress
   ingress:
 {{- if .Values.networkPolicy.ingressController.enabled }}
-    # (a) Every real request. The ALB targets the controller pods by IP, so
-    #     from the pod's side every legitimate caller is an ingress-nginx pod.
+    # (a) Every real request. The ALB targets the controller pods by IP, so from
+    #     the pod's side every legitimate caller is an nginx ingress controller
+    #     pod. The namespace it runs in is `infrastructure` here, NOT
+    #     `ingress-nginx`, which is what the auth chart's default still says.
+    #
+    #     The podSelector is ANDed onto the namespaceSelector deliberately.
+    #     A namespaceSelector alone admits EVERY pod in `infrastructure`, and
+    #     that namespace also runs the GitHub Actions runners and openvpn, which
+    #     MASQUERADEs VPN client traffic to its own pod IP. Any of those could
+    #     then forge the identity headers, which is the one thing this policy
+    #     exists to stop.
     - from:
         - namespaceSelector:
             matchLabels:
 {{ toYaml .Values.networkPolicy.ingressController.namespaceSelector | indent 14 }}
+          {{- with .Values.networkPolicy.ingressController.podSelector }}
+          podSelector:
+            matchLabels:
+{{ toYaml . | indent 14 }}
+          {{- end }}
       ports:
         - protocol: TCP
-          port: {{ .Values.networkPolicy.port }}
+          # Defaults to the port the container actually listens on, so the two
+          # cannot drift: a policy naming a port nothing serves drops every
+          # legitimate request while `helm template` stays clean.
+          port: {{ .Values.networkPolicy.port | default .Values.deployment.service.targetPort }}
 {{- end }}
 {{- with .Values.networkPolicy.nodeCidrs }}
-    # (b) The nodes. Liveness and readiness probes come from the kubelet, and
-    #     so does port-forward, which the integration suite uses to reach two
-    #     replicas past the ingress's sticky cookie. Neither is a pod, so
-    #     neither matches a podSelector or a namespaceSelector.
+    # (b) The nodes. Liveness and readiness probes come from the kubelet, so no
+    #     podSelector or namespaceSelector matches them.
     - from:
 {{- range . }}
         - ipBlock:
@@ -60,7 +93,7 @@ spec:
       ports:
         - protocol: TCP
           # `with` rebound the dot to the CIDR list, so this needs the root.
-          port: {{ $.Values.networkPolicy.port }}
+          port: {{ $.Values.networkPolicy.port | default $.Values.deployment.service.targetPort }}
 {{- end }}
 {{- with .Values.networkPolicy.extraIngress }}
     # (c) Operator-supplied extra sources, verbatim ingress rules.
