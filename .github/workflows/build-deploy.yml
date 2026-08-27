@@ -81,8 +81,26 @@ jobs:
           # hatch-vcs derives the version by describing against tags, and the
           # default fetch-depth of 1 fetches none of them — so the image
           # reported 0.0.0.dev1+g<sha> while the wheel from the same commit
-          # reported a real CalVer (ENG-1796). The publish job below already
-          # does this for exactly this reason.
+          # reported a real CalVer (ENG-1796). `publish.yml`'s own publish job
+          # already checks out with fetch-depth: 0 for exactly this reason;
+          # this build was the one path that did not.
+          #
+          # WHY THIS AND NOT A BUILD ARG. setuptools-scm's Docker guidance, and
+          # the anton half of ENG-1796, both compute the version on the runner
+          # and pass SETUPTOOLS_SCM_PRETEND_VERSION_FOR_<dist> in — which keeps
+          # .git out of the context entirely, so there is no deletion step and
+          # no ordering contract to guard. That is the cleaner shape in the
+          # abstract, and it is the right one for anton, where .dockerignore
+          # excludes .git and the image is single-stage: a build arg is the only
+          # option there that does not ship history to every pod.
+          #
+          # Here the trade runs the other way. This repo already keeps .git in
+          # the context deliberately (.dockerignore says so) and already has a
+          # builder/final boundary to delete it behind, so fetching tags is the
+          # smaller change against the existing design rather than a redesign of
+          # it. The cost is real and worth naming: one deletion step plus the
+          # ordering contract between it and `uv sync`, both pinned by tests.
+          # If that ever needs touching again, prefer the build arg.
           #
           # NOTE this makes .git full history rather than a single commit, and
           # the Dockerfile COPYs the build context into the builder stage. It
