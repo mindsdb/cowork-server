@@ -472,22 +472,23 @@ class ResponsesHandler:
     ) -> AsyncGenerator[str, None] | Response:
         """Return the router model's direct answer without initializing Anton."""
         if not request.stream:
+            text = await route.full_text()
             user_message = ConversationService(self.scoped).save_user_message(
                 conversation_id, original_content,
             )
             events = [{
                 "type": "response.output_text.delta",
-                "delta": route.text,
+                "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }, {"type": "response.completed"}]
             ConversationService(self.scoped).save_assistant_turn(
-                conversation_id, route.text, events, harness="cowork-direct",
+                conversation_id, text, events, harness="cowork-direct",
             )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(str(user_message.id), route.text)],
+                output=[self._build_output(str(user_message.id), text)],
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
@@ -519,50 +520,77 @@ class ResponsesHandler:
         route: RouteDecision,
         buffer,
     ) -> None:
-        """Persist and emit a direct answer using the normal detached lifecycle.
+        """Emit a direct answer chunk by chunk, then persist it, on the normal
+        detached lifecycle.
 
-        The full answer exists up front, so persistence happens before any
-        frame is emitted — the client can never see a completed turn the DB
-        does not have, and no pending row is needed."""
+        The head of the answer is known at decision time; the rest may still
+        be streaming from the gate.  Frames go out as chunks arrive, and the
+        turn is persisted once, when the stream ends, as a single delta event
+        carrying the full text — the same replay shape the buffered answer
+        produced.  Stop persists what had been said, like the delegated
+        producers."""
         producer_session = None
-        try:
-            producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
-            item_id = f"msg-{conv_id.hex[:12]}"
-            delta = {
-                "type": "response.output_text.delta",
-                "sequence_number": 2,
-                "item_id": item_id,
-                "delta": route.text,
-                "response_route": route.route,
-                "response_route_reason": route.reason,
-            }
-            svc = ConversationService(producer_session)
-            svc.save_user_message(conv_id, original_content)
-            svc.save_assistant_turn(
-                conv_id, route.text, [delta, {"type": "response.completed"}],
+        item_id = f"msg-{conv_id.hex[:12]}"
+        delta_base = {
+            "type": "response.output_text.delta",
+            "item_id": item_id,
+            "response_route": route.route,
+            "response_route_reason": route.reason,
+        }
+        parts: list[str] = [route.text]
+        seq = 1
+        persisted = False
+
+        def persist() -> None:
+            nonlocal persisted
+            if persisted or producer_session is None:
+                return
+            persisted = True
+            full = "".join(parts)
+            ConversationService(producer_session).save_assistant_turn(
+                conv_id, full,
+                [{**delta_base, "sequence_number": 2, "delta": full}, {"type": "response.completed"}],
                 harness="cowork-direct",
             )
+
+        async def emit_delta(chunk: str) -> None:
+            nonlocal seq
+            seq += 1
+            await buffer.append("sse", {"sse": sse_frame(
+                "response.output_text.delta", {**delta_base, "sequence_number": seq, "delta": chunk},
+            )})
+
+        try:
+            producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
+            ConversationService(producer_session).save_user_message(conv_id, original_content)
 
             response = Response(status=ResponseStatus.created, model=route.model)
             # conversation_id/harness sit at the event root, like both
             # delegated paths — the GUI reads them there.
             await buffer.append("sse", {"sse": sse_frame("response.created", {
                 "type": "response.created",
-                "sequence_number": 1,
+                "sequence_number": seq,
                 "conversation_id": str(conv_id),
                 "harness": "cowork-direct",
                 "response": response.model_dump(),
             })})
-            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
+            await emit_delta(route.text)
+            if route.text_stream is not None:
+                async for chunk in route.text_stream:
+                    parts.append(chunk)
+                    await emit_delta(chunk)
+
+            persist()
             completed_response = Response(
                 id=response.id,
                 created_at=response.created_at,
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(item_id, route.text)],
+                output=[self._build_output(item_id, "".join(parts))],
             ).model_dump()
+            seq += 1
             await buffer.append("sse", {"sse": sse_frame("response.completed", {
-                "type": "response.completed", "sequence_number": 3, "response": completed_response,
+                "type": "response.completed", "sequence_number": seq, "response": completed_response,
             })})
             await buffer.close("completed")
         except asyncio.CancelledError:
@@ -570,6 +598,8 @@ class ResponsesHandler:
                 # Same reasoning as _produce_remote's discarded branch.
                 logger.info("[responses] discarded direct turn %s — not persisting", conv_id)
                 return
+            # The text said before Stop is kept, like the delegated producers.
+            persist()
             await buffer.close("cancelled")
         except Exception:
             logger.exception("[responses] direct turn failed for conversation %s", conv_id)

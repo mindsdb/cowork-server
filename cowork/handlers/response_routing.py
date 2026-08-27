@@ -10,12 +10,17 @@ every uncertain or unsupported shape delegates to Anton.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import logging
+from collections.abc import AsyncIterator
+from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Literal
 
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
 
+
+logger = logging.getLogger(__name__)
 
 DIRECT_CONTEXT = "direct_context"
 DELEGATED_AGENTIC = "delegated_agentic"
@@ -24,8 +29,22 @@ DELEGATED_AGENTIC = "delegated_agentic"
 _MAX_HISTORY_MESSAGES = 16
 _MAX_MESSAGE_CHARS = 1_500
 _DIRECT_MAX_TOKENS = 1_024
-# The gate sits ahead of every turn; a slow router must not delay Anton.
+# The gate sits ahead of every turn; a slow router must not delay Anton.  The
+# budget bounds the time to the gate's FIRST streamed event — which is the
+# decision: a delegate tool call, or the opening words of a direct answer — not
+# the time to generate a whole answer.  Measured against the buffered gate this
+# replaced, no chat-class model produced a whole answer inside 2s (74% of calls
+# overran), so the budget was the common path and the fast path never won.
 _GATE_TIMEOUT_SECONDS = 2.0
+# Once an answer is streaming, the longest silence tolerated between chunks.
+# The sampled maximum was a 149s call: a stuck stream, not a slow answer.
+_GATE_IDLE_SECONDS = 5.0
+# Text held back before committing to the direct path.  The model is told to
+# delegate with no preamble, but "Let me look into that." followed by a tool
+# call is exactly what a buffered gate never leaked and a streamed one would.
+# Holding this much catches it, while still committing well inside a typical
+# short answer.
+_HOLD_CHARS = 120
 
 # Kept server-local so the route does not depend on Anton's private execution
 # module. The contract mirrors the existing two-action thalamus gate.
@@ -62,19 +81,93 @@ class RouterBinding:
     label: str
 
 
-async def _gate(binding: RouterBinding, *, history: list[dict]):
-    """One gating call on the router role, without coupling to Anton's gate."""
-    response = await binding.provider.complete(
+_END = object()  # `anext` default: the stream ended without a StreamComplete
+
+
+async def _close(events) -> None:
+    aclose = getattr(events, "aclose", None)
+    if aclose is not None:
+        with suppress(Exception):
+            await aclose()
+
+
+async def _gate(
+    binding: RouterBinding, *, history: list[dict]
+) -> tuple[str, AsyncIterator[str] | None] | None:
+    """One gating call on the router role, streamed so the budget bounds the
+    decision rather than the whole answer.
+
+    Returns None to delegate.  Otherwise ``(head, rest)``: the text held back
+    while deciding, and — if the answer is still arriving — an iterator over
+    the remaining chunks, or None when it completed within the hold.
+
+    Delegates on a tool call, an empty answer, or an answer that overran
+    ``_DIRECT_MAX_TOKENS`` (that long, it was not a trivial turn).  Raises
+    ``TimeoutError`` when the first event misses ``_GATE_TIMEOUT_SECONDS``, or
+    a later one misses ``_GATE_IDLE_SECONDS`` while still deciding.
+    """
+    from anton.core.llm.provider import StreamComplete, StreamTextDelta, StreamToolUseStart
+
+    events = binding.provider.stream(
         model=binding.model,
         system=_SYSTEM_PROMPT,
         messages=history,
         tools=[_DELEGATE_TOOL],
         max_tokens=_DIRECT_MAX_TOKENS,
     )
-    if response.tool_calls or response.stop_reason in {"max_tokens", "length"}:
-        return None
-    text = (response.content or "").strip()
-    return text or None
+    timeout = _GATE_TIMEOUT_SECONDS
+    head = ""
+    try:
+        while True:
+            event = await asyncio.wait_for(anext(events, _END), timeout)
+            timeout = _GATE_IDLE_SECONDS
+            if event is _END or isinstance(event, StreamComplete):
+                if event is not _END and event.response.stop_reason in {"max_tokens", "length"}:
+                    return None
+                head = head.strip()
+                return (head, None) if head else None
+            if isinstance(event, StreamToolUseStart):
+                return None
+            if isinstance(event, StreamTextDelta):
+                head += event.text
+                if len(head) >= _HOLD_CHARS:
+                    rest = _rest_of(events)
+                    events = None  # the tail owns the stream now
+                    return head, rest
+    finally:
+        if events is not None:
+            await _close(events)
+
+
+async def _rest_of(events) -> AsyncIterator[str]:
+    """The tail of a committed direct answer: text chunks until the stream ends.
+
+    Ends quietly on anything abnormal — a silence past ``_GATE_IDLE_SECONDS``,
+    a provider error, or a tool call arriving after the hold (the preamble
+    case the hold exists to catch).  By then text has reached the user and
+    cannot be unsent, so the turn completes with what was said; each case is
+    logged so it can be counted.
+    """
+    from anton.core.llm.provider import StreamComplete, StreamTextDelta, StreamToolUseStart
+
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(anext(events, _END), _GATE_IDLE_SECONDS)
+            except TimeoutError:
+                logger.warning("[routing] direct answer stalled mid-stream; ending with the text so far")
+                return
+            if event is _END or isinstance(event, StreamComplete):
+                return
+            if isinstance(event, StreamToolUseStart):
+                logger.warning("[routing] gate delegated after committing to a direct answer; ending with the text so far")
+                return
+            if isinstance(event, StreamTextDelta):
+                yield event.text
+    except Exception:
+        logger.exception("[routing] direct answer stream failed mid-way; ending with the text so far")
+    finally:
+        await _close(events)
 
 
 def _settings_binding() -> RouterBinding | None:
@@ -104,8 +197,20 @@ class RouteDecision:
     reason: str
     provider: str | None = None
     model: str | None = None
+    # A direct answer's text as known at decision time.  When the answer is
+    # still streaming, the remainder arrives through `text_stream`.
     text: str = ""
     fallback: bool = False
+    text_stream: AsyncIterator[str] | None = field(default=None, compare=False, repr=False)
+
+    async def full_text(self) -> str:
+        """`text` plus everything `text_stream` still yields (drained here)."""
+        if self.text_stream is None:
+            return self.text
+        parts = [self.text]
+        async for chunk in self.text_stream:
+            parts.append(chunk)
+        return "".join(parts)
 
 
 def _condense_content(content) -> str | None:
@@ -208,9 +313,7 @@ async def decide_route(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
             )
         try:
-            text = await asyncio.wait_for(
-                _gate(binding, history=messages), _GATE_TIMEOUT_SECONDS
-            )
+            gated = await _gate(binding, history=messages)
         except TimeoutError:
             return RouteDecision(
                 route=DELEGATED_AGENTIC,
@@ -219,19 +322,21 @@ async def decide_route(
                 model=binding.model,
                 fallback=True,
             )
-        if text is None:
+        if gated is None:
             return RouteDecision(
                 route=DELEGATED_AGENTIC,
                 reason="router_declined_direct_response",
                 provider=binding.label,
                 model=binding.model,
             )
+        head, rest = gated
         return RouteDecision(
             route=DIRECT_CONTEXT,
             reason="router_direct_response",
             provider=binding.label,
             model=binding.model,
-            text=text,
+            text=head,
+            text_stream=rest,
         )
     except Exception:
         # Attribution survives the failure: a 402 on a paid router pick is
