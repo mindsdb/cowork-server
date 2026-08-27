@@ -337,9 +337,9 @@ class OAuthSettings(Settings):
     github_client_id: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_ID"))
     github_client_secret: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_SECRET"))
 
-    # PostHog is a public, PKCE-only OAuth client (Client ID Metadata
-    # Document) — there is no client_secret to configure, unlike every
-    # other provider above.
+    supabase_client_id: str = Field(default="", validation_alias=AliasChoices("SUPABASE_CLIENT_ID"))
+    supabase_client_secret: str = Field(default="", validation_alias=AliasChoices("SUPABASE_CLIENT_SECRET"))
+
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
     # Browser-side key for the Google Picker widget (drive.file scope only
@@ -547,16 +547,15 @@ class AppSettings(Settings):
         ),
     )
     ask_user_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
         description=(
             "Whether the agent may ask interactive multiple-choice questions "
-            "(the `ask_user` tool). Off by default because the renderer must "
-            "ship first: the frontend and this server are versioned "
-            "independently, and a client that does not know the "
-            "`response.ask_user` event drops it silently, leaving the agent "
-            "apparently hung until the question times out. Turn on only after "
-            "the frontend is rolled out."
+            "(the `ask_user` tool). On by default now that the renderer "
+            "support (the `response.ask_user` card) has shipped; kept as a "
+            "kill switch because a renderer that does not know the event "
+            "drops it silently, stalling the agent until the question times "
+            "out. Set to false to degrade to plain-text questions (ENG-1984)."
         ),
     )
     surface_override: str = Field(

@@ -68,7 +68,7 @@ class ConnectionsService:
             result.append(ConnectionSummaryResponse(
                 engine=engine,
                 name=name,
-                display_name=connection_display_name(fields),
+                display_name=connection_display_name(fields, engine),
                 created_at=item.get("created_at"),
                 label=spec.label if spec else None,
                 user_label=user_label,
@@ -95,7 +95,7 @@ class ConnectionsService:
                 fields[key] = _SENTINEL
                 masked_keys.append(key)
 
-        display_name = connection_display_name(fields)
+        display_name = connection_display_name(fields, engine)
         user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
         # Pop both out of `fields` (still needed — see below), just without
         # re-adding either as `fields["label"]`/`fields["user_label"]` the way
