@@ -1097,8 +1097,8 @@ class UserSettings(Settings):
     @property
     def resolved_router_model(self) -> str | None:
         # wallet_aware: same rationale as resolved_coding_model — the router
-        # role (respond-vs-delegate gating, history summarization) is invisible
-        # in default mode (ENG-1632).
+        # role (history summarization; the route gate resolves its own model,
+        # see resolved_gate_model) is invisible in default mode (ENG-1632).
         return _resolved_model(
             self.resolved_router_provider,
             self.router_provider,

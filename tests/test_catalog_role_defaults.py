@@ -665,3 +665,37 @@ def test_gate_uses_the_users_model_on_openai_compatible():
     )
 
     assert s.resolved_gate_model == "my-fast-model"
+
+
+def test_the_row_is_told_which_model_gates(monkeypatch):
+    """The Settings row shows the gate's model rather than inferring it from the
+    provider (ENG-1851): the UI ships OTA on its own cadence and can resolve the
+    row's provider differently from the server, so the server states the answer.
+    Fresh from the map just persisted, like the pair."""
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "sonnet", "haiku", "kimi"],
+        enabled={"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True},
+        role_defaults={"planning": "sonnet", "coding": "haiku", "router": "kimi"},
+    )
+
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["gate"] == {"provider": "minds-cloud", "model": "kimi", "followsRouterPick": False}
+    # The same answer the pair gives for the role, and the one a turn resolves to.
+    assert payload["gate"]["model"] == payload["recommendedPair"]["minds-cloud"][2]
+
+
+def test_the_gate_model_is_availability_adjusted_like_resolution_is(monkeypatch):
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "kimi"],
+        enabled={"mindshub_air": True, "kimi": False},
+        role_defaults={"planning": "kimi", "coding": "kimi", "router": "kimi"},
+    )
+
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["gate"]["model"] == "mindshub_air"
