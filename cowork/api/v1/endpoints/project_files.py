@@ -5,20 +5,22 @@ This is not necessarily final state — it was migrated to eliminate
 compat stubs and may be refactored later.
 """
 
-import hashlib
 import logging
 import mimetypes
 import os
+import secrets
 import shutil
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.services.projects import ProjectService
 
 
@@ -28,7 +30,55 @@ router = APIRouter()
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
 
-_PROJECT_PREVIEW_MOUNTS: dict[str, Path] = {}
+#: How long a preview token stays usable. Long enough that a preview left open
+#: keeps loading its sub-assets, short enough that a token which escapes the
+#: browser it was minted in dies the same session.
+PREVIEW_TOKEN_TTL_SECONDS = 30 * 60
+
+
+@dataclass(frozen=True)
+class _PreviewMount:
+    """A directory one preview token may read, and who may read it.
+
+    The token is a bearer string in a URL, so an iframe can load it and a
+    screenshot, a proxy log or a browser history can leak it. The record is
+    therefore what carries the authority, not the string: whoever presents the
+    token still has to be the member it was minted for, in the organization it
+    was minted in, before it expires.
+    """
+
+    parent: Path
+    org_id: str | None
+    user_id: str | None
+    expires_at: float
+
+    def readable_by(self, scope: TenantScope) -> bool:
+        """Desktop has one user and no organization, so nothing to compare."""
+        if not scope.org_mode:
+            return True
+        return self.org_id == scope.org_id and self.user_id == scope.user_id
+
+
+_PROJECT_PREVIEW_MOUNTS: dict[str, _PreviewMount] = {}
+
+
+def _register_preview_mount(parent: Path, scope: TenantScope) -> str:
+    """Mint a token for `parent` and bind it to the caller.
+
+    Expired records are dropped here rather than on read: minting is rare and
+    reading is per sub-asset, and nothing else ever removes an entry.
+    """
+    now = time.time()
+    for stale in [t for t, m in _PROJECT_PREVIEW_MOUNTS.items() if m.expires_at <= now]:
+        _PROJECT_PREVIEW_MOUNTS.pop(stale, None)
+    token = secrets.token_urlsafe(32)
+    _PROJECT_PREVIEW_MOUNTS[token] = _PreviewMount(
+        parent=parent,
+        org_id=scope.org_id,
+        user_id=scope.user_id,
+        expires_at=now + PREVIEW_TOKEN_TTL_SECONDS,
+    )
+    return token
 
 
 class _FileWriteRequest(BaseModel):
@@ -279,13 +329,13 @@ def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
 def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
     base = _project_dir(req.name, scoped)
     target = _safe_relpath(req.path, base)
+    _require_workspace_access(target, base, scoped)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     if target.suffix.lower() != ".html":
         raise HTTPException(status_code=415, detail="Preview mount is only available for HTML files")
     parent = target.parent.resolve()
-    token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
-    _PROJECT_PREVIEW_MOUNTS[token] = parent
+    token = _register_preview_mount(parent, scoped.scope)
     return {
         "token": token,
         "entry": target.name,
@@ -294,10 +344,16 @@ def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}")
-def preview_asset(token: str, rel_path: str):
-    parent = _PROJECT_PREVIEW_MOUNTS.get(token)
-    if parent is None:
+def preview_asset(
+    token: str, rel_path: str, scope: TenantScope = Depends(get_tenant_scope)
+):
+    # An unknown token, an expired one and another member's one all answer the
+    # same 404: which of the three it was is itself information about somebody
+    # else's files.
+    mount = _PROJECT_PREVIEW_MOUNTS.get(token)
+    if mount is None or mount.expires_at <= time.time() or not mount.readable_by(scope):
         raise HTTPException(status_code=404, detail="Preview mount has expired or is unknown")
+    parent = mount.parent
     try:
         target = (parent / rel_path).resolve()
     except Exception as exc:
@@ -316,6 +372,7 @@ def preview_asset(token: str, rel_path: str):
 def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
+    _require_workspace_access(target, base, scoped)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"

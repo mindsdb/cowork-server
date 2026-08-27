@@ -596,13 +596,15 @@ class AppSettings(Settings):
         ),
     )
     identity_enforce: Literal["audit", "enforce"] = Field(
-        default="audit",
+        default="enforce",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
-            "Org-mode identity enforcement. 'audit' (default): requests without "
-            "identity headers are logged and allowed through. 'enforce': they "
-            "are rejected with 401. Flip to 'enforce' once the audit log shows "
-            "all legitimate identity-less callers are handled."
+            "Org-mode identity enforcement. 'enforce' (default): a request "
+            "without identity headers is rejected with 401. 'audit': it is "
+            "logged and allowed through, which is the rollout mode the org "
+            "cutover needed and now has to be asked for. Dropping the env var "
+            "must not reopen the no-principal path, so the default is the "
+            "closed one."
         ),
     )
     owner: str = Field(

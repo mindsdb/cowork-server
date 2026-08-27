@@ -179,6 +179,54 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 
+### Who can read what in org mode
+
+Local mode has one user, so none of this applies: every check below is inert on
+the desktop.
+
+In org mode a request acts as a pair, an organization and a user, and it never
+carries less. The gateway authenticates the credential, asks the auth service
+whether that user is still a member of that organization, and injects
+`X-User-Id` and `X-Organization-Id`. cowork-server validates the shape of those
+headers and then trusts them, so **the gateway being the only route to the pod is
+what makes them trustworthy**, and that is a NetworkPolicy rather than
+anything in this codebase.
+A request with no valid pair is answered 401 before any route runs.
+
+Inside one organization, two different rules apply, and which one you get
+depends on the resource:
+
+- **Shared with the organization:** projects, project files at the project root,
+  skills, project memory, connected apps. Every member reads them.
+- **Private to whoever created it:** conversations and their history, scheduled
+  tasks, personal memory, uploaded files, and everything under a conversation's
+  own workspace at `conversations/<conversation_id>/`. Live artifacts are in
+  that last group, because the agent writes them into the conversation it is
+  running in.
+
+The private rule is enforced by the service layer rather than by the routes:
+`ConversationService._owned`, `FileService._owned_select` and
+`ScheduleService._owned_select` each add `created_by == <the caller>` when a
+request is org-scoped. Two places extend the same rule to the filesystem.
+`_conversation_workspace_ok` in the project-file routes refuses a path under
+another member's conversation directory, and `artifact_roots` drops another
+member's conversation directories before the artifact list or delete ever sees
+them, because those routes are addressed by project and slug and never receive a
+conversation id.
+
+**A refusal on a private resource answers 404, not 403**, with the same body a
+genuine miss returns. Telling the two apart would confirm that another member's
+file exists, which is most of what an attacker wants to know. Policy refusals
+that reveal nothing personal answer 403 instead: the desktop-only routes say
+`not available in org deployments`, and an organization-settings write without
+the admin role says so plainly.
+
+**The HTML preview hands out a bearer token in a URL** (`preview-mount-file`
+returns one, `preview-asset` spends it), because an iframe cannot send an
+`Authorization` header. The token is random, it is bound to the member and
+organization that minted it, and it expires after 30 minutes, so a token that
+escapes into a log or a screenshot is not a way into someone else's directory.
+
 ### The default model is the one the free allowance covers
 
 Every minds-cloud role defaults to `mindshub_air`, for all three roles: planning,
@@ -306,6 +354,8 @@ Environment variables fall into two namespaces:
 |----------|---------|-------------|
 | `COWORK_LISTEN_PORT` | `26866` | Server port |
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
+| `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" below. |
+| `COWORK_IDENTITY_ENFORCE` | `enforce` | Org mode only. `enforce` answers 401 to a request carrying no valid identity headers. `audit` logs it and lets it through, which is the rollout mode the org cutover used; it now has to be asked for. |
 | `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
