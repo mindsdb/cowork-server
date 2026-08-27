@@ -552,10 +552,12 @@ class UserSettings(Settings):
         default=None,
         title="Routing & Summarization Model",
         description=(
-            "The cheap model used for respond-vs-delegate routing and history "
-            "summarization. Defaults to the recommended model for the selected "
-            "provider (MindsHub → MindsHub Air; other providers → their smallest "
-            "model)."
+            "The cheap model used for history summarization. The pre-Anton route "
+            "gate does NOT run on it — it takes the role's fast default for the "
+            "provider (see resolved_gate_model), except on openai-compatible, "
+            "where this is the only model there is. Defaults to the recommended "
+            "model for the selected provider (MindsHub → MindsHub Air; other "
+            "providers → their smallest model)."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -1104,6 +1106,33 @@ class UserSettings(Settings):
             self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
+        )
+
+    @property
+    def resolved_gate_model(self) -> str | None:
+        """The model the pre-Anton route gate runs on (ENG-1851).
+
+        Deliberately NOT the user's ``router_model``. The gate sits ahead of
+        every turn with a budget measured in seconds, so it has one requirement
+        the router role's other consumer (history summarization) does not:
+        speed. A user who picks a large model for "routing and summarization"
+        is choosing it for the summaries; applied to the gate it times out on
+        every turn and bills for the attempt. So the gate takes the role's
+        *default* for the resolved provider — the catalog's declared default
+        for minds-cloud, the compiled one for the direct providers — which are
+        all chosen to be fast, availability-adjusted like every other default.
+
+        openai-compatible is the exception: it has no canonical model (it is a
+        BYO endpoint), so the user's own pick is the only model that exists
+        there and the gate uses it. The Settings UI carries the speed note.
+        """
+        provider = self.resolved_router_provider
+        if provider is Provider.OPENAI_COMPATIBLE:
+            return self.resolved_router_model
+        return _enabled_aware_default(
+            provider.value,
+            self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
+            self._minds_enabled_map(),
         )
 
     @property
