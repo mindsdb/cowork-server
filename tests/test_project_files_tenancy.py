@@ -189,12 +189,32 @@ def test_a_captured_token_is_useless_to_another_member(client, tree):
 def test_a_captured_token_is_useless_in_another_org(client, tree):
     """The token was the one capability in the system that crossed the tenant
     wall: the route took no session at all, so whoever held the string read the
-    bytes."""
+    bytes.
+
+    The SAME user id with the other org's id, deliberately, because
+    `readable_by` is a conjunction and changing both axes at once lets the user
+    comparison alone satisfy the assertion. One human holds one `user_id` across
+    every org they belong to and the switcher changes only the org header, so
+    this is the request the org half actually has to refuse. Same discipline as
+    `test_sources_for_scope_covers_only_own_org` in test_artifact_roots.py.
+    """
     token = _mount(client, A, f"conversations/{tree['conversation_id']}/page.html").json()["token"]
 
-    res = client.get(f"/api/v1/projects/preview-asset/{token}/page.html", headers=B)
+    same_user_other_org = {"X-User-Id": USER_A, "X-Organization-Id": ORG_B}
+    res = client.get(
+        f"/api/v1/projects/preview-asset/{token}/page.html", headers=same_user_other_org
+    )
 
     assert res.status_code == 404
+    # And the org half is what refused it, not the absence of the file.
+    assert client.get(f"/api/v1/projects/preview-asset/{token}/page.html", headers=A).status_code == 200
+
+
+def test_a_captured_token_is_useless_to_a_stranger(client, tree):
+    """Different user AND different org, the shape a leaked URL actually takes."""
+    token = _mount(client, A, f"conversations/{tree['conversation_id']}/page.html").json()["token"]
+
+    assert client.get(f"/api/v1/projects/preview-asset/{token}/page.html", headers=B).status_code == 404
 
 
 def test_a_token_dies_when_its_ttl_runs_out(client, tree, monkeypatch):
@@ -221,6 +241,182 @@ def test_minting_drops_records_that_have_expired(client, tree, monkeypatch):
     _mount(client, A, f"conversations/{tree['conversation_id']}/page.html")
 
     assert stale not in project_files._PROJECT_PREVIEW_MOUNTS
+
+
+def test_the_registry_is_capped_so_live_mounts_cannot_grow_without_bound(client, tree, monkeypatch):
+    """The old token was `sha256(parent)`, so repeated mounts of one directory
+    reused one key. A random token per mint inserts every time and only the TTL
+    evicts, so a member looping the mount route grows the dict for 30 minutes.
+    """
+    from cowork.api.v1.endpoints import project_files
+
+    monkeypatch.setattr(project_files, "PREVIEW_MOUNT_LIMIT", 8)
+    project_files._PROJECT_PREVIEW_MOUNTS.clear()
+
+    for _ in range(40):
+        _mount(client, A, f"conversations/{tree['conversation_id']}/page.html")
+
+    assert len(project_files._PROJECT_PREVIEW_MOUNTS) <= 8
+
+
+# ── the mounted directory is not a way out of the workspace ───────────────
+#
+# A mount grants a DIRECTORY. `preview_mount_file` gates the file it was handed,
+# so the gate is satisfied by any shared file, and the directory that then gets
+# mounted can sit above every member's private workspace. All three of these
+# served another member's bytes before the `serves` check existed.
+
+def test_a_mount_at_the_project_root_cannot_read_into_a_workspace(client, tree):
+    """A2 may write and preview a shared project file. That must not become a
+    read of A's conversation directory."""
+    assert client.put(
+        f"/api/v1/projects/{PROJECT}/files/shared-page.html",
+        json={"content": "<html>mine</html>"},
+        headers=A2,
+    ).status_code == 200
+
+    token = _mount(client, A2, "shared-page.html").json()["token"]
+
+    # The mount itself still works on what it was taken for.
+    assert client.get(f"/api/v1/projects/preview-asset/{token}/shared-page.html", headers=A2).status_code == 200
+
+    stolen = client.get(
+        f"/api/v1/projects/preview-asset/{token}/conversations/{tree['conversation_id']}/report.txt",
+        headers=A2,
+    )
+    assert stolen.status_code == 404
+    assert "private notes" not in stolen.text
+
+
+def test_a_mount_at_the_project_root_cannot_read_a_workspaces_artifacts(client, tree):
+    """Same door, the other P0 behind it: live artifacts live under
+    `conversations/<id>/.anton/artifacts`, so this route bypassed the roots
+    resolver's owner filter entirely."""
+    art = tree["workspace"] / ".anton" / "artifacts" / "deck"
+    art.mkdir(parents=True, exist_ok=True)
+    (art / "index.html").write_text("<html>A's private artifact</html>")
+    client.put(
+        f"/api/v1/projects/{PROJECT}/files/shared-page.html",
+        json={"content": "<html>mine</html>"},
+        headers=A2,
+    )
+
+    token = _mount(client, A2, "shared-page.html").json()["token"]
+
+    res = client.get(
+        f"/api/v1/projects/preview-asset/{token}/"
+        f"conversations/{tree['conversation_id']}/.anton/artifacts/deck/index.html",
+        headers=A2,
+    )
+    assert res.status_code == 404
+    assert "private artifact" not in res.text
+
+
+def test_a_mount_on_conversations_itself_cannot_read_a_workspace(client, tree):
+    """`_conversation_workspace_ok` treats `conversations/<not-a-uuid>` as a
+    shared file, so an .html placed directly under `conversations/` passes the
+    gate and mounts the directory every workspace hangs off."""
+    assert client.put(
+        f"/api/v1/projects/{PROJECT}/files/conversations/door.html",
+        json={"content": "<html>door</html>"},
+        headers=A2,
+    ).status_code == 200
+
+    token = _mount(client, A2, "conversations/door.html").json()["token"]
+
+    stolen = client.get(
+        f"/api/v1/projects/preview-asset/{token}/{tree['conversation_id']}/report.txt",
+        headers=A2,
+    )
+    assert stolen.status_code == 404
+    assert "private notes" not in stolen.text
+
+
+def test_a_root_mount_reaches_no_workspace_at_all_not_even_the_owners(client, tree):
+    """The refusal is not an ownership decision, because `preview_asset` holds no
+    session: a mount reaches its own workspace or none. A owns this conversation
+    and is still refused from a root-level mount.
+
+    That costs nothing real. A preview's sub-assets sit beside its entry file, so
+    the owner previewing their own workspace mounts from inside it, which
+    `test_preview_mount_and_asset_work_for_the_owner` covers. Keeping the rule
+    session-free is what stops this route opening a connection per sub-asset.
+    """
+    client.put(
+        f"/api/v1/projects/{PROJECT}/files/shared-page.html",
+        json={"content": "<html>mine</html>"},
+        headers=A,
+    )
+    token = _mount(client, A, "shared-page.html").json()["token"]
+
+    res = client.get(
+        f"/api/v1/projects/preview-asset/{token}/conversations/{tree['conversation_id']}/report.txt",
+        headers=A,
+    )
+    assert res.status_code == 404
+
+
+def test_the_pinned_open_refuses_a_symlinked_component(tmp_path):
+    """What closes the check-then-open window, tested at the helper because the
+    routes cannot show it.
+
+    `_require_workspace_access` decides ownership from a resolved path and the
+    sink then re-opens that path by name, which hands the whole chain back to
+    the kernel to walk again. A pod mounts its own workspace read-write, so
+    between the two it can swap a directory component for a link into another
+    member's tree, or another org's.
+
+    A route-level test cannot reproduce that: `_safe_relpath` resolves first, so
+    any link planted BEFORE the request is collapsed out of the path and the
+    swap that matters is the one landing in a window a test cannot schedule.
+    What is testable is the property that makes the window harmless, which is
+    that the open refuses a symlinked component instead of following it.
+    """
+    from cowork.api.v1.endpoints.project_files import _pinned_fd
+
+    base = tmp_path / "project"
+    (base / "real").mkdir(parents=True)
+    (base / "real" / "notes.md").write_text("mine")
+    (base / "victim").mkdir()
+    (base / "victim" / "notes.md").write_text("theirs")
+
+    # The honest chain opens.
+    with _pinned_fd(base / "real" / "notes.md", base, os.O_RDONLY) as fd:
+        assert os.read(fd, 64) == b"mine"
+
+    # Swap the directory component for a link, the way a pod would. The path
+    # still lands inside the project, so a containment check would allow it.
+    (base / "real").rename(base / "real-moved")
+    (base / "real").symlink_to(base / "victim", target_is_directory=True)
+
+    with pytest.raises(OSError):
+        with _pinned_fd(base / "real" / "notes.md", base, os.O_RDONLY):
+            pass
+
+
+def test_a_refused_component_becomes_a_404_not_a_500(tmp_path):
+    """The OSError has to reach the client as the same 404 a genuine miss
+    returns. A 500 on this path would be an existence oracle and a page.
+    """
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.project_files import _pinned_regular_file
+
+    base = tmp_path / "project"
+    (base / "victim").mkdir(parents=True)
+    (base / "victim" / "notes.md").write_text("theirs")
+    (base / "real").symlink_to(base / "victim", target_is_directory=True)
+
+    with pytest.raises(HTTPException) as err:
+        _pinned_regular_file(base / "real" / "notes.md", base)
+
+    assert err.value.status_code == 404
+    assert err.value.detail == "File not found"
+
+    # A directory where a file was asked for takes the same exit.
+    with pytest.raises(HTTPException) as err:
+        _pinned_regular_file(base / "victim", base)
+    assert err.value.status_code == 404
 
 
 # ── desktop ───────────────────────────────────────────────────────────────

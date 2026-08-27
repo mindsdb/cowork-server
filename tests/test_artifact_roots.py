@@ -227,3 +227,46 @@ def test_conversation_base_agrees_with_the_listed_roots(session, tmp_path, org_m
     scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A))
 
     assert turn_base in [s.base for s in artifacts_sources_for_project(scoped, row.id)]
+
+
+def test_the_unfiltered_scan_yields_nothing_for_an_org_project(session, tmp_path, org_mode, monkeypatch):
+    """A tripwire, not a behaviour test.
+
+    `artifacts_sources_for_scan` is this module's third public resolver and the
+    only one taking no session, so it applies no org filter and no owner filter.
+    `/api/v1/search` calls it unconditionally, in every tenancy mode.
+
+    Nothing leaks today, for two reasons and neither of them is a check. It
+    walks `_projects_root()`, which is deliberately unkeyed and so empty in org
+    mode because org projects live at `<shared_root>/<org_id>/projects`
+    (services/artifacts.py carries its own TODO to org-scope it). And
+    `_scan_artifact_dirs` looks only for `<project>/.anton/artifacts`, the
+    desktop layout, while an org project's artifacts sit one level deeper under
+    `conversations/<id>/`.
+
+    So this points the scan straight at an org project's real tree, defeating
+    the first reason, and asserts the second holds. Whoever org-scopes the root
+    or teaches the scan the conversation layout reopens a cross-member artifact
+    read through search, and this fails when they do.
+    """
+    from cowork.services import artifacts as artifacts_service
+    from cowork.services.artifact_roots import artifacts_sources_for_scan
+
+    project = _project(session, tmp_path, name="scanned", org_id=ORG_A)
+    _conversation(session, project, owner=USER_A2)
+    monkeypatch.setattr(
+        artifacts_service, "_projects_root", lambda: Path(project.path).parent
+    )
+
+    assert artifacts_sources_for_scan() == [], (
+        "the scan reached an org project's conversation workspaces; /api/v1/search "
+        "would now surface a co-member's artifacts"
+    )
+
+    # Not vacuous: the same scan, same root, does find a desktop-layout tree, so
+    # the empty result above is the org layout being skipped rather than the
+    # scan being broken or the root being wrong.
+    (Path(project.path) / ".anton" / "artifacts").mkdir(parents=True)
+    assert [s.base for s in artifacts_sources_for_scan()] == [
+        Path(project.path).resolve() / ".anton" / "artifacts"
+    ]

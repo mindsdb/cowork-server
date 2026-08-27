@@ -129,10 +129,15 @@ async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     assert "secret" not in slugs
 
 
-async def test_list_hides_another_members_artifacts(session, tmp_path, org_mode):
-    """Same org, same project, different chat. Live artifacts live inside a
-    conversation, so they inherit that conversation's privacy rather than the
-    project's sharing."""
+def test_list_hides_another_members_artifacts(session, tmp_path, org_mode):
+    """Same org, different chat. Live artifacts live inside a conversation, so
+    they inherit that conversation's privacy rather than the project's sharing.
+
+    Two projects here, because `_project_with_artifact` builds one per call. The
+    one-project-two-owners case, which is what a narrowing of the filter to
+    per-project granularity would slip past, is pinned at the resolver instead:
+    `test_artifact_roots.py::test_sources_for_project_skip_another_members_conversations`.
+    """
     _project_with_artifact(
         session, tmp_path, name="shared", org_id=ORG_A, slug="theirs", owner=USER_A2
     )

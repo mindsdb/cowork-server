@@ -191,7 +191,9 @@ whether that user is still a member of that organization, and injects
 headers and then trusts them, so **the gateway being the only route to the pod is
 what makes them trustworthy**, and that is a NetworkPolicy rather than
 anything in this codebase.
-A request with no valid pair is answered 401 before any route runs.
+A request with no valid pair is answered 401 before any route runs, except on
+`/api/v1/health/`, which the kubelet probes with no headers, and the channel
+webhook paths, which third parties call.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
@@ -214,6 +216,13 @@ member's conversation directories before the artifact list or delete ever sees
 them, because those routes are addressed by project and slug and never receive a
 conversation id.
 
+Both of those decide from a resolved path and the route then opens that path, so
+the decision is carried to the open rather than trusted afterwards: every
+component below the project directory is opened `O_NOFOLLOW`, and a symlink
+planted anywhere in the chain is refused. A pod mounts its own workspace
+read-write, so without that a swapped directory component between the check and
+the open reaches another member's tree, or another organization's.
+
 **A refusal on a private resource answers 404, not 403**, with the same body a
 genuine miss returns. Telling the two apart would confirm that another member's
 file exists, which is most of what an attacker wants to know. Policy refusals
@@ -225,7 +234,16 @@ the admin role says so plainly.
 returns one, `preview-asset` spends it), because an iframe cannot send an
 `Authorization` header. The token is random, it is bound to the member and
 organization that minted it, and it expires after 30 minutes, so a token that
-escapes into a log or a screenshot is not a way into someone else's directory.
+escapes into a log or a screenshot is not a way in for anyone else.
+
+Being the minter is not enough on its own, because **a mount grants a
+directory**. The gate runs on the file the caller named, and an `.html` at the
+project root sits in a directory every member's `conversations/<id>/` hangs off,
+so a token minted on a shared file would otherwise read every workspace under it.
+A mount therefore reaches only the workspace its own file lived in, and a mount
+taken on a shared file reaches no workspace at all, not even the minter's own.
+That check holds no session, deliberately: `preview-asset` serves every sub-asset
+a page pulls, and a session there is a database connection per image.
 
 ### The default model is the one the free allowance covers
 
@@ -354,7 +372,7 @@ Environment variables fall into two namespaces:
 |----------|---------|-------------|
 | `COWORK_LISTEN_PORT` | `26866` | Server port |
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
-| `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" below. |
+| `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |
 | `COWORK_IDENTITY_ENFORCE` | `enforce` | Org mode only. `enforce` answers 401 to a request carrying no valid identity headers. `audit` logs it and lets it through, which is the rollout mode the org cutover used; it now has to be asked for. |
 | `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
