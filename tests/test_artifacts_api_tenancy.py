@@ -24,10 +24,18 @@ from cowork.services import artifacts as ep_artifacts
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
+from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
 ORG_B = "22222222-2222-2222-2222-222222222222"
+USER_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+# A second member of ORG_A. Same tenant, different person: the axis the org
+# filter alone does not cover.
+USER_A2 = "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2"
+
+#: What the gateway injects on a real org-mode request.
+_IDENTITY = {"X-User-Id": USER_A, "X-Organization-Id": ORG_A}
 
 
 def _set_mode(monkeypatch, mode: str) -> None:
@@ -56,25 +64,35 @@ def session():
         yield s
 
 
-def _scoped(session, org_id: str) -> ScopedSession:
-    return ScopedSession(session, TenantScope(org_mode=True, org_id=org_id, user_id="u-1"))
+def _scoped(session, org_id: str, user_id: str = USER_A) -> ScopedSession:
+    return ScopedSession(session, TenantScope(org_mode=True, org_id=org_id, user_id=user_id))
 
 
-def _project_with_artifact(session, tmp_path, *, name, org_id, slug, conversation=None):
+def _project_with_artifact(session, tmp_path, *, name, org_id, slug, owner=USER_A):
     path = tmp_path / (org_id or "local") / name
+    row = Project(id=uuid.uuid4(), name=name, path=str(path), org_id=org_id)
+    session.add(row)
+
     # Org projects carry the conversation segment the cloud pod writes under
     # (artifact_roots.CONVERSATIONS_DIRNAME); desktop projects do not. Mirroring
     # both real layouts here is what makes these tests exercise the resolver
-    # rather than a shape only the tests believe in.
-    workspace = path / "conversations" / (conversation or "c1") if org_id is not None else path
+    # rather than a shape only the tests believe in. The directory name is the
+    # conversation's id and the row behind it is what says who owns the
+    # artifacts inside, so both have to be real.
+    workspace = path
+    if org_id is not None:
+        conversation = Conversation(
+            id=uuid.uuid4(), topic=f"{name} chat", project_id=row.id, org_id=org_id, created_by=owner
+        )
+        session.add(conversation)
+        workspace = path / "conversations" / str(conversation.id)
+
     folder = workspace / ".anton" / "artifacts" / slug
     folder.mkdir(parents=True)
     (folder / "index.html").write_text("<html></html>")
     (folder / "metadata.json").write_text(
         json.dumps({"slug": slug, "name": slug, "type": "html-app"})
     )
-    row = Project(id=uuid.uuid4(), name=name, path=str(path), org_id=org_id)
-    session.add(row)
     session.commit()
     return row, folder
 
@@ -111,7 +129,29 @@ async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     assert "secret" not in slugs
 
 
-async def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
+def test_list_hides_another_members_artifacts(session, tmp_path, org_mode):
+    """Same org, different chat. Live artifacts live inside a conversation, so
+    they inherit that conversation's privacy rather than the project's sharing.
+
+    Two projects here, because `_project_with_artifact` builds one per call. The
+    one-project-two-owners case, which is what a narrowing of the filter to
+    per-project granularity would slip past, is pinned at the resolver instead:
+    `test_artifact_roots.py::test_sources_for_project_skip_another_members_conversations`.
+    """
+    _project_with_artifact(
+        session, tmp_path, name="shared", org_id=ORG_A, slug="theirs", owner=USER_A2
+    )
+    _project_with_artifact(
+        session, tmp_path, name="also-mine", org_id=ORG_A, slug="mine", owner=USER_A
+    )
+
+    slugs = [c["slug"] for c in ep.artifacts_for_request(_scoped(session, ORG_A, USER_A))]
+
+    assert "mine" in slugs
+    assert "theirs" not in slugs
+
+
+def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
     row, _ = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="other", org_id=ORG_A, slug="second")
 
@@ -187,6 +227,25 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     assert not folder.exists()
 
 
+async def test_delete_cannot_reach_another_members_artifact(
+    session, tmp_path, org_mode, publish_key
+):
+    """The project is shared, so the scoped read hands it over and the org filter
+    is satisfied. What stops the delete is that none of the roots under it belong
+    to the caller, and a slug that resolves to no root of theirs is a miss."""
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="shared-proj", org_id=ORG_A, slug="theirs", owner=USER_A
+    )
+
+    with pytest.raises(HTTPException) as err:
+        await ep.delete_artifact_for_request(
+            _scoped(session, ORG_A, USER_A2), "theirs", project_id=row.id
+        )
+
+    assert err.value.status_code == 404
+    assert folder.exists()
+
+
 async def test_delete_in_foreign_project_is_404_and_keeps_files(
     session, tmp_path, org_mode, publish_key
 ):
@@ -230,15 +289,21 @@ async def test_delete_in_desktop_hits_the_named_project_not_the_first_one(
     "/api/v1/publish/",
 ])
 def test_desktop_only_endpoints_are_403_in_org_mode(org_mode, path):
-    # TestClient is fine here: require_local_tenancy reads the setting at request
-    # time, so the app's build-time mode is irrelevant.
+    # Build the app under the mode this test names instead of importing the
+    # module-level `app`. That one is created on first import and keeps
+    # whichever middleware stack the mode in force at that moment gave it, so
+    # importing it makes the answer depend on which test file ran first.
+    #
+    # The identity headers are what the gateway injects on every real request.
+    # Without them the principal middleware answers 401 before the guard is
+    # reached, which says nothing about the guard.
     #
     # 403 rather than 501 so the edge books the refusal as a client error. The
     # capability 501 in handlers/responses.py is a different thing and keeps its
     # status; tests/test_no_execution_in_org_mode.py pins it.
-    from cowork.server import app
+    from cowork.server import create_app
 
-    res = TestClient(app).get(path)
+    res = TestClient(create_app()).get(path, headers=_IDENTITY)
     assert res.status_code == 403
     # require_local answers 403 too, so the detail is what tells the two
     # refusals apart, and it is what tells the caller why.
@@ -246,12 +311,13 @@ def test_desktop_only_endpoints_are_403_in_org_mode(org_mode, path):
 
 
 def test_desktop_only_endpoints_are_reachable_in_local_mode(local_mode):
-    from cowork.server import app
+    from cowork.server import create_app
 
     # /status never raises for an unknown path, so a guard that stays quiet
     # means 200. Asserting the real status rather than "not the refusal" keeps
-    # this test failing if the guard ever fires in local mode.
-    assert TestClient(app).get("/api/v1/artifacts/status?path=/nope").status_code == 200
+    # this test failing if the guard ever fires in local mode. No identity
+    # headers: the desktop sends none and local mode wires no middleware.
+    assert TestClient(create_app()).get("/api/v1/artifacts/status?path=/nope").status_code == 200
 
 
 # ── desktop project_path filter ────────────────────────────────────────────
