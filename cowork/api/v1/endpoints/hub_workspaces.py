@@ -34,7 +34,7 @@ from sqlmodel import Session
 
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
-from cowork.principal import caller_bearer
+from cowork.principal import hub_credential
 from cowork.schemas.hub_workspaces import (
     HubWorkspaceActivateRequest,
     HubWorkspaceRow,
@@ -73,7 +73,7 @@ async def _build_view(
     makes no workspace request at all. That is worth one sequential round trip:
     the alternative asks auth for a listing nobody is going to render.
     """
-    bearer = caller_bearer(request)
+    bearer = hub_credential(request)
     org_id = scope.org_id or ""
     if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id):
         return _DISABLED
@@ -117,7 +117,7 @@ async def set_active_hub_workspace(
     nothing resolves to the default workspace on the next read, which would look
     like the switch silently doing nothing.
     """
-    bearer = caller_bearer(request)
+    bearer = hub_credential(request)
     org_id = scope.org_id or ""
     if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id):
         raise HTTPException(

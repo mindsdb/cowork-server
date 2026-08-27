@@ -197,8 +197,16 @@ The packaged Electron app would get away with a direct call because it runs with
 `webSecurity: false`; the web SPA would not. Reading here works for both shells.
 The outbound host is derived by `default_minds_auth_host()` from `ENV`, which the
 desktop propagates when it spawns this process, and the credential is the
-caller's own bearer, never the stored provider key and never `minds_url`, both
-of which an org admin can set.
+caller's own, never the stored provider key and never `minds_url`, both of which
+an org admin can set.
+
+**The credential arrives in its own header, `X-MindsHub-Authorization`.** It
+cannot use `Authorization`: Electron's main process overwrites that on every
+request to the loopback server with the server's own token, so the caller's
+Keycloak JWT can never arrive under that name in the desktop shell. `Authorization`
+is still the fallback, which is what the web shell uses. `hub_credential` reads
+both, and it is deliberately a different function from `caller_bearer` so a client
+cannot steer the credential on the org model-catalog fetch by setting a header.
 
 **The switch is auth's Statsig gate, not a local setting.** Auth declares
 `authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its

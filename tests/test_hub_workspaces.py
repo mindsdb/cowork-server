@@ -24,7 +24,7 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.db.session import get_engine
-from cowork.principal import caller_bearer
+from cowork.principal import HEADER_HUB_CREDENTIAL, caller_bearer, hub_credential
 from cowork.schemas.hub_workspaces import HubWorkspaceActivateRequest
 from cowork.services import hub_workspaces as svc
 from cowork.services.settings import SettingService
@@ -76,10 +76,16 @@ def _rows(*, archived: bool = False) -> dict:
 
 
 class FakeRequest:
-    """Just enough Request for `caller_bearer`."""
+    """Just enough Request for `hub_credential`.
+
+    Sends the credential the way the desktop shell has to: its own header, not
+    Authorization, which Electron overwrites with the loopback token.
+    """
 
     def __init__(self, bearer: str = "jwt-abc") -> None:
-        self.headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+        self.headers = (
+            {HEADER_HUB_CREDENTIAL: f"Bearer {bearer}"} if bearer else {}
+        )
 
 
 @pytest.fixture
@@ -669,3 +675,53 @@ def test_caller_bearer_parsing(header, expected):
 
 def test_caller_bearer_with_no_request_is_empty():
     assert caller_bearer(None) == ""
+
+
+# ── Which header carries the credential ──────────────────────────────
+
+
+def test_the_hub_header_wins_over_the_loopback_authorization():
+    """The desktop case, and the whole reason this header exists.
+
+    Electron's main process overwrites Authorization on every loopback request
+    with the server's own token, so the caller's JWT can only arrive under its
+    own name. Reading Authorization here would forward the loopback token to
+    auth, which rejects it, and the menu would be empty on every desktop install.
+    """
+    request = type(
+        "R",
+        (),
+        {
+            "headers": {
+                "Authorization": "Bearer loopback-token-not-the-users",
+                HEADER_HUB_CREDENTIAL: "Bearer real-user-jwt",
+            }
+        },
+    )()
+
+    assert hub_credential(request) == "real-user-jwt"
+    # The other helper is untouched, so the model-catalog fetch cannot be steered
+    # by a client setting the hub header.
+    assert caller_bearer(request) == "loopback-token-not-the-users"
+
+
+def test_the_web_shell_falls_back_to_authorization():
+    """No hook there, so the ingress-forwarded Authorization is the JWT."""
+    request = type("R", (), {"headers": {"Authorization": "Bearer web-jwt"}})()
+
+    assert hub_credential(request) == "web-jwt"
+
+
+@pytest.mark.parametrize("value", ["", "Basic abc", "real-user-jwt"])
+def test_a_malformed_hub_header_falls_back_rather_than_forwarding_junk(value):
+    request = type(
+        "R",
+        (),
+        {"headers": {HEADER_HUB_CREDENTIAL: value, "Authorization": "Bearer fallback"}},
+    )()
+
+    assert hub_credential(request) == "fallback"
+
+
+def test_hub_credential_with_no_request_is_empty():
+    assert hub_credential(None) == ""
