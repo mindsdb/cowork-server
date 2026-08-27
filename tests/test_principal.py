@@ -184,6 +184,39 @@ def test_audit_mode_lets_malformed_identity_through(caplog):
     assert "no principal on" in caplog.text
 
 
+def test_org_mode_enforces_identity_when_the_env_var_is_absent(monkeypatch):
+    """The whole point of the default. Every deployment sets
+    COWORK_IDENTITY_ENFORCE today, so the value only decides anything when
+    somebody drops it, and dropping it must not reopen the no-principal path.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.server import create_app
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.delenv("COWORK_IDENTITY_ENFORCE", raising=False)
+    get_app_settings.cache_clear()
+    try:
+        app = create_app()
+
+        # A route that answers 200 on its own, so reaching it is the signal.
+        # Every real route touches org-scoped data and answers 401 under audit
+        # too, which would make this test pass whatever the default is.
+        @app.get("/api/v1/_reached")
+        def _reached():
+            return {"reached": True}
+
+        client = TestClient(app)
+
+        res = client.get("/api/v1/_reached")
+        assert res.status_code == 401
+        assert res.json() == {"detail": "Unauthorized"}
+
+        res = client.get("/api/v1/health/")
+        assert res.status_code == 200, "health stays reachable for the kubelet"
+    finally:
+        get_app_settings.cache_clear()
+
+
 def test_missing_tenant_scope_maps_to_401(monkeypatch):
     # Org-scoped data touched with no org in scope (audit mode, no identity)
     # must answer 401 via the create_app exception handler, not a 500.
