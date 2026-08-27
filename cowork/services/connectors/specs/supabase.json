@@ -21,6 +21,7 @@
   "category": "database",
   "logo": "database",
   "logo_color": "#3ECF8E",
+  "featured": true,
   "form": {
     "form_id": "supabase-connector",
     "title": "Connect Supabase",
@@ -29,10 +30,31 @@
     "logo_color": "#3ECF8E",
     "methods": [
       {
+        "id": "browser_oauth_builtin",
+        "label": "Authorize with Supabase",
+        "description": "Sign in to Supabase in your browser and authorize access. No database credentials are required.",
+        "recommended": true,
+        "hidden": false,
+        "how_to": "Click **Connect**, sign in to Supabase, and click **Authorize**. OAuth access is granted according to the scopes configured on the Supabase OAuth app. Use `http://localhost:47292/callback` as the OAuth app redirect URI.",
+        "fields": [],
+        "oauth": {
+          "auth_url": "https://api.supabase.com/v1/oauth/authorize",
+          "token_url": "https://api.supabase.com/v1/oauth/token",
+          "revoke_url": "https://api.supabase.com/v1/oauth/revoke",
+          "scopes": ["projects:read", "organizations:read"],
+          "service_id": "supabase",
+          "token_auth_style": "basic",
+          "supports_refresh": true,
+          "supports_revoke": true,
+          "redirect_port": 47292,
+          "redirect_host": "localhost"
+        }
+      },
+      {
         "id": "connection-string",
         "label": "Connection String",
         "description": "Paste the full Postgres connection string from your Supabase project settings. Quickest way to get connected — one field, no assembly required.",
-        "recommended": true,
+        "recommended": false,
         "how_to": "## Get your Supabase connection string\n\n1. Open [Supabase Dashboard](https://supabase.com/dashboard) and select your project.\n2. Go to **Project Settings** (gear icon in the left sidebar) → **Database**.\n3. Scroll to the **Connection string** section.\n4. Choose the **URI** tab.\n5. Copy the full string — it looks like `postgresql://postgres:[YOUR-PASSWORD]@db.<project-ref>.supabase.co:5432/postgres`.\n6. If the password placeholder `[YOUR-PASSWORD]` appears, replace it with your database password (set when you created the project, or reset under **Database → Database Password**).\n7. Paste the string into the field below.\n\n### Notes\n\n- Use the **Transaction** mode URI (port 6543) if you plan to run many short-lived queries; use the direct URI (port 5432) for long-running or migration workloads.\n- If you're on the free plan and your project is paused, you'll need to unpause it in the dashboard first.\n",
         "help_url": "https://supabase.com/docs/guides/database/connecting-to-postgres",
         "fields": [

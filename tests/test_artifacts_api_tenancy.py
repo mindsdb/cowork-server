@@ -479,18 +479,29 @@ async def test_delete_in_desktop_hits_the_named_project_not_the_first_one(
     "/api/v1/artifacts/preview?path=/x",
     "/api/v1/publish/",
 ])
-def test_desktop_only_endpoints_are_501_in_org_mode(org_mode, path):
+def test_desktop_only_endpoints_are_403_in_org_mode(org_mode, path):
     # TestClient is fine here: require_local_tenancy reads the setting at request
     # time, so the app's build-time mode is irrelevant.
+    #
+    # 403 rather than 501 so the edge books the refusal as a client error. The
+    # capability 501 in handlers/responses.py is a different thing and keeps its
+    # status; tests/test_no_execution_in_org_mode.py pins it.
     from cowork.server import app
 
-    assert TestClient(app).get(path).status_code == 501
+    res = TestClient(app).get(path)
+    assert res.status_code == 403
+    # require_local answers 403 too, so the detail is what tells the two
+    # refusals apart, and it is what tells the caller why.
+    assert res.json()["detail"] == "not available in org deployments"
 
 
 def test_desktop_only_endpoints_are_reachable_in_local_mode(local_mode):
     from cowork.server import app
 
-    assert TestClient(app).get("/api/v1/artifacts/status?path=/nope").status_code != 501
+    # /status never raises for an unknown path, so a guard that stays quiet
+    # means 200. Asserting the real status rather than "not the refusal" keeps
+    # this test failing if the guard ever fires in local mode.
+    assert TestClient(app).get("/api/v1/artifacts/status?path=/nope").status_code == 200
 
 
 # ── desktop project_path filter ────────────────────────────────────────────

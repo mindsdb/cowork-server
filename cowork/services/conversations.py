@@ -22,6 +22,8 @@ from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
+from cowork.services.channel_bindings import ChannelBindingService
+from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
 
@@ -53,6 +55,50 @@ def _is_tool_row(content) -> bool:
 
 
 logger = logging.getLogger(__name__)
+
+# ENG-1992: swapped in for an image content block a provider permanently
+# rejected (a schema/shape mismatch, not a moderation refusal), so it must
+# read as a removal notice, not as if the user said this.
+_IMAGE_PLACEHOLDER_TEXT = (
+    "[An image here could not be sent to the model and was removed "
+    "automatically so this conversation could continue. Re-share it if you "
+    "still need it referenced.]"
+)
+
+
+def _strip_image_blocks(content):
+    """Replace image content blocks with a text placeholder, recursing into
+    tool_result blocks' own nested content (a tool can return an image, e.g.
+    a screenshot).
+
+    Returns `(content, changed)` — `content` is the exact same object when
+    nothing needed stripping, so a caller can skip a write when `changed` is
+    False. Used to repair a conversation whose stored history contains an
+    image block a provider permanently rejected (ENG-1992's
+    ContentValidationError) — once removed, replay just works again, with no
+    special-casing needed on future turns.
+    """
+    if not isinstance(content, list):
+        return content, False
+
+    changed = False
+    new_blocks = []
+    for block in content:
+        if not isinstance(block, dict):
+            new_blocks.append(block)
+            continue
+        if block.get("type") == "image":
+            new_blocks.append({"type": "text", "text": _IMAGE_PLACEHOLDER_TEXT})
+            changed = True
+            continue
+        if block.get("type") == "tool_result":
+            nested, nested_changed = _strip_image_blocks(block.get("content"))
+            if nested_changed:
+                new_blocks.append({**block, "content": nested})
+                changed = True
+                continue
+        new_blocks.append(block)
+    return (new_blocks if changed else content), changed
 
 
 def _skill_created_slug(event_data) -> str | None:
@@ -224,6 +270,43 @@ class ConversationService:
             message.pending = False
             self.session.add(message)
         self.session.commit()
+
+    def repair_image_content(self, conversation_id: UUID) -> list[UUID]:
+        """Strip image content blocks from every stored message in a
+        conversation, replacing each with a text placeholder.
+
+        Called when a turn dies on ContentValidationError (ENG-1992): the
+        provider permanently rejected some image block in history, and
+        retrying identically fails identically forever, because the
+        translation that produced the bad block runs fresh from this same
+        stored data on every call. Fixing the DATA once, here, rather than
+        special-casing replay means every future turn just works — no flag,
+        no per-turn filtering to maintain.
+
+        Scans every message (including pending/tool-only rows — a poisoned
+        image could be in either) rather than trying to identify "the" one
+        culprit from the provider's error: that needs mapping a request-
+        relative index (e.g. Responses' "input[70]") back to a specific
+        stored message, which isn't reliable across providers or dialects.
+        Structurally finding every image block is deterministic and safe
+        instead.
+
+        Returns the ids of messages that were actually changed — empty if
+        none needed it (e.g. the failure turned out not to be image-shaped
+        after all, so there's nothing here to fix).
+        """
+        messages = self.get_ordered_messages(conversation_id, include_pending=True)
+        repaired: list[UUID] = []
+        for message in messages:
+            new_content, changed = _strip_image_blocks(message.content)
+            if not changed:
+                continue
+            message.content = new_content
+            self.session.add(message)
+            repaired.append(message.id)
+        if repaired:
+            self.session.commit()
+        return repaired
 
     def last_message_at(self, conversation_id: UUID) -> datetime | None:
         """Timestamp of the most recent message, or None for an empty
@@ -451,6 +534,16 @@ class ConversationService:
         attachment_dirs = FileService(self.session).delete_by_purpose(
             attachment_purpose(str(conversation_id))
         )
+        # Three more tables point at this conversation, and unlike the rows above
+        # they are not the conversation's own data: a schedule and its runs record
+        # the conversation a run produced, and a channel binding records the one
+        # its external chat is pinned to. No foreign key in this schema declares
+        # an `ondelete`, so Postgres refuses the delete below while any of them
+        # still points here, and SQLite (desktop, and the whole test suite) runs
+        # with foreign keys off and orphans them instead. Each owning service
+        # releases its own link and keeps its rows, staged into this transaction.
+        ScheduleService(self.session).release_conversation(conversation_id)
+        ChannelBindingService(self.session).release_conversation(conversation_id)
         # anton snapshots the scratchpad namespace to
         # `<project>/.anton/scratchpad-sessions/<conversation_id>/` so variables survive
         # the pad process being replaced each turn (ENG-1124). Nothing else prunes those

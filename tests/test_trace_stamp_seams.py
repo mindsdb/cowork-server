@@ -176,6 +176,76 @@ def test_the_matcher_catches_an_attribute_qualified_construction():
     assert not _is_config_call(not_a_call)
 
 
+# ---------------------------------------------------------------------------
+# The same rule, for the harness (ENG-1941).
+#
+# The connector probe got the ENG-1459 `surface` plumbing and never the older
+# `harness` field, so every probe trace reached Langfuse with a surface and an
+# empty harness — the only anton-originated traffic that did, and therefore
+# indistinguishable from direct-API callers in any harness filter. The surface
+# rule above was sitting one line away and could not see it, because it keys on
+# a different kwarg. Same seam, same guard, second field.
+# ---------------------------------------------------------------------------
+
+
+def _declares_harness(call: ast.Call) -> bool:
+    """A literal ``harness=`` keyword — deliberately NOT the ``**helper()``
+    shape that :func:`_declares_surface` also accepts.
+
+    The asymmetry is intentional and load-bearing. ``surface`` is **absent**
+    from the pinned anton (``uv.lock`` → ``466520b``, v2.26.8.20.3), so passing
+    it unconditionally would raise ``TypeError`` on every turn — hence the
+    defensive ``**surface_kwarg(ChatSessionConfig)``. ``harness`` *is* declared
+    at that same commit, so it can be passed as a plain keyword, and requiring
+    the literal keeps this guard exact.
+
+    If a future change ever needs harness passed defensively too, this
+    predicate will reject that shape and must be widened the way
+    ``_declares_surface`` was — matching on the **inner helper name**, not
+    merely on a ``**``-unpack. Matching any unpack would make the guard
+    satisfiable by any ``**kwargs`` that happens not to contain a harness,
+    which is the vacuous-guard failure this file exists to prevent
+    (#386 review).
+    """
+    return any(kw.arg == "harness" for kw in call.keywords)
+
+
+def test_every_turn_originator_declares_its_harness():
+    offenders = [
+        f"{path.relative_to(COWORK_ROOT.parent)}:{call.lineno}"
+        for path, call in _config_sites()
+        if not _declares_harness(call)
+    ]
+    assert not offenders, (
+        "These ChatSessionConfig call sites originate a turn without declaring a "
+        "harness, so their traces carry an empty `harness` and read as direct-API "
+        "traffic in Langfuse (ENG-1941). Pass harness=... — see "
+        f"cowork/harnesses/anton_harness/harness.py: {offenders}"
+    )
+
+
+def test_the_probe_reports_the_same_harness_as_the_anton_harness():
+    """The probe declares its harness as a literal (the connectors service
+    does not import the harness package). Pin it to `AntonHarness.id`: if
+    either side is renamed alone, probe traces silently become a second
+    population under a name nothing filters on — the exact failure ENG-1941
+    fixed, reintroduced by a refactor."""
+    from cowork.harnesses.anton_harness.harness import AntonHarness
+    from cowork.services.connectors.probe import PROBE_HARNESS
+
+    assert PROBE_HARNESS == AntonHarness.id
+
+
+def test_the_harness_predicate_actually_rejects_a_bare_call():
+    """Positive control on `_declares_harness` — a predicate weakened to
+    `return True` must fail here, not report green forever."""
+    accepted = ast.parse("ChatSessionConfig(harness='anton')").body[0].value
+    bare = ast.parse("ChatSessionConfig(llm_client=x)").body[0].value
+
+    assert _declares_harness(accepted)
+    assert not _declares_harness(bare), "the predicate accepts a call site with no harness"
+
+
 def test_the_surface_predicate_actually_rejects_a_bare_call():
     """Positive control on `_declares_surface` itself.
 
