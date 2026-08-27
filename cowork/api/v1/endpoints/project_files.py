@@ -10,17 +10,28 @@ import mimetypes
 import os
 import secrets
 import shutil
+import stat
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from cowork.common.paths import (
+    O_NOFOLLOW,
+    dir_lstat,
+    dir_open,
+    dir_unlink,
+    opened_subdir_nofollow,
+)
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 from cowork.services.projects import ProjectService
 
 
@@ -35,6 +46,12 @@ TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
 #: browser it was minted in dies the same session.
 PREVIEW_TOKEN_TTL_SECONDS = 30 * 60
 
+#: Most live preview mounts one process holds. A mount is a few hundred bytes
+#: and only one browser tab spends each one, so a real deployment sits in the
+#: tens; the cap is here because nothing but the TTL evicts, and the container
+#: limit is 256Mi.
+PREVIEW_MOUNT_LIMIT = 2048
+
 
 @dataclass(frozen=True)
 class _PreviewMount:
@@ -45,9 +62,18 @@ class _PreviewMount:
     therefore what carries the authority, not the string: whoever presents the
     token still has to be the member it was minted for, in the organization it
     was minted in, before it expires.
+
+    Being the minter is not enough on its own, because a mount grants a whole
+    directory and the directory it grants may sit ABOVE the private workspaces.
+    An .html at the project root mounts the project root, and every member's
+    `conversations/<id>/` hangs off it. So the record also carries the project
+    root and which workspace, if any, the mounted file lived in, and
+    `serves` refuses a path that reaches into a different one.
     """
 
     parent: Path
+    project_base: Path
+    workspace: str | None
     org_id: str | None
     user_id: str | None
     expires_at: float
@@ -58,22 +84,72 @@ class _PreviewMount:
             return True
         return self.org_id == scope.org_id and self.user_id == scope.user_id
 
+    def serves(self, target: Path) -> bool:
+        """Whether this mount may hand out `target`.
+
+        Containment in `parent` is checked by the caller. This is the second
+        question: a mount parented at or above `conversations/` must not be a
+        way into a workspace the minter does not own. Only the workspace the
+        mounted file itself lived in is reachable, and a mount taken on a shared
+        file reaches no workspace at all.
+        """
+        if self.org_id is None:
+            # Desktop: one user, nothing to keep apart. An org-mode mount always
+            # carries an org, because minting reads the project through a scoped
+            # session and that raises without one.
+            return True
+        try:
+            rel = target.relative_to(self.project_base).as_posix()
+        except ValueError:
+            return False
+        parts = rel.split("/", 2)
+        if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
+            return True  # shared project file
+        return parts[1] == self.workspace
+
 
 _PROJECT_PREVIEW_MOUNTS: dict[str, _PreviewMount] = {}
 
 
-def _register_preview_mount(parent: Path, scope: TenantScope) -> str:
-    """Mint a token for `parent` and bind it to the caller.
+def _mount_workspace(target: Path, base: Path) -> str | None:
+    """The `conversations/<id>` segment `target` sits in, or None when it is a
+    shared project file. `_require_workspace_access` has already established
+    that the caller owns it."""
+    try:
+        rel = target.relative_to(base.resolve()).as_posix()
+    except (ValueError, OSError):
+        return None
+    parts = rel.split("/", 2)
+    if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
+        return None
+    return parts[1]
+
+
+def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str:
+    """Mint a token for `target`'s directory and bind it to the caller.
 
     Expired records are dropped here rather than on read: minting is rare and
     reading is per sub-asset, and nothing else ever removes an entry.
+
+    Dropping the expired ones is not enough on its own. The old token was
+    `sha256(parent)`, so N mounts of one directory reused one key and the
+    registry was bounded by the number of distinct directories; a random token
+    per mint means every call inserts, and nothing evicts a record that is still
+    inside its 30-minute TTL. So the registry is also capped, oldest expiry
+    first. Overrunning the cap costs an early 404 on the least fresh preview,
+    which reloads, rather than an unbounded dict in a 256Mi container.
     """
     now = time.time()
     for stale in [t for t, m in _PROJECT_PREVIEW_MOUNTS.items() if m.expires_at <= now]:
         _PROJECT_PREVIEW_MOUNTS.pop(stale, None)
+    while len(_PROJECT_PREVIEW_MOUNTS) >= PREVIEW_MOUNT_LIMIT:
+        oldest = min(_PROJECT_PREVIEW_MOUNTS, key=lambda t: _PROJECT_PREVIEW_MOUNTS[t].expires_at)
+        _PROJECT_PREVIEW_MOUNTS.pop(oldest, None)
     token = secrets.token_urlsafe(32)
     _PROJECT_PREVIEW_MOUNTS[token] = _PreviewMount(
-        parent=parent,
+        parent=target.parent.resolve(),
+        project_base=base.resolve(),
+        workspace=_mount_workspace(target, base),
         org_id=scope.org_id,
         user_id=scope.user_id,
         expires_at=now + PREVIEW_TOKEN_TTL_SECONDS,
@@ -153,7 +229,7 @@ def _conversation_workspace_ok(
     if not scoped.scope.org_mode:
         return True
     parts = rel_posix.split("/", 2)
-    if len(parts) < 2 or parts[0] != "conversations":
+    if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
         return True  # shared project file
     seg = parts[1]
     if cache is not None and seg in cache:
@@ -185,6 +261,76 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
         raise HTTPException(status_code=404, detail="File not found")
     if not _conversation_workspace_ok(rel, scoped):
         raise HTTPException(status_code=404, detail="File not found")
+
+
+@contextmanager
+def _pinned_fd(target: Path, base: Path, flags: int) -> Iterator[int]:
+    """Yield a descriptor for `target`, opening every component below `base`
+    with O_NOFOLLOW so no planted link can redirect the open.
+
+    `_require_workspace_access` decides ownership from a resolved path string,
+    and re-opening that string by name hands the whole chain back to the kernel
+    to walk again. A pod mounts its own subtree read-write and can swap a
+    directory component for a link in between, so the decision has to be carried
+    to the open rather than re-derived from a name afterwards. Same defence
+    `ProjectService` applies to the projects root and `_secure_attachments_dir`
+    to the attachments tree; see `opened_subdir_nofollow`.
+
+    A planted link raises `OSError` (ELOOP), which callers map to the same 404 a
+    genuine miss returns rather than letting it surface as a 500.
+    """
+    rel = target.relative_to(base.resolve())
+    *dirs, name = rel.parts
+    with opened_subdir_nofollow(base, *dirs) as pinned:
+        fd = dir_open(pinned, name, flags | O_NOFOLLOW)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+
+
+def _pinned_regular_file(target: Path, base: Path, flags: int = os.O_RDONLY):
+    """`_pinned_fd`, plus the "is it actually a file" check every route needs,
+    with every failure collapsed onto 404."""
+    try:
+        cm = _pinned_fd(target, base, flags)
+        fd = cm.__enter__()
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        cm.__exit__(None, None, None)
+        raise HTTPException(status_code=404, detail="File not found")
+    if not stat.S_ISREG(st.st_mode):
+        cm.__exit__(None, None, None)
+        raise HTTPException(status_code=404, detail="File not found")
+    return cm, fd, st
+
+
+def _pinned_stream(target: Path, base: Path, *, media_type: str, headers: dict) -> StreamingResponse:
+    """Serve `target` from a pinned descriptor.
+
+    A `FileResponse` takes a path and opens it after the handler returns, which
+    is the one thing the pinning exists to avoid, so the bytes come off the
+    descriptor instead. Content-Length comes from `fstat` on that same
+    descriptor, so it describes the file being sent rather than whatever the name
+    resolves to next.
+    """
+    cm, fd, st = _pinned_regular_file(target, base)
+
+    def _chunks():
+        try:
+            while chunk := os.read(fd, 1 << 16):
+                yield chunk
+        finally:
+            cm.__exit__(None, None, None)
+
+    return StreamingResponse(
+        _chunks(),
+        media_type=media_type,
+        headers={**headers, "Content-Length": str(st.st_size)},
+    )
 
 
 @router.get("/{project_name}/instructions")
@@ -241,13 +387,18 @@ def read_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
         raise HTTPException(status_code=404, detail="File not found")
     if target.is_dir():
         raise HTTPException(status_code=400, detail="Path is a directory")
-    if target.stat().st_size > TEXT_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="File too large to read inline")
+    # Everything past the gate reads through a pinned chain, so the file whose
+    # ownership was just checked is the file that gets opened.
+    cm, fd, st = _pinned_regular_file(target, base)
     try:
-        content = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=415, detail="File is not valid UTF-8 text") from exc
-    st = target.stat()
+        if st.st_size > TEXT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="File too large to read inline")
+        try:
+            content = os.read(fd, TEXT_MAX_BYTES + 1).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=415, detail="File is not valid UTF-8 text") from exc
+    finally:
+        cm.__exit__(None, None, None)
     return {"path": path, "content": content, "size": st.st_size, "modified": st.st_mtime}
 
 
@@ -259,11 +410,27 @@ def write_project_file(project_name: str, path: str, req: _FileWriteRequest, sco
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=400, detail="Path is a directory")
     body = req.content or ""
-    if len(body.encode("utf-8")) > TEXT_MAX_BYTES:
+    encoded = body.encode("utf-8")
+    if len(encoded) > TEXT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content exceeds 2 MiB cap")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(body, encoding="utf-8")
-    st = target.stat()
+    # Pinned like the read: without it a link planted under the caller's own
+    # workspace between the gate and the open lands this write in another
+    # member's directory, and `.anton/anton.md` there is an instruction file
+    # their agent reads.
+    rel = target.relative_to(base.resolve())
+    *dirs, name = rel.parts
+    try:
+        with opened_subdir_nofollow(base, *dirs, create=True) as pinned:
+            fd = dir_open(
+                pinned, name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW, 0o644
+            )
+            try:
+                os.write(fd, encoded)
+                st = os.fstat(fd)
+            finally:
+                os.close(fd)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found")
     return {"path": path, "size": st.st_size, "modified": st.st_mtime}
 
 
@@ -303,7 +470,19 @@ def delete_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
         raise HTTPException(status_code=404, detail="File not found")
     if target.is_dir():
         raise HTTPException(status_code=400, detail="Path is a directory")
-    target.unlink()
+    # Pinned like the read and the write: an unlink that follows a planted
+    # component deletes another member's file.
+    rel = target.relative_to(base.resolve())
+    *dirs, name = rel.parts
+    try:
+        with opened_subdir_nofollow(base, *dirs) as pinned:
+            if stat.S_ISLNK(dir_lstat(pinned, name).st_mode):
+                raise HTTPException(status_code=404, detail="File not found")
+            dir_unlink(pinned, name)
+    except HTTPException:
+        raise
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found")
     return {"status": "deleted", "path": path}
 
 
@@ -334,8 +513,7 @@ def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
         raise HTTPException(status_code=404, detail="File not found")
     if target.suffix.lower() != ".html":
         raise HTTPException(status_code=415, detail="Preview mount is only available for HTML files")
-    parent = target.parent.resolve()
-    token = _register_preview_mount(parent, scoped.scope)
+    token = _register_preview_mount(target, base, scoped.scope)
     return {
         "token": token,
         "entry": target.name,
@@ -362,10 +540,19 @@ def preview_asset(
         target.relative_to(parent)
     except ValueError:
         raise HTTPException(status_code=403, detail="Asset is outside the mounted directory")
-    if not target.is_file():
+    # Containment in the mounted directory is not ownership. A mount taken on an
+    # .html at the project root is parented ABOVE `conversations/`, so every
+    # member's workspace hangs off it and the containment check above passes for
+    # all of them. Same 404 as an unknown token: which it was is information.
+    if not mount.serves(target):
         raise HTTPException(status_code=404, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
+    return _pinned_stream(
+        target,
+        mount.project_base,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=300"},
+    )
 
 
 @router.get("/{project_name}/files-raw/{path:path}")
@@ -376,9 +563,9 @@ def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    return FileResponse(
+    return _pinned_stream(
         target,
+        base,
         media_type=media_type,
-        filename=target.name,
         headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
     )
