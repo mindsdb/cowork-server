@@ -1,8 +1,15 @@
 """Dump every FastAPI route with its method and dependency chain.
 
-Seed script for the ENG-1558 authorization map (auth/docs/endpoint-authorization-map.md):
+Seed script for the ENG-1558 authorization map (auth/docs/endpoint-authorization-map.md),
+run with the same tenancy mode the map is scoped to (org):
 
-    python -m scripts.dump_routes > /tmp/cowork_routes.csv
+    COWORK_TENANCY_MODE=org python -m scripts.dump_routes > /tmp/cowork_routes.csv
+
+`cowork.server.create_app()` runs at import time and branches its route set on
+`COWORK_TENANCY_MODE` (default: `local`). Local mode mounts channel-plugin
+webhook routers (`_install_channels` in `cowork/server.py`) that an org
+deployment never exposes, so running this without `COWORK_TENANCY_MODE=org`
+set dumps a superset of the surface the map's cowork section is scoped to.
 
 Columns (`path, methods, checks`) match auth's, mindshub_inference's, and
 mindshub_services's dump_routes.py. Cowork-server's real gate for org-mode
