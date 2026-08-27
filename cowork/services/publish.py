@@ -409,10 +409,10 @@ def publish_artifact(
     # legacy loose file has no metadata and keeps the service-generated key.
     canonical_artifact_key: str | None = None
     if (published_dir / "metadata.json").is_file():
-        from cowork.services.artifact_identity import artifact_key, ensure_stable_id
+        from cowork.services.artifact_identity import artifact_key, ensure_full_id
 
-        stable_id, _metadata = ensure_stable_id(published_dir)
-        canonical_artifact_key = artifact_key(stable_id)
+        artifact_id, _metadata = ensure_full_id(published_dir)
+        canonical_artifact_key = artifact_key(artifact_id)
 
     # Markdown is rendered to a throwaway index.html that we hand to the
     # publisher; `.html` and fullstack publish their real target directly.

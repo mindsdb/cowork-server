@@ -715,12 +715,12 @@ def card_for_folder(
     meta = _load_metadata(folder)
     if meta is None:
         return None
-    from cowork.services.artifact_identity import artifact_key, ensure_stable_id
+    from cowork.services.artifact_identity import artifact_key, ensure_full_id
 
     try:
-        stable_id, meta = ensure_stable_id(folder, meta)
+        artifact_id, meta = ensure_full_id(folder, meta)
     except (OSError, ValueError):
-        logger.warning("Skipping artifact with invalid stable identity: %s", folder, exc_info=True)
+        logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
         return None
     files = _user_files(folder)
     primary = _pick_primary(folder, files, primary_hint=meta.get("primary"))
@@ -743,8 +743,9 @@ def card_for_folder(
     mtime_seconds = _content_mtime(folder)
 
     card = {
-        "id": meta.get("id") or folder.name,
-        "stableId": stable_id,
+        # The one identity: drafts, published versions, revisions, comments
+        # and the workspace API all key off it.
+        "id": artifact_id,
         "slug": meta.get("slug") or folder.name,
         "title": meta.get("name") or folder.name,
         "description": meta.get("description") or "",
@@ -776,7 +777,7 @@ def card_for_folder(
     # Drafts and every published version share this key. A legacy
     # `.published.json` key is intentionally overridden here so comments do not
     # fork when an artifact is re-published under a different report URL.
-    card["artifactKey"] = artifact_key(stable_id)
+    card["artifactKey"] = artifact_key(artifact_id)
     if primary is not None:
         project_ref = project_id or "local"
         # macOS commonly exposes the same temporary directory through both
@@ -787,7 +788,7 @@ def card_for_folder(
         ).as_posix()
         card["draftUrl"] = (
             f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
-            f"{quote(stable_id)}/{quote(rel, safe='/')}"
+            f"{quote(artifact_id)}/{quote(rel, safe='/')}"
         )
     if _org_mode():
         # Dropped at the single card builder so inline chat cards are covered

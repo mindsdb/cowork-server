@@ -70,15 +70,15 @@ def _sources_for_project_ref(session: ScopedSession, project_ref: str):
     return artifact_sources_for_request(session, project_id, None)
 
 
-def workspace_artifact_for_request(session: ScopedSession, project_ref: str, stable_id: str):
-    """Resolve a stable identity only inside roots authorized for the caller."""
+def workspace_artifact_for_request(session: ScopedSession, project_ref: str, artifact_id: str):
+    """Resolve an artifact identity only inside roots authorized for the caller."""
     from cowork.services.artifact_identity import (
         ArtifactIdentityConflict,
         resolve_artifact_folder,
     )
 
     try:
-        return resolve_artifact_folder(_sources_for_project_ref(session, project_ref), stable_id)
+        return resolve_artifact_folder(_sources_for_project_ref(session, project_ref), artifact_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ArtifactIdentityConflict as exc:

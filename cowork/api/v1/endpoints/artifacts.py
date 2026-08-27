@@ -105,24 +105,24 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
     from cowork.services.artifact_publish_key import PublishKey
     from cowork.services.publish import _resolve_publish_endpoint
 
-    # New clients address deletion by stable id. Keep the slug fallback for
+    # New clients address deletion by artifact id. Keep the slug fallback for
     # older desktop clients, but never use it when the caller supplied a UUID:
     # two conversations in one project can legitimately produce the same slug.
     sources = artifact_sources_for_request(session, project_id, None)
     source = None
     folder = None
     try:
-        stable_ref = str(UUID(slug))
+        id_ref = str(UUID(slug))
     except ValueError:
-        stable_ref = None
-    if stable_ref:
+        id_ref = None
+    if id_ref:
         from cowork.services.artifact_identity import (
             ArtifactIdentityConflict,
             resolve_artifact_folder,
         )
 
         try:
-            source, folder, _metadata = resolve_artifact_folder(sources, stable_ref)
+            source, folder, _metadata = resolve_artifact_folder(sources, id_ref)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except ArtifactIdentityConflict as exc:
@@ -158,11 +158,11 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
             ArtifactAccessUnavailable,
             revoke_draft_review_access,
         )
-        from cowork.services.artifact_identity import ensure_stable_id
+        from cowork.services.artifact_identity import ensure_full_id
 
         try:
-            stable_id, _metadata = await run_in_threadpool(ensure_stable_id, folder)
-            await revoke_draft_review_access(stable_id)
+            artifact_id, _metadata = await run_in_threadpool(ensure_full_id, folder)
+            await revoke_draft_review_access(artifact_id)
         except ArtifactAccessUnavailable as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

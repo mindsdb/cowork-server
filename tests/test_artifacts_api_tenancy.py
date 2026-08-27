@@ -25,7 +25,7 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts as ep
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.services import artifacts as ep_artifacts
-from cowork.services.artifact_identity import ensure_stable_id
+from cowork.services.artifact_identity import ensure_full_id
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
@@ -195,19 +195,23 @@ async def test_card_omits_owner_side_access_fields_in_org_mode(session, tmp_path
     assert "accessEmails" not in card
 
 
-async def test_card_has_one_stable_identity_for_draft_and_comments(session, tmp_path, org_mode):
+async def test_card_has_one_identity_for_draft_and_comments(session, tmp_path, org_mode):
     row, folder = _project_with_artifact(
         session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
     )
 
     card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    artifact_id = card["id"]
 
-    assert str(UUID(card["stableId"])) == card["stableId"]
-    assert card["artifactKey"] == f"artifact/{card['stableId']}"
+    assert UUID(artifact_id).hex == artifact_id
+    assert "stableId" not in card
+    assert card["artifactKey"] == f"artifact/{UUID(artifact_id)}"
     assert card["draftUrl"].startswith(
-        f"/api/v1/artifacts/drafts/{row.id}/{card['stableId']}/"
+        f"/api/v1/artifacts/drafts/{row.id}/{artifact_id}/"
     )
-    assert json.loads((folder / "metadata.json").read_text())["stableId"] == card["stableId"]
+    persisted = json.loads((folder / "metadata.json").read_text())
+    assert persisted["id"] == artifact_id
+    assert "stableId" not in persisted
 
 
 async def test_org_source_read_and_manual_edit_are_project_scoped(
@@ -219,11 +223,11 @@ async def test_org_source_read_and_manual_edit_are_project_scoped(
     card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
 
     source = await workspace_ep.artifact_source(
-        str(row.id), card["stableId"], _scoped(session, ORG_A), path="index.html"
+        str(row.id), card["id"], _scoped(session, ORG_A), path="index.html"
     )
     saved = await workspace_ep.update_artifact_source(
         str(row.id),
-        card["stableId"],
+        card["id"],
         workspace_ep._SourceUpdateBody(
             content="<html><h1>Edited</h1></html>",
             expectedRevisionId=source["revision"]["id"],
@@ -248,7 +252,7 @@ async def test_org_source_read_cannot_cross_org(session, tmp_path, org_mode):
     with Session(session.get_bind()) as foreign_session:
         with pytest.raises(HTTPException) as err:
             await workspace_ep.artifact_source(
-                str(row.id), card["stableId"], _scoped(foreign_session, ORG_A), path="index.html"
+                str(row.id), card["id"], _scoped(foreign_session, ORG_A), path="index.html"
             )
 
         assert err.value.status_code == 404
@@ -269,13 +273,13 @@ async def test_same_org_reviewer_can_preview_but_cannot_edit_source(
         assert card["capabilities"]["canEdit"] is False
 
         draft = await workspace_ep.serve_private_draft(
-            str(row.id), card["stableId"], "index.html", MagicMock(query_params={}), reviewer
+            str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
         )
         assert draft.status_code == 200
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.artifact_source(
-                str(row.id), card["stableId"], reviewer, path="index.html"
+                str(row.id), card["id"], reviewer, path="index.html"
             )
         assert err.value.status_code == 403
 
@@ -298,13 +302,13 @@ async def test_same_org_reviewer_receives_the_current_revision_for_comments(
     with Session(session.get_bind()) as reviewer_session:
         result = await workspace_ep.enable_artifact_comments(
             str(row.id),
-            card["stableId"],
+            card["id"],
             _scoped(reviewer_session, ORG_A, user_id="u-2"),
         )
 
     assert result["capabilities"]["role"] == "reviewer"
     assert result["capabilities"]["canEdit"] is False
-    assert result["currentRevision"]["artifactId"] == card["stableId"]
+    assert result["currentRevision"]["artifactId"] == card["id"]
     assert result["currentRevision"]["path"] == "index.html"
 
 
@@ -328,13 +332,13 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
         asset = await workspace_ep.serve_private_draft(
-            str(row.id), card["stableId"], "static/app.js", MagicMock(query_params={}), reviewer
+            str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer
         )
         assert asset.status_code == 200
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
-                str(row.id), card["stableId"], "backend.py", MagicMock(query_params={}), reviewer
+                str(row.id), card["id"], "backend.py", MagicMock(query_params={}), reviewer
             )
         assert err.value.status_code == 404
 
@@ -357,7 +361,7 @@ async def test_fullstack_draft_preview_refuses_a_root_level_primary(
         reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
-                str(row.id), card["stableId"], "index.html", MagicMock(query_params={}), reviewer
+                str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
             )
         assert err.value.status_code == 404
 
@@ -372,7 +376,7 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     assert not folder.exists()
 
 
-async def test_delete_by_stable_id_selects_the_exact_duplicate_slug(
+async def test_delete_by_artifact_id_selects_the_exact_duplicate_slug(
     session, tmp_path, org_mode, publish_key
 ):
     row, first_folder = _project_with_artifact(
@@ -410,10 +414,10 @@ async def test_delete_by_stable_id_selects_the_exact_duplicate_slug(
             "type": "html-app",
         })
     )
-    second_stable_id, _metadata = ensure_stable_id(second_folder)
+    second_artifact_id, _metadata = ensure_full_id(second_folder)
 
     await ep.delete_artifact_for_request(
-        _scoped(session, ORG_A), second_stable_id, project_id=row.id
+        _scoped(session, ORG_A), second_artifact_id, project_id=row.id
     )
 
     assert first_folder.exists()
@@ -426,11 +430,11 @@ async def test_reviewer_cannot_delete_an_owners_artifact(
     row, folder = _project_with_artifact(
         session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
     )
-    stable_id, _metadata = ensure_stable_id(folder)
+    artifact_id, _metadata = ensure_full_id(folder)
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A, user_id="u-2"), stable_id, project_id=row.id
+            _scoped(session, ORG_A, user_id="u-2"), artifact_id, project_id=row.id
         )
 
     assert err.value.status_code == 403

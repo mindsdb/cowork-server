@@ -12,7 +12,11 @@ from uuid import uuid4
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from cowork.services.artifact_identity import ArtifactIdentityConflict, resolve_artifact_folder
+from cowork.services.artifact_identity import (
+    ArtifactIdentityConflict,
+    artifact_key,
+    resolve_artifact_folder,
+)
 from cowork.services.artifact_lock import artifact_lock
 from cowork.services.artifact_roots import artifacts_sources_for_scan
 
@@ -31,9 +35,9 @@ def _now() -> str:
 class LocalArtifactComments:
     """Small atomic journal with the same response shape as inference comments."""
 
-    def __init__(self, stable_id: str) -> None:
+    def __init__(self, artifact_id: str) -> None:
         try:
-            _, folder, _ = resolve_artifact_folder(artifacts_sources_for_scan(), stable_id)
+            _, folder, _ = resolve_artifact_folder(artifacts_sources_for_scan(), artifact_id)
         except ArtifactIdentityConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (FileNotFoundError, ValueError) as exc:
@@ -42,7 +46,9 @@ class LocalArtifactComments:
         revisions_dir.mkdir(parents=True, exist_ok=True)
         self.path = revisions_dir / "comments.json"
         self.folder = Path(folder)
-        self.artifact_id = f"artifact/{stable_id}"
+        # Threads carry the same `artifact/<uuid>` key the cloud comments service
+        # uses, so a desktop journal stays readable if it ever moves to the cloud.
+        self.artifact_key = artifact_key(artifact_id)
 
     def _read(self) -> list[dict]:
         try:
@@ -112,7 +118,7 @@ class LocalArtifactComments:
         now = _now()
         thread = {
             "id": str(uuid4()),
-            "artifact_id": self.artifact_id,
+            "artifact_id": self.artifact_key,
             "selector": selector,
             "status": "open",
             "version": 1,
@@ -215,8 +221,8 @@ class LocalArtifactComments:
         return self._mutate(mutation)
 
 
-async def handle_local_comments(request: Request, stable_id: str, subpath: str):
-    service = LocalArtifactComments(stable_id)
+async def handle_local_comments(request: Request, artifact_id: str, subpath: str):
+    service = LocalArtifactComments(artifact_id)
     parts = [part for part in subpath.split("/") if part]
     method = request.method.upper()
     try:
@@ -248,8 +254,8 @@ async def handle_local_comments(request: Request, stable_id: str, subpath: str):
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown comment operation")
 
 
-def local_comments_stream(stable_id: str) -> StreamingResponse:
-    service = LocalArtifactComments(stable_id)
+def local_comments_stream(artifact_id: str) -> StreamingResponse:
+    service = LocalArtifactComments(artifact_id)
 
     async def events():
         previous = {

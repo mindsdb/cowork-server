@@ -77,11 +77,13 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
-# Stacked feature dependency: cowork-server passes the stable artifact key added
-# by this Anton commit. Keep this exact until both branches land on staging;
-# otherwise a fresh install resolves an older publisher with an incompatible
-# call signature.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "f4504ac1d4bcdca678f00f5ab389761a652246e1" }
+# Stacked feature dependency: cowork-server imports the artifact-identity
+# derivation (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`)
+# from this Anton commit, and persists what Anton only derives in memory — the
+# two must agree on the value or one artifact ends up with two identities. Keep
+# this exact until both branches land on staging; an older Anton has no such
+# symbols, so every artifact endpoint would fail to import.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "acbb74a93bf14afce73b664a056a068ed2a96370" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
