@@ -122,7 +122,14 @@ jobs:
             fi
             sleep 2
           done
-          echo "::warning::port-forwards did not come up; the cross-replica test will skip."
+          # Fail rather than warn. A warning still exits 0, so the job stays
+          # green and the cross-replica test silently skips, which reads exactly
+          # like "the cross-replica behaviour is fine". Something refusing this
+          # connection is the interesting case, not a reason to say nothing: a
+          # NetworkPolicy on these pods would land here first.
+          echo "::error::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
+          echo "::error::The cross-replica test cannot run. If a NetworkPolicy was just enabled on cowork-server, this is that."
+          exit 1
 
       - name: Run integration tests
         env:
