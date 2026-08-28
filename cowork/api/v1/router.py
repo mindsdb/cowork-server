@@ -20,6 +20,7 @@ from cowork.api.v1.endpoints import (
     projects,
     publish,
     responses,
+    runtime_credential,
     schedules,
     search,
     settings,
@@ -78,6 +79,9 @@ api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifact
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
+api_router.include_router(
+    runtime_credential.router, prefix="/runtime-credential", tags=["runtime-credential"]
+)
 api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 
