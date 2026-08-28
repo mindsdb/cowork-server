@@ -83,8 +83,24 @@ def _sources_for_project_ref(
 def _resolve_in(sources, artifact_id: str):
     from cowork.services.artifact_identity import (
         ArtifactIdentityConflict,
+        canonical_artifact_id,
         resolve_artifact_folder,
     )
+
+    # Normalized here, at the edge of the service layer, and not only inside
+    # `resolve_artifact_folder`: everything downstream — the identity index, the
+    # revision journal, the draft preview — takes this value, and every caller
+    # of this module should be able to see that the string was rejected unless
+    # it parses as a UUID. Callers over HTTP are already gated by the route's
+    # `UUID` path type; the desktop delete path reaches here with its own
+    # `UUID(slug)` check, and a future caller gets the same guarantee for free.
+    try:
+        artifact_id = canonical_artifact_id(artifact_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact identity",
+        ) from exc
 
     try:
         return resolve_artifact_folder(sources, artifact_id)
