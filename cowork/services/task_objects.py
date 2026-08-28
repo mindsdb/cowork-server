@@ -26,8 +26,9 @@ def _artifacts_base(project: Project) -> Path:
 
 def _artifact_owner(folder: Path) -> str | None:
     """The conversation id that first created this artifact, read from its
-    metadata `provenance` (written by the shared ArtifactStore for every
-    harness). The creating conversation is the first provenance entry."""
+    metadata `provenance`. Derivation lives in `services.artifacts` — the same
+    value ships to the client as the card's `originConversationId`, so the two
+    must never disagree about which conversation owns an artifact."""
     meta = folder / "metadata.json"
     if not meta.is_file():
         return None
@@ -35,14 +36,9 @@ def _artifact_owner(folder: Path) -> str | None:
         data = json.loads(meta.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    provenance = data.get("provenance") or []
-    if not isinstance(provenance, list) or not provenance:
-        return None
-    first = provenance[0]
-    if isinstance(first, dict):
-        owner = first.get("conversation")
-        return str(owner) if owner else None
-    return None
+    from cowork.services.artifacts import origin_conversation_id
+
+    return origin_conversation_id(data) or None
 
 
 class TaskObjectService:
