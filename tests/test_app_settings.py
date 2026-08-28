@@ -145,11 +145,14 @@ def test_hermes_available_in_local_mode(monkeypatch):
 
 
 def test_app_settings_identity_enforce_defaults_to_enforce(monkeypatch):
+    """A deployment that loses the env var must not quietly start letting
+    identity-less requests through, so the closed value is the default and
+    audit has to be asked for."""
     monkeypatch.delenv("COWORK_IDENTITY_ENFORCE", raising=False)
 
     settings = AppSettings(_env_file=None)
 
-    assert settings.identity_enforce == "audit"
+    assert settings.identity_enforce == "enforce"
 
 
 def test_app_settings_identity_enforce_can_opt_into_audit(monkeypatch):

@@ -102,7 +102,16 @@ jobs:
               | grep '^cowork-server-' || true
           )
           if [[ "${#pods[@]}" -lt 2 ]]; then
-            echo "Only ${#pods[@]} cowork-server pod(s) in $ns; the cross-replica test will skip."
+            # Not the same thing, and the messages should not read the same.
+            # Zero means this runner cannot see that namespace's pods at all:
+            # the job is pinned to mdb-dev, so on the prod release path it lists
+            # nothing and has never exercised the cross-replica behaviour.
+            if [[ "${#pods[@]}" -eq 0 ]]; then
+              echo "::warning::No cowork-server pods visible in $ns from this runner." \
+                   "The cross-replica test did NOT run. A green job here says nothing about it."
+            else
+              echo "::warning::Only 1 cowork-server pod in $ns; the cross-replica test did NOT run."
+            fi
             exit 0
           fi
           # 9010 is the port uvicorn binds (see the chart's args). Reached
@@ -122,7 +131,25 @@ jobs:
             fi
             sleep 2
           done
-          echo "::warning::port-forwards did not come up; the cross-replica test will skip."
+          # Say what did not happen, and do not fail on it yet.
+          #
+          # Failing here is the right end state: a warning exits 0, so the job
+          # stays green while the cross-replica test silently skips, which reads
+          # exactly like "the cross-replica behaviour is fine". But this step is
+          # ALREADY failing on every push to staging, and has been for as long
+          # as the annotations go back, because the runner ServiceAccount has no
+          # `create pods/portforward` in that namespace. Turning it into `exit 1`
+          # before that RBAC lands makes every staging release red and alerts
+          # on-call per push, for a cause that has nothing to do with whatever
+          # change is being shipped.
+          #
+          # So: grant the runner `pods/portforward` in
+          # Kubernetes-Foundational-Services, confirm this step goes green on a
+          # staging push, and then make this an error.
+          echo "::warning::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
+          echo "::warning::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first;" \
+               "this step cannot pass without it."
+          exit 0
 
       - name: Run integration tests
         env:

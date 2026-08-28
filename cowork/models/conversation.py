@@ -36,6 +36,9 @@ class Conversation(BaseSQLModel, table=True):
     model: str | None = Field(
         default=None, description="Model alias the task's harness was launched with"
     )
+    reasoning_effort: str | None = Field(
+        default=None, description="Reasoning effort the task's harness was launched with"
+    )
 
     project: "Project" = Relationship()
     messages: list["Message"] = Relationship()

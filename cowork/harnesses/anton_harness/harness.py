@@ -406,6 +406,10 @@ class AntonHarness:
         # Per-conversation model pick (the composer's dropdown) — overrides
         # planning/coding/router for this call only; see _build_chat_session.
         model: str | None = None,
+        # Per-task reasoning-effort pick (the composer's Effort sub-picker) —
+        # overrides planning/coding effort for this call only; see
+        # _build_chat_session and providers.build_llm_client's effort_override.
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Observability pass-through (see ResponsesRequest / HarnessProvider):
         # forwarded to Anton's per-turn TraceContext so they land on the
@@ -436,10 +440,14 @@ class AntonHarness:
                 "in-process execution is disabled."
             )
         temp_vault_dir: Path | None = None
-        # Attribute + surface any artifact created during this turn. Anton runs
-        # with its own session id and doesn't tag artifacts with the cowork
-        # conversation_id, so we diff the project's artifacts dir around the run
-        # (see services.task_objects.finalize_turn_artifacts).
+        # Attribute + surface any artifact this turn created or edited. Anton's
+        # artifact tools record what they touch as they run
+        # (ChatSession.artifacts_touched), and that set — not a bare diff of the
+        # artifacts dir — is what bounds the turn's cards: every conversation in
+        # a project shares one artifacts directory, so a concurrent sibling
+        # turn's brand-new artifact would otherwise land in this turn's diff and
+        # be carded onto the wrong conversation (ENG-1933). The dir snapshot is
+        # still taken, to tell CREATED from EDITED within that set.
         from cowork.services.task_objects import (
             finalize_turn_skill_drafts,
             index_turn_artifacts,
@@ -479,6 +487,7 @@ class AntonHarness:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
@@ -541,6 +550,15 @@ class AntonHarness:
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 conversation, conv_id, conv_project_id, artifacts_base,
                 before_slugs, before_mtimes,
+                # Anton reports both: `create_artifact` and `open_artifact`
+                # (the only way to get a path to write into) both record, so
+                # the same set bounds created AND edited. Read defensively —
+                # on an early failure `session` is None, and an anton build
+                # predating the field has no `artifacts_touched`; both degrade
+                # to the pre-existing diff-only behaviour rather than dropping
+                # the turn's cards entirely.
+                tracked_new=getattr(session, "artifacts_touched", None),
+                tracked_edits=getattr(session, "artifacts_touched", None),
             )
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,
@@ -581,10 +599,25 @@ class AntonHarness:
         output — most visible on short turns like "hi"/"who are you?" with
         little else to anchor generation.
 
+        Also scrubs plain-text content before replay: anton only scrubs a
+        user turn's OWN input as it arrives, not history read back from
+        storage, so a credential typed in an earlier turn would otherwise
+        reappear unmasked here on every later turn (ENG-1849). Vault
+        secrets for the whole conversation are already registered by the
+        time this runs (`restore_namespaced_env` above, in
+        `_build_chat_session`), so this catches anything vaulted since the
+        message was first persisted, not just what was known at persist
+        time. List-shaped content (tool_use/tool_result blocks) is left
+        alone — that's already scrubbed at generation time.
+
         Extracted (not an inline closure) so this can be unit-tested
         directly against fake messages, same reasoning as _seed_history.
         """
+        from anton.utils.datasources import scrub_credentials
+
         om = m.to_openai_message().model_dump()
+        if isinstance(om.get("content"), str) and om["content"]:
+            om["content"] = scrub_credentials(om["content"])
         ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
@@ -616,7 +649,9 @@ class AntonHarness:
 
         tail = [stamp(m) for m in ordered_messages[tail_start:]]
         if history_summary:
-            summary_msg = {"role": "user", "content": history_summary}
+            from anton.utils.datasources import scrub_credentials
+
+            summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
                 # Same fix anton's own _summarize_history applies: two
                 # consecutive user messages break/degrade most providers.
@@ -698,6 +733,7 @@ class AntonHarness:
         self,
         conversation: Conversation,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
     ):
@@ -816,7 +852,7 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client()
+        llm_client = self._build_llm_client(effort=reasoning_effort)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -1086,6 +1122,6 @@ class AntonHarness:
         return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(effort: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
+        return build_llm_client(effort_override=effort)
