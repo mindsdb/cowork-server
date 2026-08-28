@@ -129,7 +129,7 @@ BG_CYCLE = [
 # backend's runtime log (`backend.log`) is excluded from the published
 # bundle there, so it must not count toward content mtime here either,
 # or it would constantly trip the gate and force a false badge.
-_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json"}
+_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json", ".revisions"}
 
 TEXT_EXTENSIONS = {
     ".html", ".md", ".txt", ".csv", ".json", ".py", ".js",
@@ -243,6 +243,25 @@ def _load_metadata(folder: Path) -> dict | None:
         return None
 
 
+def origin_conversation_id(meta: dict | None) -> str:
+    """The conversation that first created this artifact, from its metadata
+    `provenance` (written by the shared ArtifactStore for every harness) — the
+    creating conversation is the first entry. Empty when unknown: artifacts
+    predate provenance, and a folder can be edited by later conversations
+    without the first entry ever changing.
+
+    Takes the already-parsed metadata so the card builder does not read
+    `metadata.json` a second time; `task_objects` passes what it loaded.
+    """
+    provenance = (meta or {}).get("provenance") or []
+    if not isinstance(provenance, list) or not provenance:
+        return ""
+    first = provenance[0]
+    if not isinstance(first, dict):
+        return ""
+    return str(first.get("conversation") or "")
+
+
 def _user_files(folder: Path) -> list[Path]:
     """All non-housekeeping files inside an artifact folder, sorted by mtime desc."""
     out: list[Path] = []
@@ -317,6 +336,19 @@ def _content_mtime(folder: Path) -> int:
 # the gate, the `modified` badge, and the card's cache-bust token can never
 # disagree.
 content_mtime = _content_mtime
+
+
+def content_mtime_ns(folder: Path) -> int:
+    """Nanosecond content clock for efficient before/after turn snapshots.
+
+    This uses the same user-file set as :func:`content_mtime` but preserves the
+    filesystem's full timestamp precision, avoiding whole-file hashing merely
+    to notice two edits that landed in the same second.
+    """
+    try:
+        return max((p.stat().st_mtime_ns for p in _user_files(folder)), default=0)
+    except OSError:
+        return 0
 
 
 def load_published_map(folder: Path) -> dict:
@@ -702,6 +734,13 @@ def card_for_folder(
     meta = _load_metadata(folder)
     if meta is None:
         return None
+    from cowork.services.artifact_identity import artifact_key, ensure_full_id
+
+    try:
+        artifact_id, meta = ensure_full_id(folder, meta)
+    except (OSError, ValueError):
+        logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
+        return None
     files = _user_files(folder)
     primary = _pick_primary(folder, files, primary_hint=meta.get("primary"))
     primary_path = str(primary) if primary is not None else str(folder)
@@ -723,7 +762,9 @@ def card_for_folder(
     mtime_seconds = _content_mtime(folder)
 
     card = {
-        "id": meta.get("id") or folder.name,
+        # The one identity: drafts, published versions, revisions, comments
+        # and the workspace API all key off it.
+        "id": artifact_id,
         "slug": meta.get("slug") or folder.name,
         "title": meta.get("name") or folder.name,
         "description": meta.get("description") or "",
@@ -745,6 +786,13 @@ def card_for_folder(
         "primary": meta.get("primary") or None,
         "projectId": project_id,
         "projectName": project_name,
+        # The conversation that produced the artifact, so a comment addressed
+        # with the agent from the artifacts list resumes that chat instead of
+        # opening a fresh one. Empty for artifacts written before provenance —
+        # the client then falls back to a new conversation. Whether the chat is
+        # still reachable is the client's call: it already knows its own
+        # conversations and can fetch the rest.
+        "originConversationId": origin_conversation_id(meta),
         "publishedUrl": _published_url_for(folder, primary),
         "modified": _is_modified(folder, primary, mtime_seconds),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
@@ -752,6 +800,31 @@ def card_for_folder(
         **_published_access_for(folder, primary),
         "serveUrl": serve_url_for(primary_path),
     }
+    # Drafts and every published version share this key. A legacy
+    # `.published.json` key is intentionally overridden here so comments do not
+    # fork when an artifact is re-published under a different report URL.
+    card["artifactKey"] = artifact_key(artifact_id)
+    if primary is not None:
+        project_ref = project_id or "local"
+        # macOS commonly exposes the same temporary directory through both
+        # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
+        # the URL path so an absolute primary hint cannot fail on that alias.
+        # A primary that resolves outside its own folder has no draft URL, and
+        # one odd artifact must not take the whole list down with a ValueError:
+        # this builder runs per card, and `GET /artifacts/` would 500 instead of
+        # dropping the single card. `_user_files` and `_pick_primary` both keep
+        # the primary inside, so reaching the warning means one of them changed.
+        try:
+            rel = primary.resolve(strict=False).relative_to(
+                folder.resolve(strict=False)
+            ).as_posix()
+        except ValueError:
+            logger.warning("Artifact primary resolves outside its folder: %s", folder)
+        else:
+            card["draftUrl"] = (
+                f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
+                f"{quote(artifact_id)}/{quote(rel, safe='/')}"
+            )
     if _org_mode():
         # Dropped at the single card builder so inline chat cards are covered
         # too: they call this function as well, and a filter applied only at the

@@ -77,7 +77,9 @@ def _conversation_id(child: Path) -> UUID | None:
         return None
 
 
-def _project_artifact_bases(project_path: str, session: ScopedSession) -> list[Path]:
+def _project_artifact_bases(
+    project_path: str, session: ScopedSession, *, include_other_members: bool = False
+) -> list[Path]:
     """Every artifacts root of one project the caller is allowed to read.
 
     One on the desktop. In org mode, one per conversation that has actually
@@ -97,6 +99,14 @@ def _project_artifact_bases(project_path: str, session: ScopedSession) -> list[P
     on project files (`_conversation_workspace_ok`) treats such a name as a
     shared file instead, because it guards a tree where shared files really do
     sit beside the workspaces. Nothing shares this one.
+
+    `include_other_members` drops that filter and is NOT an access decision: it
+    only widens the search so a co-member's artifact can be found by id, and
+    every caller must then check the owner's per-artifact grant
+    (`artifact_draft_review.draft_review_allows`). It exists because a review
+    route receives an artifact id and no conversation id, so there is nothing
+    else to look the folder up by. Never reachable from the artifacts list or
+    from any mutation.
     """
     if not _org_mode():
         return [_artifacts_base(project_path)]
@@ -106,7 +116,7 @@ def _project_artifact_bases(project_path: str, session: ScopedSession) -> list[P
     except OSError:
         return []
     children = [child for child in children if child.is_dir()]
-    if session.scope.org_mode:
+    if session.scope.org_mode and not include_other_members:
         from cowork.services.conversations import ConversationService
 
         candidates = {child: _conversation_id(child) for child in children}
@@ -117,7 +127,9 @@ def _project_artifact_bases(project_path: str, session: ScopedSession) -> list[P
     return [child.joinpath(*_ARTIFACTS_SUBPATH) for child in children]
 
 
-def _sources_for(session: ScopedSession, project) -> list[ProjectArtifacts]:
+def _sources_for(
+    session: ScopedSession, project, *, include_other_members: bool = False
+) -> list[ProjectArtifacts]:
     """One `ProjectArtifacts` per root. They all carry the SAME project identity:
     a conversation is where the bytes happen to live, not a thing the client
     addresses artifacts by, so cards stay project-addressed in both modes."""
@@ -127,7 +139,9 @@ def _sources_for(session: ScopedSession, project) -> list[ProjectArtifacts]:
             project_id=str(project.id),
             project_name=project.name,
         )
-        for base in _project_artifact_bases(project.path, session)
+        for base in _project_artifact_bases(
+            project.path, session, include_other_members=include_other_members
+        )
     ]
 
 
@@ -151,7 +165,9 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
     ]
 
 
-def artifacts_sources_for_project(session: ScopedSession, project_id: UUID) -> list[ProjectArtifacts]:
+def artifacts_sources_for_project(
+    session: ScopedSession, project_id: UUID, *, include_other_members: bool = False
+) -> list[ProjectArtifacts]:
     """The caller's own project by id. Raises ValueError for anything else —
     including another organization's project, which the scoped read does not
     return at all.
@@ -164,10 +180,17 @@ def artifacts_sources_for_project(session: ScopedSession, project_id: UUID) -> l
     resolves fine on desktop too. That is deliberate — without it the desktop
     branch would have to ignore `project_id`, and a slug-addressed delete would
     then act on whichever project happened to sort first.
+
+    `include_other_members` is passed through for review-only resolution; see
+    `_project_artifact_bases`. It widens the search, never the permission.
     """
     from cowork.services.projects import ProjectService
 
-    return _sources_for(session, ProjectService(session).get_project(project_id))
+    return _sources_for(
+        session,
+        ProjectService(session).get_project(project_id),
+        include_other_members=include_other_members,
+    )
 
 
 def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
