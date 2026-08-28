@@ -76,12 +76,31 @@ async def test_get_connection_propagates_auths_404(monkeypatch):
     assert exc_info.value.status_code == 404
 
 
-def test_delete_connection_is_an_honest_501_in_org_mode():
-    """Not a fake 204 — auth has no revoke endpoint yet, so the connection
-    and its live token stay fully active server-side either way."""
+@pytest.mark.asyncio
+async def test_delete_connection_proxies_to_auth(monkeypatch):
+    calls = []
+
+    async def fake_proxy_delete(engine, name, request, settings):
+        calls.append((engine, name))
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_delete", fake_proxy_delete)
+
+    result = await connections_endpoints.delete_connection("google_drive", "work", ORG_SCOPE, FakeRequest())
+
+    assert result is None
+    assert calls == [("google_drive", "work")]
+
+
+@pytest.mark.asyncio
+async def test_delete_connection_propagates_auths_404(monkeypatch):
+    async def fake_proxy_delete(engine, name, request, settings):
+        raise HTTPException(status_code=404, detail="No google_drive connection named 'ghost' for this user.")
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_delete", fake_proxy_delete)
+
     with pytest.raises(HTTPException) as exc_info:
-        connections_endpoints.delete_connection("google_drive", "work", ORG_SCOPE)
-    assert exc_info.value.status_code == 501
+        await connections_endpoints.delete_connection("google_drive", "ghost", ORG_SCOPE, FakeRequest())
+    assert exc_info.value.status_code == 404
 
 
 def test_patch_connection_token_is_a_501_in_org_mode():

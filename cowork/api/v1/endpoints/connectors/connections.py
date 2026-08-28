@@ -4,6 +4,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -98,20 +99,17 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
 
 
 @router.delete("/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_connection(engine: str, name: str, scope: ScopeDep):
+async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Request):
     if scope.org_mode:
-        # auth has no revoke/disconnect endpoint yet (only start/token/
-        # catalogue/status/picked-files) — a fake 204 here would tell the
-        # user they disconnected while the connection and its live token
-        # stay fully active server-side. An honest error until that
-        # endpoint exists, rather than a silent no-op against the local
-        # vault (which 404s today since org mode never wrote there).
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="Disconnecting a connector isn't available yet in this deployment.",
-        )
+        # No local vault to delete from in org mode — same forwarded-
+        # credential proxy as the other OAuth Connector Lifecycle endpoints.
+        await auth_proxy.proxy_delete(engine, name, request, OAuthSettings())
+        return
     try:
-        oauth_service.revoke(engine, name, ConnectorSettings(), OAuthSettings(), scope=scope)
+        # revoke() makes a blocking provider HTTP call (up to its own 10s
+        # timeout) - off the event loop, since this handler is now async for
+        # the org-mode branch above and FastAPI no longer threadpools it.
+        await run_in_threadpool(oauth_service.revoke, engine, name, ConnectorSettings(), OAuthSettings(), scope=scope)
     except Exception:
         _log.exception("Failed to revoke token for %s/%s", engine, name)
     if not ConnectionsService(scope).delete(engine, name):
