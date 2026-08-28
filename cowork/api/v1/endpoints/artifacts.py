@@ -65,6 +65,9 @@ def artifacts_for_request(
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
     sources = artifact_sources_for_request(session, project_id, project_path)
+    # Roots come from the scoped project read; the listing walks them and never
+    # joins a client string onto a path.
+    # deepcode ignore PT: project_id/project_path only select among server-discovered roots; folders come from walking them
     cards = _list_artifacts(sources)
     from cowork.services.artifact_permissions import artifact_capabilities
 
@@ -128,6 +131,9 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
         # below is what refuses, the resolver only decides visibility.
         from cowork.api.v1.artifact_scope import review_artifact_for_request
 
+        # `id_ref` already passed `UUID(slug)` above, and the folder is resolved
+        # from the identity index rather than assembled from the request.
+        # deepcode ignore PT: id_ref parsed as UUID before this call; the folder is chosen from a server-walked index, never composed from input
         source, folder, _metadata, _is_own = review_artifact_for_request(
             session, str(project_id), id_ref
         )

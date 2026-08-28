@@ -107,6 +107,9 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
     draft, and "not found" would read as deleted. Anything without a grant is
     still invisible — `review_artifact_for_request` raises 404 there.
     """
+    # No path is built from the request: the folder comes from an identity index
+    # walked under an authorized root, re-checked with resolve().relative_to().
+    # deepcode ignore PT: artifact_id is a UUID path param; the folder is chosen from a server-walked index, never composed from input
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
@@ -201,6 +204,9 @@ async def artifact_review_entry(
     """
     from cowork.services.artifact_identity import artifact_key
 
+    # Same resolution as every other route here: index lookup under an
+    # authorized root, not a path assembled from the request.
+    # deepcode ignore PT: artifact_id is a UUID path param; the folder is chosen from a server-walked index, never composed from input
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
@@ -447,6 +453,9 @@ async def serve_private_draft(
     `review_artifact_for_request`: a co-member's draft is reachable here solely
     because its owner granted same-org review on that one artifact.
     """
+    # The artifact folder is resolved by identity, not by any path the caller
+    # sent; `rel_path` below is what is contained, and it is checked there.
+    # deepcode ignore PT: artifact_id is a UUID path param; the folder is chosen from a server-walked index, never composed from input
     _source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
@@ -499,6 +508,9 @@ async def serve_private_draft(
             resp.headers["Cache-Control"] = "private, no-store"
             resp.headers["X-Content-Type-Options"] = "nosniff"
             return resp
+    # `target` is resolved and proven inside the artifact folder above, and for a
+    # fullstack artifact inside its public subtree; housekeeping names are refused.
+    # deepcode ignore PT: target passed resolve() plus relative_to() containment against the artifact folder before this point
     return FileResponse(
         target,
         media_type=media_type,
