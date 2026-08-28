@@ -15,7 +15,10 @@ from cowork.api.v1.artifact_preview import (
     html_with_comment_layer,
     wants_comment_layer,
 )
-from cowork.api.v1.artifact_scope import workspace_artifact_for_request
+from cowork.api.v1.artifact_scope import (
+    review_artifact_for_request,
+    workspace_artifact_for_request,
+)
 from cowork.db.scoped import ScopedSessionDep
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -75,8 +78,16 @@ class _RepairDecisionBody(BaseModel):
 
 
 def _owner_workspace(session, project_ref: str, artifact_id: str):
-    """Resolve one scoped artifact and enforce its source-mutation boundary."""
-    source, folder, metadata = workspace_artifact_for_request(session, project_ref, artifact_id)
+    """Resolve one scoped artifact and enforce its source-mutation boundary.
+
+    Resolution goes through the review path so a reviewer the owner granted
+    access to is refused with 403 rather than 404: they are looking at the
+    draft, and "not found" would read as deleted. Anything without a grant is
+    still invisible — `review_artifact_for_request` raises 404 there.
+    """
+    source, folder, metadata, _is_own = review_artifact_for_request(
+        session, project_ref, artifact_id
+    )
     capabilities = require_artifact_owner(session, source)
     return source, folder, metadata, capabilities
 
@@ -152,20 +163,59 @@ async def artifact_revisions(
     return {"revisions": await run_in_threadpool(list_revisions, folder, rel_path=path)}
 
 
+@router.get("/workspace/{project_ref}/{artifact_id}/review")
+async def artifact_review_entry(
+    project_ref: str,
+    artifact_id: str,
+    session: ScopedSessionDep,
+):
+    """What a reviewer needs to comment, and nothing that reveals the source.
+
+    Separate from the `comments-access` POST below because that one mints an
+    auth rule: provisioning is the owner's decision, so a reviewer opening the
+    artifact must not be what performs it. A reviewer lands here instead and
+    gets the revision to anchor comments to; the source itself stays behind
+    `require_artifact_owner`.
+    """
+    from cowork.services.artifact_identity import artifact_key
+
+    source, folder, metadata, _is_own = review_artifact_for_request(
+        session, project_ref, artifact_id
+    )
+    capabilities = artifact_capabilities(session, source)
+    current_revision = None
+    try:
+        draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
+        current_revision = draft.get("revision")
+    except (FileNotFoundError, OSError, ValueError, TimeoutError):
+        # Binary/oversized artifacts still support general review comments.
+        pass
+    return {
+        "artifactKey": artifact_key(artifact_id),
+        "capabilities": capabilities,
+        "currentRevision": current_revision,
+    }
+
+
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
 async def enable_artifact_comments(
     project_ref: str,
     artifact_id: str,
     session: ScopedSessionDep,
 ):
-    """Provision same-org draft review without broadening source-edit access."""
+    """Provision same-org draft review without broadening source-edit access.
+
+    Owner-only: this mints an auth rule and reopens a private conversation
+    workspace to the organization, which is the owner's call to make. A
+    reviewer's client calls the `review` GET above instead.
+    """
     from cowork.services.artifact_access import (
         ArtifactAccessUnavailable,
         provision_draft_review_access,
     )
+    from cowork.services.artifact_draft_review import enable_draft_review
 
-    source, folder, metadata = workspace_artifact_for_request(session, project_ref, artifact_id)
-    capabilities = artifact_capabilities(session, source)
+    source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
     owner_user_id = artifact_owner_id(session, source)
     try:
         key = await provision_draft_review_access(
@@ -178,6 +228,15 @@ async def enable_artifact_comments(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
+    # After the auth rule, never before: the marker is what reopens the folder
+    # to co-members on this server, and a rule-less grant would show a draft the
+    # comments service then refuses to talk about.
+    await run_in_threadpool(
+        enable_draft_review,
+        folder,
+        org_id=str(session.scope.org_id),
+        enabled_by=str(session.scope.user_id),
+    )
     current_revision = None
     try:
         draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
@@ -360,8 +419,15 @@ async def serve_private_draft(
     request: Request,
     session: ScopedSessionDep,
 ):
-    """Authenticated draft preview with project/org containment and relative assets."""
-    _source, folder, metadata = workspace_artifact_for_request(session, project_ref, artifact_id)
+    """Authenticated draft preview with project/org containment and relative assets.
+
+    Open to a reviewer as well as the owner, but only through
+    `review_artifact_for_request`: a co-member's draft is reachable here solely
+    because its owner granted same-org review on that one artifact.
+    """
+    _source, folder, metadata, _is_own = review_artifact_for_request(
+        session, project_ref, artifact_id
+    )
     if not rel_path or "\x00" in rel_path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path")
     try:

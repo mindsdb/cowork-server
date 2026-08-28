@@ -406,6 +406,10 @@ class AntonHarness:
         # Per-conversation model pick (the composer's dropdown) — overrides
         # planning/coding/router for this call only; see _build_chat_session.
         model: str | None = None,
+        # Per-task reasoning-effort pick (the composer's Effort sub-picker) —
+        # overrides planning/coding effort for this call only; see
+        # _build_chat_session and providers.build_llm_client's effort_override.
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Observability pass-through (see ResponsesRequest / HarnessProvider):
         # forwarded to Anton's per-turn TraceContext so they land on the
@@ -483,6 +487,7 @@ class AntonHarness:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
@@ -728,6 +733,7 @@ class AntonHarness:
         self,
         conversation: Conversation,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
     ):
@@ -846,7 +852,7 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client()
+        llm_client = self._build_llm_client(effort=reasoning_effort)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -1116,6 +1122,6 @@ class AntonHarness:
         return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(effort: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
+        return build_llm_client(effort_override=effort)

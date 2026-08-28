@@ -178,6 +178,122 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/publish` | Publish HTML artifacts to 4nton.ai |
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
+| `/hub/workspaces` | Which MindsHub workspace this person is working in |
+
+### The MindsHub workspace selector
+
+`/api/v1/hub/workspaces` backs the workspace group in the desktop app's account
+menu. A **MindsHub Workspace** is an org-internal container that owns hub
+resources (API keys, artifacts, model entitlements) and lives in the auth
+service. It has nothing to do with the filesystem directories this repo calls
+workspaces, which is why the stored key is `hub_workspace_id`.
+
+Three things about it are worth knowing before changing it.
+
+**The sidecar makes the call, not the renderer.** Auth's ingress allows three
+console origins per environment and no Cowork host, and a per-PR Cowork host
+cannot be added to a static allow-list because its name carries the PR number.
+The packaged Electron app would get away with a direct call because it runs with
+`webSecurity: false`; the web SPA would not. Reading here works for both shells.
+The outbound host is derived by `default_minds_auth_host()` from `ENV`, which the
+desktop propagates when it spawns this process, and the credential is the
+caller's own, never the stored provider key and never `minds_url`, both of which
+an org admin can set.
+
+**The credential arrives in its own header, `X-MindsHub-Authorization`.** It
+cannot use `Authorization`: Electron's main process overwrites that on every
+request to the loopback server with the server's own token, so the caller's
+Keycloak JWT can never arrive under that name in the desktop shell. `Authorization`
+is still the fallback, which is what the web shell uses. `hub_credential` reads
+both, and it is deliberately a different function from `caller_bearer` so a client
+cannot steer the credential on the org model-catalog fetch by setting a header.
+
+**The switch is auth's Statsig gate, not a local setting.** Auth declares
+`authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its
+server SDK, and reports the verdict in the entitlements payload; this service
+reads it from there. One gate governs the console and Cowork rather than two that
+can disagree, and Cowork holds no Statsig client and no SDK key. Every answer
+short of a definite yes reads as off: no bearer, auth unreachable, a version of
+auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is an
+ON-only development override for walking the surface where no rule targets you;
+it cannot switch the surface off, so it cannot escape the kill switch.
+
+**Picking a workspace changes what the client shows, not what a turn is billed
+to.** Neither turn credential carries a workspace: a desktop turn presents a
+long-lived key bound to a user and an organization, and a cloud turn presents a
+minted key whose request body has no workspace field. So nothing on the turn path
+reads `hub_workspace_id`, and a test asserts that.
+
+The pick is stored as an untagged `UserSettings` field, so it lands per `(org,
+user)` in org mode and in the single global row on a desktop install. That is
+interim: the shared per-user preference the console reads has no route in auth
+yet, and a follow-up migrates this onto it.
+
+### Who can read what in org mode
+
+Local mode has one user, so none of this applies: every check below is inert on
+the desktop.
+
+In org mode a request acts as a pair, an organization and a user, and it never
+carries less. The gateway authenticates the credential, asks the auth service
+whether that user is still a member of that organization, and injects
+`X-User-Id` and `X-Organization-Id`. cowork-server validates the shape of those
+headers and then trusts them, so **the gateway being the only route to the pod is
+what makes them trustworthy**, and that is a NetworkPolicy rather than
+anything in this codebase.
+A request with no valid pair is answered 401 before any route runs, except on
+`/api/v1/health/`, which the kubelet probes with no headers, and the channel
+webhook paths, which third parties call.
+
+Inside one organization, two different rules apply, and which one you get
+depends on the resource:
+
+- **Shared with the organization:** projects, project files at the project root,
+  skills, project memory, connected apps. Every member reads them.
+- **Private to whoever created it:** conversations and their history, scheduled
+  tasks, personal memory, uploaded files, and everything under a conversation's
+  own workspace at `conversations/<conversation_id>/`. Live artifacts are in
+  that last group, because the agent writes them into the conversation it is
+  running in.
+
+The private rule is enforced by the service layer rather than by the routes:
+`ConversationService._owned`, `FileService._owned_select` and
+`ScheduleService._owned_select` each add `created_by == <the caller>` when a
+request is org-scoped. Two places extend the same rule to the filesystem.
+`_conversation_workspace_ok` in the project-file routes refuses a path under
+another member's conversation directory, and `artifact_roots` drops another
+member's conversation directories before the artifact list or delete ever sees
+them, because those routes are addressed by project and slug and never receive a
+conversation id.
+
+Both of those decide from a resolved path and the route then opens that path, so
+the decision is carried to the open rather than trusted afterwards: every
+component below the project directory is opened `O_NOFOLLOW`, and a symlink
+planted anywhere in the chain is refused. A pod mounts its own workspace
+read-write, so without that a swapped directory component between the check and
+the open reaches another member's tree, or another organization's.
+
+**A refusal on a private resource answers 404, not 403**, with the same body a
+genuine miss returns. Telling the two apart would confirm that another member's
+file exists, which is most of what an attacker wants to know. Policy refusals
+that reveal nothing personal answer 403 instead: the desktop-only routes say
+`not available in org deployments`, and an organization-settings write without
+the admin role says so plainly.
+
+**The HTML preview hands out a bearer token in a URL** (`preview-mount-file`
+returns one, `preview-asset` spends it), because an iframe cannot send an
+`Authorization` header. The token is random, it is bound to the member and
+organization that minted it, and it expires after 30 minutes, so a token that
+escapes into a log or a screenshot is not a way in for anyone else.
+
+Being the minter is not enough on its own, because **a mount grants a
+directory**. The gate runs on the file the caller named, and an `.html` at the
+project root sits in a directory every member's `conversations/<id>/` hangs off,
+so a token minted on a shared file would otherwise read every workspace under it.
+A mount therefore reaches only the workspace its own file lived in, and a mount
+taken on a shared file reaches no workspace at all, not even the minter's own.
+That check holds no session, deliberately: `preview-asset` serves every sub-asset
+a page pulls, and a session there is a database connection per image.
 
 ### The default model is the one the free allowance covers
 
@@ -306,12 +422,15 @@ Environment variables fall into two namespaces:
 |----------|---------|-------------|
 | `COWORK_LISTEN_PORT` | `26866` | Server port |
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
+| `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |
+| `COWORK_IDENTITY_ENFORCE` | `enforce` | Org mode only. `enforce` answers 401 to a request carrying no valid identity headers. `audit` logs it and lets it through, which is the rollout mode the org cutover used; it now has to be asked for. |
 | `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
+| `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
 
 **Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
 

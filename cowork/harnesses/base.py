@@ -49,6 +49,13 @@ class HarnessProvider(Protocol):
         # this harness's planning/router/coding roles for just this call.
         # None keeps the account-wide default for every role, as before.
         model: str | None = None,
+        # Per-task reasoning-effort pick (the composer's Effort sub-picker),
+        # overriding this harness's planning/coding effort for just this
+        # call. None keeps the account-wide default for every role, as
+        # before. Mirrors `model` above but applies differently underneath
+        # (see providers.build_llm_client's effort_override param) — harnesses
+        # without an effort concept accept and ignore it.
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Optional observability pass-through (see ResponsesRequest). Forwarded
         # to the trace the harness emits; harnesses without tracing accept and

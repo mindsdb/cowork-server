@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import stat
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -396,6 +397,21 @@ class ConversationService:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         return self.session.exec(stmt).first()
 
+    def owned_ids(self, conversation_ids: Iterable[UUID]) -> set[UUID]:
+        """The subset of `conversation_ids` the caller owns, in one query.
+
+        Same rule as `_owned`, batched. The artifact roots resolver walks one
+        directory per conversation and holds every id at once, so without this
+        a plain list request would issue a SELECT per directory.
+        """
+        ids = list(conversation_ids)
+        if not ids:
+            return set()
+        stmt = self.session.select(Conversation).where(Conversation.id.in_(ids))
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
+        return {row.id for row in self.session.exec(stmt).all()}
+
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)
         if conversation is None:
@@ -409,6 +425,7 @@ class ConversationService:
         conversation_id: UUID | None = None,
         harness: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
@@ -424,6 +441,7 @@ class ConversationService:
             project_id=target_project_id,
             harness=harness,
             model=model,
+            reasoning_effort=reasoning_effort,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
