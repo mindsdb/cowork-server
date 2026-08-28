@@ -53,6 +53,20 @@ from __future__ import annotations
 
 import html
 import json
+import re
+
+# Real Drive file ids only ever match this shape (mirrors desktop's
+# DRIVE_FILE_ID_RE in drive-picker-service.ts) — validated at the API
+# boundary so a malformed file_ids never reaches this page at all.
+_DRIVE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def is_valid_drive_file_ids(file_ids: object) -> bool:
+    """True when file_ids is a list of strings each shaped like a real
+    Drive file id (an empty list is valid — "no file ids given")."""
+    return isinstance(file_ids, list) and all(
+        isinstance(fid, str) and _DRIVE_FILE_ID_RE.match(fid) for fid in file_ids
+    )
 
 
 def _json_for_script(value) -> str:
@@ -124,7 +138,9 @@ def render_picker_page(
         "data-api-key": html.escape(api_key, quote=True),
         "data-app-id": html.escape(app_id, quote=True),
         "data-account-email": html.escape(account_email, quote=True),
-        "data-file-ids": json.dumps(file_ids or []),
+        # json.dumps() is JSON-safe, not HTML-attribute-safe — its own quote
+        # characters still need escaping, or a crafted file id breaks out.
+        "data-file-ids": html.escape(json.dumps(file_ids or []), quote=True),
     }
     picker_attrs_html = " ".join(f'{attr_name}="{value}"' for attr_name, value in data_attrs.items())
 
