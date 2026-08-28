@@ -18,6 +18,7 @@ from cowork.services.connectors.oauth.google import (
     oauth_service,
 )
 from cowork.services.connectors.oauth.picker_page import (
+    is_valid_drive_file_ids,
     render_picker_error_page,
     render_picker_page,
 )
@@ -133,12 +134,16 @@ async def create_picker_session(engine: str, request: Request, scope: ScopeDep, 
             detail="Google Drive Picker is not fully configured for this deployment.",
         )
 
+    file_ids = body.get("file_ids") or []
+    if not is_valid_drive_file_ids(file_ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file id.")
+
     session_id = await picker_session.create({
         "access_token": access_token,
         "account_email": account_email,
         "api_key": api_key,
         "app_id": app_id,
-        "file_ids": body.get("file_ids") or [],
+        "file_ids": file_ids,
     })
     return {"url": f"/api/v1/connectors/oauth/{engine}/picker?session={session_id}"}
 
