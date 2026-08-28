@@ -77,7 +77,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
 
     async def fake_gate(binding, *, history):
         assert binding.provider is client
-        return ("The result was 42.", None)
+        return "The result was 42."
 
     monkeypatch.setattr(
         routing,
@@ -145,7 +145,7 @@ async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch)
 
     async def fake_gate(binding, *, history):
         seen_models.append(binding.model)
-        return ("The result was 42.", None)
+        return "The result was 42."
 
     monkeypatch.setattr(
         routing,
@@ -234,7 +234,7 @@ async def test_slow_gate_times_out_and_fails_open(monkeypatch):
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
-    monkeypatch.setattr(routing, "_GATE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.02)
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -463,7 +463,7 @@ async def test_router_binding_absent_outside_remote_backend(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_produce_direct_streams_chunks_then_persists_once_and_roots_metadata(monkeypatch):
+async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkeypatch):
     import json
     from uuid import uuid4 as _uuid4
 
@@ -471,32 +471,14 @@ async def test_produce_direct_streams_chunks_then_persists_once_and_roots_metada
 
     handler = _routing_handler(monkeypatch)
     calls = []
-    saved = {}
     monkeypatch.setattr(responses, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(responses, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None))
-
-    user_id = _uuid4()
-
-    def save_user_message(cid, content, pending=False):
-        calls.append("save_user")
-        saved.update(pending=pending)
-        return SimpleNamespace(id=user_id)
-
-    def save_assistant_turn(cid, text, events, harness=None):
-        calls.append("save_assistant")
-        saved.update(text=text, events=events, harness=harness)
-
-    def finalize_pending(cid, message_id=None):
-        calls.append("finalize")
-        saved.update(finalized=message_id)
-
     monkeypatch.setattr(
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            save_user_message=save_user_message,
-            save_assistant_turn=save_assistant_turn,
-            finalize_pending=finalize_pending,
+            save_user_message=lambda cid, content, pending=False: calls.append("save_user") or SimpleNamespace(id=_uuid4()),
+            save_assistant_turn=lambda cid, text, events, harness=None: calls.append("save_assistant"),
         ),
     )
 
@@ -512,15 +494,10 @@ async def test_produce_direct_streams_chunks_then_persists_once_and_roots_metada
         async def close(self, reason):
             self.closed = reason
 
-    async def tail():
-        yield " There"
-        yield "."
-
     buffer = _Buffer()
     conv_id = _uuid4()
     route = RouteDecision(
-        route=DIRECT_CONTEXT, reason="router_direct_response", model="m",
-        text="Hi.", text_stream=tail(),
+        route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.",
     )
 
     await handler._produce_direct(
@@ -532,88 +509,14 @@ async def test_produce_direct_streams_chunks_then_persists_once_and_roots_metada
     )
 
     assert buffer.closed == "completed"
-    # created + 3 deltas + completed; persisted once, after the last delta, before
-    # completed; the question is pending until then and finalized with the answer.
-    assert calls == ["save_user", "emit", "emit", "emit", "emit", "save_assistant", "finalize", "emit"]
-    assert saved["pending"] is True
-    assert saved["finalized"] == user_id
-    payloads = [json.loads(f.split("data: ", 1)[1]) for f in buffer.frames]
-    assert [p_["type"] for p_ in payloads] == [
-        "response.created", "response.output_text.delta", "response.output_text.delta",
-        "response.output_text.delta", "response.completed",
-    ]
-    assert [p_["delta"] for p_ in payloads[1:4]] == ["Hi.", " There", "."]
-    assert [p_["sequence_number"] for p_ in payloads] == [1, 2, 3, 4, 5]
-    # The persisted shape is the buffered one: a single delta carrying the full text.
-    assert saved["text"] == "Hi. There."
-    assert saved["harness"] == "cowork-direct"
-    assert [e["type"] for e in saved["events"]] == ["response.output_text.delta", "response.completed"]
-    assert saved["events"][0]["delta"] == "Hi. There."
-    assert payloads[-1]["response"]["output"][0]["content"][0]["text"] == "Hi. There."
-    assert payloads[0]["conversation_id"] == str(conv_id)
-    assert payloads[0]["harness"] == "cowork-direct"
+    # The whole answer is known before the first frame, so it is in the DB
+    # before the client can see a completed turn — no pending row needed.
+    assert calls.index("save_assistant") < calls.index("emit")
+    created = json.loads(buffer.frames[0].split("data: ", 1)[1])
+    assert created["conversation_id"] == str(conv_id)
+    assert created["harness"] == "cowork-direct"
     for frame in buffer.frames:
         assert frame.endswith("\n\n") and "\\n" not in frame
-
-
-@pytest.mark.asyncio
-async def test_produce_direct_persists_what_was_said_when_stopped(monkeypatch):
-    import asyncio
-    from uuid import uuid4 as _uuid4
-
-    import cowork.handlers.responses as responses
-
-    handler = _routing_handler(monkeypatch)
-    saved = {}
-    user_id = _uuid4()
-    monkeypatch.setattr(responses, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
-    monkeypatch.setattr(responses, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None))
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(
-            save_user_message=lambda cid, content, pending=False: SimpleNamespace(id=user_id),
-            save_assistant_turn=lambda cid, text, events, harness=None: saved.update(text=text),
-            finalize_pending=lambda cid, message_id=None: saved.update(finalized=message_id),
-        ),
-    )
-
-    class _Buffer:
-        closed = None
-
-        async def append(self, kind, record):
-            pass
-
-        async def close(self, reason):
-            self.closed = reason
-
-    closed = []
-
-    async def tail():
-        try:
-            yield " There"
-            raise asyncio.CancelledError  # Stop pressed mid-answer
-        finally:
-            closed.append(True)
-
-    buffer = _Buffer()
-    route = RouteDecision(
-        route=DIRECT_CONTEXT, reason="router_direct_response", model="m",
-        text="Hi.", text_stream=tail(),
-    )
-
-    await handler._produce_direct(
-        lifecycle=SimpleNamespace(discarded=False),
-        conv_id=_uuid4(),
-        original_content="Hello",
-        route=route,
-        buffer=buffer,
-    )
-
-    assert buffer.closed == "cancelled"
-    assert saved["text"] == "Hi. There"
-    assert saved["finalized"] == user_id  # what was said rejoins history
-    assert closed == [True]  # the gate's stream does not outlive the turn
 
 
 # --- history view: tool rows become markers, not holes (ENG-1851) -----------
@@ -767,9 +670,9 @@ def _tool():
     return StreamToolUseStart(id="t1", name="delegate")
 
 
-def _complete(stop_reason="end_turn"):
+def _complete(stop_reason="end_turn", tool_calls=()):
     from anton.core.llm.provider import StreamComplete
-    return StreamComplete(response=SimpleNamespace(stop_reason=stop_reason))
+    return StreamComplete(response=SimpleNamespace(stop_reason=stop_reason, tool_calls=list(tool_calls)))
 
 
 class _StreamProvider:
@@ -801,7 +704,8 @@ def _binding(provider):
 
 
 HISTORY = [{"role": "user", "content": "Hello"}]
-LONG = "x" * 130  # past _HOLD_CHARS in one chunk
+PREAMBLE = ("Sure — let me pull up last month's revenue for you. I'll query the sales "
+            "table, sum the amounts, and format the result nicely.")
 
 
 @pytest.mark.asyncio
@@ -828,11 +732,11 @@ async def test_gate_delegates_on_a_tool_call_and_closes_the_stream():
 
 
 @pytest.mark.asyncio
-async def test_gate_returns_a_short_answer_whole_when_it_completes_within_the_hold():
+async def test_gate_returns_the_answer_once_the_stream_ends():
     from cowork.handlers.response_routing import _gate
 
     provider = _StreamProvider([_text("Hi "), _text("there."), _complete()])
-    assert await _gate(_binding(provider), history=HISTORY) == ("Hi there.", None)
+    assert await _gate(_binding(provider), history=HISTORY) == "Hi there."
 
 
 @pytest.mark.asyncio
@@ -847,71 +751,147 @@ async def test_gate_delegates_an_empty_or_truncated_answer():
 
 
 @pytest.mark.asyncio
-async def test_gate_commits_once_the_hold_fills_and_streams_the_rest():
+async def test_gate_delegates_on_a_tool_call_reported_only_on_the_completed_response():
+    """A provider that fills a tool call's id/name across deltas never emits the
+    Start (anton's chat-completions branch emits it only when the first delta
+    carries both), so the completed response is checked too — otherwise the gate
+    answers a turn the model meant to delegate."""
     from cowork.handlers.response_routing import _gate
 
-    provider = _StreamProvider([_text("\n\n" + LONG), _text(" and"), _text(" more."), _complete()])
-    head, rest = await _gate(_binding(provider), history=HISTORY)
-
-    assert head == LONG  # leading whitespace trimmed, as on the buffered path
-    assert rest is not None
-    assert [c async for c in rest] == [" and", " more."]
-    assert provider.closed
+    provider = _StreamProvider([_text("Let me look that up."), _complete(tool_calls=[{"name": "delegate"}])])
+    assert await _gate(_binding(provider), history=HISTORY) is None
 
 
 @pytest.mark.asyncio
-async def test_gate_budget_bounds_the_first_event_not_the_whole_answer(monkeypatch):
-    """A whole answer may take far longer than the budget, as long as the
-    decision arrives inside it. This is the property the buffered gate lacked."""
+async def test_gate_budget_bounds_the_first_event_not_the_generation(monkeypatch):
+    """The decision is the first event, so a delegate call exits inside the
+    first-event budget however long a whole answer would have taken — the
+    property the buffered gate lacked."""
     import cowork.handlers.response_routing as routing
 
-    monkeypatch.setattr(routing, "_GATE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.05)
     monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
 
-    # Five chunks 0.03s apart: ~0.15s total, three times the budget — commits fine.
-    slow_answer = _StreamProvider(
-        [_text(LONG), _text(" a"), _text(" b"), _text(" c"), _complete()], gap=0.03,
-    )
-    head, rest = await routing._gate(_binding(slow_answer), history=HISTORY)
-    assert head == LONG and [c async for c in rest] == [" a", " b", " c"]
+    # Five chunks 0.03s apart: ~0.15s total, three times the first-event budget.
+    slow_answer = _StreamProvider([_text("a"), _text("b"), _text("c"), _text("d"), _complete()], gap=0.03)
+    assert await routing._gate(_binding(slow_answer), history=HISTORY) == "abcd"
 
-    # The same content, but the first event arrives late: the budget trips.
-    late_start = _StreamProvider([_text(LONG), _complete()], first_delay=0.2)
+    late_start = _StreamProvider([_tool()], first_delay=0.2)
     with pytest.raises(TimeoutError):
         await routing._gate(_binding(late_start), history=HISTORY)
     assert late_start.closed
 
 
 @pytest.mark.asyncio
-async def test_gate_tail_ends_quietly_on_a_late_tool_call():
-    """A tool call after the hold cannot un-send what streamed; the answer
-    ends with the text so far and never yields past the tool call."""
-    from cowork.handlers.response_routing import _gate
+async def test_gate_total_budget_bounds_a_trickling_stream(monkeypatch):
+    """`decide_route` runs before any SSE exists, so it blocks the client's POST.
+    Per-event budgets alone cannot bound that: a stream that trickles inside the
+    idle window runs arbitrarily long."""
+    import asyncio
 
-    provider = _StreamProvider([_text(LONG), _text(" more"), _tool(), _text(" never")])
-    head, rest = await _gate(_binding(provider), history=HISTORY)
+    import cowork.handlers.response_routing as routing
 
-    assert [c async for c in rest] == [" more"]
-    assert provider.closed
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 1.0)
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 0.12)
+
+    #每 chunk well inside the idle bound, but sixteen of them overrun the total.
+    trickle = _StreamProvider([_text(f"w{i} ") for i in range(16)] + [_complete()], gap=0.03)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError):
+        await routing._gate(_binding(trickle), history=HISTORY)
+    assert asyncio.get_running_loop().time() - started < 0.5
+    assert trickle.closed
 
 
 @pytest.mark.asyncio
-async def test_gate_tail_ends_quietly_when_the_stream_stalls(monkeypatch):
+async def test_gate_total_budget_survives_events_that_decide_nothing(monkeypatch):
+    """An event that is neither text, tool call nor completion must not re-arm
+    the idle window forever."""
     import cowork.handlers.response_routing as routing
+    from anton.core.llm.provider import StreamReasoningDelta
 
-    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 0.02)
-    provider = _StreamProvider([_text(LONG), _text(" late")], gap=0.2)
-    head, rest = await routing._gate(_binding(provider), history=HISTORY)
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 0.12)
 
-    assert [c async for c in rest] == []
-    assert provider.closed
+    noise = _StreamProvider([StreamReasoningDelta(text="thinking") for _ in range(16)], gap=0.03)
+    with pytest.raises(TimeoutError):
+        await routing._gate(_binding(noise), history=HISTORY)
+
+
+# --- Done-when #5: the two paths can never both answer -----------------------
 
 
 @pytest.mark.asyncio
-async def test_direct_decision_carries_the_stream_and_full_text_drains_it(monkeypatch):
+async def test_a_preamble_before_a_tool_call_delegates_and_says_nothing(monkeypatch):
+    """The gate returns nothing until its stream ends, so a model that talks
+    before delegating cannot have already spoken to the user.
+
+    `handle()` returns a direct answer without ever building the harness, so a
+    committed preamble would abandon the request: the user is told the work is
+    coming and no agent ever runs."""
     import cowork.handlers.response_routing as routing
 
-    provider = _StreamProvider([_text(LONG), _text(" tail."), _complete()])
+    chunks = [_text(PREAMBLE[i:i + 20]) for i in range(0, len(PREAMBLE), 20)]
+    provider = _StreamProvider(chunks + [_tool()])
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
+    )
+    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+
+    decision = await decide_route(
+        history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
+    )
+
+    assert len(PREAMBLE) > 120  # long enough that any commit-early rule would have fired
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_declined_direct_response"
+    assert decision.text == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "events, first_delay",
+    [
+        ([_tool()], 0.0),                                            # delegated outright
+        ([_text("preamble"), _tool()], 0.0),                          # delegated after talking
+        ([_text("x"), _complete(tool_calls=[{"name": "delegate"}])], 0.0),  # tool only on the response
+        ([_text("x"), _complete("max_tokens")], 0.0),                 # overran the output budget
+        ([_complete()], 0.0),                                         # said nothing
+        ([_text("x"), _complete()], 0.4),                             # missed the budget
+    ],
+)
+async def test_no_delegated_route_ever_carries_text(monkeypatch, events, first_delay):
+    """The invariant behind Done-when #5, over every shape that delegates:
+    `_handle_direct_response` is reached only for DIRECT_CONTEXT, and only a
+    DIRECT_CONTEXT decision carries text — so the gate's answer and Anton's are
+    mutually exclusive by construction."""
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
+    )
+    provider = _StreamProvider(events, first_delay=first_delay)
+    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+
+    decision = await decide_route(
+        history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.text == ""
+
+
+@pytest.mark.asyncio
+async def test_a_direct_decision_carries_the_whole_answer(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    provider = _StreamProvider([_text("Forty"), _text("-two."), _complete()])
     monkeypatch.setattr(
         routing,
         "get_user_settings",
@@ -924,6 +904,4 @@ async def test_direct_decision_carries_the_stream_and_full_text_drains_it(monkey
     )
 
     assert decision.route == DIRECT_CONTEXT
-    assert decision.text == LONG
-    assert decision.text_stream is not None
-    assert await decision.full_text() == LONG + " tail."
+    assert decision.text == "Forty-two."

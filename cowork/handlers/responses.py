@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import suppress
 import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
@@ -274,6 +273,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=bool(disabled),
+            trace_metadata=trace_metadata,
         )
         trace_metadata = {
             **trace_metadata,
@@ -387,6 +387,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
+        trace_metadata: dict[str, str] | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
@@ -412,16 +413,37 @@ class ResponsesHandler:
                 if message.role in {"user", "assistant"}
             ]
             history.append({"role": "user", "content": self._prompt_text(harness_input)})
-            # The gate resolves the router role + key ambiently; bind the org scope.
-            with use_settings_scope(self.scope):
-                binding, turn_llm = await self._router_binding()
-                decision = await decide_route(
-                    history=history,
-                    has_non_text_input=has_non_text_input,
-                    has_attachments=has_attachments,
-                    has_disabled_connections=has_disabled_connections,
-                    binding=binding,
-                )
+            # The gate's LLM call is the only one a direct turn makes, and it
+            # is made outside any ChatSession — so without a trace context it
+            # reaches MindsHub anonymous, and a direct turn leaves no trace to
+            # count (ENG-1851 Done-when #1). Installing one attributes the call
+            # to the conversation and stamps the build (ENG-1279), which is what
+            # makes the direct/delegated share answerable from traces.
+            from anton.core.llm.tracing import (
+                TraceContext,
+                reset_trace_context,
+                set_trace_context,
+            )
+
+            trace_token = set_trace_context(TraceContext(
+                session_id=str(conversation_id),
+                harness=self.harness_name,
+                tags=("cowork-gate",),
+                metadata=dict(trace_metadata or {}),
+            ))
+            try:
+                # The gate resolves the router role + key ambiently; bind the org scope.
+                with use_settings_scope(self.scope):
+                    binding, turn_llm = await self._router_binding()
+                    decision = await decide_route(
+                        history=history,
+                        has_non_text_input=has_non_text_input,
+                        has_attachments=has_attachments,
+                        has_disabled_connections=has_disabled_connections,
+                        binding=binding,
+                    )
+            finally:
+                reset_trace_context(trace_token)
             return decision, turn_llm
         except Exception:
             # Any gate-path failure (history query, mint, settings) fails open.
@@ -473,7 +495,7 @@ class ResponsesHandler:
     ) -> AsyncGenerator[str, None] | Response:
         """Return the router model's direct answer without initializing Anton."""
         if not request.stream:
-            text = await route.full_text()
+            text = route.text
             user_message = ConversationService(self.scoped).save_user_message(
                 conversation_id, original_content,
             )
@@ -521,89 +543,51 @@ class ResponsesHandler:
         route: RouteDecision,
         buffer,
     ) -> None:
-        """Emit a direct answer chunk by chunk, then persist it, on the normal
-        detached lifecycle.
+        """Persist and emit a direct answer using the normal detached lifecycle.
 
-        The head of the answer is known at decision time; the rest may still
-        be streaming from the gate.  Frames go out as chunks arrive, and the
-        turn is persisted once, when the stream ends, as a single delta event
-        carrying the full text — the same replay shape the buffered answer
-        produced.  Stop persists what had been said, like the delegated
-        producers."""
+        The full answer exists up front — the gate does not return until its
+        stream ends — so persistence happens before any frame is emitted: the
+        client can never see a completed turn the DB does not have, and no
+        pending row is needed."""
         producer_session = None
-        item_id = f"msg-{conv_id.hex[:12]}"
-        delta_base = {
-            "type": "response.output_text.delta",
-            "item_id": item_id,
-            "response_route": route.route,
-            "response_route_reason": route.reason,
-        }
-        parts: list[str] = [route.text]
-        seq = 1
-        persisted = False
-        pending_message_id = None
-
-        def persist() -> None:
-            nonlocal persisted
-            if persisted or producer_session is None:
-                return
-            persisted = True
-            full = "".join(parts)
-            svc = ConversationService(producer_session)
-            svc.save_assistant_turn(
-                conv_id, full,
-                [{**delta_base, "sequence_number": 2, "delta": full}, {"type": "response.completed"}],
-                harness="cowork-direct",
-            )
-            # Only now does the question rejoin replayed history (ENG-1231):
-            # a crash between the pending persist and here leaves it pending —
-            # visible in the UI, excluded from history — rather than folded in
-            # as a question with no answer, exactly as the delegated producers.
-            if pending_message_id is not None:
-                svc.finalize_pending(conv_id, pending_message_id)
-
-        async def emit_delta(chunk: str) -> None:
-            nonlocal seq
-            seq += 1
-            await buffer.append("sse", {"sse": sse_frame(
-                "response.output_text.delta", {**delta_base, "sequence_number": seq, "delta": chunk},
-            )})
-
         try:
             producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
-            # Pending until the answer is persisted, like the delegated producers:
-            # a mid-turn refresh shows the question, history does not replay it yet.
-            pending_message_id = ConversationService(producer_session).save_user_message(
-                conv_id, original_content, pending=True,
-            ).id
+            item_id = f"msg-{conv_id.hex[:12]}"
+            delta = {
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": item_id,
+                "delta": route.text,
+                "response_route": route.route,
+                "response_route_reason": route.reason,
+            }
+            svc = ConversationService(producer_session)
+            svc.save_user_message(conv_id, original_content)
+            svc.save_assistant_turn(
+                conv_id, route.text, [delta, {"type": "response.completed"}],
+                harness="cowork-direct",
+            )
 
             response = Response(status=ResponseStatus.created, model=route.model)
             # conversation_id/harness sit at the event root, like both
             # delegated paths — the GUI reads them there.
             await buffer.append("sse", {"sse": sse_frame("response.created", {
                 "type": "response.created",
-                "sequence_number": seq,
+                "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "harness": "cowork-direct",
                 "response": response.model_dump(),
             })})
-            await emit_delta(route.text)
-            if route.text_stream is not None:
-                async for chunk in route.text_stream:
-                    parts.append(chunk)
-                    await emit_delta(chunk)
-
-            persist()
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
             completed_response = Response(
                 id=response.id,
                 created_at=response.created_at,
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(item_id, "".join(parts))],
+                output=[self._build_output(item_id, route.text)],
             ).model_dump()
-            seq += 1
             await buffer.append("sse", {"sse": sse_frame("response.completed", {
-                "type": "response.completed", "sequence_number": seq, "response": completed_response,
+                "type": "response.completed", "sequence_number": 3, "response": completed_response,
             })})
             await buffer.close("completed")
         except asyncio.CancelledError:
@@ -611,21 +595,12 @@ class ResponsesHandler:
                 # Same reasoning as _produce_remote's discarded branch.
                 logger.info("[responses] discarded direct turn %s — not persisting", conv_id)
                 return
-            # The text said before Stop is kept, like the delegated producers.
-            persist()
             await buffer.close("cancelled")
         except Exception:
             logger.exception("[responses] direct turn failed for conversation %s", conv_id)
             await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
             await buffer.close("error")
         finally:
-            # Whatever ended the turn, the gate's stream must not outlive it:
-            # a Stop mid-answer would otherwise leave the provider request open
-            # until the generator is garbage-collected.
-            aclose = getattr(route.text_stream, "aclose", None)
-            if aclose is not None:
-                with suppress(Exception):
-                    await aclose()
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
             if producer_session is not None:
                 producer_session.close()
