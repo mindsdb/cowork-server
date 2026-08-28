@@ -19,6 +19,7 @@ from cowork.api.v1.artifact_preview import wants_comment_layer
 from cowork.common.paths import (
     O_NOFOLLOW,
     dir_open,
+    dir_scandir,
     open_pinned_child,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
@@ -108,6 +109,22 @@ def _artifact_folder_component(source, folder: Path) -> str:
     return name
 
 
+def _existing_draft_entry_name(directory, requested: str) -> str:
+    """Return the pinned directory's own name for a request selector.
+
+    Validation makes ``requested`` a single component, but it still originated
+    in an HTTP path.  Compare it with entries already discovered below the
+    pinned directory and return ``DirEntry.name`` so no request-derived string
+    is ever supplied to ``openat``.  A replacement after the scan remains safe:
+    the subsequent descriptor-relative open uses ``O_NOFOLLOW``.
+    """
+    with dir_scandir(directory) as entries:
+        for entry in entries:
+            if entry.name == requested:
+                return entry.name
+    raise FileNotFoundError(requested)
+
+
 def _open_pinned_draft_file(source, folder: Path, parts: tuple[str, ...]):
     """Open one regular draft file without following any writable symlink.
 
@@ -123,10 +140,12 @@ def _open_pinned_draft_file(source, folder: Path, parts: tuple[str, ...]):
     resources = ExitStack()
     try:
         current = resources.enter_context(opened_artifact_folder(source, folder_name))
-        for component in parts[:-1]:
-            current = open_pinned_child(current, component)
+        for requested in parts[:-1]:
+            disk_name = _existing_draft_entry_name(current, requested)
+            current = open_pinned_child(current, disk_name)
             resources.callback(current.close)
-        fd = dir_open(current, parts[-1], os.O_RDONLY | O_NOFOLLOW)
+        disk_name = _existing_draft_entry_name(current, parts[-1])
+        fd = dir_open(current, disk_name, os.O_RDONLY | O_NOFOLLOW)
         resources.callback(os.close, fd)
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):

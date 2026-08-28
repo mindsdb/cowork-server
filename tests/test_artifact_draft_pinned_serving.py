@@ -150,6 +150,43 @@ async def test_non_utf8_comment_preview_falls_back_to_the_pinned_byte_stream(
     assert await _stream_body(response) == payload
 
 
+def test_request_components_are_replaced_with_names_read_from_disk(
+    tmp_path, monkeypatch
+):
+    source, folder, _metadata = _artifact(tmp_path)
+    (folder / "assets").mkdir()
+    (folder / "assets" / "app.js").write_text("safe", encoding="utf-8")
+    requested_dir = ("assets" + "x")[:-1]
+    requested_file = ("app.js" + "x")[:-1]
+    requested = (requested_dir, requested_file)
+    opened_names = []
+    original_open_child = workspace_ep.open_pinned_child
+    original_dir_open = workspace_ep.dir_open
+
+    def open_child(directory, name):
+        opened_names.append(name)
+        return original_open_child(directory, name)
+
+    def open_file(directory, name, flags, mode=0o777):
+        opened_names.append(name)
+        return original_dir_open(directory, name, flags, mode)
+
+    monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
+    monkeypatch.setattr(workspace_ep, "dir_open", open_file)
+
+    resources, fd, _file_stat = workspace_ep._open_pinned_draft_file(
+        source, folder, requested
+    )
+    try:
+        assert os.read(fd, 4) == b"safe"
+    finally:
+        resources.close()
+
+    assert opened_names == ["assets", "app.js"]
+    assert opened_names[0] is not requested_dir
+    assert opened_names[1] is not requested_file
+
+
 async def test_send_failure_before_iteration_closes_the_pinned_file(tmp_path):
     path = tmp_path / "draft.txt"
     path.write_text("draft", encoding="utf-8")

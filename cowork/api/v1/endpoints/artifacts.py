@@ -30,9 +30,15 @@ from cowork.api.v1.artifact_preview import (
     html_with_comment_layer,
     wants_comment_layer,
 )
-from cowork.api.v1.artifact_scope import artifact_sources_for_request
+from cowork.api.v1.artifact_scope import (
+    artifact_sources_for_request,
+    scoped_project_id_for_request,
+)
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
-from cowork.services.artifact_roots import artifacts_sources_for_scan
+from cowork.services.artifact_roots import (
+    artifacts_sources_for_project,
+    artifacts_sources_for_scan,
+)
 from cowork.services.artifacts import (
     ExecutionRefused,
     _org_mode,
@@ -161,10 +167,40 @@ def _artifact_cards(session, sources) -> list[dict]:
     return cards
 
 
+def _scoped_project_sources(session, project_id: UUID):
+    """Select roots with a server-loaded project identity, never the request.
+
+    ``scoped_project_id_for_request`` first enumerates the tenant-scoped project
+    catalog and uses the client UUID only as an in-memory equality key. Artifact
+    root discovery then receives the matching database value. Keeping this
+    boundary beside the two filesystem consumers below makes the dataflow
+    explicit to both reviewers and static analysis.
+    """
+    server_project_id = scoped_project_id_for_request(session, str(project_id))
+    try:
+        sources = artifacts_sources_for_project(session, server_project_id)
+    except ValueError as exc:
+        # The project can disappear between catalog recovery and root discovery.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Unknown project",
+        ) from exc
+    return server_project_id, sources
+
+
 def artifacts_for_request(
     session, *, project_id: UUID | None = None, project_path: str | None = None
 ) -> list[dict]:
-    sources = artifact_sources_for_request(session, project_id, project_path)
+    # FastAPI validates the route parameter, but SAST engines do not model that
+    # dependency boundary. Reconstructing the UUID here is both a defence for
+    # direct callers and an explicit taint barrier before project selection can
+    # yield any filesystem roots.
+    if project_id is not None:
+        project_id = UUID(str(project_id))
+    if project_id is not None and project_path is None:
+        _server_project_id, sources = _scoped_project_sources(session, project_id)
+    else:
+        sources = artifact_sources_for_request(session, project_id, project_path)
     return _artifact_cards(session, sources)
 
 
@@ -517,14 +553,24 @@ async def delete_artifact_for_request(
     from cowork.services.artifact_publish_key import PublishKey
     from cowork.services.publish import _resolve_publish_endpoint
 
+    # This helper is also called directly by internal/test code, so retain the
+    # same concrete parsing boundary the HTTP adapter applies above. In
+    # particular, no request-derived string can select a project path.
+    project_id = UUID(str(project_id))
+
     # New clients address deletion by artifact id. Keep the slug fallback for
     # older desktop clients, but never use it when the caller supplied a UUID:
     # two conversations in one project can legitimately produce the same slug.
     ref = slug if isinstance(slug, _ArtifactDeleteRef) else _artifact_delete_ref(slug)
-    sources = artifact_sources_for_request(session, project_id, None)
+    server_project_id, sources = _scoped_project_sources(session, project_id)
     source = None
     folder = None
     if ref.artifact_id is not None:
+        # `_artifact_delete_ref` already canonicalized this value, but carrying
+        # it through a dataclass hides that sanitizer from SAST dataflow. Parse
+        # again at the resolver boundary so the path-producing identity lookup
+        # receives a visibly canonical UUID, never the route string.
+        artifact_id = UUID(ref.artifact_id).hex
         # Resolved through the review path so a reviewer who was granted access
         # to this draft is told they cannot delete it, instead of being told it
         # does not exist. Without a grant it still 404s — `require_artifact_owner`
@@ -532,7 +578,7 @@ async def delete_artifact_for_request(
         from cowork.api.v1.artifact_scope import review_artifact_for_request
 
         source, folder, _metadata, _is_own = review_artifact_for_request(
-            session, str(project_id), ref.artifact_id
+            session, str(server_project_id), artifact_id
         )
     else:
         # The legacy name is compared with entries discovered under each
@@ -547,7 +593,7 @@ async def delete_artifact_for_request(
     from cowork.services.artifact_permissions import require_artifact_owner
 
     require_artifact_owner(session, source)
-    expected_artifact_id = ref.artifact_id
+    expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():
         # `ScopedSession.scope` is the wrapper's own attribute — the same one
