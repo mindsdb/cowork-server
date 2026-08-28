@@ -4,6 +4,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -105,7 +106,10 @@ async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Re
         await auth_proxy.proxy_delete(engine, name, request, OAuthSettings())
         return
     try:
-        oauth_service.revoke(engine, name, ConnectorSettings(), OAuthSettings(), scope=scope)
+        # revoke() makes a blocking provider HTTP call (up to its own 10s
+        # timeout) - off the event loop, since this handler is now async for
+        # the org-mode branch above and FastAPI no longer threadpools it.
+        await run_in_threadpool(oauth_service.revoke, engine, name, ConnectorSettings(), OAuthSettings(), scope=scope)
     except Exception:
         _log.exception("Failed to revoke token for %s/%s", engine, name)
     if not ConnectionsService(scope).delete(engine, name):
