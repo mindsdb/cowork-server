@@ -84,3 +84,14 @@ def test_cloud_key_from_url_rejects_anything_but_the_view_shape():
     assert cloud_key_from_url("https://view.dev.mindshub.ai/view/u") == ""
     assert cloud_key_from_url("") == ""
     assert cloud_key_from_url("not a url") == ""
+
+
+def test_publish_entry_records_the_lambda_echo_separately():
+    """The echo must stay distinguishable from cowork's canonical fallback."""
+    from cowork.services.publish import _lambda_artifact_key
+
+    assert _lambda_artifact_key({"artifact_key": STABLE_KEY}) == STABLE_KEY
+    assert _lambda_artifact_key({"artifact_key": "b9996ebec/c675003f"}) == "b9996ebec/c675003f"
+    assert _lambda_artifact_key({}) == ""
+    assert _lambda_artifact_key({"artifact_key": None}) == ""
+    assert _lambda_artifact_key({"artifact_key": "  "}) == ""
