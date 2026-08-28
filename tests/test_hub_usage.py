@@ -1,6 +1,6 @@
 """The usage read: free monthly tokens, wallet balance, auto top up.
 
-Outbound HTTP is stubbed at the shared `_get_json`, same as the workspace tests,
+Outbound HTTP is stubbed at the shared `get_auth_json`, same as the workspace tests,
 so each case seeds the auth bodies and asserts the one view the desktop gets.
 """
 from __future__ import annotations
@@ -71,7 +71,7 @@ def calls(monkeypatch):
         asked.append(path)
         return answers.get(path)
 
-    monkeypatch.setattr(svc, "_get_json", _fake)
+    monkeypatch.setattr(svc, "get_auth_json", _fake)
     return type("Calls", (), {"asked": asked, "answers": answers})()
 
 
@@ -79,8 +79,8 @@ def _scope() -> TenantScope:
     return TenantScope(org_mode=True, org_id="org-a", user_id="user-a")
 
 
-def _fetch(bearer: str = "jwt-abc"):
-    return asyncio.run(svc.fetch_hub_usage(bearer_token=bearer, org_id="org-a"))
+def _fetch(bearer: str = "jwt-abc", user_id: str = "user-a"):
+    return asyncio.run(svc.fetch_hub_usage(bearer_token=bearer, org_id="org-a", user_id=user_id))
 
 
 def test_no_bearer_is_unreachable_and_asks_nothing(calls):
@@ -156,6 +156,35 @@ def test_remaining_is_derived_when_auth_omits_it(calls):
 def test_unlimited_grant_passes_through_as_minus_one(calls):
     calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": -1, "used": 30, "remaining": -1}}
     assert _fetch().free_tokens.limit == -1
+
+
+def test_the_cache_is_per_caller_not_per_org(calls):
+    """Two people in one org must not see each other's allowance or owner flag."""
+    calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
+    calls.answers[svc.WALLET_PATH] = WALLET
+
+    _fetch(user_id="user-a")
+    calls.answers[svc.ENTITLEMENTS_PATH] = {**ENTITLEMENTS, "is_billing_owner": False}
+    view_b = _fetch(user_id="user-b")
+
+    assert view_b.is_billing_owner is False
+    assert calls.asked.count(svc.ENTITLEMENTS_PATH) == 2
+
+
+def test_an_uncapped_grant_with_no_remaining_field_is_not_zero(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": -1, "used": 30}}
+    assert _fetch().free_tokens.remaining == -1
+
+
+def test_credit_spend_needs_a_known_cost_source(calls):
+    """Only the invoice source is a real number; an absent field (older auth) is accepted."""
+    calls.answers[svc.WALLET_PATH] = WALLET
+    calls.answers[svc.USAGE_SUMMARY_PATH] = {**SUMMARY, "meta": {"cost_source": "estimate"}}
+    assert _fetch().credit_spend is None
+
+    svc.reset_cache_for_tests()
+    calls.answers[svc.USAGE_SUMMARY_PATH] = {**SUMMARY, "meta": {}}
+    assert _fetch().credit_spend.usd == 0.02
 
 
 def test_a_successful_read_is_cached(calls):
