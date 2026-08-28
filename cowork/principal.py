@@ -10,11 +10,15 @@ identity headers:
     X-User-Roles       comma-separated role names  (optional)
 
 TrustedHeaderMiddleware turns those headers into a Principal on
-``request.state.principal``. Requests without a valid pair are rejected
-with 401 (COWORK_IDENTITY_ENFORCE=enforce) or logged and let through
-(audit, the rollout default). Identity is never derived from anything a
+``request.state.principal``. A request without a valid pair is rejected
+with 401, and is only logged and let through where an operator has asked
+for that by setting COWORK_IDENTITY_ENFORCE=audit, the mode the org
+cutover rolled out behind. Identity is never derived from anything a
 client can set directly, only from what the gateway injected after
-verification.
+verification. That last sentence holds only while the gateway is the only
+route to the pod, which is a network question this file cannot answer:
+enforce mode refuses a caller carrying no identity, not one carrying a
+well-formed forged pair.
 
 In local mode (the desktop sidecar, the default) the middleware is not
 registered and ``request.state.principal`` is absent; ``get_principal``

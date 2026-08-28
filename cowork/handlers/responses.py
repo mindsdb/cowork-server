@@ -626,6 +626,7 @@ class ResponsesHandler:
                 buffer=buffer,
                 turn_id=turn_id,
                 turn_llm=turn_llm,
+                disabled=disabled,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -780,6 +781,7 @@ class ResponsesHandler:
         turn_id: int = 0,
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
+        disabled: list[dict] | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: pipe the turn's replies
         through the same SSE formatter as the in-process path (full step /
@@ -853,6 +855,7 @@ class ResponsesHandler:
                     **self._remote_workspace(producer_session, conv_id),
                     correlation_id=(turn_llm or {}).get("correlation_id"),
                     llm=(turn_llm or {}).get("llm"),
+                    disabled=disabled,
                 ):
                     if kind == "turn_delta":
                         yield StreamTextDelta(text=data.get("text", ""))
