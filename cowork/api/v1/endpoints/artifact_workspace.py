@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import mimetypes
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -41,6 +41,28 @@ from cowork.services.artifact_revisions import (
 )
 
 router = APIRouter()
+
+
+def _artifact_id_from_path(artifact_id: UUID) -> str:
+    """The identity gate for every route in this file.
+
+    Declaring the path parameter as a `UUID` makes FastAPI answer 422 before any
+    handler body runs, so a request-supplied string never reaches the identity
+    resolver, the revision journal or the filesystem. `resolve_artifact_folder`
+    normalizes again and the index only ever yields folders it walked itself, so
+    this is the outer of several gates rather than the only one — but it is the
+    one that keeps unvalidated input out of the service layer entirely.
+
+    Returns the canonical 32-hex spelling, which is what metadata carries and
+    what the responses echo, so both the dashed and undashed URL forms resolve
+    to one identity.
+    """
+    return artifact_id.hex
+
+
+#: Path-validated artifact identity. Routes keep `{artifact_id}` in their path;
+#: the dependency claims that parameter and hands the handler a canonical id.
+ArtifactIdDep = Annotated[str, Depends(_artifact_id_from_path)]
 
 
 class _SourceUpdateBody(BaseModel):
@@ -95,7 +117,7 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
 @router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
     path: str | None = Query(default=None),
 ):
@@ -116,7 +138,7 @@ async def artifact_source(
 @router.put("/workspace/{project_ref}/{artifact_id}")
 async def update_artifact_source(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     body: _SourceUpdateBody,
     session: ScopedSessionDep,
 ):
@@ -153,7 +175,7 @@ async def update_artifact_source(
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions")
 async def artifact_revisions(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
     path: str | None = Query(default=None),
 ):
@@ -166,7 +188,7 @@ async def artifact_revisions(
 @router.get("/workspace/{project_ref}/{artifact_id}/review")
 async def artifact_review_entry(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
@@ -200,7 +222,7 @@ async def artifact_review_entry(
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
 async def enable_artifact_comments(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
 ):
     """Provision same-org draft review without broadening source-edit access.
@@ -256,7 +278,7 @@ async def enable_artifact_comments(
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}")
 async def artifact_revision(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     revision_id: str,
     session: ScopedSessionDep,
 ):
@@ -274,7 +296,7 @@ async def artifact_revision(
 @router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
 async def restore_artifact_revision(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     revision_id: str,
     body: _RestoreBody,
     session: ScopedSessionDep,
@@ -312,7 +334,7 @@ async def restore_artifact_revision(
 @router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs")
 async def request_agent_repair(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     body: _AgentRepairBody,
     session: ScopedSessionDep,
 ):
@@ -343,7 +365,7 @@ async def request_agent_repair(
 @router.get("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}")
 async def get_agent_repair(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     repair_id: str,
     session: ScopedSessionDep,
 ):
@@ -361,7 +383,7 @@ async def get_agent_repair(
 @router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel")
 async def cancel_queued_agent_repair(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     repair_id: str,
     session: ScopedSessionDep,
 ):
@@ -380,7 +402,7 @@ async def cancel_queued_agent_repair(
 @router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision")
 async def decide_agent_repair(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     repair_id: str,
     body: _RepairDecisionBody,
     session: ScopedSessionDep,
@@ -414,7 +436,7 @@ async def decide_agent_repair(
 @router.get("/drafts/{project_ref}/{artifact_id}/{rel_path:path}")
 async def serve_private_draft(
     project_ref: str,
-    artifact_id: str,
+    artifact_id: ArtifactIdDep,
     rel_path: str,
     request: Request,
     session: ScopedSessionDep,
