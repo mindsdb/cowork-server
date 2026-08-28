@@ -116,6 +116,17 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _lambda_artifact_key(result: dict) -> str:
+    """The upload lambda's own `artifact_key` echo, or "" when it sent none.
+
+    Kept apart from the `artifact_key` entry field, which falls back to cowork's
+    canonical key: that fallback is indistinguishable from an echo, and the two
+    imply DIFFERENT cloud comment scopes (stable key vs. composite), so mixing
+    them routes comments to a scope with no access rule behind it.
+    """
+    return str(result.get("artifact_key") or "").strip()
+
+
 def _write_published_map(published_json: Path, published_map: dict[str, Any]) -> None:
     """Write `.published.json` atomically.
 
@@ -481,6 +492,11 @@ def publish_artifact(
             # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
             # so the comments panel can key threads after an app restart.
             "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
+            # The lambda's raw echo, or "" from an older lambda that sends none.
+            # Decides which scope the published page uses for comments; see
+            # services/comments_scope. Deliberately NOT merged with the field
+            # above, whose canonical fallback would read as an echo.
+            "lambda_artifact_key": _lambda_artifact_key(result),
             "last_md5": result.get("md5", ""),
             # Snapshot of the artifact's content mtime at publish time — the
             # cheap gate for the `modified` badge (see card_for_folder). Uses
