@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cowork.common.settings import runtime_credential
-from cowork.common.settings import user_settings as us
+from cowork.common.settings.app_settings import get_app_settings
 
 _CREDENTIAL_KEYS = (
     "minds_api_key",
@@ -158,9 +158,9 @@ def test_org_mode_ignores_a_hand_over(monkeypatch):
     # value accepted here would be one tenant's credential answering for every
     # tenant. The route guard refuses first; this is the layer under it.
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    us.get_app_settings.cache_clear()
+    get_app_settings.cache_clear()
     try:
         runtime_credential.set_minds_credential("handed-over-token")
         assert runtime_credential.get_minds_credential() is None
     finally:
-        us.get_app_settings.cache_clear()
+        get_app_settings.cache_clear()
