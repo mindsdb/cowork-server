@@ -26,9 +26,34 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
 # Then the project source and a full sync (installs cowork-server into the venv).
+#
+# .git rides along in the context on purpose — hatch-vcs reads it to derive the
+# version, which is baked into the installed dist-info by this sync. It is then
+# deleted: the build workflow now checks out full history for that version
+# (ENG-1796), and the final stage COPYs this whole directory, so leaving it
+# would ship every commit of this repo inside the runtime image.
+#
+# What keeps it out is the STAGE boundary, not this layer — an earlier revision
+# of this comment credited the wrong mechanism. `.git` does exist in the builder
+# layer created by `COPY . /app` above, and this `rm` is a later layer, so it
+# does not erase that history. The final stage's `COPY --from=builder /app /app`
+# copies the builder's final filesystem STATE rather than its layer history,
+# which is what actually leaves `.git` behind. Worth stating precisely: the
+# classic form of this mistake — deleting in a later layer of the SHIPPED stage —
+# does leak, and reads identically to this.
+#
+# Order matters: the sync must resolve the version before .git is gone.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev \
+    && v="$(.venv/bin/python -c 'from importlib.metadata import version; print(version("cowork-server"))')" \
+    && echo "cowork-server version: $v" \
+    && case "$v" in 0.0.0*) \
+         echo "ERROR: version resolved to $v - the checkout has no tags, so hatch-vcs" >&2; \
+         echo "       had nothing to describe against. Build with fetch-depth: 0 (ENG-1796)." >&2; \
+         exit 1 ;; \
+       esac \
+    && rm -rf /app/.git
 
 
 # Final: slim runtime with just the venv + source.
