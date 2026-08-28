@@ -6,8 +6,12 @@ from __future__ import annotations
 
 import html
 import json
+from html.parser import HTMLParser
 
-from cowork.services.connectors.oauth.picker_page import render_picker_page
+from cowork.services.connectors.oauth.picker_page import (
+    is_valid_drive_file_ids,
+    render_picker_page,
+)
 
 
 def _render(**overrides) -> str:
@@ -20,6 +24,27 @@ def _render(**overrides) -> str:
     }
     kwargs.update(overrides)
     return render_picker_page(**kwargs)
+
+
+class _StatusDivAttrs(HTMLParser):
+    """Collects the attributes of the first <div id="status"> tag using a
+    real HTML tokenizer — reports exactly what a browser would treat as a
+    live attribute vs. inert text, unlike a substring search."""
+
+    def __init__(self):
+        super().__init__()
+        self.attrs = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "div" and self.attrs is None and ("id", "status") in attrs:
+            self.attrs = dict(attrs)
+
+
+def _status_div_attrs(page: str) -> dict:
+    parser = _StatusDivAttrs()
+    parser.feed(page)
+    assert parser.attrs is not None, 'expected a <div id="status"> tag'
+    return parser.attrs
 
 
 def test_picked_files_result_includes_new_files():
@@ -42,18 +67,41 @@ def test_every_data_attr_value_is_html_escaped_including_file_ids():
     """Regression: file_ids is JSON-encoded before it's an HTML attribute
     value, but json.dumps() output is JSON-safe, not HTML-attribute-safe —
     its own quote characters still need html.escape(), or a crafted file id
-    breaks out of the data-file-ids attribute."""
+    breaks out of the data-file-ids attribute.
+
+    Parses the real tag with an HTML tokenizer rather than substring-
+    matching the page text: json.dumps() already backslash-escapes the
+    hostile string's own quotes, so the raw payload never appears verbatim
+    in the page either way — a plain `hostile not in page` check can't tell
+    an escaped attribute from a broken-out one. An actual parser can: if the
+    payload broke out, `onmouseover` shows up as a live attribute key.
+    """
     hostile = 'a" onmouseover=alert(1) x="'
     page = _render(state='s" onx="1', file_ids=[hostile])
 
-    # The raw, unescaped breakout must never appear — its quotes have to be
-    # &quot;, not literal ", or onmouseover becomes a live tag attribute.
-    assert hostile not in page
-    assert '"1"' not in page  # would appear only if the state attribute broke out unescaped
+    attrs = _status_div_attrs(page)
 
-    # The escaped attribute must still decode + JSON.parse back to the
-    # original value, the way the client's dataset/JSON.parse read does.
-    segment = page.split("data-file-ids=")[1]
-    quoted = segment[1:segment.index('"', 1)]
-    decoded = html.unescape(quoted)
-    assert json.loads(decoded) == [hostile]
+    assert "onmouseover" not in attrs
+    assert set(attrs) == {
+        "class", "id", "data-state", "data-access-token", "data-api-key",
+        "data-app-id", "data-account-email", "data-file-ids",
+    }
+
+    # The escaped attributes must still decode back to their original
+    # values, the way the client's dataset/JSON.parse read does.
+    assert html.unescape(attrs["data-state"]) == 's" onx="1'
+    assert json.loads(html.unescape(attrs["data-file-ids"])) == [hostile]
+
+
+def test_is_valid_drive_file_ids():
+    """Mirrors desktop's isValidDriveFileIds (drive-picker-service.ts) —
+    same shape, same allowed/rejected cases."""
+    assert is_valid_drive_file_ids([]) is True
+    assert is_valid_drive_file_ids(["1a2B3c_-4d", "AbCd_1234-XYZ"]) is True
+
+    assert is_valid_drive_file_ids("abc") is False
+    assert is_valid_drive_file_ids(None) is False
+    assert is_valid_drive_file_ids([123]) is False
+    assert is_valid_drive_file_ids(["ok", "</script><script>evil()</script>"]) is False
+    assert is_valid_drive_file_ids(["has space"]) is False
+    assert is_valid_drive_file_ids(["../etc/passwd"]) is False

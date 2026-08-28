@@ -130,6 +130,31 @@ async def test_create_session_forwards_the_connection_name(org_mode, fake_redis,
 
 
 @pytest.mark.asyncio
+async def test_create_session_rejects_malformed_file_ids(org_mode, fake_redis, picker_ready):
+    """Defense in depth (mirrors desktop's isValidDriveFileIds gate in
+    main/index.ts): a file id that isn't a real Drive id shape is rejected
+    here, before it's ever persisted or reaches the picker page template."""
+    request = FakeRequest(headers={"authorization": "Bearer real-user-token"})
+    with pytest.raises(HTTPException) as exc_info:
+        await oauth_endpoints.create_picker_session(
+            "google_drive", request, ORG_SCOPE,
+            body={"account_email": "a@b.com", "file_ids": ['a" onmouseover=alert(1) x="']},
+        )
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_non_list_file_ids(org_mode, fake_redis, picker_ready):
+    request = FakeRequest(headers={"authorization": "Bearer real-user-token"})
+    with pytest.raises(HTTPException) as exc_info:
+        await oauth_endpoints.create_picker_session(
+            "google_drive", request, ORG_SCOPE,
+            body={"account_email": "a@b.com", "file_ids": "not-a-list"},
+        )
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_get_picker_embeds_session_token_and_is_single_use(org_mode, fake_redis, picker_ready):
     request = FakeRequest(headers={"authorization": "Bearer real-user-token"})
     session = await oauth_endpoints.create_picker_session("google_drive", request, ORG_SCOPE, body={})
