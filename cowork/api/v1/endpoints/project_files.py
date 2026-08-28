@@ -210,10 +210,19 @@ ProjectMutationPathDep = Annotated[_ValidatedProjectPath, Depends(_validated_pro
 
 
 def _project_dir(name: str, scoped: ScopedSession) -> Path:
-    """Resolve a project name to its on-disk directory or 404."""
+    """Resolve a sanitized project name to its scoped on-disk directory."""
+    selected_name = os.path.basename(name)
+    if (
+        not selected_name
+        or selected_name != name
+        or selected_name in {".", ".."}
+        or "\\" in selected_name
+        or "\x00" in selected_name
+    ):
+        raise HTTPException(status_code=404, detail="Project not found")
     service = ProjectService(scoped)
     try:
-        project = service.get_project_by_name(name)
+        project = service.get_project_by_name(selected_name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     # Any project can lose its directory (fresh pod, wiped volume), not just the
@@ -396,7 +405,7 @@ def _opened_existing_project_entry(
     """
     if not requested_parts:
         raise FileNotFoundError
-    with pinned_dir(base) as root, ExitStack() as descendants:
+    with pinned_dir(base, nofollow_base=True) as root, ExitStack() as descendants:
         current = root
         for requested in requested_parts[:-1]:
             name = _existing_entry_name(current, requested)
