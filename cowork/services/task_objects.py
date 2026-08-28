@@ -329,8 +329,11 @@ def index_turn_artifacts(
         not zero.
 
     Both default to None — a pure directory diff, the pre-existing behaviour.
-    That is only safe where no concurrent turn can write the directory: the
-    org deployment, where each conversation's pod mounts its own workspace.
+    That is only safe where no concurrent turn can write the directory. The org
+    deployment used to qualify (each conversation's pod had its own artifacts
+    dir), but since ENG-2056 its pods share the project-level base, so the
+    remote producer's pure diff carries the same concurrent-sibling caveat as
+    the desktop; the pod reports no tracked sets yet.
 
     conversation_id/project_id are captured by the caller while the row is
     unambiguously attached (not read here, to avoid depending on the session
