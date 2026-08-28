@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +38,27 @@ def _marker_path(folder: Path) -> Path:
     return folder.joinpath(*_MARKER_RELPATH)
 
 
+def _write_atomically(path: Path, payload: dict) -> None:
+    """Replace `path` in one step, like the sibling comments journal does.
+
+    A half-written grant would read as absent (`draft_review_grant` fails
+    closed), so the risk is a draft that silently stays private rather than one
+    that leaks — but a reader must never see a truncated file either way.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=".draft-review-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+    except BaseException:
+        os.unlink(name)
+        raise
+
+
 def enable_draft_review(folder: Path, *, org_id: str, enabled_by: str) -> dict:
     """Record that `folder`'s draft is open to `org_id` for review.
 
@@ -45,8 +68,6 @@ def enable_draft_review(folder: Path, *, org_id: str, enabled_by: str) -> dict:
     existing = draft_review_grant(folder)
     if existing is not None:
         return existing
-    from cowork.services.artifact_revisions import _atomic_bytes, _journal
-
     grant = {
         "version": 1,
         "scope": SCOPE_ORGANIZATION,
@@ -54,12 +75,7 @@ def enable_draft_review(folder: Path, *, org_id: str, enabled_by: str) -> dict:
         "enabledBy": str(enabled_by),
         "enabledAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    _journal(folder).mkdir(parents=True, exist_ok=True)
-    _atomic_bytes(
-        _marker_path(folder),
-        json.dumps(grant, indent=2).encode("utf-8"),
-        mode=0o600,
-    )
+    _write_atomically(_marker_path(folder), grant)
     return grant
 
 
