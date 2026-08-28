@@ -266,3 +266,9 @@ def reset_caches_for_tests() -> None:
     """Drop both caches so each test starts from a known state."""
     _gate_cache.clear()
     _listing_cache.clear()
+
+
+# Public names for the auth transport, shared with ``hub_usage``. Same
+# functions; the underscore versions stay for this module's own callers.
+auth_v1 = _auth_v1
+get_auth_json = _get_json

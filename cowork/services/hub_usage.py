@@ -10,7 +10,10 @@ The desktop shows them above the composer and in Settings so a person sees
 Same rules as ``hub_workspaces``: the sidecar makes the call because auth's
 ingress does not allow Cowork origins, the bearer is the caller's own, and the
 host is the operator's (``default_minds_auth_host``), never the tenant-settable
-``minds_url``. Transport lives in ``hub_workspaces._get_json`` and is shared.
+``minds_url``. Transport is ``hub_workspaces.get_auth_json``, shared.
+
+The cache is per caller, not per org: the allowance and ``is_billing_owner``
+are the caller's own, and in org mode one process serves everyone in the org.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from cowork.schemas.hub_usage import (
     HubFreeTokens,
     HubUsageView,
 )
-from cowork.services.hub_workspaces import _auth_v1, _get_json
+from cowork.services.hub_workspaces import auth_v1, get_auth_json
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +44,7 @@ USAGE_SUMMARY_PATH = "/usage/summary/?group_by=model&limit=200"
 _TTL_OK = 30.0
 _TTL_FAIL = 15.0
 
-_cache: dict[tuple[str, str], tuple[float, HubUsageView]] = {}
+_cache: dict[tuple[str, str, str], tuple[float, HubUsageView]] = {}
 
 
 def _usd(value: Any) -> Optional[float]:
@@ -69,11 +72,16 @@ def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
         return None
     limit = _int(included.get("limit"))
     used = _int(included.get("used"))
-    remaining = included.get("remaining")
+    if included.get("remaining") is not None:
+        remaining = _int(included.get("remaining"))
+    elif limit < 0:
+        remaining = -1  # uncapped: nothing to count down
+    else:
+        remaining = max(0, limit - used)
     return HubFreeTokens(
         limit=limit,
         used=used,
-        remaining=_int(remaining, max(0, limit - used)) if remaining is not None else max(0, limit - used),
+        remaining=remaining,
         resets_at=payload.get("next_refresh_at") if isinstance(payload.get("next_refresh_at"), str) else None,
     )
 
@@ -117,10 +125,10 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
     """The period's paid spend.
 
     Prefer the usage summary, the console's own source, but only when its
-    ``meta.cost_source`` says the number is real (``metronome_invoice``); an
-    ``unavailable`` source means the cost is not known yet and showing $0.00
-    would be wrong. Fall back to the wallet's ``credit_spend`` block, which older
-    auth versions serve, and give up rather than guess.
+    ``meta.cost_source`` is ``metronome_invoice`` (or absent, on an auth that
+    predates the field). Anything else means the cost is not known yet, and
+    showing $0.00 would be wrong. Fall back to the wallet's ``credit_spend``
+    block, which older auth versions serve, and give up rather than guess.
     """
     if isinstance(summary, dict):
         meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
@@ -128,7 +136,8 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
         cost = totals.get("cost") if isinstance(totals.get("cost"), dict) else {}
         rng = summary.get("range") if isinstance(summary.get("range"), dict) else {}
         usd = _usd(cost.get("total_usd"))
-        if usd is not None and meta.get("cost_source", "metronome_invoice") != "unavailable":
+        source = meta.get("cost_source")
+        if usd is not None and source in (None, "metronome_invoice"):
             return HubCreditSpend(
                 usd=usd,
                 period_start=rng.get("start") if isinstance(rng.get("start"), str) else None,
@@ -148,7 +157,7 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
 
 def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> HubUsageView:
     """Turn the auth bodies into one view. Any body may be None."""
-    if entitlements is None and wallet is None:
+    if entitlements is None and wallet is None and summary is None:
         return HubUsageView()
     return HubUsageView(
         reachable=True,
@@ -160,7 +169,7 @@ def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> HubUsage
     )
 
 
-async def fetch_hub_usage(*, bearer_token: str, org_id: str) -> HubUsageView:
+async def fetch_hub_usage(*, bearer_token: str, org_id: str, user_id: str = "") -> HubUsageView:
     """The caller's free allowance and their organization's wallet.
 
     Unreachable returns ``reachable=False`` rather than raising: the surfaces
@@ -169,18 +178,22 @@ async def fetch_hub_usage(*, bearer_token: str, org_id: str) -> HubUsageView:
     if not bearer_token:
         return HubUsageView()
 
-    cache_key = (_auth_v1(), org_id or "")
+    cache_key = (auth_v1(), org_id or "", user_id or "")
     cached = _cache.get(cache_key)
     if cached:
         stamped, value = cached
         if (time.monotonic() - stamped) < (_TTL_OK if value.reachable else _TTL_FAIL):
             return value
 
-    entitlements, wallet, summary = await asyncio.gather(
-        _get_json(ENTITLEMENTS_PATH, bearer_token),
-        _get_json(WALLET_PATH, bearer_token),
-        _get_json(USAGE_SUMMARY_PATH, bearer_token),
+    # get_auth_json never raises by contract; return_exceptions keeps one
+    # surprise from taking the other two reads down with it.
+    results = await asyncio.gather(
+        get_auth_json(ENTITLEMENTS_PATH, bearer_token),
+        get_auth_json(WALLET_PATH, bearer_token),
+        get_auth_json(USAGE_SUMMARY_PATH, bearer_token),
+        return_exceptions=True,
     )
+    entitlements, wallet, summary = (None if isinstance(r, BaseException) else r for r in results)
     view = parse_usage(entitlements, wallet, summary)
     _cache[cache_key] = (time.monotonic(), view)
     return view

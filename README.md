@@ -179,6 +179,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
+| `/hub/usage` | The caller's free monthly tokens, balance, auto top up and credit spend, for the desktop's usage warnings |
 
 ### The MindsHub workspace selector
 

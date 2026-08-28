@@ -23,5 +23,7 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 @router.get("/", response_model=HubUsageView)
 async def get_hub_usage(request: Request, scope: ScopeDep) -> HubUsageView:
     return await fetch_hub_usage(
-        bearer_token=hub_credential(request), org_id=scope.org_id or ""
+        bearer_token=hub_credential(request),
+        org_id=scope.org_id or "",
+        user_id=scope.user_id or "",
     )
