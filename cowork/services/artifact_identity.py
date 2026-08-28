@@ -14,8 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -25,10 +28,21 @@ from typing import TYPE_CHECKING
 # import it from this module because that is where the rest of the identity
 # vocabulary lives.
 from anton.core.artifacts.models import (
-    artifact_key,
+    artifact_key as artifact_key,
     canonical_artifact_id,
     extend_legacy_id,
     resolve_artifact_id,
+)
+from cowork.common.paths import (
+    O_NOFOLLOW,
+    PinnedDir,
+    dir_open,
+    dir_scandir,
+    dir_stat,
+    dir_unlink,
+    open_pinned_child,
+    opened_subdir_nofollow,
+    pinned_dir,
 )
 
 if TYPE_CHECKING:
@@ -40,6 +54,72 @@ logger = logging.getLogger(__name__)
 
 class ArtifactIdentityConflict(RuntimeError):
     """More than one scoped folder claims the same artifact identity."""
+
+
+def _component(value: str) -> str:
+    """Validate one filesystem component before handing it to ``openat``."""
+    value = str(value)
+    if not value or value in (".", "..") or Path(value).name != value:
+        raise ValueError("Artifact path component is invalid")
+    return value
+
+
+def _normalized_path(path: Path) -> str:
+    """Normalize lexically; resolving here would follow the link we must reject."""
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+
+
+@contextmanager
+def opened_artifact_root(source: "ProjectArtifacts") -> Iterator[PinnedDir]:
+    """Pin an authorized artifacts root without following writable links.
+
+    Resolvers created by :mod:`artifact_roots` carry a server-owned project
+    directory plus the relative storage components.  Opening those components
+    one by one with ``O_NOFOLLOW`` closes both the ordinary symlink escape and
+    the check/swap/use race.  Explicit legacy/local sources have no anchor and
+    pin their base itself with ``O_NOFOLLOW`` instead.
+    """
+    base = Path(source.base)
+    anchor_value = getattr(source, "trusted_anchor", None)
+    parts = tuple(getattr(source, "root_parts", ()) or ())
+    if anchor_value is None:
+        if parts:
+            raise ValueError("Artifact root parts require a trusted anchor")
+        with pinned_dir(base, nofollow_base=True) as root:
+            yield root
+        return
+
+    anchor = Path(anchor_value)
+    parts = tuple(_component(part) for part in parts)
+    if not parts or _normalized_path(anchor.joinpath(*parts)) != _normalized_path(base):
+        raise ValueError("Artifact root does not match its trusted anchor")
+    with opened_subdir_nofollow(anchor, *parts) as root:
+        yield root
+
+
+@contextmanager
+def _opened_child_directory(parent: PinnedDir, name: str) -> Iterator[PinnedDir]:
+    name = _component(name)
+    # This explicit no-follow stat gives the Windows path fallback the same
+    # discovery semantics.  POSIX security comes from the subsequent openat,
+    # so a replacement after this probe is still refused rather than followed.
+    if not stat.S_ISDIR(dir_stat(parent, name, follow_symlinks=False).st_mode):
+        raise NotADirectoryError(name)
+    child = open_pinned_child(parent, name)
+    try:
+        yield child
+    finally:
+        child.close()
+
+
+@contextmanager
+def opened_artifact_folder(
+    source: "ProjectArtifacts", folder_name: str
+) -> Iterator[PinnedDir]:
+    """Pin one direct, non-symlink artifact folder below ``source``."""
+    with opened_artifact_root(source) as root:
+        with _opened_child_directory(root, folder_name) as folder:
+            yield folder
 
 
 def _resolved_id(metadata: dict, folder: Path) -> str:
@@ -72,8 +152,8 @@ def _is_migrated(metadata: dict, resolved: str) -> bool:
     return metadata.get("id") == resolved and not metadata.get("stableId")
 
 
-def _read_no_follow(path: Path) -> str:
-    """Read `path`, refusing to follow it if it is a symlink.
+def _read_no_follow(folder: PinnedDir, name: str) -> str:
+    """Read a direct child, refusing to follow it if it is a symlink.
 
     An artifact folder is agent-writable, so `metadata.json` can be replaced
     with a link to something outside the artifact. Reading through it would turn
@@ -82,47 +162,56 @@ def _read_no_follow(path: Path) -> str:
     the correct outcome for a link too. `O_NOFOLLOW` raises `ELOOP` (an
     `OSError`) in that case, which every caller of this module already handles.
     """
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = dir_open(folder, _component(name), os.O_RDONLY | O_NOFOLLOW)
     try:
-        with os.fdopen(fd, "r", encoding="utf-8") as stream:
-            return stream.read()
+        stream = os.fdopen(fd, "r", encoding="utf-8")
     except BaseException:
-        # `fdopen` owns the descriptor once it succeeds; close it ourselves only
-        # if the wrapping itself failed.
         os.close(fd)
         raise
+    with stream:
+        return stream.read()
 
 
-def _atomic_json(path: Path, payload: dict) -> None:
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:
+    name = _component(name)
+    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
     try:
         # `O_EXCL | O_NOFOLLOW`: the name carries a uuid4 so a collision is not
         # realistic, but creating rather than opening is what makes "write to a
         # file somebody planted here" impossible rather than improbable.
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fd = dir_open(
+            folder,
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
+            0o600,
+        )
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         # `os.replace` acts on the link itself, never its target, so a symlinked
         # `metadata.json` is replaced by the real document instead of writing
         # through it.
-        os.replace(tmp, path)
+        if folder.fd is not None:
+            os.replace(tmp, name, src_dir_fd=folder.fd, dst_dir_fd=folder.fd)
+        else:
+            os.replace(folder.path / tmp, folder.path / name)
     finally:
         try:
-            tmp.unlink(missing_ok=True)
+            dir_unlink(folder, tmp)
+        except FileNotFoundError:
+            pass
         except OSError:
             pass
 
 
-def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dict]:
-    """Return the folder's canonical 32-hex id, persisting a legacy widening.
-
-    The widening is deterministic, so concurrent readers choose the same value
-    even before either atomic metadata write wins.
-    """
-    path = folder / "metadata.json"
+def _ensure_full_id(
+    folder: PinnedDir, metadata: dict | None = None
+) -> tuple[str, dict]:
+    """Descriptor-relative implementation for :func:`ensure_full_id`."""
+    name = "metadata.json"
+    path = folder.path / name
     if metadata is None:
-        metadata = json.loads(_read_no_follow(path))
-    resolved = _resolved_id(metadata, folder)
+        metadata = json.loads(_read_no_follow(folder, name))
+    resolved = _resolved_id(metadata, folder.path)
     if _is_migrated(metadata, resolved):
         return resolved, metadata
 
@@ -130,10 +219,10 @@ def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dic
     # Merge into the latest durable document instead of writing the stale
     # snapshot back over unrelated metadata fields.
     try:
-        latest = json.loads(_read_no_follow(path))
+        latest = json.loads(_read_no_follow(folder, name))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Artifact metadata is unreadable") from exc
-    resolved = _resolved_id(latest, folder)
+    resolved = _resolved_id(latest, folder.path)
     if _is_migrated(latest, resolved):
         return resolved, latest
     updated = {key: value for key, value in latest.items() if key != "stableId"}
@@ -145,11 +234,11 @@ def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dic
     # would mark every legacy artifact as just-updated and deliver stale
     # attachments to the chat.
     try:
-        before = path.stat(follow_symlinks=False)
+        before = dir_stat(folder, name, follow_symlinks=False)
     except OSError:
         before = None
     try:
-        _atomic_json(path, updated)
+        _atomic_json(folder, name, updated)
     except OSError:
         # Persisting is an optimization, not the contract: the id is derived
         # deterministically, so a read-only or full artifacts root still
@@ -157,59 +246,116 @@ def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dic
         # Propagating would drop the artifact from every listing (both callers
         # treat an identity error as "skip this folder"), which reads as a
         # deletion of files that are sitting right there.
-        logger.warning("Could not persist widened artifact id for %s", folder, exc_info=True)
+        logger.warning("Could not persist widened artifact id for %s", folder.path, exc_info=True)
         return resolved, updated
     if before is not None:
         try:
-            # `follow_symlinks=False`: after the replace above `path` is a real
-            # file, but if it was a link a moment earlier this call must not be
-            # what reaches its old target — setting the mtime of an arbitrary
-            # file is the one part of this write a planted link could still
-            # steer.
-            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns), follow_symlinks=False)
+            # The name is resolved against the still-pinned folder.  Combined
+            # with `follow_symlinks=False`, neither a directory swap nor a
+            # planted metadata link can steer the timestamp restoration.
+            if folder.fd is not None:
+                os.utime(
+                    name,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                    dir_fd=folder.fd,
+                    follow_symlinks=False,
+                )
+            else:
+                os.utime(
+                    path,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                    follow_symlinks=False,
+                )
         except OSError:
             pass
     return resolved, updated
 
 
-def _directory_version(base: Path) -> tuple[int, int]:
-    """A cheap invalidation clock for one artifacts container."""
+def ensure_full_id(
+    folder: Path,
+    metadata: dict | None = None,
+    *,
+    _pinned: PinnedDir | None = None,
+) -> tuple[str, dict]:
+    """Return the folder's canonical 32-hex id, persisting a legacy widening.
+
+    The widening is deterministic, so concurrent readers choose the same value
+    even before either atomic metadata write wins.
+    """
+    # Internal pinned callers stay on this public function so instrumentation
+    # and the cache's one-read contract continue to observe every identity
+    # load. The handle remains an implementation detail, not a second API.
+    if _pinned is not None:
+        return _ensure_full_id(_pinned, metadata)
+
+    # Pinning the folder itself makes supplied metadata safe too: even when no
+    # read is necessary, a symlink folder is refused before a legacy migration
+    # can write through it.
+    with pinned_dir(folder, nofollow_base=True) as pinned:
+        return _ensure_full_id(pinned, metadata)
+
+
+DirectoryClock = tuple[int, int, int, int]
+
+
+def _directory_version(base: PinnedDir) -> DirectoryClock:
+    """An invalidation clock tied to the directory inode we actually opened."""
     try:
-        stat = base.stat()
+        value = os.fstat(base.fd) if base.fd is not None else base.path.stat(
+            follow_symlinks=False
+        )
     except OSError:
-        return (0, 0)
-    return (stat.st_mtime_ns, stat.st_ctime_ns)
+        return (0, 0, 0, 0)
+    # Device + inode prevent a replacement container with coincidentally equal
+    # timestamps from reusing an index built for the directory it displaced.
+    return (value.st_dev, value.st_ino, value.st_mtime_ns, value.st_ctime_ns)
 
 
 _IDENTITY_INDEX_LIMIT = 256
 _identity_indexes: OrderedDict[
-    tuple[str, tuple[int, int]], dict[str, tuple[str, ...]]
+    tuple[str, DirectoryClock], dict[str, tuple[str, ...]]
 ] = OrderedDict()
 _identity_indexes_lock = RLock()
 
 
-def _build_identity_index(base_value: str) -> dict[str, tuple[str, ...]]:
-    """Build an id-to-folder index for one artifacts container."""
-    base = Path(base_value)
+def _build_identity_index(base: PinnedDir) -> dict[str, tuple[str, ...]]:
+    """Build an id-to-folder-name index below one pinned container."""
     matches: dict[str, list[str]] = {}
     try:
-        folders = sorted(base.iterdir())
+        with dir_scandir(base) as entries:
+            folder_names = []
+            for entry in entries:
+                try:
+                    if (
+                        not entry.is_symlink()
+                        and entry.is_dir(follow_symlinks=False)
+                    ):
+                        folder_names.append(entry.name)
+                except OSError:
+                    continue
     except OSError:
         return {}
-    for folder in folders:
-        if not folder.is_dir() or not (folder / "metadata.json").is_file():
-            continue
+    # DirEntry's no-follow probe is an early filter; each openat below is the
+    # race-safe decision if an entry changes after the scan.
+    for folder_name in sorted(folder_names):
         try:
-            found, _metadata = ensure_full_id(folder)
+            with _opened_child_directory(base, folder_name) as folder:
+                metadata_stat = dir_stat(
+                    folder, "metadata.json", follow_symlinks=False
+                )
+                if not stat.S_ISREG(metadata_stat.st_mode):
+                    continue
+                found, _metadata = ensure_full_id(folder.path, _pinned=folder)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        matches.setdefault(found, []).append(str(folder))
+        matches.setdefault(found, []).append(folder_name)
     return {artifact_id: tuple(folders) for artifact_id, folders in matches.items()}
 
 
 def _identity_index(
     base_value: str,
-    directory_clock: tuple[int, int],
+    directory_clock: DirectoryClock,
+    base: PinnedDir,
     *,
     force_refresh: bool = False,
 ) -> tuple[dict[str, tuple[str, ...]], bool]:
@@ -227,7 +373,7 @@ def _identity_index(
                 _identity_indexes[key] = cached
                 return cached, True
 
-    index = _build_identity_index(base_value)
+    index = _build_identity_index(base)
     with _identity_indexes_lock:
         for stale_key in tuple(_identity_indexes):
             if stale_key[0] == base_value and stale_key != key:
@@ -246,50 +392,76 @@ def _clear_identity_indexes() -> None:
 
 
 def _refresh_identity_index(
-    cache_key: tuple[str, tuple[int, int]],
+    cache_key: tuple[str, DirectoryClock], base: PinnedDir
 ) -> dict[str, tuple[str, ...]]:
-    return _identity_index(*cache_key, force_refresh=True)[0]
+    return _identity_index(*cache_key, base, force_refresh=True)[0]
 
 
 def _validated_index_records(
-    base: Path,
+    base: PinnedDir,
     artifact_id: str,
-    folder_values: tuple[str, ...],
+    folder_names: tuple[str, ...],
 ) -> tuple[tuple[Path, dict], ...]:
     records: list[tuple[Path, dict]] = []
-    for folder_value in folder_values:
-        folder = Path(folder_value)
+    for folder_name in folder_names:
         try:
-            folder.resolve(strict=False).relative_to(base)
-            found, metadata = ensure_full_id(folder)
+            with _opened_child_directory(base, folder_name) as folder:
+                found, metadata = ensure_full_id(folder.path, _pinned=folder)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if found == artifact_id:
-            records.append((folder, metadata))
+            records.append((base.path / folder_name, metadata))
     return tuple(records)
 
 
-def _indexed_artifacts(base: Path, artifact_id: str) -> tuple[tuple[Path, dict], ...]:
-    resolved = base.resolve(strict=False)
-    cache_key = (str(resolved), _directory_version(resolved))
-    index, was_cached = _identity_index(*cache_key)
-    folders = index.get(artifact_id)
-    if folders is not None:
-        records = _validated_index_records(resolved, artifact_id, folders)
-        if len(records) == len(folders):
-            return records
+def _root_still_current(source: "ProjectArtifacts", opened: PinnedDir) -> bool:
+    """Reopen the source and ensure its name still denotes the pinned inode."""
+    try:
+        with opened_artifact_root(source) as current:
+            if opened.fd is not None and current.fd is not None:
+                before = os.fstat(opened.fd)
+                after = os.fstat(current.fd)
+            else:
+                before = opened.path.stat(follow_symlinks=False)
+                after = current.path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
 
-    # A freshly-built index is already authoritative for this point in time.
-    # Only cached misses or stale positive entries need one forced rebuild.
-    if not was_cached:
+
+def _indexed_artifacts(
+    source: "ProjectArtifacts", artifact_id: str
+) -> tuple[tuple[Path, dict], ...]:
+    try:
+        with opened_artifact_root(source) as base:
+            # The lexical key deliberately does not resolve symlinks.  The
+            # descriptor is the authority, and its device/inode are part of the
+            # clock, so a replaced root cannot inherit another root's cache.
+            cache_key = (_normalized_path(base.path), _directory_version(base))
+            index, was_cached = _identity_index(*cache_key, base)
+            folders = index.get(artifact_id)
+            if folders is not None:
+                records = _validated_index_records(base, artifact_id, folders)
+                if len(records) == len(folders):
+                    return records if _root_still_current(source, base) else ()
+
+            # A freshly-built index is already authoritative for this point in
+            # time. Only cached misses or stale positives need one rebuild.
+            if not was_cached:
+                return ()
+
+            # Writing metadata inside an already-existing artifact folder does
+            # not necessarily tick the container. A cached miss or failed
+            # target revalidation therefore rebuilds once.
+            refreshed = _refresh_identity_index(cache_key, base)
+            records = _validated_index_records(
+                base, artifact_id, refreshed.get(artifact_id, ())
+            )
+            return records if _root_still_current(source, base) else ()
+    except (OSError, ValueError):
+        # Missing roots and every refused symlink have the same externally
+        # observable result: this authorized source contains no such artifact.
         return ()
-
-    # Writing metadata inside an already-existing artifact folder does not
-    # necessarily tick the artifacts container itself. A miss or failed target
-    # revalidation therefore rebuilds once before declaring the identity
-    # absent. Positive lookups remain the one-target fast path.
-    refreshed = _refresh_identity_index(cache_key)
-    return _validated_index_records(resolved, artifact_id, refreshed.get(artifact_id, ()))
 
 
 def resolve_artifact_folder(
@@ -299,8 +471,7 @@ def resolve_artifact_folder(
     wanted = canonical_artifact_id(artifact_id)
     matches: list[tuple["ProjectArtifacts", Path, dict]] = []
     for source in sources:
-        base = Path(source.base).resolve(strict=False)
-        for folder, metadata in _indexed_artifacts(base, wanted):
+        for folder, metadata in _indexed_artifacts(source, wanted):
             matches.append((source, folder, metadata))
 
     if not matches:

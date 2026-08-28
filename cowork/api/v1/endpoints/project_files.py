@@ -7,6 +7,7 @@ compat stubs and may be refactored later.
 
 import logging
 import mimetypes
+import ntpath
 import os
 import secrets
 import shutil
@@ -16,7 +17,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -29,6 +30,7 @@ from cowork.common.paths import (
     dir_open,
     dir_unlink,
     opened_subdir_nofollow,
+    safe_join,
 )
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
@@ -169,6 +171,40 @@ class _PreviewMountRequest(BaseModel):
     path: str
 
 
+@dataclass(frozen=True)
+class _ValidatedProjectPath:
+    """A request path reduced to non-traversing relative components."""
+
+    parts: tuple[str, ...]
+
+    @property
+    def value(self) -> str:
+        return "/".join(self.parts)
+
+
+def _validated_project_path(path: str) -> _ValidatedProjectPath:
+    """Validate write/delete paths before either handler reaches the disk.
+
+    These routes support nested project files, so a basename-only policy would
+    break normal use. Splitting once and rejecting empty, dot and dot-dot
+    components gives the handlers the nested shape they need without retaining
+    an unchecked path expression. The later resolved-containment and dirfd /
+    ``O_NOFOLLOW`` checks remain in place for symlinks and races.
+    """
+    if not path or len(path) > 4096 or "\x00" in path:
+        raise HTTPException(status_code=400, detail="invalid path")
+    cleaned = path.replace("\\", "/")
+    if cleaned.startswith("/") or ntpath.splitdrive(cleaned)[0]:
+        raise HTTPException(status_code=400, detail="invalid path")
+    parts = tuple(cleaned.split("/"))
+    if any(not part or part in {".", ".."} for part in parts):
+        raise HTTPException(status_code=400, detail="invalid path")
+    return _ValidatedProjectPath(parts)
+
+
+ProjectMutationPathDep = Annotated[_ValidatedProjectPath, Depends(_validated_project_path)]
+
+
 def _project_dir(name: str, scoped: ScopedSession) -> Path:
     """Resolve a project name to its on-disk directory or 404."""
     service = ProjectService(scoped)
@@ -190,7 +226,12 @@ def _anton_md_path(base: Path) -> Path:
     return base / ".anton" / ANTON_INSTRUCTIONS_FILENAME
 
 
-def _safe_relpath(rel: str, base: Path) -> Path:
+def _safe_relpath(rel: str | _ValidatedProjectPath, base: Path) -> Path:
+    if isinstance(rel, _ValidatedProjectPath):
+        try:
+            return safe_join(base, *rel.parts)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
     if not rel:
         raise HTTPException(status_code=400, detail="path required")
     cleaned = rel.replace("\\", "/").lstrip("/")
@@ -406,7 +447,12 @@ def read_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
 
 
 @router.put("/{project_name}/files/{path:path}")
-def write_project_file(project_name: str, path: str, req: _FileWriteRequest, scoped: ScopedSessionDep):
+def write_project_file(
+    project_name: str,
+    path: ProjectMutationPathDep,
+    req: _FileWriteRequest,
+    scoped: ScopedSessionDep,
+):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     _require_workspace_access(target, base, scoped)
@@ -434,7 +480,7 @@ def write_project_file(project_name: str, path: str, req: _FileWriteRequest, sco
                 os.close(fd)
     except (OSError, ValueError):
         raise HTTPException(status_code=404, detail="File not found")
-    return {"path": path, "size": st.st_size, "modified": st.st_mtime}
+    return {"path": path.value, "size": st.st_size, "modified": st.st_mtime}
 
 
 @router.post("/{project_name}/files/upload")
@@ -465,7 +511,9 @@ async def upload_project_files(
 
 
 @router.delete("/{project_name}/files/{path:path}")
-def delete_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+def delete_project_file(
+    project_name: str, path: ProjectMutationPathDep, scoped: ScopedSessionDep
+):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     _require_workspace_access(target, base, scoped)
@@ -486,7 +534,7 @@ def delete_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
         raise
     except (OSError, ValueError):
         raise HTTPException(status_code=404, detail="File not found")
-    return {"status": "deleted", "path": path}
+    return {"status": "deleted", "path": path.value}
 
 
 @router.delete("/{project_name}/skill_drafts/{slug}", status_code=status.HTTP_204_NO_CONTENT)

@@ -21,6 +21,7 @@ one, so both modes address artifacts the same way.
 """
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 from uuid import UUID
 
@@ -49,6 +50,34 @@ CONVERSATIONS_DIRNAME = "conversations"
 
 def _artifacts_base(project_path: str) -> Path:
     return Path(project_path).joinpath(*_ARTIFACTS_SUBPATH)
+
+
+def _is_real_directory(path: Path) -> bool:
+    """True only for a directory entry, never a link to one."""
+    try:
+        return stat.S_ISDIR(path.stat(follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool) -> bool:
+    """Reject a link in the writable ``.anton/artifacts`` chain.
+
+    This is an early discovery filter.  The identity service repeats the
+    guarantee atomically by reopening both components relative to a pinned
+    project directory, so replacing either entry after this check is refused at
+    use time too.
+    """
+    for component in (workspace / _ARTIFACTS_SUBPATH[0], workspace.joinpath(*_ARTIFACTS_SUBPATH)):
+        try:
+            mode = component.stat(follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            return may_be_absent
+        except OSError:
+            return False
+        if not stat.S_ISDIR(mode):
+            return False
+    return True
 
 
 def conversation_artifacts_base(project_path: str, conversation_id) -> Path:
@@ -111,12 +140,19 @@ def _project_artifact_bases(
     if not _org_mode():
         return [_artifacts_base(project_path)]
     conversations = Path(project_path) / CONVERSATIONS_DIRNAME
+    if not _is_real_directory(conversations):
+        return []
     try:
         children = sorted(conversations.iterdir())
     except OSError:
         return []
-    children = [child for child in children if child.is_dir()]
-    if session.scope.org_mode and not include_other_members:
+    children = [
+        child
+        for child in children
+        if _is_real_directory(child)
+        and _storage_components_are_safe(child, may_be_absent=True)
+    ]
+    if not include_other_members and session.scope.org_mode:
         from cowork.services.conversations import ConversationService
 
         candidates = {child: _conversation_id(child) for child in children}
@@ -133,16 +169,21 @@ def _sources_for(
     """One `ProjectArtifacts` per root. They all carry the SAME project identity:
     a conversation is where the bytes happen to live, not a thing the client
     addresses artifacts by, so cards stay project-addressed in both modes."""
-    return [
-        ProjectArtifacts(
-            base=base,
-            project_id=str(project.id),
-            project_name=project.name,
+    project_path = Path(project.path)
+    sources: list[ProjectArtifacts] = []
+    for base in _project_artifact_bases(
+        project.path, session, include_other_members=include_other_members
+    ):
+        sources.append(
+            ProjectArtifacts(
+                base=base,
+                project_id=str(project.id),
+                project_name=project.name,
+                trusted_anchor=project_path,
+                root_parts=base.relative_to(project_path).parts,
+            )
         )
-        for base in _project_artifact_bases(
-            project.path, session, include_other_members=include_other_members
-        )
-    ]
+    return sources
 
 
 def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts]:
@@ -202,7 +243,21 @@ def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
     string, and a rename moves the directory and updates the row together
     (services/projects.py).
     """
-    return [
-        ProjectArtifacts(base=base, project_id=None, project_name=base.parent.parent.name)
-        for base in _scan_artifact_dirs()
-    ]
+    sources: list[ProjectArtifacts] = []
+    for base in _scan_artifact_dirs():
+        # ``_scan_artifact_dirs`` historically follows directory links in its
+        # ``is_dir`` probe.  Do not let such a root become an authorization
+        # source; ordinary desktop directories retain the exact same shape.
+        if not _storage_components_are_safe(base.parent.parent, may_be_absent=False):
+            continue
+        project_path = base.parent.parent
+        sources.append(
+            ProjectArtifacts(
+                base=base,
+                project_id=None,
+                project_name=project_path.name,
+                trusted_anchor=project_path,
+                root_parts=_ARTIFACTS_SUBPATH,
+            )
+        )
+    return sources
