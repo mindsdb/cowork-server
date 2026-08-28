@@ -243,6 +243,25 @@ def _load_metadata(folder: Path) -> dict | None:
         return None
 
 
+def origin_conversation_id(meta: dict | None) -> str:
+    """The conversation that first created this artifact, from its metadata
+    `provenance` (written by the shared ArtifactStore for every harness) — the
+    creating conversation is the first entry. Empty when unknown: artifacts
+    predate provenance, and a folder can be edited by later conversations
+    without the first entry ever changing.
+
+    Takes the already-parsed metadata so the card builder does not read
+    `metadata.json` a second time; `task_objects` passes what it loaded.
+    """
+    provenance = (meta or {}).get("provenance") or []
+    if not isinstance(provenance, list) or not provenance:
+        return ""
+    first = provenance[0]
+    if not isinstance(first, dict):
+        return ""
+    return str(first.get("conversation") or "")
+
+
 def _user_files(folder: Path) -> list[Path]:
     """All non-housekeeping files inside an artifact folder, sorted by mtime desc."""
     out: list[Path] = []
@@ -767,6 +786,13 @@ def card_for_folder(
         "primary": meta.get("primary") or None,
         "projectId": project_id,
         "projectName": project_name,
+        # The conversation that produced the artifact, so a comment addressed
+        # with the agent from the artifacts list resumes that chat instead of
+        # opening a fresh one. Empty for artifacts written before provenance —
+        # the client then falls back to a new conversation. Whether the chat is
+        # still reachable is the client's call: it already knows its own
+        # conversations and can fetch the rest.
+        "originConversationId": origin_conversation_id(meta),
         "publishedUrl": _published_url_for(folder, primary),
         "modified": _is_modified(folder, primary, mtime_seconds),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
