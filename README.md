@@ -256,7 +256,11 @@ whether that user is still a member of that organization, and injects
 `X-User-Id` and `X-Organization-Id`. cowork-server validates the shape of those
 headers and then trusts them, so **the gateway being the only route to the pod is
 what makes them trustworthy**, and that is a NetworkPolicy rather than
-anything in this codebase.
+anything in this codebase. `deployment/cowork-server/templates/network-policy.yaml`
+is that policy, on in staging and prod, and it admits only the nginx ingress
+controller pods in the `infrastructure` namespace on port 9010. It is off in PR
+environments, which take base values, so a PR environment does not enforce this
+boundary and a forged-header caller inside one is served.
 A request with no valid pair is answered 401 before any route runs, except on
 `/api/v1/health/`, which the kubelet probes with no headers, and the channel
 webhook paths, which third parties call.

@@ -131,25 +131,26 @@ jobs:
             fi
             sleep 2
           done
-          # Say what did not happen, and do not fail on it yet.
+          # A warning exits 0, so the job stays green while the cross-replica
+          # test silently skips, which reads exactly like "the cross-replica
+          # behaviour is fine". So fail where the port-forward is supposed to
+          # work, and warn where it is known not to.
           #
-          # Failing here is the right end state: a warning exits 0, so the job
-          # stays green while the cross-replica test silently skips, which reads
-          # exactly like "the cross-replica behaviour is fine". But this step is
-          # ALREADY failing on every push to staging, and has been for as long
-          # as the annotations go back, because the runner ServiceAccount has no
-          # `create pods/portforward` in that namespace. Turning it into `exit 1`
-          # before that RBAC lands makes every staging release red and alerts
-          # on-call per push, for a cause that has nothing to do with whatever
-          # change is being shipped.
-          #
-          # So: grant the runner `pods/portforward` in
-          # Kubernetes-Foundational-Services, confirm this step goes green on a
-          # staging push, and then make this an error.
+          # It works in the deploy namespaces, where `<env>-gha-runner-deploy`
+          # holds `create pods/portforward`. It does not work in a PR
+          # environment: `<env>-gha-runner-prenv` is read-only on purpose and
+          # does not carry that verb, so the test skips there and the skip is
+          # said out loud rather than passing quietly.
           echo "::warning::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
-          echo "::warning::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first;" \
-               "this step cannot pass without it."
-          exit 0
+          if [[ "$ns" == pr-* ]]; then
+            echo "::warning::The cross-replica test did NOT run. A PR environment cannot port-forward:" \
+                 "the runner is read-only there by design."
+            exit 0
+          fi
+          echo "::error::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first:" \
+               "kubectl -n $ns auth can-i create pods/portforward" \
+               "--as=system:serviceaccount:infrastructure:<env>-gha-runner"
+          exit 1
 
       - name: Run integration tests
         env:
