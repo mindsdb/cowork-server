@@ -558,6 +558,51 @@ def _conversation_at(project_dir):
     return SimpleNamespace(project=project, project_id=project.id)
 
 
+def _patch_conversation_service(monkeypatch, conversation):
+    class _Svc:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return conversation
+
+    monkeypatch.setattr(responses_mod, "ConversationService", _Svc)
+
+
+def test_remote_artifacts_context_diffs_the_project_base(monkeypatch, tmp_path):
+    """ENG-2056: the pod writes artifacts into the PROJECT-level base (mounted
+    at /project-artifacts), not conversations/<id>/.anton/artifacts — so that is
+    the directory the end-of-turn snapshot/diff must watch. A context still
+    pointed at the per-conversation dir sees an empty diff, and the turn's
+    artifact silently gets no card and no publish."""
+    project_dir = tmp_path / "proj"
+    conversation = _conversation_at(project_dir)
+    _patch_conversation_service(monkeypatch, conversation)
+
+    ctx = ResponsesHandler._remote_artifacts_context(None, uuid4())
+
+    assert ctx is not None
+    assert ctx[1] == project_dir / ".anton" / "artifacts"
+    assert ctx[2] == str(conversation.project_id)
+    assert ctx[3] == "proj"
+
+
+def test_stage_remote_workspace_files_creates_the_project_artifacts_base(monkeypatch, tmp_path):
+    """ENG-2056: scratchpad-controller mounts `<project>/.anton/artifacts` into
+    the pod with a subPath, which requires the directory to exist before the pod
+    starts. Project creation does not make it, so the pre-turn staging must —
+    and must have made it even when a later staging step degrades (the fakes
+    here make the attachment staging blow up on purpose)."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    conversation = _conversation_at(project_dir)
+    _patch_conversation_service(monkeypatch, conversation)
+
+    ResponsesHandler._stage_remote_workspace_files(None, uuid4())
+
+    assert (project_dir / ".anton" / "artifacts").is_dir()
+
+
 @pytest.mark.asyncio
 async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tmp_path):
     saved = {}

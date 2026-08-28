@@ -169,9 +169,10 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
     from cowork.services.artifact_publish_key import PublishKey
     from cowork.services.publish import _resolve_publish_endpoint
 
-    # A project can have several artifacts roots in org mode (one per
-    # conversation — see artifact_roots.CONVERSATIONS_DIRNAME), so the slug alone
-    # does not name a directory. Pick the root that actually holds it.
+    # A project can have several artifacts roots in org mode (the shared
+    # project base plus one legacy root per conversation — ENG-2056, see
+    # artifact_roots._project_artifact_bases), so the slug alone does not name
+    # a directory. Pick the root that actually holds it.
     #
     # MVP limitation: the slug is only unique WITHIN a conversation, so two
     # conversations can both produce e.g. `untitled-artifact` and this deletes
