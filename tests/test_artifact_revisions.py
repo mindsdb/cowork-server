@@ -165,6 +165,49 @@ def test_legacy_identity_widening_preserves_metadata_mtime(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8"))["id"] == artifact_id
 
 
+def test_a_symlinked_metadata_is_not_read_through(tmp_path):
+    """An artifact folder is agent-writable, so `metadata.json` can be swapped
+    for a link. Following it would make identity resolution read a file of the
+    writer's choosing; refusing reads as "this folder has no usable identity",
+    which is what every caller already handles."""
+    import pytest as _pytest
+
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"id": "f" * 32, "createdAt": "2026-08-25"}), encoding="utf-8")
+    folder = tmp_path / "planted"
+    folder.mkdir()
+    (folder / "metadata.json").symlink_to(outside)
+
+    with _pytest.raises(OSError):
+        ensure_full_id(folder)
+
+
+def test_widening_does_not_retimestamp_a_symlink_target(tmp_path):
+    """The mtime restore is the one part of the write a planted link could still
+    steer: `os.replace` acts on the link, but `os.utime` would follow it."""
+    import os
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("untouched", encoding="utf-8")
+    target_ns = outside.stat().st_mtime_ns - 7_200_000_000_000  # two hours ago
+    os.utime(outside, ns=(target_ns, target_ns))
+
+    folder = tmp_path / "legacy"
+    folder.mkdir()
+    (folder / "metadata.json").symlink_to(outside)
+    metadata = {"id": "c0c1c2c3", "createdAt": "2026-08-25", "name": "Old"}
+
+    # Metadata supplied by the caller, so the read is skipped and the write path
+    # runs against the link — the shape this guard is about.
+    try:
+        ensure_full_id(folder, metadata)
+    except (OSError, ValueError):
+        pass
+
+    assert outside.read_text(encoding="utf-8") == "untouched"
+    assert outside.stat().st_mtime_ns == target_ns
+
+
 def test_identity_resolution_reuses_the_container_index(artifact, monkeypatch):
     folder, _metadata, artifact_id = artifact
     unrelated = folder.parent / "unrelated"
