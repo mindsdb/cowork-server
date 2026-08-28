@@ -14,7 +14,7 @@ import shutil
 import stat
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -26,10 +26,14 @@ from pydantic import BaseModel
 
 from cowork.common.paths import (
     O_NOFOLLOW,
+    PinnedDir,
     dir_lstat,
     dir_open,
+    dir_scandir,
     dir_unlink,
+    open_pinned_child,
     opened_subdir_nofollow,
+    pinned_dir,
     safe_join,
 )
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
@@ -307,6 +311,16 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
         raise HTTPException(status_code=404, detail="File not found")
 
 
+def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
+    """Authorize a validated lexical path before an fd-relative mutation.
+
+    Mutation helpers refuse symlinks in every component, so the lexical
+    conversation id is the only workspace the operation can reach.
+    """
+    if not _conversation_workspace_ok(path.value, scoped):
+        raise HTTPException(status_code=404, detail="File not found")
+
+
 @contextmanager
 def _pinned_fd(target: Path, base: Path, flags: int) -> Iterator[int]:
     """Yield a descriptor for `target`, opening every component below `base`
@@ -350,6 +364,50 @@ def _pinned_regular_file(target: Path, base: Path, flags: int = os.O_RDONLY):
         cm.__exit__(None, None, None)
         raise HTTPException(status_code=404, detail="File not found")
     return cm, fd, st
+
+
+def _existing_entry_name(directory: PinnedDir, requested: str) -> str:
+    """Return the directory's own name for an exact request component.
+
+    A validated request component is safe to compare, but keeping it as the
+    argument to ``openat``/``unlinkat`` still leaves static analysis (and a
+    future relaxed validator) with an HTTP-to-filesystem data flow.  Resolve
+    the selector against the already-pinned directory instead.  The returned
+    value originates in ``scandir``, so every filesystem operation below uses
+    a name supplied by that directory, never the HTTP string.
+    """
+    with dir_scandir(directory) as entries:
+        for entry in entries:
+            if entry.name == requested:
+                return entry.name
+    raise FileNotFoundError
+
+
+@contextmanager
+def _opened_existing_project_entry(
+    base: Path, requested_parts: tuple[str, ...]
+) -> Iterator[tuple[PinnedDir, str]]:
+    """Pin the parent of an existing project entry and yield its disk name.
+
+    Each descent name is obtained from the pinned directory itself and each
+    directory is opened with ``O_NOFOLLOW``.  This preserves nested project
+    paths without ever joining a request value into a path or handing one to a
+    filesystem syscall.
+    """
+    if not requested_parts:
+        raise FileNotFoundError
+    with pinned_dir(base) as root, ExitStack() as descendants:
+        current = root
+        for requested in requested_parts[:-1]:
+            name = _existing_entry_name(current, requested)
+            parent_stat = dir_lstat(current, name)
+            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                parent_stat.st_mode
+            ):
+                raise FileNotFoundError
+            current = open_pinned_child(current, name)
+            descendants.callback(current.close)
+        yield current, _existing_entry_name(current, requested_parts[-1])
 
 
 def _pinned_stream(target: Path, base: Path, *, media_type: str, headers: dict) -> StreamingResponse:
@@ -515,21 +573,18 @@ def delete_project_file(
     project_name: str, path: ProjectMutationPathDep, scoped: ScopedSessionDep
 ):
     base = _project_dir(project_name, scoped)
-    target = _safe_relpath(path, base)
-    _require_workspace_access(target, base, scoped)
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    if target.is_dir():
-        raise HTTPException(status_code=400, detail="Path is a directory")
-    # Pinned like the read and the write: an unlink that follows a planted
-    # component deletes another member's file.
-    rel = target.relative_to(base.resolve())
-    *dirs, name = rel.parts
+    _require_workspace_path(path, scoped)
+    # The request components are selectors only. Every name used below comes
+    # back from scanning a pinned directory, which both breaks the HTTP-to-path
+    # data flow and keeps a planted symlink from redirecting the deletion.
     try:
-        with opened_subdir_nofollow(base, *dirs) as pinned:
-            if stat.S_ISLNK(dir_lstat(pinned, name).st_mode):
+        with _opened_existing_project_entry(base, path.parts) as (parent, disk_name):
+            target_stat = dir_lstat(parent, disk_name)
+            if stat.S_ISLNK(target_stat.st_mode):
                 raise HTTPException(status_code=404, detail="File not found")
-            dir_unlink(pinned, name)
+            if stat.S_ISDIR(target_stat.st_mode):
+                raise HTTPException(status_code=400, detail="Path is a directory")
+            dir_unlink(parent, disk_name)
     except HTTPException:
         raise
     except (OSError, ValueError):

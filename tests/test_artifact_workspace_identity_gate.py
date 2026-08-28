@@ -6,9 +6,13 @@ signature would look tested while never running. These go over HTTP.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+from uuid import UUID
+
 import pytest
 from fastapi.testclient import TestClient
 
+from cowork.api.v1 import artifact_scope
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -76,3 +80,29 @@ def test_the_draft_preview_route_is_gated_too(client, no_resolution):
     res = client.get("/api/v1/artifacts/drafts/local/not-a-uuid/index.html")
 
     assert res.status_code == 422, res.text
+
+
+def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
+    """The equal request spelling chooses a DB value; it is never reused as
+    the UUID handed to artifact-root discovery."""
+    server_id = UUID("0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b")
+    request_ref = (str(server_id) + "x")[:-1]
+    seen = []
+
+    class Projects:
+        def __init__(self, _session):
+            pass
+
+        def list_projects(self):
+            return [SimpleNamespace(id=server_id)]
+
+    monkeypatch.setattr("cowork.services.projects.ProjectService", Projects)
+    monkeypatch.setattr(
+        artifact_scope,
+        "artifacts_sources_for_project",
+        lambda _session, project_id, **_kwargs: seen.append(project_id) or [],
+    )
+
+    assert artifact_scope._sources_for_project_ref(object(), request_ref) == []
+    assert seen == [server_id]
+    assert seen[0] is server_id

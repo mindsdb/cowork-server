@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import stat
 import uuid
 from collections import OrderedDict
@@ -432,6 +433,14 @@ def _root_still_current(source: "ProjectArtifacts", opened: PinnedDir) -> bool:
 def _indexed_artifacts(
     source: "ProjectArtifacts", artifact_id: str
 ) -> tuple[tuple[Path, dict], ...]:
+    """Revalidate one identity copied from this source's own index.
+
+    ``artifact_id`` is deliberately not a request value.  Public resolution
+    first snapshots the identities found on disk, compares the requested UUID
+    with those values in memory, and passes the matching *indexed* spelling
+    here.  Keeping that distinction structural prevents a request parameter
+    from selecting a directory name inside this filesystem-facing helper.
+    """
     try:
         with opened_artifact_root(source) as base:
             # The lexical key deliberately does not resolve symlinks.  The
@@ -464,14 +473,80 @@ def _indexed_artifacts(
         return ()
 
 
+def _indexed_identities(
+    source: "ProjectArtifacts", *, force_refresh: bool = False
+) -> tuple[tuple[str, ...], bool]:
+    """Snapshot server-discovered identities without accepting a lookup key.
+
+    The boolean says whether the ordinary read reused a cache entry.  Callers
+    use it to preserve the existing one-refresh-on-miss behavior for metadata
+    created inside an already-existing artifact folder (which need not change
+    the artifacts directory's mtime).
+    """
+    try:
+        with opened_artifact_root(source) as base:
+            cache_key = (_normalized_path(base.path), _directory_version(base))
+            index, was_cached = _identity_index(
+                *cache_key,
+                base,
+                force_refresh=force_refresh,
+            )
+            if not _root_still_current(source, base):
+                return (), was_cached
+            return tuple(index), was_cached
+    except (OSError, ValueError):
+        return (), False
+
+
+def _matching_indexed_identity(
+    indexed_identities: tuple[str, ...], wanted: str
+) -> str | None:
+    """Return the server-derived spelling equal to ``wanted``.
+
+    Returning ``known`` rather than ``wanted`` is the taint boundary: the
+    request UUID participates only in a constant-time in-memory comparison and
+    is never handed to root discovery, directory opening, or path creation.
+    """
+    for known in indexed_identities:
+        if secrets.compare_digest(known, wanted):
+            return known
+    return None
+
+
+def _resolved_from_source(
+    source: "ProjectArtifacts", wanted: str
+) -> tuple[tuple[Path, dict], ...]:
+    """Match a request identity to an index before filesystem revalidation."""
+    identities, was_cached = _indexed_identities(source)
+    known = _matching_indexed_identity(identities, wanted)
+    if known is not None:
+        return _indexed_artifacts(source, known)
+
+    # A metadata file appearing inside an existing folder may not update the
+    # root directory clock.  Refresh a cached miss once, just as the previous
+    # target-keyed implementation did, then still pass only the index's value
+    # into the filesystem-facing validator.
+    if was_cached:
+        identities, _ = _indexed_identities(source, force_refresh=True)
+        known = _matching_indexed_identity(identities, wanted)
+        if known is not None:
+            return _indexed_artifacts(source, known)
+    return ()
+
+
 def resolve_artifact_folder(
     sources: list["ProjectArtifacts"], artifact_id: str
 ) -> tuple["ProjectArtifacts", Path, dict]:
-    """Resolve an id only inside roots already authorized for the caller."""
+    """Resolve an id only inside roots already authorized for the caller.
+
+    Root discovery and identity indexing never receive ``artifact_id``.  The
+    request value selects a server-discovered identity in memory; only that
+    trusted copy can enter the descriptor-relative revalidation path.
+    """
     wanted = canonical_artifact_id(artifact_id)
     matches: list[tuple["ProjectArtifacts", Path, dict]] = []
     for source in sources:
-        for folder, metadata in _indexed_artifacts(source, wanted):
+        for folder, metadata in _resolved_from_source(source, wanted):
             matches.append((source, folder, metadata))
 
     if not matches:

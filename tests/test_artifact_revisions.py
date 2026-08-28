@@ -236,6 +236,32 @@ def test_identity_resolution_reuses_the_container_index(artifact, monkeypatch):
     assert calls == first_lookup_calls + 1  # hot lookup reads only its target
 
 
+def test_identity_revalidation_receives_the_server_index_value(monkeypatch, tmp_path):
+    """A request UUID only matches the index in memory; the filesystem-facing
+    validator receives the distinct string object supplied by that index."""
+    server_id = _full_id("77777777-7777-4777-8777-777777777777")
+    request_id = (server_id + "x")[:-1]
+    folder = tmp_path / "artifact"
+    source = ProjectArtifacts(tmp_path, None, "test")
+    seen = []
+
+    monkeypatch.setattr(
+        identity_service,
+        "_indexed_identities",
+        lambda _source, **_kwargs: ((server_id,), False),
+    )
+
+    def revalidate(_source, indexed_id):
+        seen.append(indexed_id)
+        return ((folder, {"id": server_id}),)
+
+    monkeypatch.setattr(identity_service, "_indexed_artifacts", revalidate)
+
+    assert resolve_artifact_folder([source], request_id)[1] == folder
+    assert seen == [server_id]
+    assert seen[0] is server_id
+
+
 def test_identity_miss_refreshes_existing_folder_metadata(artifact):
     folder, _metadata, _artifact_id = artifact
     pending = folder.parent / "pending"
