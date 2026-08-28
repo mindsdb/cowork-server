@@ -355,6 +355,18 @@ class OAuthSettings(Settings):
         default_factory=lambda: str(cowork_home() / "oauth_state.json"),
         description="Path to the file used to persist pending OAuth state",
     )
+    auth_service_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("AUTH_SERVICE_BASE_URL", "COWORK_TURN_AUTH_INTERNAL_BASE_URL"),
+        description=(
+            "Base URL of the auth service's public API, used in org/cloud mode to proxy the "
+            "OAuth Connector Lifecycle (start/status/catalogue), the Google Drive Picker token "
+            "mint, and the turn-key oauth-token base URL anton calls directly. This is the same "
+            "auth service TurnQueueSettings.auth_internal_base_url reaches (just different, "
+            "public /v1/... routes instead of /internal/...) — accepts that env var as a "
+            "fallback so a single k8s config value covers both."
+        ),
+    )  # AUTH_SERVICE_BASE_URL
 
 
 class MemorySettings(Settings):
@@ -596,13 +608,15 @@ class AppSettings(Settings):
         ),
     )
     identity_enforce: Literal["audit", "enforce"] = Field(
-        default="audit",
+        default="enforce",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
-            "Org-mode identity enforcement. 'audit' (default): requests without "
-            "identity headers are logged and allowed through. 'enforce': they "
-            "are rejected with 401. Flip to 'enforce' once the audit log shows "
-            "all legitimate identity-less callers are handled."
+            "Org-mode identity enforcement. 'enforce' (default): a request "
+            "without identity headers is rejected with 401. 'audit': it is "
+            "logged and allowed through, which is the rollout mode the org "
+            "cutover needed and now has to be asked for. Dropping the env var "
+            "must not reopen the no-principal path, so the default is the "
+            "closed one."
         ),
     )
     owner: str = Field(
