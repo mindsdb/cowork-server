@@ -1,15 +1,21 @@
-# The ingress restriction is NOT enabled here yet, and staging is where it will
-# go first when it is: cowork-server has no deployment in the dev namespace and
-# PR environments take base values only, so there is nowhere else to rehearse.
+# Staging enables the ingress restriction first, and it is the only place it can
+# be rehearsed: cowork-server has no deployment in the dev namespace and PR
+# environments take base values only.
 #
-# What has to land before flipping this to true, both outside this repo:
-#   1. The CI deploy ServiceAccount needs `create networkpolicies` in this
-#      namespace. It does not have it, so enabling this fails the release and
-#      --atomic rolls the deploy back. See templates/network-policy.yaml.
-#   2. A probe that can actually see the policy. port-forward cannot.
+# The prerequisite outside this repo is now in place. `newdev-gha-runner` gets
+# `create networkpolicies` in this namespace from the `<env>-gha-runner-deploy`
+# role in Kubernetes-Foundational-Services. Without it the release fails and
+# --atomic rolls the whole deploy back, so confirm the runner chart was rolled
+# before merging a change here:
+#   kubectl --context newdev -n staging auth can-i create networkpolicies \
+#     --as=system:serviceaccount:infrastructure:newdev-gha-runner
 #
-# When it does get enabled: watch both replicas stay Ready through the rollout,
-# then run the forged-header curl from a pod in another namespace by hand.
+# Watch both replicas stay Ready through the rollout, then run the forged-header
+# curl from a pod in another namespace. A port-forward cannot see this policy:
+# it enters the pod's network namespace and never crosses the veth where the
+# policy is enforced.
+networkPolicy:
+  enabled: true
 
 deployment:
   ingress:

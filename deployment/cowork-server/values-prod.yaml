@@ -1,3 +1,20 @@
+# Prod goes second, behind a staging soak. This value reaches prod when
+# `staging` merges to `main`, so staging has already run under the policy by the
+# time it applies here.
+#
+# Roll the gha-runner-scale-set chart on newprod BEFORE this reaches `main`.
+# `newprod-gha-runner` needs `create networkpolicies` in the prod namespace; the
+# release fails without it and --atomic rolls the whole deploy back. Confirm:
+#   kubectl --context newprod -n prod auth can-i create networkpolicies \
+#     --as=system:serviceaccount:infrastructure:newprod-gha-runner
+#
+# newprod enforces with Cilium, which claims a pod when the pod is created, so a
+# pod that started before the policy is not covered by it. A release rolls the
+# pods anyway because the image tag changes; if you enable this without one, run
+# `kubectl -n prod rollout restart deployment/cowork-server`.
+networkPolicy:
+  enabled: true
+
 deployment:
   ingress:
     enabled: true
