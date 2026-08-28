@@ -72,10 +72,39 @@ def _is_migrated(metadata: dict, resolved: str) -> bool:
     return metadata.get("id") == resolved and not metadata.get("stableId")
 
 
+def _read_no_follow(path: Path) -> str:
+    """Read `path`, refusing to follow it if it is a symlink.
+
+    An artifact folder is agent-writable, so `metadata.json` can be replaced
+    with a link to something outside the artifact. Reading through it would turn
+    identity resolution into a file read of the attacker's choosing, and the
+    caller here treats an unreadable identity as "skip this folder", which is
+    the correct outcome for a link too. `O_NOFOLLOW` raises `ELOOP` (an
+    `OSError`) in that case, which every caller of this module already handles.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            return stream.read()
+    except BaseException:
+        # `fdopen` owns the descriptor once it succeeds; close it ourselves only
+        # if the wrapping itself failed.
+        os.close(fd)
+        raise
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        # `O_EXCL | O_NOFOLLOW`: the name carries a uuid4 so a collision is not
+        # realistic, but creating rather than opening is what makes "write to a
+        # file somebody planted here" impossible rather than improbable.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        # `os.replace` acts on the link itself, never its target, so a symlinked
+        # `metadata.json` is replaced by the real document instead of writing
+        # through it.
         os.replace(tmp, path)
     finally:
         try:
@@ -92,7 +121,7 @@ def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dic
     """
     path = folder / "metadata.json"
     if metadata is None:
-        metadata = json.loads(path.read_text(encoding="utf-8"))
+        metadata = json.loads(_read_no_follow(path))
     resolved = _resolved_id(metadata, folder)
     if _is_migrated(metadata, resolved):
         return resolved, metadata
@@ -101,7 +130,7 @@ def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dic
     # Merge into the latest durable document instead of writing the stale
     # snapshot back over unrelated metadata fields.
     try:
-        latest = json.loads(path.read_text(encoding="utf-8"))
+        latest = json.loads(_read_no_follow(path))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Artifact metadata is unreadable") from exc
     resolved = _resolved_id(latest, folder)
@@ -116,7 +145,7 @@ def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dic
     # would mark every legacy artifact as just-updated and deliver stale
     # attachments to the chat.
     try:
-        before = path.stat()
+        before = path.stat(follow_symlinks=False)
     except OSError:
         before = None
     try:
@@ -132,7 +161,12 @@ def ensure_full_id(folder: Path, metadata: dict | None = None) -> tuple[str, dic
         return resolved, updated
     if before is not None:
         try:
-            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            # `follow_symlinks=False`: after the replace above `path` is a real
+            # file, but if it was a link a moment earlier this call must not be
+            # what reaches its old target — setting the mtime of an arbitrary
+            # file is the one part of this write a planted link could still
+            # steer.
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns), follow_symlinks=False)
         except OSError:
             pass
     return resolved, updated
