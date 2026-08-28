@@ -232,6 +232,7 @@ class ResponsesHandler:
                         conversation_id=conv_id,
                         harness=self.harness_name,
                         model=request.model,
+                        reasoning_effort=request.reasoning_effort,
                     )
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
@@ -243,6 +244,7 @@ class ResponsesHandler:
                     project_id=self._resolve_project_id(request),
                     harness=self.harness_name,
                     model=request.model,
+                    reasoning_effort=request.reasoning_effort,
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
@@ -251,6 +253,7 @@ class ResponsesHandler:
                 project_id=self._resolve_project_id(request),
                 harness=self.harness_name,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
             )
 
         self.last_conversation_id = str(conversation.id)
@@ -273,7 +276,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=bool(disabled),
-            model=request.model,
+            trace_metadata=trace_metadata,
         )
         trace_metadata = {
             **trace_metadata,
@@ -325,6 +328,7 @@ class ResponsesHandler:
                 harness_input=harness_input,
                 original_content=original_content,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
                 disabled=disabled,
                 harness_name=self.harness_name,
                 harness_id=getattr(harness, "id", None),
@@ -374,6 +378,7 @@ class ResponsesHandler:
                 conversation=conversation,
                 input=harness_input,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
                 disabled_connections=disabled,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
@@ -387,9 +392,13 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
-        model: str | None = None,
+        trace_metadata: dict[str, str] | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        The composer's per-conversation model pick (`request.model`) is
+        deliberately not passed down: it drives Anton's turn, not the gate
+        (see `UserSettings.resolved_gate_model`).
 
         Returns the decision plus pre-minted turn credentials
         (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
@@ -409,17 +418,37 @@ class ResponsesHandler:
                 if message.role in {"user", "assistant"}
             ]
             history.append({"role": "user", "content": self._prompt_text(harness_input)})
-            # The gate resolves the router role + key ambiently; bind the org scope.
-            with use_settings_scope(self.scope):
-                binding, turn_llm = await self._router_binding()
-                decision = await decide_route(
-                    history=history,
-                    has_non_text_input=has_non_text_input,
-                    has_attachments=has_attachments,
-                    has_disabled_connections=has_disabled_connections,
-                    binding=binding,
-                    model_override=model,
-                )
+            # The gate's LLM call is the only one a direct turn makes, and it
+            # is made outside any ChatSession — so without a trace context it
+            # reaches MindsHub anonymous, and a direct turn leaves no trace to
+            # count (ENG-1851 Done-when #1). Installing one attributes the call
+            # to the conversation and stamps the build (ENG-1279), which is what
+            # makes the direct/delegated share answerable from traces.
+            from anton.core.llm.tracing import (
+                TraceContext,
+                reset_trace_context,
+                set_trace_context,
+            )
+
+            trace_token = set_trace_context(TraceContext(
+                session_id=str(conversation_id),
+                harness=self.harness_name,
+                tags=("cowork-gate",),
+                metadata=dict(trace_metadata or {}),
+            ))
+            try:
+                # The gate resolves the router role + key ambiently; bind the org scope.
+                with use_settings_scope(self.scope):
+                    binding, turn_llm = await self._router_binding()
+                    decision = await decide_route(
+                        history=history,
+                        has_non_text_input=has_non_text_input,
+                        has_attachments=has_attachments,
+                        has_disabled_connections=has_disabled_connections,
+                        binding=binding,
+                    )
+            finally:
+                reset_trace_context(trace_token)
             return decision, turn_llm
         except Exception:
             # Any gate-path failure (history query, mint, settings) fails open.
@@ -455,7 +484,7 @@ class ResponsesHandler:
         )
         binding = RouterBinding(
             provider=provider,
-            model=settings.resolved_router_model or MINDS_FREE_MODEL,
+            model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
         return binding, {"correlation_id": corr, "llm": block}
@@ -471,22 +500,23 @@ class ResponsesHandler:
     ) -> AsyncGenerator[str, None] | Response:
         """Return the router model's direct answer without initializing Anton."""
         if not request.stream:
+            text = route.text
             user_message = ConversationService(self.scoped).save_user_message(
                 conversation_id, original_content,
             )
             events = [{
                 "type": "response.output_text.delta",
-                "delta": route.text,
+                "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }, {"type": "response.completed"}]
             ConversationService(self.scoped).save_assistant_turn(
-                conversation_id, route.text, events, harness="cowork-direct",
+                conversation_id, text, events, harness="cowork-direct",
             )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(str(user_message.id), route.text)],
+                output=[self._build_output(str(user_message.id), text)],
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
@@ -520,9 +550,10 @@ class ResponsesHandler:
     ) -> None:
         """Persist and emit a direct answer using the normal detached lifecycle.
 
-        The full answer exists up front, so persistence happens before any
-        frame is emitted — the client can never see a completed turn the DB
-        does not have, and no pending row is needed."""
+        The full answer exists up front — the gate does not return until its
+        stream ends — so persistence happens before any frame is emitted: the
+        client can never see a completed turn the DB does not have, and no
+        pending row is needed."""
         producer_session = None
         try:
             producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
@@ -586,6 +617,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         original_content,
         model: str,
+        reasoning_effort: str | None = None,
         disabled: list[dict] | None,
         harness_name: str,
         harness_id: str | None,
@@ -620,6 +652,7 @@ class ResponsesHandler:
                 buffer=buffer,
                 turn_id=turn_id,
                 turn_llm=turn_llm,
+                disabled=disabled,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -627,6 +660,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             original_content=original_content,
             model=model,
+            reasoning_effort=reasoning_effort,
             disabled=disabled,
             harness_name=harness_name,
             harness_id=harness_id,
@@ -773,6 +807,7 @@ class ResponsesHandler:
         turn_id: int = 0,
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
+        disabled: list[dict] | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: pipe the turn's replies
         through the same SSE formatter as the in-process path (full step /
@@ -846,6 +881,7 @@ class ResponsesHandler:
                     **self._remote_workspace(producer_session, conv_id),
                     correlation_id=(turn_llm or {}).get("correlation_id"),
                     llm=(turn_llm or {}).get("llm"),
+                    disabled=disabled,
                 ):
                     if kind == "turn_delta":
                         yield StreamTextDelta(text=data.get("text", ""))
@@ -1018,6 +1054,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         original_content,
         model: str,
+        reasoning_effort: str | None = None,
         disabled: list[dict] | None,
         harness_name: str,
         harness_id: str | None,
@@ -1096,7 +1133,8 @@ class ResponsesHandler:
             ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=conv, input=harness_input, model=model, disabled_connections=disabled,
+                conversation=conv, input=harness_input, model=model,
+                reasoning_effort=reasoning_effort, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0

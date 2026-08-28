@@ -116,17 +116,15 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
     except ValueError:
         id_ref = None
     if id_ref:
-        from cowork.services.artifact_identity import (
-            ArtifactIdentityConflict,
-            resolve_artifact_folder,
-        )
+        # Resolved through the review path so a reviewer who was granted access
+        # to this draft is told they cannot delete it, instead of being told it
+        # does not exist. Without a grant it still 404s — `require_artifact_owner`
+        # below is what refuses, the resolver only decides visibility.
+        from cowork.api.v1.artifact_scope import review_artifact_for_request
 
-        try:
-            source, folder, _metadata = resolve_artifact_folder(sources, id_ref)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-        except ArtifactIdentityConflict as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        source, folder, _metadata, _is_own = review_artifact_for_request(
+            session, str(project_id), id_ref
+        )
     else:
         source = next((candidate for candidate in sources if (candidate.base / slug).is_dir()), None)
         if source is not None:

@@ -34,6 +34,13 @@ from cowork.models.project import Project
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
 ORG_B = "22222222-2222-2222-2222-222222222222"
+USER_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+# A second member of ORG_A. Same tenant, different person: the axis the org
+# filter alone does not cover.
+USER_A2 = "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2"
+
+#: What the gateway injects on a real org-mode request.
+_IDENTITY = {"X-User-Id": USER_A, "X-Organization-Id": ORG_A}
 
 
 def _set_mode(monkeypatch, mode: str) -> None:
@@ -62,38 +69,46 @@ def session():
         yield s
 
 
-def _scoped(session, org_id: str, user_id: str = "u-1") -> ScopedSession:
+def _scoped(session, org_id: str, user_id: str = USER_A) -> ScopedSession:
     return ScopedSession(session, TenantScope(org_mode=True, org_id=org_id, user_id=user_id))
 
 
-def _project_with_artifact(session, tmp_path, *, name, org_id, slug, conversation=None):
+def _project_with_artifact(
+    session, tmp_path, *, name, org_id, slug, owner=USER_A, conversation=None
+):
     path = tmp_path / (org_id or "local") / name
     row = Project(id=uuid.uuid4(), name=name, path=str(path), org_id=org_id)
     session.add(row)
-    session.commit()
+
     # Org projects carry the conversation segment the cloud pod writes under
     # (artifact_roots.CONVERSATIONS_DIRNAME); desktop projects do not. Mirroring
     # both real layouts here is what makes these tests exercise the resolver
-    # rather than a shape only the tests believe in.
-    conversation_id = UUID(str(conversation)) if conversation else uuid.uuid4()
+    # rather than a shape only the tests believe in. The directory name is the
+    # conversation's id and the row behind it is what says who owns the
+    # artifacts inside, so both have to be real.
+    # `conversation` pins that id when a test needs the artifact's
+    # `originConversationId` to point at a chat it already knows.
+    workspace = path
     if org_id is not None:
+        conversation_id = UUID(str(conversation)) if conversation else uuid.uuid4()
         session.add(
             Conversation(
                 id=conversation_id,
-                topic=f"{name} task",
+                topic=f"{name} chat",
                 project_id=row.id,
                 org_id=org_id,
-                created_by="u-1",
+                created_by=owner,
             )
         )
-        session.commit()
-    workspace = path / "conversations" / str(conversation_id) if org_id is not None else path
+        workspace = path / "conversations" / str(conversation_id)
+
     folder = workspace / ".anton" / "artifacts" / slug
     folder.mkdir(parents=True)
     (folder / "index.html").write_text("<html></html>")
     (folder / "metadata.json").write_text(
         json.dumps({"slug": slug, "name": slug, "type": "html-app"})
     )
+    session.commit()
     return row, folder
 
 
@@ -129,7 +144,29 @@ async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     assert "secret" not in slugs
 
 
-async def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
+def test_list_hides_another_members_artifacts(session, tmp_path, org_mode):
+    """Same org, different chat. Live artifacts live inside a conversation, so
+    they inherit that conversation's privacy rather than the project's sharing.
+
+    Two projects here, because `_project_with_artifact` builds one per call. The
+    one-project-two-owners case, which is what a narrowing of the filter to
+    per-project granularity would slip past, is pinned at the resolver instead:
+    `test_artifact_roots.py::test_sources_for_project_skip_another_members_conversations`.
+    """
+    _project_with_artifact(
+        session, tmp_path, name="shared", org_id=ORG_A, slug="theirs", owner=USER_A2
+    )
+    _project_with_artifact(
+        session, tmp_path, name="also-mine", org_id=ORG_A, slug="mine", owner=USER_A
+    )
+
+    slugs = [c["slug"] for c in ep.artifacts_for_request(_scoped(session, ORG_A, USER_A))]
+
+    assert "mine" in slugs
+    assert "theirs" not in slugs
+
+
+def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
     row, _ = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="other", org_id=ORG_A, slug="second")
 
@@ -237,7 +274,7 @@ async def test_org_source_read_and_manual_edit_are_project_scoped(
         _scoped(session, ORG_A),
     )
 
-    assert saved["revision"]["actor"] == {"kind": "manual", "id": "u-1"}
+    assert saved["revision"]["actor"] == {"kind": "manual", "id": USER_A}
     assert (folder / "index.html").read_text() == "<html><h1>Edited</h1></html>"
 
 
@@ -258,19 +295,41 @@ async def test_org_source_read_cannot_cross_org(session, tmp_path, org_mode):
         assert err.value.status_code == 404
 
 
-async def test_same_org_reviewer_can_preview_but_cannot_edit_source(
-    session, tmp_path, org_mode
-):
-    row, _folder = _project_with_artifact(
-        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
+async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", org_id=ORG_A):
+    """Own an artifact and open it for same-org review, the way the owner does.
+
+    The grant is the whole point of these tests: a project is org-shared but the
+    conversation workspace under it is private (ENG-1910), so without an owner
+    action a co-member cannot see the artifact at all.
+    """
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=org_id, slug=slug
     )
-    owner_card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
-    assert owner_card["capabilities"]["role"] == "owner"
+    card = ep.artifacts_for_request(_scoped(session, org_id), project_id=row.id)[0]
+
+    async def fake_provision(*_args, **_kwargs):
+        return card["artifactKey"]
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_access.provision_draft_review_access",
+        fake_provision,
+    )
+    enabled = await workspace_ep.enable_artifact_comments(
+        str(row.id), card["id"], _scoped(session, org_id)
+    )
+    assert enabled["enabled"] is True
+    return row, folder, card
+
+
+async def test_same_org_reviewer_can_preview_but_cannot_edit_source(
+    session, tmp_path, org_mode, monkeypatch
+):
+    row, _folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
     with Session(session.get_bind()) as reviewer_session:
-        reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
-        card = ep.artifacts_for_request(reviewer, project_id=row.id)[0]
-        assert card["capabilities"]["role"] == "reviewer"
-        assert card["capabilities"]["canEdit"] is False
+        reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
+        entry = await workspace_ep.artifact_review_entry(str(row.id), card["id"], reviewer)
+        assert entry["capabilities"]["role"] == "reviewer"
+        assert entry["capabilities"]["canEdit"] is False
 
         draft = await workspace_ep.serve_private_draft(
             str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
@@ -284,26 +343,49 @@ async def test_same_org_reviewer_can_preview_but_cannot_edit_source(
         assert err.value.status_code == 403
 
 
+async def test_ungranted_draft_stays_invisible_to_a_co_member(session, tmp_path, org_mode):
+    """No owner action, no access — and the refusal is a 404, so a co-member
+    cannot use the review routes to learn that the artifact exists."""
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
+    )
+    artifact_id, _metadata = ensure_full_id(folder)
+    with Session(session.get_bind()) as reviewer_session:
+        reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
+
+        for call in (
+            workspace_ep.artifact_review_entry(str(row.id), artifact_id, reviewer),
+            workspace_ep.serve_private_draft(
+                str(row.id), artifact_id, "index.html", MagicMock(query_params={}), reviewer
+            ),
+        ):
+            with pytest.raises(HTTPException) as err:
+                await call
+            assert err.value.status_code == 404
+
+
+async def test_reviewer_cannot_provision_draft_review(session, tmp_path, org_mode, monkeypatch):
+    """Provisioning mints an auth rule and reopens a private workspace, so it is
+    the owner's decision. A reviewer's client reads `review` instead."""
+    row, _folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
+    with Session(session.get_bind()) as reviewer_session:
+        with pytest.raises(HTTPException) as err:
+            await workspace_ep.enable_artifact_comments(
+                str(row.id), card["id"], _scoped(reviewer_session, ORG_A, user_id=USER_A2)
+            )
+
+    assert err.value.status_code == 403
+
+
 async def test_same_org_reviewer_receives_the_current_revision_for_comments(
     session, tmp_path, org_mode, monkeypatch
 ):
-    row, _folder = _project_with_artifact(
-        session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
-    )
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
-
-    async def fake_provision(*_args, **_kwargs):
-        return card["artifactKey"]
-
-    monkeypatch.setattr(
-        "cowork.services.artifact_access.provision_draft_review_access",
-        fake_provision,
-    )
+    row, _folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
     with Session(session.get_bind()) as reviewer_session:
-        result = await workspace_ep.enable_artifact_comments(
+        result = await workspace_ep.artifact_review_entry(
             str(row.id),
             card["id"],
-            _scoped(reviewer_session, ORG_A, user_id="u-2"),
+            _scoped(reviewer_session, ORG_A, user_id=USER_A2),
         )
 
     assert result["capabilities"]["role"] == "reviewer"
@@ -313,11 +395,9 @@ async def test_same_org_reviewer_receives_the_current_revision_for_comments(
 
 
 async def test_fullstack_draft_preview_cannot_read_backend_source(
-    session, tmp_path, org_mode
+    session, tmp_path, org_mode, monkeypatch
 ):
-    row, folder = _project_with_artifact(
-        session, tmp_path, name="mine", org_id=ORG_A, slug="app"
-    )
+    row, folder, _card = await _grant_draft_review(session, tmp_path, monkeypatch, slug="app")
     (folder / "static").mkdir()
     (folder / "index.html").replace(folder / "static" / "index.html")
     (folder / "static" / "app.js").write_text("console.log('safe')")
@@ -330,7 +410,7 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
     }))
     card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
     with Session(session.get_bind()) as reviewer_session:
-        reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
+        reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         asset = await workspace_ep.serve_private_draft(
             str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer
         )
@@ -344,10 +424,10 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
 
 
 async def test_fullstack_draft_preview_refuses_a_root_level_primary(
-    session, tmp_path, org_mode
+    session, tmp_path, org_mode, monkeypatch
 ):
-    row, folder = _project_with_artifact(
-        session, tmp_path, name="mine", org_id=ORG_A, slug="legacy-app"
+    row, folder, _card = await _grant_draft_review(
+        session, tmp_path, monkeypatch, slug="legacy-app"
     )
     (folder / "backend.py").write_text("API_SECRET = 'server-only'")
     (folder / "metadata.json").write_text(json.dumps({
@@ -358,7 +438,7 @@ async def test_fullstack_draft_preview_refuses_a_root_level_primary(
     }))
     card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
     with Session(session.get_bind()) as reviewer_session:
-        reviewer = _scoped(reviewer_session, ORG_A, user_id="u-2")
+        reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
                 str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
@@ -392,7 +472,7 @@ async def test_delete_by_artifact_id_selects_the_exact_duplicate_slug(
             topic="second task",
             project_id=row.id,
             org_id=ORG_A,
-            created_by="u-1",
+            created_by=USER_A,
         )
     )
     session.commit()
@@ -425,6 +505,26 @@ async def test_delete_by_artifact_id_selects_the_exact_duplicate_slug(
 
 
 async def test_reviewer_cannot_delete_an_owners_artifact(
+    session, tmp_path, org_mode, publish_key, monkeypatch
+):
+    """A granted reviewer sees the artifact, so the delete is refused as 403 —
+    not hidden as a 404, which would read as "already gone" to a client that is
+    looking at the draft."""
+    row, folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
+
+    with Session(session.get_bind()) as reviewer_session:
+        with pytest.raises(HTTPException) as err:
+            await ep.delete_artifact_for_request(
+                _scoped(reviewer_session, ORG_A, user_id=USER_A2),
+                card["id"],
+                project_id=row.id,
+            )
+
+    assert err.value.status_code == 403
+    assert folder.exists()
+
+
+async def test_ungranted_delete_by_a_co_member_is_404(
     session, tmp_path, org_mode, publish_key
 ):
     row, folder = _project_with_artifact(
@@ -434,10 +534,29 @@ async def test_reviewer_cannot_delete_an_owners_artifact(
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A, user_id="u-2"), artifact_id, project_id=row.id
+            _scoped(session, ORG_A, user_id=USER_A2), artifact_id, project_id=row.id
         )
 
-    assert err.value.status_code == 403
+    assert err.value.status_code == 404
+    assert folder.exists()
+
+
+async def test_delete_cannot_reach_another_members_artifact(
+    session, tmp_path, org_mode, publish_key
+):
+    """The project is shared, so the scoped read hands it over and the org filter
+    is satisfied. What stops the delete is that none of the roots under it belong
+    to the caller, and a slug that resolves to no root of theirs is a miss."""
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="shared-proj", org_id=ORG_A, slug="theirs", owner=USER_A
+    )
+
+    with pytest.raises(HTTPException) as err:
+        await ep.delete_artifact_for_request(
+            _scoped(session, ORG_A, USER_A2), "theirs", project_id=row.id
+        )
+
+    assert err.value.status_code == 404
     assert folder.exists()
 
 
@@ -484,15 +603,21 @@ async def test_delete_in_desktop_hits_the_named_project_not_the_first_one(
     "/api/v1/publish/",
 ])
 def test_desktop_only_endpoints_are_403_in_org_mode(org_mode, path):
-    # TestClient is fine here: require_local_tenancy reads the setting at request
-    # time, so the app's build-time mode is irrelevant.
+    # Build the app under the mode this test names instead of importing the
+    # module-level `app`. That one is created on first import and keeps
+    # whichever middleware stack the mode in force at that moment gave it, so
+    # importing it makes the answer depend on which test file ran first.
+    #
+    # The identity headers are what the gateway injects on every real request.
+    # Without them the principal middleware answers 401 before the guard is
+    # reached, which says nothing about the guard.
     #
     # 403 rather than 501 so the edge books the refusal as a client error. The
     # capability 501 in handlers/responses.py is a different thing and keeps its
     # status; tests/test_no_execution_in_org_mode.py pins it.
-    from cowork.server import app
+    from cowork.server import create_app
 
-    res = TestClient(app).get(path)
+    res = TestClient(create_app()).get(path, headers=_IDENTITY)
     assert res.status_code == 403
     # require_local answers 403 too, so the detail is what tells the two
     # refusals apart, and it is what tells the caller why.
@@ -500,12 +625,13 @@ def test_desktop_only_endpoints_are_403_in_org_mode(org_mode, path):
 
 
 def test_desktop_only_endpoints_are_reachable_in_local_mode(local_mode):
-    from cowork.server import app
+    from cowork.server import create_app
 
     # /status never raises for an unknown path, so a guard that stays quiet
     # means 200. Asserting the real status rather than "not the refusal" keeps
-    # this test failing if the guard ever fires in local mode.
-    assert TestClient(app).get("/api/v1/artifacts/status?path=/nope").status_code == 200
+    # this test failing if the guard ever fires in local mode. No identity
+    # headers: the desktop sends none and local mode wires no middleware.
+    assert TestClient(create_app()).get("/api/v1/artifacts/status?path=/nope").status_code == 200
 
 
 # ── desktop project_path filter ────────────────────────────────────────────
