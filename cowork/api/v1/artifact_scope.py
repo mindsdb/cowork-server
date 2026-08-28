@@ -2,18 +2,9 @@
 from __future__ import annotations
 
 import os
-import re
 from uuid import UUID
 
 from fastapi import HTTPException, status
-
-#: The only shape an artifact identity may have by the time it selects a folder:
-#: 32 lowercase hex characters, anchored. `canonical_artifact_id` already
-#: guarantees it (it returns `UUID(value).hex`), so this is a second, explicit
-#: statement of the same rule rather than a new one — worth its line because
-#: this is the point where a request-supplied string starts choosing a path, and
-#: an allowlist is checkable at a glance by a reader and by a static analyzer.
-_CANONICAL_ARTIFACT_ID = re.compile(r"\A[0-9a-f]{32}\Z")
 
 from cowork.db.scoped import ScopedSession
 from cowork.services.artifact_roots import (
@@ -110,14 +101,6 @@ def _resolve_in(sources, artifact_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid artifact identity",
         ) from exc
-    if not _CANONICAL_ARTIFACT_ID.fullmatch(artifact_id):
-        # Unreachable through `canonical_artifact_id` above; kept so the
-        # allowlist, not a UUID constructor's side effect, is what the code says
-        # about which strings may reach the resolver.
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid artifact identity",
-        )
 
     try:
         return resolve_artifact_folder(sources, artifact_id)
