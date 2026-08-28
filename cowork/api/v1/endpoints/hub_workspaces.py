@@ -75,10 +75,11 @@ async def _build_view(
     """
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id):
+    user_id = scope.user_id or ""
+    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
         return _DISABLED
 
-    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id)
+    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     stored = SettingService(session, scope).load().hub_workspace_id
     active = resolve_active(listing.workspaces, stored)
     active_id = active.id if active else None
@@ -116,16 +117,22 @@ async def set_active_hub_workspace(
     refuses rather than storing an id nobody could verify: a stored id that names
     nothing resolves to the default workspace on the next read, which would look
     like the switch silently doing nothing.
+
+    Two refusals rather than one, because the writable set is the set the menu
+    offered. A workspace missing from the listing is a grant the caller does not
+    hold. A workspace in the listing but filtered out of the menu is archived,
+    which is a different answer and deserves to say so.
     """
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id):
+    user_id = scope.user_id or ""
+    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="workspace selection is not enabled",
         )
 
-    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id)
+    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     if not listing.reachable:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -135,6 +142,15 @@ async def set_active_hub_workspace(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="no access to that workspace",
+        )
+
+    stored = SettingService(session, scope).load().hub_workspace_id
+    current = resolve_active(listing.workspaces, stored)
+    offered = selectable(listing.workspaces, current.id if current else None)
+    if not any(workspace.id == body.workspace_id for workspace in offered):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="that workspace is archived",
         )
 
     SettingService(session, scope).upsert_setting(SETTING_KEY, body.workspace_id)

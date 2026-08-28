@@ -218,10 +218,13 @@ an org admin can set.
 **The credential arrives in its own header, `X-MindsHub-Authorization`.** It
 cannot use `Authorization`: Electron's main process overwrites that on every
 request to the loopback server with the server's own token, so the caller's
-Keycloak JWT can never arrive under that name in the desktop shell. `Authorization`
-is still the fallback, which is what the web shell uses. `hub_credential` reads
-both, and it is deliberately a different function from `caller_bearer` so a client
-cannot steer the credential on the org model-catalog fetch by setting a header.
+Keycloak JWT can never arrive under that name in the desktop shell.
+`Authorization` is still the fallback **in org mode only**, where the ingress put
+the caller's JWT there; on a desktop install that header holds this server's own
+bearer, and forwarding it to auth would leak the one credential the main process
+scopes to the loopback origin. `hub_credential` reads both, and it is
+deliberately a different function from `caller_bearer` so a client cannot steer
+the credential on the org model-catalog fetch by setting a header.
 
 **The switch is auth's Statsig gate, not a local setting.** Auth declares
 `authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its

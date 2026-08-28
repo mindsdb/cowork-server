@@ -89,8 +89,24 @@ class HubWorkspaceListing(BaseModel):
     reachable: bool = False
 
 
-_gate_cache: dict[tuple[str, str], tuple[float, bool]] = {}
-_listing_cache: dict[tuple[str, str], tuple[float, HubWorkspaceListing]] = {}
+# Keyed by (auth host, organization, USER). The user is the load-bearing part:
+# auth answers this listing per caller, not per organization. An owner or admin
+# gets every workspace in the org and a member only the ones they hold a grant
+# on, and `role` is that caller's own standing. Keyed on the organization alone,
+# one admin's menu is served to every member of their org for the whole TTL, and
+# the grant check on `PUT /active` reads the same entry, so a member can store a
+# workspace they hold no grant on. This process serves every user of every
+# organization at once (`COWORK_TENANCY_MODE=org`, two replicas), so the caller
+# has to be in the key.
+_CacheKey = tuple[str, str, str]
+
+_gate_cache: dict[_CacheKey, tuple[float, bool]] = {}
+_listing_cache: dict[_CacheKey, tuple[float, HubWorkspaceListing]] = {}
+
+
+def _cache_key(*, org_id: str, user_id: str) -> _CacheKey:
+    """One entry per caller per organization per deployment."""
+    return (_auth_v1(), org_id or "", user_id or "")
 
 
 def _auth_v1() -> str:
@@ -135,7 +151,7 @@ async def _get_json(path: str, bearer_token: str) -> Optional[Any]:
         return None
 
 
-async def authorization_ui_enabled(*, bearer_token: str, org_id: str) -> bool:
+async def authorization_ui_enabled(*, bearer_token: str, org_id: str, user_id: str) -> bool:
     """Whether the authorization surfaces are switched on for this caller.
 
     Auth evaluates the Statsig gate with its server SDK and reports the verdict
@@ -147,6 +163,11 @@ async def authorization_ui_enabled(*, bearer_token: str, org_id: str) -> bool:
     a version of auth with no gates field, or the gate off. Those are all states
     where nobody knows whether the surface is safe to show, and a dark feature
     that stays dark is the cheap outcome.
+
+    Cached per caller rather than per organization, because auth evaluates the
+    gate for whoever presents the bearer: `authorization_ui` declares
+    ``idType: userID``, so a rule below 100% or a per-user override answers
+    differently for two people in one organization.
     """
     from cowork.common.settings.app_settings import get_app_settings
 
@@ -159,7 +180,7 @@ async def authorization_ui_enabled(*, bearer_token: str, org_id: str) -> bool:
     if not bearer_token:
         return False
 
-    cache_key = (_auth_v1(), org_id or "")
+    cache_key = _cache_key(org_id=org_id, user_id=user_id)
     cached = _gate_cache.get(cache_key)
     if cached:
         stamped, value = cached
@@ -173,7 +194,7 @@ async def authorization_ui_enabled(*, bearer_token: str, org_id: str) -> bool:
     return enabled
 
 
-async def fetch_hub_workspaces(*, bearer_token: str, org_id: str) -> HubWorkspaceListing:
+async def fetch_hub_workspaces(*, bearer_token: str, org_id: str, user_id: str) -> HubWorkspaceListing:
     """The workspaces this caller may use in their active organization.
 
     Reads ``GET /v1/organizations/current/workspaces/``, which auth gates on the
@@ -181,13 +202,21 @@ async def fetch_hub_workspaces(*, bearer_token: str, org_id: str) -> HubWorkspac
     environment with no OpenFGA configured. Every route under
     ``/v1/workspaces/<id>/`` does not, and would answer 503 there.
 
+    **The answer is per caller, which is why the cache is too.** auth's
+    ``WorkspaceService.visible_workspaces`` returns every workspace in the
+    organization to an owner or admin and only granted ones to a member, and
+    derives ``role`` for that caller. Two people in one organization get
+    different listings, so ``user_id`` is required rather than defaulted: a
+    caller that forgot to pass it would share an entry with everyone else in
+    their org, and this listing is what the switch checks a grant against.
+
     Unreachable returns ``reachable=False`` with an empty list rather than
     raising: the caller renders nothing and keeps whatever it already had.
     """
     if not bearer_token:
         return HubWorkspaceListing()
 
-    cache_key = (_auth_v1(), org_id or "")
+    cache_key = _cache_key(org_id=org_id, user_id=user_id)
     cached = _listing_cache.get(cache_key)
     if cached:
         stamped, value = cached
