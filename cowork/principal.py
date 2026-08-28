@@ -118,6 +118,59 @@ def get_principal(request: Request) -> Principal | None:
     return getattr(request.state, "principal", None)
 
 
+# Where the desktop shell puts the caller's MindsHub credential, because it
+# cannot use Authorization. See `hub_credential`.
+HEADER_HUB_CREDENTIAL = "X-MindsHub-Authorization"
+
+
+def hub_credential(request: Request | None) -> str:
+    """The caller's MindsHub credential, for a read this server makes as them.
+
+    Prefers ``X-MindsHub-Authorization`` over ``Authorization``, and the reason is
+    the desktop shell. Electron's main process overwrites ``Authorization`` on
+    every request to the loopback server with the server's own token, as a plain
+    assignment in its ``onBeforeSendHeaders`` hook, so the caller's Keycloak JWT
+    can never arrive under that name there. The web shell has no such hook and
+    its ``Authorization`` is the JWT, which the fallback covers.
+
+    **A credential, not an identity.** Nothing here decides who the caller is:
+    this value is opaque to us and only the service it is forwarded to can
+    verify it. That is why accepting it from a client-set header is safe, while
+    accepting an identity from one would not be. A caller can present their own
+    token or a useless one; neither buys them anything they did not already have.
+
+    Deliberately separate from ``caller_bearer``. Folding the header preference
+    into that one would let any client steer the credential on the org model
+    catalog fetch too, which reads ``Authorization`` because in org mode the
+    gateway put it there.
+    """
+    if request is None:
+        return ""
+    explicit = request.headers.get(HEADER_HUB_CREDENTIAL, "")
+    if explicit.lower().startswith("bearer "):
+        return explicit[7:].strip()
+    return caller_bearer(request)
+
+
+def caller_bearer(request: Request | None) -> str:
+    """The caller's own bearer token, for a read this server makes on their behalf.
+
+    Every outbound MindsHub call that acts as the caller sends this and never the
+    stored provider key or ``minds_url``: both of those are tenant-settable, so
+    using either would let an org admin point a member's credential at a host
+    they chose. Empty string when there is no bearer, which callers turn into
+    their fail-closed answer rather than an anonymous request.
+
+    This is not an identity source. Nothing here decides who the caller is: in
+    org mode that is the gateway's injected headers, and this token is opaque to
+    us. It exists only to be forwarded to the service that can verify it.
+    """
+    if request is None:
+        return ""
+    header = request.headers.get("Authorization", "")
+    return header[7:].strip() if header.lower().startswith("bearer ") else ""
+
+
 # Keycloak org role that marks an organization admin (see auth's
 # role_context/authenticate: X-User-Roles carries realm + org roles).
 ORG_MANAGE_ROLE = "manage-organization"

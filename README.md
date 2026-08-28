@@ -193,6 +193,57 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
+| `/hub/workspaces` | Which MindsHub workspace this person is working in |
+
+### The MindsHub workspace selector
+
+`/api/v1/hub/workspaces` backs the workspace group in the desktop app's account
+menu. A **MindsHub Workspace** is an org-internal container that owns hub
+resources (API keys, artifacts, model entitlements) and lives in the auth
+service. It has nothing to do with the filesystem directories this repo calls
+workspaces, which is why the stored key is `hub_workspace_id`.
+
+Three things about it are worth knowing before changing it.
+
+**The sidecar makes the call, not the renderer.** Auth's ingress allows three
+console origins per environment and no Cowork host, and a per-PR Cowork host
+cannot be added to a static allow-list because its name carries the PR number.
+The packaged Electron app would get away with a direct call because it runs with
+`webSecurity: false`; the web SPA would not. Reading here works for both shells.
+The outbound host is derived by `default_minds_auth_host()` from `ENV`, which the
+desktop propagates when it spawns this process, and the credential is the
+caller's own, never the stored provider key and never `minds_url`, both of which
+an org admin can set.
+
+**The credential arrives in its own header, `X-MindsHub-Authorization`.** It
+cannot use `Authorization`: Electron's main process overwrites that on every
+request to the loopback server with the server's own token, so the caller's
+Keycloak JWT can never arrive under that name in the desktop shell. `Authorization`
+is still the fallback, which is what the web shell uses. `hub_credential` reads
+both, and it is deliberately a different function from `caller_bearer` so a client
+cannot steer the credential on the org model-catalog fetch by setting a header.
+
+**The switch is auth's Statsig gate, not a local setting.** Auth declares
+`authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its
+server SDK, and reports the verdict in the entitlements payload; this service
+reads it from there. One gate governs the console and Cowork rather than two that
+can disagree, and Cowork holds no Statsig client and no SDK key. Every answer
+short of a definite yes reads as off: no bearer, auth unreachable, a version of
+auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is an
+ON-only development override for walking the surface where no rule targets you;
+it cannot switch the surface off, so it cannot escape the kill switch.
+
+**Picking a workspace changes what the client shows, not what a turn is billed
+to.** Neither turn credential carries a workspace: a desktop turn presents the
+user's own session credential, whose organization comes from the token's
+active-organization claim, and a cloud turn presents a minted key whose request
+body has no workspace field. So nothing on the turn path reads
+`hub_workspace_id`, and a test asserts that.
+
+The pick is stored as an untagged `UserSettings` field, so it lands per `(org,
+user)` in org mode and in the single global row on a desktop install. That is
+interim: the shared per-user preference the console reads has no route in auth
+yet, and a follow-up migrates this onto it.
 
 ### Who can read what in org mode
 
@@ -395,6 +446,7 @@ Environment variables fall into two namespaces:
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
+| `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
 
 **Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
 

@@ -638,6 +638,29 @@ class UserSettings(Settings):
         title="Memory Enabled",
         description="Enable conversation memory.",
     )
+    # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
+    # means a filesystem location (the per-conversation private directory, the
+    # project tree, the paths on AntonSettings), and that meaning is load-bearing
+    # in dozens of places. This field holds a MindsHub Workspace uuid, an
+    # org-internal container that owns hub resources and lives in the auth
+    # service. The two concepts share nothing but a word.
+    #
+    # Untagged, so it writes per-user: `SettingService._new_row` files an
+    # untagged key at (org, user) scope in org mode and in the single global row
+    # on a desktop install, which is the right answer for both. It carries no
+    # ORG marker deliberately: which workspace a person is looking at is their
+    # own preference, not org configuration an admin sets for everyone.
+    hub_workspace_id: str = Field(
+        default="",
+        title="Active MindsHub Workspace",
+        description=(
+            "Which MindsHub workspace this person is working in, as a uuid. "
+            "Empty means no pick has been made, and readers fall back to the "
+            "organization's default workspace. Interim storage: the shared "
+            "per-user preference the console reads has no route in auth yet, and "
+            "this field is what a follow-up migrates onto it."
+        ),
+    )
     coding_mode_enabled: bool = Field(
         default=False,
         title="Enable Coding Mode",
