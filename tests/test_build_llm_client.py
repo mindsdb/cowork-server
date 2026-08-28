@@ -57,14 +57,14 @@ def build(monkeypatch):
         "anton.core.llm.anthropic.AnthropicProvider", _capture("anthropic")
     )
 
-    def _build(settings: UserSettings):
+    def _build(settings: UserSettings, effort_override=None):
         monkeypatch.setattr(
             "cowork.common.settings.user_settings.get_user_settings",
             lambda: settings,
         )
         from cowork.services.providers import build_llm_client
 
-        client = build_llm_client()
+        client = build_llm_client(effort_override=effort_override)
         return client, calls
 
     return _build
@@ -273,3 +273,49 @@ def test_keyless_openai_compatible_without_base_still_gates(build):
     )
     assert settings._has_key(Provider.OPENAI_COMPATIBLE) is False
     assert settings.config_status["config_ready"] is False
+
+
+# ── Per-task effort override (ENG-1940) ─────────────────────────────────
+
+def test_effort_override_wins_over_stored_role_effort(build):
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("mdb-key"),
+        minds_url="https://api.mindshub.ai",
+        coding_model="haiku",
+        coding_reasoning_effort="low",
+    )
+    _client, calls = build(settings, effort_override="high")
+    assert calls["openai"][-1].get("reasoning_effort") == "high"
+
+
+def test_effort_override_applies_even_when_stored_effort_would_be_dropped(build):
+    # The stale-model guard (_effort_for) must not suppress an explicit
+    # per-task override the way it suppresses a stale persisted choice.
+    import json as _json
+
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("mdb-key"),
+        minds_url="https://api.mindshub.ai",
+        coding_model="haiku",
+        coding_reasoning_effort="low",
+        minds_model_enabled=_json.dumps({"mindshub_air": True, "haiku": False}),
+    )
+    _client, calls = build(settings, effort_override="high")
+    assert calls["openai"][-1].get("reasoning_effort") == "high"
+
+
+def test_no_effort_override_falls_back_to_existing_behavior(build):
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("mdb-key"),
+        minds_url="https://api.mindshub.ai",
+        coding_model="haiku",
+        coding_reasoning_effort="high",
+    )
+    _client, calls = build(settings)  # no effort_override — default None
+    assert calls["openai"][-1].get("reasoning_effort") == "high"
