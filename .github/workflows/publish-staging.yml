@@ -130,7 +130,12 @@ jobs:
           set -euo pipefail
           uv venv .smoke-venv
           uv pip install --python .smoke-venv "$(ls dist/*.whl)"
-          .smoke-venv/bin/python -c "import cowork.server"
+          VENV_PY="$(pwd)/.smoke-venv/bin/python"
+          # Run from outside the checkout: the repo root has its own cowork/
+          # source directory, and `python -c` puts cwd first on sys.path, so
+          # importing from here would silently shadow the wheel we just
+          # installed and test the checkout instead of the published artifact.
+          cd /tmp && "$VENV_PY" -c "import cowork.server"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
