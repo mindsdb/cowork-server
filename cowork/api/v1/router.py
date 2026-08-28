@@ -13,6 +13,7 @@ from cowork.api.v1.endpoints import (
     conversations,
     files,
     health,
+    hub_workspaces,
     memory,
     pins,
     project_files,
@@ -82,6 +83,7 @@ api_router.include_router(
     runtime_credential.router, prefix="/runtime-credential", tags=["runtime-credential"]
 )
 api_router.include_router(search.router, prefix="/search", tags=["search"])
+api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])

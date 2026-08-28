@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -202,6 +203,25 @@ def default_turn_minds_api_host() -> str:
     if ns.startswith("pr-"):
         return f"https://api-{ns}.dev.mindshub.ai"
     return default_minds_api_host()
+
+
+def default_minds_auth_host() -> str:
+    """MindsHub auth-service host, derived from the API host rather than built.
+
+    Auth is a sibling of the API host with the leading service token swapped, in
+    both host shapes: ``api.staging.mindshub.ai`` -> ``auth.staging.mindshub.ai``
+    and ``api-pr-42.dev.mindshub.ai`` -> ``auth-pr-42.dev.mindshub.ai``. Deriving
+    from the already-resolved turn host instead of re-reading ENV is what keeps
+    the two in lockstep: a per-PR env has its own auth database, so a host built
+    from the ENV slug alone would send a PR env's reads to dev's auth, which
+    answers 401 for a caller it has never seen. ``default_turn_minds_api_host``
+    already solves that from the namespace, so this inherits the answer.
+
+    This is the PUBLIC host. It is not ``TurnQueueSettings.auth_internal_base_url``,
+    which is a ClusterIP address for the secret-authenticated mint routes and is
+    unreachable from a desktop install.
+    """
+    return re.sub(r"^(https?://)api([.-])", r"\1auth\2", default_turn_minds_api_host())
 
 
 def default_publish_url() -> str:
@@ -556,6 +576,20 @@ class AppSettings(Settings):
             "resolving under COWORK_HOME exactly as before. Defaults to the "
             "container's own temp directory, which is never the shared EFS "
             "mount and is gone on pod restart."
+        ),
+    )
+    hub_workspaces_force_on: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_HUB_WORKSPACES_FORCE_ON"),
+        description=(
+            "Development override that turns the MindsHub workspace surfaces on "
+            "where no Statsig rule targets you. ON only: it cannot switch the "
+            "surfaces off, so it can never be used to escape the kill switch. "
+            "The switch itself is auth's `authorization_ui` gate, declared in "
+            "that repo's configs/statsig_gates.json and read through the "
+            "entitlements payload; this exists so the surface can be walked "
+            "before a rule exists for your environment. Never set in a deployed "
+            "environment."
         ),
     )
     ask_user_enabled: bool = Field(
