@@ -124,7 +124,10 @@ def render_picker_page(
         "data-api-key": html.escape(api_key, quote=True),
         "data-app-id": html.escape(app_id, quote=True),
         "data-account-email": html.escape(account_email, quote=True),
-        "data-file-ids": json.dumps(file_ids or []),
+        # json.dumps() makes this JSON-safe, not HTML-attribute-safe — its own
+        # quote characters still need escaping like every other value here,
+        # or a crafted file id can break out of the attribute.
+        "data-file-ids": html.escape(json.dumps(file_ids or []), quote=True),
     }
     picker_attrs_html = " ".join(f'{attr_name}="{value}"' for attr_name, value in data_attrs.items())
 
