@@ -266,6 +266,19 @@ member's conversation directories before the artifact list or delete ever sees
 them, because those routes are addressed by project and slug and never receive a
 conversation id.
 
+One artifact at a time can leave the private group, and only its owner can put it
+there. `POST /artifacts/workspace/{project}/{artifact}/comments-access` records a
+grant in that artifact's `.revisions/draft-review.json` and mints the matching
+rule in auth. A co-member then resolves that one artifact by id —
+`artifact_scope.review_artifact_for_request` searches other members' workspaces
+only after the caller's own, and only accepts a folder that carries the grant —
+and gets the draft preview and comments, never the source, the edit routes or the
+delete. Without a grant the answer is 404, so a private draft still cannot be
+told apart from one that does not exist; with a grant the owner-only routes
+answer 403 instead, because to a client already looking at the draft a 404 would
+read as deleted. The artifacts list is unaffected either way: a co-member's
+artifact never appears in it, so review starts from the link the owner shares.
+
 Both of those decide from a resolved path and the route then opens that path, so
 the decision is carried to the open rather than trusted afterwards: every
 component below the project directory is opened `O_NOFOLLOW`, and a symlink
