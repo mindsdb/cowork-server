@@ -590,6 +590,23 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         _fill_missing(model_providers, oc_listing.providers, skip=reserved_ids)
         _fill_missing(model_families, oc_listing.families, skip=reserved_ids)
 
+    # Which model the pre-Anton route gate will actually run on (ENG-1851), so
+    # the Settings row can show it instead of inferring it from the provider —
+    # the UI ships OTA ahead of or behind this server, and its idea of the
+    # row's provider can differ from `_resolve_provider`'s. Reloaded after the
+    # persists above so the availability map and role defaults just written
+    # are what resolve, exactly as the next turn will see them. `model` is
+    # None when the gate has nothing to run on (openai-compatible with no
+    # model picked): that turn delegates without a gate call.
+    gate_settings = SettingService(session, scope).load()
+    gate_provider = gate_settings.resolved_router_provider
+    gate = {
+        # The UI's provider type is the enum value hyphenated ("minds-cloud").
+        "provider": gate_provider.value.replace("_", "-"),
+        "model": gate_settings.resolved_gate_model,
+        "followsRouterPick": gate_provider is Provider.OPENAI_COMPATIBLE,
+    }
+
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
@@ -598,6 +615,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "modelLabels": model_labels,
         "modelProviders": model_providers,
         "modelFamilies": model_families,
+        "gate": gate,
     }
 
 

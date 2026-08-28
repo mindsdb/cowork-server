@@ -160,6 +160,20 @@ Agents (via their harness) have read/write access to their project's working dir
 
 **Settings** use a hybrid approach: user preferences and API keys are stored in the `settings` DB table (with Fernet encryption for secrets), while connector credentials live in the filesystem vault (`data-vault/`).
 
+**The MindsHub credential is the exception, and it is stored nowhere.** On the
+desktop it is the user's own session token, which lives ten minutes, so the
+Electron app hands it over at runtime through `PUT /api/v1/runtime-credential/minds`
+and this process keeps it in memory. `SettingService._raw_data` overlays it onto
+the stored rows, so every reader of `get_user_settings()` sees it without
+knowing where it came from, and a value handed over beats any stored row.
+
+Two properties follow. **Nothing survives a restart**, so the desktop app
+re-pushes on every start of this process. And a key the user supplied by hand
+travels the same way, which is what keeps a long-lived `mdb_` key out of both
+`.env` and the settings table. The route is loopback-only and refuses in org
+mode: an org deployment mints a per-turn credential in the turn producer and its
+pods are never handed one.
+
 ## API
 
 All endpoints live under `/api/v1/`. Key resource groups:
@@ -178,6 +192,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/publish` | Publish HTML artifacts to 4nton.ai |
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
+| `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
 
 ### The MindsHub workspace selector
@@ -219,10 +234,11 @@ ON-only development override for walking the surface where no rule targets you;
 it cannot switch the surface off, so it cannot escape the kill switch.
 
 **Picking a workspace changes what the client shows, not what a turn is billed
-to.** Neither turn credential carries a workspace: a desktop turn presents a
-long-lived key bound to a user and an organization, and a cloud turn presents a
-minted key whose request body has no workspace field. So nothing on the turn path
-reads `hub_workspace_id`, and a test asserts that.
+to.** Neither turn credential carries a workspace: a desktop turn presents the
+user's own session credential, whose organization comes from the token's
+active-organization claim, and a cloud turn presents a minted key whose request
+body has no workspace field. So nothing on the turn path reads
+`hub_workspace_id`, and a test asserts that.
 
 The pick is stored as an untagged `UserSettings` field, so it lands per `(org,
 user)` in org mode and in the single global row on a desktop install. That is
@@ -265,6 +281,19 @@ another member's conversation directory, and `artifact_roots` drops another
 member's conversation directories before the artifact list or delete ever sees
 them, because those routes are addressed by project and slug and never receive a
 conversation id.
+
+One artifact at a time can leave the private group, and only its owner can put it
+there. `POST /artifacts/workspace/{project}/{artifact}/comments-access` records a
+grant in that artifact's `.revisions/draft-review.json` and mints the matching
+rule in auth. A co-member then resolves that one artifact by id —
+`artifact_scope.review_artifact_for_request` searches other members' workspaces
+only after the caller's own, and only accepts a folder that carries the grant —
+and gets the draft preview and comments, never the source, the edit routes or the
+delete. Without a grant the answer is 404, so a private draft still cannot be
+told apart from one that does not exist; with a grant the owner-only routes
+answer 403 instead, because to a client already looking at the draft a 404 would
+read as deleted. The artifacts list is unaffected either way: a co-member's
+artifact never appears in it, so review starts from the link the owner shares.
 
 Both of those decide from a resolved path and the route then opens that path, so
 the decision is carried to the open rather than trusted afterwards: every

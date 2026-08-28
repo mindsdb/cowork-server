@@ -118,6 +118,25 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.release.outputs.version }}
         run: uv build
 
+      # Catches the anton/cowork-server pairing race: the pin step above grabs
+      # whichever anton-agent is newest on PyPI right now, which can predate an
+      # anton change this commit already depends on if anton's own matching rc
+      # hasn't finished publishing yet. Installing the wheel about to ship and
+      # importing the app runs the same import chain uvicorn runs at startup
+      # (server.py -> router.py -> endpoints -> services), so a stale pin fails
+      # here instead of on a user's machine.
+      - name: Verify the pinned anton-agent satisfies this build
+        run: |
+          set -euo pipefail
+          uv venv .smoke-venv
+          uv pip install --python .smoke-venv "$(ls dist/*.whl)"
+          VENV_PY="$(pwd)/.smoke-venv/bin/python"
+          # Run from outside the checkout: the repo root has its own cowork/
+          # source directory, and `python -c` puts cwd first on sys.path, so
+          # importing from here would silently shadow the wheel we just
+          # installed and test the checkout instead of the published artifact.
+          cd /tmp && "$VENV_PY" -c "import cowork.server"
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # Trusted publisher (OIDC) — publish-staging.yml must be registered at
