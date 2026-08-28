@@ -682,10 +682,18 @@ class ResponsesHandler:
         chats before it ever opens the skills menu. Never fails the turn: a
         staging error degrades to a turn without the missing piece."""
         try:
+            from cowork.services.artifact_roots import project_artifacts_base
             from cowork.services.files import stage_project_instructions
 
             conversation = ConversationService(session).get_conversation(conv_id)
             project_path = conversation.project.path
+            # ENG-2056: the pod mounts the PROJECT-level artifacts base (subPath
+            # `.anton/artifacts`) at /project-artifacts, and a subPath mount needs
+            # the directory to exist before the pod starts. Project creation does
+            # not make it, so make it here — this is the one place that runs
+            # before every remote turn. First in the block: the pod needs it even
+            # when a later staging step degrades.
+            project_artifacts_base(project_path).mkdir(parents=True, exist_ok=True)
             FileService(session).stage_conversation_attachments(conv_id, project_path)
             stage_project_instructions(project_path, conv_id)
             SkillService(session.scope).ensure_builtin_skills()
@@ -736,15 +744,24 @@ class ResponsesHandler:
         None on any failure: no artifact card and no autopublish is a recoverable
         outcome (the next turn in this project reconciles), a failed turn is not.
         """
-        from cowork.services.artifact_roots import conversation_artifacts_base
+        from cowork.services.artifact_roots import project_artifacts_base
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            # Conversation-scoped in org mode: the pod's workspace is
-            # <project>/conversations/<id>, not the project, so that is where the
-            # worker's artifacts land. Resolved through artifact_roots so this and
-            # the artifacts list agree on the layout.
-            artifacts_base = conversation_artifacts_base(conversation.project.path, conv_id)
+            # ENG-2056: project-scoped in BOTH modes. The pod mounts the
+            # PROJECT-level base at /project-artifacts and anton writes there
+            # (ANTON_CLOUD_ARTIFACTS_ROOT), so that is where the worker's
+            # artifacts land — no longer under conversations/<id>/. Resolved
+            # through artifact_roots so this and the artifacts list agree on
+            # the layout.
+            #
+            # The base is now shared by every task in the project, so the raw
+            # before/after diff below can attribute a concurrent sibling turn's
+            # artifact to this turn. Pre-existing caveat, not new machinery: the
+            # in-process path bounds the same diff with the session's
+            # artifacts_touched set (ENG-1933), but the remote pod reports no
+            # equivalent yet, so the diff stands alone here.
+            artifacts_base = project_artifacts_base(conversation.project.path)
             return (
                 conversation,
                 artifacts_base,
