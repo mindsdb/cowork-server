@@ -14,17 +14,29 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 from urllib.parse import quote
 
+from cowork.common.paths import (
+    O_NOFOLLOW,
+    PinnedDir,
+    dir_open,
+    dir_rmtree,
+    dir_scandir,
+    dir_stat,
+    dir_unlink,
+)
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -42,6 +54,13 @@ class ProjectArtifacts:
     base: Path
     project_id: str | None
     project_name: str
+    # When present, ``base`` is reopened from this server-owned directory one
+    # component at a time.  The relative components are agent-writable in org
+    # mode, so each open uses O_NOFOLLOW; carrying the anchor separately avoids
+    # resolving a symlink before the identity service has a chance to refuse it.
+    # Optional defaults preserve callers which construct an explicit local root.
+    trusted_anchor: Path | None = None
+    root_parts: tuple[str, ...] = ()
 
 
 def _org_mode() -> bool:
@@ -148,9 +167,12 @@ def _human_mtime(ts: float) -> str:
     if ts <= 0:
         return ""
     secs = time.time() - ts
-    if secs < 60:    return "updated just now"
-    if secs < 3600:  return f"updated {int(secs // 60)}m ago"
-    if secs < 86400: return f"updated {int(secs // 3600)}h ago"
+    if secs < 60:
+        return "updated just now"
+    if secs < 3600:
+        return f"updated {int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"updated {int(secs // 3600)}h ago"
     return f"updated {int(secs // 86400)}d ago"
 
 
@@ -283,14 +305,24 @@ def _user_files(folder: Path) -> list[Path]:
     return out
 
 
-def _pick_primary(folder: Path, files: list[Path], primary_hint: str | None = None) -> Path | None:
+def _pick_primary(
+    folder: Path,
+    files: list[Path],
+    primary_hint: str | None = None,
+    *,
+    preserve_folder_path: bool = False,
+) -> Path | None:
     """The "open this" file for an artifact card."""
     if primary_hint:
         try:
-            target = (folder / primary_hint).resolve()
+            candidate = folder / primary_hint
+            target = candidate.resolve()
             target.relative_to(folder.resolve())
             if target.is_file():
-                return target
+                # A pinned Linux folder is represented through /proc/self/fd.
+                # Keep that stable descriptor path rather than returning the
+                # resolved, swappable storage name after the containment check.
+                return candidate if preserve_folder_path else target
         except (ValueError, OSError):
             pass
     if not files:
@@ -314,6 +346,57 @@ def _load_published_map(folder: Path) -> dict:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _load_published_map_pinned(folder: PinnedDir) -> dict:
+    """Read the direct publish record without following a planted link."""
+    try:
+        fd = dir_open(folder, ".published.json", os.O_RDONLY | O_NOFOLLOW)
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            data = json.load(stream)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return data if isinstance(data, dict) else {}
+
+
+def _write_published_map_pinned(folder: PinnedDir, payload: dict) -> None:
+    """Best-effort atomic publish-record update relative to a pinned folder."""
+    name = ".published.json"
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        fd = dir_open(
+            folder,
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, indent=2) + "\n")
+        if folder.fd is not None:
+            os.replace(
+                temporary,
+                name,
+                src_dir_fd=folder.fd,
+                dst_dir_fd=folder.fd,
+            )
+        else:
+            os.replace(folder.path / temporary, folder.path / name)
+    except Exception:
+        logger.warning("Could not write pinned publish record in %s", folder.path, exc_info=True)
+    finally:
+        try:
+            dir_unlink(folder, temporary)
+        except OSError:
+            pass
 
 
 def _content_mtime(folder: Path) -> int:
@@ -358,10 +441,16 @@ def load_published_map(folder: Path) -> dict:
     return _load_published_map(folder)
 
 
-def _published_url_for(folder: Path, primary: Path | None) -> str:
+def _published_url_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> str:
     if primary is None:
         return ""
-    entry = _load_published_map(folder).get(primary.name)
+    pmap = published_map if published_map is not None else _load_published_map(folder)
+    entry = pmap.get(primary.name)
     if isinstance(entry, dict):
         # `published: False` is a soft-deleted record (kept so re-publish can
         # reuse report_id) — it must not surface as a live URL. Legacy entries
@@ -372,7 +461,15 @@ def _published_url_for(folder: Path, primary: Path | None) -> str:
     return ""
 
 
-def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool:
+def _is_modified(
+    folder: Path,
+    primary: Path | None,
+    content_mtime: int,
+    *,
+    artifacts_base: Path | None = None,
+    published_map: dict | None = None,
+    pinned_folder: PinnedDir | None = None,
+) -> bool:
     """Whether a *published* artifact's content diverged from what was published.
 
     Hybrid mtime→md5 (see the 2026-06-23 design):
@@ -387,7 +484,7 @@ def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool
     """
     if primary is None:
         return False
-    pmap = _load_published_map(folder)
+    pmap = published_map if published_map is not None else _load_published_map(folder)
     entry = pmap.get(primary.name)
     if not isinstance(entry, dict) or not entry.get("published", True):
         return False
@@ -405,7 +502,9 @@ def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
-    current_md5 = compute_publish_md5(folder, artifacts_base=folder.parent)
+    current_md5 = compute_publish_md5(
+        folder, artifacts_base=artifacts_base or folder.parent
+    )
     if current_md5 is None:
         return False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):
@@ -415,16 +514,24 @@ def _is_modified(folder: Path, primary: Path | None, content_mtime: int) -> bool
     # don't re-zip on every future listing. Best-effort.
     entry["published_mtime"] = content_mtime
     pmap[primary.name] = entry
-    try:
-        (folder / ".published.json").write_text(
-            json.dumps(pmap, indent=2) + "\n", encoding="utf-8"
-        )
-    except Exception:
-        pass
+    if pinned_folder is not None:
+        _write_published_map_pinned(pinned_folder, pmap)
+    else:
+        try:
+            (folder / ".published.json").write_text(
+                json.dumps(pmap, indent=2) + "\n", encoding="utf-8"
+            )
+        except Exception:
+            pass
     return False
 
 
-def _published_access_for(folder: Path, primary: Path | None) -> dict:
+def _published_access_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> dict:
     """Owner-side access state for the primary file, from `.published.json`.
 
     Returns ``accessMode`` (public|password|restricted) plus the mode-specific
@@ -447,11 +554,8 @@ def _published_access_for(folder: Path, primary: Path | None) -> dict:
     }
     if primary is None:
         return out
-    published_index = folder / ".published.json"
-    if not published_index.is_file():
-        return out
     try:
-        pmap = json.loads(published_index.read_text(encoding="utf-8"))
+        pmap = published_map if published_map is not None else _load_published_map(folder)
         entry = pmap.get(primary.name)
         # A soft-deleted record (published=False) is no longer live, so it must
         # not report a password/restricted mode — that would draw a lock icon on
@@ -668,6 +772,87 @@ def _unpublish_folder(
         )
 
 
+def _unpublish_identifier(
+    identifier: str, entry: dict, *, api_key: str, publish_url: str
+) -> None:
+    """Revoke one known remote identifier without reopening a local path."""
+    if not api_key:
+        raise ValueError("Unpublishing requires an API key")
+    try:
+        from anton.publisher import unpublish
+    except Exception as exc:
+        from cowork.services.publish import PublisherUnavailable
+
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
+
+    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    try:
+        unpublish(
+            identifier,
+            api_key=api_key,
+            publish_url=publish_url,
+            ssl_verify=ssl_verify,
+        )
+    except Exception as exc:
+        message = str(exc) or "Unpublishing failed."
+        if "404" in message or "not found" in message.lower():
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=unpublish_404",
+                identifier,
+                entry.get("url", ""),
+            )
+            return
+        logger.exception("Unpublishing failed (identifier=%s)", identifier)
+        raise RuntimeError(f"Unpublishing failed: {message}") from exc
+
+
+def _unpublish_pinned_folder(
+    folder: PinnedDir, *, api_key: str, publish_url: str
+) -> None:
+    """Unpublish records read and updated through one pinned artifact folder."""
+    published_map = _load_published_map_pinned(folder)
+    for name, entry in published_map.items():
+        if not isinstance(entry, dict) or entry.get("published") is False:
+            continue
+        identifier = entry.get("report_id") or entry.get("last_md5")
+        if not identifier:
+            continue
+        if (
+            not name
+            or name in {".", ".."}
+            or Path(name).name != name
+            or "/" in name
+            or "\\" in name
+            or "\x00" in name
+        ):
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=primary_invalid",
+                identifier,
+                entry.get("url", ""),
+            )
+            continue
+        try:
+            primary_stat = dir_stat(folder, name, follow_symlinks=False)
+        except OSError:
+            primary_stat = None
+        if primary_stat is None or not stat.S_ISREG(primary_stat.st_mode):
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=primary_missing",
+                identifier,
+                entry.get("url", ""),
+            )
+            continue
+
+        _unpublish_identifier(
+            str(identifier), entry, api_key=api_key, publish_url=publish_url
+        )
+        entry["published"] = False
+        published_map[name] = entry
+        # Match the historical partial-progress behavior: if a later remote
+        # revoke fails, earlier successful records remain marked unpublished.
+        _write_published_map_pinned(folder, published_map)
+
+
 def delete_artifact(
     artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
 ) -> None:
@@ -698,6 +883,98 @@ def delete_artifact(
     shutil.rmtree(folder)
 
 
+def artifact_id_for_folder(source: ProjectArtifacts, folder_name: str) -> str:
+    """Read one direct child's canonical identity through its authorized root.
+
+    This is used by the legacy slug delete path before it revokes review access.
+    The returned id comes from a pinned, non-symlink folder; the request's slug
+    is never converted into an absolute path.
+    """
+    from cowork.services.artifact_identity import (
+        ensure_full_id,
+        opened_artifact_folder,
+    )
+
+    with opened_artifact_folder(source, folder_name) as folder:
+        artifact_id, _metadata = ensure_full_id(folder.path, _pinned=folder)
+        return artifact_id
+
+
+def delete_artifact_from_source(
+    source: ProjectArtifacts,
+    folder_name: str,
+    *,
+    expected_artifact_id: str | None,
+    api_key: str,
+    publish_url: str,
+) -> None:
+    """Delete one direct artifact child through pinned directory descriptors.
+
+    The older :func:`delete_artifact` remains the desktop/path-oriented public
+    helper. HTTP deletion has stronger information: an authorized
+    ``ProjectArtifacts`` source and a direct child selected by identity or by a
+    validated legacy name. Keeping the root and folder descriptors open across
+    validation and unpublishing prevents a writable root/folder symlink swap
+    from redirecting the eventual removal to another tenant's storage.
+    """
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        canonical_artifact_id,
+        ensure_full_id,
+        opened_artifact_root,
+    )
+
+    expected = (
+        canonical_artifact_id(expected_artifact_id)
+        if expected_artifact_id is not None
+        else None
+    )
+    with opened_artifact_root(source) as root:
+        with _opened_child_directory(root, folder_name) as folder:
+            try:
+                metadata_stat = dir_stat(
+                    folder, "metadata.json", follow_symlinks=False
+                )
+            except OSError as exc:
+                raise FileNotFoundError("Artifact not found") from exc
+            if not stat.S_ISREG(metadata_stat.st_mode):
+                raise FileNotFoundError("Artifact metadata is not a regular file")
+
+            if expected is not None:
+                found, _metadata = ensure_full_id(folder.path, _pinned=folder)
+                if found != expected:
+                    raise FileNotFoundError("Artifact identity changed before deletion")
+
+            # Unpublish before deletion. A remote failure propagates while the
+            # exact folder remains present, preserving the established contract.
+            _unpublish_pinned_folder(
+                folder,
+                api_key=api_key,
+                publish_url=publish_url,
+            )
+
+            opened_stat = (
+                os.fstat(folder.fd)
+                if folder.fd is not None
+                else folder.path.stat(follow_symlinks=False)
+            )
+            try:
+                current_stat = dir_stat(root, folder_name, follow_symlinks=False)
+            except OSError as exc:
+                raise FileNotFoundError("Artifact changed before deletion") from exc
+            if (
+                not stat.S_ISDIR(current_stat.st_mode)
+                or (current_stat.st_dev, current_stat.st_ino)
+                != (opened_stat.st_dev, opened_stat.st_ino)
+            ):
+                raise FileNotFoundError("Artifact changed before deletion")
+
+        # POSIX ``shutil.rmtree(..., dir_fd=...)`` performs its own fd/stat
+        # symlink-attack checks while walking. The root descriptor also keeps
+        # this operation in the authorized container if its lexical path moves.
+        dir_rmtree(root, folder_name)
+
+
 def reveal_in_file_manager(path: Path) -> None:
     """Open the OS file manager on `path`. In org mode this always refuses;
     see `_org_mode`."""
@@ -719,6 +996,8 @@ def card_for_folder(
     *,
     project_id: str | None = None,
     project_name: str = "",
+    _pinned_folder: PinnedDir | None = None,
+    _pinned_root: PinnedDir | None = None,
 ) -> dict | None:
     """The artifact card for a single folder, or ``None`` if its metadata is
     unreadable. This is the canonical card shape — used both by the artifacts
@@ -731,20 +1010,43 @@ def card_for_folder(
     them to address an artifact by project + slug: in an org deployment the
     artifacts list spans every project of the organization, so a card cannot be
     tied to a project by inspecting its path."""
-    meta = _load_metadata(folder)
-    if meta is None:
+    logical_folder = folder
+    io_folder = _pinned_directory_path(_pinned_folder) if _pinned_folder else folder
+    io_root = _pinned_directory_path(_pinned_root) if _pinned_root else None
+    if io_folder is None or (_pinned_root is not None and io_root is None):
         return None
     from cowork.services.artifact_identity import artifact_key, ensure_full_id
 
     try:
-        artifact_id, meta = ensure_full_id(folder, meta)
+        if _pinned_folder is not None:
+            artifact_id, meta = ensure_full_id(
+                logical_folder, _pinned=_pinned_folder
+            )
+            published_map = _load_published_map_pinned(_pinned_folder)
+        else:
+            meta = _load_metadata(folder)
+            if meta is None:
+                return None
+            artifact_id, meta = ensure_full_id(folder, meta)
+            published_map = _load_published_map(folder)
     except (OSError, ValueError):
         logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
         return None
-    files = _user_files(folder)
-    primary = _pick_primary(folder, files, primary_hint=meta.get("primary"))
-    primary_path = str(primary) if primary is not None else str(folder)
-    primary_ext = primary.suffix.lower() if primary is not None else ""
+    files = _user_files(io_folder)
+    primary = _pick_primary(
+        io_folder,
+        files,
+        primary_hint=meta.get("primary"),
+        preserve_folder_path=_pinned_folder is not None,
+    )
+    logical_primary = None
+    if primary is not None:
+        try:
+            logical_primary = logical_folder / primary.relative_to(io_folder)
+        except ValueError:
+            primary = None
+    primary_path = str(logical_primary) if logical_primary is not None else str(logical_folder)
+    primary_ext = logical_primary.suffix.lower() if logical_primary is not None else ""
     artifact_type = meta.get("type") or "mixed"
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
     is_live = False
@@ -759,7 +1061,7 @@ def card_for_folder(
     # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
     # Named `mtime_seconds` so it does not shadow the module-level
     # `content_mtime` alias other services import.
-    mtime_seconds = _content_mtime(folder)
+    mtime_seconds = _content_mtime(io_folder)
 
     card = {
         # The one identity: drafts, published versions, revisions, comments
@@ -781,7 +1083,7 @@ def card_for_folder(
         # matching, title fallbacks), and it is no secret — a client of its own
         # organization already knows `<root>/<org_id>`. Isolation comes from
         # `projectId` plus the server-side scope, not from hiding the path.
-        "folder": str(folder),
+        "folder": str(logical_folder),
         "path": primary_path,
         "primary": meta.get("primary") or None,
         "projectId": project_id,
@@ -793,11 +1095,22 @@ def card_for_folder(
         # still reachable is the client's call: it already knows its own
         # conversations and can fetch the rest.
         "originConversationId": origin_conversation_id(meta),
-        "publishedUrl": _published_url_for(folder, primary),
-        "modified": _is_modified(folder, primary, mtime_seconds),
+        "publishedUrl": _published_url_for(
+            io_folder, primary, published_map=published_map
+        ),
+        "modified": _is_modified(
+            io_folder,
+            primary,
+            mtime_seconds,
+            artifacts_base=io_root,
+            published_map=published_map,
+            pinned_folder=_pinned_folder,
+        ),
         # Owner-side access state (lock badge + eye-reveal). accessPassword
         # is the plaintext, returned only to the owner's own session.
-        **_published_access_for(folder, primary),
+        **_published_access_for(
+            io_folder, primary, published_map=published_map
+        ),
         "serveUrl": serve_url_for(primary_path),
     }
     # Drafts and every published version share this key. A legacy
@@ -816,7 +1129,7 @@ def card_for_folder(
         # the primary inside, so reaching the warning means one of them changed.
         try:
             rel = primary.resolve(strict=False).relative_to(
-                folder.resolve(strict=False)
+                io_folder.resolve(strict=False)
             ).as_posix()
         except ValueError:
             logger.warning("Artifact primary resolves outside its folder: %s", folder)
@@ -837,24 +1150,48 @@ def card_for_folder(
     return card
 
 
-def artifact_status(raw_path: str) -> dict:
-    """Fresh owner-side status for a single artifact path: its published URL,
-    the stale-since-publish ``modified`` flag, and access settings.
+def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
+    """A stable path view of an open directory for path-oriented card helpers.
+
+    Org mode runs on Linux, where procfs exposes an open directory descriptor as
+    a traversable path.  macOS/Windows are local-only and retain their ordinary
+    path behavior.  A Linux deployment without procfs fails closed instead of
+    falling back to a swappable shared-EFS name.
+    """
+    if directory is None:
+        return None
+    if directory.fd is None or not sys.platform.startswith("linux"):
+        return directory.path
+    candidate = Path("/proc/self/fd") / str(directory.fd)
+    try:
+        return candidate if candidate.is_dir() else None
+    except OSError:
+        return None
+
+
+def _blank_artifact_status() -> dict:
+    """The stable response for an unknown or no-longer-readable artifact."""
+    return {
+        "publishedUrl": "", "modified": False, "accessMode": "public",
+        "accessProtected": False, "accessEmails": [], "orgAllowed": False,
+    }
+
+
+def artifact_status_for_resolved(artifact: Path) -> dict:
+    """Fresh owner-side status for an already resolved artifact path.
+
+    The HTTP boundary resolves an untrusted request through
+    :func:`resolve_artifact_path` once, then calls this function. Keeping the
+    resolved-path operation separate prevents status computation from walking a
+    request string a second time after its containment decision.
 
     Reuses ``card_for_folder`` so the preview viewer's in-place refresh can
     never disagree with the listing. Returns the published/modified/access
     subset only — the cheap read the viewer polls on window focus to light up
     the "Update" button when the artifact changes underneath an open preview.
     """
-    blank = {
-        "publishedUrl": "", "modified": False, "accessMode": "public",
-        "accessProtected": False, "accessEmails": [], "orgAllowed": False,
-    }
-    try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    except Exception:
-        return dict(blank)
-    if artifact is None:
+    blank = _blank_artifact_status()
+    if not isinstance(artifact, Path) or not artifact.is_absolute():
         return dict(blank)
     # Fullstack artifacts keep their primary file in a `static/` subdir, so a
     # naive `artifact.parent` would land there instead of the artifact root
@@ -885,6 +1222,17 @@ def artifact_status(raw_path: str) -> dict:
     }
 
 
+def artifact_status(raw_path: str) -> dict:
+    """Compatibility wrapper accepting the historical raw path string."""
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    except Exception:
+        return _blank_artifact_status()
+    if artifact is None:
+        return _blank_artifact_status()
+    return artifact_status_for_resolved(artifact)
+
+
 def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     """Every artifact under the given roots, newest first, capped at 80.
 
@@ -894,28 +1242,50 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     `sources` spans every project of the organization instead of one tree.
     """
     cards: list[dict] = []
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        opened_artifact_root,
+    )
+
     for source in sources:
-        base = Path(source.base)
-        if not base.is_dir():
-            continue
         try:
-            children = sorted(base.iterdir())
-        except OSError:
+            with opened_artifact_root(source) as root:
+                with dir_scandir(root) as entries:
+                    child_names = []
+                    for entry in entries:
+                        try:
+                            if (
+                                not entry.is_symlink()
+                                and entry.is_dir(follow_symlinks=False)
+                            ):
+                                child_names.append(entry.name)
+                        except OSError:
+                            continue
+                for child_name in sorted(child_names):
+                    try:
+                        with _opened_child_directory(root, child_name) as pinned_folder:
+                            folder = root.path / child_name
+                            card = card_for_folder(
+                                folder,
+                                len(cards),
+                                project_id=source.project_id,
+                                project_name=source.project_name,
+                                _pinned_folder=pinned_folder,
+                                _pinned_root=root,
+                            )
+                            if card is None:
+                                continue
+                            try:
+                                card["_sortTs"] = dir_stat(
+                                    pinned_folder, "metadata.json"
+                                ).st_mtime
+                            except OSError:
+                                card["_sortTs"] = 0.0
+                            cards.append(card)
+                    except (OSError, ValueError):
+                        continue
+        except (OSError, ValueError):
             continue
-        for folder in children:
-            if not folder.is_dir() or not (folder / "metadata.json").is_file():
-                continue
-            card = card_for_folder(
-                folder, len(cards),
-                project_id=source.project_id, project_name=source.project_name,
-            )
-            if card is None:
-                continue
-            try:
-                card["_sortTs"] = (folder / "metadata.json").stat().st_mtime
-            except OSError:
-                card["_sortTs"] = 0.0
-            cards.append(card)
 
     cards.sort(key=lambda c: c["_sortTs"], reverse=True)
     for c in cards:
