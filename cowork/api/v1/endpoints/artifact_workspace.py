@@ -464,7 +464,11 @@ async def serve_private_draft(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Artifact file not found",
             ) from exc
-    if not target.is_file() or target.is_symlink():
+    # No symlink check here: `target` came out of `resolve()`, so it is already
+    # the link's destination and `is_symlink()` could never be true. A link that
+    # escapes the artifact is caught by the containment checks above, which
+    # compare resolved paths.
+    if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     if wants_comment_layer(media_type, request):

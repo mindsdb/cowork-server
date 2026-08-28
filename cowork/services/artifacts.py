@@ -809,13 +809,22 @@ def card_for_folder(
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
         # the URL path so an absolute primary hint cannot fail on that alias.
-        rel = primary.resolve(strict=False).relative_to(
-            folder.resolve(strict=False)
-        ).as_posix()
-        card["draftUrl"] = (
-            f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
-            f"{quote(artifact_id)}/{quote(rel, safe='/')}"
-        )
+        # A primary that resolves outside its own folder has no draft URL, and
+        # one odd artifact must not take the whole list down with a ValueError:
+        # this builder runs per card, and `GET /artifacts/` would 500 instead of
+        # dropping the single card. `_user_files` and `_pick_primary` both keep
+        # the primary inside, so reaching the warning means one of them changed.
+        try:
+            rel = primary.resolve(strict=False).relative_to(
+                folder.resolve(strict=False)
+            ).as_posix()
+        except ValueError:
+            logger.warning("Artifact primary resolves outside its folder: %s", folder)
+        else:
+            card["draftUrl"] = (
+                f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
+                f"{quote(artifact_id)}/{quote(rel, safe='/')}"
+            )
     if _org_mode():
         # Dropped at the single card builder so inline chat cards are covered
         # too: they call this function as well, and a filter applied only at the

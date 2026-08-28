@@ -68,14 +68,20 @@ def artifacts_for_request(
     cards = _list_artifacts(sources)
     from cowork.services.artifact_permissions import artifact_capabilities
 
+    # Capabilities are a property of the ROOT, not of the artifact: in org mode
+    # they come from the owning conversation, and every artifact under one root
+    # shares it. Derived once per root, so a project with 50 artifacts across 50
+    # conversations costs 50 conversation reads instead of 50 per card.
+    by_base = {Path(source.base): source for source in sources}
+    capabilities_by_base: dict[Path, dict] = {}
     for card in cards:
-        folder = Path(str(card.get("folder") or ""))
-        source = next(
-            (candidate for candidate in sources if folder.parent == Path(candidate.base)),
-            None,
-        )
-        if source is not None:
-            card["capabilities"] = artifact_capabilities(session, source)
+        base = Path(str(card.get("folder") or "")).parent
+        source = by_base.get(base)
+        if source is None:
+            continue
+        if base not in capabilities_by_base:
+            capabilities_by_base[base] = artifact_capabilities(session, source)
+        card["capabilities"] = capabilities_by_base[base]
     return cards
 
 
