@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts
@@ -17,18 +18,41 @@ def test_project_filtered_cards_discover_roots_with_the_server_catalog_id(
     # Same UUID value, deliberately a different object representing the value
     # recovered from the tenant-scoped database catalog.
     server_id = UUID(request_id.hex)
+    trusted_source = SimpleNamespace(base="/server-owned/artifacts")
     seen = {}
+    events = []
+
+    class SanitizedProjectRef(str):
+        pass
+
+    real_basename = artifacts.os.path.basename
+
+    def sanitize(project_ref):
+        events.append("basename")
+        sanitized = SanitizedProjectRef(real_basename(project_ref))
+        seen["sanitized"] = sanitized
+        return sanitized
 
     def recover(_session, project_ref):
+        events.append("catalog")
+        assert project_ref is seen["sanitized"]
         seen["lookup"] = project_ref
         return server_id
 
     def discover(_session, project_id):
+        events.append("roots")
         seen["discovery"] = project_id
+        return [trusted_source]
+
+    def list_from_roots(sources):
+        events.append("sink")
+        seen["card_sources"] = sources
         return []
 
+    monkeypatch.setattr(artifacts.os.path, "basename", sanitize)
     monkeypatch.setattr(artifacts, "scoped_project_id_for_request", recover)
     monkeypatch.setattr(artifacts, "artifacts_sources_for_project", discover)
+    monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = artifacts.artifacts_for_request(
         SimpleNamespace(), project_id=str(request_id)
@@ -37,6 +61,24 @@ def test_project_filtered_cards_discover_roots_with_the_server_catalog_id(
     assert cards == []
     assert seen["lookup"] == str(request_id)
     assert seen["discovery"] is server_id
+    assert seen["card_sources"] == [trusted_source]
+    assert events == ["basename", "catalog", "roots", "sink"]
+
+
+def test_project_path_leaf_sanitization_does_not_accept_a_prefixed_uuid(monkeypatch):
+    def unexpected_catalog(*_args):
+        raise AssertionError("path-like project value reached the catalog")
+
+    monkeypatch.setattr(
+        artifacts, "scoped_project_id_for_request", unexpected_catalog
+    )
+
+    with pytest.raises(HTTPException) as error:
+        artifacts._scoped_project_sources(
+            SimpleNamespace(), f"nested/{uuid4()}"
+        )
+
+    assert error.value.status_code == 400
 
 
 async def test_legacy_delete_scans_only_roots_selected_by_the_server_catalog(

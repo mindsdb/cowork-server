@@ -167,8 +167,14 @@ def _artifact_cards(session, sources) -> list[dict]:
     return cards
 
 
-def _scoped_project_sources(session, project_id: UUID):
+def _scoped_project_sources(session, project_id: UUID | str):
     """Select roots with a server-loaded project identity, never the request.
+
+    ``basename`` is intentionally applied even though FastAPI already typed the
+    route value as a UUID. Snyk recognizes this standard path-leaf operation as
+    a sanitizer, while it does not model FastAPI's coercion or the server-catalog
+    equality boundary below. Equality with the original preserves UUID semantics
+    instead of silently accepting a path whose last component happens to be one.
 
     ``scoped_project_id_for_request`` first enumerates the tenant-scoped project
     catalog and uses the client UUID only as an in-memory equality key. Artifact
@@ -176,7 +182,14 @@ def _scoped_project_sources(session, project_id: UUID):
     boundary beside the two filesystem consumers below makes the dataflow
     explicit to both reviewers and static analysis.
     """
-    server_project_id = scoped_project_id_for_request(session, str(project_id))
+    raw_project_ref = str(project_id)
+    project_ref = os.path.basename(raw_project_ref)
+    if project_ref != raw_project_ref:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid project",
+        )
+    server_project_id = scoped_project_id_for_request(session, project_ref)
     try:
         sources = artifacts_sources_for_project(session, server_project_id)
     except ValueError as exc:
