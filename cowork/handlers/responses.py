@@ -32,6 +32,8 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming.backend import get_backend
+from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.schemas.responses import (
     Content,
@@ -522,7 +524,7 @@ class ResponsesHandler:
         # turn_id comes from handle(): same numbering as the delegated path.
         buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
-        await registry.start(
+        handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
             buffer=buffer,
@@ -537,6 +539,19 @@ class ResponsesHandler:
             ),
             lifecycle=lifecycle,
         )
+        # A direct answer still uses the shared Redis buffer in a multi-replica
+        # deployment. Register it just like a delegated turn so another replica
+        # can locate and replay that buffer. Do this only when start accepted our
+        # buffer: a duplicate send returns the existing handle and must not
+        # overwrite its index entry with the discarded turn.
+        if get_backend() == "redis" and handle.buffer is buffer:
+            await record_turn(
+                str(conversation_id),
+                turn_id=turn_id,
+                correlation_id=f"direct-{uuid4()}",
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+            )
         return sse_from_buffer(buffer, 0)
 
     async def _produce_direct(
