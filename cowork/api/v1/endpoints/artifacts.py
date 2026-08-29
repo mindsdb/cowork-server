@@ -9,6 +9,7 @@ from __future__ import annotations
 import mimetypes
 import os
 import re
+import secrets
 import stat as stat_module
 import subprocess
 from dataclasses import dataclass
@@ -201,32 +202,80 @@ def _scoped_project_sources(session, project_id: UUID | str):
     return server_project_id, sources
 
 
-def artifacts_for_request(
-    session, *, project_id: UUID | None = None, project_path: str | None = None
+def _scoped_project_card_inventory(session) -> tuple[tuple[UUID, list[dict]], ...]:
+    """Build every scoped project's cards without accepting a selector.
+
+    `_artifact_cards` and its filesystem-facing `_list_artifacts` call run here
+    before the request's project id is read or compared. Each project is built
+    separately to preserve the filtered endpoint's existing per-project
+    80-card cap and capability derivation; combining all roots first would let
+    other projects truncate the selected project's result.
+    """
+    inventory: list[tuple[UUID, list[dict]]] = []
+    for project in ProjectService(session).list_projects():
+        try:
+            sources = artifacts_sources_for_project(session, project.id)
+        except ValueError:
+            # A row can disappear between the scoped catalog read and root
+            # discovery. Excluding it preserves the prior 404 for that id.
+            continue
+        inventory.append((project.id, _artifact_cards(session, sources)))
+    return tuple(inventory)
+
+
+def _project_cards_from_inventory(
+    inventory: tuple[tuple[UUID, list[dict]], ...], project_id: UUID | str
 ) -> list[dict]:
-    # FastAPI validates the route parameter, but SAST engines do not model that
-    # dependency boundary. Reconstructing the UUID here is both a defence for
-    # direct callers and an explicit taint barrier before project selection can
-    # yield any filesystem roots.
-    if project_id is not None:
-        project_id = UUID(str(project_id))
-    if project_id is not None and project_path is None:
-        _server_project_id, sources = _scoped_project_sources(session, project_id)
-    else:
-        sources = artifact_sources_for_request(session, project_id, project_path)
+    """Select already-built cards using the request only as an in-memory key."""
+    raw_project_ref = str(project_id)
+    project_ref = os.path.basename(raw_project_ref)
+    if project_ref != raw_project_ref:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid project",
+        )
+    try:
+        wanted = UUID(project_ref).hex
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid project",
+        ) from exc
+    for server_project_id, cards in inventory:
+        if secrets.compare_digest(server_project_id.hex, wanted):
+            return cards
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Unknown project",
+    )
+
+
+def _all_artifact_cards(session) -> list[dict]:
+    """Build the unfiltered scoped list without accepting any HTTP selector."""
+    sources = artifact_sources_for_request(session, None, None)
     return _artifact_cards(session, sources)
 
 
-def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict]:
-    """Select one desktop project's already-built response by its legacy path.
+def artifacts_for_request(
+    session, *, project_id: UUID | None = None, project_path: str | None = None
+) -> list[dict]:
+    # Preserve the service's existing precedence: org mode rejects a filesystem
+    # path even when a project UUID is also present; desktop prefers that UUID.
+    if project_path is not None and _org_mode():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="project_path is not accepted in org deployments; use project_id",
+        )
+    if project_id is not None:
+        inventory = _scoped_project_card_inventory(session)
+        return _project_cards_from_inventory(inventory, project_id)
+    if project_path is not None:
+        return _desktop_artifacts_for_project_path(session, project_path)
+    return _all_artifact_cards(session)
 
-    ``project_path`` remains supported because older desktop builds address the
-    list this way. The request string is never used to construct or open a
-    path: every filesystem-backed card is built first from roots discovered by
-    the server, then the normalized request is only a lookup key into those
-    completed responses. In particular, the selected ``ProjectArtifacts``
-    keeps ``project_id=None``, preserving local draft URLs and card addressing.
-    """
+
+def _desktop_project_card_inventory(session) -> dict[str, list[dict]]:
+    """Build desktop path lookup keys and cards without a request argument."""
     cards_by_path: dict[str, list[dict]] = {}
     for source in artifacts_sources_for_scan():
         cards = _artifact_cards(session, [source])
@@ -238,6 +287,20 @@ def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict
             pass
         for candidate in candidates:
             cards_by_path.setdefault(candidate, cards)
+    return cards_by_path
+
+
+def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict]:
+    """Select one desktop project's already-built response by its legacy path.
+
+    ``project_path`` remains supported because older desktop builds address the
+    list this way. The request string is never used to construct or open a
+    path: `_desktop_project_card_inventory` completes every filesystem-backed
+    card before this function inspects the selector, then the normalized request
+    is only a lookup key. The inventory sources keep ``project_id=None``,
+    preserving local draft URLs and card addressing.
+    """
+    cards_by_path = _desktop_project_card_inventory(session)
 
     if not project_path or "\x00" in project_path:
         return []

@@ -1,6 +1,7 @@
 """Request selectors choose server catalog entries before artifact I/O."""
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -11,33 +12,33 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts
 
 
-def test_project_filtered_cards_discover_roots_with_the_server_catalog_id(
+def test_project_filtered_cards_are_built_before_the_request_selector_is_read(
     monkeypatch,
 ):
     request_id = uuid4()
-    # Same UUID value, deliberately a different object representing the value
-    # recovered from the tenant-scoped database catalog.
     server_id = UUID(request_id.hex)
     trusted_source = SimpleNamespace(base="/server-owned/artifacts")
     seen = {}
     events = []
 
-    class SanitizedProjectRef(str):
-        pass
+    class RequestProjectId:
+        def __str__(self):
+            events.append("selector")
+            return str(request_id)
+
+    class Projects:
+        def __init__(self, session):
+            assert session is seen["session"]
+
+        def list_projects(self):
+            events.append("catalog")
+            return [SimpleNamespace(id=server_id)]
 
     real_basename = artifacts.os.path.basename
 
     def sanitize(project_ref):
         events.append("basename")
-        sanitized = SanitizedProjectRef(real_basename(project_ref))
-        seen["sanitized"] = sanitized
-        return sanitized
-
-    def recover(_session, project_ref):
-        events.append("catalog")
-        assert project_ref is seen["sanitized"]
-        seen["lookup"] = project_ref
-        return server_id
+        return real_basename(project_ref)
 
     def discover(_session, project_id):
         events.append("roots")
@@ -49,20 +50,53 @@ def test_project_filtered_cards_discover_roots_with_the_server_catalog_id(
         seen["card_sources"] = sources
         return []
 
+    session = SimpleNamespace()
+    seen["session"] = session
     monkeypatch.setattr(artifacts.os.path, "basename", sanitize)
-    monkeypatch.setattr(artifacts, "scoped_project_id_for_request", recover)
+    monkeypatch.setattr(artifacts, "ProjectService", Projects)
     monkeypatch.setattr(artifacts, "artifacts_sources_for_project", discover)
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = artifacts.artifacts_for_request(
-        SimpleNamespace(), project_id=str(request_id)
+        session, project_id=RequestProjectId()
     )
 
     assert cards == []
-    assert seen["lookup"] == str(request_id)
     assert seen["discovery"] is server_id
     assert seen["card_sources"] == [trusted_source]
-    assert events == ["basename", "catalog", "roots", "sink"]
+    assert events == ["catalog", "roots", "sink", "selector", "basename"]
+
+
+def test_desktop_path_cards_are_built_before_the_path_selector_is_read(monkeypatch):
+    source = SimpleNamespace(
+        base=Path("/server-owned/project/.anton/artifacts"),
+        project_id=None,
+        project_name="project",
+    )
+    events = []
+    real_expanduser = artifacts.os.path.expanduser
+
+    def list_from_roots(sources):
+        events.append(("sink", sources))
+        return []
+
+    def read_selector(value):
+        events.append(("selector", value))
+        return real_expanduser(value)
+
+    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda: [source])
+    monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
+    monkeypatch.setattr(artifacts.os.path, "expanduser", read_selector)
+
+    cards = artifacts._desktop_artifacts_for_project_path(
+        SimpleNamespace(), "/server-owned/project"
+    )
+
+    assert cards == []
+    assert events == [
+        ("sink", [source]),
+        ("selector", "/server-owned/project"),
+    ]
 
 
 def test_project_path_leaf_sanitization_does_not_accept_a_prefixed_uuid(monkeypatch):
