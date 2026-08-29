@@ -27,7 +27,10 @@ returns None so shared code can branch on "no tenant context".
 
 from __future__ import annotations
 
+import binascii
+import json
 import logging
+from base64 import urlsafe_b64decode
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Literal
@@ -180,13 +183,29 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         )
 
 
+def _has_jose_header(segment: str) -> bool:
+    """True when a token's first segment decodes to a JOSE header object.
+
+    Read the segment rather than measuring it. A compact header such as
+    ``{"alg":"RS256"}`` encodes to exactly 20 characters, so a length threshold
+    classifies a real signed token as an opaque credential and silently skips
+    the boundary for it.
+    """
+    padding = "=" * (-len(segment) % 4)
+    try:
+        header = json.loads(urlsafe_b64decode(segment + padding))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return False
+    return isinstance(header, dict) and isinstance(header.get("alg"), str) and bool(header["alg"])
+
+
 def _is_browser_jwt_request(request: Request) -> bool:
     """True only for a bearer shaped like a browser Keycloak JWT.
 
-    Authentication remains the ingress gateway's job. The shape mirrors
-    ``AuthenticationViewSet._is_jwt_token`` on auth's ``/v1/authenticate/``
-    route, which keeps the stale-document protocol away from API keys, desktop
-    tokens, and internal callers that do not participate in browser reloads.
+    Authentication remains the ingress gateway's job; this only decides which
+    callers take part in the browser reload protocol. MindsDB API keys carry
+    the ``mdb_`` prefix, and every other opaque service credential fails the
+    JOSE header check, so both keep their existing behavior.
     """
     authorization = request.headers.get("Authorization", "").strip()
     if not authorization.lower().startswith("bearer "):
@@ -195,7 +214,7 @@ def _is_browser_jwt_request(request: Request) -> bool:
     if not credential or credential.lower().startswith("mdb_"):
         return False
     parts = credential.split(".")
-    return len(parts) == 3 and all(parts) and len(parts[0]) > 20
+    return len(parts) == 3 and all(parts) and _has_jose_header(parts[0])
 
 
 def get_principal(request: Request) -> Principal | None:
