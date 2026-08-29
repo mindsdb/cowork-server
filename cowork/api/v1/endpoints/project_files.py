@@ -209,8 +209,8 @@ def _validated_project_path(path: str) -> _ValidatedProjectPath:
 ProjectMutationPathDep = Annotated[_ValidatedProjectPath, Depends(_validated_project_path)]
 
 
-def _project_dir(name: str, scoped: ScopedSession) -> Path:
-    """Resolve a sanitized project name to its scoped on-disk directory."""
+def _project_name_selector(name: str) -> str:
+    """Validate an HTTP project name for equality-only catalog selection."""
     selected_name = os.path.basename(name)
     if (
         not selected_name
@@ -220,6 +220,45 @@ def _project_dir(name: str, scoped: ScopedSession) -> Path:
         or "\x00" in selected_name
     ):
         raise HTTPException(status_code=404, detail="Project not found")
+    return selected_name
+
+
+@contextmanager
+def _opened_project_directory_inventory(
+    scoped: ScopedSession,
+) -> Iterator[tuple[tuple[str, PinnedDir | None], ...]]:
+    """Open every scoped project root before a request name selects one.
+
+    This context intentionally has no request-derived argument. Each root is
+    built from its scoped database row and pinned before the inventory reaches
+    the caller. The surrounding ``ExitStack`` keeps every descriptor alive
+    while the caller compares names and closes all of them on every exit path.
+    """
+    service = ProjectService(scoped)
+    projects = service.list_projects()
+    with ExitStack() as resources:
+        opened: list[tuple[str, PinnedDir | None]] = []
+        for project in projects:
+            name = str(project.name)
+            directory: PinnedDir | None = None
+            try:
+                # Preserve the historical self-heal for a missing project
+                # directory before attempting to pin the row's stored path.
+                service.ensure_dir_exists(project)
+                path = Path(project.path)
+                if path.is_dir():
+                    directory = resources.enter_context(
+                        pinned_dir(path, nofollow_base=True)
+                    )
+            except (OSError, TypeError, ValueError):
+                pass
+            opened.append((name, directory))
+        yield tuple(opened)
+
+
+def _project_dir(name: str, scoped: ScopedSession) -> Path:
+    """Resolve a sanitized project name to its scoped on-disk directory."""
+    selected_name = _project_name_selector(name)
     service = ProjectService(scoped)
     try:
         project = service.get_project_by_name(selected_name)
@@ -394,7 +433,7 @@ def _existing_entry_name(directory: PinnedDir, requested: str) -> str:
 
 @contextmanager
 def _opened_existing_project_entry(
-    base: Path, requested_parts: tuple[str, ...]
+    root: PinnedDir, requested_parts: tuple[str, ...]
 ) -> Iterator[tuple[PinnedDir, str]]:
     """Pin the parent of an existing project entry and yield its disk name.
 
@@ -405,7 +444,7 @@ def _opened_existing_project_entry(
     """
     if not requested_parts:
         raise FileNotFoundError
-    with pinned_dir(base, nofollow_base=True) as root, ExitStack() as descendants:
+    with ExitStack() as descendants:
         current = root
         for requested in requested_parts[:-1]:
             name = _existing_entry_name(current, requested)
@@ -581,19 +620,46 @@ async def upload_project_files(
 def delete_project_file(
     project_name: str, path: ProjectMutationPathDep, scoped: ScopedSessionDep
 ):
-    base = _project_dir(project_name, scoped)
     _require_workspace_path(path, scoped)
-    # The request components are selectors only. Every name used below comes
-    # back from scanning a pinned directory, which both breaks the HTTP-to-path
-    # data flow and keeps a planted symlink from redirecting the deletion.
     try:
-        with _opened_existing_project_entry(base, path.parts) as (parent, disk_name):
-            target_stat = dir_lstat(parent, disk_name)
-            if stat.S_ISLNK(target_stat.st_mode):
-                raise HTTPException(status_code=404, detail="File not found")
-            if stat.S_ISDIR(target_stat.st_mode):
-                raise HTTPException(status_code=400, detail="Path is a directory")
-            dir_unlink(parent, disk_name)
+        # Each candidate is resolved and pinned from the scoped catalog before
+        # the HTTP name is compared with it. The request can only select the
+        # already-open handle; it never reaches a Path constructor or open.
+        with _opened_project_directory_inventory(scoped) as inventory:
+            selected_name = os.path.basename(project_name)
+            if (
+                not selected_name
+                or selected_name != project_name
+                or selected_name in {".", ".."}
+                or "\\" in selected_name
+                or "\x00" in selected_name
+            ):
+                raise HTTPException(status_code=404, detail="Project not found")
+            for server_name, directory in inventory:
+                if server_name != selected_name:
+                    continue
+                if directory is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Project directory not found on disk",
+                    )
+
+                # Path components are selectors too. Every syscall name comes
+                # back from scanning this already-pinned directory.
+                with _opened_existing_project_entry(
+                    directory, path.parts
+                ) as (parent, disk_name):
+                    target_stat = dir_lstat(parent, disk_name)
+                    if stat.S_ISLNK(target_stat.st_mode):
+                        raise HTTPException(status_code=404, detail="File not found")
+                    if stat.S_ISDIR(target_stat.st_mode):
+                        raise HTTPException(
+                            status_code=400, detail="Path is a directory"
+                        )
+                    dir_unlink(parent, disk_name)
+                break
+            else:
+                raise HTTPException(status_code=404, detail="Project not found")
     except HTTPException:
         raise
     except (OSError, ValueError):

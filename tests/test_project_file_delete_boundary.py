@@ -13,7 +13,17 @@ from cowork.db.scoped import LOCAL_SCOPE
 
 
 def _delete(base, relative: str, monkeypatch):
-    monkeypatch.setattr(project_files, "_project_dir", lambda *_args: base)
+    class Catalog:
+        def __init__(self, _scoped):
+            pass
+
+        def list_projects(self):
+            return [SimpleNamespace(name="project", path=str(base))]
+
+        def ensure_dir_exists(self, _project):
+            pass
+
+    monkeypatch.setattr(project_files, "ProjectService", Catalog)
     scoped = SimpleNamespace(scope=LOCAL_SCOPE)
     return project_files.delete_project_file(
         "project", project_files._validated_project_path(relative), scoped
