@@ -424,6 +424,40 @@ def test_short_three_part_bearer_is_exempt_from_organization_boundary():
     assert res.status_code == 200
 
 
+def test_compact_jose_header_still_takes_part_in_the_organization_boundary():
+    """`{"alg":"RS256"}` encodes to exactly 20 characters — a real signed token
+    that a length threshold would wave past the boundary."""
+    compact = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature"
+
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": f"Bearer {compact}",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+            "Origin": ORIGIN,
+        },
+    )
+
+    _assert_organization_boundary_rejection(res, 409)
+
+
+def test_three_part_bearer_without_a_jose_header_is_exempt():
+    """The first segment decodes, but to a JSON string rather than a header."""
+    not_a_header = "IlJTMjU2Ig.eyJzdWIiOiJ1c2VyIn0.signature"
+
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": f"Bearer {not_a_header}",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
 def test_missing_bearer_is_exempt_from_organization_boundary():
     res = _client(organization_boundary_mode="enforce").get(
         "/api/v1/whoami",
