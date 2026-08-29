@@ -19,6 +19,7 @@ from pydantic import SecretStr
 
 from cowork.common.http_client import get_proxy_client
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+from cowork.principal import caller_bearer
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,61 @@ def resolve_inference_endpoint(settings=None) -> tuple[str, str]:
     if host == "mindshub.ai" or host.endswith(".mindshub.ai"):
         return oai.rstrip("/"), _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
     return (settings.minds_url or "").rstrip("/"), _secret_str(settings.minds_api_key)
+
+
+def _org_mode() -> bool:
+    """True when this deployment is multi-tenant.
+
+    A local, lazily-imported copy of the same check comments.py makes. Importing
+    it from there instead would point a service at the endpoint module that
+    imports it, and the settings read is behind an lru_cache anyway.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    return get_app_settings().tenancy_mode == "org"
+
+
+def _org_inference_base() -> str:
+    """This deployment's OWN inference base — never a tenant-settable one.
+
+    Mirrors the org model catalog (services/providers.py, fetch_org_minds_models),
+    which resolves the same URL for the same reason: `openai_base_url` and
+    `minds_url` are settable by an org admin, and sending a member's credential
+    to a host they chose is what caller_bearer's contract forbids. The turn
+    producer derives the same host through minds_chat_base_url; the two agree on
+    every org host, and this spelling leaves out that helper's `mdb.ai` ->
+    `/api/v1` rule, which only ever applied to chat.
+
+    Constructed per call on purpose. pydantic-settings reads the environment when
+    instantiated and the tests monkeypatch it per test, so hoisting this into a
+    module-level constant would freeze whichever value import time happened to see.
+    """
+    from cowork.common.settings.app_settings import (
+        TurnQueueSettings,
+        default_turn_minds_api_host,
+    )
+
+    return TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
+
+
+def resolve_comments_upstream(request: Request) -> tuple[str, str]:
+    """(base_url, credential) for this request, chosen by tenancy.
+
+    Desktop keeps the user's stored MindsHub key and their own endpoint. An org
+    pod has neither — no user settings exist for it — so the shared resolver
+    yielded an empty key and the gateway answered 401. The caller's own bearer is
+    the credential that fits: the ingress just validated it against the very auth
+    endpoint inference's ingress uses, and forwarding it makes the upstream
+    identity equal to the caller's by construction, with no key to mint, cache or
+    revoke.
+
+    The credential is bare (no `Bearer ` prefix), matching what _forward_headers
+    expects. An empty one is the caller's problem, not ours: callers must refuse
+    rather than send an anonymous upstream request.
+    """
+    if not _org_mode():
+        return resolve_inference_endpoint()
+    return _org_inference_base(), caller_bearer(request)
 
 
 # Segments that would traverse out of the /artifact-comments/ prefix on the
