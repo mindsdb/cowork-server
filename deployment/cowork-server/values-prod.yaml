@@ -1,3 +1,34 @@
+# Prod goes second, behind a staging soak. This value reaches prod when
+# `staging` merges to `main`, so staging has already run under the policy by the
+# time it applies here.
+#
+# Roll the gha-runner-scale-set chart on newprod BEFORE this reaches `main`.
+# `newprod-gha-runner` needs `create networkpolicies` in the prod namespace; the
+# release fails without it and --atomic rolls the whole deploy back. Confirm:
+#   kubectl --context newprod -n prod auth can-i create networkpolicies \
+#     --as=system:serviceaccount:infrastructure:newprod-gha-runner
+#
+# Then read the two selectors against newprod, because getting either one wrong
+# fails SILENTLY. The release succeeds, both replicas stay Ready because the
+# kubelet is still allowed, and every request to cowork.mindshub.ai/api is
+# dropped with nothing going red. Both were read on newdev; newprod is a
+# separate cluster running a separately hand-rolled ingress chart.
+#   kubectl --context newprod -n infrastructure get pods -l nginx-ingress-controller=true
+#   kubectl --context newprod get ns infrastructure -o jsonpath='{.metadata.labels}{"\n"}'
+# The first has to list the controller pods. The second has to show
+# kubernetes.io/metadata.name: infrastructure. Check nothing is there to collide
+# with either, since Helm will not adopt an object it does not own:
+#   kubectl --context newprod -n prod get networkpolicies
+#
+# newprod enforces with Cilium, and a running pod is covered by a policy applied
+# after it: Cilium recomputes policy for the endpoints it already manages, so no
+# rollout is needed to pick this up. The only pod it never covers is one that
+# started before Cilium itself was installed, and Cilium went in on newprod on
+# 2026-08-20. So if you do find a pod this policy is not applied to, that is
+# Cilium not managing the pod, which is a bigger problem than this policy.
+networkPolicy:
+  enabled: true
+
 deployment:
   ingress:
     enabled: true
