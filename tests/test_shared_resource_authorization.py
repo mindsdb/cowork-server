@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import io
 from pathlib import Path
@@ -32,6 +33,7 @@ from cowork.schemas.memory import MemoryResponse, MemoryScope
 from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
 from cowork.schemas.skills import SkillCreateRequest, SkillResponse, SkillUpdateRequest
 from cowork.services.memory import MemoryService, apply_turn_memory, build_turn_memory
+from cowork.services import memory as memory_service_module
 from cowork.harnesses.memory.store import ProjectMemoryStore
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService, attachment_purpose
@@ -41,6 +43,7 @@ from cowork.services.shared_resources import (
     PROJECT_INSTRUCTIONS,
     PROJECT_MEMORY,
     SKILL,
+    SKILL_PROJECT_REFERENCES,
     SharedResourceAccess,
     project_memory_resource_key,
     project_resource_key,
@@ -439,6 +442,172 @@ def test_project_collision_normalized_noop_stays_member_selectable(org_engine):
     assert [
         event.id for event in alice.exec(alice.select(SharedResourceMutation)).all()
     ] == before
+
+
+def test_project_rename_cannot_claim_the_unprovisioned_general_name(org_engine):
+    alice = _scoped(org_engine, ALICE)
+    project = projects.create_project(
+        ProjectCreateRequest(name="default-name-hijack"),
+        alice,
+        _principal(ALICE),
+    )
+
+    renamed = projects.update_project(
+        project["id"],
+        ProjectUpdateRequest(name=GENERAL_PROJECT),
+        alice,
+        _principal(ALICE),
+    )
+    general = ProjectService(alice).ensure_general_for_scope()
+
+    assert renamed["name"] == "general-2"
+    assert general is not None
+    assert general.id != renamed["id"]
+    assert general.name == GENERAL_PROJECT
+    assert general.created_by is None
+
+
+def test_concurrent_project_renames_allocate_distinct_names(
+    org_engine,
+    monkeypatch,
+    tmp_path,
+):
+    race_engine = create_engine(
+        f"sqlite:///{tmp_path / 'project-rename-namespace.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(race_engine)
+    alice = _scoped(race_engine, ALICE)
+    first = projects.create_project(
+        ProjectCreateRequest(name="rename-source-one"),
+        alice,
+        _principal(ALICE),
+    )
+    second = projects.create_project(
+        ProjectCreateRequest(name="rename-source-two"),
+        alice,
+        _principal(ALICE),
+    )
+    namespace_barrier = Barrier(2)
+    original_coordination_lock = SharedResourceAccess.coordination_lock
+
+    @contextmanager
+    def synchronize_namespace(access, namespace, key):
+        if (namespace, key) == (SKILL_PROJECT_REFERENCES, "all"):
+            namespace_barrier.wait(timeout=5)
+        with original_coordination_lock(access, namespace, key):
+            yield
+
+    monkeypatch.setattr(
+        SharedResourceAccess,
+        "coordination_lock",
+        synchronize_namespace,
+    )
+
+    def rename(project_id):
+        scoped = _scoped(race_engine, ALICE)
+        try:
+            return projects.update_project(
+                project_id,
+                ProjectUpdateRequest(name="shared-rename-target"),
+                scoped,
+                _principal(ALICE),
+            )
+        finally:
+            scoped.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            future.result(timeout=10)
+            for future in (
+                pool.submit(rename, first["id"]),
+                pool.submit(rename, second["id"]),
+            )
+        ]
+
+    alice.rollback()
+    stored = [ProjectService(alice).get_project(result["id"]) for result in results]
+    assert {project.name for project in stored} == {
+        "shared-rename-target",
+        "shared-rename-target-2",
+    }
+    assert len({project.path for project in stored}) == 2
+    assert all(Path(project.path).is_dir() for project in stored)
+    race_engine.dispose()
+
+
+def test_project_create_and_rename_share_the_name_namespace(
+    org_engine,
+    monkeypatch,
+    tmp_path,
+):
+    race_engine = create_engine(
+        f"sqlite:///{tmp_path / 'project-create-rename-namespace.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(race_engine)
+    alice = _scoped(race_engine, ALICE)
+    source = projects.create_project(
+        ProjectCreateRequest(name="create-rename-source"),
+        alice,
+        _principal(ALICE),
+    )
+    namespace_barrier = Barrier(2)
+    original_coordination_lock = SharedResourceAccess.coordination_lock
+
+    @contextmanager
+    def synchronize_namespace(access, namespace, key):
+        if (namespace, key) == (SKILL_PROJECT_REFERENCES, "all"):
+            namespace_barrier.wait(timeout=5)
+        with original_coordination_lock(access, namespace, key):
+            yield
+
+    monkeypatch.setattr(
+        SharedResourceAccess,
+        "coordination_lock",
+        synchronize_namespace,
+    )
+
+    def rename():
+        scoped = _scoped(race_engine, ALICE)
+        try:
+            return projects.update_project(
+                source["id"],
+                ProjectUpdateRequest(name="shared-create-rename-target"),
+                scoped,
+                _principal(ALICE),
+            )
+        finally:
+            scoped.close()
+
+    def create():
+        scoped = _scoped(race_engine, ALICE)
+        try:
+            return projects.create_project(
+                ProjectCreateRequest(name="shared-create-rename-target"),
+                scoped,
+                _principal(ALICE),
+            )
+        finally:
+            scoped.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        renamed_future = pool.submit(rename)
+        created_future = pool.submit(create)
+        results = [
+            renamed_future.result(timeout=10),
+            created_future.result(timeout=10),
+        ]
+
+    alice.rollback()
+    stored = [ProjectService(alice).get_project(result["id"]) for result in results]
+    assert {project.name for project in stored} == {
+        "shared-create-rename-target",
+        "shared-create-rename-target-2",
+    }
+    assert len({project.path for project in stored}) == 2
+    assert all(Path(project.path).is_dir() for project in stored)
+    race_engine.dispose()
 
 
 def test_project_rename_restores_directory_and_all_skill_bytes_on_repair_failure(
@@ -1311,6 +1480,51 @@ def test_builtin_identity_fails_closed_when_package_assets_are_missing(
     assert denied.value.status_code == 403
 
 
+def test_builtin_identity_uses_directory_slug_when_frontmatter_drifts(org_engine):
+    alice = _scoped(org_engine, ALICE)
+    service = SkillService(alice.scope)
+    service.ensure_builtin_skills()
+    victim = "documents"
+    skill_file = service._skill_dir(victim) / "SKILL.md"
+    original_bytes = skill_file.read_bytes()
+    skill_file.write_bytes(
+        original_bytes.replace(b"name: documents", b"name: renamed-documents", 1)
+    )
+
+    admin = _scoped(org_engine, ADMIN)
+    principal = _principal(ADMIN, admin=True)
+    response = skills.get_skill(victim, admin, principal)
+    listed = {
+        item["id"]: item for item in skills.list_skills(admin, principal)["skills"]
+    }
+
+    for item in (response, listed[victim]):
+        assert item["id"] == victim
+        assert item["isBuiltin"] is True
+        assert item["capabilities"] == {
+            "canEdit": False,
+            "canDelete": False,
+            "canDisable": False,
+        }
+    with pytest.raises(HTTPException) as edit_denied:
+        skills.update_skill(
+            victim,
+            SkillUpdateRequest(instructions="replace packaged content"),
+            admin,
+            principal,
+        )
+    assert edit_denied.value.status_code == 403
+    with pytest.raises(HTTPException) as delete_denied:
+        skills.delete_skill(victim, admin, principal)
+    assert delete_denied.value.status_code == 403
+    assert skill_file.read_bytes() == original_bytes.replace(
+        b"name: documents", b"name: renamed-documents", 1
+    )
+    assert (
+        SharedResourceAccess(admin, principal)._find(SKILL, "renamed-documents") is None
+    )
+
+
 def test_local_mode_keeps_project_and_builtin_mutations(org_engine):
     local = ScopedSession(Session(org_engine), LOCAL_SCOPE)
     project = projects.create_project(
@@ -1831,6 +2045,54 @@ async def test_existing_memory_audit_failure_restores_exact_prior_bytes(
     assert {
         event.id for event in alice.exec(alice.select(SharedResourceMutation)).all()
     } == before_events
+
+
+def test_remote_memory_setup_failure_releases_coordination_and_rolls_back(
+    org_engine,
+    monkeypatch,
+):
+    alice = _scoped(org_engine, ALICE)
+    project = ProjectService(alice).create_project("failed-remote-memory-setup")
+    coordination_exited = Event()
+    rollback_called = Event()
+    original_coordination = memory_service_module._project_slot_coordination
+    original_rollback = alice.rollback
+
+    @contextmanager
+    def tracking_coordination(*args, **kwargs):
+        try:
+            with original_coordination(*args, **kwargs) as coordinated:
+                yield coordinated
+        finally:
+            coordination_exited.set()
+
+    def fail_recovery(*_args, **_kwargs):
+        raise RuntimeError("memory setup failed")
+
+    def tracking_rollback():
+        rollback_called.set()
+        original_rollback()
+
+    monkeypatch.setattr(
+        memory_service_module,
+        "_project_slot_coordination",
+        tracking_coordination,
+    )
+    monkeypatch.setattr(SharedResourceAccess, "recover_stale_claim", fail_recovery)
+    monkeypatch.setattr(alice, "rollback", tracking_rollback)
+
+    with pytest.raises(RuntimeError, match="memory setup failed") as exc_info:
+        apply_turn_memory(
+            alice.scope,
+            project.path,
+            [{"text": "Never persisted", "kind": "always", "scope": "project"}],
+            access=SharedResourceAccess(alice, _principal(ALICE)),
+            project_id=project.id,
+        )
+
+    assert exc_info.value.args == ("memory setup failed",)
+    assert coordination_exited.is_set()
+    assert rollback_called.is_set()
 
 
 def test_mutation_lock_serializes_the_entire_resource_window(org_engine):

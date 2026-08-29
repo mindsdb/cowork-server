@@ -202,12 +202,23 @@ def build_turn_skills(
     return out
 
 
-def _skill_from_dir(skill_dir: Path) -> Skill | None:
-    """Read a ``SKILL.md`` folder into a ``Skill``."""
+def _skill_from_dir(
+    skill_dir: Path,
+    *,
+    canonicalize_name: bool = True,
+) -> Skill | None:
+    """Read a ``SKILL.md`` folder into a ``Skill``.
+
+    Persisted skill identity is its directory slug. Frontmatter can drift after
+    a hand edit or partial filesystem mutation, but reads must not let that
+    content select another authorization or builtin identity.
+    """
     agent = parse_skill_dir(skill_dir)
     if agent is None:
         return None
     skill = Skill.model_construct(**dict(agent))
+    if canonicalize_name:
+        skill.name = skill_dir.name
 
     return skill
 
@@ -309,7 +320,7 @@ class SkillService:
         skills: list[Skill] = []
         for entry in self.root.iterdir():
             if entry.is_dir() and (entry / SKILL_FILE).exists():
-                skill = _skill_from_dir(entry)
+                skill = _skill_from_dir(entry, canonicalize_name=True)
                 if skill is not None:
                     skills.append(skill)
         skills.sort(key=lambda s: (s.created_at is None, s.created_at), reverse=True)
@@ -318,7 +329,9 @@ class SkillService:
     def get_skill(self, slug: str) -> Skill:
         skill_dir = self._skill_dir(slug)
         skill = (
-            _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).exists() else None
+            _skill_from_dir(skill_dir, canonicalize_name=True)
+            if (skill_dir / SKILL_FILE).exists()
+            else None
         )
         if skill is None:
             raise ValueError(f"Skill {slug!r} not found.")
@@ -341,7 +354,7 @@ class SkillService:
                 return False
             if skill_file.is_symlink() or not skill_file.is_file():
                 return False
-            parsed = _skill_from_dir(skill_dir)
+            parsed = _skill_from_dir(skill_dir, canonicalize_name=False)
         except (OSError, UnicodeError, ValueError):
             return False
         return parsed is not None and parsed.name == slug
@@ -557,7 +570,7 @@ class SkillService:
         otherwise only ``SKILL.md`` is written by ``_write``.
         """
         self._normalize_skill_dir(src_dir)
-        skill = _skill_from_dir(src_dir)
+        skill = _skill_from_dir(src_dir, canonicalize_name=False)
         if skill is None:
             raise ValueError("Could not find a parseable SKILL.md in the upload.")
         if not skill.name:
