@@ -160,3 +160,54 @@ def test_app_settings_rejects_invalid_identity_enforce(monkeypatch):
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+def test_app_settings_organization_boundary_defaults_to_enforce(monkeypatch):
+    monkeypatch.delenv("COWORK_ORGANIZATION_BOUNDARY_MODE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_boundary_mode == "enforce"
+
+
+@pytest.mark.parametrize("mode", ["audit", "enforce"])
+def test_app_settings_reads_organization_boundary_mode(monkeypatch, mode):
+    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", mode)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_boundary_mode == mode
+
+
+def test_app_settings_rejects_invalid_organization_boundary_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "strict")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_app_settings_organization_switch_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("COWORK_ORGANIZATION_SWITCH_ENABLED", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_switch_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("true", True), ("false", False), ("1", True), ("0", False)],
+)
+def test_app_settings_reads_organization_switch_enabled(monkeypatch, raw, expected):
+    monkeypatch.setenv("COWORK_ORGANIZATION_SWITCH_ENABLED", raw)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_switch_enabled is expected
+
+
+def test_app_settings_rejects_invalid_organization_switch_enabled(monkeypatch):
+    monkeypatch.setenv("COWORK_ORGANIZATION_SWITCH_ENABLED", "sometimes")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
