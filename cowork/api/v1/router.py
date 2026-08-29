@@ -9,17 +9,21 @@ from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
     artifacts,
+    artifact_workspace,
+    channels,
     comments,
     coding,
     conversations,
     files,
     health,
+    hub_workspaces,
     memory,
     pins,
     project_files,
     projects,
     publish,
     responses,
+    runtime_credential,
     schedules,
     search,
     settings,
@@ -32,19 +36,6 @@ from cowork.api.v1.endpoints.connectors import (
     specs,
     submissions,
 )
-from cowork.api.v1.endpoints import (
-    channels,
-    conversations,
-    files,
-    memory,
-    pins,
-    projects,
-    responses,
-    schedules,
-    settings,
-    skills
-)
-
 # SHIM:client-compat — compat imports; remove this block and the
 # "Compat routes" section below when the client is updated.
 from cowork.api.v1.endpoints.compat.stubs import (
@@ -75,11 +66,16 @@ api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
+api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
+api_router.include_router(
+    runtime_credential.router, prefix="/runtime-credential", tags=["runtime-credential"]
+)
 api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
+api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])

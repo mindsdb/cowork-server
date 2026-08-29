@@ -48,6 +48,7 @@ def _kwargs(**overrides) -> dict:
         harness_input=[{"type": "text", "text": "hello there"}],
         original_content="hello there",
         model="anton",
+        reasoning_effort=None,
         disabled=None,
         harness_name="anton",
         harness_id="anton",

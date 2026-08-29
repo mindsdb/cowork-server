@@ -5,27 +5,32 @@ is built from a cowork git branch while the server is a pinned wheel — and an
 unknown SSE event is dropped silently on both ends. Withholding the elicitor
 un-registers ask_user, so a version-skewed pair degrades to plain-text
 questions instead of an agent that appears to hang.
+
+Since ENG-1984 the flag defaults to ON (the renderer card shipped with
+cowork #537); COWORK_ASK_USER_ENABLED=false remains as the way back off.
 """
 
 from __future__ import annotations
 
 
-def test_flag_defaults_to_off(monkeypatch):
+def test_flag_defaults_to_on(monkeypatch):
     monkeypatch.delenv("COWORK_ASK_USER_ENABLED", raising=False)
     from cowork.common.settings.app_settings import AppSettings
 
     # _env_file=None on purpose: Settings.model_config points env_file at
     # _env_file_chain() (~/.anton/.env, <COWORK_HOME>/.env, ./.env), and
-    # delenv does not neutralise a file. Without this, "defaults to off" would
-    # silently weaken to "off on this machine".
-    assert AppSettings(_env_file=None).ask_user_enabled is False
+    # delenv does not neutralise a file. Without this, "defaults to on" would
+    # silently weaken to "on on this machine".
+    assert AppSettings(_env_file=None).ask_user_enabled is True
 
 
 def test_flag_reads_the_env_var(monkeypatch):
-    monkeypatch.setenv("COWORK_ASK_USER_ENABLED", "true")
+    # The kill-switch direction: the default is on, so the env var matters
+    # only as the way to turn the feature OFF (ENG-1984).
+    monkeypatch.setenv("COWORK_ASK_USER_ENABLED", "false")
     from cowork.common.settings.app_settings import AppSettings
 
-    assert AppSettings().ask_user_enabled is True
+    assert AppSettings().ask_user_enabled is False
 
 
 def test_harness_injects_no_elicitor_when_the_flag_is_off(monkeypatch):

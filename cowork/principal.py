@@ -10,11 +10,15 @@ identity headers:
     X-User-Roles       comma-separated role names  (optional)
 
 TrustedHeaderMiddleware turns those headers into a Principal on
-``request.state.principal``. Requests without a valid pair are rejected
-with 401 (COWORK_IDENTITY_ENFORCE=enforce) or logged and let through
-(audit, the rollout default). Identity is never derived from anything a
+``request.state.principal``. A request without a valid pair is rejected
+with 401, and is only logged and let through where an operator has asked
+for that by setting COWORK_IDENTITY_ENFORCE=audit, the mode the org
+cutover rolled out behind. Identity is never derived from anything a
 client can set directly, only from what the gateway injected after
-verification.
+verification. That last sentence holds only while the gateway is the only
+route to the pod, which is a network question this file cannot answer:
+enforce mode refuses a caller carrying no identity, not one carrying a
+well-formed forged pair.
 
 In local mode (the desktop sidecar, the default) the middleware is not
 registered and ``request.state.principal`` is absent; ``get_principal``
@@ -32,6 +36,8 @@ from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp
+
+from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +118,72 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
 def get_principal(request: Request) -> Principal | None:
     """FastAPI dependency: the request's Principal, or None in local mode."""
     return getattr(request.state, "principal", None)
+
+
+# Where the desktop shell puts the caller's MindsHub credential, because it
+# cannot use Authorization. See `hub_credential`.
+HEADER_HUB_CREDENTIAL = "X-MindsHub-Authorization"
+
+
+def hub_credential(request: Request | None) -> str:
+    """The caller's MindsHub credential, for a read this server makes as them.
+
+    Prefers ``X-MindsHub-Authorization`` over ``Authorization``, and the reason is
+    the desktop shell. Electron's main process overwrites ``Authorization`` on
+    every request to the loopback server with the server's own token, as a plain
+    assignment in its ``onBeforeSendHeaders`` hook, so the caller's Keycloak JWT
+    can never arrive under that name there. The web shell has no such hook and
+    its ``Authorization`` is the JWT, which the fallback covers.
+
+    **A credential, not an identity.** Nothing here decides who the caller is:
+    this value is opaque to us and only the service it is forwarded to can
+    verify it. That is why accepting it from a client-set header is safe, while
+    accepting an identity from one would not be. A caller can present their own
+    token or a useless one; neither buys them anything they did not already have.
+
+    Deliberately separate from ``caller_bearer``. Folding the header preference
+    into that one would let any client steer the credential on the org model
+    catalog fetch too, which reads ``Authorization`` because in org mode the
+    gateway put it there.
+
+    **The fallback is org mode only, and that is a containment rule rather than a
+    tidiness one.** In org mode the ingress put the caller's own JWT in
+    ``Authorization``, so reading it is correct. On a desktop install nothing
+    does: the Electron main process assigns THIS server's bearer to that header
+    on every loopback request, so falling back there would forward our own
+    credential to auth. It would be refused, and it would still have left the
+    machine, which is exactly what the main process's own "scoped to our loopback
+    origin so it can't leak elsewhere" is supposed to prevent. Empty is the right
+    answer instead: the caller has no MindsHub credential, and the surfaces this
+    feeds are all fail-closed.
+    """
+    if request is None:
+        return ""
+    explicit = request.headers.get(HEADER_HUB_CREDENTIAL, "")
+    if explicit.lower().startswith("bearer "):
+        return explicit[7:].strip()
+    if get_app_settings().tenancy_mode != "org":
+        return ""
+    return caller_bearer(request)
+
+
+def caller_bearer(request: Request | None) -> str:
+    """The caller's own bearer token, for a read this server makes on their behalf.
+
+    Every outbound MindsHub call that acts as the caller sends this and never the
+    stored provider key or ``minds_url``: both of those are tenant-settable, so
+    using either would let an org admin point a member's credential at a host
+    they chose. Empty string when there is no bearer, which callers turn into
+    their fail-closed answer rather than an anonymous request.
+
+    This is not an identity source. Nothing here decides who the caller is: in
+    org mode that is the gateway's injected headers, and this token is opaque to
+    us. It exists only to be forwarded to the service that can verify it.
+    """
+    if request is None:
+        return ""
+    header = request.headers.get("Authorization", "")
+    return header[7:].strip() if header.lower().startswith("bearer ") else ""
 
 
 # Keycloak org role that marks an organization admin (see auth's
