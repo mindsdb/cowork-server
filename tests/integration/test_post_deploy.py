@@ -44,6 +44,8 @@ import uuid
 import httpx
 import pytest
 
+from tests.integration.prereq import missing_prerequisite
+
 pytestmark = pytest.mark.postdeploy
 
 # A turn that runs for a while, so there is something to cancel and something
@@ -66,6 +68,7 @@ QUICK_PROMPT = "Reply with exactly the word: pong"
 
 TURN_TIMEOUT_S = 180.0
 CANCEL_VISIBLE_S = 45.0
+CROSS_REPLICA_VISIBILITY_S = 10.0
 # How long to wait for the server to report the turn as running before giving
 # up on having anything to cancel. This covers the gap between the caller
 # disconnecting and the registry answering, not the model's thinking time.
@@ -80,14 +83,24 @@ BROWSER_UA = (
 )
 
 
+class _Identity(dict[str, str]):
+    """A test identity whose repr can safely appear in a pytest traceback."""
+
+    def __repr__(self) -> str:
+        redacted = dict(self)
+        if "api_key" in redacted:
+            redacted["api_key"] = "***"
+        return repr(redacted)
+
+
 def _base_url() -> str:
     url = os.environ.get("COWORK_BASE_URL")
     if not url:
-        pytest.skip("COWORK_BASE_URL not set; post-deploy tests only run against a deployment")
+        missing_prerequisite("COWORK_BASE_URL not set; post-deploy tests only run against a deployment")
     return url.rstrip("/")
 
 
-def _provision_identity() -> dict[str, str]:
+def _provision_identity() -> _Identity:
     """A user_id, organization_id and email for a throwaway tenant.
 
     Three sources, in order:
@@ -105,12 +118,12 @@ def _provision_identity() -> dict[str, str]:
     user_id = os.environ.get("COWORK_TEST_USER_ID")
     org_id = os.environ.get("COWORK_TEST_ORG_ID")
     if api_key and user_id and org_id:
-        return {
+        return _Identity({
             "api_key": api_key,
             "user_id": user_id,
             "organization_id": org_id,
             "email": os.environ.get("COWORK_TEST_USER_EMAIL", "postdeploy@example.com"),
-        }
+        })
 
     mint_url = os.environ.get("TEST_USER_MINT_URL")
     if mint_url:
@@ -123,7 +136,7 @@ def _provision_identity() -> dict[str, str]:
         provision_url = os.environ.get("TEST_USER_PROVISION_URL")
         secret = os.environ.get("TEST_USER_PROVISION_SECRET")
         if not (provision_url and secret):
-            pytest.skip(
+            missing_prerequisite(
                 "no identity source: set COWORK_TEST_API_KEY + COWORK_TEST_USER_ID + "
                 "COWORK_TEST_ORG_ID, or TEST_USER_MINT_URL, or TEST_USER_PROVISION_URL "
                 "+ TEST_USER_PROVISION_SECRET"
@@ -146,11 +159,11 @@ def _provision_identity() -> dict[str, str]:
             f"auth returned no organization_id for {user.get('email')}; "
             "the personal org is provisioned on first login and could not be resolved"
         )
-    return user
+    return _Identity(user)
 
 
 @pytest.fixture(scope="session")
-def identity() -> dict[str, str]:
+def identity() -> _Identity:
     """Provisioned once per run: minting is a Keycloak round trip per call."""
     return _provision_identity()
 
@@ -279,7 +292,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     url_a = os.environ.get("COWORK_BASE_URL_A")
     url_b = os.environ.get("COWORK_BASE_URL_B")
     if not (url_a and url_b):
-        pytest.skip("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
+        missing_prerequisite("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
 
     headers = _direct_headers(identity)
     with httpx.Client(base_url=url_a.rstrip("/"), headers=headers, timeout=30.0) as replica_a:
@@ -294,8 +307,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
                     break
 
     with httpx.Client(base_url=url_b.rstrip("/"), headers=headers, timeout=30.0) as replica_b:
-        probe = replica_b.get("/api/v1/responses/in-flight",
-                              params={"conversation_id": conversation_id}).json()
+        probe = _await_shared_buffer(replica_b, conversation_id)
         # Before the Redis backend this replica had no handle and no buffer,
         # and answered has_buffer=False.
         assert probe["has_buffer"] is True, probe
@@ -309,6 +321,25 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
             replayed = _sse_events(resp.read().decode())
 
     assert "response.created" in replayed, replayed
+
+
+def _await_shared_buffer(api, conversation_id, *, timeout_s=CROSS_REPLICA_VISIBILITY_S) -> dict:
+    """Wait for a peer replica to observe the turn index written by the producer.
+
+    ``response.created`` is appended before the remote reply generator starts,
+    so seeing that frame on replica A does not mean its Redis turn-index write
+    has completed. The index is shared synchronously once written; this wait
+    covers only that startup ordering window.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        probe = api.get(
+            "/api/v1/responses/in-flight",
+            params={"conversation_id": conversation_id},
+        ).json()
+        if probe.get("has_buffer") or time.monotonic() >= deadline:
+            return probe
+        time.sleep(0.1)
 
 
 def _await_running_turn(api, conversation_id) -> dict | None:

@@ -26,6 +26,24 @@ async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
         return resp.json()["key"]
 
 
+async def list_active_connections(*, org_id: str, user_id: str, settings) -> list[dict]:
+    """Org's active OAuth-builtin connections, for the turn-key `oauth` block
+    (Turn-Key Token Handoff). Internal/service-authenticated, same mechanism
+    as mint_turn_key — not the caller's own Bearer credential: by the time
+    the remote producer builds this block it only has the gateway-verified
+    Principal (org_id/user_id), never the original request's raw
+    Authorization header (ResponsesHandler is constructed from a Principal,
+    not a Request). Returns each connection as {"engine": ..., "name": ...}.
+    """
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/oauth/connections/"
+    headers = {"X-Internal-Auth": settings.auth_internal_secret}
+    params = {"organization_id": org_id, "user_id": user_id}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(url, params=params, headers=headers)
+        resp.raise_for_status()
+        return resp.json().get("items", [])
+
+
 async def revoke_turn_key(*, instance_id: str, settings) -> None:
     """Revoke every active turn key for `instance_id`.
 

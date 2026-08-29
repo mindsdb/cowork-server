@@ -36,6 +36,19 @@ IMAGE_FORMAT_USER_MESSAGE = (
 # Wire-level code for the unsupported-image case.
 IMAGE_FORMAT_CODE = "image_format"
 
+# ENG-1992: distinct from IMAGE_FORMAT_CODE on purpose. That copy tells the
+# user to re-upload as PNG/JPEG — correct for an actually-malformed image
+# file, wrong here: the failure is an internal serialization mismatch, not
+# anything wrong with the image itself, and by the time this code reaches
+# the client the conversation has ALREADY been repaired server-side. Telling
+# the user to re-upload would be both inaccurate and unnecessary.
+CONTENT_RECOVERY_CODE = "content_recovery"
+CONTENT_RECOVERY_USER_MESSAGE = (
+    "An image earlier in this conversation couldn't be sent to the model "
+    "due to an internal formatting issue. I've fixed it automatically — "
+    "you can keep going."
+)
+
 # Curated copy for the out-of-credits case. In the wallet billing model this
 # fires when either the org's wallet is empty (gateway 402 `wallet_empty`) or
 # the free monthly included-token allowance is spent (gateway 429
@@ -241,6 +254,38 @@ def is_image_format_error(exc: Exception) -> bool:
         return True
     # Other phrasings of "this image content block was rejected".
     return "image" in s and ("unsupported image" in s or "could not process image" in s)
+
+
+def is_content_validation_error(exc: Exception) -> bool:
+    """Detect a permanent, content-SHAPED provider rejection — a content block
+    in conversation history reached the model in a shape it doesn't parse
+    (ENG-1992), not a provider-availability issue. Retrying the identical
+    request fails identically every time, since the same translation runs
+    fresh from stored history on every call — the request never changes
+    between attempts.
+
+    A strict superset of the older, narrower `is_image_format_error`: this
+    recognizes BOTH known dialects (OpenAI Responses' "Invalid value: 'x'.
+    Supported values are: ..." and Anthropic's "Input tag 'x' found using
+    'type' does not match any of the expected tags"), and the caller that
+    detects this repairs the conversation's stored history (unlike
+    `is_image_format_error`, whose own docstring says it can't).
+    """
+    try:
+        from anton.core.llm.provider import ContentValidationError
+
+        if isinstance(exc, ContentValidationError):
+            return True
+    except Exception:
+        # anton not importable / the type moved — fall back to the stable
+        # provider-message phrasings below.
+        pass
+    s = str(exc).lower()
+    if "supported values are" in s:
+        return True
+    if "does not match any of the expected tags" in s:
+        return True
+    return False
 
 
 def is_token_limit_error(exc: Exception) -> bool:
@@ -827,6 +872,13 @@ def friendly_turn_error(
     overloaded = provider_overloaded_info(exc)
     if overloaded is not None:
         return overloaded[0], str(exc) or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
+    # Checked before is_image_format_error: a content-SHAPE mismatch (this
+    # detector) and a genuinely corrupt/unsupported image FILE (that one)
+    # are different failures with different correct copy — this one has
+    # already been auto-repaired server-side, that one needs the user to
+    # re-upload. The two detectors' phrasings don't overlap.
+    if is_content_validation_error(exc):
+        return CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
     if is_image_format_error(exc):
         return IMAGE_FORMAT_CODE, IMAGE_FORMAT_USER_MESSAGE
     return None
@@ -869,6 +921,14 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
     if type_name == "ConnectionError" and "api key" in message.lower():
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
+    if type_name == "ContentValidationError":
+        # ENG-1992: the repair itself (stripping the offending image blocks
+        # from stored history) is triggered by the caller, keyed on this
+        # same code — see producer.py. The curated message anton constructs
+        # is already safe to show verbatim, but the code is what the client
+        # keys its (different, "already fixed") copy on, so return the
+        # stable curated constant rather than passing `message` through.
+        return CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
 

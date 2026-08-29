@@ -59,6 +59,79 @@ def test_returns_none_for_unmapped_error():
     assert te.friendly_turn_error(Exception("boom")) is None
 
 
+# ── content-shaped rejections (ENG-1992) ──────────────────────────────
+
+def test_detects_content_validation_via_anton_type():
+    provider = pytest.importorskip("anton.core.llm.provider")
+    error_cls = getattr(provider, "ContentValidationError", None)
+    if error_cls is None:
+        pytest.skip("installed anton predates ContentValidationError (ENG-1992)")
+    assert te.is_content_validation_error(error_cls("boom")) is True
+
+
+def test_detects_openai_responses_dialect():
+    # The exact phrasing from the live ENG-1992 incident.
+    exc = Exception(
+        "Invalid value: 'image'. Supported values are: 'input_text', "
+        "'input_image', 'input_audio', 'output_text', 'refusal', "
+        "'input_file', 'computer_screenshot', 'summary_text', and "
+        "'encrypted_content'."
+    )
+    assert te.is_content_validation_error(exc) is True
+
+
+def test_detects_anthropic_dialect_via_content_validation():
+    # This is also the earlier, narrower is_image_format_error case — a
+    # content-shape error can trigger both detectors; friendly_turn_error's
+    # ordering decides which code wins (see below).
+    exc = Exception(
+        "Input tag 'image_url' found using 'type' does not match "
+        "any of the expected tags: 'image'"
+    )
+    assert te.is_content_validation_error(exc) is True
+
+
+def test_content_validation_ignores_unrelated_errors():
+    assert te.is_content_validation_error(Exception("Internal server error")) is False
+    assert te.is_content_validation_error(
+        Exception("tool_use ids were found without tool_result blocks")
+    ) is False
+
+
+def test_maps_content_validation_error_to_curated_copy():
+    result = te.friendly_turn_error(
+        Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    )
+    assert result is not None
+    code, message = result
+    assert code == te.CONTENT_RECOVERY_CODE
+    assert "fixed it automatically" in message
+    # And NOT the old "re-upload as PNG/JPEG" copy — that advice is wrong
+    # here; the failure isn't anything wrong with the image itself.
+    assert "PNG" not in message
+
+
+def test_content_validation_wins_over_image_format_for_the_full_anthropic_phrasing():
+    # The REAL Anthropic dialect matches both detectors; content_recovery
+    # must win, because that path actually repairs the conversation —
+    # image_format's docstring says it explicitly can't.
+    result = te.friendly_turn_error(
+        Exception(
+            "Input tag 'image_url' found using 'type' does not match "
+            "any of the expected tags: 'image'"
+        )
+    )
+    assert result is not None
+    code, _ = result
+    assert code == te.CONTENT_RECOVERY_CODE
+
+
+def test_remote_content_validation_error_maps_to_curated_copy():
+    code, message = te.remote_turn_error("ContentValidationError: some provider detail")
+    assert code == te.CONTENT_RECOVERY_CODE
+    assert message == te.CONTENT_RECOVERY_USER_MESSAGE
+
+
 def test_response_failed_sse_shape():
     frame = te.response_failed_sse("oops", "image_format")
     assert frame.startswith("event: response.failed\ndata: ")
@@ -80,7 +153,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
         raise exc
 
     async def _stream_response(
-        *, conversation, input, model=None, disabled_connections=None,
+        *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
         trace_tags=None, trace_metadata=None,
     ):
         if False:
@@ -211,6 +284,90 @@ def test_collect_raises_500_generic_for_unmapped_error():
     assert err.value.status_code == 500
     assert err.value.detail == te.GENERIC_TURN_ERROR_MESSAGE
     assert "secret-token" not in err.value.detail
+
+
+# ── Conversation repair on content validation error (ENG-1992) ────
+
+def test_stream_repairs_conversation_on_content_validation_error():
+    from unittest.mock import MagicMock, patch
+
+    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    handler = _handler_with_raising_formatter(exc)
+
+    class _Buffer:
+        async def append(self, _kind, data):
+            pass
+
+        async def close(self, _status):
+            pass
+
+    conv_id = uuid4()
+    with (
+        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
+        patch("cowork.handlers.responses.ConversationService") as conv_svc,
+        patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
+    ):
+        conv_svc.return_value.get_conversation.return_value = MagicMock()
+        conv_svc.return_value.repair_image_content.return_value = [uuid4()]
+        asyncio.run(handler._produce(
+            conv_id=conv_id,
+            harness_input=[{"type": "text", "text": "hi"}],
+            original_content="hi",
+            model="anton",
+            disabled=None,
+            harness_name="anton",
+            harness_id="anton",
+            buffer=_Buffer(),
+        ))
+        conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
+
+
+def test_stream_does_not_repair_conversation_for_unrelated_errors():
+    from unittest.mock import MagicMock, patch
+
+    handler = _handler_with_raising_formatter(Exception("boom, totally unrelated"))
+
+    class _Buffer:
+        async def append(self, _kind, data):
+            pass
+
+        async def close(self, _status):
+            pass
+
+    conv_id = uuid4()
+    with (
+        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
+        patch("cowork.handlers.responses.ConversationService") as conv_svc,
+        patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
+    ):
+        conv_svc.return_value.get_conversation.return_value = MagicMock()
+        asyncio.run(handler._produce(
+            conv_id=conv_id,
+            harness_input=[{"type": "text", "text": "hi"}],
+            original_content="hi",
+            model="anton",
+            disabled=None,
+            harness_name="anton",
+            harness_id="anton",
+            buffer=_Buffer(),
+        ))
+        conv_svc.return_value.repair_image_content.assert_not_called()
+
+
+def test_collect_repairs_conversation_on_content_validation_error():
+    from unittest.mock import MagicMock, patch
+
+    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    handler = _handler_with_raising_formatter(exc)
+    handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
+    conv_id = uuid4()
+
+    with patch("cowork.handlers.responses.ConversationService") as conv_svc:
+        conv_svc.return_value.repair_image_content.return_value = [uuid4()]
+        with pytest.raises(HTTPException) as err:
+            asyncio.run(handler._collect(stream=None, conversation_id=conv_id, model="anton", original_content="hi"))
+        assert err.value.status_code == 400
+        conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
 
 
 # ── Token-limit (quota) detection / mapping ───────────────────────
@@ -1080,6 +1237,9 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         "rate_limited",
         # ENG-1537 — the spent free allowance, split off the credits card.
         "included_allowance_exhausted",
+        # ENG-1992 — a content-shaped rejection the server already repaired;
+        # distinct copy from image_format (no re-upload needed).
+        "content_recovery",
         "anton_error",
     }
 

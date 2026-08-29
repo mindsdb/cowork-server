@@ -47,6 +47,18 @@ The chart references two Secrets that must exist in the target namespace:
 - `mindsdb-secrets` — provider API keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
   `GEMINI_API_KEY`.
 
+## Required cluster permissions
+
+In `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
+is true in those values files), so whoever runs the upgrade needs
+`create networkpolicies` in the target namespace. Without it the release fails and
+`--atomic` rolls the whole deploy back. CI runs as
+`system:serviceaccount:infrastructure:<env>-gha-runner`, which holds the verb only
+in the namespaces listed under `runner_deploy_namespaces` in
+Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
+for the two selector checks to run alongside it, since getting either one wrong
+drops every real request without failing the release.
+
 ## Configuration
 
 For configuration options possible, please see our [helm-charts](#todo) repository.
