@@ -273,7 +273,8 @@ def create_app() -> FastAPI:
         )
         logger.info("auth: bearer-token authentication enabled")
 
-    # Configure CORS middleware (added last → outermost)
+    # Configure CORS outside the authentication and principal layers. The
+    # no-store wrapper added below remains outermost.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
