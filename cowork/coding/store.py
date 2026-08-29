@@ -39,11 +39,12 @@ class CodingStore:
     def _events_path(self, session_id: str) -> Path:
         return self._dir(session_id) / "events.jsonl"
 
-    def save_session(self, session: CodingSession) -> None:
+    def save_session(self, session: CodingSession, *, touch_updated_at: bool = True) -> None:
         with self._lock:
             target_dir = self._dir(session.id)
             target_dir.mkdir(parents=True, exist_ok=True)
-            session.updated_at = utc_now()
+            if touch_updated_at:
+                session.updated_at = utc_now()
             target = self._meta_path(session.id)
             temp = target.with_suffix(".tmp")
             data = session.model_dump_json(indent=2)
@@ -55,12 +56,14 @@ class CodingStore:
         self,
         session_id: str,
         update: Callable[[CodingSession], None],
+        *,
+        touch_updated_at: bool = True,
     ) -> CodingSession:
         """Apply a state transition to the latest persisted session atomically."""
         with self._lock:
             session = self.load_session(session_id)
             update(session)
-            self.save_session(session)
+            self.save_session(session, touch_updated_at=touch_updated_at)
             return session
 
     def load_session(self, session_id: str) -> CodingSession:

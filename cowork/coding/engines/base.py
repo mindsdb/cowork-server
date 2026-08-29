@@ -10,6 +10,7 @@ from cowork.coding.contracts import (
     ExtensionInventory,
     PermissionMode,
     RuntimePlatformStatus,
+    TerminalShellPreference,
 )
 
 ApprovalHandler = Callable[[str, dict[str, Any] | None], dict[str, str]]
@@ -38,6 +39,7 @@ class EngineSessionConfig:
     environment: tuple[tuple[str, str], ...] = ()
     session_id: str = ""
     cowork_root: str = ""
+    workspace_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,7 @@ class EngineSession(Protocol):
         process_id: str,
         cols: int,
         rows: int,
+        shell: TerminalShellPreference,
         output_handler: TerminalOutputHandler,
         exit_handler: TerminalExitHandler,
     ) -> None: ...

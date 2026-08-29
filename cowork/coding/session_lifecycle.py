@@ -168,6 +168,7 @@ class SessionLifecycleOperations:
                     "active_turn_id": None,
                     "pending_approval": None,
                     "queued_instructions": [],
+                    "terminal_tabs": [],
                     "archived": False,
                     "status": SessionStatus.completed,
                     "last_error": None,

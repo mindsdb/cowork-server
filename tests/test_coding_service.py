@@ -325,6 +325,54 @@ def test_terminal_start_failure_is_not_left_running(tmp_path: Path) -> None:
     assert failed.error == "Terminal process failed to start"
 
 
+def test_task_terminals_run_independently_and_keep_their_names(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    task_updated_at = service.get_session(created.id).updated_at
+
+    first = service.create_terminal_tab(created.id)
+    second = service.create_terminal_tab(created.id)
+    assert (first.label, second.label) == ("Terminal 1", "Terminal 2")
+    second = service.rename_terminal_tab(created.id, second.id, "Dev server")
+    assert second.label == "Dev server"
+    restored = service_with(tmp_path, FakeEngine())
+    assert [item.label for item in restored.terminals(created.id).items] == [
+        "Terminal 1", "Dev server"
+    ]
+
+    service.start_terminal_tab(created.id, first.id, CREDS, 100, 30)
+    service.start_terminal_tab(created.id, second.id, CREDS, 120, 40)
+    first_process, second_process = engine.terminal_process_ids
+    assert first_process != second_process
+    assert engine.terminal_sizes == {first_process: (100, 30), second_process: (120, 40)}
+
+    engine.terminal_outputs[first_process]("Zmlyc3Q=", "stdout", False)
+    engine.terminal_outputs[second_process]("c2Vjb25k", "stdout", False)
+    assert [item.data_base64 for item in service.terminal_tab(created.id, first.id).items] == ["Zmlyc3Q="]
+    assert [item.data_base64 for item in service.terminal_tab(created.id, second.id).items] == ["c2Vjb25k"]
+
+    service.write_terminal_tab(created.id, first.id, "bHMK")
+    service.resize_terminal_tab(created.id, second.id, 90, 24)
+    assert engine.terminal_writes[-1] == (first_process, "bHMK")
+    assert engine.terminal_sizes[second_process] == (90, 24)
+
+    engine.terminal_exits[first_process](0, None)
+    states = {item.id: item for item in service.terminals(created.id).items}
+    assert states[first.id].status.value == "exited"
+    assert states[second.id].status.value == "running"
+
+    service.delete_terminal_tab(created.id, first.id)
+    service.delete_terminal_tab(created.id, second.id)
+    assert service.terminals(created.id).items == []
+    assert second_process in engine.terminal_stops
+    assert service.get_session(created.id).updated_at == task_updated_at
+
+
 def test_goal_command_uses_engine_goal_lifecycle(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
