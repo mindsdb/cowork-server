@@ -78,6 +78,12 @@ def health() -> dict:
     _org_mode = get_app_settings().tenancy_mode == "org"
     return {
         "status": "ok",
+        # Runtime feature handshake for desktop clients. A healthy HTTP server
+        # is not necessarily the server this UI was built for: during feature
+        # development an older published sidecar can still answer /health while
+        # returning 404 for every Code Mode route. Keep this list additive so a
+        # client can require the capability it needs before adopting a sidecar.
+        "capabilities": ["coding"],
         "anton_available": True,
         "mode": "anton",
         "server_version": _pkg_version("cowork-server"),
