@@ -64,26 +64,33 @@ def _request_wire_size(params: dict) -> int:
 
 
 def _fit_request(params: dict, conversation_id: str) -> dict:
-    """Warn when the request line will not fit the pod's stdin cap.
+    """Drop project memory first, then warn if the request still will not fit.
 
-    This used to shed ``skills`` then ``memory``, which were re-sent every turn
-    and degraded gracefully. Both now live on the shared mount and never enter
-    the payload, so there is nothing optional left to drop: what remains is
-    input, model, llm and history, and none of them can be silently discarded
-    without changing the turn's meaning.
+    Skills and personal/global memory live on read-only mounts. Project memory
+    does not: the worker mounts only this conversation's workspace, so its two
+    shared slots ride the request again. They are the one optional block we can
+    deterministically shed as a unit without changing the user's input or
+    history (and without serving rules but silently losing lessons).
 
-    So this no longer trims, it reports. An oversized line is a real problem
-    (the pod's readline will truncate it) and history is the only thing that
-    grows unboundedly, so the fix belongs in history windowing upstream, not in
-    a silent drop here.
+    If the required fields alone exceed the envelope, report that explicitly.
+    The pod would otherwise truncate the line into invalid JSON; history
+    windowing remains the upstream fix for that required-payload case.
     """
     budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
     size = _request_wire_size(params)
+    if size > budget and params.pop("memory", None) is not None:
+        logger.warning(
+            "[producer] dropped project memory from turn %s: request line was "
+            "%d bytes, over the %d-byte cap",
+            conversation_id,
+            size,
+            budget,
+        )
+        size = _request_wire_size(params)
     if size > budget:
         logger.warning(
             "[producer] turn %s request line is %d bytes, over the %d-byte cap; "
-            "nothing is sheddable now that skills and memory read off the shared mount, "
-            "so this needs history windowing upstream",
+            "project memory is already absent, so this needs history windowing upstream",
             conversation_id, size, budget,
         )
     return params
@@ -230,6 +237,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 model: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
+                                memory: dict | None = None,
                                 project_id: str | None = None,
                                 workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
@@ -284,10 +292,19 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # <root>, so the two sit at different depths and an absolute path from
     # here is wrong inside the pod. Each side joins its own root.
     #
-    # Skills and memory are no longer shipped: the pod reads them off the same
-    # mount, which also removes most of what _fit_request exists to trim.
+    # Skills and personal/global memory are mounted read-only. Project memory is
+    # outside the conversation-scoped workspace mount, so send only that tier on
+    # the wire. Filtering here as well as in ResponsesHandler keeps a future
+    # caller from accidentally serializing private global memory into the job.
+    project_memory = memory.get("project") if isinstance(memory, dict) else None
+    memory_block = (
+        {"project": project_memory}
+        if isinstance(project_memory, dict) and project_memory
+        else None
+    )
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "model": model, "history": history or [], "llm": llm_block,
+              **({"memory": memory_block} if memory_block else {}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),

@@ -188,6 +188,15 @@ def move_attachment_to_project(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
+    if (
+        scoped.scope.org_mode
+        and (os.path.basename(filename or "upload").strip() or "upload") == ".anton"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The .anton project namespace is reserved",
+        )
+
     project_dir = Path(project.path)
     project_dir.mkdir(parents=True, exist_ok=True)
     target = _unique_project_target(project_dir, filename)
@@ -219,4 +228,3 @@ browse_router = APIRouter()
 @browse_router.get("/status")
 def browse_status():
     return {"available": False}
-

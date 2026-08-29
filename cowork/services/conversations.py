@@ -4,6 +4,7 @@ import logging
 import os
 import stat
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -39,6 +40,15 @@ _MESSAGE_ORDER = (
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
+
+
+@dataclass(frozen=True)
+class ConversationDeleteStage:
+    """DB deletes plus the filesystem cleanup deferred until their commit."""
+
+    conversation_id: UUID
+    attachment_dirs: tuple[Path, ...]
+    project_path: str | None
 
 
 def _is_tool_row(content) -> bool:
@@ -392,7 +402,9 @@ class ConversationService:
         member's chat by guessing its id. Local mode has one user, so no owner
         filter applies.
         """
-        stmt = self.session.select(Conversation).where(Conversation.id == conversation_id)
+        stmt = self.session.select(Conversation).where(
+            Conversation.id == conversation_id
+        )
         if self.session.scope.org_mode:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         return self.session.exec(stmt).first()
@@ -515,9 +527,24 @@ class ConversationService:
         skipping the foreign ones would orphan their messages/events/task
         objects/attachment bytes (the ENG-701 orphaning the cascade exists to
         prevent). The caller has already scoped the fetch to the org."""
-        return self._delete_conversation(conversation)
+        return self._delete_conversation(
+            conversation,
+            include_org_attachments=True,
+        )
 
-    def _delete_conversation(self, conversation: Conversation) -> bool:
+    def stage_delete_conversation_row(
+        self,
+        conversation: Conversation,
+        *,
+        include_org_attachments: bool = True,
+    ) -> ConversationDeleteStage:
+        """Stage every conversation-owned DB delete without external cleanup.
+
+        The project cascade passes an already-authorized conversation row and
+        intentionally cleans every org member's attachment row for that
+        purpose. A direct conversation delete must opt out so the actor-owned
+        request cannot delete a peer's independently owned file row.
+        """
         conversation_id = conversation.id
         messages = self.session.exec(
             self.session.select(Message)
@@ -545,13 +572,14 @@ class ConversationService:
         from cowork.services.files import (
             FileService,
             attachment_purpose,
-            remove_conversation_workspace_dir,
-            unlink_file_dirs,
         )
 
-        attachment_dirs = FileService(self.session).delete_by_purpose(
-            attachment_purpose(str(conversation_id))
-        )
+        file_service = FileService(self.session)
+        purpose = attachment_purpose(str(conversation_id))
+        if include_org_attachments:
+            attachment_dirs = file_service.delete_by_purpose_for_parent_cascade(purpose)
+        else:
+            attachment_dirs = file_service.delete_by_purpose(purpose)
         # Three more tables point at this conversation, and unlike the rows above
         # they are not the conversation's own data: a schedule and its runs record
         # the conversation a run produced, and a channel binding records the one
@@ -573,17 +601,55 @@ class ConversationService:
         session_project_path = (
             conversation.project.path if conversation.project is not None else None
         )
+        self.session.delete(conversation)
+        return ConversationDeleteStage(
+            conversation_id=conversation_id,
+            attachment_dirs=tuple(attachment_dirs),
+            project_path=session_project_path,
+        )
+
+    @staticmethod
+    def finalize_staged_conversation_delete(
+        stage: ConversationDeleteStage,
+        *,
+        cleanup_project_files: bool = True,
+    ) -> None:
+        """Remove external state only after the staged DB transaction commits."""
+        from cowork.services.files import (
+            remove_conversation_workspace_dir,
+            unlink_file_dirs,
+        )
+
         # Its buffers and turn-index entry outlive the rows otherwise: on the
         # Redis backend /in-flight keeps naming a turn whose conversation is
         # gone, and a reused turn_id would replay a deleted turn's answer.
-        _discard_conversation_streams(conversation_id)
-        self.session.delete(conversation)
-        self.session.commit()
-        unlink_file_dirs(attachment_dirs)
-        remove_conversation_sessions(session_project_path, conversation_id)
-        # Also drop the per-conversation workspace (staged attachments +
-        # instructions on the shared mount) so it doesn't orphan there.
-        remove_conversation_workspace_dir(session_project_path, conversation_id)
+        _discard_conversation_streams(stage.conversation_id)
+        unlink_file_dirs(list(stage.attachment_dirs))
+        if cleanup_project_files:
+            remove_conversation_sessions(stage.project_path, stage.conversation_id)
+            # Also drop the per-conversation workspace (staged attachments +
+            # instructions on the shared mount) so it doesn't orphan there.
+            remove_conversation_workspace_dir(
+                stage.project_path,
+                stage.conversation_id,
+            )
+
+    def _delete_conversation(
+        self,
+        conversation: Conversation,
+        *,
+        include_org_attachments: bool = False,
+    ) -> bool:
+        try:
+            stage = self.stage_delete_conversation_row(
+                conversation,
+                include_org_attachments=include_org_attachments,
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        self.finalize_staged_conversation_delete(stage)
         return True
 
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:

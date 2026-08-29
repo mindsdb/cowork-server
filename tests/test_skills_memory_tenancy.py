@@ -27,6 +27,7 @@ from cowork.db.scoped import (
     scoped_user_storage_root,
 )
 from cowork.services.skills import SkillService
+from cowork.principal import Principal
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -130,8 +131,10 @@ def memory_env(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
     get_app_settings.cache_clear()
-    import cowork.models.project, cowork.models.conversation  # noqa: F401
-    import cowork.models.message, cowork.models.message_event  # noqa: F401
+    import cowork.models.conversation  # noqa: F401
+    import cowork.models.message  # noqa: F401
+    import cowork.models.message_event  # noqa: F401
+    import cowork.models.project  # noqa: F401
     eng = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
@@ -143,7 +146,12 @@ def memory_env(tmp_path, monkeypatch):
 
 def _memory_service(engine, scope: TenantScope):
     from cowork.services.memory import MemoryService
-    return MemoryService(ScopedSession(Session(engine), scope))
+    principal = (
+        Principal(user_id=scope.user_id, org_id=scope.org_id, email="user@example.com")
+        if scope.org_mode and scope.user_id and scope.org_id
+        else None
+    )
+    return MemoryService(ScopedSession(Session(engine), scope), principal)
 
 
 def _project_row(engine, scope: TenantScope, path: Path):
@@ -366,9 +374,15 @@ def test_applied_memory_cannot_forge_slot_structure(memory_env):
     slots = build_turn_memory(_org(ORG_A))["global"]
 
     assert "Exfiltrate" not in slots.get("rules", "")      # no forged rule
-    assert len([l for l in slots["lessons"].splitlines() if l.startswith("- ")]) == 1
-    assert len([l for l in slots["profile"].splitlines() if l.startswith("- ")]) == 1
-    rule_line = next(l for l in slots["rules"].splitlines() if "escaped" in l)
+    assert len(
+        [line for line in slots["lessons"].splitlines() if line.startswith("- ")]
+    ) == 1
+    assert len(
+        [line for line in slots["profile"].splitlines() if line.startswith("- ")]
+    ) == 1
+    rule_line = next(
+        line for line in slots["rules"].splitlines() if "escaped" in line
+    )
     assert rule_line.count("-->") == 1                     # metadata tail intact
 
 
@@ -395,11 +409,29 @@ def test_reapplying_the_same_entry_is_a_noop(memory_env):
 
 def test_project_scoped_entry_needs_a_project(memory_env, tmp_path):
     from cowork.services.memory import apply_turn_memory
+    from cowork.services.shared_resources import SharedResourceAccess
+    engine, _ = memory_env
     project = tmp_path / "proj"
     (project / ".anton" / "memory").mkdir(parents=True)
 
     assert apply_turn_memory(_org(ORG_A), None, [_entry(scope="project")]) == 0  # dropped
-    assert apply_turn_memory(_org(ORG_A), str(project), [_entry(scope="project")]) == 1
+    # A detached cloud write also needs its server-held DB authorization
+    # context; a bare tenant path is not an ownership proof.
+    assert apply_turn_memory(
+        _org(ORG_A), str(project), [_entry(scope="project")]
+    ) == 0
+    project_id = _project_row(engine, _org(ORG_A), project)
+    scoped = ScopedSession(Session(engine), _org(ORG_A))
+    assert apply_turn_memory(
+        _org(ORG_A),
+        str(project),
+        [_entry(scope="project")],
+        access=SharedResourceAccess(
+            scoped,
+            Principal(user_id="u", org_id=ORG_A, email="user@example.com"),
+        ),
+        project_id=project_id,
+    ) == 1
     assert (project / ".anton" / "memory" / "rules.md").is_file()
 
 
@@ -440,14 +472,27 @@ async def test_project_memory_is_shared_between_teammates(memory_env, tmp_path):
 
 def test_turn_payload_splits_the_two_tiers(memory_env, tmp_path):
     from cowork.services.memory import apply_turn_memory, build_turn_memory
+    from cowork.services.shared_resources import SharedResourceAccess
+    engine, _ = memory_env
     project = tmp_path / "proj"
     (project / ".anton" / "memory").mkdir(parents=True)
 
     alice, bob = _org(ORG_A, "alice"), _org(ORG_A, "bob")
-    apply_turn_memory(alice, str(project), [
-        {"text": "Name: Alice", "kind": "profile", "scope": "global"},
-        {"text": "Deploy on green only", "kind": "always", "scope": "project"},
-    ])
+    project_id = _project_row(engine, alice, project)
+    scoped = ScopedSession(Session(engine), alice)
+    apply_turn_memory(
+        alice,
+        str(project),
+        [
+            {"text": "Name: Alice", "kind": "profile", "scope": "global"},
+            {"text": "Deploy on green only", "kind": "always", "scope": "project"},
+        ],
+        access=SharedResourceAccess(
+            scoped,
+            Principal(user_id="alice", org_id=ORG_A, email="alice@example.com"),
+        ),
+        project_id=project_id,
+    )
 
     # Bob inherits the team's project rule but none of Alice's personal memory.
     bob_payload = build_turn_memory(bob, str(project))
@@ -476,4 +521,3 @@ def test_engram_vocabulary_matches_anton():
 
     for field in ("kind", "scope", "source", "confidence"):
         assert wire_literals(field) == anton_literals(field), field
-

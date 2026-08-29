@@ -74,15 +74,30 @@ def test_the_second_call_does_nothing(skills_root):
     assert ensure_builtin_skills(_org()) is False
 
 
-def test_a_deleted_builtin_does_not_come_back(skills_root):
-    """The marker outlives the skills, so a deliberate delete sticks."""
+def test_a_builtin_cannot_be_deleted(skills_root):
+    """Packaged skill identities are immutable for every organization role."""
     ensure_builtin_skills(_org())
     svc = SkillService(_org())
     victim = sorted(_packaged_slugs())[0]
-    assert svc.delete_skill(victim) is True
+    with pytest.raises(PermissionError, match="immutable"):
+        svc.delete_skill(victim)
 
     ensure_builtin_skills(_org())
-    assert victim not in {s.name for s in svc.list_skills()}
+    assert victim in {s.name for s in svc.list_skills()}
+
+
+def test_local_builtin_copy_remains_deletable(skills_root):
+    """Desktop keeps its historical, single-user editable-copy behavior."""
+    import shutil
+
+    victim = sorted(_packaged_slugs())[0]
+    source = BUILTIN_SKILLS_DIR / victim
+    target = skills_root / victim
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
+
+    assert SkillService(LOCAL_SCOPE).delete_skill(victim) is True
+    assert not target.exists()
 
 
 def test_a_lost_volume_reseeds(skills_root):

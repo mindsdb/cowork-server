@@ -9,6 +9,7 @@ the persistence layer inside _produce_remote) are stubbed.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -132,6 +133,119 @@ def _remote_handler(monkeypatch, saved):
     monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     return handler
+
+
+def test_remote_memory_filters_out_personal_global_tier(monkeypatch):
+    project = SimpleNamespace(path="/current/project")
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(project=project)
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(
+        responses_mod,
+        "build_turn_memory",
+        lambda scope, path: {
+            "global": {"rules": "private"},
+            "project": {"rules": "shared", "lessons": "learned"},
+        },
+    )
+
+    assert ResponsesHandler._remote_memory(_FakeScoped(), uuid4()) == {
+        "project": {"rules": "shared", "lessons": "learned"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_passes_project_memory_to_turnqueue(monkeypatch):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    expected = {"project": {"rules": "shared", "lessons": "learned"}}
+    handler._remote_memory = lambda session, conv_id: expected
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(),
+        input_text="hi",
+        original_content="hi",
+        model="anton",
+        harness_id="anton",
+        buffer=_FakeBuffer(),
+    )
+
+    assert captured["memory"] == expected
+
+
+def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
+    import cowork.services.shared_resources as shared_resources
+
+    project_id = uuid4()
+    conversation = SimpleNamespace(project_id=project_id)
+    project = SimpleNamespace(id=project_id, path="/projects/renamed")
+    events = []
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            events.append("conversation")
+            return conversation
+
+    class FakeSession:
+        scope = _FakeScope()
+
+        def get(self, model, ident):
+            events.append("project")
+            assert ident == project_id
+            return project
+
+        def refresh(self, row):
+            events.append("refresh-project" if row is project else "refresh-conversation")
+
+    class FakeAccess:
+        def __init__(self, session, principal):
+            self.session = session
+
+        @contextmanager
+        def coordination_lock(self, kind, key):
+            events.append("lock-enter")
+            yield
+            events.append("lock-exit")
+
+    def fake_apply(scope, path, entries, **kwargs):
+        events.append(("apply", path, entries))
+        assert kwargs["project_id"] == project_id
+        assert isinstance(kwargs["access"], FakeAccess)
+        return 1
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "apply_turn_memory", fake_apply)
+    monkeypatch.setattr(shared_resources, "SharedResourceAccess", FakeAccess)
+
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+    ResponsesHandler._persist_turn_memory(FakeSession(), uuid4(), entries, object())
+
+    assert events == [
+        "conversation",
+        "lock-enter",
+        "conversation",
+        "refresh-conversation",
+        "project",
+        "refresh-project",
+        ("apply", "/projects/renamed", entries),
+        "lock-exit",
+    ]
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, Request
-from sqlalchemy import event
+from sqlalchemy import event, inspect
 from sqlalchemy.sql import Select
 from sqlmodel import Session, select
 
@@ -108,7 +108,9 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
     if not scope.org_mode:
         return base
     if not scope.org_id:
-        raise MissingTenantScopeError("filesystem store requires an organization in scope")
+        raise MissingTenantScopeError(
+            "filesystem store requires an organization in scope"
+        )
     # "" is silently dropped by pathlib (store collapses onto the org root);
     # "."/".."/separators would escape it.
     if not store or store in (".", "..") or "/" in store or "\\" in store:
@@ -117,7 +119,9 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
     return shared / scope.org_id / store
 
 
-def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
+def scoped_user_storage_root(
+    base: Path, scope: TenantScope | None, *, store: str
+) -> Path:
     """``<shared_root>/<org_id>/<store>/users/<user_id>``, for stores that are one
     person's rather than the org's. ``base`` in local mode (one user per machine);
     org mode fail-closes without BOTH ids, since silently sharing one person's
@@ -140,7 +144,9 @@ def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: st
     if not scope.org_mode:
         return base
     if not scope.user_id:
-        raise MissingTenantScopeError("per-user filesystem store requires a user in scope")
+        raise MissingTenantScopeError(
+            "per-user filesystem store requires a user in scope"
+        )
     return scoped_storage_root(base, scope, store=store) / "users" / scope.user_id
 
 
@@ -180,6 +186,7 @@ class ScopedSelect:
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._stmt, name)
         if callable(attr):
+
             def _wrapped(*args: Any, **kwargs: Any) -> Any:
                 result = attr(*args, **kwargs)
                 return ScopedSelect(result) if isinstance(result, Select) else result
@@ -231,10 +238,7 @@ class ScopedSession:
                         f"org_id={self.scope.org_id!r}"
                     )
         for row in session.new:
-            if (
-                self.scope.user_id
-                and getattr(row, "created_by", "missing") is None
-            ):
+            if self.scope.user_id and getattr(row, "created_by", "missing") is None:
                 row.created_by = self.scope.user_id
         for row in session.deleted:
             if _is_org_scoped(type(row)):
@@ -260,14 +264,20 @@ class ScopedSession:
 
     def exec(self, stmt: ScopedSelect) -> Any:
         if not isinstance(stmt, ScopedSelect):
-            raise TypeError("ScopedSession.exec only runs statements built by .select()")
+            raise TypeError(
+                "ScopedSession.exec only runs statements built by .select()"
+            )
         return self._session.exec(stmt._stmt)
 
     def get(self, model: type, ident: Any) -> Any:
         if _is_org_scoped(model):
             self._require_org(model)
             row = self._session.get(model, ident)
-            if row is not None and self.scope.org_mode and row.org_id != self.scope.org_id:
+            if (
+                row is not None
+                and self.scope.org_mode
+                and row.org_id != self.scope.org_id
+            ):
                 return None
             return row
         return self._session.get(model, ident)
@@ -287,6 +297,7 @@ class ScopedSession:
         if (
             self.scope.org_mode
             and self.scope.user_id
+            and inspect(row).transient
             and getattr(row, "created_by", "missing") is None
         ):
             row.created_by = self.scope.user_id
@@ -313,6 +324,10 @@ class ScopedSession:
 
     def rollback(self) -> None:
         self._session.rollback()
+
+    def get_bind(self) -> Any:
+        """Return the scoped session's engine for server-owned coordination."""
+        return self._session.get_bind()
 
     def close(self) -> None:
         self._session.close()
