@@ -12,6 +12,7 @@ never requested at all.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -116,6 +117,11 @@ def _clean_state():
             _scope(ORG_B, USER_A),
         ):
             SettingService(s, scope).delete_setting(ep.SETTING_KEY)
+        # The host-derivation test seeds `minds_url` with an attacker host to
+        # prove nothing reads it. One session-scoped SQLite file backs the whole
+        # run, so leaving it there hands every later test a tenant-settable value
+        # pointing off-site.
+        SettingService(s, LOCAL_SCOPE).delete_setting("minds_url")
 
 
 @pytest.fixture
@@ -348,6 +354,189 @@ def test_switching_with_the_gate_off_is_not_a_route(session, calls):
     assert SettingService(session, _scope()).load().hub_workspace_id == ""
 
 
+# ── One caller's answer is not another's ─────────────────────────────
+
+
+def _rows_for(*ids) -> dict:
+    """A listing carrying only the named workspaces, as auth would answer it."""
+    by_id = {row["id"]: row for row in _rows(archived=True)["results"]}
+    return {"results": [by_id[i] for i in ids]}
+
+
+def test_one_members_listing_is_not_served_to_another(session, calls):
+    """auth answers this per caller, so the cache has to key on the caller.
+
+    `visible_workspaces` gives an owner or admin every workspace in the
+    organization and a plain member only the ones they hold a grant on. Keyed on
+    the organization alone, the first caller through warms an entry that every
+    other member of that org then reads, and this process serves all of them:
+    org mode, two replicas, one module-level dict.
+    """
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
+    admin = _view(session, _scope(user_id=USER_A))
+    assert [w.id for w in admin.workspaces] == [WS_DEFAULT, WS_CLIENT_A]
+
+    # Same org, same moment, a member auth answers differently for.
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT)
+    member = _view(session, _scope(user_id=USER_A2))
+
+    assert [w.id for w in member.workspaces] == [WS_DEFAULT]
+
+
+def test_a_member_cannot_switch_into_a_workspace_from_anothers_cached_listing(session, calls):
+    """The grant check reads the same cache the menu does, so a shared entry is
+    not only a leak: it is the switch's authorization, and it would pass."""
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
+    _view(session, _scope(user_id=USER_A))
+
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT)
+    with pytest.raises(HTTPException) as caught:
+        _activate(session, _scope(user_id=USER_A2), WS_CLIENT_A)
+
+    assert caught.value.status_code == 403
+    assert SettingService(session, _scope(user_id=USER_A2)).load().hub_workspace_id == ""
+
+
+def test_the_gate_verdict_is_not_shared_across_callers(session, calls):
+    """`authorization_ui` declares `idType: userID`, so auth evaluates it for
+    whoever presents the bearer. A rule below 100%, or one per-user override, and
+    an org-keyed verdict hands one person's answer to everyone beside them."""
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows()
+    assert _view(session, _scope(user_id=USER_A)).enabled is True
+
+    calls.answers[ENTITLEMENTS] = {"feature_gates": {"authorization_ui": False}}
+
+    assert _view(session, _scope(user_id=USER_A2)).enabled is False
+
+
+def test_switching_into_an_archived_workspace_is_refused(session, calls):
+    """The writable set is the set the menu offered, and the menu drops archived
+    rows. Accepting one stores a pick no client could have made."""
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows(archived=True)
+
+    with pytest.raises(HTTPException) as caught:
+        _activate(session, _scope(), WS_ARCHIVED)
+
+    assert caught.value.status_code == 409
+    assert SettingService(session, _scope()).load().hub_workspace_id == ""
+
+
+def test_a_desktop_account_switch_does_not_reuse_the_previous_listing(session, calls):
+    """The per-caller key has to include the CREDENTIAL, not just the identity.
+
+    Outside org mode `scope_from_principal` returns LOCAL_SCOPE, so `user_id` is
+    None for every request on a desktop install and an identity-only key collapses
+    to one shared entry. Sign out, sign in as someone else, and the previous
+    account's workspaces would be served for the rest of the TTL, with the grant
+    check on `PUT /active` reading them.
+    """
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
+    first = _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
+    assert [w.id for w in first.workspaces] == [WS_DEFAULT, WS_CLIENT_A]
+
+    # Same process, same (empty) scope, a different MindsHub session.
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT)
+    second = _view(session, LOCAL_SCOPE, bearer="jwt-second-account")
+
+    assert [w.id for w in second.workspaces] == [WS_DEFAULT]
+
+
+def test_a_desktop_account_switch_cannot_switch_on_the_previous_listing(session, calls):
+    """Same key, but on the path where it authorizes rather than renders."""
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
+    _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
+
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT)
+    with pytest.raises(HTTPException) as caught:
+        _activate(session, LOCAL_SCOPE, WS_CLIENT_A, bearer="jwt-second-account")
+
+    assert caught.value.status_code == 403
+
+
+def test_the_archived_refusal_survives_a_write_through_the_settings_route(session, calls):
+    """The 409 must not read a value any caller can write.
+
+    `hub_workspace_id` is an untagged UserSettings field, so
+    `PUT /api/v1/settings/hub_workspace_id` stores it with no gate and no listing
+    check. `selectable` keeps the ACTIVE row even when archived, so a refusal
+    phrased as "is this in the set the menu offered" would have been talked into
+    accepting an archived workspace by one call to that route.
+    """
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows(archived=True)
+    # Exactly what the unguarded second writer does.
+    SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_ARCHIVED)
+
+    with pytest.raises(HTTPException) as caught:
+        _activate(session, _scope(), WS_ARCHIVED)
+
+    assert caught.value.status_code == 409
+
+
+def test_a_gate_off_verdict_is_cached_as_long_as_a_gate_on_one(session, calls):
+    """A verdict auth actually returned is an answer, whichever way it went.
+
+    The TTL used to be picked from the verdict, so a definite "off" got the 15s
+    failure budget. That is the state this ships in, and per-caller keys made it
+    one extra entitlements read per person rather than per organization.
+    """
+    _gate(calls, False)
+    assert _view(session, _scope()).enabled is False
+    asked_once = calls.asked.count(ENTITLEMENTS)
+
+    # Age the entry past _TTL_FAIL but leave it well inside _TTL_OK.
+    key = next(iter(svc._gate_cache))
+    stamped, value, answered = svc._gate_cache[key]
+    assert answered is True
+    svc._gate_cache[key] = (stamped - (svc._TTL_FAIL + 1), value, answered)
+
+    assert _view(session, _scope()).enabled is False
+    assert calls.asked.count(ENTITLEMENTS) == asked_once, (
+        "an answered gate-off verdict was re-fetched inside its own TTL"
+    )
+
+
+def test_an_unanswered_gate_read_keeps_the_short_ttl(session, calls):
+    """The other half: no answer is still cached, but only briefly."""
+    calls.answers.pop(ENTITLEMENTS, None)  # unreachable
+    assert _view(session, _scope()).enabled is False
+    asked_once = calls.asked.count(ENTITLEMENTS)
+
+    key = next(iter(svc._gate_cache))
+    stamped, value, answered = svc._gate_cache[key]
+    assert answered is False
+    svc._gate_cache[key] = (stamped - (svc._TTL_FAIL + 1), value, answered)
+
+    _view(session, _scope())
+
+    assert calls.asked.count(ENTITLEMENTS) == asked_once + 1
+
+
+def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(session, calls):
+    """Nothing re-reads a departed caller's key, so nothing would ever drop it."""
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows()
+    _view(session, LOCAL_SCOPE, bearer="jwt-someone-who-leaves")
+    assert len(svc._listing_cache) == 1
+
+    stale = {
+        k: (stamped - (svc._MAX_TTL_S + 1), v)
+        for k, (stamped, v) in svc._listing_cache.items()
+    }
+    svc._listing_cache.clear()
+    svc._listing_cache.update(stale)
+
+    _view(session, LOCAL_SCOPE, bearer="jwt-somebody-else")
+
+    assert len(svc._listing_cache) == 1, "the departed caller's entry was never dropped"
+
+
 # ── Where the pick is stored ─────────────────────────────────────────
 
 
@@ -425,16 +614,40 @@ def test_nothing_on_the_turn_path_reads_the_stored_workspace():
     workspace is separate work that has not shipped, so this asserts the boundary
     rather than trusting it.
     """
-    import subprocess
+    from pathlib import Path
 
-    hits = subprocess.run(
-        ["grep", "-rln", "hub_workspace_id", "cowork/turnqueue/", "cowork/handlers/",
-         "cowork/harnesses/", "cowork/services/providers.py"],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    repo = Path(__file__).resolve().parents[1]
+    targets = [
+        repo / "cowork" / "turnqueue",
+        repo / "cowork" / "handlers",
+        repo / "cowork" / "harnesses",
+        repo / "cowork" / "services" / "providers.py",
+    ]
 
-    assert hits == "", f"the turn path reads the stored workspace: {hits}"
+    # Read in Python rather than shelling out to grep. The shell version asserted
+    # on stdout alone, so a wrong working directory or a renamed path made grep
+    # error, print nothing, and the guard pass having checked no files at all.
+    missing = [str(t.relative_to(repo)) for t in targets if not t.exists()]
+    assert not missing, f"this guard points at paths that no longer exist: {missing}"
+
+    # Every file, not just `*.py`. The shell version this replaced was a plain
+    # `grep -rln`, so it also read the skill markdown and prompt templates under
+    # `cowork/harnesses/`, and the turn path can name a setting from one of those
+    # as easily as from code.
+    def _walk(target):
+        if target.is_file():
+            return [target]
+        return sorted(f for f in target.rglob("*") if f.is_file())
+
+    files = [f for t in targets for f in _walk(t)]
+    assert files, "the guard matched no files, so it proved nothing"
+    hits = [
+        str(f.relative_to(repo))
+        for f in files
+        if "hub_workspace_id" in f.read_text(encoding="utf-8", errors="ignore")
+    ]
+
+    assert hits == [], f"the turn path reads the stored workspace: {hits}"
 
 
 def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
@@ -479,7 +692,7 @@ def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
     monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
 
     listing = asyncio.run(
-        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A)
+        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
 
     assert listing.reachable is True
@@ -515,6 +728,12 @@ def test_every_transport_failure_reads_as_unreachable(monkeypatch, failure):
 
     A menu open must never raise into the UI and must never run past the budget,
     so each of these returns "we could not ask" rather than propagating.
+
+    The timeout case SLEEPS and answers cleanly, and the assertion is on ELAPSED
+    TIME, which is the only thing that can tell the ceiling apart from the
+    blanket `except`. Raising `asyncio.TimeoutError` from the fake proved
+    nothing: it lands in that handler with or without the `asyncio.wait_for`
+    around the fetch, so the budget could be deleted and this stayed green.
     """
 
     class FakeResponse:
@@ -522,7 +741,9 @@ def test_every_transport_failure_reads_as_unreachable(monkeypatch, failure):
 
         @staticmethod
         def json():
-            raise ValueError("not json")
+            if failure == "non-json":
+                raise ValueError("not json")
+            return _rows()
 
     class FakeClient:
         def __init__(self, **_kwargs):
@@ -538,21 +759,28 @@ def test_every_transport_failure_reads_as_unreachable(monkeypatch, failure):
             if failure == "raises":
                 raise RuntimeError("connection reset")
             if failure == "times-out":
-                raise asyncio.TimeoutError()
+                # Far past the patched budget, and it answers successfully if it
+                # is ever allowed to finish, so only the ceiling can fail it.
+                await asyncio.sleep(30)
             return FakeResponse()
 
     monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(svc, "_TIMEOUT_S", 0.05)
 
+    started = time.monotonic()
     listing = asyncio.run(
-        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A)
+        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
     enabled = asyncio.run(
-        svc.authorization_ui_enabled(bearer_token="jwt-abc", org_id=ORG_A)
+        svc.authorization_ui_enabled(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
+    elapsed = time.monotonic() - started
 
     assert listing.reachable is False
     assert listing.workspaces == []
     assert enabled is False
+    if failure == "times-out":
+        assert elapsed < 2.0, f"the total-time ceiling did not fire: two calls took {elapsed:.1f}s"
 
 
 @pytest.mark.parametrize(
@@ -624,7 +852,7 @@ def test_an_http_refusal_is_not_mistaken_for_an_empty_organization(monkeypatch):
     monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
 
     listing = asyncio.run(
-        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A)
+        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
 
     assert listing.reachable is False
@@ -705,22 +933,51 @@ def test_the_hub_header_wins_over_the_loopback_authorization():
     assert caller_bearer(request) == "loopback-token-not-the-users"
 
 
-def test_the_web_shell_falls_back_to_authorization():
+def test_the_web_shell_falls_back_to_authorization(monkeypatch):
     """No hook there, so the ingress-forwarded Authorization is the JWT."""
-    request = type("R", (), {"headers": {"Authorization": "Bearer web-jwt"}})()
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    try:
+        request = type("R", (), {"headers": {"Authorization": "Bearer web-jwt"}})()
 
-    assert hub_credential(request) == "web-jwt"
+        assert hub_credential(request) == "web-jwt"
+    finally:
+        get_app_settings.cache_clear()
+
+
+def test_a_desktop_install_never_forwards_the_servers_own_token(monkeypatch):
+    """The fallback is org mode only, and this is why.
+
+    On a desktop install the Electron main process assigns THIS server's bearer
+    to `Authorization` on every loopback request, so a caller with no MindsHub
+    session leaves that header holding our own credential. Falling back to it
+    puts that credential on the wire to auth. It gets refused, and it has still
+    left the machine.
+    """
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    try:
+        request = type("R", (), {"headers": {"Authorization": "Bearer the-loopback-token"}})()
+
+        assert hub_credential(request) == ""
+    finally:
+        get_app_settings.cache_clear()
 
 
 @pytest.mark.parametrize("value", ["", "Basic abc", "real-user-jwt"])
-def test_a_malformed_hub_header_falls_back_rather_than_forwarding_junk(value):
-    request = type(
-        "R",
-        (),
-        {"headers": {HEADER_HUB_CREDENTIAL: value, "Authorization": "Bearer fallback"}},
-    )()
+def test_a_malformed_hub_header_falls_back_rather_than_forwarding_junk(value, monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    try:
+        request = type(
+            "R",
+            (),
+            {"headers": {HEADER_HUB_CREDENTIAL: value, "Authorization": "Bearer fallback"}},
+        )()
 
-    assert hub_credential(request) == "fallback"
+        assert hub_credential(request) == "fallback"
+    finally:
+        get_app_settings.cache_clear()
 
 
 def test_hub_credential_with_no_request_is_empty():

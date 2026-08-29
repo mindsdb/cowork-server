@@ -37,6 +37,8 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp
 
+from cowork.common.settings.app_settings import get_app_settings
+
 logger = logging.getLogger(__name__)
 
 # Keep in sync with auth-service and mindshub_inference (minds/common/constants.py).
@@ -143,12 +145,25 @@ def hub_credential(request: Request | None) -> str:
     into that one would let any client steer the credential on the org model
     catalog fetch too, which reads ``Authorization`` because in org mode the
     gateway put it there.
+
+    **The fallback is org mode only, and that is a containment rule rather than a
+    tidiness one.** In org mode the ingress put the caller's own JWT in
+    ``Authorization``, so reading it is correct. On a desktop install nothing
+    does: the Electron main process assigns THIS server's bearer to that header
+    on every loopback request, so falling back there would forward our own
+    credential to auth. It would be refused, and it would still have left the
+    machine, which is exactly what the main process's own "scoped to our loopback
+    origin so it can't leak elsewhere" is supposed to prevent. Empty is the right
+    answer instead: the caller has no MindsHub credential, and the surfaces this
+    feeds are all fail-closed.
     """
     if request is None:
         return ""
     explicit = request.headers.get(HEADER_HUB_CREDENTIAL, "")
     if explicit.lower().startswith("bearer "):
         return explicit[7:].strip()
+    if get_app_settings().tenancy_mode != "org":
+        return ""
     return caller_bearer(request)
 
 

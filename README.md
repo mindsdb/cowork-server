@@ -197,13 +197,13 @@ All endpoints live under `/api/v1/`. Key resource groups:
 
 ### The MindsHub workspace selector
 
-`/api/v1/hub/workspaces` backs the workspace group in the desktop app's account
-menu. A **MindsHub Workspace** is an org-internal container that owns hub
+`/api/v1/hub/workspaces` backs the workspace selector at the top of the desktop
+app's sidebar. A **MindsHub Workspace** is an org-internal container that owns hub
 resources (API keys, artifacts, model entitlements) and lives in the auth
 service. It has nothing to do with the filesystem directories this repo calls
 workspaces, which is why the stored key is `hub_workspace_id`.
 
-Three things about it are worth knowing before changing it.
+Five things about it are worth knowing before changing it.
 
 **The sidecar makes the call, not the renderer.** Auth's ingress allows three
 console origins per environment and no Cowork host, and a per-PR Cowork host
@@ -218,10 +218,13 @@ an org admin can set.
 **The credential arrives in its own header, `X-MindsHub-Authorization`.** It
 cannot use `Authorization`: Electron's main process overwrites that on every
 request to the loopback server with the server's own token, so the caller's
-Keycloak JWT can never arrive under that name in the desktop shell. `Authorization`
-is still the fallback, which is what the web shell uses. `hub_credential` reads
-both, and it is deliberately a different function from `caller_bearer` so a client
-cannot steer the credential on the org model-catalog fetch by setting a header.
+Keycloak JWT can never arrive under that name in the desktop shell.
+`Authorization` is still the fallback **in org mode only**, where the ingress put
+the caller's JWT there; on a desktop install that header holds this server's own
+bearer, and forwarding it to auth would leak the one credential the main process
+scopes to the loopback origin. `hub_credential` reads both, and it is
+deliberately a different function from `caller_bearer` so a client cannot steer
+the credential on the org model-catalog fetch by setting a header.
 
 **The switch is auth's Statsig gate, not a local setting.** Auth declares
 `authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its
@@ -232,6 +235,35 @@ short of a definite yes reads as off: no bearer, auth unreachable, a version of
 auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is an
 ON-only development override for walking the surface where no rule targets you;
 it cannot switch the surface off, so it cannot escape the kill switch.
+
+**Both caches are keyed on the credential, not just the caller.** Auth answers
+the listing and the gate per caller: an owner or admin sees every workspace in
+the organization, a member only the ones they hold a grant on, and
+`authorization_ui` declares `idType: userID`. So an organization-keyed cache
+served one admin's menu to every member for the whole TTL, and the grant check on
+`PUT /active` reads the same entry. The key is
+`(auth host, organization, user, credential digest)`. The digest is not
+belt-and-braces: `user_id` comes from the gateway-set principal and is `None` on
+every desktop request, because `scope_from_principal` returns `LOCAL_SCOPE`
+outside org mode, so identity alone collapses to one shared entry and a
+sign-out/sign-in as another account would be served the previous one's
+workspaces. A new session means a new token means a new entry. Entries are swept
+on write, since nothing re-reads a departed caller's key and the dicts would
+otherwise grow for the process lifetime. The TTL follows whether **auth
+answered**, not what it said: a gate auth evaluated as off is a real answer and
+keeps the long TTL, which matters because off is the state this ships in.
+
+**Two refusals on `PUT /active`, and neither may read the stored pick.** A
+workspace missing from the caller's listing is a 403; one in the listing but
+stamped archived is a 409, so the client can say retrying will not help instead
+of offering a loop with no exit. The archived check reads the target row's own
+`archived_at` rather than asking whether it is in the set the menu offered, and
+that distinction is load-bearing. `hub_workspace_id` is an untagged
+`UserSettings` field, so `PUT /api/v1/settings/hub_workspace_id` writes it with
+no gate and no listing check, and `selectable` keeps the active row even when
+archived. A refusal phrased against the offered set would therefore have been
+talked into accepting an archived workspace by one call to the settings route.
+Nothing that refuses a request may read a value any caller can write.
 
 **Picking a workspace changes what the client shows, not what a turn is billed
 to.** Neither turn credential carries a workspace: a desktop turn presents the
