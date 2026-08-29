@@ -254,6 +254,17 @@ class PatchPickedFilesBody(BaseModel):
     files: list[PickedFile] = Field(default_factory=list)
 
 
+class PickerTokenResponse(BaseModel):
+    """What the SPA needs to build a Google Picker itself. `api_key` is
+    auth's `picker_api_key` under a different name, so this pins a rename
+    the client would otherwise only assert by hand."""
+
+    access_token: str
+    account_email: str = ""
+    api_key: str
+    app_id: str
+
+
 class OAuthStartRequest(BaseModel):
     client_id: str = ""
     client_secret: str = ""
