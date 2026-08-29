@@ -1,6 +1,7 @@
 """Draft previews keep authorization and file use on one pinned descriptor."""
 from __future__ import annotations
 
+import mimetypes
 import os
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -303,7 +304,11 @@ async def test_fullstack_preview_stays_inside_the_declared_public_subtree(
 # is not HTML/Markdown. The bytes and the authorization are the preview's; only
 # the disposition changes.
 
-XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+# Derived, not hard-coded: Python's BUILT-IN mimetypes map has no `.xlsx`. A
+# macOS run passes because it reads /etc/apache2/mime.types; a bare Linux image
+# may answer None, and the route then falls back to octet-stream. The test must
+# assert what the route does on THIS machine, not what one developer's box did.
+XLSX = mimetypes.guess_type("model.xlsx")[0] or "application/octet-stream"
 
 
 async def test_download_serves_a_binary_as_an_attachment(tmp_path, monkeypatch):
