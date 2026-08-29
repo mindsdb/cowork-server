@@ -8,6 +8,7 @@ import stat
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -58,6 +59,28 @@ _PRIVATE_DRAFT_ENTRIES = {
     "README.md",
     "backend.log",
 }
+
+
+def _attachment_disposition(filename: str) -> str:
+    """``Content-Disposition`` for saving ``filename``, safe to put on the wire.
+
+    The name is a request-derived path component. ``_relative_file_parts``
+    rejects NUL, separators and ``..``, but a quote, CR or LF still pass — and
+    any of them interpolated raw into a header is a header-injection vector
+    (``project_files.download_project_file`` has exactly that shape; ENG-2044).
+
+    Two spellings so every client gets a usable name: an ASCII ``filename=``
+    with quotes and backslashes escaped and non-printables dropped, and an
+    RFC 5987 ``filename*=UTF-8''…`` carrying the exact name percent-encoded,
+    which is what current browsers read first.
+    """
+    cleaned = "".join(ch for ch in filename if ch.isprintable())
+    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii")
+    ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"').strip() or "download"
+    return (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(cleaned or 'download', safe='')}"
+    )
 
 
 def _relative_file_parts(value: str) -> tuple[str, ...]:
@@ -179,7 +202,14 @@ def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
     return HTMLResponse(inject_layer(html), headers=_DRAFT_RESPONSE_HEADERS)
 
 
-def _draft_stream(resources: ExitStack, fd: int, size: int, media_type: str):
+def _draft_stream(
+    resources: ExitStack,
+    fd: int,
+    size: int,
+    media_type: str,
+    *,
+    extra_headers: dict[str, str] | None = None,
+):
     """Stream bytes from the pinned descriptor and close every held handle."""
     def chunks():
         try:
@@ -192,7 +222,11 @@ def _draft_stream(resources: ExitStack, fd: int, size: int, media_type: str):
         chunks(),
         resources=resources,
         media_type=media_type,
-        headers={**_DRAFT_RESPONSE_HEADERS, "Content-Length": str(size)},
+        headers={
+            **_DRAFT_RESPONSE_HEADERS,
+            **(extra_headers or {}),
+            "Content-Length": str(size),
+        },
     )
 
 
@@ -611,12 +645,22 @@ async def serve_private_draft(
     rel_path: str,
     request: Request,
     session: ScopedSessionDep,
+    download: Annotated[bool, Query()] = False,
 ):
     """Authenticated draft preview with project/org containment and relative assets.
 
     Open to a reviewer as well as the owner, but only through
     `review_artifact_for_request`: a co-member's draft is reachable here solely
     because its owner granted same-org review on that one artifact.
+
+    ``?download=1`` returns the same bytes as an attachment (ENG-2044). On an
+    org deployment this is the ONLY way to obtain a non-HTML artifact: the
+    stateless ``/serve`` route is desktop-only there, and autopublish skips
+    anything that is not HTML/Markdown. Authorization is unchanged — a review
+    grant already lets its holder read every byte through the preview, so the
+    header changes how the response is labelled, not who may read it.
+    ``Annotated[..., Query()] = False`` rather than ``= Query(False)`` so a
+    direct call (the tests') gets a real ``False``, not the ``Query`` object.
     """
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
@@ -656,12 +700,18 @@ async def serve_private_draft(
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
     try:
-        if wants_comment_layer(media_type, request):
+        if not download and wants_comment_layer(media_type, request):
             resp = await run_in_threadpool(_comment_layer_from_fd, fd)
             if resp is not None:
                 resources.close()
                 return resp
-        return _draft_stream(resources, fd, file_stat.st_size, media_type)
+        extra = (
+            {"Content-Disposition": _attachment_disposition(parts[-1])}
+            if download else None
+        )
+        return _draft_stream(
+            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+        )
     except BaseException:
         resources.close()
         raise
