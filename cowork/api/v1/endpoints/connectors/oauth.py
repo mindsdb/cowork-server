@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse
 from cowork.api.v1.endpoints.guards import require_local
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse
+from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.oauth.google import (
@@ -106,30 +106,29 @@ def _require_picker_engine(engine: str, *, org_mode: bool) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No file picker for engine {engine!r}")
 
 
-@router.post("/{engine}/picker/token")
+@router.post("/{engine}/picker/session")
+async def create_picker_session(engine: str, scope: ScopeDep):
+    """Gone: the picker is built in the SPA now, so there is no session to
+    mint. Answers 410 rather than 404 so a tab still running the previous
+    bundle tells the user to reload instead of reporting a picker failure."""
+    _require_picker_engine(engine, org_mode=scope.org_mode)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Cowork has been updated — reload the page to add Google Drive files.",
+    )
+
+
+@router.post("/{engine}/picker/token", response_model=PickerTokenResponse)
 async def mint_picker_token(engine: str, request: Request, scope: ScopeDep, body: dict = Body(default_factory=dict)):
-    """Org-mode only. Mints the live access token directly into the JSON
-    response.
-
-    Replaces the old two-step session handoff (mint at POST time, hand off
-    via an opaque Redis-backed ticket to a header-less `GET .../picker`
-    popup navigation, which could never carry a Bearer header). The Picker
-    now renders in-page in the SPA itself (see `pickDriveFiles`/host.ts) —
-    everything here is a normal authenticated `fetch()`, so there is no
-    header-less hop this token needs to survive, and nothing about it is
-    ever served to an unauthenticated request.
-
-    `file_ids` (pre-navigating the picker to specific files) is no longer
-    threaded through this endpoint at all: the caller already has that value
-    itself and can hand it straight to the Picker widget's own JS builder,
-    with no server round trip needed."""
+    """Org-mode only. Returns a live Drive access token to the caller's own
+    authenticated fetch — safe because nothing here is reachable without the
+    caller's Bearer, and the token never leaves that response."""
     _require_picker_engine(engine, org_mode=scope.org_mode)
 
     settings = OAuthSettings()
     token = await auth_proxy.proxy_token(engine, request, settings, name=body.get("name") or "")
 
     access_token = token.get("access_token")
-    account_email = token.get("account_email") or body.get("account_email", "")
     api_key = token.get("picker_api_key") or settings.google_picker_api_key
     app_id = token.get("app_id", "")
     if not access_token or not api_key or not app_id:
@@ -138,9 +137,9 @@ async def mint_picker_token(engine: str, request: Request, scope: ScopeDep, body
             detail="Google Drive Picker is not fully configured for this deployment.",
         )
 
-    return {
-        "access_token": access_token,
-        "account_email": account_email,
-        "api_key": api_key,
-        "app_id": app_id,
-    }
+    return PickerTokenResponse(
+        access_token=access_token,
+        account_email=token.get("account_email", ""),
+        api_key=api_key,
+        app_id=app_id,
+    )
