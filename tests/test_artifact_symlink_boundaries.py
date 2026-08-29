@@ -104,6 +104,27 @@ def test_symlinked_artifact_folder_is_neither_resolved_nor_migrated(tmp_path):
     assert (outside / "metadata.json").read_bytes() == before
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
+def test_symlinked_trusted_project_anchor_is_refused(tmp_path):
+    real_project = tmp_path / "real-project"
+    folder = real_project / ".anton" / "artifacts" / "draft"
+    _write_metadata(folder)
+    (folder / "index.html").write_text("<html></html>", encoding="utf-8")
+    assert list_artifacts([_source(real_project)])[0]["slug"] == "draft"
+
+    planted_anchor = tmp_path / "planted-project"
+    planted_anchor.symlink_to(real_project, target_is_directory=True)
+    planted = ProjectArtifacts(
+        base=planted_anchor / ".anton" / "artifacts",
+        project_id=None,
+        project_name="planted-project",
+        trusted_anchor=planted_anchor,
+        root_parts=(".anton", "artifacts"),
+    )
+
+    assert list_artifacts([planted]) == []
+
+
 @pytest.mark.skipif(os.name == "nt", reason="file-link threat is POSIX org storage")
 def test_listing_does_not_read_a_symlinked_publish_record(tmp_path):
     project = tmp_path / "project"

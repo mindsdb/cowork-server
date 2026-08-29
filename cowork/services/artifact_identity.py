@@ -19,7 +19,7 @@ import stat
 import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -42,7 +42,6 @@ from cowork.common.paths import (
     dir_stat,
     dir_unlink,
     open_pinned_child,
-    opened_subdir_nofollow,
     pinned_dir,
 )
 
@@ -96,10 +95,22 @@ def opened_artifact_root(source: "ProjectArtifacts") -> Iterator[PinnedDir]:
 
     anchor = Path(anchor_value)
     parts = tuple(_component(part) for part in parts)
-    if not parts or _normalized_path(anchor.joinpath(*parts)) != _normalized_path(base):
+    normalized_anchor_parts = Path(_normalized_path(anchor)).parts
+    normalized_base_parts = Path(_normalized_path(base)).parts
+    if not parts or normalized_base_parts != (*normalized_anchor_parts, *parts):
         raise ValueError("Artifact root does not match its trusted anchor")
-    with opened_subdir_nofollow(anchor, *parts) as root:
-        yield root
+
+    # The project directory itself is writable storage and can be replaced by a
+    # symlink too. Pin its trusted parent, then open the basename and every root
+    # component relative to descriptors with O_NOFOLLOW. At no point is the
+    # already-authorized path re-walked as one joined string.
+    anchor_name = _component(anchor.name)
+    with pinned_dir(anchor.parent, nofollow_base=True) as parent:
+        with ExitStack() as opened:
+            root = opened.enter_context(_opened_child_directory(parent, anchor_name))
+            for part in parts:
+                root = opened.enter_context(_opened_child_directory(root, part))
+            yield root
 
 
 @contextmanager
@@ -175,6 +186,25 @@ def _read_no_follow(folder: PinnedDir, name: str) -> str:
         raise
     with stream:
         return stream.read()
+
+
+def read_full_id(folder: PinnedDir) -> tuple[str, dict]:
+    """Read and normalize one artifact identity without mutating its metadata.
+
+    Artifact listing is a read operation. Legacy metadata still needs to expose
+    the same deterministic full id as :func:`ensure_full_id`, but persisting that
+    widening makes an HTTP GET reach ``os.replace`` and ``os.utime``. This entry
+    point has a deliberately separate call graph: it reads through the pinned
+    descriptor, derives the canonical id in memory, and returns the normalized
+    metadata that callers historically received after a successful migration.
+    """
+    metadata = json.loads(_read_no_follow(folder, "metadata.json"))
+    resolved = _resolved_id(metadata, folder.path)
+    if _is_migrated(metadata, resolved):
+        return resolved, metadata
+    normalized = {key: value for key, value in metadata.items() if key != "stableId"}
+    normalized["id"] = resolved
+    return resolved, normalized
 
 
 def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:

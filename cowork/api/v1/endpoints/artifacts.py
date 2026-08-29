@@ -255,61 +255,68 @@ def _desktop_source_path_keys(source) -> set[str]:
     return candidates
 
 
-def _desktop_registered_path_catalog() -> frozenset[tuple[str, str]]:
-    """Build legacy path/name keys without accepting an HTTP selector."""
-    return frozenset(
-        (path_key, os.path.basename(str(Path(source.base).parent.parent)))
+@dataclass(frozen=True)
+class _DesktopSourceCatalogEntry:
+    """One server-discovered source and its accepted legacy path spelling."""
+
+    path_key: str
+    project_name: str
+    source: object
+
+
+def _desktop_registered_path_catalog() -> tuple[_DesktopSourceCatalogEntry, ...]:
+    """Build the complete legacy source catalog without an HTTP selector."""
+    return tuple(
+        _DesktopSourceCatalogEntry(
+            path_key=path_key,
+            project_name=os.path.basename(str(Path(source.base).parent.parent)),
+            source=source,
+        )
         for source in artifacts_sources_for_scan()
-        for path_key in _desktop_source_path_keys(source)
+        for path_key in sorted(_desktop_source_path_keys(source))
     )
 
 
-def _desktop_path_is_registered(
-    catalog: frozenset[tuple[str, str]], requested: str, project_name: str
-) -> bool:
-    """Validate a legacy absolute path against an already-built catalog.
+def _desktop_registered_source(
+    catalog: tuple[_DesktopSourceCatalogEntry, ...],
+    requested: str,
+    project_name: str,
+):
+    """Select the exact server source for a registered legacy path.
 
     This selector performs comparisons only: all Path operations happened in
     ``_desktop_registered_path_catalog`` before the HTTP path entered the
-    operation. The caller then passes only the basename-sanitized project name
-    into the separate card-building phase.
+    operation. Returning the catalog's source, rather than rescanning by leaf
+    name, preserves exact-path semantics when two roots share a basename.
     """
-    return any(
-        secrets.compare_digest(server_path, requested)
-        and secrets.compare_digest(server_name, project_name)
-        for server_path, server_name in catalog
-    )
-
-
-def _desktop_project_cards(session, project_name: str) -> list[dict]:
-    """Build one desktop project's cards from a sanitized project name."""
-    for source in artifacts_sources_for_scan():
-        server_name = os.path.basename(str(Path(source.base).parent.parent))
-        if secrets.compare_digest(server_name, project_name):
-            return _artifact_cards(session, [source])
-    return []
+    for entry in catalog:
+        if secrets.compare_digest(
+            entry.path_key, requested
+        ) and secrets.compare_digest(entry.project_name, project_name):
+            return entry.source
+    return None
 
 
 def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict]:
-    """Select one desktop project's already-built response by its legacy path.
+    """Select one desktop project's response by its legacy path.
 
     ``project_path`` remains supported because older desktop builds address the
-    list this way. It is first matched exactly against server-discovered roots,
-    then discarded. A second discovery selects by its basename-sanitized project
-    name, so the raw path never selects an object passed to ``_list_artifacts``.
-    The selected source keeps ``project_id=None``, preserving local draft URLs
-    and card addressing.
+    list this way. A complete source catalog is built first, then the request is
+    used only as an equality key. It is never joined or opened. The exact source
+    retained in that catalog keeps ``project_id=None``, preserving local draft
+    URLs and card addressing.
     """
     catalog = _desktop_registered_path_catalog()
     if not project_path or "\x00" in project_path:
         return []
     requested = os.path.normpath(os.path.expanduser(project_path))
     project_name = os.path.basename(requested)
-    if not project_name or not _desktop_path_is_registered(
-        catalog, requested, project_name
-    ):
+    if not project_name:
         return []
-    return _desktop_project_cards(session, project_name)
+    source = _desktop_registered_source(catalog, requested, project_name)
+    if source is None:
+        return []
+    return _artifact_cards(session, [source])
 
 
 _BLANK_ARTIFACT_STATUS = {
@@ -614,15 +621,16 @@ async def list_artifacts(
                 return []
             requested = os.path.normpath(os.path.expanduser(project_path))
             # Snyk Code recognizes basename as a path-traversal sanitizer. Keep
-            # it directly at the HTTP boundary: only this leaf enters the
-            # filesystem-facing card builder, while the raw absolute path is
-            # consumed solely by the registration check.
+            # it directly at the HTTP boundary. Both request-derived values are
+            # consumed solely by equality checks; the card builder receives the
+            # exact server-created source retained in the complete catalog.
             project_name = os.path.basename(requested)
-            if not project_name or not _desktop_path_is_registered(
-                catalog, requested, project_name
-            ):
+            if not project_name:
                 return []
-            return _desktop_project_cards(session, project_name)
+            source = _desktop_registered_source(catalog, requested, project_name)
+            if source is None:
+                return []
+            return _artifact_cards(session, [source])
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
