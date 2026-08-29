@@ -46,7 +46,9 @@ def unlink_file_dirs(dirs: list[Path]) -> None:
             logger.warning("could not remove file dir %s", d, exc_info=True)
 
 
-def remove_conversation_workspace_dir(project_path: str | Path | None, conversation_id: str | UUID) -> None:
+def remove_conversation_workspace_dir(
+    project_path: str | Path | None, conversation_id: str | UUID
+) -> None:
     """Remove ``<project>/conversations/<conv>/`` on conversation delete — the
     per-conversation workspace holding the staged attachments and instructions
     (and, in cloud, session state). Otherwise it orphans on the shared mount,
@@ -70,10 +72,14 @@ def remove_conversation_workspace_dir(project_path: str | Path | None, conversat
         if target.is_dir() and not target.is_symlink():
             shutil.rmtree(target, ignore_errors=True)
     except OSError:
-        logger.warning("could not remove conversation workspace dir %s", target, exc_info=True)
+        logger.warning(
+            "could not remove conversation workspace dir %s", target, exc_info=True
+        )
 
 
-def stage_project_instructions(project_path: str | Path, conversation_id: str | UUID) -> bool:
+def stage_project_instructions(
+    project_path: str | Path, conversation_id: str | UUID
+) -> bool:
     """Copy the project's ``anton.md`` into the conversation workspace so the
     pod picks it up: anton reads ``<workspace>/.anton/anton.md``, but the pod's
     workspace is the conversation dir while the project's Instructions live at
@@ -83,7 +89,9 @@ def stage_project_instructions(project_path: str | Path, conversation_id: str | 
     anton's Workspace and cowork's project_files endpoint.
     """
     try:
-        conv_seg = str(UUID(str(conversation_id)))  # path segment must be a real id, never `..`
+        conv_seg = str(
+            UUID(str(conversation_id))
+        )  # path segment must be a real id, never `..`
     except (ValueError, TypeError):
         return False
     conv_root = Path(project_path) / "conversations" / conv_seg
@@ -93,7 +101,10 @@ def stage_project_instructions(project_path: str | Path, conversation_id: str | 
     try:
         dest = safe_join(conv_root, ".anton", "anton.md")
     except ValueError:
-        logger.warning("staged instructions path escapes workspace for conversation %s", conversation_id)
+        logger.warning(
+            "staged instructions path escapes workspace for conversation %s",
+            conversation_id,
+        )
         return False
     src = Path(project_path) / ".anton" / "anton.md"
     if not src.is_file():
@@ -123,7 +134,11 @@ def stage_project_instructions(project_path: str | Path, conversation_id: str | 
         shutil.copy2(src, dest)
         return True
     except OSError:
-        logger.warning("could not stage instructions for conversation %s", conversation_id, exc_info=True)
+        logger.warning(
+            "could not stage instructions for conversation %s",
+            conversation_id,
+            exc_info=True,
+        )
         return False
 
 
@@ -181,7 +196,9 @@ def _secure_attachments_dir(conv_dir: Path) -> PinnedDir | None:
         return None
 
 
-def _stage_attachment(attach: PinnedDir, file_id: str, name: str, src: Path, size: int) -> None:
+def _stage_attachment(
+    attach: PinnedDir, file_id: str, name: str, src: Path, size: int
+) -> None:
     """Copy *src* to ``<attachments>/<file_id>/<name>`` relative to *attach*.
 
     Never follows a symlink the pod may have planted for the per-id directory or
@@ -235,7 +252,9 @@ def _prune_staged_attachments(attach: PinnedDir, keep: set[str]) -> None:
             else:
                 dir_unlink(attach, entry.name)
         except OSError:
-            logger.warning("could not prune staged attachment %s", entry.name, exc_info=True)
+            logger.warning(
+                "could not prune staged attachment %s", entry.name, exc_info=True
+            )
 
 
 class FileService:
@@ -281,7 +300,9 @@ class FileService:
         """Raw File rows for callers that need fields the OpenAI-style
         FileResponse drops (content_type, timestamps) — e.g. the
         attachments compat endpoints."""
-        return list(self.session.exec(self._owned_select().where(File.purpose == purpose)).all())
+        return list(
+            self.session.exec(self._owned_select().where(File.purpose == purpose)).all()
+        )
 
     def get_file_row(self, file_id: UUID) -> File:
         return self._get_file_model(file_id)
@@ -290,7 +311,9 @@ class FileService:
         """Repoint every file stored under `old_purpose`. Used when a
         conversation ends up with a different id than the one the client
         uploaded attachments against. Returns the number relinked."""
-        files = self.session.exec(self._owned_select().where(File.purpose == old_purpose)).all()
+        files = self.session.exec(
+            self._owned_select().where(File.purpose == old_purpose)
+        ).all()
         for file in files:
             file.purpose = new_purpose
             self.session.add(file)
@@ -337,7 +360,9 @@ class FileService:
         self.session.refresh(file)
         return self._to_response(file)
 
-    def create_file_from_bytes(self, *, filename: str, content_type: str, data: bytes, purpose: str) -> File:
+    def create_file_from_bytes(
+        self, *, filename: str, content_type: str, data: bytes, purpose: str
+    ) -> File:
         """Server-side ingestion (e.g. channel media); returns the model.
         The filename comes from an external platform, so keep only its basename."""
         safe_name = Path(filename).name.strip() or "file"
@@ -407,11 +432,31 @@ class FileService:
         conversation), then the caller unlinks the returned dirs via
         `unlink_file_dirs` AFTER committing.
         """
-        rows = list(self.session.exec(self._owned_select().where(File.purpose == purpose)).all())
+        rows = list(
+            self.session.exec(self._owned_select().where(File.purpose == purpose)).all()
+        )
         # Same validated candidates as delete_file (_doomed_dirs).
         dirs = [d for f in rows for d in self._doomed_dirs(f)]
         for f in rows:
             self.session.delete(f)
+        return dirs
+
+    def delete_by_purpose_for_parent_cascade(self, purpose: str) -> list[Path]:
+        """Stage all org-scoped rows owned by an authorized parent resource.
+
+        Project deletion may cascade conversations belonging to several org
+        members. The conversation UUID in ``purpose`` comes from an already
+        scoped, authorized parent row, so applying the ordinary user filter
+        here would orphan another member's attachment rows and bytes.
+        """
+        rows = list(
+            self.session.exec(
+                self.session.select(File).where(File.purpose == purpose)
+            ).all()
+        )
+        dirs = [directory for row in rows for directory in self._doomed_dirs(row)]
+        for row in rows:
+            self.session.delete(row)
         return dirs
 
     def get_file_content(self, file_id: UUID) -> tuple[str, str, Path]:
@@ -421,7 +466,9 @@ class FileService:
             raise ValueError("File content not found on disk")
         return file.content_type, file.filename, path
 
-    def stage_conversation_attachments(self, conversation_id: UUID | str, project_path: str | Path) -> int:
+    def stage_conversation_attachments(
+        self, conversation_id: UUID | str, project_path: str | Path
+    ) -> int:
         """Copy this conversation's attachments into the pod-visible workspace at
         ``<project_path>/conversations/<conv>/attachments/<file_id>/<name>`` so a
         delegated (cloud) turn can read them off the shared mount — the flat
@@ -436,7 +483,9 @@ class FileService:
         the number staged.
         """
         try:
-            conv_seg = str(UUID(str(conversation_id)))  # path segment must be a real id, never `..`
+            conv_seg = str(
+                UUID(str(conversation_id))
+            )  # path segment must be a real id, never `..`
         except (ValueError, TypeError):
             return 0
         # The pod mounts this conversation dir read-write, so it can replace
@@ -448,7 +497,9 @@ class FileService:
         conv_dir = Path(project_path) / "conversations" / conv_seg
         attach = _secure_attachments_dir(conv_dir)
         if attach is None:
-            logger.warning("could not secure attachments dir for conversation %s", conversation_id)
+            logger.warning(
+                "could not secure attachments dir for conversation %s", conversation_id
+            )
             return 0
         # Only copy bytes that live under THIS org's files root: a legacy
         # escaped row (path into another org) must not be dragged into the
@@ -466,8 +517,14 @@ class FileService:
                     src = Path(row.path)
                     if not src.is_file():
                         continue
-                    if files_root is not None and files_root not in src.resolve().parents:
-                        logger.warning("attachment %s path is outside the org files root; skipping", row.id)
+                    if (
+                        files_root is not None
+                        and files_root not in src.resolve().parents
+                    ):
+                        logger.warning(
+                            "attachment %s path is outside the org files root; skipping",
+                            row.id,
+                        )
                         continue
                     _stage_attachment(attach, str(row.id), src.name, src, row.size)
                     staged_ids.add(str(row.id))
@@ -475,7 +532,9 @@ class FileService:
                 except (OSError, ValueError):
                     logger.warning(
                         "could not stage attachment %s for conversation %s",
-                        getattr(row, "id", "?"), conversation_id, exc_info=True,
+                        getattr(row, "id", "?"),
+                        conversation_id,
+                        exc_info=True,
                     )
             # Prune every staged entry we did NOT just (re)stage: a deleted row, a
             # row whose source bytes vanished, or one skipped as out-of-root, so

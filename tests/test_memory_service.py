@@ -146,6 +146,12 @@ def test_get_list_endpoint(client, memory_root, memory_settings):
     assert categories == {"profile", "rules", "lessons"}
     rules = next(item for item in items if item["category"] == "rules")
     assert rules["content"].strip() == "global rule"
+    assert rules["attribution"] == {
+        "createdBy": None,
+        "lastModifiedBy": None,
+        "lastModifiedAt": None,
+    }
+    assert rules["capabilities"] == {"canEdit": True, "canDelete": True}
 
 
 def test_put_endpoint(client, memory_root, memory_settings):

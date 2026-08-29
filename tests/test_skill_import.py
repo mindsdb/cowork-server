@@ -53,6 +53,49 @@ def test_import_duplicate(svc: SkillService):
         svc.import_skill(VALID, filename="x.md")
 
 
+def test_rename_failure_restores_source_and_preserves_racing_destination(
+    svc: SkillService,
+    monkeypatch,
+):
+    svc.create_skill(
+        "old-skill",
+        "Original instructions",
+        description="Original description",
+    )
+    source_file = svc.root / "old-skill" / "SKILL.md"
+    original_bytes = source_file.read_bytes()
+    destination_bytes: dict[str, bytes] = {}
+
+    def fail_after_destination_appears(old_slug: str, new_slug: str) -> None:
+        assert (old_slug, new_slug) == ("old-skill", "new-skill")
+        svc.create_skill(
+            "new-skill",
+            "Concurrent winner",
+            description="Destination must survive",
+        )
+        destination_bytes["content"] = (
+            svc.root / "new-skill" / "SKILL.md"
+        ).read_bytes()
+        raise OSError("destination appeared before rename")
+
+    monkeypatch.setattr(svc, "_rename_dir", fail_after_destination_appears)
+
+    with pytest.raises(OSError, match="destination appeared"):
+        svc.update_skill(
+            "old-skill",
+            label="new-skill",
+            instructions="Uncommitted replacement",
+        )
+
+    assert source_file.read_bytes() == original_bytes
+    restored = svc.get_skill("old-skill")
+    assert restored.name == "old-skill"
+    assert restored.instructions == "Original instructions"
+    destination_file = svc.root / "new-skill" / "SKILL.md"
+    assert destination_file.read_bytes() == destination_bytes["content"]
+    assert svc.get_skill("new-skill").instructions == "Concurrent winner"
+
+
 def test_import_zip_keeps_sibling_files(svc: SkillService):
     data = _zip({"SKILL.md": VALID, "assets/helper.py": b"print(1)\n"})
     skill = svc.import_skill(data, filename="pack.zip")
@@ -83,4 +126,3 @@ def test_import_zip_path_traversal_rejected(svc: SkillService):
     data = _zip({"SKILL.md": VALID, "../escape.txt": b"evil"})
     with pytest.raises(ValueError):
         svc.import_skill(data, filename="pack.zip")
-

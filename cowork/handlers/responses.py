@@ -773,17 +773,30 @@ class ResponsesHandler:
 
     @staticmethod
     def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
-        """This org's memory slots for the pod. A read error degrades to a turn
-        without memory rather than failing the turn."""
+        """This project's shared memory slots for the pod.
+
+        Personal/global memory is already mounted read-only per (org, user).
+        The pod's writable mount starts at the conversation workspace, so it
+        cannot see the project-level ``.anton/memory`` sibling unless these two
+        slots travel on the wire. A read error degrades to a turn without
+        project memory rather than failing the turn.
+        """
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            return build_turn_memory(session.scope, conversation.project.path)
+            resolved = build_turn_memory(session.scope, conversation.project.path)
+            project = resolved.get("project")
+            return {"project": project} if project else {}
         except Exception:
             logger.exception("[responses] failed to read memory for conversation %s", conv_id)
             return {}
 
     @staticmethod
-    def _persist_turn_memory(session: ScopedSession, conv_id: UUID, entries: list) -> None:
+    def _persist_turn_memory(
+        session: ScopedSession,
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+    ) -> None:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
 
@@ -793,7 +806,37 @@ class ResponsesHandler:
             return
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            applied = apply_turn_memory(session.scope, conversation.project.path, entries)
+            from cowork.models.project import Project
+            from cowork.services.shared_resources import (
+                PROJECT,
+                SharedResourceAccess,
+                project_resource_key,
+            )
+
+            access = SharedResourceAccess(session, principal)
+            project_id = conversation.project_id
+            with access.coordination_lock(
+                PROJECT,
+                project_resource_key(project_id),
+            ):
+                # The turn may have waited behind rename/delete. Re-anchor both
+                # rows while holding the project lock and use only that current
+                # path for the contained memory mutation.
+                conversation = ConversationService(session).get_conversation(conv_id)
+                session.refresh(conversation)
+                if conversation.project_id != project_id:
+                    raise RuntimeError("Conversation project changed during memory write")
+                project = session.get(Project, project_id)
+                if project is None:
+                    raise ValueError("Project not found")
+                session.refresh(project)
+                applied = apply_turn_memory(
+                    session.scope,
+                    project.path,
+                    entries,
+                    access=access,
+                    project_id=project.id,
+                )
             logger.info("[responses] applied %d memory entr(ies) for conversation %s",
                         applied, conv_id)
         except Exception:
@@ -891,8 +934,10 @@ class ResponsesHandler:
                     # Producer session, NOT self.scoped: this coroutine is detached
                     # and the request session may be closed by the time it runs.
                     history=self._remote_history(producer_session, conv_id),
-                    # Skills and memory are NOT sent: the pod reads them off the
-                    # shared mount. Only the org-relative project path travels.
+                    # Global memory and skills use read-only mounts. Project
+                    # memory is outside the conversation workspace and therefore
+                    # travels as a bounded, sheddable wire block.
+                    memory=self._remote_memory(producer_session, conv_id),
                     **self._remote_workspace(producer_session, conv_id),
                     correlation_id=(turn_llm or {}).get("correlation_id"),
                     llm=(turn_llm or {}).get("llm"),
@@ -904,7 +949,12 @@ class ResponsesHandler:
                         for event in step_stream_events(data):
                             yield event
                     elif kind == "turn_memory":
-                        self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                        self._persist_turn_memory(
+                            producer_session,
+                            conv_id,
+                            data.get("entries") or [],
+                            self.principal,
+                        )
                     elif kind == "turn_history":
                         # Slice-assign, not extend: the pod emits one frame per
                         # turn, so a repeated frame must replace the rows rather
@@ -1317,7 +1367,7 @@ class ResponsesHandler:
         if "response.created" in sse_string and "conversation_id" not in sse_string:
             try:
                 lines = sse_string.strip().split("\n")
-                data_line = next(l for l in lines if l.startswith("data:"))
+                data_line = next(line for line in lines if line.startswith("data:"))
                 payload = json.loads(data_line[5:])
                 payload["conversation_id"] = str(conversation_id)
                 if harness_id:

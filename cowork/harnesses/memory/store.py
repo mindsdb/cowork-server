@@ -100,6 +100,25 @@ class MemoryStore:
             # ELOOP): no readable slot content.
             return ""
 
+    def read_checked(self, slot_id: MemorySlot | str) -> tuple[bool, str]:
+        """Return verified existence and content, propagating unsafe/read errors.
+
+        Authorization must distinguish a missing slot from a legacy slot that
+        exists but cannot currently be read. Treating both as empty would let a
+        member claim and overwrite an unreadable shared resource.
+        """
+        name = self._filename(slot_id)
+        try:
+            with self._root_fd(create=False) as root:
+                sfd = dir_open(root, name, os.O_RDONLY | O_NOFOLLOW)
+                # Keep valid legacy newline bytes intact for an exact
+                # compensation snapshot. ``newline=None`` would translate
+                # CRLF to LF before ``restore_exact`` can put it back.
+                with open(sfd, encoding="utf-8", newline="") as f:
+                    return True, f.read()
+        except FileNotFoundError:
+            return False, ""
+
     def write(self, slot_id: MemorySlot | str, content: str) -> None:
         name = self._filename(slot_id)
         with self._root_fd(create=True) as root:
@@ -114,6 +133,35 @@ class MemoryStore:
             )
             with open(sfd, "w", encoding="utf-8") as f:
                 f.write(content.rstrip() + "\n")
+
+    def restore_exact(
+        self,
+        slot_id: MemorySlot | str,
+        content: str | bytes,
+        *,
+        existed: bool,
+    ) -> None:
+        """Restore a pre-mutation snapshot without normalizing its bytes.
+
+        This is intentionally separate from ``write`` and only for failure
+        compensation: normal writes retain Anton's canonical trailing-newline
+        behavior, while rollback must reproduce the exact prior UTF-8 file.
+        The same pinned, no-follow open protects every path component.
+        """
+        if not existed:
+            self.delete(slot_id)
+            return
+        name = self._filename(slot_id)
+        payload = content.encode("utf-8") if isinstance(content, str) else content
+        with self._root_fd(create=True) as root:
+            sfd = dir_open(
+                root,
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
+                0o600,
+            )
+            with open(sfd, "wb") as f:
+                f.write(payload)
 
     def delete(self, slot_id: MemorySlot | str) -> None:
         name = self._filename(slot_id)
