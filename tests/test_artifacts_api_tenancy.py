@@ -245,8 +245,11 @@ async def test_card_has_one_identity_for_draft_and_comments(session, tmp_path, o
     assert card["draftUrl"].startswith(
         f"/api/v1/artifacts/drafts/{row.id}/{artifact_id}/"
     )
+    # GET/listing derives legacy identities in memory and must not mutate the
+    # agent-owned metadata tree. Identity-resolving mutation routes persist the
+    # same deterministic value when they subsequently need it.
     persisted = json.loads((folder / "metadata.json").read_text())
-    assert persisted["id"] == artifact_id
+    assert "id" not in persisted
     assert "stableId" not in persisted
 
 

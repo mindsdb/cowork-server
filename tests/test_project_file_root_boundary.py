@@ -95,22 +95,35 @@ def test_delete_pins_complete_inventory_before_project_name_selection(
         finally:
             closed.append(base)
 
+    def record_child(parent, name):
+        events.append(("child", parent.path, name))
+        return project_files.PinnedDir(None, parent.path / name)
+
     original_basename = project_files.os.path.basename
+    basename_calls = []
 
     def inspect_request(value):
-        assert events == [
-            "catalog",
-            "list",
-            ("ensure", "reports"),
-            ("pin", reports_root),
-            ("ensure", "other"),
-            ("pin", other_root),
-        ]
-        events.append("request")
+        # The first two calls sanitize server-owned directory names while the
+        # inventory is built. The third is the HTTP selector and must not run
+        # until every catalog directory has already been pinned.
+        if len(basename_calls) == 2:
+            assert events == [
+                "catalog",
+                "list",
+                ("ensure", "reports"),
+                ("pin", reports_root.parent),
+                ("child", reports_root.parent, "reports"),
+                ("ensure", "other"),
+                ("pin", other_root.parent),
+                ("child", other_root.parent, "other"),
+            ]
+            events.append("request")
+        basename_calls.append(value)
         return original_basename(value)
 
     monkeypatch.setattr(project_files, "ProjectService", Catalog)
     monkeypatch.setattr(project_files, "pinned_dir", record_pin)
+    monkeypatch.setattr(project_files, "open_pinned_child", record_child)
     monkeypatch.setattr(project_files.os.path, "basename", inspect_request)
 
     result = project_files.delete_project_file(
@@ -120,8 +133,9 @@ def test_delete_pins_complete_inventory_before_project_name_selection(
     )
 
     assert result == {"status": "deleted", "path": "notes.txt"}
-    assert opened == [reports_root, other_root]
-    assert closed == [other_root, reports_root]
+    assert basename_calls == ["reports", "other", "reports"]
+    assert opened == [reports_root.parent, other_root.parent]
+    assert closed == [other_root.parent, reports_root.parent]
     assert not target.exists()
 
 
@@ -193,6 +207,42 @@ def test_delete_refuses_a_symlinked_project_root(tmp_path, monkeypatch):
         project_files.delete_project_file(
             "project",
             project_files._validated_project_path("victim.txt"),
+            SimpleNamespace(scope=LOCAL_SCOPE),
+        )
+
+    assert error.value.status_code == 404
+    assert victim.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows local mode has no O_NOFOLLOW")
+def test_write_refuses_a_symlinked_projects_store(tmp_path, monkeypatch):
+    outside_store = tmp_path / "outside-store"
+    project_root = outside_store / "project"
+    project_root.mkdir(parents=True)
+    victim = project_root / "victim.txt"
+    victim.write_text("keep", encoding="utf-8")
+    linked_store = tmp_path / "linked-store"
+    linked_store.symlink_to(outside_store, target_is_directory=True)
+
+    class Catalog:
+        def __init__(self, _scoped):
+            pass
+
+        def list_projects(self):
+            return [
+                SimpleNamespace(name="project", path=str(linked_store / "project"))
+            ]
+
+        def ensure_dir_exists(self, _project):
+            pass
+
+    monkeypatch.setattr(project_files, "ProjectService", Catalog)
+
+    with pytest.raises(HTTPException) as error:
+        project_files.write_project_file(
+            "project",
+            project_files._validated_project_path("victim.txt"),
+            project_files._FileWriteRequest(content="replace"),
             SimpleNamespace(scope=LOCAL_SCOPE),
         )
 

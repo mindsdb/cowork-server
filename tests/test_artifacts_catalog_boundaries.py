@@ -61,7 +61,7 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
     assert events == ["selector", "basename", "roots", "sink"]
 
 
-async def test_desktop_route_reselects_one_source_by_sanitized_name(monkeypatch):
+async def test_desktop_route_selects_exact_source_from_complete_catalog(monkeypatch):
     other = SimpleNamespace(
         base=Path("/server-owned/other/.anton/artifacts"),
         project_id=None,
@@ -95,9 +95,42 @@ async def test_desktop_route_reselects_one_source_by_sanitized_name(monkeypatch)
     assert cards == []
     assert events == [
         "roots",
-        "roots",
         ("sink", [selected]),
     ]
+
+
+async def test_desktop_route_distinguishes_duplicate_project_basenames(monkeypatch):
+    first = SimpleNamespace(
+        base=Path("/root-a/project/.anton/artifacts"),
+        project_id=None,
+        project_name="project",
+    )
+    selected = SimpleNamespace(
+        base=Path("/root-b/project/.anton/artifacts"),
+        project_id=None,
+        project_name="project",
+    )
+    seen = []
+
+    monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
+    monkeypatch.setattr(
+        artifacts, "artifacts_sources_for_scan", lambda: [first, selected]
+    )
+
+    def list_from_roots(sources):
+        seen.append(sources)
+        return []
+
+    monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
+
+    cards = await artifacts.list_artifacts(
+        SimpleNamespace(),
+        project_id=None,
+        project_path="/root-b/project",
+    )
+
+    assert cards == []
+    assert seen == [[selected]]
 
 
 async def test_desktop_route_rejects_unregistered_path_with_same_basename(

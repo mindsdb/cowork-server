@@ -28,6 +28,7 @@ from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
     dir_lstat,
+    dir_mkdir,
     dir_open,
     dir_scandir,
     dir_unlink,
@@ -252,10 +253,24 @@ def _opened_project_directory_inventory(
                 # directory before attempting to pin the row's stored path.
                 service.ensure_dir_exists(project)
                 path = Path(project.path)
-                if path.is_dir():
-                    directory = resources.enter_context(
-                        pinned_dir(path, nofollow_base=True)
-                    )
+                child_name = os.path.basename(path.name)
+                if (
+                    not child_name
+                    or child_name != path.name
+                    or child_name in {".", ".."}
+                ):
+                    raise ValueError("invalid project directory name")
+
+                # Pin the projects-store directory itself without following a
+                # link, then open the project as its descriptor-relative child.
+                # Opening ``path`` directly with O_NOFOLLOW protects the final
+                # component but still lets a swapped ``path.parent`` redirect
+                # the lookup before that final open.
+                parent = resources.enter_context(
+                    pinned_dir(path.parent, nofollow_base=True)
+                )
+                directory = open_pinned_child(parent, child_name)
+                resources.callback(directory.close)
             except (OSError, TypeError, ValueError):
                 pass
             opened.append((name, directory))
@@ -464,6 +479,69 @@ def _opened_existing_project_entry(
         yield current, _existing_entry_name(current, requested_parts[-1])
 
 
+@contextmanager
+def _opened_pinned_descendant(
+    root: PinnedDir, names: tuple[str, ...], *, create: bool
+) -> Iterator[PinnedDir]:
+    """Descend from an already-pinned project root without rebuilding its Path.
+
+    Every component is reduced to a basename again beside the descriptor-based
+    operation. POSIX resolves it with ``dir_fd`` and ``O_NOFOLLOW``; the local
+    Windows fallback receives the same single-component guarantee.
+    """
+    with ExitStack() as descendants:
+        current = root
+        for raw_name in names:
+            name = os.path.basename(raw_name)
+            if not name or name != raw_name or name in {".", ".."}:
+                raise ValueError("invalid path component")
+            if create:
+                try:
+                    dir_mkdir(current, name)
+                except FileExistsError:
+                    pass
+            current = open_pinned_child(current, name)
+            descendants.callback(current.close)
+        yield current
+
+
+def _write_bytes_at_project_root(
+    root: PinnedDir, path: _ValidatedProjectPath, data: bytes
+) -> os.stat_result:
+    """Write a validated relative path below an already-pinned project root."""
+    dirs = tuple(os.path.basename(part) for part in path.parts[:-1])
+    name = os.path.basename(path.parts[-1])
+    if dirs != path.parts[:-1] or name != path.parts[-1]:
+        raise ValueError("invalid path component")
+
+    with _opened_pinned_descendant(root, dirs, create=True) as parent:
+        try:
+            existing = dir_lstat(parent, name)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode):
+                raise HTTPException(status_code=404, detail="File not found")
+            if stat.S_ISDIR(existing.st_mode):
+                raise HTTPException(status_code=400, detail="Path is a directory")
+        fd = dir_open(
+            parent,
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
+            0o644,
+        )
+        try:
+            remaining = memoryview(data)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written == 0:
+                    raise OSError("project file write made no progress")
+                remaining = remaining[written:]
+            return os.fstat(fd)
+        finally:
+            os.close(fd)
+
+
 def _pinned_stream(target: Path, base: Path, *, media_type: str, headers: dict) -> StreamingResponse:
     """Serve `target` from a pinned descriptor.
 
@@ -565,49 +643,37 @@ def write_project_file(
     req: _FileWriteRequest,
     scoped: ScopedSessionDep,
 ):
-    # Keep the recognized sanitizer on both path-bearing HTTP parameters at the
-    # decorated route boundary. ``_project_dir`` repeats the validation for its
-    # other callers and resolves this leaf only through the scoped catalog.
-    selected_project_name = os.path.basename(project_name)
-    if selected_project_name != project_name:
-        raise HTTPException(status_code=404, detail="Project not found")
-    base = _project_dir(selected_project_name, scoped)
     _require_workspace_path(path, scoped)
     body = req.content or ""
     encoded = body.encode("utf-8")
     if len(encoded) > TEXT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content exceeds 2 MiB cap")
-    # Pinned like the read: without it a link planted under the caller's own
-    # workspace between the gate and the open lands this write in another
-    # member's directory, and `.anton/anton.md` there is an instruction file
-    # their agent reads.
-    # Re-sanitize at the filesystem boundary.  The dependency has already
-    # rejected traversal, absolute paths, empty components and drive prefixes;
-    # doing this beside the sink makes the guarantee explicit even to analyzers
-    # which do not model FastAPI dependency return types.
-    dirs = tuple(os.path.basename(part) for part in path.parts[:-1])
-    name = os.path.basename(path.parts[-1])
-    if dirs != path.parts[:-1] or name != path.parts[-1]:
-        raise HTTPException(status_code=400, detail="invalid path")
     try:
-        with opened_subdir_nofollow(base, *dirs, create=True) as pinned:
-            try:
-                existing = dir_lstat(pinned, name)
-            except FileNotFoundError:
-                existing = None
-            if existing is not None:
-                if stat.S_ISLNK(existing.st_mode):
-                    raise HTTPException(status_code=404, detail="File not found")
-                if stat.S_ISDIR(existing.st_mode):
-                    raise HTTPException(status_code=400, detail="Path is a directory")
-            fd = dir_open(
-                pinned, name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW, 0o644
-            )
-            try:
-                os.write(fd, encoded)
-                st = os.fstat(fd)
-            finally:
-                os.close(fd)
+        # Project roots are constructed and pinned solely from scoped database
+        # rows. The HTTP name can only choose an existing handle, so no selected
+        # value ever reaches ``Path(base)`` or an absolute-path reopen.
+        with _opened_project_directory_inventory(scoped) as inventory:
+            selected_project_name = os.path.basename(project_name)
+            if (
+                not selected_project_name
+                or selected_project_name != project_name
+                or selected_project_name in {".", ".."}
+                or "\\" in selected_project_name
+                or "\x00" in selected_project_name
+            ):
+                raise HTTPException(status_code=404, detail="Project not found")
+            for server_name, directory in inventory:
+                if not secrets.compare_digest(server_name, selected_project_name):
+                    continue
+                if directory is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Project directory not found on disk",
+                    )
+                st = _write_bytes_at_project_root(directory, path, encoded)
+                break
+            else:
+                raise HTTPException(status_code=404, detail="Project not found")
     except (OSError, ValueError):
         raise HTTPException(status_code=404, detail="File not found")
     return {"path": path.value, "size": st.st_size, "modified": st.st_mtime}
@@ -619,24 +685,51 @@ async def upload_project_files(
     scoped: ScopedSessionDep,
     files: list[UploadFile] = File(...),
 ):
-    base = _project_dir(project_name, scoped)
     results: list[dict[str, Any]] = []
-    for f in files:
-        if not f.filename:
-            results.append({"name": "", "ok": False, "error": "filename missing"})
-            continue
-        safe_name = os.path.basename(f.filename).strip()
-        if not safe_name or safe_name.startswith("."):
-            results.append({"name": f.filename, "ok": False, "error": "invalid filename"})
-            continue
-        target = base / safe_name
-        try:
-            data = await f.read()
-            target.write_bytes(data)
-            results.append({"name": safe_name, "ok": True, "size": len(data)})
-        except Exception as exc:
-            logger.error("Failed to write file %s: %s", safe_name, exc)
-            results.append({"name": safe_name, "ok": False, "error": "File write failed"})
+    with _opened_project_directory_inventory(scoped) as inventory:
+        selected_project_name = os.path.basename(project_name)
+        if (
+            not selected_project_name
+            or selected_project_name != project_name
+            or selected_project_name in {".", ".."}
+            or "\\" in selected_project_name
+            or "\x00" in selected_project_name
+        ):
+            raise HTTPException(status_code=404, detail="Project not found")
+        directory = next(
+            (
+                opened
+                for server_name, opened in inventory
+                if secrets.compare_digest(server_name, selected_project_name)
+            ),
+            None,
+        )
+        if directory is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        for f in files:
+            if not f.filename:
+                results.append(
+                    {"name": "", "ok": False, "error": "filename missing"}
+                )
+                continue
+            safe_name = os.path.basename(f.filename).strip()
+            if not safe_name or safe_name.startswith("."):
+                results.append(
+                    {"name": f.filename, "ok": False, "error": "invalid filename"}
+                )
+                continue
+            try:
+                data = await f.read()
+                _write_bytes_at_project_root(
+                    directory, _ValidatedProjectPath((safe_name,)), data
+                )
+                results.append({"name": safe_name, "ok": True, "size": len(data)})
+            except Exception as exc:
+                logger.error("Failed to write file %s: %s", safe_name, exc)
+                results.append(
+                    {"name": safe_name, "ok": False, "error": "File write failed"}
+                )
     return {"results": results}
 
 
