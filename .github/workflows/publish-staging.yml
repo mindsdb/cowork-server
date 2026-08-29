@@ -20,7 +20,11 @@ name: Staging pre-release and publish to PyPI
 
 on:
   push:
-    branches: [staging]
+    branches:
+      - staging
+      # TEMPORARY: manual staging smoke-test for the org comments-proxy 401 fix.
+      # Revert this entry before merging that PR.
+      - artifact-collaboration-workflow-2
   workflow_dispatch:
 
 concurrency:
@@ -149,7 +153,11 @@ jobs:
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
     needs: [unit-tests, build-deploy, release, publish]
-    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    # TEMPORARY: no eng-channel alerts for the smoke-test branch above. `release`
+    # and `publish` are staging-only, so off staging the aggregate is all-skipped
+    # and this would post a "recovered" message on every push. Revert alongside
+    # the `on.push.branches` entry.
+    if: ${{ github.ref_name != 'artifact-collaboration-workflow-2' && !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
       actions: read  # the prior-run lookup behind the recovery message
