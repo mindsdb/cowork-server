@@ -84,7 +84,9 @@ jobs:
       # the same replica. Everything else goes through the ingress, which is
       # also what authenticates the Bearer key.
       #
-      # One pod is a valid deployment, so that test skips rather than fails.
+      # One pod is a valid deployment where nobody promised two, so the test
+      # skips rather than fails there. In a namespace this runner deploys to,
+      # the deploy job just rolled two, so a skip is a failure.
       - name: Port-forward two pods for the cross-replica test
         env:
           DEPLOY_ENV: ${{ inputs.deploy-env }}
@@ -93,6 +95,18 @@ jobs:
           # PR envs and permanent envs both deploy into a namespace named
           # after the env.
           ns="$DEPLOY_ENV"
+          # Which namespaces make a missing replica or a dead port-forward a
+          # real defect rather than a known gap in the environment. This job
+          # always runs on mdb-dev, so the only namespaces it reaches are
+          # newdev's, and `<env>-gha-runner-deploy` carries both `pods list` and
+          # `create pods/portforward` in them. `prod` is on newprod and lists
+          # nothing from here. A `pr-*` namespace is served by
+          # `<env>-gha-runner-prenv`, which is read-only by design. Neither gap
+          # is about the change being shipped, so neither goes red.
+          case "$ns" in
+            dev|staging) enforce=true ;;
+            *)           enforce=false ;;
+          esac
           # Selected by name rather than by label: the chart comes from an
           # external `deployment` dependency, so its label scheme is not ours to
           # rely on. Deployment pods are always <deployment>-<hash>-<suffix>.
@@ -107,11 +121,18 @@ jobs:
             # the job is pinned to mdb-dev, so on the prod release path it lists
             # nothing and has never exercised the cross-replica behaviour.
             if [[ "${#pods[@]}" -eq 0 ]]; then
-              echo "::warning::No cowork-server pods visible in $ns from this runner." \
-                   "The cross-replica test did NOT run. A green job here says nothing about it."
+              detail="No cowork-server pods visible in $ns from this runner."
             else
-              echo "::warning::Only 1 cowork-server pod in $ns; the cross-replica test did NOT run."
+              detail="Only 1 cowork-server pod in $ns."
             fi
+            if [[ "$enforce" == true ]]; then
+              # The deploy job just rolled two replicas into this namespace and
+              # this runner can read it, so seeing fewer is a real failure.
+              echo "::error::$detail The cross-replica test did NOT run."
+              exit 1
+            fi
+            echo "::warning::$detail The cross-replica test did NOT run." \
+                 "A green job here says nothing about it."
             exit 0
           fi
           # 9010 is the port uvicorn binds (see the chart's args). Reached
@@ -142,8 +163,8 @@ jobs:
           # does not carry that verb, so the test skips there and the skip is
           # said out loud rather than passing quietly.
           echo "::warning::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
-          if [[ "$ns" == pr-* ]]; then
-            echo "::warning::The cross-replica test did NOT run. A PR environment cannot port-forward:" \
+          if [[ "$enforce" != true ]]; then
+            echo "::warning::The cross-replica test did NOT run. $ns cannot port-forward:" \
                  "the runner is read-only there by design."
             exit 0
           fi
