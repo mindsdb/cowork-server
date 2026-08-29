@@ -1,10 +1,16 @@
 """Proxy artifact-comment REST + SSE from the renderer to the inference backend.
 
-The renderer holds no bearer token, so it calls these cowork-server routes and the
-server attaches the user's MindsHub credential (the same Minds API key publish uses;
-auth's /v1/authenticate/ maps an mdb_ key to X-User-Id = the Keycloak sub). Targets
-inference's auth-gated `/v1/artifact-comments/*` prefix (cowork ≠ browser viewer, no
-vet_). SSE is streamed straight through (httpx stream -> StreamingResponse).
+Targets inference's auth-gated `/v1/artifact-comments/*` prefix (cowork ≠ browser
+viewer, so no vet_ token). SSE is streamed straight through (httpx stream ->
+StreamingResponse).
+
+Which credential goes upstream depends on tenancy, and the two answers have
+nothing in common. On desktop the renderer holds no bearer, so the server attaches
+the user's stored MindsHub credential (the same Minds API key publish uses; auth's
+/v1/authenticate/ maps an mdb_ key to X-User-Id = the Keycloak sub). In an org
+deployment those settings do not exist, and the renderer DOES hold a bearer — the
+one the ingress just validated — so the server forwards that instead. See
+resolve_comments_upstream.
 """
 
 from __future__ import annotations
@@ -149,12 +155,34 @@ def _forward_headers(api_key: str) -> dict[str, str]:
     return headers
 
 
+def _upstream_or_refusal(request: Request) -> tuple[str, str] | Response:
+    """The upstream to call, or the response to answer with instead.
+
+    Both forwarders need the same two refusals, and the org one has to happen
+    BEFORE the request goes out: an upstream call carrying no Authorization comes
+    back as the gateway's own 401 page, which the renderer shows as "Session
+    expired" — a wrong and unactionable message for a server-side gap.
+
+    Desktop keeps its old shape, empty key included. There the credential is a
+    user setting that may legitimately be unset, and the request has always gone
+    out anyway.
+    """
+    base, credential = resolve_comments_upstream(request)
+    if not base:
+        return PlainTextResponse("inference endpoint not configured", status_code=503)
+    if _org_mode() and not credential:
+        logger.warning("comments proxy: org request carries no caller credential")
+        return PlainTextResponse("missing caller credential", status_code=401)
+    return base, credential
+
+
 async def forward_comments_rest(
     request: Request, user_dir: str, report_id: str, subpath: str
 ) -> Response:
-    base, api_key = resolve_inference_endpoint()
-    if not base:
-        return PlainTextResponse("inference endpoint not configured", status_code=503)
+    upstream = _upstream_or_refusal(request)
+    if isinstance(upstream, Response):
+        return upstream
+    base, api_key = upstream
     client = get_proxy_client()
     body = await request.body()
     try:
@@ -180,9 +208,10 @@ async def forward_comments_rest(
 async def forward_comments_stream(
     request: Request, user_dir: str, report_id: str
 ) -> Response:
-    base, api_key = resolve_inference_endpoint()
-    if not base:
-        return PlainTextResponse("inference endpoint not configured", status_code=503)
+    upstream = _upstream_or_refusal(request)
+    if isinstance(upstream, Response):
+        return upstream
+    base, api_key = upstream
     client = get_proxy_client()
     try:
         url = _upstream_url(base, user_dir, report_id, "stream", request.url.query)
