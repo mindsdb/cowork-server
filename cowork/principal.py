@@ -37,6 +37,8 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp
 
+from cowork.common.settings.app_settings import get_app_settings
+
 logger = logging.getLogger(__name__)
 
 # Keep in sync with auth-service and mindshub_inference (minds/common/constants.py).
@@ -160,8 +162,6 @@ def hub_credential(request: Request | None) -> str:
     explicit = request.headers.get(HEADER_HUB_CREDENTIAL, "")
     if explicit.lower().startswith("bearer "):
         return explicit[7:].strip()
-    from cowork.common.settings.app_settings import get_app_settings
-
     if get_app_settings().tenancy_mode != "org":
         return ""
     return caller_bearer(request)
