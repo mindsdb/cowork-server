@@ -102,7 +102,10 @@ jobs:
           # `create pods/portforward` in them. `prod` is on newprod and lists
           # nothing from here. A `pr-*` namespace is served by
           # `<env>-gha-runner-prenv`, which is read-only by design. Neither gap
-          # is about the change being shipped, so neither goes red.
+          # is about the change being shipped, so neither goes red. A PR
+          # environment also runs one replica, pinned by argocd-envs in
+          # parent/templates/cowork-server-app.yaml, so it lands in the one-pod
+          # branch below rather than the port-forward one.
           case "$ns" in
             dev|staging) enforce=true ;;
             *)           enforce=false ;;
@@ -157,11 +160,13 @@ jobs:
           # behaviour is fine". So fail where the port-forward is supposed to
           # work, and warn where it is known not to.
           #
-          # It works in the deploy namespaces, where `<env>-gha-runner-deploy`
-          # holds `create pods/portforward`. It does not work in a PR
-          # environment: `<env>-gha-runner-prenv` is read-only on purpose and
-          # does not carry that verb, so the test skips there and the skip is
-          # said out loud rather than passing quietly.
+          # Reaching here means two pods were listed, so in practice only a
+          # deploy namespace gets this far: a PR environment runs one replica and
+          # `prod` lists nothing from a runner pinned to mdb-dev. The guard below
+          # is there for the day one of those changes, and it is right on its own
+          # terms, because `<env>-gha-runner-prenv` is read-only and does not
+          # carry `create pods/portforward`, so a PR environment with two pods
+          # still could not forward to them.
           echo "::warning::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
           if [[ "$enforce" != true ]]; then
             echo "::warning::The cross-replica test did NOT run. $ns cannot port-forward:" \
