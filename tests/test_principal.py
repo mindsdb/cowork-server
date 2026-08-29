@@ -23,10 +23,18 @@ WEBHOOK = "/api/v1/channels/slack/events"
 
 USER_ID = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 ORG_ID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+OTHER_ORG_ID = "4e27728a-a002-48b5-8961-0e1ca339d13f"
 IDENTITY = {"X-User-Id": USER_ID, "X-Organization-Id": ORG_ID}
+EXPECTED_ORG_HEADER = "X-Cowork-Expected-Organization-Id"
+RELOAD_HEADER = "X-Cowork-Organization-Reload"
+JWT = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyIn0.signature"
 
 
-def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
+def _app(
+    org_mode: bool = True,
+    enforce: bool = True,
+    organization_boundary_mode: str | None = "enforce",
+) -> FastAPI:
     app = FastAPI()
 
     @app.get("/api/v1/health")
@@ -51,7 +59,15 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
     # Mirror create_app's ordering: principal added first (inner), CORS last
     # (outer) so a 401 still flows back out through CORS.
     if org_mode:
-        app.add_middleware(TrustedHeaderMiddleware, exempt_paths={WEBHOOK}, enforce=enforce)
+        options = {}
+        if organization_boundary_mode is not None:
+            options["organization_boundary_mode"] = organization_boundary_mode
+        app.add_middleware(
+            TrustedHeaderMiddleware,
+            exempt_paths={WEBHOOK},
+            enforce=enforce,
+            **options,
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[ORIGIN],
@@ -62,8 +78,19 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
     return app
 
 
-def _client(org_mode: bool = True, enforce: bool = True) -> TestClient:
-    return TestClient(_app(org_mode, enforce))
+def _client(
+    org_mode: bool = True,
+    enforce: bool = True,
+    organization_boundary_mode: str | None = "enforce",
+) -> TestClient:
+    return TestClient(_app(org_mode, enforce, organization_boundary_mode))
+
+
+def _browser_headers(expected_org_id: str | None = ORG_ID) -> dict[str, str]:
+    headers = {**IDENTITY, "Authorization": f"Bearer {JWT}"}
+    if expected_org_id is not None:
+        headers[EXPECTED_ORG_HEADER] = expected_org_id
+    return headers
 
 
 def test_missing_identity_is_401():
@@ -246,6 +273,194 @@ def test_audit_mode_still_builds_principal_when_identity_present():
     assert res.status_code == 200
     assert res.json()["user_id"] == USER_ID
     assert res.json()["org_id"] == ORG_ID
+
+
+def test_browser_jwt_expected_organization_exact_match_is_allowed():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami", headers=_browser_headers()
+    )
+
+    assert res.status_code == 200
+    assert res.json()["org_id"] == ORG_ID
+
+
+def test_browser_jwt_expected_organization_is_uuid_normalized():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami", headers=_browser_headers(ORG_ID.upper())
+    )
+
+    assert res.status_code == 200
+    assert res.json()["org_id"] == ORG_ID
+
+
+def test_organization_boundary_audits_missing_header_and_allows(caplog):
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        res = _client(organization_boundary_mode="audit").get(
+            "/api/v1/whoami", headers=_browser_headers(None)
+        )
+
+    assert res.status_code == 200
+    assert any(
+        "organization" in record.getMessage().lower()
+        and "missing" in record.getMessage().lower()
+        and "/api/v1/whoami" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_organization_boundary_audits_malformed_header_and_allows(caplog):
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        res = _client(organization_boundary_mode="audit").get(
+            "/api/v1/whoami", headers=_browser_headers("not-an-organization")
+        )
+
+    assert res.status_code == 200
+    assert any(
+        "organization" in record.getMessage().lower()
+        and "malformed" in record.getMessage().lower()
+        and "/api/v1/whoami" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_organization_boundary_audits_mismatch_and_allows(caplog):
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        res = _client(organization_boundary_mode="audit").get(
+            "/api/v1/whoami", headers=_browser_headers(OTHER_ORG_ID)
+        )
+
+    assert res.status_code == 200
+    assert any(
+        "organization" in record.getMessage().lower()
+        and "mismatch" in record.getMessage().lower()
+        and "/api/v1/whoami" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def _assert_organization_boundary_rejection(response, status_code: int) -> None:
+    assert response.status_code == status_code
+    assert response.json() == {
+        "code": "organization_reload_required",
+        "detail": "Reload Cowork to continue in the active organization.",
+    }
+    assert response.headers.get(RELOAD_HEADER) == "required"
+    assert response.headers.get("cache-control") == "no-store"
+    assert response.headers.get("access-control-allow-origin") == ORIGIN
+
+
+def test_organization_boundary_enforce_requires_browser_header():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={**_browser_headers(None), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 426)
+
+
+def test_organization_boundary_defaults_to_enforce():
+    res = _client(organization_boundary_mode=None).get(
+        "/api/v1/whoami",
+        headers={**_browser_headers(None), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 426)
+
+
+def test_organization_boundary_enforce_rejects_malformed_browser_header():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={**_browser_headers("not-an-organization"), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 409)
+
+
+def test_organization_boundary_enforce_rejects_browser_org_mismatch():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={**_browser_headers(OTHER_ORG_ID), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 409)
+
+
+def test_api_key_is_exempt_from_organization_boundary():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": "Bearer mdb_organization_api_key",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
+def test_opaque_bearer_is_exempt_from_organization_boundary():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": "Bearer opaque-token",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
+def test_short_three_part_bearer_is_exempt_from_organization_boundary():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": "Bearer opaque.service.token",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
+def test_missing_bearer_is_exempt_from_organization_boundary():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/whoami",
+        headers={**IDENTITY, EXPECTED_ORG_HEADER: OTHER_ORG_ID},
+    )
+
+    assert res.status_code == 200
+
+
+def test_health_is_exempt_from_organization_boundary():
+    res = _client(organization_boundary_mode="enforce").get(
+        "/api/v1/health", headers=_browser_headers(OTHER_ORG_ID)
+    )
+
+    assert res.status_code == 200
+
+
+def test_channel_webhook_is_exempt_from_organization_boundary():
+    res = _client(organization_boundary_mode="enforce").post(
+        WEBHOOK, headers=_browser_headers(OTHER_ORG_ID)
+    )
+
+    assert res.status_code == 200
+
+
+def test_options_is_exempt_from_organization_boundary():
+    res = _client(organization_boundary_mode="enforce").options(
+        "/api/v1/whoami",
+        headers={
+            "Origin": ORIGIN,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": EXPECTED_ORG_HEADER,
+        },
+    )
+
+    assert res.status_code in (200, 204)
+    assert res.headers.get("access-control-allow-origin") == ORIGIN
 
 
 def test_identity_trace_metadata_without_principal_is_passthrough():
