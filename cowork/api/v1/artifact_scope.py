@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -41,6 +42,10 @@ def artifact_sources_for_request(
             detail="project_path is not accepted in org deployments; use project_id",
         )
     if project_id is not None:
+        # Even a typed FastAPI UUID originates at the request boundary. Recover
+        # the equal UUID object from the scoped project catalog before any root
+        # discovery so downstream paths depend only on server-owned records.
+        project_id = scoped_project_id_for_request(session, str(project_id))
         try:
             return artifacts_sources_for_project(session, project_id)
         except ValueError as exc:
@@ -58,6 +63,40 @@ def artifact_sources_for_request(
     return sources
 
 
+def scoped_project_id_for_request(session: ScopedSession, project_ref: str) -> UUID:
+    """Recover a request-selected project id from the scoped server catalog.
+
+    Callers that will discover filesystem roots must use the returned database
+    value, not the request spelling.  The client value is parsed and compared
+    in memory only, so it cannot flow into path construction even though both
+    values represent the same UUID.
+    """
+    try:
+        wanted_project_id = UUID(project_ref).hex
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid project",
+        ) from exc
+
+    from cowork.services.projects import ProjectService
+
+    project_id = next(
+        (
+            project.id
+            for project in ProjectService(session).list_projects()
+            if secrets.compare_digest(project.id.hex, wanted_project_id)
+        ),
+        None,
+    )
+    if project_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Unknown project",
+        )
+    return project_id
+
+
 def _sources_for_project_ref(
     session: ScopedSession, project_ref: str, *, include_other_members: bool = False
 ):
@@ -65,19 +104,24 @@ def _sources_for_project_ref(
         if _org_mode():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
         return artifacts_sources_for_scan()
+    # Recover the project id from a tenant-scoped database row before artifact
+    # root discovery.  The request value is used only for an in-memory equality
+    # check; the UUID passed into the filesystem-facing source resolver is the
+    # value the server loaded from its own database.
+    project_id = scoped_project_id_for_request(session, project_ref)
     try:
-        project_id = UUID(project_ref)
+        return artifacts_sources_for_project(
+            session,
+            project_id,
+            include_other_members=include_other_members,
+        )
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project") from exc
-    if include_other_members:
-        try:
-            return artifacts_sources_for_project(session, project_id, include_other_members=True)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Unknown project",
-            ) from exc
-    return artifact_sources_for_request(session, project_id, None)
+        # The row can disappear between the scoped inventory and the second
+        # scoped read performed by artifact root discovery.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Unknown project",
+        ) from exc
 
 
 def _resolve_in(sources, artifact_id: str):

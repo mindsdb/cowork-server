@@ -21,7 +21,6 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
-from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts as ep
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.services import artifacts as ep_artifacts
@@ -246,8 +245,11 @@ async def test_card_has_one_identity_for_draft_and_comments(session, tmp_path, o
     assert card["draftUrl"].startswith(
         f"/api/v1/artifacts/drafts/{row.id}/{artifact_id}/"
     )
+    # GET/listing derives legacy identities in memory and must not mutate the
+    # agent-owned metadata tree. Identity-resolving mutation routes persist the
+    # same deterministic value when they subsequently need it.
     persisted = json.loads((folder / "metadata.json").read_text())
-    assert persisted["id"] == artifact_id
+    assert "id" not in persisted
     assert "stableId" not in persisted
 
 
@@ -636,6 +638,23 @@ def test_desktop_only_endpoints_are_reachable_in_local_mode(local_mode):
 
 # ── desktop project_path filter ────────────────────────────────────────────
 
+async def test_desktop_project_id_filter_keeps_project_addressed_cards(
+    session, tmp_path, local_mode
+):
+    row, _folder = _project_with_artifact(
+        session, tmp_path, name="mine", org_id=None, slug="dash"
+    )
+
+    card = ep.artifacts_for_request(
+        ScopedSession(session, LOCAL_SCOPE), project_id=row.id
+    )[0]
+
+    assert card["projectId"] == str(row.id)
+    assert card["draftUrl"].startswith(
+        f"/api/v1/artifacts/drafts/{row.id}/"
+    )
+
+
 async def test_desktop_project_path_narrows_to_that_project(
     session, tmp_path, local_mode, monkeypatch
 ):
@@ -650,7 +669,7 @@ async def test_desktop_project_path_narrows_to_that_project(
     mine_project_dir = mine.parent.parent.parent
 
     monkeypatch.setattr(
-        artifact_scope, "artifacts_sources_for_scan",
+        ep, "artifacts_sources_for_scan",
         lambda: [
             ep_artifacts.ProjectArtifacts(
                 base=p / ".anton" / "artifacts", project_id=None, project_name=p.name,
@@ -671,7 +690,7 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
 ):
     _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="dash")
     monkeypatch.setattr(
-        artifact_scope, "artifacts_sources_for_scan",
+        ep, "artifacts_sources_for_scan",
         lambda: [
             ep_artifacts.ProjectArtifacts(
                 base=(tmp_path / "local" / "mine") / ".anton" / "artifacts",

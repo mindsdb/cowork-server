@@ -461,16 +461,15 @@ def _published_url_for(
     return ""
 
 
-def _is_modified(
+def _modified_state(
     folder: Path,
     primary: Path | None,
     content_mtime: int,
     *,
     artifacts_base: Path | None = None,
-    published_map: dict | None = None,
-    pinned_folder: PinnedDir | None = None,
-) -> bool:
-    """Whether a *published* artifact's content diverged from what was published.
+    published_map: dict,
+) -> tuple[bool, bool]:
+    """Return ``(modified, should_heal_mtime)`` without writing anything.
 
     Hybrid mtime→md5 (see the 2026-06-23 design):
       1. Not published → not modified.
@@ -483,17 +482,16 @@ def _is_modified(
     so the badge never appears on a false positive.
     """
     if primary is None:
-        return False
-    pmap = published_map if published_map is not None else _load_published_map(folder)
-    entry = pmap.get(primary.name)
+        return False, False
+    entry = published_map.get(primary.name)
     if not isinstance(entry, dict) or not entry.get("published", True):
-        return False
+        return False, False
     if not entry.get("report_id"):
-        return False
+        return False, False
 
     published_mtime = entry.get("published_mtime")
     if isinstance(published_mtime, (int, float)) and content_mtime <= published_mtime:
-        return False  # cheap gate — nothing touched since publish
+        return False, False  # cheap gate — nothing touched since publish
 
     # Local import: publish imports this module, so import lazily to avoid a
     # circular import (mirrors _unpublish_folder below).
@@ -506,12 +504,55 @@ def _is_modified(
         folder, artifacts_base=artifacts_base or folder.parent
     )
     if current_md5 is None:
-        return False  # can't tell — don't raise a false "modified"
+        return False, False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):
-        return True
+        return True, False
+    return False, True
+
+
+def _is_modified_read_only(
+    folder: Path,
+    primary: Path | None,
+    content_mtime: int,
+    *,
+    artifacts_base: Path | None,
+    published_map: dict,
+) -> bool:
+    """Read-only modified badge calculation used exclusively by listing."""
+    modified, _should_heal = _modified_state(
+        folder,
+        primary,
+        content_mtime,
+        artifacts_base=artifacts_base,
+        published_map=published_map,
+    )
+    return modified
+
+
+def _is_modified(
+    folder: Path,
+    primary: Path | None,
+    content_mtime: int,
+    *,
+    artifacts_base: Path | None = None,
+    published_map: dict | None = None,
+    pinned_folder: PinnedDir | None = None,
+) -> bool:
+    """Modified badge calculation with the historical mtime self-heal."""
+    pmap = published_map if published_map is not None else _load_published_map(folder)
+    modified, should_heal = _modified_state(
+        folder,
+        primary,
+        content_mtime,
+        artifacts_base=artifacts_base,
+        published_map=pmap,
+    )
+    if modified or not should_heal or primary is None:
+        return modified
 
     # Content identical despite the bumped mtime — heal the snapshot so we
     # don't re-zip on every future listing. Best-effort.
+    entry = pmap[primary.name]
     entry["published_mtime"] = content_mtime
     pmap[primary.name] = entry
     if pinned_folder is not None:
@@ -990,54 +1031,42 @@ def reveal_in_file_manager(path: Path) -> None:
 
 # ─── Public API ───────────────────────────────────────────────────
 
-def card_for_folder(
+
+@dataclass(frozen=True)
+class _PreparedArtifactCard:
+    """Pure card result plus the inputs needed for its modified badge."""
+
+    card: dict
+    io_folder: Path
+    io_root: Path | None
+    primary: Path | None
+    mtime_seconds: int
+
+
+def _prepare_artifact_card(
     folder: Path,
     idx: int = 0,
     *,
-    project_id: str | None = None,
-    project_name: str = "",
-    _pinned_folder: PinnedDir | None = None,
-    _pinned_root: PinnedDir | None = None,
-) -> dict | None:
-    """The artifact card for a single folder, or ``None`` if its metadata is
-    unreadable. This is the canonical card shape — used both by the artifacts
-    list and by the inline chat cards (see services.task_objects), so the two
-    can never disagree about how an artifact is named, typed, or opened.
-
-    `idx` only selects a background gradient (cosmetic).
-
-    `project_id`/`project_name` identify the owning project. The client needs
-    them to address an artifact by project + slug: in an org deployment the
-    artifacts list spans every project of the organization, so a card cannot be
-    tied to a project by inspecting its path."""
+    artifact_id: str,
+    meta: dict,
+    published_map: dict,
+    project_id: str | None,
+    project_name: str,
+    pinned_folder: PinnedDir | None,
+    pinned_root: PinnedDir | None,
+) -> _PreparedArtifactCard | None:
+    """Assemble the shared card shape without any filesystem mutation."""
     logical_folder = folder
-    io_folder = _pinned_directory_path(_pinned_folder) if _pinned_folder else folder
-    io_root = _pinned_directory_path(_pinned_root) if _pinned_root else None
-    if io_folder is None or (_pinned_root is not None and io_root is None):
-        return None
-    from cowork.services.artifact_identity import artifact_key, ensure_full_id
-
-    try:
-        if _pinned_folder is not None:
-            artifact_id, meta = ensure_full_id(
-                logical_folder, _pinned=_pinned_folder
-            )
-            published_map = _load_published_map_pinned(_pinned_folder)
-        else:
-            meta = _load_metadata(folder)
-            if meta is None:
-                return None
-            artifact_id, meta = ensure_full_id(folder, meta)
-            published_map = _load_published_map(folder)
-    except (OSError, ValueError):
-        logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
+    io_folder = _pinned_directory_path(pinned_folder) if pinned_folder else folder
+    io_root = _pinned_directory_path(pinned_root) if pinned_root else None
+    if io_folder is None or (pinned_root is not None and io_root is None):
         return None
     files = _user_files(io_folder)
     primary = _pick_primary(
         io_folder,
         files,
         primary_hint=meta.get("primary"),
-        preserve_folder_path=_pinned_folder is not None,
+        preserve_folder_path=pinned_folder is not None,
     )
     logical_primary = None
     if primary is not None:
@@ -1098,14 +1127,9 @@ def card_for_folder(
         "publishedUrl": _published_url_for(
             io_folder, primary, published_map=published_map
         ),
-        "modified": _is_modified(
-            io_folder,
-            primary,
-            mtime_seconds,
-            artifacts_base=io_root,
-            published_map=published_map,
-            pinned_folder=_pinned_folder,
-        ),
+        # Filled by one of the two callers below. Keeping the slot here preserves
+        # the canonical response shape and key order.
+        "modified": False,
         # Owner-side access state (lock badge + eye-reveal). accessPassword
         # is the plaintext, returned only to the owner's own session.
         **_published_access_for(
@@ -1113,6 +1137,8 @@ def card_for_folder(
         ),
         "serveUrl": serve_url_for(primary_path),
     }
+    from cowork.services.artifact_identity import artifact_key
+
     # Drafts and every published version share this key. A legacy
     # `.published.json` key is intentionally overridden here so comments do not
     # fork when an artifact is re-published under a different report URL.
@@ -1147,7 +1173,110 @@ def card_for_folder(
         # from it.
         card.pop("accessPassword", None)
         card.pop("accessEmails", None)
-    return card
+    return _PreparedArtifactCard(
+        card=card,
+        io_folder=io_folder,
+        io_root=io_root,
+        primary=primary,
+        mtime_seconds=mtime_seconds,
+    )
+
+
+def card_for_folder(
+    folder: Path,
+    idx: int = 0,
+    *,
+    project_id: str | None = None,
+    project_name: str = "",
+    _pinned_folder: PinnedDir | None = None,
+    _pinned_root: PinnedDir | None = None,
+) -> dict | None:
+    """Build one card, retaining legacy metadata and publish-map self-heals.
+
+    Inline chat cards and status refreshes historically migrate legacy ids and
+    heal stale publish mtimes. HTTP artifact listing uses the separate pinned,
+    read-only entry point below; both share only the mutation-free assembler.
+    """
+    from cowork.services.artifact_identity import ensure_full_id
+
+    try:
+        if _pinned_folder is not None:
+            artifact_id, meta = ensure_full_id(folder, _pinned=_pinned_folder)
+            published_map = _load_published_map_pinned(_pinned_folder)
+        else:
+            meta = _load_metadata(folder)
+            if meta is None:
+                return None
+            artifact_id, meta = ensure_full_id(folder, meta)
+            published_map = _load_published_map(folder)
+    except (OSError, ValueError):
+        logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
+        return None
+
+    prepared = _prepare_artifact_card(
+        folder,
+        idx,
+        artifact_id=artifact_id,
+        meta=meta,
+        published_map=published_map,
+        project_id=project_id,
+        project_name=project_name,
+        pinned_folder=_pinned_folder,
+        pinned_root=_pinned_root,
+    )
+    if prepared is None:
+        return None
+    prepared.card["modified"] = _is_modified(
+        prepared.io_folder,
+        prepared.primary,
+        prepared.mtime_seconds,
+        artifacts_base=prepared.io_root,
+        published_map=published_map,
+        pinned_folder=_pinned_folder,
+    )
+    return prepared.card
+
+
+def _listed_card_for_pinned_folder(
+    folder: Path,
+    idx: int,
+    *,
+    project_id: str | None,
+    project_name: str,
+    pinned_folder: PinnedDir,
+    pinned_root: PinnedDir,
+) -> dict | None:
+    """Build one list card through a call graph containing no artifact writes."""
+    from cowork.services.artifact_identity import read_full_id
+
+    try:
+        artifact_id, meta = read_full_id(pinned_folder)
+        published_map = _load_published_map_pinned(pinned_folder)
+    except (OSError, ValueError):
+        logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
+        return None
+
+    prepared = _prepare_artifact_card(
+        folder,
+        idx,
+        artifact_id=artifact_id,
+        meta=meta,
+        published_map=published_map,
+        project_id=project_id,
+        project_name=project_name,
+        pinned_folder=pinned_folder,
+        pinned_root=pinned_root,
+    )
+    if prepared is None:
+        return None
+    prepared.card["modified"] = _is_modified_read_only(
+        prepared.io_folder,
+        prepared.primary,
+        prepared.mtime_seconds,
+        artifacts_base=prepared.io_root,
+        published_map=published_map,
+    )
+    return prepared.card
 
 
 def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
@@ -1265,13 +1394,13 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     try:
                         with _opened_child_directory(root, child_name) as pinned_folder:
                             folder = root.path / child_name
-                            card = card_for_folder(
+                            card = _listed_card_for_pinned_folder(
                                 folder,
                                 len(cards),
                                 project_id=source.project_id,
                                 project_name=source.project_name,
-                                _pinned_folder=pinned_folder,
-                                _pinned_root=root,
+                                pinned_folder=pinned_folder,
+                                pinned_root=root,
                             )
                             if card is None:
                                 continue

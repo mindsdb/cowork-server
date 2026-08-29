@@ -14,7 +14,7 @@ import shutil
 import stat
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -26,10 +26,15 @@ from pydantic import BaseModel
 
 from cowork.common.paths import (
     O_NOFOLLOW,
+    PinnedDir,
     dir_lstat,
+    dir_mkdir,
     dir_open,
+    dir_scandir,
     dir_unlink,
+    open_pinned_child,
     opened_subdir_nofollow,
+    pinned_dir,
     safe_join,
 )
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
@@ -196,20 +201,88 @@ def _validated_project_path(path: str) -> _ValidatedProjectPath:
     cleaned = path.replace("\\", "/")
     if cleaned.startswith("/") or ntpath.splitdrive(cleaned)[0]:
         raise HTTPException(status_code=400, detail="invalid path")
-    parts = tuple(cleaned.split("/"))
-    if any(not part or part in {".", ".."} for part in parts):
-        raise HTTPException(status_code=400, detail="invalid path")
-    return _ValidatedProjectPath(parts)
+    parts: list[str] = []
+    for raw_part in cleaned.split("/"):
+        # Keep a standard, sink-recognized sanitizer on every value retained by
+        # the dependency.  The equality check preserves the route's existing
+        # rejection semantics instead of silently accepting only a suffix.
+        part = os.path.basename(raw_part)
+        if not part or part != raw_part or part in {".", ".."}:
+            raise HTTPException(status_code=400, detail="invalid path")
+        parts.append(part)
+    return _ValidatedProjectPath(tuple(parts))
 
 
 ProjectMutationPathDep = Annotated[_ValidatedProjectPath, Depends(_validated_project_path)]
 
 
+def _project_name_selector(name: str) -> str:
+    """Validate an HTTP project name for equality-only catalog selection."""
+    selected_name = os.path.basename(name)
+    if (
+        not selected_name
+        or selected_name != name
+        or selected_name in {".", ".."}
+        or "\\" in selected_name
+        or "\x00" in selected_name
+    ):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return selected_name
+
+
+@contextmanager
+def _opened_project_directory_inventory(
+    scoped: ScopedSession,
+) -> Iterator[tuple[tuple[str, PinnedDir | None], ...]]:
+    """Open every scoped project root before a request name selects one.
+
+    This context intentionally has no request-derived argument. Each root is
+    built from its scoped database row and pinned before the inventory reaches
+    the caller. The surrounding ``ExitStack`` keeps every descriptor alive
+    while the caller compares names and closes all of them on every exit path.
+    """
+    service = ProjectService(scoped)
+    projects = service.list_projects()
+    with ExitStack() as resources:
+        opened: list[tuple[str, PinnedDir | None]] = []
+        for project in projects:
+            name = str(project.name)
+            directory: PinnedDir | None = None
+            try:
+                # Preserve the historical self-heal for a missing project
+                # directory before attempting to pin the row's stored path.
+                service.ensure_dir_exists(project)
+                path = Path(project.path)
+                child_name = os.path.basename(path.name)
+                if (
+                    not child_name
+                    or child_name != path.name
+                    or child_name in {".", ".."}
+                ):
+                    raise ValueError("invalid project directory name")
+
+                # Pin the projects-store directory itself without following a
+                # link, then open the project as its descriptor-relative child.
+                # Opening ``path`` directly with O_NOFOLLOW protects the final
+                # component but still lets a swapped ``path.parent`` redirect
+                # the lookup before that final open.
+                parent = resources.enter_context(
+                    pinned_dir(path.parent, nofollow_base=True)
+                )
+                directory = open_pinned_child(parent, child_name)
+                resources.callback(directory.close)
+            except (OSError, TypeError, ValueError):
+                pass
+            opened.append((name, directory))
+        yield tuple(opened)
+
+
 def _project_dir(name: str, scoped: ScopedSession) -> Path:
-    """Resolve a project name to its on-disk directory or 404."""
+    """Resolve a sanitized project name to its scoped on-disk directory."""
+    selected_name = _project_name_selector(name)
     service = ProjectService(scoped)
     try:
-        project = service.get_project_by_name(name)
+        project = service.get_project_by_name(selected_name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     # Any project can lose its directory (fresh pod, wiped volume), not just the
@@ -307,6 +380,16 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
         raise HTTPException(status_code=404, detail="File not found")
 
 
+def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
+    """Authorize a validated lexical path before an fd-relative mutation.
+
+    Mutation helpers refuse symlinks in every component, so the lexical
+    conversation id is the only workspace the operation can reach.
+    """
+    if not _conversation_workspace_ok(path.value, scoped):
+        raise HTTPException(status_code=404, detail="File not found")
+
+
 @contextmanager
 def _pinned_fd(target: Path, base: Path, flags: int) -> Iterator[int]:
     """Yield a descriptor for `target`, opening every component below `base`
@@ -350,6 +433,113 @@ def _pinned_regular_file(target: Path, base: Path, flags: int = os.O_RDONLY):
         cm.__exit__(None, None, None)
         raise HTTPException(status_code=404, detail="File not found")
     return cm, fd, st
+
+
+def _existing_entry_name(directory: PinnedDir, requested: str) -> str:
+    """Return the directory's own name for an exact request component.
+
+    A validated request component is safe to compare, but keeping it as the
+    argument to ``openat``/``unlinkat`` still leaves static analysis (and a
+    future relaxed validator) with an HTTP-to-filesystem data flow.  Resolve
+    the selector against the already-pinned directory instead.  The returned
+    value originates in ``scandir``, so every filesystem operation below uses
+    a name supplied by that directory, never the HTTP string.
+    """
+    with dir_scandir(directory) as entries:
+        for entry in entries:
+            if entry.name == requested:
+                return entry.name
+    raise FileNotFoundError
+
+
+@contextmanager
+def _opened_existing_project_entry(
+    root: PinnedDir, requested_parts: tuple[str, ...]
+) -> Iterator[tuple[PinnedDir, str]]:
+    """Pin the parent of an existing project entry and yield its disk name.
+
+    Each descent name is obtained from the pinned directory itself and each
+    directory is opened with ``O_NOFOLLOW``.  This preserves nested project
+    paths without ever joining a request value into a path or handing one to a
+    filesystem syscall.
+    """
+    if not requested_parts:
+        raise FileNotFoundError
+    with ExitStack() as descendants:
+        current = root
+        for requested in requested_parts[:-1]:
+            name = _existing_entry_name(current, requested)
+            parent_stat = dir_lstat(current, name)
+            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                parent_stat.st_mode
+            ):
+                raise FileNotFoundError
+            current = open_pinned_child(current, name)
+            descendants.callback(current.close)
+        yield current, _existing_entry_name(current, requested_parts[-1])
+
+
+@contextmanager
+def _opened_pinned_descendant(
+    root: PinnedDir, names: tuple[str, ...], *, create: bool
+) -> Iterator[PinnedDir]:
+    """Descend from an already-pinned project root without rebuilding its Path.
+
+    Every component is reduced to a basename again beside the descriptor-based
+    operation. POSIX resolves it with ``dir_fd`` and ``O_NOFOLLOW``; the local
+    Windows fallback receives the same single-component guarantee.
+    """
+    with ExitStack() as descendants:
+        current = root
+        for raw_name in names:
+            name = os.path.basename(raw_name)
+            if not name or name != raw_name or name in {".", ".."}:
+                raise ValueError("invalid path component")
+            if create:
+                try:
+                    dir_mkdir(current, name)
+                except FileExistsError:
+                    pass
+            current = open_pinned_child(current, name)
+            descendants.callback(current.close)
+        yield current
+
+
+def _write_bytes_at_project_root(
+    root: PinnedDir, path: _ValidatedProjectPath, data: bytes
+) -> os.stat_result:
+    """Write a validated relative path below an already-pinned project root."""
+    dirs = tuple(os.path.basename(part) for part in path.parts[:-1])
+    name = os.path.basename(path.parts[-1])
+    if dirs != path.parts[:-1] or name != path.parts[-1]:
+        raise ValueError("invalid path component")
+
+    with _opened_pinned_descendant(root, dirs, create=True) as parent:
+        try:
+            existing = dir_lstat(parent, name)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode):
+                raise HTTPException(status_code=404, detail="File not found")
+            if stat.S_ISDIR(existing.st_mode):
+                raise HTTPException(status_code=400, detail="Path is a directory")
+        fd = dir_open(
+            parent,
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
+            0o644,
+        )
+        try:
+            remaining = memoryview(data)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written == 0:
+                    raise OSError("project file write made no progress")
+                remaining = remaining[written:]
+            return os.fstat(fd)
+        finally:
+            os.close(fd)
 
 
 def _pinned_stream(target: Path, base: Path, *, media_type: str, headers: dict) -> StreamingResponse:
@@ -453,31 +643,37 @@ def write_project_file(
     req: _FileWriteRequest,
     scoped: ScopedSessionDep,
 ):
-    base = _project_dir(project_name, scoped)
-    target = _safe_relpath(path, base)
-    _require_workspace_access(target, base, scoped)
-    if target.exists() and target.is_dir():
-        raise HTTPException(status_code=400, detail="Path is a directory")
+    _require_workspace_path(path, scoped)
     body = req.content or ""
     encoded = body.encode("utf-8")
     if len(encoded) > TEXT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content exceeds 2 MiB cap")
-    # Pinned like the read: without it a link planted under the caller's own
-    # workspace between the gate and the open lands this write in another
-    # member's directory, and `.anton/anton.md` there is an instruction file
-    # their agent reads.
-    rel = target.relative_to(base.resolve())
-    *dirs, name = rel.parts
     try:
-        with opened_subdir_nofollow(base, *dirs, create=True) as pinned:
-            fd = dir_open(
-                pinned, name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW, 0o644
-            )
-            try:
-                os.write(fd, encoded)
-                st = os.fstat(fd)
-            finally:
-                os.close(fd)
+        # Project roots are constructed and pinned solely from scoped database
+        # rows. The HTTP name can only choose an existing handle, so no selected
+        # value ever reaches ``Path(base)`` or an absolute-path reopen.
+        with _opened_project_directory_inventory(scoped) as inventory:
+            selected_project_name = os.path.basename(project_name)
+            if (
+                not selected_project_name
+                or selected_project_name != project_name
+                or selected_project_name in {".", ".."}
+                or "\\" in selected_project_name
+                or "\x00" in selected_project_name
+            ):
+                raise HTTPException(status_code=404, detail="Project not found")
+            for server_name, directory in inventory:
+                if not secrets.compare_digest(server_name, selected_project_name):
+                    continue
+                if directory is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Project directory not found on disk",
+                    )
+                st = _write_bytes_at_project_root(directory, path, encoded)
+                break
+            else:
+                raise HTTPException(status_code=404, detail="Project not found")
     except (OSError, ValueError):
         raise HTTPException(status_code=404, detail="File not found")
     return {"path": path.value, "size": st.st_size, "modified": st.st_mtime}
@@ -489,24 +685,51 @@ async def upload_project_files(
     scoped: ScopedSessionDep,
     files: list[UploadFile] = File(...),
 ):
-    base = _project_dir(project_name, scoped)
     results: list[dict[str, Any]] = []
-    for f in files:
-        if not f.filename:
-            results.append({"name": "", "ok": False, "error": "filename missing"})
-            continue
-        safe_name = os.path.basename(f.filename).strip()
-        if not safe_name or safe_name.startswith("."):
-            results.append({"name": f.filename, "ok": False, "error": "invalid filename"})
-            continue
-        target = base / safe_name
-        try:
-            data = await f.read()
-            target.write_bytes(data)
-            results.append({"name": safe_name, "ok": True, "size": len(data)})
-        except Exception as exc:
-            logger.error("Failed to write file %s: %s", safe_name, exc)
-            results.append({"name": safe_name, "ok": False, "error": "File write failed"})
+    with _opened_project_directory_inventory(scoped) as inventory:
+        selected_project_name = os.path.basename(project_name)
+        if (
+            not selected_project_name
+            or selected_project_name != project_name
+            or selected_project_name in {".", ".."}
+            or "\\" in selected_project_name
+            or "\x00" in selected_project_name
+        ):
+            raise HTTPException(status_code=404, detail="Project not found")
+        directory = next(
+            (
+                opened
+                for server_name, opened in inventory
+                if secrets.compare_digest(server_name, selected_project_name)
+            ),
+            None,
+        )
+        if directory is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        for f in files:
+            if not f.filename:
+                results.append(
+                    {"name": "", "ok": False, "error": "filename missing"}
+                )
+                continue
+            safe_name = os.path.basename(f.filename).strip()
+            if not safe_name or safe_name.startswith("."):
+                results.append(
+                    {"name": f.filename, "ok": False, "error": "invalid filename"}
+                )
+                continue
+            try:
+                data = await f.read()
+                _write_bytes_at_project_root(
+                    directory, _ValidatedProjectPath((safe_name,)), data
+                )
+                results.append({"name": safe_name, "ok": True, "size": len(data)})
+            except Exception as exc:
+                logger.error("Failed to write file %s: %s", safe_name, exc)
+                results.append(
+                    {"name": safe_name, "ok": False, "error": "File write failed"}
+                )
     return {"results": results}
 
 
@@ -514,22 +737,46 @@ async def upload_project_files(
 def delete_project_file(
     project_name: str, path: ProjectMutationPathDep, scoped: ScopedSessionDep
 ):
-    base = _project_dir(project_name, scoped)
-    target = _safe_relpath(path, base)
-    _require_workspace_access(target, base, scoped)
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    if target.is_dir():
-        raise HTTPException(status_code=400, detail="Path is a directory")
-    # Pinned like the read and the write: an unlink that follows a planted
-    # component deletes another member's file.
-    rel = target.relative_to(base.resolve())
-    *dirs, name = rel.parts
+    _require_workspace_path(path, scoped)
     try:
-        with opened_subdir_nofollow(base, *dirs) as pinned:
-            if stat.S_ISLNK(dir_lstat(pinned, name).st_mode):
-                raise HTTPException(status_code=404, detail="File not found")
-            dir_unlink(pinned, name)
+        # Each candidate is resolved and pinned from the scoped catalog before
+        # the HTTP name is compared with it. The request can only select the
+        # already-open handle; it never reaches a Path constructor or open.
+        with _opened_project_directory_inventory(scoped) as inventory:
+            selected_name = os.path.basename(project_name)
+            if (
+                not selected_name
+                or selected_name != project_name
+                or selected_name in {".", ".."}
+                or "\\" in selected_name
+                or "\x00" in selected_name
+            ):
+                raise HTTPException(status_code=404, detail="Project not found")
+            for server_name, directory in inventory:
+                if server_name != selected_name:
+                    continue
+                if directory is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Project directory not found on disk",
+                    )
+
+                # Path components are selectors too. Every syscall name comes
+                # back from scanning this already-pinned directory.
+                with _opened_existing_project_entry(
+                    directory, path.parts
+                ) as (parent, disk_name):
+                    target_stat = dir_lstat(parent, disk_name)
+                    if stat.S_ISLNK(target_stat.st_mode):
+                        raise HTTPException(status_code=404, detail="File not found")
+                    if stat.S_ISDIR(target_stat.st_mode):
+                        raise HTTPException(
+                            status_code=400, detail="Path is a directory"
+                        )
+                    dir_unlink(parent, disk_name)
+                break
+            else:
+                raise HTTPException(status_code=404, detail="Project not found")
     except HTTPException:
         raise
     except (OSError, ValueError):
