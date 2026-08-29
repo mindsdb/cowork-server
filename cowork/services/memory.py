@@ -192,7 +192,6 @@ def apply_turn_memory(
         before = ""
         before_exists = False
         key = ""
-        mutation_context = None
         coordination_context: ExitStack | None = None
         if project_entry and scope.org_mode:
             # Cloud turns must carry the request's trusted identity all the way
@@ -206,86 +205,83 @@ def apply_turn_memory(
             ):
                 continue
             coordination_context = ExitStack()
-            _project, project_store, key = coordination_context.enter_context(
-                _project_slot_coordination(
-                    access.session,
-                    access,
-                    project_id,
-                    slot,
+            try:
+                _project, project_store, key = coordination_context.enter_context(
+                    _project_slot_coordination(
+                        access.session,
+                        access,
+                        project_id,
+                        slot,
+                    )
                 )
-            )
-            project_hc = Hippocampus(project_store.root)
-            target = project_hc
-            before_exists, before = project_store.read_checked(slot)
-            has_meaningful_content = bool(before.strip())
-            access.recover_stale_claim(
-                PROJECT_MEMORY,
-                key,
-                resource_exists=lambda: bool(
-                    project_store.read_checked(slot)[1].strip()
-                ),
-            )
-            creator_id = access.creator_id(PROJECT_MEMORY, key)
-            attribution_exists = access.has_attribution(PROJECT_MEMORY, key)
-            if has_meaningful_content or attribution_exists:
-                if not access.can_change(creator_id):
-                    coordination_context.close()
-                    continue
-                if access.claim_is_pending(PROJECT_MEMORY, key):
-                    coordination_context.close()
-                    continue
-                mutation_context = access.mutation_lock(
+                project_hc = Hippocampus(project_store.root)
+                target = project_hc
+                before_exists, before = project_store.read_checked(slot)
+                has_meaningful_content = bool(before.strip())
+                access.recover_stale_claim(
                     PROJECT_MEMORY,
                     key,
                     resource_exists=lambda: bool(
                         project_store.read_checked(slot)[1].strip()
                     ),
                 )
-                attribution = mutation_context.__enter__()
-                if attribution is None or not access.can_change(
-                    attribution.created_by_id
-                ):
-                    mutation_context.__exit__(None, None, None)
-                    coordination_context.close()
-                    continue
-                try:
-                    before_exists, before = project_store.read_checked(slot)
-                except Exception:
-                    mutation_context.__exit__(None, None, None)
-                    coordination_context.close()
-                    raise
-            else:
-                claimed, claim_token = access.reserve_claim(
-                    PROJECT_MEMORY,
-                    key,
-                )
-                if claimed is None or not access.can_change(claimed.created_by_id):
-                    coordination_context.close()
-                    continue
-                if claim_token is None:
-                    if claimed.pending_claim_token:
+                creator_id = access.creator_id(PROJECT_MEMORY, key)
+                attribution_exists = access.has_attribution(PROJECT_MEMORY, key)
+                if has_meaningful_content or attribution_exists:
+                    if not access.can_change(creator_id):
                         coordination_context.close()
                         continue
-                    mutation_context = access.mutation_lock(
-                        PROJECT_MEMORY,
-                        key,
-                        resource_exists=lambda: bool(
-                            project_store.read_checked(slot)[1].strip()
-                        ),
+                    if access.claim_is_pending(PROJECT_MEMORY, key):
+                        coordination_context.close()
+                        continue
+                    attribution = coordination_context.enter_context(
+                        access.mutation_lock(
+                            PROJECT_MEMORY,
+                            key,
+                            resource_exists=lambda: bool(
+                                project_store.read_checked(slot)[1].strip()
+                            ),
+                        )
                     )
-                    attribution = mutation_context.__enter__()
                     if attribution is None or not access.can_change(
                         attribution.created_by_id
                     ):
-                        mutation_context.__exit__(None, None, None)
                         coordination_context.close()
                         continue
-                    try:
-                        before_exists, before = project_store.read_checked(slot)
-                    except Exception:
-                        mutation_context.__exit__(None, None, None)
+                    before_exists, before = project_store.read_checked(slot)
+                else:
+                    claimed, claim_token = access.reserve_claim(
+                        PROJECT_MEMORY,
+                        key,
+                    )
+                    if claimed is None or not access.can_change(claimed.created_by_id):
                         coordination_context.close()
-                        raise
+                        continue
+                    if claim_token is None:
+                        if claimed.pending_claim_token:
+                            coordination_context.close()
+                            continue
+                        attribution = coordination_context.enter_context(
+                            access.mutation_lock(
+                                PROJECT_MEMORY,
+                                key,
+                                resource_exists=lambda: bool(
+                                    project_store.read_checked(slot)[1].strip()
+                                ),
+                            )
+                        )
+                        if attribution is None or not access.can_change(
+                            attribution.created_by_id
+                        ):
+                            coordination_context.close()
+                            continue
+                        before_exists, before = project_store.read_checked(slot)
+            except Exception:
+                try:
+                    access.session.rollback()
+                finally:
+                    coordination_context.close()
+                raise
 
         try:
             if entry.kind == "profile":
@@ -317,8 +313,6 @@ def apply_turn_memory(
                     access.release_claim(claimed, claim_token=claim_token)
                 except Exception:
                     logger.exception("Could not release a failed project-memory claim")
-            if mutation_context is not None:
-                mutation_context.__exit__(None, None, None)
             if coordination_context is not None:
                 coordination_context.close()
             raise
@@ -366,13 +360,9 @@ def apply_turn_memory(
                         logger.exception(
                             "Could not release a failed project-memory claim"
                         )
-                if mutation_context is not None:
-                    mutation_context.__exit__(None, None, None)
                 if coordination_context is not None:
                     coordination_context.close()
                 raise
-            if mutation_context is not None:
-                mutation_context.__exit__(None, None, None)
         if coordination_context is not None:
             coordination_context.close()
         applied += 1

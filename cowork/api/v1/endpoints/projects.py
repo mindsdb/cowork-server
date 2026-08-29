@@ -235,42 +235,46 @@ def create_project(
     claim = None
     claim_token = None
     project_id = uuid4() if session.scope.org_mode else None
-    coordination_context = None
-    try:
-        if project_id is not None:
-            coordination_context = access.coordination_lock(
-                PROJECT,
-                project_resource_key(project_id),
-            )
-            coordination_context.__enter__()
-            claim, claim_token = access.reserve_claim(
-                PROJECT,
-                project_resource_key(project_id),
-            )
-            if claim is None or claim_token is None:
-                raise RuntimeError("Project ownership could not be reserved")
-        project = service.create_project(body.name, project_id=project_id)
-        if claim is not None and claim_token is not None:
-            finalized = access.finalize_claim(
-                claim,
-                claim_token,
-                action="create",
-            )
-            if finalized is None:
-                raise RuntimeError("Project ownership changed during creation")
-    except Exception:
-        session.rollback()
-        if project_id is not None:
-            try:
-                service.delete_project(project_id)
-            except Exception:
-                session.rollback()
+    with ExitStack() as locks:
+        try:
+            if project_id is not None:
+                locks.enter_context(
+                    access.coordination_lock(
+                        PROJECT,
+                        project_resource_key(project_id),
+                    )
+                )
+                claim, claim_token = access.reserve_claim(
+                    PROJECT,
+                    project_resource_key(project_id),
+                )
+                if claim is None or claim_token is None:
+                    raise RuntimeError("Project ownership could not be reserved")
+                # This lock is also the project-name namespace: skill project
+                # validation and every org create/rename observe one canonical
+                # name allocation order across replicas.
+                locks.enter_context(
+                    access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
+                )
+            project = service.create_project(body.name, project_id=project_id)
             if claim is not None and claim_token is not None:
-                access.release_claim(claim, claim_token=claim_token)
-        raise
-    finally:
-        if coordination_context is not None:
-            coordination_context.__exit__(None, None, None)
+                finalized = access.finalize_claim(
+                    claim,
+                    claim_token,
+                    action="create",
+                )
+                if finalized is None:
+                    raise RuntimeError("Project ownership changed during creation")
+        except Exception:
+            session.rollback()
+            if project_id is not None:
+                try:
+                    service.delete_project(project_id)
+                except Exception:
+                    session.rollback()
+                if claim is not None and claim_token is not None:
+                    access.release_claim(claim, claim_token=claim_token)
+            raise
     return _project_response(project, access)
 
 
@@ -304,147 +308,137 @@ def update_project(
                 name=None,
                 is_active=body.is_active,
             )
+        elif not session.scope.org_mode:
+            updated = service.update_project(
+                project_id,
+                name=body.name,
+                is_active=body.is_active,
+            )
         else:
-            resolved_name = service.resolve_update_name(current, body.name)
-            if resolved_name == current.name:
-                # Active selection remains member-wide and is not a protected
-                # project mutation, even when the client echoes a normalized or
-                # collision-resolved spelling of the current name.
-                updated = service.update_project(
-                    project_id,
-                    name=None,
-                    is_active=body.is_active,
+            with ExitStack() as locks:
+                attribution = locks.enter_context(
+                    access.mutation_lock(
+                        PROJECT,
+                        resource_key,
+                        fallback_creator_id=current.created_by,
+                        resource_exists=lambda: session.get(Project, project_id)
+                        is not None,
+                    )
                 )
-            elif not session.scope.org_mode:
-                updated = service.update_project(
-                    project_id,
-                    name=body.name,
-                    is_active=body.is_active,
+                current = service.get_project(project_id)
+                # Resolve only after taking the shared project-name/reference
+                # namespace. A waiter must see names committed by an earlier
+                # create or rename before it chooses a collision suffix.
+                locks.enter_context(
+                    access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
                 )
-            else:
-                with ExitStack() as locks:
-                    attribution = locks.enter_context(
-                        access.mutation_lock(
+                resolved_name = service.resolve_update_name(current, body.name)
+                if resolved_name == current.name:
+                    # Active selection remains member-wide and is not a protected
+                    # project mutation, even when the client echoes a normalized or
+                    # collision-resolved spelling of the current name.
+                    updated = service.update_project(
+                        project_id,
+                        name=None,
+                        is_active=body.is_active,
+                    )
+                else:
+                    if current.name == GENERAL_PROJECT:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="The General project is immutable",
+                        )
+                    access.require_change(
+                        (
+                            attribution.created_by_id
+                            if attribution is not None
+                            else current.created_by
+                        )
+                        or current.created_by,
+                        detail="Only the project creator or an organization admin can rename this project",
+                    )
+                    _guard_project_instructions_for_move(
+                        current,
+                        access,
+                        locks,
+                        pending_guards,
+                        legacy_guards,
+                    )
+                    _guard_project_memory_for_move(
+                        current,
+                        access,
+                        locks,
+                        pending_guards,
+                        legacy_guards,
+                    )
+
+                    skill_service = SkillService(session.scope)
+                    locked_slugs: set[str] = set()
+                    # Re-scan after each lock batch. A skill mutation that
+                    # started before this rename is either observed here or
+                    # completes before its own resource lock is acquired.
+                    while True:
+                        unlocked = sorted(
+                            set(skill_service.project_reference_slugs(current.name))
+                            - locked_slugs
+                        )
+                        if not unlocked:
+                            break
+                        for slug in unlocked:
+                            locks.enter_context(access.coordination_lock(SKILL, slug))
+                            access.recover_stale_claim(
+                                SKILL,
+                                slug,
+                                resource_exists=lambda slug=slug: (
+                                    skill_service.has_complete_skill(slug)
+                                ),
+                            )
+                            try:
+                                locks.enter_context(
+                                    access.mutation_lock(
+                                        SKILL,
+                                        slug,
+                                        resource_exists=lambda slug=slug: (
+                                            skill_service.has_complete_skill(slug)
+                                        ),
+                                    )
+                                )
+                            except HTTPException as exc:
+                                if exc.status_code == status.HTTP_404_NOT_FOUND:
+                                    continue
+                                raise
+                            locked_slugs.add(slug)
+
+                    rewrites = skill_service.prepare_project_reference_rewrites(
+                        current.name,
+                        resolved_name,
+                        slugs=sorted(locked_slugs),
+                    )
+                    updated, rename_stage = service.stage_project_update(
+                        project_id,
+                        resolved_name=resolved_name,
+                        is_active=body.is_active,
+                        skill_rewrites=rewrites,
+                    )
+                    try:
+                        access.stage_update(
                             PROJECT,
                             resource_key,
-                            fallback_creator_id=current.created_by,
-                            resource_exists=lambda: session.get(Project, project_id)
-                            is not None,
+                            action="rename",
+                            fallback_creator_id=updated.created_by,
                         )
-                    )
-                    current = service.get_project(project_id)
-                    resolved_name = service.resolve_update_name(current, body.name)
-                    if resolved_name == current.name:
-                        updated = service.update_project(
-                            project_id,
-                            name=None,
-                            is_active=body.is_active,
+                        updated = service.commit_staged_project_update(
+                            updated,
+                            rename_stage,
                         )
-                    else:
-                        if current.name == GENERAL_PROJECT:
-                            raise HTTPException(
-                                status_code=status.HTTP_403_FORBIDDEN,
-                                detail="The General project is immutable",
-                            )
-                        access.require_change(
-                            (
-                                attribution.created_by_id
-                                if attribution is not None
-                                else current.created_by
-                            )
-                            or current.created_by,
-                            detail="Only the project creator or an organization admin can rename this project",
-                        )
-                        _guard_project_instructions_for_move(
-                            current,
-                            access,
-                            locks,
-                            pending_guards,
-                            legacy_guards,
-                        )
-                        _guard_project_memory_for_move(
-                            current,
-                            access,
-                            locks,
-                            pending_guards,
-                            legacy_guards,
-                        )
-                        locks.enter_context(
-                            access.coordination_lock(
-                                SKILL_PROJECT_REFERENCES,
-                                "all",
-                            )
-                        )
-
-                        skill_service = SkillService(session.scope)
-                        locked_slugs: set[str] = set()
-                        # Re-scan after each lock batch. A skill mutation that
-                        # started before this rename is either observed here or
-                        # completes before its own resource lock is acquired.
-                        while True:
-                            unlocked = sorted(
-                                set(skill_service.project_reference_slugs(current.name))
-                                - locked_slugs
-                            )
-                            if not unlocked:
-                                break
-                            for slug in unlocked:
-                                locks.enter_context(
-                                    access.coordination_lock(SKILL, slug)
-                                )
-                                access.recover_stale_claim(
-                                    SKILL,
-                                    slug,
-                                    resource_exists=lambda slug=slug: (
-                                        skill_service.has_complete_skill(slug)
-                                    ),
-                                )
-                                try:
-                                    locks.enter_context(
-                                        access.mutation_lock(
-                                            SKILL,
-                                            slug,
-                                            resource_exists=lambda slug=slug: (
-                                                skill_service.has_complete_skill(slug)
-                                            ),
-                                        )
-                                    )
-                                except HTTPException as exc:
-                                    if exc.status_code == status.HTTP_404_NOT_FOUND:
-                                        continue
-                                    raise
-                                locked_slugs.add(slug)
-
-                        rewrites = skill_service.prepare_project_reference_rewrites(
-                            current.name,
-                            resolved_name,
-                            slugs=sorted(locked_slugs),
-                        )
-                        updated, rename_stage = service.stage_project_update(
-                            project_id,
-                            resolved_name=resolved_name,
-                            is_active=body.is_active,
-                            skill_rewrites=rewrites,
-                        )
+                    except Exception:
+                        session.rollback()
                         try:
-                            access.stage_update(
-                                PROJECT,
-                                resource_key,
-                                action="rename",
-                                fallback_creator_id=updated.created_by,
-                            )
-                            updated = service.commit_staged_project_update(
-                                updated,
-                                rename_stage,
-                            )
+                            service.rollback_project_rename(rename_stage)
                         except Exception:
-                            session.rollback()
-                            try:
-                                service.rollback_project_rename(rename_stage)
-                            except Exception:
-                                # The service logs individual restore failures.
-                                pass
-                            raise
+                            # The service logs individual restore failures.
+                            pass
+                        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     finally:

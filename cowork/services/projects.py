@@ -454,7 +454,10 @@ class ProjectService:
 
     def resolve_update_name(self, project: Project, name: str) -> str:
         """Return the canonical collision-resolved name for an update."""
-        return self._unique_name(self._sanitize_name(name), exclude=project.name)
+        sanitized = self._sanitize_name(name)
+        if sanitized == GENERAL_PROJECT and project.name != GENERAL_PROJECT:
+            sanitized = f"{GENERAL_PROJECT}-2"
+        return self._unique_name(sanitized, exclude=project.name)
 
     def _stage_project_rename(
         self,
