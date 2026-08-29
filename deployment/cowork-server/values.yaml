@@ -25,29 +25,42 @@ sharedStorage:
 # rather than anything a user would notice first.
 #
 # Enforcement is not the same on both clusters. newdev runs the AWS VPC CNI's
-# policy controller AND Cilium; newprod runs Cilium alone, installed
-# 2026-08-20. Cilium claims a pod when the pod is created, so in newprod a
-# policy only applies to pods that started after it. Roll the deployment after
-# enabling, then prove it rather than assuming.
+# policy controller AND Cilium; newprod runs Cilium alone, installed 2026-08-20.
+# Cilium recomputes policy for the endpoints it already manages, so a running pod
+# is covered by a policy applied after it. The only pod it never covers is one
+# that started before Cilium itself was installed, because that pod has no
+# Cilium-managed endpoint. Prove the policy after enabling rather than assuming.
 #
-# TWO THINGS BLOCK ENABLING THIS, AND BOTH ARE OUTSIDE THIS CHART.
+# BEFORE ENABLING THIS IN A NEW ENVIRONMENT, CHECK THREE THINGS, ALL OUTSIDE
+# THIS CHART. The first and third fail loudly. The second does not fail at all
+# until users notice.
 #
-#   1. The CI deploy identity cannot create the kind. `helm upgrade` runs
+#   1. The CI deploy identity can create the kind. `helm upgrade` runs
 #      in-cluster as `system:serviceaccount:infrastructure:<env>-gha-runner`,
-#      and on newdev `auth can-i create networkpolicies -n staging` answers no
-#      (`ingresses` and `deployments` answer yes). Enabling this therefore fails
-#      the release, and `--atomic` rolls the whole deploy back with it. The
-#      runner ClusterRole in Kubernetes-Foundational-Services needs the verb
-#      first.
-#   2. There is no working canary. `kubectl port-forward` cannot observe this
-#      policy at all: containerd's CRI PortForward enters the pod's network
-#      namespace and dials localhost, so the bytes never cross the veth where
-#      Cilium or the VPC CNI agent enforces ingress. Pod readiness is a real
-#      signal; the integration job's cross-replica test is not, and it has been
-#      failing on every staging push for unrelated RBAC reasons anyway.
+#      which holds `create networkpolicies` only in the namespaces listed under
+#      `runner_deploy_namespaces` in Kubernetes-Foundational-Services. staging
+#      and prod are in that set and a PR environment is not. Where it is
+#      missing, the release fails and `--atomic` rolls the whole deploy back.
+#        kubectl --context <ctx> -n <ns> auth can-i create networkpolicies \
+#          --as=system:serviceaccount:infrastructure:<env>-gha-runner
+#   2. That cluster's ingress controller actually matches the selectors below,
+#      and its namespace carries the label they select on. This one fails
+#      SILENTLY: the release succeeds, both replicas stay Ready because the
+#      kubelet is still allowed, and every real request is dropped.
+#        kubectl --context <ctx> -n infrastructure get pods -l nginx-ingress-controller=true
+#        kubectl --context <ctx> get ns infrastructure -o jsonpath='{.metadata.labels}{"\n"}'
+#   3. No NetworkPolicy of this name is in the namespace already. Helm will not
+#      adopt an object it does not own, so a leftover from a hand-applied test
+#      fails the release.
+#        kubectl --context <ctx> -n <ns> get networkpolicies
 #
-# So the probe that actually proves this works is the forged-header curl from a
-# pod in another namespace, run by hand after a rollout.
+# There is still no canary. `kubectl port-forward` cannot observe this policy at
+# all: containerd's CRI PortForward enters the pod's network namespace and dials
+# localhost, so the bytes never cross the veth where Cilium or the VPC CNI agent
+# enforces ingress. Pod readiness is a real signal and the integration job's
+# cross-replica test is not. So the probe that actually proves this works is the
+# forged-header curl from a pod in another namespace, run by hand after a
+# rollout.
 networkPolicy:
   enabled: false
 

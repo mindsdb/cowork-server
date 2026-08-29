@@ -84,7 +84,9 @@ jobs:
       # the same replica. Everything else goes through the ingress, which is
       # also what authenticates the Bearer key.
       #
-      # One pod is a valid deployment, so that test skips rather than fails.
+      # One pod is a valid deployment where nobody promised two, so the test
+      # skips rather than fails there. In a namespace this runner deploys to,
+      # the deploy job just rolled two, so a skip is a failure.
       - name: Port-forward two pods for the cross-replica test
         env:
           DEPLOY_ENV: ${{ inputs.deploy-env }}
@@ -93,6 +95,21 @@ jobs:
           # PR envs and permanent envs both deploy into a namespace named
           # after the env.
           ns="$DEPLOY_ENV"
+          # Which namespaces make a missing replica or a dead port-forward a
+          # real defect rather than a known gap in the environment. This job
+          # always runs on mdb-dev, so the only namespaces it reaches are
+          # newdev's, and `<env>-gha-runner-deploy` carries both `pods list` and
+          # `create pods/portforward` in them. `prod` is on newprod and lists
+          # nothing from here. A `pr-*` namespace is served by
+          # `<env>-gha-runner-prenv`, which is read-only by design. Neither gap
+          # is about the change being shipped, so neither goes red. A PR
+          # environment also runs one replica, pinned by argocd-envs in
+          # parent/templates/cowork-server-app.yaml, so it lands in the one-pod
+          # branch below rather than the port-forward one.
+          case "$ns" in
+            dev|staging) enforce=true ;;
+            *)           enforce=false ;;
+          esac
           # Selected by name rather than by label: the chart comes from an
           # external `deployment` dependency, so its label scheme is not ours to
           # rely on. Deployment pods are always <deployment>-<hash>-<suffix>.
@@ -107,11 +124,18 @@ jobs:
             # the job is pinned to mdb-dev, so on the prod release path it lists
             # nothing and has never exercised the cross-replica behaviour.
             if [[ "${#pods[@]}" -eq 0 ]]; then
-              echo "::warning::No cowork-server pods visible in $ns from this runner." \
-                   "The cross-replica test did NOT run. A green job here says nothing about it."
+              detail="No cowork-server pods visible in $ns from this runner."
             else
-              echo "::warning::Only 1 cowork-server pod in $ns; the cross-replica test did NOT run."
+              detail="Only 1 cowork-server pod in $ns."
             fi
+            if [[ "$enforce" == true ]]; then
+              # The deploy job just rolled two replicas into this namespace and
+              # this runner can read it, so seeing fewer is a real failure.
+              echo "::error::$detail The cross-replica test did NOT run."
+              exit 1
+            fi
+            echo "::warning::$detail The cross-replica test did NOT run." \
+                 "A green job here says nothing about it."
             exit 0
           fi
           # 9010 is the port uvicorn binds (see the chart's args). Reached
@@ -131,25 +155,28 @@ jobs:
             fi
             sleep 2
           done
-          # Say what did not happen, and do not fail on it yet.
+          # A warning exits 0, so the job stays green while the cross-replica
+          # test silently skips, which reads exactly like "the cross-replica
+          # behaviour is fine". So fail where the port-forward is supposed to
+          # work, and warn where it is known not to.
           #
-          # Failing here is the right end state: a warning exits 0, so the job
-          # stays green while the cross-replica test silently skips, which reads
-          # exactly like "the cross-replica behaviour is fine". But this step is
-          # ALREADY failing on every push to staging, and has been for as long
-          # as the annotations go back, because the runner ServiceAccount has no
-          # `create pods/portforward` in that namespace. Turning it into `exit 1`
-          # before that RBAC lands makes every staging release red and alerts
-          # on-call per push, for a cause that has nothing to do with whatever
-          # change is being shipped.
-          #
-          # So: grant the runner `pods/portforward` in
-          # Kubernetes-Foundational-Services, confirm this step goes green on a
-          # staging push, and then make this an error.
+          # Reaching here means two pods were listed, so in practice only a
+          # deploy namespace gets this far: a PR environment runs one replica and
+          # `prod` lists nothing from a runner pinned to mdb-dev. The guard below
+          # is there for the day one of those changes, and it is right on its own
+          # terms, because `<env>-gha-runner-prenv` is read-only and does not
+          # carry `create pods/portforward`, so a PR environment with two pods
+          # still could not forward to them.
           echo "::warning::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
-          echo "::warning::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first;" \
-               "this step cannot pass without it."
-          exit 0
+          if [[ "$enforce" != true ]]; then
+            echo "::warning::The cross-replica test did NOT run. $ns cannot port-forward:" \
+                 "the runner is read-only there by design."
+            exit 0
+          fi
+          echo "::error::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first:" \
+               "kubectl -n $ns auth can-i create pods/portforward" \
+               "--as=system:serviceaccount:infrastructure:<env>-gha-runner"
+          exit 1
 
       - name: Run integration tests
         env:
