@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from cowork.coding.contracts import CodingSession, TerminalPage
+from cowork.coding.contracts import CodingSession, TerminalPage, TerminalShellPreference
 from cowork.coding.engines.base import (
     EngineCredentials,
     EngineSession,
@@ -51,14 +51,14 @@ class RuntimeManager:
         self._registry = registry
         self._approval_request = approval_request
         self._lock = threading.RLock()
-        self._session_locks: dict[str, threading.Lock] = {}
+        self._session_locks: dict[str, threading.RLock] = {}
         self._runtimes: dict[str, EngineSession] = {}
-        self._terminals: dict[str, TerminalBuffer] = {}
+        self._terminals: dict[tuple[str, str], TerminalBuffer] = {}
         self._closed = False
 
-    def session_lock(self, session_id: str) -> threading.Lock:
+    def session_lock(self, session_id: str) -> threading.RLock:
         with self._lock:
-            return self._session_locks.setdefault(session_id, threading.Lock())
+            return self._session_locks.setdefault(session_id, threading.RLock())
 
     def open(self, session: CodingSession, credentials: EngineCredentials) -> EngineSession:
         with self.session_lock(session.id):
@@ -93,6 +93,7 @@ class RuntimeManager:
                 environment=tuple(session.environment.items()),
                 session_id=session.id,
                 cowork_root=str(self._root),
+                workspace_label=session.project_name or Path(session.source_path).name or "Workspace",
             ),
             credentials=credentials,
             existing_session_id=session.engine_session_id,
@@ -115,11 +116,16 @@ class RuntimeManager:
         """Close a runtime while the caller owns ``session_lock``."""
         with self._lock:
             runtime = self._runtimes.pop(session_id, None)
-            terminal = self._terminals.pop(session_id, None)
+            terminals = [
+                self._terminals.pop(key)
+                for key in list(self._terminals)
+                if key[0] == session_id
+            ]
         if runtime is not None:
             runtime.close()
-        if terminal is not None and terminal.is_running:
-            terminal.finish(None, None)
+        for terminal in terminals:
+            if terminal.is_running:
+                terminal.finish(None, None)
 
     def discard_if_closed(self, session_id: str, runtime: EngineSession) -> None:
         if not runtime.is_closed:
@@ -128,31 +134,38 @@ class RuntimeManager:
             if self._runtimes.get(session_id) is runtime:
                 self._runtimes.pop(session_id, None)
 
-    def terminal_page(self, session_id: str, after: int = 0) -> TerminalPage:
+    def terminal_page(self, session_id: str, terminal_id: str, after: int = 0) -> TerminalPage:
         with self._lock:
-            terminal = self._terminals.get(session_id)
+            terminal = self._terminals.get((session_id, terminal_id))
         return terminal.page(after) if terminal is not None else TerminalPage()
 
-    def wait_for_terminal(self, session_id: str, after: int, timeout: float) -> TerminalPage:
+    def wait_for_terminal(self, session_id: str, terminal_id: str, after: int, timeout: float) -> TerminalPage:
         with self._lock:
-            terminal = self._terminals.get(session_id)
+            terminal = self._terminals.get((session_id, terminal_id))
         return terminal.wait(after, timeout) if terminal is not None else TerminalPage()
 
-    def terminal_is_running(self, session_id: str) -> bool:
+    def terminal_is_running(self, session_id: str, terminal_id: str | None = None) -> bool:
         with self._lock:
-            terminal = self._terminals.get(session_id)
-        return terminal is not None and terminal.is_running
+            if terminal_id is not None:
+                terminal = self._terminals.get((session_id, terminal_id))
+                return terminal is not None and terminal.is_running
+            return any(
+                stored_session_id == session_id and terminal.is_running
+                for (stored_session_id, _), terminal in self._terminals.items()
+            )
 
     def start_terminal(
         self,
         session: CodingSession,
         credentials: EngineCredentials,
+        terminal_id: str,
         cols: int,
         rows: int,
+        shell: TerminalShellPreference = TerminalShellPreference.auto,
     ) -> TerminalPage:
         with self.session_lock(session.id):
             with self._lock:
-                current = self._terminals.get(session.id)
+                current = self._terminals.get((session.id, terminal_id))
             if current is not None and current.is_running:
                 return current.page()
 
@@ -160,31 +173,55 @@ class RuntimeManager:
             process_id = str(uuid.uuid4())
             terminal = TerminalBuffer(process_id)
             with self._lock:
-                self._terminals[session.id] = terminal
+                self._terminals[(session.id, terminal_id)] = terminal
             try:
-                runtime.start_terminal(process_id, cols, rows, terminal.append, terminal.finish)
+                runtime.start_terminal(process_id, cols, rows, shell, terminal.append, terminal.finish)
             except Exception:
                 terminal.finish(None, "Terminal process failed to start")
                 raise
             return terminal.page()
 
-    def write_terminal(self, session_id: str, data_base64: str) -> TerminalPage:
-        runtime, terminal = self._active_terminal(session_id)
+    def write_terminal(self, session_id: str, terminal_id: str, data_base64: str) -> TerminalPage:
+        runtime, terminal = self._active_terminal(session_id, terminal_id)
         runtime.write_terminal(terminal.process_id, data_base64)
         return terminal.page()
 
-    def resize_terminal(self, session_id: str, cols: int, rows: int) -> TerminalPage:
-        runtime, terminal = self._active_terminal(session_id)
+    def resize_terminal(self, session_id: str, terminal_id: str, cols: int, rows: int) -> TerminalPage:
+        runtime, terminal = self._active_terminal(session_id, terminal_id)
         runtime.resize_terminal(terminal.process_id, cols, rows)
         return terminal.page()
 
-    def stop_terminal(self, session_id: str) -> TerminalPage:
-        runtime, terminal = self._active_terminal(session_id)
+    def stop_terminal(self, session_id: str, terminal_id: str) -> TerminalPage:
+        runtime, terminal = self._active_terminal(session_id, terminal_id)
         runtime.stop_terminal(terminal.process_id)
         return terminal.page()
 
-    def terminal_status(self, session_id: str) -> str:
-        return self.terminal_page(session_id).status.value
+    def remove_terminal(self, session_id: str, terminal_id: str) -> None:
+        with self.session_lock(session_id):
+            with self._lock:
+                runtime = self._runtimes.get(session_id)
+                terminal = self._terminals.pop((session_id, terminal_id), None)
+            if terminal is None or not terminal.is_running:
+                return
+            try:
+                if runtime is not None and not runtime.is_closed:
+                    runtime.stop_terminal(terminal.process_id)
+            finally:
+                terminal.finish(None, None)
+
+    def terminal_status(self, session_id: str, terminal_id: str | None = None) -> str:
+        if terminal_id is not None:
+            return self.terminal_page(session_id, terminal_id).status.value
+        with self._lock:
+            terminals = [
+                terminal
+                for (stored_session_id, _), terminal in self._terminals.items()
+                if stored_session_id == session_id
+            ]
+        if not terminals:
+            return "stopped"
+        running = sum(terminal.is_running for terminal in terminals)
+        return f"{running} running · {len(terminals)} open"
 
     def close_all(self) -> None:
         with self._lock:
@@ -199,10 +236,10 @@ class RuntimeManager:
             if terminal.is_running:
                 terminal.finish(None, None)
 
-    def _active_terminal(self, session_id: str) -> tuple[EngineSession, TerminalBuffer]:
+    def _active_terminal(self, session_id: str, terminal_id: str) -> tuple[EngineSession, TerminalBuffer]:
         with self._lock:
             runtime = self._runtimes.get(session_id)
-            terminal = self._terminals.get(session_id)
+            terminal = self._terminals.get((session_id, terminal_id))
         if terminal is None or not terminal.is_running:
             raise RuntimeError("There is no running terminal for this coding task")
         if runtime is None or runtime.is_closed:

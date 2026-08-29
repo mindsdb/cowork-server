@@ -26,10 +26,16 @@ from cowork.coding.contracts import (
     SessionCreateRequest,
     SessionPage,
     SessionUpdateRequest,
+    TerminalCreateRequest,
     TerminalInputRequest,
+    TerminalPage,
     TerminalResizeRequest,
+    TerminalRenameRequest,
     TerminalStartRequest,
+    TerminalShellInventory,
     TerminalStatus,
+    TerminalTabPage,
+    TerminalTabState,
     TurnRequest,
 )
 from cowork.coding.engines.base import EngineCredentials
@@ -50,6 +56,7 @@ from cowork.coding.project_models import (
     WorkItemSearchRequest,
 )
 from cowork.coding.redaction import redact_text
+from cowork.coding.shells import shell_inventory
 from cowork.coding.service import CodingService, get_coding_service
 from cowork.coding.skill_models import (
     SkillLibraryDocument,
@@ -68,6 +75,13 @@ from cowork.services.skills import CodeSkillService
 
 router = APIRouter(dependencies=[Depends(require_local), Depends(require_local_tenancy)])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/terminal-shells", response_model=TerminalShellInventory)
+def terminal_shells():
+    return shell_inventory()
+
+
 SessionDep = Annotated[Session, Depends(get_session)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
@@ -537,6 +551,86 @@ def cancel(session_id: str):
     return _call(_service().cancel, session_id)
 
 
+@router.get("/sessions/{session_id}/terminals", response_model=TerminalTabPage)
+def terminals(session_id: str):
+    return _call(_service().terminals, session_id)
+
+
+@router.post("/sessions/{session_id}/terminals", response_model=TerminalTabState)
+def create_terminal(session_id: str, body: TerminalCreateRequest):
+    return _call(_service().create_terminal_tab, session_id, body.label)
+
+
+@router.patch("/sessions/{session_id}/terminals/{terminal_id}", response_model=TerminalTabState)
+def rename_terminal(session_id: str, terminal_id: str, body: TerminalRenameRequest):
+    return _call(_service().rename_terminal_tab, session_id, terminal_id, body.label)
+
+
+@router.delete("/sessions/{session_id}/terminals/{terminal_id}", status_code=204)
+def delete_terminal(session_id: str, terminal_id: str):
+    _call(_service().delete_terminal_tab, session_id, terminal_id)
+
+
+@router.get("/sessions/{session_id}/terminals/{terminal_id}")
+def terminal_tab(session_id: str, terminal_id: str, after: int = Query(default=0, ge=0)):
+    return _call(_service().terminal_tab, session_id, terminal_id, after)
+
+
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/start")
+def start_terminal_tab(
+    session_id: str,
+    terminal_id: str,
+    body: TerminalStartRequest,
+    session: SessionDep,
+    scope: ScopeDep,
+):
+    return _call(
+        _service().start_terminal_tab,
+        session_id,
+        terminal_id,
+        _credentials(_settings(session, scope)),
+        body.cols,
+        body.rows,
+        body.shell,
+    )
+
+
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/input")
+def terminal_tab_input(session_id: str, terminal_id: str, body: TerminalInputRequest):
+    return _call(_service().write_terminal_tab, session_id, terminal_id, body.data_base64)
+
+
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/resize")
+def terminal_tab_resize(session_id: str, terminal_id: str, body: TerminalResizeRequest):
+    return _call(_service().resize_terminal_tab, session_id, terminal_id, body.cols, body.rows)
+
+
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/stop")
+def terminal_tab_stop(session_id: str, terminal_id: str):
+    return _call(_service().stop_terminal_tab, session_id, terminal_id)
+
+
+@router.get("/sessions/{session_id}/terminals/{terminal_id}/stream")
+async def stream_terminal_tab(
+    request: Request,
+    session_id: str,
+    terminal_id: str,
+    after: int = Query(default=0, ge=0),
+):
+    service = _service()
+    _call(service.terminal_tab, session_id, terminal_id)
+    return _terminal_stream_response(
+        request,
+        after,
+        lambda cursor, timeout: service.wait_for_terminal_tab(
+            session_id,
+            terminal_id,
+            cursor,
+            timeout,
+        ),
+    )
+
+
 @router.get("/sessions/{session_id}/terminal")
 def terminal(session_id: str, after: int = Query(default=0, ge=0)):
     return _call(_service().terminal, session_id, after)
@@ -555,6 +649,7 @@ def start_terminal(
         _credentials(_settings(session, scope)),
         body.cols,
         body.rows,
+        body.shell,
     )
 
 
@@ -577,12 +672,24 @@ def terminal_stop(session_id: str):
 async def stream_terminal(request: Request, session_id: str, after: int = Query(default=0, ge=0)):
     service = _service()
     _call(service.get_session, session_id)
+    return _terminal_stream_response(
+        request,
+        after,
+        lambda cursor, timeout: service.wait_for_terminal(session_id, cursor, timeout),
+    )
+
+
+def _terminal_stream_response(
+    request: Request,
+    after: int,
+    wait_for_page: Callable[[int, float], TerminalPage],
+) -> StreamingResponse:
 
     async def generate():
         cursor = after
         yield "retry: 1000\n\n"
         while not await request.is_disconnected():
-            page = await asyncio.to_thread(service.wait_for_terminal, session_id, cursor, 15.0)
+            page = await asyncio.to_thread(wait_for_page, cursor, 15.0)
             for chunk in page.items:
                 cursor = chunk.seq
                 payload = chunk.model_dump(mode="json")
