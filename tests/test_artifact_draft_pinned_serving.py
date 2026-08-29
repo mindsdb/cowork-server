@@ -29,11 +29,14 @@ def _artifact(tmp_path, *, metadata: dict | None = None):
     return source, folder, metadata or {"type": "html-app"}
 
 
-async def _serve(monkeypatch, source, folder, metadata, rel_path, *, comments=False):
+async def _serve(
+    monkeypatch, source, folder, metadata, rel_path, *,
+    comments=False, download=False, is_own=True,
+):
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, metadata, True),
+        lambda *_args: (source, folder, metadata, is_own),
     )
     request = SimpleNamespace(
         query_params={ACTIVATION_PARAM: "1"} if comments else {}
@@ -44,6 +47,7 @@ async def _serve(monkeypatch, source, folder, metadata, rel_path, *, comments=Fa
         rel_path,
         request,
         SimpleNamespace(),
+        download=download,
     )
 
 
@@ -291,3 +295,112 @@ async def test_fullstack_preview_stays_inside_the_declared_public_subtree(
     with pytest.raises(HTTPException) as error:
         await _serve(monkeypatch, source, folder, metadata, "backend.py")
     assert error.value.status_code == 404
+
+
+# ── ?download=1 (ENG-2044) ──────────────────────────────────────────────────
+# On an org deployment this parameter is the only way to obtain a non-HTML
+# artifact: `/serve` is desktop-only there and autopublish skips anything that
+# is not HTML/Markdown. The bytes and the authorization are the preview's; only
+# the disposition changes.
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+async def test_download_serves_a_binary_as_an_attachment(tmp_path, monkeypatch):
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    payload = b"PK\x03\x04" + bytes(range(64))
+    (folder / "report.xlsx").write_bytes(payload)
+
+    response = await _serve(monkeypatch, source, folder, metadata, "report.xlsx", download=True)
+
+    assert isinstance(response, StreamingResponse)
+    assert response.media_type == XLSX
+    assert response.headers["content-disposition"] == (
+        "attachment; filename=\"report.xlsx\"; filename*=UTF-8''report.xlsx"
+    )
+    # The preview's hardening headers are kept, not replaced.
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["content-length"] == str(len(payload))
+    assert await _stream_body(response) == payload
+
+
+async def test_without_download_the_response_is_unchanged(tmp_path, monkeypatch):
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    (folder / "report.xlsx").write_bytes(b"PK")
+
+    response = await _serve(monkeypatch, source, folder, metadata, "report.xlsx")
+
+    assert "content-disposition" not in response.headers
+
+
+async def test_download_skips_the_comment_layer(tmp_path, monkeypatch):
+    """A saved HTML file must be the file, not the review page wrapped around it."""
+    source, folder, metadata = _artifact(tmp_path)
+    (folder / "index.html").write_text("<h1>deck</h1>", encoding="utf-8")
+
+    response = await _serve(
+        monkeypatch, source, folder, metadata, "index.html", comments=True, download=True,
+    )
+
+    assert isinstance(response, StreamingResponse)
+    assert not isinstance(response, HTMLResponse)
+    assert response.headers["content-disposition"].startswith("attachment;")
+    assert await _stream_body(response) == b"<h1>deck</h1>"
+
+
+@pytest.mark.parametrize(
+    ("name", "ascii_part", "encoded_part"),
+    (
+        # A quote must be escaped, not close the parameter early.
+        ('evil" bad.txt', 'evil\\" bad.txt', "evil%22%20bad.txt"),
+        # CR/LF are dropped: the header can never gain a second line.
+        ("a\r\nX-Injected: 1.txt", "aX-Injected: 1.txt", "aX-Injected%3A%201.txt"),
+        # Non-ASCII survives only in the RFC 5987 spelling; the ASCII one degrades.
+        ("rapport-\u00e9.xlsx", "rapport-.xlsx", "rapport-%C3%A9.xlsx"),
+    ),
+)
+async def test_download_filename_cannot_inject_headers(
+    tmp_path, monkeypatch, name, ascii_part, encoded_part
+):
+    """`_relative_file_parts` lets these names through — it only guards the
+    filesystem walk. The header builder is the second gate."""
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    (folder / name).write_bytes(b"x")
+
+    response = await _serve(monkeypatch, source, folder, metadata, name, download=True)
+
+    disposition = response.headers["content-disposition"]
+    assert "\r" not in disposition and "\n" not in disposition
+    assert disposition == (
+        f'attachment; filename="{ascii_part}"; filename*=UTF-8\'\'{encoded_part}'
+    )
+
+
+async def test_download_is_served_to_a_granted_reviewer(tmp_path, monkeypatch):
+    """Recorded decision (ENG-2044): a review grant already exposes every byte
+    through the preview, so a reviewer may save the file too."""
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    (folder / "report.docx").write_bytes(b"PK")
+
+    response = await _serve(
+        monkeypatch, source, folder, metadata, "report.docx", download=True, is_own=False,
+    )
+
+    assert response.headers["content-disposition"].startswith("attachment;")
+
+
+async def test_download_does_not_bypass_authorization(tmp_path, monkeypatch):
+    """The parameter changes the disposition only; who may read is decided
+    before it is ever looked at."""
+    def deny(*_args):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", deny)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workspace_ep.serve_private_draft(
+            "local", "0123456789abcdef0123456789abcdef", "report.xlsx",
+            SimpleNamespace(query_params={}), SimpleNamespace(), download=True,
+        )
+    assert excinfo.value.status_code == 404
