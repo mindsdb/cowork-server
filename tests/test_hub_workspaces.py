@@ -425,6 +425,118 @@ def test_switching_into_an_archived_workspace_is_refused(session, calls):
     assert SettingService(session, _scope()).load().hub_workspace_id == ""
 
 
+def test_a_desktop_account_switch_does_not_reuse_the_previous_listing(session, calls):
+    """The per-caller key has to include the CREDENTIAL, not just the identity.
+
+    Outside org mode `scope_from_principal` returns LOCAL_SCOPE, so `user_id` is
+    None for every request on a desktop install and an identity-only key collapses
+    to one shared entry. Sign out, sign in as someone else, and the previous
+    account's workspaces would be served for the rest of the TTL, with the grant
+    check on `PUT /active` reading them.
+    """
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
+    first = _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
+    assert [w.id for w in first.workspaces] == [WS_DEFAULT, WS_CLIENT_A]
+
+    # Same process, same (empty) scope, a different MindsHub session.
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT)
+    second = _view(session, LOCAL_SCOPE, bearer="jwt-second-account")
+
+    assert [w.id for w in second.workspaces] == [WS_DEFAULT]
+
+
+def test_a_desktop_account_switch_cannot_switch_on_the_previous_listing(session, calls):
+    """Same key, but on the path where it authorizes rather than renders."""
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
+    _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
+
+    calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT)
+    with pytest.raises(HTTPException) as caught:
+        _activate(session, LOCAL_SCOPE, WS_CLIENT_A, bearer="jwt-second-account")
+
+    assert caught.value.status_code == 403
+
+
+def test_the_archived_refusal_survives_a_write_through_the_settings_route(session, calls):
+    """The 409 must not read a value any caller can write.
+
+    `hub_workspace_id` is an untagged UserSettings field, so
+    `PUT /api/v1/settings/hub_workspace_id` stores it with no gate and no listing
+    check. `selectable` keeps the ACTIVE row even when archived, so a refusal
+    phrased as "is this in the set the menu offered" would have been talked into
+    accepting an archived workspace by one call to that route.
+    """
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows(archived=True)
+    # Exactly what the unguarded second writer does.
+    SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_ARCHIVED)
+
+    with pytest.raises(HTTPException) as caught:
+        _activate(session, _scope(), WS_ARCHIVED)
+
+    assert caught.value.status_code == 409
+
+
+def test_a_gate_off_verdict_is_cached_as_long_as_a_gate_on_one(session, calls):
+    """A verdict auth actually returned is an answer, whichever way it went.
+
+    The TTL used to be picked from the verdict, so a definite "off" got the 15s
+    failure budget. That is the state this ships in, and per-caller keys made it
+    one extra entitlements read per person rather than per organization.
+    """
+    _gate(calls, False)
+    assert _view(session, _scope()).enabled is False
+    asked_once = calls.asked.count(ENTITLEMENTS)
+
+    # Age the entry past _TTL_FAIL but leave it well inside _TTL_OK.
+    key = next(iter(svc._gate_cache))
+    stamped, value, answered = svc._gate_cache[key]
+    assert answered is True
+    svc._gate_cache[key] = (stamped - (svc._TTL_FAIL + 1), value, answered)
+
+    assert _view(session, _scope()).enabled is False
+    assert calls.asked.count(ENTITLEMENTS) == asked_once, (
+        "an answered gate-off verdict was re-fetched inside its own TTL"
+    )
+
+
+def test_an_unanswered_gate_read_keeps_the_short_ttl(session, calls):
+    """The other half: no answer is still cached, but only briefly."""
+    calls.answers.pop(ENTITLEMENTS, None)  # unreachable
+    assert _view(session, _scope()).enabled is False
+    asked_once = calls.asked.count(ENTITLEMENTS)
+
+    key = next(iter(svc._gate_cache))
+    stamped, value, answered = svc._gate_cache[key]
+    assert answered is False
+    svc._gate_cache[key] = (stamped - (svc._TTL_FAIL + 1), value, answered)
+
+    _view(session, _scope())
+
+    assert calls.asked.count(ENTITLEMENTS) == asked_once + 1
+
+
+def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(session, calls):
+    """Nothing re-reads a departed caller's key, so nothing would ever drop it."""
+    _gate(calls, True)
+    calls.answers[WORKSPACES] = _rows()
+    _view(session, LOCAL_SCOPE, bearer="jwt-someone-who-leaves")
+    assert len(svc._listing_cache) == 1
+
+    stale = {
+        k: (stamped - (svc._MAX_TTL_S + 1), v)
+        for k, (stamped, v) in svc._listing_cache.items()
+    }
+    svc._listing_cache.clear()
+    svc._listing_cache.update(stale)
+
+    _view(session, LOCAL_SCOPE, bearer="jwt-somebody-else")
+
+    assert len(svc._listing_cache) == 1, "the departed caller's entry was never dropped"
+
+
 # ── Where the pick is stored ─────────────────────────────────────────
 
 
@@ -518,9 +630,22 @@ def test_nothing_on_the_turn_path_reads_the_stored_workspace():
     missing = [str(t.relative_to(repo)) for t in targets if not t.exists()]
     assert not missing, f"this guard points at paths that no longer exist: {missing}"
 
-    files = [f for t in targets for f in ([t] if t.is_file() else sorted(t.rglob("*.py")))]
-    assert files, "the guard matched no Python files, so it proved nothing"
-    hits = [str(f.relative_to(repo)) for f in files if "hub_workspace_id" in f.read_text()]
+    # Every file, not just `*.py`. The shell version this replaced was a plain
+    # `grep -rln`, so it also read the skill markdown and prompt templates under
+    # `cowork/harnesses/`, and the turn path can name a setting from one of those
+    # as easily as from code.
+    def _walk(target):
+        if target.is_file():
+            return [target]
+        return sorted(f for f in target.rglob("*") if f.is_file())
+
+    files = [f for t in targets for f in _walk(t)]
+    assert files, "the guard matched no files, so it proved nothing"
+    hits = [
+        str(f.relative_to(repo))
+        for f in files
+        if "hub_workspace_id" in f.read_text(encoding="utf-8", errors="ignore")
+    ]
 
     assert hits == [], f"the turn path reads the stored workspace: {hits}"
 
