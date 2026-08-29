@@ -27,9 +27,13 @@ returns None so shared code can branch on "no tenant context".
 
 from __future__ import annotations
 
+import binascii
+import json
 import logging
+from base64 import urlsafe_b64decode
 from collections.abc import Collection
 from dataclasses import dataclass, field
+from typing import Literal
 from uuid import UUID
 
 from fastapi import Request
@@ -46,6 +50,10 @@ HEADER_USER_ID = "X-User-Id"
 HEADER_ORG_ID = "X-Organization-Id"
 HEADER_USER_EMAIL = "X-User-Email"
 HEADER_USER_ROLES = "X-User-Roles"
+HEADER_EXPECTED_ORG_ID = "X-Cowork-Expected-Organization-Id"
+HEADER_ORG_RELOAD = "X-Cowork-Organization-Reload"
+
+OrganizationBoundaryMode = Literal["audit", "enforce"]
 
 # Always reachable without identity; channel webhooks are added by create_app().
 _EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/health/"})
@@ -74,10 +82,12 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         app: ASGIApp,
         exempt_paths: Collection[str] = (),
         enforce: bool = True,
+        organization_boundary_mode: OrganizationBoundaryMode = "enforce",
     ) -> None:
         super().__init__(app)
         self._exempt_paths = exempt_paths
         self._enforce = enforce
+        self._organization_boundary_mode = organization_boundary_mode
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         # CORS preflight never carries identity headers.
@@ -112,7 +122,99 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
             email=request.headers.get(HEADER_USER_EMAIL, "").strip(),
             roles=roles,
         )
+
+        boundary_response = self._organization_boundary_response(request, org_id)
+        if boundary_response is not None:
+            return boundary_response
         return await call_next(request)
+
+    def _organization_boundary_response(
+        self, request: Request, trusted_org_id: str
+    ) -> JSONResponse | None:
+        """Fence stale canonical-web documents against the trusted principal.
+
+        The ingress has already authenticated the credential and supplied
+        ``trusted_org_id``. The bearer shape is used only to identify Keycloak
+        browser sessions; it never supplies identity. API keys and opaque
+        service credentials remain compatible with existing callers.
+        """
+        if not _is_browser_jwt_request(request):
+            return None
+
+        supplied = request.headers.get(HEADER_EXPECTED_ORG_ID)
+        status_code: int | None = None
+        reason: str | None = None
+        if supplied is None or not supplied.strip():
+            status_code = 426
+            reason = "missing expected organization"
+        else:
+            try:
+                expected_org_id = str(UUID(supplied.strip()))
+            except ValueError:
+                status_code = 409
+                reason = "malformed expected organization"
+            else:
+                if expected_org_id != trusted_org_id:
+                    status_code = 409
+                    reason = "organization mismatch"
+
+        if status_code is None or reason is None:
+            return None
+
+        logger.warning(
+            "organization boundary: %s on %s %s (%s mode)",
+            reason,
+            request.method,
+            request.url.path,
+            self._organization_boundary_mode,
+        )
+        if self._organization_boundary_mode == "audit":
+            return None
+        return JSONResponse(
+            {
+                "code": "organization_reload_required",
+                "detail": "Reload Cowork to continue in the active organization.",
+            },
+            status_code=status_code,
+            headers={
+                "Cache-Control": "no-store",
+                HEADER_ORG_RELOAD: "required",
+            },
+        )
+
+
+def _has_jose_header(segment: str) -> bool:
+    """True when a token's first segment decodes to a JOSE header object.
+
+    Read the segment rather than measuring it. A compact header such as
+    ``{"alg":"RS256"}`` encodes to exactly 20 characters, so a length threshold
+    classifies a real signed token as an opaque credential and silently skips
+    the boundary for it.
+    """
+    padding = "=" * (-len(segment) % 4)
+    try:
+        header = json.loads(urlsafe_b64decode(segment + padding))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return False
+    return isinstance(header, dict) and isinstance(header.get("alg"), str) and bool(header["alg"])
+
+
+def _is_browser_jwt_request(request: Request) -> bool:
+    """True only for a bearer shaped like a browser Keycloak JWT.
+
+    Authentication remains the ingress gateway's job; this only decides which
+    callers take part in the browser reload protocol. MindsDB API keys carry
+    the ``mdb_`` prefix, and every other opaque service credential fails the
+    JOSE header check, so both keep their existing behavior.
+    """
+    authorization = request.headers.get("Authorization", "").strip()
+    if not authorization.lower().startswith("bearer "):
+        return False
+    credential = authorization[7:].strip()
+    if not credential or credential.lower().startswith("mdb_"):
+        return False
+    parts = credential.split(".")
+    return len(parts) == 3 and all(parts) and _has_jose_header(parts[0])
 
 
 def get_principal(request: Request) -> Principal | None:
