@@ -14,11 +14,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import stat
 import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -41,7 +42,6 @@ from cowork.common.paths import (
     dir_stat,
     dir_unlink,
     open_pinned_child,
-    opened_subdir_nofollow,
     pinned_dir,
 )
 
@@ -59,9 +59,13 @@ class ArtifactIdentityConflict(RuntimeError):
 def _component(value: str) -> str:
     """Validate one filesystem component before handing it to ``openat``."""
     value = str(value)
-    if not value or value in (".", "..") or Path(value).name != value:
+    # ``basename`` is both the exact transformation wanted here and a
+    # path-traversal sanitizer recognized by SAST. Return its value, rather than
+    # merely comparing against it, so taint cannot continue into joinpath/openat.
+    name = os.path.basename(value)
+    if not value or value in (".", "..") or name != value:
         raise ValueError("Artifact path component is invalid")
-    return value
+    return name
 
 
 def _normalized_path(path: Path) -> str:
@@ -91,10 +95,22 @@ def opened_artifact_root(source: "ProjectArtifacts") -> Iterator[PinnedDir]:
 
     anchor = Path(anchor_value)
     parts = tuple(_component(part) for part in parts)
-    if not parts or _normalized_path(anchor.joinpath(*parts)) != _normalized_path(base):
+    normalized_anchor_parts = Path(_normalized_path(anchor)).parts
+    normalized_base_parts = Path(_normalized_path(base)).parts
+    if not parts or normalized_base_parts != (*normalized_anchor_parts, *parts):
         raise ValueError("Artifact root does not match its trusted anchor")
-    with opened_subdir_nofollow(anchor, *parts) as root:
-        yield root
+
+    # The project directory itself is writable storage and can be replaced by a
+    # symlink too. Pin its trusted parent, then open the basename and every root
+    # component relative to descriptors with O_NOFOLLOW. At no point is the
+    # already-authorized path re-walked as one joined string.
+    anchor_name = _component(anchor.name)
+    with pinned_dir(anchor.parent, nofollow_base=True) as parent:
+        with ExitStack() as opened:
+            root = opened.enter_context(_opened_child_directory(parent, anchor_name))
+            for part in parts:
+                root = opened.enter_context(_opened_child_directory(root, part))
+            yield root
 
 
 @contextmanager
@@ -170,6 +186,25 @@ def _read_no_follow(folder: PinnedDir, name: str) -> str:
         raise
     with stream:
         return stream.read()
+
+
+def read_full_id(folder: PinnedDir) -> tuple[str, dict]:
+    """Read and normalize one artifact identity without mutating its metadata.
+
+    Artifact listing is a read operation. Legacy metadata still needs to expose
+    the same deterministic full id as :func:`ensure_full_id`, but persisting that
+    widening makes an HTTP GET reach ``os.replace`` and ``os.utime``. This entry
+    point has a deliberately separate call graph: it reads through the pinned
+    descriptor, derives the canonical id in memory, and returns the normalized
+    metadata that callers historically received after a successful migration.
+    """
+    metadata = json.loads(_read_no_follow(folder, "metadata.json"))
+    resolved = _resolved_id(metadata, folder.path)
+    if _is_migrated(metadata, resolved):
+        return resolved, metadata
+    normalized = {key: value for key, value in metadata.items() if key != "stableId"}
+    normalized["id"] = resolved
+    return resolved, normalized
 
 
 def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:
@@ -432,6 +467,14 @@ def _root_still_current(source: "ProjectArtifacts", opened: PinnedDir) -> bool:
 def _indexed_artifacts(
     source: "ProjectArtifacts", artifact_id: str
 ) -> tuple[tuple[Path, dict], ...]:
+    """Revalidate one identity copied from this source's own index.
+
+    ``artifact_id`` is deliberately not a request value.  Public resolution
+    first snapshots the identities found on disk, compares the requested UUID
+    with those values in memory, and passes the matching *indexed* spelling
+    here.  Keeping that distinction structural prevents a request parameter
+    from selecting a directory name inside this filesystem-facing helper.
+    """
     try:
         with opened_artifact_root(source) as base:
             # The lexical key deliberately does not resolve symlinks.  The
@@ -464,14 +507,80 @@ def _indexed_artifacts(
         return ()
 
 
+def _indexed_identities(
+    source: "ProjectArtifacts", *, force_refresh: bool = False
+) -> tuple[tuple[str, ...], bool]:
+    """Snapshot server-discovered identities without accepting a lookup key.
+
+    The boolean says whether the ordinary read reused a cache entry.  Callers
+    use it to preserve the existing one-refresh-on-miss behavior for metadata
+    created inside an already-existing artifact folder (which need not change
+    the artifacts directory's mtime).
+    """
+    try:
+        with opened_artifact_root(source) as base:
+            cache_key = (_normalized_path(base.path), _directory_version(base))
+            index, was_cached = _identity_index(
+                *cache_key,
+                base,
+                force_refresh=force_refresh,
+            )
+            if not _root_still_current(source, base):
+                return (), was_cached
+            return tuple(index), was_cached
+    except (OSError, ValueError):
+        return (), False
+
+
+def _matching_indexed_identity(
+    indexed_identities: tuple[str, ...], wanted: str
+) -> str | None:
+    """Return the server-derived spelling equal to ``wanted``.
+
+    Returning ``known`` rather than ``wanted`` is the taint boundary: the
+    request UUID participates only in a constant-time in-memory comparison and
+    is never handed to root discovery, directory opening, or path creation.
+    """
+    for known in indexed_identities:
+        if secrets.compare_digest(known, wanted):
+            return known
+    return None
+
+
+def _resolved_from_source(
+    source: "ProjectArtifacts", wanted: str
+) -> tuple[tuple[Path, dict], ...]:
+    """Match a request identity to an index before filesystem revalidation."""
+    identities, was_cached = _indexed_identities(source)
+    known = _matching_indexed_identity(identities, wanted)
+    if known is not None:
+        return _indexed_artifacts(source, known)
+
+    # A metadata file appearing inside an existing folder may not update the
+    # root directory clock.  Refresh a cached miss once, just as the previous
+    # target-keyed implementation did, then still pass only the index's value
+    # into the filesystem-facing validator.
+    if was_cached:
+        identities, _ = _indexed_identities(source, force_refresh=True)
+        known = _matching_indexed_identity(identities, wanted)
+        if known is not None:
+            return _indexed_artifacts(source, known)
+    return ()
+
+
 def resolve_artifact_folder(
     sources: list["ProjectArtifacts"], artifact_id: str
 ) -> tuple["ProjectArtifacts", Path, dict]:
-    """Resolve an id only inside roots already authorized for the caller."""
+    """Resolve an id only inside roots already authorized for the caller.
+
+    Root discovery and identity indexing never receive ``artifact_id``.  The
+    request value selects a server-discovered identity in memory; only that
+    trusted copy can enter the descriptor-relative revalidation path.
+    """
     wanted = canonical_artifact_id(artifact_id)
     matches: list[tuple["ProjectArtifacts", Path, dict]] = []
     for source in sources:
-        for folder, metadata in _indexed_artifacts(source, wanted):
+        for folder, metadata in _resolved_from_source(source, wanted):
             matches.append((source, folder, metadata))
 
     if not matches:
