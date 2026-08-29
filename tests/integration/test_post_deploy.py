@@ -44,6 +44,8 @@ import uuid
 import httpx
 import pytest
 
+from tests.integration.prereq import missing_prerequisite
+
 pytestmark = pytest.mark.postdeploy
 
 # A turn that runs for a while, so there is something to cancel and something
@@ -83,7 +85,7 @@ BROWSER_UA = (
 def _base_url() -> str:
     url = os.environ.get("COWORK_BASE_URL")
     if not url:
-        pytest.skip("COWORK_BASE_URL not set; post-deploy tests only run against a deployment")
+        missing_prerequisite("COWORK_BASE_URL not set; post-deploy tests only run against a deployment")
     return url.rstrip("/")
 
 
@@ -123,7 +125,7 @@ def _provision_identity() -> dict[str, str]:
         provision_url = os.environ.get("TEST_USER_PROVISION_URL")
         secret = os.environ.get("TEST_USER_PROVISION_SECRET")
         if not (provision_url and secret):
-            pytest.skip(
+            missing_prerequisite(
                 "no identity source: set COWORK_TEST_API_KEY + COWORK_TEST_USER_ID + "
                 "COWORK_TEST_ORG_ID, or TEST_USER_MINT_URL, or TEST_USER_PROVISION_URL "
                 "+ TEST_USER_PROVISION_SECRET"
@@ -279,7 +281,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     url_a = os.environ.get("COWORK_BASE_URL_A")
     url_b = os.environ.get("COWORK_BASE_URL_B")
     if not (url_a and url_b):
-        pytest.skip("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
+        missing_prerequisite("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
 
     headers = _direct_headers(identity)
     with httpx.Client(base_url=url_a.rstrip("/"), headers=headers, timeout=30.0) as replica_a:
