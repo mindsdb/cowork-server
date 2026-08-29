@@ -9,18 +9,13 @@ from cowork.api.v1.endpoints.guards import require_local
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse
-from cowork.services.connectors.oauth import auth_proxy, picker_session
+from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.oauth.google import (
     _ENGINE_TO_SERVICE,
     _SERVICE_CREDENTIAL_ATTRS,
     _credentials_complete,
     oauth_service,
-)
-from cowork.services.connectors.oauth.picker_page import (
-    is_valid_drive_file_ids,
-    render_picker_error_page,
-    render_picker_page,
 )
 
 router = APIRouter()
@@ -111,14 +106,23 @@ def _require_picker_engine(engine: str, *, org_mode: bool) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No file picker for engine {engine!r}")
 
 
-@router.post("/{engine}/picker/session")
-async def create_picker_session(engine: str, request: Request, scope: ScopeDep, body: dict = Body(default_factory=dict)):
-    """Org-mode only. Mints the live access token now, while the caller's
-    real Bearer header is still present on this `fetch()` POST — the popup
-    navigation that follows can't carry that header, so the token has to be
-    minted here and handed off via an opaque session id instead. See
-    `picker_session.py` and `oauth_picker` below, and cowork's
-    `pickDriveFilesWeb()` (host.ts) for the two-step caller side of this."""
+@router.post("/{engine}/picker/token")
+async def mint_picker_token(engine: str, request: Request, scope: ScopeDep, body: dict = Body(default_factory=dict)):
+    """Org-mode only. Mints the live access token directly into the JSON
+    response.
+
+    Replaces the old two-step session handoff (mint at POST time, hand off
+    via an opaque Redis-backed ticket to a header-less `GET .../picker`
+    popup navigation, which could never carry a Bearer header). The Picker
+    now renders in-page in the SPA itself (see `pickDriveFiles`/host.ts) —
+    everything here is a normal authenticated `fetch()`, so there is no
+    header-less hop this token needs to survive, and nothing about it is
+    ever served to an unauthenticated request.
+
+    `file_ids` (pre-navigating the picker to specific files) is no longer
+    threaded through this endpoint at all: the caller already has that value
+    itself and can hand it straight to the Picker widget's own JS builder,
+    with no server round trip needed."""
     _require_picker_engine(engine, org_mode=scope.org_mode)
 
     settings = OAuthSettings()
@@ -134,54 +138,9 @@ async def create_picker_session(engine: str, request: Request, scope: ScopeDep, 
             detail="Google Drive Picker is not fully configured for this deployment.",
         )
 
-    file_ids = body.get("file_ids") or []
-    if not is_valid_drive_file_ids(file_ids):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file id.")
-
-    session_id = await picker_session.create({
+    return {
         "access_token": access_token,
         "account_email": account_email,
         "api_key": api_key,
         "app_id": app_id,
-        "file_ids": file_ids,
-    })
-    return {"url": f"/api/v1/connectors/oauth/{engine}/picker?session={session_id}"}
-
-
-@router.get("/{engine}/picker", response_class=HTMLResponse)
-async def oauth_picker(engine: str, request: Request, scope: ScopeDep, session: str = Query(...)):
-    """Org-mode only — the web equivalent of Electron's own loopback picker
-    flow (drive-picker-service.ts). Served to a plain popup `window.open()`
-    navigation, so it can't rely on a Bearer header here — the live access
-    token was already minted by `create_picker_session` above, while the
-    caller's real credential was still present; this route only looks that
-    session up once, by its opaque id, and embeds the result directly into
-    the HTML page it returns (never in a JSON response the browser could
-    read outside this page). Desktop's local-mode `/{engine}/credentials`
-    stays untouched and is never used for this — it returns a raw
-    client_secret, which is fine for the loopback-only Electron main process
-    but never for a browser.
-
-    `scope` here resolves org_mode from settings alone (no Authorization
-    header needed) — get_principal(request) returning None just leaves
-    org_id/user_id unset, which this route never reads."""
-    _require_picker_engine(engine, org_mode=scope.org_mode)
-
-    data = await picker_session.consume(session)
-    if data is None:
-        return HTMLResponse(
-            content=render_picker_error_page(
-                "This file picker link has expired or was already used. Go back and try again."
-            ),
-            status_code=status.HTTP_404_NOT_FOUND,
-        )
-
-    html = render_picker_page(
-        access_token=data["access_token"],
-        api_key=data["api_key"],
-        app_id=data["app_id"],
-        account_email=data.get("account_email", ""),
-        state=session,
-        file_ids=data.get("file_ids") or [],
-    )
-    return HTMLResponse(content=html)
+    }
