@@ -110,6 +110,12 @@ jobs:
             dev|staging) enforce=true ;;
             *)           enforce=false ;;
           esac
+          # The same answer, handed to pytest. A post-deploy test with no target
+          # and no identity skips, and nine skips print the same green as nine
+          # passes, which is how this suite ran on every staging push without
+          # anyone noticing. Where the environment is supposed to have every
+          # prerequisite, a missing one is a defect: see tests/integration/prereq.py.
+          echo "COWORK_REQUIRE_INTEGRATION=$enforce" >> "$GITHUB_ENV"
           # Selected by name rather than by label: the chart comes from an
           # external `deployment` dependency, so its label scheme is not ours to
           # rely on. Deployment pods are always <deployment>-<hash>-<suffix>.
@@ -174,7 +180,7 @@ jobs:
             exit 0
           fi
           echo "::error::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first:" \
-               "kubectl -n $ns auth can-i create pods/portforward" \
+               "kubectl -n $ns auth can-i create pods --subresource=portforward" \
                "--as=system:serviceaccount:infrastructure:<env>-gha-runner"
           exit 1
 
