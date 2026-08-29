@@ -60,9 +60,13 @@ class ArtifactIdentityConflict(RuntimeError):
 def _component(value: str) -> str:
     """Validate one filesystem component before handing it to ``openat``."""
     value = str(value)
-    if not value or value in (".", "..") or Path(value).name != value:
+    # ``basename`` is both the exact transformation wanted here and a
+    # path-traversal sanitizer recognized by SAST. Return its value, rather than
+    # merely comparing against it, so taint cannot continue into joinpath/openat.
+    name = os.path.basename(value)
+    if not value or value in (".", "..") or name != value:
         raise ValueError("Artifact path component is invalid")
-    return value
+    return name
 
 
 def _normalized_path(path: Path) -> str:

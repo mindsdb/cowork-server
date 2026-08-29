@@ -200,10 +200,16 @@ def _validated_project_path(path: str) -> _ValidatedProjectPath:
     cleaned = path.replace("\\", "/")
     if cleaned.startswith("/") or ntpath.splitdrive(cleaned)[0]:
         raise HTTPException(status_code=400, detail="invalid path")
-    parts = tuple(cleaned.split("/"))
-    if any(not part or part in {".", ".."} for part in parts):
-        raise HTTPException(status_code=400, detail="invalid path")
-    return _ValidatedProjectPath(parts)
+    parts: list[str] = []
+    for raw_part in cleaned.split("/"):
+        # Keep a standard, sink-recognized sanitizer on every value retained by
+        # the dependency.  The equality check preserves the route's existing
+        # rejection semantics instead of silently accepting only a suffix.
+        part = os.path.basename(raw_part)
+        if not part or part != raw_part or part in {".", ".."}:
+            raise HTTPException(status_code=400, detail="invalid path")
+        parts.append(part)
+    return _ValidatedProjectPath(tuple(parts))
 
 
 ProjectMutationPathDep = Annotated[_ValidatedProjectPath, Depends(_validated_project_path)]
@@ -559,11 +565,14 @@ def write_project_file(
     req: _FileWriteRequest,
     scoped: ScopedSessionDep,
 ):
-    base = _project_dir(project_name, scoped)
-    target = _safe_relpath(path, base)
-    _require_workspace_access(target, base, scoped)
-    if target.exists() and target.is_dir():
-        raise HTTPException(status_code=400, detail="Path is a directory")
+    # Keep the recognized sanitizer on both path-bearing HTTP parameters at the
+    # decorated route boundary. ``_project_dir`` repeats the validation for its
+    # other callers and resolves this leaf only through the scoped catalog.
+    selected_project_name = os.path.basename(project_name)
+    if selected_project_name != project_name:
+        raise HTTPException(status_code=404, detail="Project not found")
+    base = _project_dir(selected_project_name, scoped)
+    _require_workspace_path(path, scoped)
     body = req.content or ""
     encoded = body.encode("utf-8")
     if len(encoded) > TEXT_MAX_BYTES:
@@ -572,10 +581,25 @@ def write_project_file(
     # workspace between the gate and the open lands this write in another
     # member's directory, and `.anton/anton.md` there is an instruction file
     # their agent reads.
-    rel = target.relative_to(base.resolve())
-    *dirs, name = rel.parts
+    # Re-sanitize at the filesystem boundary.  The dependency has already
+    # rejected traversal, absolute paths, empty components and drive prefixes;
+    # doing this beside the sink makes the guarantee explicit even to analyzers
+    # which do not model FastAPI dependency return types.
+    dirs = tuple(os.path.basename(part) for part in path.parts[:-1])
+    name = os.path.basename(path.parts[-1])
+    if dirs != path.parts[:-1] or name != path.parts[-1]:
+        raise HTTPException(status_code=400, detail="invalid path")
     try:
         with opened_subdir_nofollow(base, *dirs, create=True) as pinned:
+            try:
+                existing = dir_lstat(pinned, name)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if stat.S_ISLNK(existing.st_mode):
+                    raise HTTPException(status_code=404, detail="File not found")
+                if stat.S_ISDIR(existing.st_mode):
+                    raise HTTPException(status_code=400, detail="Path is a directory")
             fd = dir_open(
                 pinned, name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW, 0o644
             )

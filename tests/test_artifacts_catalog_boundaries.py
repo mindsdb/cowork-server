@@ -10,9 +10,10 @@ from fastapi import HTTPException
 
 from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts
+from cowork.services import artifact_identity
 
 
-def test_project_filtered_cards_are_built_before_the_request_selector_is_read(
+async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
     monkeypatch,
 ):
     request_id = uuid4()
@@ -26,24 +27,16 @@ def test_project_filtered_cards_are_built_before_the_request_selector_is_read(
             events.append("selector")
             return str(request_id)
 
-    class Projects:
-        def __init__(self, session):
-            assert session is seen["session"]
-
-        def list_projects(self):
-            events.append("catalog")
-            return [SimpleNamespace(id=server_id)]
-
     real_basename = artifacts.os.path.basename
 
     def sanitize(project_ref):
         events.append("basename")
         return real_basename(project_ref)
 
-    def discover(_session, project_id):
+    def discover(_session, project_ref):
         events.append("roots")
-        seen["discovery"] = project_id
-        return [trusted_source]
+        seen["project_ref"] = project_ref
+        return server_id, [trusted_source]
 
     def list_from_roots(sources):
         events.append("sink")
@@ -53,50 +46,101 @@ def test_project_filtered_cards_are_built_before_the_request_selector_is_read(
     session = SimpleNamespace()
     seen["session"] = session
     monkeypatch.setattr(artifacts.os.path, "basename", sanitize)
-    monkeypatch.setattr(artifacts, "ProjectService", Projects)
-    monkeypatch.setattr(artifacts, "artifacts_sources_for_project", discover)
+    monkeypatch.setattr(artifacts, "_scoped_project_sources", discover)
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
-    cards = artifacts.artifacts_for_request(
-        session, project_id=RequestProjectId()
+    cards = await artifacts.list_artifacts(
+        session,
+        project_id=RequestProjectId(),
+        project_path=None,
     )
 
     assert cards == []
-    assert seen["discovery"] is server_id
+    assert seen["project_ref"] == str(request_id)
     assert seen["card_sources"] == [trusted_source]
-    assert events == ["catalog", "roots", "sink", "selector", "basename"]
+    assert events == ["selector", "basename", "roots", "sink"]
 
 
-def test_desktop_path_cards_are_built_before_the_path_selector_is_read(monkeypatch):
-    source = SimpleNamespace(
+async def test_desktop_route_reselects_one_source_by_sanitized_name(monkeypatch):
+    other = SimpleNamespace(
+        base=Path("/server-owned/other/.anton/artifacts"),
+        project_id=None,
+        project_name="other",
+    )
+    selected = SimpleNamespace(
         base=Path("/server-owned/project/.anton/artifacts"),
         project_id=None,
         project_name="project",
     )
     events = []
-    real_expanduser = artifacts.os.path.expanduser
+
+    def discover():
+        events.append("roots")
+        return [other, selected]
 
     def list_from_roots(sources):
         events.append(("sink", sources))
         return []
 
-    def read_selector(value):
-        events.append(("selector", value))
-        return real_expanduser(value)
-
-    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda: [source])
+    monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
+    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", discover)
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
-    monkeypatch.setattr(artifacts.os.path, "expanduser", read_selector)
 
-    cards = artifacts._desktop_artifacts_for_project_path(
-        SimpleNamespace(), "/server-owned/project"
+    cards = await artifacts.list_artifacts(
+        SimpleNamespace(),
+        project_id=None,
+        project_path="/server-owned/project",
     )
 
     assert cards == []
     assert events == [
-        ("sink", [source]),
-        ("selector", "/server-owned/project"),
+        "roots",
+        "roots",
+        ("sink", [selected]),
     ]
+
+
+async def test_desktop_route_rejects_unregistered_path_with_same_basename(
+    monkeypatch,
+):
+    source = SimpleNamespace(
+        base=Path("/server-owned/project/.anton/artifacts"),
+        project_id=None,
+        project_name="project",
+    )
+    monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
+    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda: [source])
+    monkeypatch.setattr(
+        artifacts,
+        "_list_artifacts",
+        lambda _sources: pytest.fail("unregistered path reached artifact listing"),
+    )
+
+    cards = await artifacts.list_artifacts(
+        SimpleNamespace(),
+        project_id=None,
+        project_path="/attacker-controlled/project",
+    )
+
+    assert cards == []
+
+
+def test_artifact_component_returns_the_basename_sanitizer_value(monkeypatch):
+    class SanitizedName(str):
+        pass
+
+    clean = SanitizedName("artifacts")
+    real_basename = artifact_identity.os.path.basename
+
+    def basename(value):
+        result = real_basename(value)
+        return clean if result == clean else result
+
+    monkeypatch.setattr(artifact_identity.os.path, "basename", basename)
+
+    assert artifact_identity._component("artifacts") is clean
+    with pytest.raises(ValueError, match="component is invalid"):
+        artifact_identity._component("../artifacts")
 
 
 def test_project_path_leaf_sanitization_does_not_accept_a_prefixed_uuid(monkeypatch):
