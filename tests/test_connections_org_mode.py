@@ -2,7 +2,7 @@
 to read/write in org mode, so these proxy to auth instead (same mechanism
 as the OAuth Connector Lifecycle endpoints). Direct function calls, no
 TestClient/app fixture — matches this repo's existing convention (see
-test_oauth_picker_session.py).
+test_oauth_picker_token.py).
 """
 from __future__ import annotations
 
