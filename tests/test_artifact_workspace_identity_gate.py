@@ -6,6 +6,7 @@ signature would look tested while never running. These go over HTTP.
 """
 from __future__ import annotations
 
+import mimetypes
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -116,7 +117,9 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
 # parameter, would leave those tests green while every real request ignored
 # the flag. These go over HTTP for the same reason the gate tests above do.
 
-_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+# See test_artifact_draft_pinned_serving.py: the built-in mimetypes map has no
+# `.xlsx`, so the expectation is derived the way the route derives it.
+_XLSX = mimetypes.guess_type("model.xlsx")[0] or "application/octet-stream"
 
 
 @pytest.fixture
