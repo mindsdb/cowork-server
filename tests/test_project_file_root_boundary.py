@@ -66,6 +66,7 @@ def test_delete_pins_complete_inventory_before_project_name_selection(
     other_root.mkdir()
     target = reports_root / "notes.txt"
     target.write_text("delete", encoding="utf-8")
+    validated_path = project_files._validated_project_path("notes.txt")
     projects = [
         SimpleNamespace(name="reports", path=str(reports_root)),
         SimpleNamespace(name="other", path=str(other_root)),
@@ -114,7 +115,7 @@ def test_delete_pins_complete_inventory_before_project_name_selection(
 
     result = project_files.delete_project_file(
         "reports",
-        project_files._validated_project_path("notes.txt"),
+        validated_path,
         SimpleNamespace(scope=LOCAL_SCOPE),
     )
 

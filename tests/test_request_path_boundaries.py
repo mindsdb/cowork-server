@@ -92,6 +92,22 @@ def test_project_mutation_path_preserves_nested_and_hidden_files():
     assert path.value == "conversations/abc/.anton/anton.md"
 
 
+def test_project_mutation_path_rebuilds_every_component_with_basename(monkeypatch):
+    real_basename = project_files.os.path.basename
+    seen = []
+
+    def record(value):
+        seen.append(value)
+        return real_basename(value)
+
+    monkeypatch.setattr(project_files.os.path, "basename", record)
+
+    path = project_files._validated_project_path("nested/.anton/notes.md")
+
+    assert path.parts == ("nested", ".anton", "notes.md")
+    assert seen == ["nested", ".anton", "notes.md"]
+
+
 def test_local_comments_id_is_canonical_before_identity_lookup(monkeypatch):
     value = uuid4()
     seen = {}

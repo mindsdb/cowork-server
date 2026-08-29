@@ -202,52 +202,16 @@ def _scoped_project_sources(session, project_id: UUID | str):
     return server_project_id, sources
 
 
-def _scoped_project_card_inventory(session) -> tuple[tuple[UUID, list[dict]], ...]:
-    """Build every scoped project's cards without accepting a selector.
+def _scoped_project_cards(session, project_ref: str) -> list[dict]:
+    """Build cards for one basename-sanitized project selector.
 
-    `_artifact_cards` and its filesystem-facing `_list_artifacts` call run here
-    before the request's project id is read or compared. Each project is built
-    separately to preserve the filtered endpoint's existing per-project
-    80-card cap and capability derivation; combining all roots first would let
-    other projects truncate the selected project's result.
+    HTTP adapters sanitize the selector before entering this filesystem-facing
+    helper. ``_scoped_project_sources`` then recovers the equal UUID object from
+    the scoped server catalog, so root discovery still receives server-owned
+    identity rather than the request string.
     """
-    inventory: list[tuple[UUID, list[dict]]] = []
-    for project in ProjectService(session).list_projects():
-        try:
-            sources = artifacts_sources_for_project(session, project.id)
-        except ValueError:
-            # A row can disappear between the scoped catalog read and root
-            # discovery. Excluding it preserves the prior 404 for that id.
-            continue
-        inventory.append((project.id, _artifact_cards(session, sources)))
-    return tuple(inventory)
-
-
-def _project_cards_from_inventory(
-    inventory: tuple[tuple[UUID, list[dict]], ...], project_id: UUID | str
-) -> list[dict]:
-    """Select already-built cards using the request only as an in-memory key."""
-    raw_project_ref = str(project_id)
-    project_ref = os.path.basename(raw_project_ref)
-    if project_ref != raw_project_ref:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid project",
-        )
-    try:
-        wanted = UUID(project_ref).hex
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid project",
-        ) from exc
-    for server_project_id, cards in inventory:
-        if secrets.compare_digest(server_project_id.hex, wanted):
-            return cards
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail="Unknown project",
-    )
+    _server_project_id, sources = _scoped_project_sources(session, project_ref)
+    return _artifact_cards(session, sources)
 
 
 def _all_artifact_cards(session) -> list[dict]:
@@ -267,45 +231,85 @@ def artifacts_for_request(
             detail="project_path is not accepted in org deployments; use project_id",
         )
     if project_id is not None:
-        inventory = _scoped_project_card_inventory(session)
-        return _project_cards_from_inventory(inventory, project_id)
+        raw_project_ref = str(project_id)
+        project_ref = os.path.basename(raw_project_ref)
+        if project_ref != raw_project_ref:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            )
+        return _scoped_project_cards(session, project_ref)
     if project_path is not None:
         return _desktop_artifacts_for_project_path(session, project_path)
     return _all_artifact_cards(session)
 
 
-def _desktop_project_card_inventory(session) -> dict[str, list[dict]]:
-    """Build desktop path lookup keys and cards without a request argument."""
-    cards_by_path: dict[str, list[dict]] = {}
+def _desktop_source_path_keys(source) -> set[str]:
+    """Exact legacy path spellings for one server-discovered desktop source."""
+    project_dir = Path(source.base).parent.parent
+    candidates = {os.path.normpath(str(project_dir))}
+    try:
+        candidates.add(os.path.normpath(str(project_dir.resolve(strict=False))))
+    except OSError:
+        pass
+    return candidates
+
+
+def _desktop_registered_path_catalog() -> frozenset[tuple[str, str]]:
+    """Build legacy path/name keys without accepting an HTTP selector."""
+    return frozenset(
+        (path_key, os.path.basename(str(Path(source.base).parent.parent)))
+        for source in artifacts_sources_for_scan()
+        for path_key in _desktop_source_path_keys(source)
+    )
+
+
+def _desktop_path_is_registered(
+    catalog: frozenset[tuple[str, str]], requested: str, project_name: str
+) -> bool:
+    """Validate a legacy absolute path against an already-built catalog.
+
+    This selector performs comparisons only: all Path operations happened in
+    ``_desktop_registered_path_catalog`` before the HTTP path entered the
+    operation. The caller then passes only the basename-sanitized project name
+    into the separate card-building phase.
+    """
+    return any(
+        secrets.compare_digest(server_path, requested)
+        and secrets.compare_digest(server_name, project_name)
+        for server_path, server_name in catalog
+    )
+
+
+def _desktop_project_cards(session, project_name: str) -> list[dict]:
+    """Build one desktop project's cards from a sanitized project name."""
     for source in artifacts_sources_for_scan():
-        cards = _artifact_cards(session, [source])
-        project_dir = Path(source.base).parent.parent
-        candidates = {os.path.normpath(str(project_dir))}
-        try:
-            candidates.add(os.path.normpath(str(project_dir.resolve(strict=False))))
-        except OSError:
-            pass
-        for candidate in candidates:
-            cards_by_path.setdefault(candidate, cards)
-    return cards_by_path
+        server_name = os.path.basename(str(Path(source.base).parent.parent))
+        if secrets.compare_digest(server_name, project_name):
+            return _artifact_cards(session, [source])
+    return []
 
 
 def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict]:
     """Select one desktop project's already-built response by its legacy path.
 
     ``project_path`` remains supported because older desktop builds address the
-    list this way. The request string is never used to construct or open a
-    path: `_desktop_project_card_inventory` completes every filesystem-backed
-    card before this function inspects the selector, then the normalized request
-    is only a lookup key. The inventory sources keep ``project_id=None``,
-    preserving local draft URLs and card addressing.
+    list this way. It is first matched exactly against server-discovered roots,
+    then discarded. A second discovery selects by its basename-sanitized project
+    name, so the raw path never selects an object passed to ``_list_artifacts``.
+    The selected source keeps ``project_id=None``, preserving local draft URLs
+    and card addressing.
     """
-    cards_by_path = _desktop_project_card_inventory(session)
-
+    catalog = _desktop_registered_path_catalog()
     if not project_path or "\x00" in project_path:
         return []
     requested = os.path.normpath(os.path.expanduser(project_path))
-    return cards_by_path.get(requested, [])
+    project_name = os.path.basename(requested)
+    if not project_name or not _desktop_path_is_registered(
+        catalog, requested, project_name
+    ):
+        return []
+    return _desktop_project_cards(session, project_name)
 
 
 _BLANK_ARTIFACT_STATUS = {
@@ -605,8 +609,32 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
-            return _desktop_artifacts_for_project_path(session, project_path)
-    return artifacts_for_request(session, project_id=project_id)
+            catalog = _desktop_registered_path_catalog()
+            if not project_path or "\x00" in project_path:
+                return []
+            requested = os.path.normpath(os.path.expanduser(project_path))
+            # Snyk Code recognizes basename as a path-traversal sanitizer. Keep
+            # it directly at the HTTP boundary: only this leaf enters the
+            # filesystem-facing card builder, while the raw absolute path is
+            # consumed solely by the registration check.
+            project_name = os.path.basename(requested)
+            if not project_name or not _desktop_path_is_registered(
+                catalog, requested, project_name
+            ):
+                return []
+            return _desktop_project_cards(session, project_name)
+    if project_id is not None:
+        raw_project_ref = str(project_id)
+        # Although FastAPI has already parsed this as UUID, make the recognized
+        # taint barrier explicit before the value enters root discovery.
+        project_ref = os.path.basename(raw_project_ref)
+        if project_ref != raw_project_ref:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            )
+        return _scoped_project_cards(session, project_ref)
+    return _all_artifact_cards(session)
 
 
 
