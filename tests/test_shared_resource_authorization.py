@@ -3191,6 +3191,36 @@ def test_instructions_gate_does_not_gate_ordinary_project_files(org_engine):
     assert creator_edit["attribution"].last_modified_by.user_id == ALICE
 
 
+def test_instruction_write_response_reuses_advisory_lock_owner(
+    org_engine,
+    monkeypatch,
+):
+    """Response metadata must not open a second PostgreSQL lock connection."""
+    alice = _scoped(org_engine, ALICE)
+    project = ProjectService(alice).create_project("instruction-lock-owner")
+    instructions_path = project_files._validated_project_path(".anton/anton.md")
+    real_access = project_files.SharedResourceAccess
+    access_instances = []
+
+    def tracked_access(*args, **kwargs):
+        access = real_access(*args, **kwargs)
+        access_instances.append(access)
+        return access
+
+    monkeypatch.setattr(project_files, "SharedResourceAccess", tracked_access)
+
+    result = project_files.write_project_file(
+        project.name,
+        instructions_path,
+        project_files._FileWriteRequest(content="Keep one lock owner"),
+        alice,
+        _principal(ALICE),
+    )
+
+    assert result["attribution"].created_by.user_id == ALICE
+    assert len(access_instances) == 1
+
+
 @pytest.mark.asyncio
 async def test_generic_project_files_cannot_bypass_canonical_memory_contract(
     org_engine,
