@@ -742,6 +742,13 @@ class SharedResourceAccess:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Shared-resource ownership is still being established",
             )
+        if new_key is not None and new_key != key:
+            destination = self._find(kind, new_key)
+            if destination is not None and (row is None or destination.id != row.id):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="The requested shared-resource identity already exists",
+                )
         if row is None:
             row = SharedResourceAttribution(
                 resource_kind=kind,
