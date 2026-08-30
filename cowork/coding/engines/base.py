@@ -25,6 +25,15 @@ class EngineCredentials:
 
 
 @dataclass(frozen=True)
+class EngineMcpServer:
+    """Agent-neutral process contract for a task-scoped MCP server."""
+
+    name: str
+    command: str
+    args: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class EngineSessionConfig:
     model: str
     permission_mode: PermissionMode
@@ -40,6 +49,9 @@ class EngineSessionConfig:
     session_id: str = ""
     cowork_root: str = ""
     workspace_label: str = ""
+    inference_base_url: str = ""
+    inference_api_key: str = ""
+    mcp_servers: tuple[EngineMcpServer, ...] = ()
 
 
 @dataclass(frozen=True)
