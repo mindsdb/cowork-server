@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import socket
 import subprocess
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
-from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectFolder
+from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
+from cowork.coding.project_models import (
+    CodeProject,
+    LocalFolderResource,
+    ProjectCommand,
+    ProjectFolder,
+    ProjectResource,
+    RepositoryResource,
+    resource_folder,
+)
 from cowork.coding.workspace import (
     ApplyPlan,
     PreparedWorkspace,
@@ -15,6 +27,7 @@ from cowork.coding.workspace import (
     WorkspaceManager,
     _org_mode,
 )
+from cowork.coding.workspace_key import managed_key
 
 
 @dataclass(frozen=True)
@@ -153,7 +166,8 @@ class ProjectWorkspaceManager:
         with self._lock:
             prepared: list[TaskWorkspace] = []
             try:
-                for folder in project.folders:
+                for resource in project.resources:
+                    folder = self._runtime_folder(resource)
                     key = self._key(session_id, folder.id)
                     item = self.workspaces.prepare(key, folder.path, True, folder.base_branch)
                     prepared.append(self._task_workspace(session_id, project, folder, item))
@@ -164,6 +178,88 @@ class ProjectWorkspaceManager:
                     self._cleanup_one(session_id, workspace)
                 self.ports.release(session_id)
                 raise
+
+    def restore(
+        self,
+        session_id: str,
+        project: CodeProject,
+        records: list[ExecutionWorkspace],
+    ) -> PreparedProjectWorkspace:
+        """Reopen only the runtime-owned workspaces recorded for this task run."""
+        with self._lock:
+            by_resource = {record.resource_id: record for record in records}
+            expected_ids = {resource.id for resource in project.resources}
+            if set(by_resource) != expected_ids:
+                raise WorkspaceError("The recoverable workspace does not match this task's resource scope")
+            restored: list[TaskWorkspace] = []
+            for resource in project.resources:
+                record = by_resource[resource.id]
+                if record.status != WorkspaceStatus.ready or not record.path:
+                    raise WorkspaceError(f"The workspace for {resource.name} is no longer available")
+                folder = self._runtime_folder(resource)
+                expected = (self.workspaces.worktrees_root / managed_key(self._key(session_id, folder.id))).resolve()
+                actual = Path(record.path).expanduser().resolve()
+                if actual != expected or not actual.is_dir():
+                    raise WorkspaceError(f"The workspace for {resource.name} could not be restored safely")
+                inspection = self.workspaces.inspect(str(actual))
+                if record.workspace_kind == WorkspaceKind.git_worktree and not inspection.is_git:
+                    raise WorkspaceError(f"The Git workspace for {resource.name} is no longer valid")
+                restored.append(TaskWorkspace(
+                    folder_id=folder.id,
+                    folder_name=folder.name,
+                    source_path=str(Path(folder.path).expanduser().resolve()),
+                    workspace_path=str(actual),
+                    workspace_kind=record.workspace_kind or WorkspaceKind.local_copy,
+                    repository_root=(
+                        str(Path(folder.path).expanduser().resolve())
+                        if record.workspace_kind == WorkspaceKind.git_worktree
+                        else None
+                    ),
+                    base_revision=record.base_revision,
+                    base_branch=folder.base_branch,
+                    task_branch=record.task_branch or inspection.branch,
+                    source_dirty=False,
+                ))
+            ports = self.ports.allocate(session_id, project.environment.port_names)
+            return PreparedProjectWorkspace(primary=restored[0], workspaces=tuple(restored), ports=ports)
+
+    def _runtime_folder(self, resource: ProjectResource) -> ProjectFolder:
+        if isinstance(resource, LocalFolderResource):
+            return resource_folder(resource)
+        path = Path(resource.local_path).expanduser() if resource.local_path else None
+        if path is None or not path.is_dir():
+            if not resource.source_url:
+                raise WorkspaceError(f"Repository is unavailable on this computer: {resource.name}")
+            path = self._repository_cache(resource)
+        return resource_folder(resource.model_copy(update={"local_path": str(path)}))
+
+    def _repository_cache(self, resource: RepositoryResource) -> Path:
+        assert resource.source_url is not None
+        key = hashlib.sha256(resource.source_url.encode()).hexdigest()[:24]
+        root = self.workspaces.root / "repositories" / key
+        if root.is_dir():
+            return root
+        root.parent.mkdir(parents=True, exist_ok=True)
+        temporary = root.with_name(f".{root.name}.tmp")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        try:
+            result = self.workspaces.git.run(
+                root.parent,
+                "clone",
+                "--no-tags",
+                resource.source_url,
+                str(temporary),
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "Git clone failed").strip()
+                raise WorkspaceError(f"Could not prepare {resource.name}: {detail[:2_000]}")
+            os.replace(temporary, root)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+        return root
 
     def fork(
         self,
