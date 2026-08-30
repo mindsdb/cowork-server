@@ -152,6 +152,18 @@ def test_rename_helper_rejects_nested_source_and_destination_names(tmp_path):
     assert (root / "source").is_dir()
 
 
+def test_rmtree_helper_rejects_a_nested_name(tmp_path):
+    root = tmp_path / "root"
+    target = root / "nested" / "target"
+    target.mkdir(parents=True)
+
+    with projects_module.pinned_dir(root) as pinned:
+        with pytest.raises(ValueError, match="direct-child name"):
+            projects_module.dir_rmtree(pinned, "nested/target")
+
+    assert target.is_dir()
+
+
 def test_nested_path_is_refused_even_below_a_real_root(svc, shared):
     """_child_name is the second half of the guarantee: dir_fd only resolves
     one component safely, so a nested path must never reach it."""

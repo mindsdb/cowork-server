@@ -109,6 +109,16 @@ def test_discard_incomplete_skill_preserves_same_root_target(svc: SkillService):
     assert svc.get_skill("real-skill").instructions == "Canonical instructions"
 
 
+def test_finalize_staged_delete_rejects_a_foreign_path(svc: SkillService):
+    outside = svc.root.parent / "outside" / "keep"
+    outside.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="Invalid staged skill deletion path"):
+        svc.finalize_staged_delete(outside)
+
+    assert outside.is_dir()
+
+
 def test_rename_failure_restores_source_and_preserves_racing_destination(
     svc: SkillService,
     monkeypatch,

@@ -147,10 +147,18 @@ def dir_mkdir(d: PinnedDir, name: str) -> None:
 
 
 def dir_rmtree(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Removal path must be a direct-child name")
     if d.fd is not None:
-        shutil.rmtree(name, dir_fd=d.fd)
+        shutil.rmtree(safe_name, dir_fd=d.fd)
     else:
-        shutil.rmtree(d.path / name)
+        shutil.rmtree(d.path / safe_name)
 
 
 def dir_rename(
