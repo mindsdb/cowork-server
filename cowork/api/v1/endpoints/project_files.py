@@ -10,7 +10,6 @@ import mimetypes
 import ntpath
 import os
 import secrets
-import shutil
 import stat
 import time
 from collections.abc import Iterator
@@ -31,6 +30,7 @@ from cowork.common.paths import (
     dir_lstat,
     dir_mkdir,
     dir_open,
+    dir_rmtree,
     dir_scandir,
     dir_unlink,
     open_pinned_child,
@@ -1420,16 +1420,32 @@ def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
     lingering draft is the safe default we're clearing, not a hard error. The
     slug is confined to a direct child of the drafts dir (no traversal).
     """
-    # Resolve, then require the target to stay inside the drafts dir — rejects any
-    # traversal in `slug` regardless of what it contains.
-    drafts_root = os.path.realpath(
-        _project_dir(project_name, scoped) / ".anton" / "skill_drafts"
-    )
-    folder = os.path.realpath(os.path.join(drafts_root, slug))
-    if not folder.startswith(drafts_root + os.sep):
+    safe_slug = os.path.basename(slug)
+    if (
+        safe_slug != slug
+        or safe_slug in {"", ".", ".."}
+        or "\\" in safe_slug
+        or "\0" in safe_slug
+    ):
         raise HTTPException(status_code=400, detail="invalid slug")
-    if os.path.isdir(folder):
-        shutil.rmtree(folder, ignore_errors=True)
+    try:
+        with _opened_selected_project_directory(project_name, scoped) as project:
+            with _opened_pinned_descendant(
+                project,
+                (".anton", "skill_drafts"),
+                create=False,
+            ) as drafts:
+                disk_name = _existing_entry_name(drafts, safe_slug)
+                entry = dir_lstat(drafts, disk_name)
+                if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+                    return
+                dir_rmtree(drafts, disk_name)
+    except HTTPException:
+        raise
+    except (OSError, ValueError):
+        # Idempotent by contract: missing drafts, non-directories, planted
+        # symlinks, and best-effort cleanup failures are all no-ops.
+        return
 
 
 @router.post("/preview-mount-file")
