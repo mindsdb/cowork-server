@@ -107,16 +107,44 @@ class ControlPlaneService:
     def list_computers(self) -> ComputerPage:
         self.heartbeat(self.local_computer.id, active_run_count=self._active_count(self.local_computer.id))
         self.expire_stale_computers()
-        return ComputerPage(items=self.store.list_computers())
+        return ComputerPage(items=[item for item in self.store.list_computers() if item.revoked_at is None])
 
     def heartbeat(self, computer_id: str, active_run_count: int = 0) -> Computer:
         computer = self.store.get_computer(computer_id)
+        if computer.revoked_at is not None:
+            raise RuntimeAuthenticationError("This computer has been revoked")
         computer.last_seen_at = utc_now()
         computer.updated_at = computer.last_seen_at
         computer.active_run_count = active_run_count
         if computer.status != ComputerStatus.draining:
             computer.status = ComputerStatus.online
         return self.store.save_computer(computer)
+
+    def rename_computer(self, computer_id: str, name: str) -> Computer:
+        computer = self.store.get_computer(computer_id)
+        if computer.revoked_at is not None:
+            raise KeyError("Computer not found")
+        computer.name = self._computer_name(name)
+        if computer.is_local:
+            self._write_local_computer_name(computer.name)
+        return self.store.save_computer(computer)
+
+    def revoke_computer(self, computer_id: str) -> None:
+        computer = self.store.get_computer(computer_id)
+        if computer.revoked_at is not None:
+            raise KeyError("Computer not found")
+        if computer.is_local:
+            raise ValueError("This computer cannot be revoked from itself")
+        if any(
+            run.computer_id == computer_id and run.status not in TERMINAL_RUN_STATUSES
+            for run in self.store.list_runs()
+        ):
+            raise ValueError("Finish or move this computer's active tasks before revoking it")
+        computer.registration_epoch += 1
+        computer.status = ComputerStatus.offline
+        computer.active_run_count = 0
+        computer.revoked_at = utc_now()
+        self.store.save_computer(computer)
 
     def issue_registration_token(self) -> str:
         token = secrets.token_urlsafe(36)
@@ -146,6 +174,7 @@ class ControlPlaneService:
         computer = Computer(
             id=identifier,
             name=self._computer_name(name),
+            is_local=False,
             capabilities=capabilities,
             registration_epoch=epoch,
         )
@@ -164,6 +193,8 @@ class ControlPlaneService:
         except KeyError as exc:
             raise RuntimeAuthenticationError("Runtime authentication failed") from exc
         computer = self.store.get_computer(computer_id)
+        if computer.revoked_at is not None:
+            raise RuntimeAuthenticationError("This computer has been revoked")
         if (
             credential.registration_epoch != computer.registration_epoch
             or not hmac.compare_digest(credential.token_hash, self._digest(runtime_token))
@@ -684,19 +715,40 @@ class ControlPlaneService:
 
     def _register_local(self, capabilities: ComputerCapabilities) -> Computer:
         identifier = self._local_computer_id()
+        name = self._read_local_computer_name() or self._computer_name(platform.node())
         try:
             existing = self.store.get_computer(identifier)
-            existing.name = self._computer_name(platform.node())
+            existing.name = name
+            existing.is_local = True
             existing.capabilities = capabilities
             existing.status = ComputerStatus.online
             existing.last_seen_at = utc_now()
+            existing.revoked_at = None
             return self.store.save_computer(existing)
         except KeyError:
             return self.store.save_computer(Computer(
                 id=identifier,
-                name=self._computer_name(platform.node()),
+                name=name,
+                is_local=True,
                 capabilities=capabilities,
             ))
+
+    def _read_local_computer_name(self) -> str | None:
+        try:
+            value = (self.root / "control" / "local-computer-name").read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        return self._computer_name(value) if value else None
+
+    def _write_local_computer_name(self, name: str) -> None:
+        path = self.root / "control" / "local-computer-name"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            temp.write_text(self._computer_name(name) + "\n", encoding="utf-8")
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
 
     def _local_computer_id(self) -> str:
         path = self.root / "control" / "local-computer-id"

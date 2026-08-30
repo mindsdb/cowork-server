@@ -355,6 +355,7 @@ class CodingSession(BaseModel):
     pending_approval: PendingApproval | None = None
     queued_instructions: list[QueuedInstruction] = Field(default_factory=list)
     terminal_tabs: list[TerminalTab] = Field(default_factory=list, max_length=12)
+    pinned: bool = False
     archived: bool = False
     last_error: str | None = None
     event_count: int = 0

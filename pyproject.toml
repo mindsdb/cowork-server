@@ -57,6 +57,7 @@ Issues = "https://github.com/mindsdb/cowork-server/issues"
 [project.scripts]
 cowork-server = "cowork.cli:main"
 cowork-dev-setup = "cowork.cli:dev_setup_main"
+cowork-code-runtime = "cowork.coding.runtime_worker:main"
 
 [project.optional-dependencies]
 channels = [

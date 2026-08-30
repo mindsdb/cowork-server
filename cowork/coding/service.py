@@ -258,6 +258,9 @@ class CodingService:
             self.remote.release_workspace(session)
         return self.lifecycle.set_archived(session_id, archived)
 
+    def set_pinned(self, session_id: str, pinned: bool) -> CodingSession:
+        return self.lifecycle.set_pinned(session_id, pinned)
+
     def fork_session(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
         return self.lifecycle.fork_session(session_id, credentials)
 

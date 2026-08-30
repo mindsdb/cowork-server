@@ -92,6 +92,14 @@ class SessionLifecycleOperations:
                 lambda current: setattr(current, "archived", archived),
             )
 
+    def set_pinned(self, session_id: str, pinned: bool) -> CodingSession:
+        """Persist navigation metadata without making the task look newly active."""
+        return self.store.update_session(
+            session_id,
+            lambda current: setattr(current, "pinned", pinned),
+            touch_updated_at=False,
+        )
+
     def fork_session(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
         parent_lock = self.runtimes.session_lock(session_id)
         with parent_lock:  # noqa: SIM117 - the maintenance reservation must be acquired second.
@@ -169,6 +177,7 @@ class SessionLifecycleOperations:
                     "pending_approval": None,
                     "queued_instructions": [],
                     "terminal_tabs": [],
+                    "pinned": False,
                     "archived": False,
                     "status": SessionStatus.completed,
                     "last_error": None,
