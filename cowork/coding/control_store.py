@@ -172,9 +172,16 @@ class LocalControlPlaneStore:
     def _save(self, collection: str, document: Document) -> Document:
         with self._lock:
             target = self._path(collection, str(document.id))
-            temp = target.with_suffix(".tmp")
-            temp.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
-            os.replace(temp, target)
+            # Each store instance owns its own lock, while API requests may
+            # construct separate instances concurrently. A unique staging
+            # name keeps their atomic replacements from stealing one another's
+            # temporary file.
+            temp = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+            try:
+                temp.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+                os.replace(temp, target)
+            finally:
+                temp.unlink(missing_ok=True)
             return document
 
     def _get(self, collection: str, document_id: str, model: type[Document]) -> Document:

@@ -11,6 +11,7 @@ from cowork.coding.contracts import utc_now
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     CodeTask,
+    Computer,
     ComputerCapabilities,
     ComputerStatus,
     ExecutionWorkspace,
@@ -80,6 +81,25 @@ def test_task_run_bundle_rolls_back_if_local_persistence_is_interrupted(
     assert not (tmp_path / "control" / ".transaction.json").exists()
 
 
+def test_separate_store_instances_can_save_the_same_document_concurrently(tmp_path: Path) -> None:
+    stores = [LocalControlPlaneStore(tmp_path) for _ in range(12)]
+    computer = Computer(
+        id="shared-computer",
+        name="Shared computer",
+        capabilities=capabilities(),
+    )
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        saved = list(pool.map(
+            lambda store: store.save_computer(computer.model_copy(deep=True)),
+            stores,
+        ))
+
+    assert len(saved) == len(stores)
+    assert stores[0].get_computer(computer.id).name == computer.name
+    assert not list((tmp_path / "control" / "computers").glob("*.tmp"))
+
+
 def project(local_computer_id: str) -> CodeProject:
     return CodeProject(
         id="product",
@@ -112,6 +132,32 @@ def test_registration_is_one_use_and_computers_survive_restart(tmp_path: Path) -
     assert computer.id in persisted
     assert service.local_computer.id == restarted.local_computer.id
     assert restarted.authenticate_runtime(computer.id, runtime_token).id == computer.id
+
+
+def test_computers_can_be_named_and_remote_access_revoked(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, runtime_token = register(service, "Build computer")
+
+    renamed = service.rename_computer(remote.id, "  Release   runner  ")
+    assert renamed.name == "Release runner"
+    assert not renamed.is_local
+
+    service.revoke_computer(remote.id)
+    assert remote.id not in {item.id for item in service.list_computers().items}
+    with pytest.raises(RuntimeAuthenticationError, match="revoked"):
+        service.authenticate_runtime(remote.id, runtime_token)
+
+
+def test_this_computer_can_be_renamed_but_not_revoked(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    local = service.rename_computer(service.local_computer.id, "Ian's Mac")
+    assert local.name == "Ian's Mac"
+    assert local.is_local
+
+    restarted = ControlPlaneService(tmp_path, capabilities())
+    assert restarted.local_computer.name == "Ian's Mac"
+    with pytest.raises(ValueError, match="cannot be revoked"):
+        restarted.revoke_computer(restarted.local_computer.id)
 
 
 def test_local_folders_are_owner_bound_but_repositories_are_portable(tmp_path: Path) -> None:

@@ -74,7 +74,7 @@ from cowork.coding.project_models import (
     WorkItemSearchRequest,
 )
 from cowork.coding.redaction import redact_text
-from cowork.coding.runtime_protocol import RegistrationTokenResponse
+from cowork.coding.runtime_protocol import ComputerUpdateRequest, RegistrationTokenResponse
 from cowork.coding.service import CodingService, get_coding_service
 from cowork.coding.shells import shell_inventory
 from cowork.coding.skill_models import (
@@ -178,6 +178,16 @@ def prepare_shutdown():
 @router.get("/computers")
 def coding_computers():
     return _service().control.list_computers()
+
+
+@router.patch("/computers/{computer_id}")
+def update_coding_computer(computer_id: str, body: ComputerUpdateRequest):
+    return _call(_service().control.rename_computer, computer_id, body.name)
+
+
+@router.delete("/computers/{computer_id}", status_code=204)
+def revoke_coding_computer(computer_id: str):
+    _call(_service().control.revoke_computer, computer_id)
 
 
 @router.post("/runtime/registration-token", response_model=RegistrationTokenResponse)
@@ -478,6 +488,16 @@ def archive_session(session_id: str):
 @router.post("/sessions/{session_id}/unarchive")
 def unarchive_session(session_id: str):
     return _call(_service().set_archived, session_id, False)
+
+
+@router.post("/sessions/{session_id}/pin")
+def pin_session(session_id: str):
+    return _call(_service().set_pinned, session_id, True)
+
+
+@router.post("/sessions/{session_id}/unpin")
+def unpin_session(session_id: str):
+    return _call(_service().set_pinned, session_id, False)
 
 
 @router.post("/sessions/{session_id}/fork")

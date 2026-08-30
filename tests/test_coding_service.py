@@ -1049,6 +1049,23 @@ def test_task_can_be_renamed_archived_and_restored(tmp_path: Path) -> None:
     assert [item.id for item in service.list_sessions().items] == [created.id]
 
 
+def test_task_pin_is_persisted_without_changing_activity_order(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Pin this task"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    before = service.get_session(created.id).updated_at
+
+    pinned = service.set_pinned(created.id, True)
+
+    assert pinned.pinned is True
+    assert pinned.updated_at == before
+    assert service.get_session(created.id).pinned is True
+    assert service.set_pinned(created.id, False).pinned is False
+
+
 def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
@@ -1059,11 +1076,13 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
     wait_for_status(service, parent.id, SessionStatus.completed)
     changed = Path(parent.workspace_path, "README.md")
     changed.write_text("forked work\n", encoding="utf-8")
+    service.set_pinned(parent.id, True)
 
     child = service.fork_session(parent.id, CREDS)
 
     assert child.id != parent.id
     assert child.workspace_path != parent.workspace_path
+    assert child.pinned is False
     assert Path(child.workspace_path, "README.md").read_text(encoding="utf-8") == "forked work\n"
     assert child.engine_session_id == "forked-engine-session-1"
     child_events = service.events(child.id).items
