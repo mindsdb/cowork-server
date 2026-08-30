@@ -6,6 +6,7 @@ pod mounts its own org subtree read-write, so it can replace `projects` with a
 symlink into another org in that window. These tests perform exactly that swap
 and assert the operation still lands in the right org, or refuses.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -35,8 +36,9 @@ def shared(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def svc(shared):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
-                           poolclass=StaticPool)
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
     SQLModel.metadata.create_all(engine)
     scope = TenantScope(org_mode=True, org_id=ORG_A, user_id="u")
     return ProjectService(ScopedSession(Session(engine), scope))
@@ -57,10 +59,10 @@ def test_mkdir_refuses_a_root_swapped_for_a_symlink(svc, shared):
     root = shared / ORG_A / "projects"
     victim = shared / ORG_B / "projects"
     root.mkdir(parents=True, exist_ok=True)
-    path = svc._project_path("mine")          # checked while root is real
-    _swap_root_for_symlink_to(root, victim)   # ... then swapped
+    path = svc._project_path("mine")  # checked while root is real
+    _swap_root_for_symlink_to(root, victim)  # ... then swapped
 
-    with pytest.raises(OSError):              # O_NOFOLLOW on the root open
+    with pytest.raises(OSError):  # O_NOFOLLOW on the root open
         svc._mkdir_in_root(path)
     assert not (victim / "mine").exists(), "must not create in the other org"
 
@@ -76,7 +78,9 @@ def test_rmtree_refuses_a_root_swapped_for_a_symlink(svc, shared):
 
     with pytest.raises(OSError):
         svc._rmtree_in_root(path)
-    assert (victim / "theirs" / "keep.txt").exists(), "must not delete another org's data"
+    assert (
+        victim / "theirs" / "keep.txt"
+    ).exists(), "must not delete another org's data"
 
 
 def test_rename_keeps_source_pinned_when_root_is_swapped(
@@ -120,6 +124,32 @@ def test_rename_between_legacy_and_scoped_roots(svc):
 
     svc._rename_in_root(scoped, legacy)
     assert (legacy / "keep.txt").read_text() == "legacy content"
+
+
+def test_rename_helper_rejects_nested_source_and_destination_names(tmp_path):
+    root = tmp_path / "root"
+    (root / "nested").mkdir(parents=True)
+    (root / "nested" / "source").mkdir()
+    (root / "source").mkdir()
+
+    with projects_module.pinned_dir(root) as pinned:
+        with pytest.raises(ValueError, match="direct-child names"):
+            projects_module.dir_rename(
+                pinned,
+                "nested/source",
+                pinned,
+                "moved",
+            )
+        with pytest.raises(ValueError, match="direct-child names"):
+            projects_module.dir_rename(
+                pinned,
+                "source",
+                pinned,
+                "nested/moved",
+            )
+
+    assert (root / "nested" / "source").is_dir()
+    assert (root / "source").is_dir()
 
 
 def test_nested_path_is_refused_even_below_a_real_root(svc, shared):

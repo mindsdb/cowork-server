@@ -48,6 +48,10 @@ _NAME_MAX_LEN = 48
 _NAME_FALLBACK = "untitled-project"
 
 
+class ProjectNotFoundError(ValueError):
+    """The requested project is absent from the caller's scoped view."""
+
+
 @dataclass
 class ProjectRenameStage:
     """Filesystem changes held open until the project transaction commits."""
@@ -291,9 +295,7 @@ class ProjectService:
         """
         absolute = Path(os.path.abspath(path))
         path_parent = Path(os.path.abspath(absolute.parent))
-        canonical_parent = (
-            Path(os.path.realpath(path_parent.parent)) / path_parent.name
-        )
+        canonical_parent = Path(os.path.realpath(path_parent.parent)) / path_parent.name
         roots = (self._root_dir(), Path(get_app_settings().project.root_dir))
         for candidate in roots:
             configured = Path(os.path.abspath(candidate))
@@ -389,7 +391,7 @@ class ProjectService:
     def get_project(self, project_id: UUID) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         return project
 
     def get_project_by_name(self, name: str) -> Project:
@@ -397,7 +399,7 @@ class ProjectService:
             self.session.select(Project).where(Project.name == name)
         ).first()
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         return project
 
     def get_project_by_name_or_none(self, name: str) -> Project | None:
@@ -427,7 +429,7 @@ class ProjectService:
         """`get_or_provision_by_name_or_none`, raising when the name is genuinely missing."""
         project = self.get_or_provision_by_name_or_none(name)
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         return project
 
     def _allocate_project_dir(self, base: str) -> tuple[str, Path]:
@@ -599,7 +601,7 @@ class ProjectService:
         """Stage a project update without committing its DB transaction."""
         project = self.session.get(Project, project_id)
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         stage = None
         try:
             if resolved_name is not None and resolved_name != project.name:
@@ -671,7 +673,7 @@ class ProjectService:
     ) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         resolved_name = (
             self.resolve_update_name(project, name) if name is not None else None
         )

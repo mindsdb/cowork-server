@@ -1,4 +1,5 @@
 """Tests for SkillService.import_skill (upload of a skill file)."""
+
 import io
 import zipfile
 from pathlib import Path
@@ -63,6 +64,18 @@ def test_skill_dir_rejects_a_symlink_escape(svc: SkillService):
 
     with pytest.raises(ValueError, match="Invalid skill name"):
         svc._skill_dir("escape")
+
+
+@pytest.mark.parametrize("slug", ["nested/escape", "nested\\escape"])
+def test_skill_entry_requires_a_leaf_if_the_upstream_validator_changes(
+    svc: SkillService,
+    monkeypatch,
+    slug,
+):
+    monkeypatch.setattr("cowork.services.skills.validate_name", lambda value: value)
+
+    with pytest.raises(ValueError, match="Invalid skill name"):
+        svc._skill_entry(slug)
 
 
 def test_discard_incomplete_skill_removes_external_symlink_only(svc: SkillService):

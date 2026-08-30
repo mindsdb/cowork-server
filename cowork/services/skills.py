@@ -256,8 +256,16 @@ class SkillService:
     def _skill_entry(self, slug: str) -> Path:
         """Return the validated lexical entry without following a slug symlink."""
         validate_name(slug)
+        safe_slug = os.path.basename(slug)
+        if (
+            safe_slug != slug
+            or safe_slug in {"", ".", ".."}
+            or "\\" in safe_slug
+            or "\0" in safe_slug
+        ):
+            raise ValueError(f"Invalid skill name: {slug!r}")
         root = os.path.abspath(self.root)
-        entry = os.path.abspath(os.path.join(root, slug))
+        entry = os.path.abspath(os.path.join(root, safe_slug))
         root_prefix = root if root.endswith(os.sep) else f"{root}{os.sep}"
         if not entry.startswith(root_prefix):
             raise ValueError(f"Invalid skill name: {slug!r}")

@@ -160,17 +160,30 @@ def dir_rename(
     destination_name: str,
 ) -> None:
     """Rename one pinned direct child to another pinned direct child."""
+    safe_source_name = os.path.basename(source_name)
+    safe_destination_name = os.path.basename(destination_name)
+    if (
+        safe_source_name != source_name
+        or safe_destination_name != destination_name
+        or safe_source_name in {"", ".", ".."}
+        or safe_destination_name in {"", ".", ".."}
+        or "\\" in safe_source_name
+        or "\\" in safe_destination_name
+        or "\0" in safe_source_name
+        or "\0" in safe_destination_name
+    ):
+        raise ValueError("Rename paths must be direct-child names")
     if source.fd is not None and destination.fd is not None:
         os.rename(
-            source_name,
-            destination_name,
+            safe_source_name,
+            safe_destination_name,
             src_dir_fd=source.fd,
             dst_dir_fd=destination.fd,
         )
     else:
         os.rename(
-            source.path / source_name,
-            destination.path / destination_name,
+            source.path / safe_source_name,
+            destination.path / safe_destination_name,
         )
 
 

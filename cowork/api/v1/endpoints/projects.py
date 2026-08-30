@@ -14,7 +14,11 @@ from cowork.schemas.projects import (
     ProjectUpdateRequest,
 )
 from cowork.schemas.shared_resources import ProjectCapabilities
-from cowork.services.projects import GENERAL_PROJECT, ProjectService
+from cowork.services.projects import (
+    GENERAL_PROJECT,
+    ProjectNotFoundError,
+    ProjectService,
+)
 from cowork.services.shared_resources import (
     PROJECT,
     PROJECT_INSTRUCTIONS,
@@ -200,8 +204,7 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
         "capabilities": ProjectCapabilities(
             can_rename=can_change,
             can_delete=can_change,
-            can_edit_instructions=not pending
-            and access.can_change(project.created_by),
+            can_edit_instructions=not pending and access.can_change(project.created_by),
         ),
     }
 
@@ -439,6 +442,8 @@ def update_project(
                             # The service logs individual restore failures.
                             pass
                         raise
+    except ProjectNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     finally:
