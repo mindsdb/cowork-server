@@ -413,6 +413,27 @@ def test_project_creator_admin_and_general_policy(org_engine):
     assert immutable.value.status_code == 403
 
 
+def test_project_update_returns_not_found_for_an_unknown_scoped_project(org_engine):
+    alice = _scoped(org_engine, ALICE)
+    foreign = ScopedSession(
+        Session(org_engine),
+        TenantScope(org_mode=True, org_id=OTHER_ORG, user_id=BOB),
+    )
+    foreign_project = ProjectService(foreign).create_project("hidden-update")
+
+    for hidden_id in (uuid4(), foreign_project.id):
+        with pytest.raises(HTTPException) as missing:
+            projects.update_project(
+                hidden_id,
+                ProjectUpdateRequest(is_active=True),
+                alice,
+                _principal(ALICE),
+            )
+
+        assert missing.value.status_code == 404
+        assert missing.value.detail == "Project not found"
+
+
 def test_project_collision_normalized_noop_stays_member_selectable(org_engine):
     alice = _scoped(org_engine, ALICE)
     first = projects.create_project(
@@ -813,6 +834,18 @@ def test_project_create_does_not_surface_post_commit_refresh_failure(
         )
     ).all()
     assert [event.action for event in events] == ["create"]
+
+
+def test_project_create_populates_server_timestamps_without_expiration(org_engine):
+    alice = ScopedSession(
+        Session(org_engine, expire_on_commit=False),
+        TenantScope(org_mode=True, org_id=ORG, user_id=ALICE),
+    )
+
+    created = ProjectService(alice).create_project("timestamped-create")
+
+    assert created.created_at is not None
+    assert created.modified_at is not None
 
 
 def test_project_rename_rejects_a_pending_instruction_first_write(org_engine):
