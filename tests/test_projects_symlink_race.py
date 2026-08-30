@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from cowork.common.paths import dir_rmdir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 import cowork.services.projects as projects_module
@@ -162,6 +163,29 @@ def test_rmtree_helper_rejects_a_nested_name(tmp_path):
             projects_module.dir_rmtree(pinned, "nested/target")
 
     assert target.is_dir()
+
+
+def test_rmdir_helper_rejects_a_nested_name(tmp_path):
+    root = tmp_path / "root"
+    target = root / "nested" / "target"
+    target.mkdir(parents=True)
+
+    with projects_module.pinned_dir(root) as pinned:
+        with pytest.raises(ValueError, match="direct-child name"):
+            dir_rmdir(pinned, "nested/target")
+
+    assert target.is_dir()
+
+
+def test_rmdir_helper_removes_a_direct_child(tmp_path):
+    root = tmp_path / "root"
+    target = root / "target"
+    target.mkdir(parents=True)
+
+    with projects_module.pinned_dir(root) as pinned:
+        dir_rmdir(pinned, "target")
+
+    assert not target.exists()
 
 
 def test_nested_path_is_refused_even_below_a_real_root(svc, shared):
