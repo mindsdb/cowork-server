@@ -38,6 +38,8 @@ The existing `CodingSession` remains a compatibility/read model for the current 
 
 One current worker advertises one concurrent run because it owns one retained engine/workspace loop. Parallelism comes from multiple runtime processes or computers, not from overstating capacity.
 
+The runtime persists its computer identity and private token in its own mode-`0600` data directory, then reconnects with bounded backoff after transient control-plane outages. Renaming a Computer updates its durable display name without rotating identity; revoking it increments the registration epoch and invalidates its runtime credential. The desktop control plane remains loopback-only, so cross-device development builds must be configured with a reachable control-plane URL. A hosted control plane naturally supplies its HTTPS origin without changing the runtime command or protocol.
+
 ## Protocol and fencing
 
 The protocol version is `1.0`. Runtime requests carry a computer identity, lease ID, execution epoch and monotonic per-run event sequence where applicable.
