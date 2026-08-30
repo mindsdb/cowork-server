@@ -1,0 +1,807 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+import platform
+import secrets
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from cowork.coding.contracts import CodingSession, SessionStatus, utc_now
+from cowork.coding.control_models import (
+    RUNTIME_PROTOCOL_VERSION,
+    TERMINAL_RUN_STATUSES,
+    CodeTask,
+    Computer,
+    ComputerCapabilities,
+    ComputerPage,
+    ComputerStatus,
+    ConnectorGrant,
+    ExecutionWorkspace,
+    ResourceAvailability,
+    ResourceAvailabilityPage,
+    RunStatus,
+    RuntimeCommand,
+    RuntimeCredential,
+    RuntimeEvent,
+    TaskControlSnapshot,
+    TaskResourceScope,
+    TaskRun,
+    TaskRunCredential,
+    WorkspaceStatus,
+)
+from cowork.coding.control_store import ControlPlaneStore, LocalControlPlaneStore
+from cowork.coding.project_models import (
+    CodeProject,
+    LocalFolderResource,
+    ProjectResource,
+    RepositoryResource,
+)
+from cowork.coding.run_state import transition_run
+
+if TYPE_CHECKING:
+    from cowork.coding.contracts import TaskWorkspace
+
+
+_OFFLINE_AFTER = timedelta(seconds=35)
+_LEASE_DURATION = timedelta(seconds=30)
+_COMMAND_CLAIM_DURATION = timedelta(seconds=20)
+_SESSION_STATUS: dict[SessionStatus, RunStatus] = {
+    SessionStatus.ready: RunStatus.ready,
+    SessionStatus.running: RunStatus.running,
+    SessionStatus.awaiting_approval: RunStatus.awaiting_approval,
+    SessionStatus.completed: RunStatus.completed,
+    SessionStatus.cancelled: RunStatus.cancelled,
+    SessionStatus.interrupted: RunStatus.interrupted,
+    SessionStatus.failed: RunStatus.failed,
+}
+
+
+class RuntimeAuthenticationError(RuntimeError):
+    pass
+
+
+class StaleRuntimeEvent(RuntimeError):
+    pass
+
+
+class NoEligibleComputer(RuntimeError):
+    pass
+
+
+class ControlPlaneService:
+    """Durable Task/Run/Computer orchestration above local execution details."""
+
+    def __init__(
+        self,
+        root: Path,
+        capabilities: ComputerCapabilities,
+        store: ControlPlaneStore | None = None,
+    ) -> None:
+        self.root = root
+        self.store = store or LocalControlPlaneStore(root)
+        self._lock = threading.RLock()
+        self._registration_tokens: dict[str, datetime] = {}
+        self.local_computer = self._register_local(capabilities)
+
+    @staticmethod
+    def default_capabilities(agent_engines: list[str], shells: list[str]) -> ComputerCapabilities:
+        system = platform.system().lower()
+        normalized = "darwin" if system == "darwin" else "windows" if system == "windows" else "linux"
+        return ComputerCapabilities(
+            platform=normalized,
+            architecture=platform.machine() or "unknown",
+            runtime_version="cowork-desktop-1",
+            agent_engines=agent_engines,
+            shells=shells,
+            has_git=True,
+            has_terminal=True,
+            supports_local_folders=True,
+        )
+
+    def list_computers(self) -> ComputerPage:
+        self.heartbeat(self.local_computer.id, active_run_count=self._active_count(self.local_computer.id))
+        self.expire_stale_computers()
+        return ComputerPage(items=self.store.list_computers())
+
+    def heartbeat(self, computer_id: str, active_run_count: int = 0) -> Computer:
+        computer = self.store.get_computer(computer_id)
+        computer.last_seen_at = utc_now()
+        computer.updated_at = computer.last_seen_at
+        computer.active_run_count = active_run_count
+        if computer.status != ComputerStatus.draining:
+            computer.status = ComputerStatus.online
+        return self.store.save_computer(computer)
+
+    def issue_registration_token(self) -> str:
+        token = secrets.token_urlsafe(36)
+        with self._lock:
+            self._registration_tokens[self._digest(token)] = utc_now() + timedelta(minutes=10)
+        return token
+
+    def register_runtime(
+        self,
+        registration_token: str,
+        name: str,
+        capabilities: ComputerCapabilities,
+        computer_id: str | None = None,
+    ) -> tuple[Computer, str]:
+        self._require_protocol(capabilities.protocol_versions)
+        token_hash = self._digest(registration_token)
+        with self._lock:
+            expires = self._registration_tokens.pop(token_hash, None)
+        if expires is None or expires <= utc_now():
+            raise RuntimeAuthenticationError("Runtime registration expired or was already used")
+        identifier = computer_id or f"computer-{uuid.uuid4().hex}"
+        try:
+            current = self.store.get_computer(identifier)
+            epoch = current.registration_epoch + 1
+        except KeyError:
+            epoch = 1
+        computer = Computer(
+            id=identifier,
+            name=self._computer_name(name),
+            capabilities=capabilities,
+            registration_epoch=epoch,
+        )
+        runtime_token = secrets.token_urlsafe(40)
+        self.store.save_runtime_credential(RuntimeCredential(
+            id=identifier,
+            computer_id=identifier,
+            token_hash=self._digest(runtime_token),
+            registration_epoch=epoch,
+        ))
+        return self.store.save_computer(computer), runtime_token
+
+    def authenticate_runtime(self, computer_id: str, runtime_token: str) -> Computer:
+        try:
+            credential = self.store.get_runtime_credential(computer_id)
+        except KeyError as exc:
+            raise RuntimeAuthenticationError("Runtime authentication failed") from exc
+        computer = self.store.get_computer(computer_id)
+        if (
+            credential.registration_epoch != computer.registration_epoch
+            or not hmac.compare_digest(credential.token_hash, self._digest(runtime_token))
+        ):
+            raise RuntimeAuthenticationError("Runtime authentication failed")
+        return computer
+
+    def issue_run_token(self, run_id: str) -> str:
+        """Mint one epoch-fenced capability for the agent inside a Task Run."""
+
+        run = self.store.get_run(run_id)
+        if not run.lease_id or run.status not in {
+            RunStatus.preparing,
+            RunStatus.ready,
+            RunStatus.running,
+            RunStatus.awaiting_approval,
+        }:
+            raise RuntimeAuthenticationError("Task Run is not actively leased")
+        token = secrets.token_urlsafe(40)
+        self.store.save_run_credential(TaskRunCredential(
+            id=run.id,
+            run_id=run.id,
+            computer_id=run.computer_id,
+            epoch=run.epoch,
+            token_hash=self._digest(token),
+        ))
+        return token
+
+    def authenticate_run_token(self, run_id: str, computer_id: str, token: str) -> TaskRun:
+        try:
+            credential = self.store.get_run_credential(run_id)
+            run = self.store.get_run(run_id)
+        except KeyError as exc:
+            raise RuntimeAuthenticationError("Task Run authentication failed") from exc
+        if (
+            credential.computer_id != computer_id
+            or credential.epoch != run.epoch
+            or run.computer_id != computer_id
+            or not run.lease_id
+            or run.lease_expires_at is None
+            or run.lease_expires_at < utc_now()
+            or run.status in TERMINAL_RUN_STATUSES
+            or not hmac.compare_digest(credential.token_hash, self._digest(token))
+        ):
+            raise RuntimeAuthenticationError("Task Run authentication failed")
+        return run
+
+    def eligible_computers(
+        self,
+        project: CodeProject | None,
+        scope: TaskResourceScope,
+        engine_id: str | None = None,
+    ) -> list[Computer]:
+        resources = self._scoped_resources(project, scope)
+        eligible = []
+        for computer in self.list_computers().items:
+            capabilities = computer.capabilities
+            if computer.status != ComputerStatus.online:
+                continue
+            active_runs = max(computer.active_run_count, self._active_count(computer.id))
+            if active_runs >= capabilities.max_concurrent_runs:
+                continue
+            if engine_id and engine_id not in capabilities.agent_engines:
+                continue
+            if all(self._resource_eligible(item, computer) for item in resources):
+                eligible.append(computer)
+        return eligible
+
+    def resource_availability(self, project: CodeProject) -> ResourceAvailabilityPage:
+        computers = self.list_computers().items
+        items: list[ResourceAvailability] = []
+        for resource in project.resources:
+            eligible = [
+                computer.id
+                for computer in computers
+                if computer.status == ComputerStatus.online and self._resource_eligible(resource, computer)
+            ]
+            required = resource.computer_id if isinstance(resource, LocalFolderResource) else None
+            if eligible:
+                status, detail = "available", ""
+            elif required and any(computer.id == required for computer in computers):
+                status, detail = "offline", "The computer with this folder is offline"
+            else:
+                status, detail = "unavailable", "No registered computer can access this resource"
+            items.append(ResourceAvailability(
+                resource_id=resource.id,
+                status=status,
+                eligible_computer_ids=eligible,
+                required_computer_id=required,
+                detail=detail,
+            ))
+        return ResourceAvailabilityPage(items=items)
+
+    def create_task_run(
+        self,
+        task_id: str,
+        title: str,
+        prompt: str,
+        project: CodeProject | None,
+        requested_resource_ids: list[str] | None,
+        computer_id: str | None,
+        engine_id: str,
+        standalone_computer_id: str | None = None,
+    ) -> TaskControlSnapshot:
+        with self._lock:
+            return self._create_task_run(
+                task_id=task_id,
+                title=title,
+                prompt=prompt,
+                project=project,
+                requested_resource_ids=requested_resource_ids,
+                computer_id=computer_id,
+                engine_id=engine_id,
+                standalone_computer_id=standalone_computer_id,
+            )
+
+    def _create_task_run(
+        self,
+        task_id: str,
+        title: str,
+        prompt: str,
+        project: CodeProject | None,
+        requested_resource_ids: list[str] | None,
+        computer_id: str | None,
+        engine_id: str,
+        standalone_computer_id: str | None,
+    ) -> TaskControlSnapshot:
+        scope = TaskResourceScope(
+            all_project_resources=requested_resource_ids is None,
+            resource_ids=requested_resource_ids or [],
+        )
+        resources = self._scoped_resources(project, scope)
+        eligible = self.eligible_computers(project, scope, engine_id)
+        if project is None and standalone_computer_id:
+            eligible = [item for item in eligible if item.id == standalone_computer_id]
+        selected = next((item for item in eligible if item.id == computer_id), None) if computer_id else None
+        if computer_id and selected is None:
+            raise NoEligibleComputer("That computer cannot access every resource selected for this task")
+        if selected is None:
+            if not eligible:
+                raise NoEligibleComputer("No online computer can access every resource selected for this task")
+            selected = eligible[0]
+        task = CodeTask(
+            id=task_id,
+            title=title,
+            prompt=prompt,
+            project_id=project.id if project else None,
+            resource_scope=scope,
+        )
+        run = TaskRun(
+            id=f"run-{uuid.uuid4().hex}",
+            task_id=task.id,
+            computer_id=selected.id,
+        )
+        workspaces = [ExecutionWorkspace(
+            id=f"workspace-{uuid.uuid4().hex}",
+            run_id=run.id,
+            resource_id=resource.id,
+            computer_id=selected.id,
+        ) for resource in resources]
+        task, run, workspaces = self.store.create_task_run(task, run, workspaces)
+        return TaskControlSnapshot(task=task, run=run, computer=selected, workspaces=workspaces)
+
+    def runtime_project(self, project: CodeProject, scope: TaskResourceScope, computer_id: str) -> CodeProject:
+        resources: list[ProjectResource] = []
+        for resource in self._scoped_resources(project, scope):
+            if (
+                isinstance(resource, RepositoryResource)
+                and resource.source_url
+                and resource.computer_id != computer_id
+            ):
+                resources.append(resource.model_copy(update={"local_path": None, "computer_id": None}))
+            else:
+                resources.append(resource)
+        return CodeProject.model_validate({
+            **project.model_dump(mode="python"),
+            "resources": resources,
+        })
+
+    def set_run_status(self, run_id: str, status: RunStatus, *, error: str | None = None) -> TaskRun:
+        run = self.store.get_run(run_id)
+        transition_run(run, status, error=error)
+        return self.store.save_run(run)
+
+    def continue_task(self, task_id: str, previous_run_id: str) -> TaskRun:
+        previous = self.store.get_run(previous_run_id)
+        if previous.task_id != task_id:
+            raise ValueError("Task Run belongs to another task")
+        computer = self.store.get_computer(previous.computer_id)
+        if computer.status != ComputerStatus.online:
+            raise NoEligibleComputer("The task's computer is offline")
+        run = self.store.save_run(TaskRun(
+            id=f"run-{uuid.uuid4().hex}",
+            task_id=task_id,
+            computer_id=computer.id,
+            status=RunStatus.ready if computer.id == self.local_computer.id else RunStatus.queued,
+            epoch=previous.epoch + 1,
+        ))
+        for workspace in self.store.list_workspaces(previous.id):
+            self.store.save_workspace(workspace.model_copy(update={
+                "id": f"workspace-{uuid.uuid4().hex}",
+                "run_id": run.id,
+                "status": workspace.status,
+            }))
+        return run
+
+    def attach_prepared_workspaces(self, run_id: str, prepared: list[TaskWorkspace]) -> list[ExecutionWorkspace]:
+        run = self.store.get_run(run_id)
+        existing = {item.resource_id: item for item in self.store.list_workspaces(run_id)}
+        saved = []
+        for workspace in prepared:
+            record = existing.get(workspace.folder_id) or ExecutionWorkspace(
+                id=f"workspace-{uuid.uuid4().hex}",
+                run_id=run.id,
+                resource_id=workspace.folder_id,
+                computer_id=run.computer_id,
+            )
+            record.status = WorkspaceStatus.ready
+            record.path = workspace.workspace_path
+            record.workspace_kind = workspace.workspace_kind
+            record.base_revision = workspace.base_revision
+            record.task_branch = workspace.task_branch
+            record.detail = ""
+            saved.append(self.store.save_workspace(record))
+        return saved
+
+    def release_workspaces(self, run_id: str) -> list[ExecutionWorkspace]:
+        released = []
+        for workspace in self.store.list_workspaces(run_id):
+            workspace.status = WorkspaceStatus.released
+            workspace.path = ""
+            workspace.detail = "Workspace released"
+            released.append(self.store.save_workspace(workspace))
+        return released
+
+    def migrate_session(self, session: CodingSession, project: CodeProject | None) -> TaskControlSnapshot:
+        task_id = session.task_id or session.id
+        run_id = session.run_id or f"run-{session.id}"
+        computer_id = session.computer_id or self.local_computer.id
+        resource_ids = session.resource_ids or [item.folder_id for item in session.workspaces]
+        if project and not resource_ids:
+            resource_ids = [item.id for item in project.resources]
+        scope = TaskResourceScope(
+            all_project_resources=session.scope_all_project_resources,
+            resource_ids=[] if session.scope_all_project_resources else resource_ids,
+        )
+        try:
+            task = self.store.get_task(task_id)
+        except KeyError:
+            task = self.store.save_task(CodeTask(
+                id=task_id,
+                title=session.title,
+                project_id=session.project_id,
+                resource_scope=scope,
+                source_contexts=session.source_contexts,
+                deliveries=session.deliveries,
+            ))
+        try:
+            run = self.store.get_run(run_id)
+        except KeyError:
+            run = self.store.save_run(TaskRun(
+                id=run_id,
+                task_id=task.id,
+                computer_id=computer_id,
+                status=_SESSION_STATUS[session.status],
+                epoch=session.runtime_epoch,
+            ))
+        workspaces = self.store.list_workspaces(run.id)
+        if not workspaces:
+            source = session.workspaces or [self._fallback_workspace(session)]
+            workspaces = [self.store.save_workspace(self._execution_workspace(run, item)) for item in source]
+        return TaskControlSnapshot(
+            task=task,
+            run=run,
+            computer=self.store.get_computer(computer_id),
+            workspaces=workspaces,
+        )
+
+    def sync_session(self, session: CodingSession) -> TaskRun:
+        if not session.run_id:
+            raise ValueError("Coding session has not been linked to a Task Run")
+        run = self.store.get_run(session.run_id)
+        target = _SESSION_STATUS[session.status]
+        if run.status != target:
+            try:
+                transition_run(run, target, error=session.last_error)
+            except ValueError:
+                # Reconciliation after app restart may skip intermediate UI
+                # states; the durable session is authoritative for local runs.
+                run.status = target
+                run.last_error = session.last_error
+        # Runtime sequencing is a fenced protocol cursor, not a UI timeline
+        # cursor. Local session events must never advance it or a valid event
+        # from another computer can be rejected as stale.
+        return self.store.save_run(run)
+
+    def acquire_lease(self, computer_id: str) -> tuple[TaskRun, str] | None:
+        with self._lock:
+            self.expire_leases()
+            candidates = [
+                run for run in self.store.list_runs()
+                if run.computer_id == computer_id and run.status in {RunStatus.queued, RunStatus.recovering}
+            ]
+            if not candidates:
+                return None
+            run = min(candidates, key=lambda item: item.created_at)
+            lease_id = secrets.token_urlsafe(32)
+            run.lease_id = lease_id
+            run.lease_expires_at = utc_now() + _LEASE_DURATION
+            transition_run(run, RunStatus.preparing)
+            self.store.save_run(run)
+            return run, lease_id
+
+    def renew_lease(self, event: RuntimeEvent) -> TaskRun:
+        with self._lock:
+            run = self._fenced_run(event)
+            run.lease_expires_at = utc_now() + _LEASE_DURATION
+            run.last_event_seq = event.seq
+            if event.kind == "checkpoint":
+                run.checkpoint = event.payload
+            if event.kind == "status" and isinstance(event.payload.get("status"), str):
+                transition_run(run, RunStatus(event.payload["status"]))
+            if event.kind == "error":
+                transition_run(run, RunStatus.failed, error=str(event.payload.get("detail", "Runtime failed")))
+            return self.store.save_run(run)
+
+    def queue_command(
+        self,
+        run_id: str,
+        kind: str,
+        payload: dict[str, object] | None = None,
+        idempotency_key: str = "",
+    ) -> RuntimeCommand:
+        with self._lock:
+            run = self.store.get_run(run_id)
+            if idempotency_key:
+                existing = next(
+                    (
+                        command
+                        for command in self.store.list_commands(run_id)
+                        if command.epoch == run.epoch and command.idempotency_key == idempotency_key
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    return existing
+            return self.store.save_command(RuntimeCommand(
+                id=f"command-{uuid.uuid4().hex}",
+                run_id=run.id,
+                epoch=run.epoch,
+                kind=kind,
+                payload=payload or {},
+                idempotency_key=idempotency_key,
+            ))
+
+    def issue_connector_grant(
+        self,
+        run_id: str,
+        provider: str,
+        connection_name: str,
+        actions: list[str],
+        resource_constraints: dict[str, str] | None = None,
+        ttl: timedelta = timedelta(minutes=15),
+    ) -> tuple[ConnectorGrant, str]:
+        run = self.store.get_run(run_id)
+        if run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
+            raise ValueError("Connector access is unavailable after a Task Run ends")
+        token = secrets.token_urlsafe(40)
+        grant = ConnectorGrant(
+            id=f"grant-{uuid.uuid4().hex}",
+            run_id=run.id,
+            epoch=run.epoch,
+            provider=provider,
+            connection_name=connection_name,
+            actions=actions,
+            resource_constraints=resource_constraints or {},
+            token_hash=self._digest(token),
+            expires_at=utc_now() + ttl,
+        )
+        return self.store.save_grant(grant), token
+
+    def authorize_connector(
+        self,
+        grant_id: str,
+        token: str,
+        action: str,
+        constraints: dict[str, str] | None = None,
+    ) -> ConnectorGrant:
+        grant = self.store.get_grant(grant_id)
+        run = self.store.get_run(grant.run_id)
+        if grant.revoked_at or grant.expires_at <= utc_now():
+            raise RuntimeAuthenticationError("Connector capability expired")
+        if grant.epoch != run.epoch or run.status in TERMINAL_RUN_STATUSES:
+            raise RuntimeAuthenticationError("Connector capability belongs to a stale Task Run")
+        if not hmac.compare_digest(grant.token_hash, self._digest(token)):
+            raise RuntimeAuthenticationError("Connector capability authentication failed")
+        if action not in grant.actions:
+            raise RuntimeAuthenticationError("Connector capability does not allow this action")
+        for name, expected in (constraints or {}).items():
+            allowed = grant.resource_constraints.get(name)
+            if allowed is not None and not hmac.compare_digest(allowed, expected):
+                raise RuntimeAuthenticationError("Connector capability is outside its resource scope")
+        return grant
+
+    def revoke_connector_grants(self, run_id: str) -> None:
+        now = utc_now()
+        for grant in self.store.list_grants(run_id):
+            if grant.revoked_at is None:
+                grant.revoked_at = now
+                self.store.save_grant(grant)
+
+    def claim_commands(self, run_id: str, computer_id: str, lease_id: str, epoch: int) -> list[RuntimeCommand]:
+        with self._lock:
+            run = self.store.get_run(run_id)
+            self._require_fence(run, computer_id, lease_id, epoch)
+            claimed = []
+            now = utc_now()
+            for command in self.store.list_commands(run_id):
+                if command.acked_at is not None or command.epoch != run.epoch:
+                    continue
+                if command.claim_expires_at is not None and command.claim_expires_at > now:
+                    continue
+                command.claimed_at = now
+                command.claim_expires_at = now + _COMMAND_CLAIM_DURATION
+                command.delivery_count += 1
+                claimed.append(self.store.save_command(command))
+            return claimed
+
+    def acknowledge_command(
+        self,
+        run_id: str,
+        command_id: str,
+        computer_id: str,
+        lease_id: str,
+        epoch: int,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> RuntimeCommand:
+        with self._lock:
+            run = self.store.get_run(run_id)
+            self._require_fence(run, computer_id, lease_id, epoch)
+            command = next(
+                (item for item in self.store.list_commands(run_id) if item.id == command_id),
+                None,
+            )
+            if command is None:
+                raise KeyError("Runtime command not found")
+            if command.epoch != run.epoch:
+                raise StaleRuntimeEvent("Runtime command belongs to a stale epoch")
+            if command.acked_at is None:
+                command.acked_at = utc_now()
+                command.claim_expires_at = None
+                command.result = result
+                command.error = error
+                self.store.save_command(command)
+            return command
+
+    def wait_for_command(self, run_id: str, command_id: str, timeout: float = 20.0) -> RuntimeCommand:
+        """Wait for one fenced runtime reply without hiding persistence behind memory."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            run = self.store.get_run(run_id)
+            command = next(
+                (item for item in self.store.list_commands(run_id) if item.id == command_id),
+                None,
+            )
+            if command is None:
+                raise KeyError("Runtime command not found")
+            if command.epoch != run.epoch:
+                raise StaleRuntimeEvent("Runtime command belongs to a superseded execution")
+            if command.acked_at is not None:
+                return command
+            if time.monotonic() >= deadline:
+                raise RuntimeError("The selected computer did not answer in time")
+            time.sleep(0.05)
+
+    def recover_run(self, run_id: str, computer_id: str | None = None) -> TaskRun:
+        with self._lock:
+            run = self.store.get_run(run_id)
+            target_computer = computer_id or run.computer_id
+            computer = self.store.get_computer(target_computer)
+            if computer.status != ComputerStatus.online:
+                raise NoEligibleComputer("Choose an online computer to resume this task")
+            run.computer_id = target_computer
+            run.epoch += 1
+            run.lease_id = None
+            run.lease_expires_at = None
+            run.last_event_seq = 0
+            run.checkpoint = {}
+            transition_run(run, RunStatus.recovering)
+            return self.store.save_run(run)
+
+    def expire_stale_computers(self) -> None:
+        threshold = utc_now() - _OFFLINE_AFTER
+        for computer in self.store.list_computers():
+            if computer.id == self.local_computer.id or computer.status == ComputerStatus.draining:
+                continue
+            if computer.last_seen_at < threshold and computer.status != ComputerStatus.offline:
+                computer.status = ComputerStatus.offline
+                self.store.save_computer(computer)
+
+    def expire_leases(self) -> None:
+        with self._lock:
+            now = utc_now()
+            for run in self.store.list_runs():
+                if run.lease_expires_at is None or run.lease_expires_at >= now:
+                    continue
+                if run.status in {RunStatus.preparing, RunStatus.ready, RunStatus.running, RunStatus.awaiting_approval}:
+                    run.lease_id = None
+                    run.lease_expires_at = None
+                    run.epoch += 1
+                    run.last_event_seq = 0
+                    run.checkpoint = {}
+                    run.status = RunStatus.recovering
+                    run.last_error = "The computer stopped responding. The task can be resumed safely."
+                    self.store.save_run(run)
+
+    def _register_local(self, capabilities: ComputerCapabilities) -> Computer:
+        identifier = self._local_computer_id()
+        try:
+            existing = self.store.get_computer(identifier)
+            existing.name = self._computer_name(platform.node())
+            existing.capabilities = capabilities
+            existing.status = ComputerStatus.online
+            existing.last_seen_at = utc_now()
+            return self.store.save_computer(existing)
+        except KeyError:
+            return self.store.save_computer(Computer(
+                id=identifier,
+                name=self._computer_name(platform.node()),
+                capabilities=capabilities,
+            ))
+
+    def _local_computer_id(self) -> str:
+        path = self.root / "control" / "local-computer-id"
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except FileNotFoundError:
+            pass
+        value = f"computer-{uuid.uuid4().hex}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        temp.write_text(value + "\n", encoding="utf-8")
+        os.replace(temp, path)
+        return value
+
+    @staticmethod
+    def _computer_name(value: str) -> str:
+        normalized = " ".join(value.replace(".local", "").replace("-", " ").split())
+        return (normalized or "This computer")[:120]
+
+    @staticmethod
+    def _digest(value: str) -> str:
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    @staticmethod
+    def _require_protocol(protocol_versions: list[str]) -> None:
+        if RUNTIME_PROTOCOL_VERSION not in protocol_versions:
+            raise ValueError(f"Runtime protocol {RUNTIME_PROTOCOL_VERSION} is required")
+
+    def _active_count(self, computer_id: str) -> int:
+        capacity_statuses = {
+            RunStatus.preparing,
+            RunStatus.running,
+            RunStatus.awaiting_approval,
+            RunStatus.recovering,
+        }
+        return sum(
+            run.computer_id == computer_id and run.status in capacity_statuses
+            for run in self.store.list_runs()
+        )
+
+    @staticmethod
+    def _resource_eligible(resource: ProjectResource, computer: Computer) -> bool:
+        if isinstance(resource, LocalFolderResource):
+            return computer.capabilities.supports_local_folders and resource.computer_id == computer.id
+        if not computer.capabilities.has_git:
+            return False
+        return bool(resource.source_url) or resource.computer_id == computer.id
+
+    @staticmethod
+    def _scoped_resources(project: CodeProject | None, scope: TaskResourceScope) -> list[ProjectResource]:
+        if project is None:
+            return []
+        if scope.all_project_resources:
+            return list(project.resources)
+        by_id = {resource.id: resource for resource in project.resources}
+        missing = [resource_id for resource_id in scope.resource_ids if resource_id not in by_id]
+        if missing:
+            raise ValueError(f"Unknown project resources: {', '.join(missing)}")
+        return [by_id[resource_id] for resource_id in scope.resource_ids]
+
+    def _fenced_run(self, event: RuntimeEvent) -> TaskRun:
+        if event.protocol_version != RUNTIME_PROTOCOL_VERSION:
+            raise StaleRuntimeEvent("Runtime protocol version is not supported")
+        run = self.store.get_run(event.run_id)
+        self._require_fence(run, event.computer_id, event.lease_id, event.epoch)
+        if event.seq <= run.last_event_seq:
+            raise StaleRuntimeEvent("Runtime event sequence is stale")
+        return run
+
+    @staticmethod
+    def _require_fence(run: TaskRun, computer_id: str, lease_id: str, epoch: int) -> None:
+        if run.computer_id != computer_id or run.epoch != epoch or not run.lease_id:
+            raise StaleRuntimeEvent("Task Run ownership changed")
+        if not hmac.compare_digest(run.lease_id, lease_id):
+            raise StaleRuntimeEvent("Task Run lease is stale")
+        if run.lease_expires_at is None or run.lease_expires_at < utc_now():
+            raise StaleRuntimeEvent("Task Run lease expired")
+
+    @staticmethod
+    def _fallback_workspace(session: CodingSession) -> TaskWorkspace:
+        from cowork.coding.contracts import TaskWorkspace
+
+        return TaskWorkspace(
+            folder_id="folder",
+            folder_name=Path(session.source_path).name or "Folder",
+            source_path=session.source_path,
+            workspace_path=session.workspace_path,
+            workspace_kind=session.workspace_kind,
+            repository_root=session.repository_root,
+            base_revision=session.base_revision,
+            source_dirty=session.source_dirty,
+        )
+
+    @staticmethod
+    def _execution_workspace(run: TaskRun, workspace: TaskWorkspace) -> ExecutionWorkspace:
+        return ExecutionWorkspace(
+            id=f"workspace-{uuid.uuid4().hex}",
+            run_id=run.id,
+            resource_id=workspace.folder_id,
+            computer_id=run.computer_id,
+            status=WorkspaceStatus.ready,
+            path=workspace.workspace_path,
+            workspace_kind=workspace.workspace_kind,
+            base_revision=workspace.base_revision,
+            task_branch=workspace.task_branch,
+        )

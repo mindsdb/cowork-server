@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -9,16 +10,19 @@ import pytest
 
 from cowork.coding import project_store as project_store_module
 from cowork.coding.contracts import SourceContext, WorkspaceKind
+from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.playbooks import PlaybookService
 from cowork.coding.project_models import (
     CodeProject,
+    LocalFolderResource,
     ProjectCommand,
     ProjectConnection,
     ProjectCreateRequest,
     ProjectEnvironment,
     ProjectFolder,
     ProjectUpdateRequest,
+    RepositoryResource,
 )
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
@@ -61,6 +65,36 @@ def test_new_code_projects_default_to_the_live_gpt_5_6_sol_catalog_id(tmp_path: 
     )
 
     assert project.default_model == "gpt"
+
+
+def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path) -> None:
+    repo = repository(tmp_path, "legacy-repo")
+    notes = tmp_path / "legacy-notes"
+    notes.mkdir()
+    root = tmp_path / "coding"
+    projects = root / "projects"
+    projects.mkdir(parents=True)
+    (projects / "legacy.json").write_text(json.dumps({
+        "schema_version": 1,
+        "id": "legacy",
+        "name": "Legacy",
+        "folders": [
+            {"id": "repo", "name": "Repo", "path": str(repo), "commands": []},
+            {"id": "notes", "name": "Notes", "path": str(notes), "commands": []},
+        ],
+    }), encoding="utf-8")
+
+    service = CodeProjectService(root, computer_id="computer-local")
+    migrated = service.get("legacy")
+
+    assert migrated.schema_version == 2
+    assert isinstance(migrated.resources[0], RepositoryResource)
+    assert migrated.resources[0].local_path == str(repo.resolve())
+    assert migrated.resources[0].computer_id == "computer-local"
+    assert isinstance(migrated.resources[1], LocalFolderResource)
+    assert migrated.resources[1].path == str(notes.resolve())
+    assert migrated.resources[1].computer_id == "computer-local"
+    assert len(CodeProjectService(root, computer_id="computer-local").get("legacy").resources) == 2
 
 
 def test_related_project_updates_roll_back_after_a_mid_write_failure(
@@ -168,6 +202,47 @@ def test_project_workspace_isolates_git_and_non_git_folders_and_hands_off_togeth
     assert not Path(second.primary.workspace_path).parent.exists()
     assert not (tmp_path / "coding" / "baselines" / "session-one").exists()
     assert not (tmp_path / "coding" / "baselines" / "session-two").exists()
+
+
+def test_project_workspace_restores_only_recorded_task_paths(tmp_path: Path) -> None:
+    repo = repository(tmp_path, "app")
+    project = CodeProject(
+        id="project-restore",
+        name="Restore",
+        resources=[RepositoryResource(
+            id="app",
+            name="App",
+            local_path=str(repo),
+            source_url=str(repo),
+        )],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = manager.prepare("recoverable-task", project)
+    original = prepared.primary
+    record = ExecutionWorkspace(
+        id="workspace-restore",
+        run_id="run-restore",
+        resource_id="app",
+        computer_id="computer-restore",
+        status=WorkspaceStatus.ready,
+        path=original.workspace_path,
+        workspace_kind=original.workspace_kind,
+        base_revision=original.base_revision,
+        task_branch=original.task_branch,
+    )
+
+    restored = manager.restore("recoverable-task", project, [record])
+
+    assert restored.primary.workspace_path == original.workspace_path
+    assert restored.primary.base_revision == original.base_revision
+    assert restored.primary.task_branch == original.task_branch
+    assert git(Path(restored.primary.workspace_path), "branch", "--show-current") == original.task_branch
+
+    unsafe = record.model_copy(update={"path": str(repo)})
+    with pytest.raises(WorkspaceError, match="could not be restored safely"):
+        manager.restore("recoverable-task", project, [unsafe])
+
+    manager.cleanup("recoverable-task", list(prepared.workspaces))
 
 
 def test_multi_folder_handoff_preflights_every_folder_before_changing_any_source(tmp_path: Path) -> None:

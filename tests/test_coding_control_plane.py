@@ -1,0 +1,445 @@
+from __future__ import annotations
+
+import os
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+
+from cowork.coding.contracts import utc_now
+from cowork.coding.control_models import (
+    RUNTIME_PROTOCOL_VERSION,
+    CodeTask,
+    ComputerCapabilities,
+    ComputerStatus,
+    ExecutionWorkspace,
+    RunStatus,
+    RuntimeEvent,
+    TaskRun,
+)
+from cowork.coding.control_service import (
+    ControlPlaneService,
+    NoEligibleComputer,
+    RuntimeAuthenticationError,
+    StaleRuntimeEvent,
+)
+from cowork.coding.control_store import LocalControlPlaneStore
+from cowork.coding.project_models import (
+    CodeProject,
+    LocalFolderResource,
+    RepositoryResource,
+)
+from cowork.coding.run_state import InvalidRunTransition
+
+
+def capabilities(*, max_runs: int = 4) -> ComputerCapabilities:
+    return ComputerCapabilities(
+        platform="linux",
+        architecture="test",
+        runtime_version="test-runtime",
+        protocol_versions=[RUNTIME_PROTOCOL_VERSION],
+        agent_engines=["codex"],
+        shells=["bash"],
+        max_concurrent_runs=max_runs,
+    )
+
+
+def register(service: ControlPlaneService, name: str = "Remote", *, max_runs: int = 4):
+    token = service.issue_registration_token()
+    return service.register_runtime(token, name, capabilities(max_runs=max_runs))
+
+
+def test_task_run_bundle_rolls_back_if_local_persistence_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalControlPlaneStore(tmp_path)
+    task = CodeTask(id="atomic-task", title="Atomic task")
+    run = TaskRun(id="atomic-run", task_id=task.id, computer_id="computer")
+    workspace = ExecutionWorkspace(
+        id="atomic-workspace",
+        run_id=run.id,
+        resource_id="resource",
+        computer_id="computer",
+    )
+    real_replace = os.replace
+
+    def interrupted_replace(source: str | Path, destination: str | Path) -> None:
+        target = Path(destination)
+        if target.name == f"{task.id}.json":
+            raise OSError("simulated interruption")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("cowork.coding.control_store.os.replace", interrupted_replace)
+    with pytest.raises(OSError, match="simulated interruption"):
+        store.create_task_run(task, run, [workspace])
+
+    with pytest.raises(KeyError):
+        store.get_task(task.id)
+    assert not (tmp_path / "control" / ".transaction.json").exists()
+
+
+def project(local_computer_id: str) -> CodeProject:
+    return CodeProject(
+        id="product",
+        name="Product",
+        resources=[
+            RepositoryResource(
+                id="api",
+                name="API",
+                source_url="https://github.com/example/api.git",
+            ),
+            LocalFolderResource(
+                id="notes",
+                name="Notes",
+                path="/example/notes",
+                computer_id=local_computer_id,
+            ),
+        ],
+    )
+
+
+def test_registration_is_one_use_and_computers_survive_restart(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    computer, runtime_token = register(service)
+    assert service.authenticate_runtime(computer.id, runtime_token).id == computer.id
+    with pytest.raises(RuntimeAuthenticationError, match="already used"):
+        service.register_runtime("invalid-token-that-is-long-enough-for-testing", "Other", capabilities())
+
+    restarted = ControlPlaneService(tmp_path, capabilities())
+    persisted = {item.id: item for item in restarted.list_computers().items}
+    assert computer.id in persisted
+    assert service.local_computer.id == restarted.local_computer.id
+    assert restarted.authenticate_runtime(computer.id, runtime_token).id == computer.id
+
+
+def test_local_folders_are_owner_bound_but_repositories_are_portable(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    code_project = project(service.local_computer.id)
+
+    repo_run = service.create_task_run(
+        task_id="repo-task",
+        title="Repository task",
+        prompt="Change the API",
+        project=code_project,
+        requested_resource_ids=["api"],
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    assert repo_run.computer.id == remote.id
+
+    with pytest.raises(NoEligibleComputer, match="cannot access"):
+        service.create_task_run(
+            task_id="folder-task",
+            title="Folder task",
+            prompt="Update notes",
+            project=code_project,
+            requested_resource_ids=["notes"],
+            computer_id=remote.id,
+            engine_id="codex",
+        )
+
+
+def test_no_project_folder_task_is_kept_on_its_owning_computer(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    assert remote.id != service.local_computer.id
+
+    snapshot = service.create_task_run(
+        task_id="standalone",
+        title="Standalone",
+        prompt="Inspect this folder",
+        project=None,
+        requested_resource_ids=None,
+        computer_id=None,
+        engine_id="codex",
+        standalone_computer_id=service.local_computer.id,
+    )
+    assert snapshot.computer.id == service.local_computer.id
+
+
+def test_leases_fence_stale_and_duplicate_runtime_events(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    snapshot = service.create_task_run(
+        task_id="portable",
+        title="Portable",
+        prompt="Run remotely",
+        project=CodeProject(
+            id="portable-project",
+            name="Portable",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    leased = service.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+    assert run.status == RunStatus.preparing
+
+    event = RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=1,
+        kind="status",
+        payload={"status": "ready"},
+    )
+    assert service.renew_lease(event).status == RunStatus.ready
+    with pytest.raises(StaleRuntimeEvent, match="sequence is stale"):
+        service.renew_lease(event)
+
+    recovered = service.recover_run(snapshot.run.id, service.local_computer.id)
+    assert recovered.epoch == run.epoch + 1
+    with pytest.raises(StaleRuntimeEvent, match="ownership changed"):
+        service.renew_lease(event.model_copy(update={"seq": 2}))
+
+
+def test_only_one_concurrent_runtime_claim_can_acquire_a_queued_run(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    service.create_task_run(
+        task_id="single-lease-task",
+        title="Single lease",
+        prompt="Run once",
+        project=CodeProject(
+            id="single-lease-project",
+            name="Single lease project",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://github.com/acme/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        claims = list(executor.map(lambda _: service.acquire_lease(remote.id), range(8)))
+
+    assert len([claim for claim in claims if claim is not None]) == 1
+
+
+def test_recovered_run_can_be_leased_for_workspace_preparation(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    snapshot = service.create_task_run(
+        task_id="recoverable",
+        title="Recoverable",
+        prompt="Resume safely",
+        project=CodeProject(
+            id="recoverable-project",
+            name="Recoverable",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    first = service.acquire_lease(remote.id)
+    assert first is not None
+    service.set_run_status(snapshot.run.id, RunStatus.interrupted)
+
+    recovered = service.recover_run(snapshot.run.id, remote.id)
+    assert recovered.status == RunStatus.recovering
+    assert recovered.epoch == 2
+    assert recovered.last_event_seq == 0
+    assert recovered.checkpoint == {}
+
+    resumed = service.acquire_lease(remote.id)
+    assert resumed is not None
+    run, lease_id = resumed
+    assert run.status == RunStatus.preparing
+    assert run.epoch == recovered.epoch
+    assert lease_id != first[1]
+    assert service.renew_lease(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=1,
+        kind="status",
+        payload={"status": "ready"},
+    )).status == RunStatus.ready
+
+
+def test_capacity_counts_only_computer_work_not_idle_task_history(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities(max_runs=1))
+    remote, _ = register(service, max_runs=1)
+    code_project = CodeProject(
+        id="project",
+        name="Project",
+        resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+    )
+    first = service.create_task_run(
+        task_id="first",
+        title="First",
+        prompt="First",
+        project=code_project,
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    # Queued metadata does not consume execution capacity until leased.
+    second = service.create_task_run(
+        task_id="second",
+        title="Second",
+        prompt="Second",
+        project=code_project,
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    assert first.run.status == second.run.status == RunStatus.queued
+    assert service.acquire_lease(remote.id) is not None
+    assert service.store.get_computer(remote.id).status == ComputerStatus.online
+    with pytest.raises(NoEligibleComputer, match="cannot access"):
+        service.create_task_run(
+            task_id="third",
+            title="Third",
+            prompt="Third",
+            project=code_project,
+            requested_resource_ids=None,
+            computer_id=remote.id,
+            engine_id="codex",
+        )
+
+
+def test_terminal_run_cannot_be_reopened_without_explicit_recovery(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    snapshot = service.create_task_run(
+        task_id="done",
+        title="Done",
+        prompt="Done",
+        project=None,
+        requested_resource_ids=None,
+        computer_id=None,
+        engine_id="codex",
+        standalone_computer_id=service.local_computer.id,
+    )
+    service.set_run_status(snapshot.run.id, RunStatus.preparing)
+    service.set_run_status(snapshot.run.id, RunStatus.ready)
+    service.set_run_status(snapshot.run.id, RunStatus.running)
+    service.set_run_status(snapshot.run.id, RunStatus.completed)
+    with pytest.raises(InvalidRunTransition, match="completed to running"):
+        service.set_run_status(snapshot.run.id, RunStatus.running)
+
+
+def test_connector_capabilities_are_short_lived_scoped_and_revocable(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    snapshot = service.create_task_run(
+        task_id="connector-task",
+        title="Connector task",
+        prompt="Read one repository",
+        project=CodeProject(
+            id="connector-project",
+            name="Connector project",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://github.com/acme/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=None,
+        engine_id="codex",
+    )
+    grant, token = service.issue_connector_grant(
+        snapshot.run.id,
+        "github",
+        "work-account",
+        ["read_source"],
+        {"repository": "acme/repo"},
+    )
+    assert service.authorize_connector(
+        grant.id,
+        token,
+        "read_source",
+        {"repository": "acme/repo"},
+    ).connection_name == "work-account"
+    assert token not in grant.model_dump_json()
+    with pytest.raises(RuntimeAuthenticationError, match="does not allow"):
+        service.authorize_connector(grant.id, token, "search_work")
+    with pytest.raises(RuntimeAuthenticationError, match="outside its resource scope"):
+        service.authorize_connector(
+            grant.id,
+            token,
+            "read_source",
+            {"repository": "acme/other"},
+        )
+    service.revoke_connector_grants(snapshot.run.id)
+    with pytest.raises(RuntimeAuthenticationError, match="expired"):
+        service.authorize_connector(grant.id, token, "read_source")
+
+
+def test_agent_token_is_scoped_to_one_leased_run_epoch(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    service.create_task_run(
+        task_id="agent-token-task",
+        title="Agent token task",
+        prompt="Run remotely",
+        project=CodeProject(
+            id="agent-token-project",
+            name="Agent token project",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    leased = service.acquire_lease(remote.id)
+    assert leased is not None
+    run, _ = leased
+    token = service.issue_run_token(run.id)
+    assert service.authenticate_run_token(run.id, remote.id, token).epoch == run.epoch
+    assert token not in service.store.get_run_credential(run.id).model_dump_json()
+
+    run.last_event_seq = 7
+    run.checkpoint = {"phase": "running"}
+    run.lease_expires_at = utc_now() - timedelta(seconds=1)
+    service.store.save_run(run)
+    service.expire_leases()
+    expired = service.store.get_run(run.id)
+    assert expired.epoch == 2
+    assert expired.last_event_seq == 0
+    assert expired.checkpoint == {}
+    with pytest.raises(RuntimeAuthenticationError, match="failed"):
+        service.authenticate_run_token(run.id, remote.id, token)
+
+
+def test_runtime_commands_are_idempotent_retryable_and_acknowledged(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    service.create_task_run(
+        task_id="command-task",
+        title="Command task",
+        prompt="Start",
+        project=CodeProject(
+            id="command-project",
+            name="Command project",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    leased = service.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+    first = service.queue_command(run.id, "start", {"prompt": "Build"}, "start-turn-1")
+    duplicate = service.queue_command(run.id, "start", {"prompt": "Ignored"}, "start-turn-1")
+    assert duplicate.id == first.id
+
+    claimed = service.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert [item.id for item in claimed] == [first.id]
+    assert service.claim_commands(run.id, remote.id, lease_id, run.epoch) == []
+
+    claimed[0].claim_expires_at = utc_now() - timedelta(seconds=1)
+    service.store.save_command(claimed[0])
+    retried = service.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert retried[0].id == first.id
+    assert retried[0].delivery_count == 2
+
+    acknowledged = service.acknowledge_command(run.id, first.id, remote.id, lease_id, run.epoch)
+    assert acknowledged.acked_at is not None
+    assert service.claim_commands(run.id, remote.id, lease_id, run.epoch) == []

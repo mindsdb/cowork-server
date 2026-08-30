@@ -22,8 +22,9 @@ class _JournalEntry:
 class CodeProjectStore:
     """Crash-safe local persistence for the durable Code Project catalogue."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, migration_computer_id: str = "local") -> None:
         self.root = root / "projects"
+        self.migration_computer_id = migration_computer_id
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._recover_transaction()
@@ -163,9 +164,10 @@ class CodeProjectStore:
             raise ValueError("invalid Code Project transaction journal")
         return _JournalEntry(project_id=project_id, before=before, stage=stage)
 
-    @staticmethod
-    def _load(raw: dict) -> CodeProject:
+    def _load(self, raw: dict) -> CodeProject:
         version = raw.get("schema_version", 1)
-        if version != 1:
+        if version not in {1, 2}:
             raise ValueError(f"unsupported Code Project schema {version}")
+        if version == 1:
+            raw = {**raw, "_migration_computer_id": self.migration_computer_id}
         return CodeProject.model_validate(raw)
