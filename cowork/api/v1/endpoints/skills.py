@@ -365,14 +365,21 @@ def update_skill(
         access,
         needed=True,
     ):
-        resource_coordination = None
+        resource_coordination = ExitStack()
         try:
             if scoped.scope.org_mode and body.projects is not None:
                 _require_known_projects(scoped, body.projects)
             current = service.get_skill(skill_id)
             if scoped.scope.org_mode:
-                resource_coordination = access.coordination_lock(SKILL, current.name)
-                resource_coordination.__enter__()
+                target_slug = (
+                    service._slug_from_label(body.label)
+                    if body.label is not None
+                    else current.name
+                )
+                for slug in sorted({current.name, target_slug}):
+                    resource_coordination.enter_context(
+                        access.coordination_lock(SKILL, slug)
+                    )
                 _recover_stale_skill_claim(access, service, current.name)
             creator_id = access.creator_id(SKILL, current.name)
             if scoped.scope.org_mode and is_builtin_skill(current.name):
@@ -381,6 +388,20 @@ def update_skill(
                 creator_id,
                 detail="Only the skill creator or an organization admin can edit this skill",
             )
+            if scoped.scope.org_mode and target_slug != current.name:
+                if is_builtin_skill(target_slug):
+                    raise PermissionError(
+                        f"Built-in skill {target_slug!r} is immutable."
+                    )
+                _recover_stale_skill_claim(access, service, target_slug)
+                if access.has_attribution(
+                    SKILL,
+                    target_slug,
+                ) or service._skill_dir(target_slug).exists():
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"A skill named '{target_slug}' already exists.",
+                    )
             with access.mutation_lock(
                 SKILL,
                 current.name,
@@ -452,8 +473,7 @@ def update_skill(
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
         finally:
-            if resource_coordination is not None:
-                resource_coordination.__exit__(None, None, None)
+            resource_coordination.close()
     return _skill_response(skill, access)
 
 
