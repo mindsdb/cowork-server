@@ -1,9 +1,17 @@
 import logging
 from contextlib import ExitStack, nullcontext
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import (
+    ScopedSession,
+    ScopedSessionDep,
+    TenantScope,
+    get_tenant_scope,
+)
+from cowork.db.session import get_open_session
 from cowork.models.skill import Skill
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
@@ -240,19 +248,14 @@ def create_skill(
     return _skill_response(skill, access)
 
 
-@router.post(
-    "/upload",
-    status_code=status.HTTP_201_CREATED,
-    response_model=SkillResponse,
-)
-async def upload_skill(
-    file: UploadFile,
-    scoped: ScopedSessionDep,
-    principal: Principal | None = Depends(get_principal),
-):
+def _upload_skill_bytes(
+    raw: bytes,
+    filename: str | None,
+    scoped: ScopedSession,
+    principal: Principal | None,
+) -> dict:
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
-    raw = await file.read()
     service = SkillService(scoped.scope)
     claim = None
     claim_token = None
@@ -271,7 +274,7 @@ async def upload_skill(
             try:
                 skill = service.import_skill(
                     raw,
-                    filename=file.filename,
+                    filename=filename,
                     before_persist=reserve_import if scoped.scope.org_mode else None,
                 )
             except PermissionError as e:
@@ -300,6 +303,40 @@ async def upload_skill(
                 claim_token=claim_token,
             )
     return _skill_response(skill, access)
+
+
+@router.post(
+    "/upload",
+    status_code=status.HTTP_201_CREATED,
+    response_model=SkillResponse,
+)
+async def upload_skill(
+    file: UploadFile,
+    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+    principal: Principal | None = Depends(get_principal),
+):
+    raw = await file.read()
+    return await run_in_threadpool(
+        _upload_skill_in_new_session,
+        raw,
+        file.filename,
+        scope,
+        principal,
+    )
+
+
+def _upload_skill_in_new_session(
+    raw: bytes,
+    filename: str | None,
+    scope: TenantScope,
+    principal: Principal | None,
+) -> dict:
+    raw_session = get_open_session()
+    try:
+        scoped = ScopedSession(raw_session, scope)
+        return _upload_skill_bytes(raw, filename, scoped, principal)
+    finally:
+        raw_session.close()
 
 
 @router.get("/{skill_id}", response_model=SkillResponse)

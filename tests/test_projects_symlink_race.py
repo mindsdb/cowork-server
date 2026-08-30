@@ -16,6 +16,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
+import cowork.services.projects as projects_module
 from cowork.services.projects import ProjectService
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -76,6 +77,49 @@ def test_rmtree_refuses_a_root_swapped_for_a_symlink(svc, shared):
     with pytest.raises(OSError):
         svc._rmtree_in_root(path)
     assert (victim / "theirs" / "keep.txt").exists(), "must not delete another org's data"
+
+
+def test_rename_keeps_source_pinned_when_root_is_swapped(
+    svc,
+    shared,
+    monkeypatch,
+):
+    root = shared / ORG_A / "projects"
+    detached = shared / ORG_A / "detached-projects"
+    victim = shared / ORG_B / "projects"
+    (root / "mine").mkdir(parents=True)
+    (root / "mine" / "owner.txt").write_text("org a")
+    (victim / "mine").mkdir(parents=True)
+    (victim / "mine" / "owner.txt").write_text("org b")
+    original_rename = projects_module.dir_rename
+
+    def swap_before_rename(source, source_name, destination, destination_name):
+        root.rename(detached)
+        root.symlink_to(victim, target_is_directory=True)
+        original_rename(source, source_name, destination, destination_name)
+
+    monkeypatch.setattr(projects_module, "dir_rename", swap_before_rename)
+
+    svc._rename_in_root(
+        svc._project_path("mine"),
+        svc._project_path("renamed"),
+    )
+
+    assert (detached / "renamed" / "owner.txt").read_text() == "org a"
+    assert (victim / "mine" / "owner.txt").read_text() == "org b"
+
+
+def test_rename_between_legacy_and_scoped_roots(svc):
+    legacy = Path(get_app_settings().project.root_dir) / "legacy"
+    scoped = svc._project_path("renamed")
+    legacy.mkdir(parents=True)
+    (legacy / "keep.txt").write_text("legacy content")
+
+    svc._rename_in_root(legacy, scoped)
+    assert (scoped / "keep.txt").read_text() == "legacy content"
+
+    svc._rename_in_root(scoped, legacy)
+    assert (legacy / "keep.txt").read_text() == "legacy content"
 
 
 def test_nested_path_is_refused_even_below_a_real_root(svc, shared):

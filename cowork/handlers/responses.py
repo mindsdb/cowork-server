@@ -65,7 +65,7 @@ from cowork.handlers.turn_errors import (
     retry_at_instant,
     response_failed_sse,
 )
-from cowork.db.scoped import ScopedSession, scope_from_principal
+from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -708,6 +708,33 @@ class ResponsesHandler:
             logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
 
     @staticmethod
+    def _stage_remote_workspace_files_in_new_session(
+        conv_id: UUID,
+        scope: TenantScope,
+    ) -> None:
+        raw_session = None
+        session = None
+        try:
+            raw_session = get_open_session()
+            session = ScopedSession(raw_session, scope)
+            ResponsesHandler._stage_remote_workspace_files(session, conv_id)
+        except Exception:
+            logger.exception(
+                "[responses] failed to open workspace staging session for conversation %s",
+                conv_id,
+            )
+        finally:
+            opened = session or raw_session
+            if opened is not None:
+                try:
+                    opened.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close workspace staging session for conversation %s",
+                        conv_id,
+                    )
+
+    @staticmethod
     def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
         """The conversation's project as a path relative to the org root.
 
@@ -843,6 +870,42 @@ class ResponsesHandler:
             logger.exception("[responses] failed to apply memory for conversation %s", conv_id)
 
     @staticmethod
+    def _persist_turn_memory_in_new_session(
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+        scope: TenantScope,
+    ) -> None:
+        if not entries:
+            return
+        raw_session = None
+        session = None
+        try:
+            raw_session = get_open_session()
+            session = ScopedSession(raw_session, scope)
+            ResponsesHandler._persist_turn_memory(
+                session,
+                conv_id,
+                entries,
+                principal,
+            )
+        except Exception:
+            logger.exception(
+                "[responses] failed to open memory persistence session for conversation %s",
+                conv_id,
+            )
+        finally:
+            opened = session or raw_session
+            if opened is not None:
+                try:
+                    opened.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close memory persistence session for conversation %s",
+                        conv_id,
+                    )
+
+    @staticmethod
     def _remote_history(session, conv_id) -> list[dict]:
         """Prior user/assistant messages in canonical order, as OpenAI-shaped
         dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
@@ -873,7 +936,6 @@ class ResponsesHandler:
         user + assistant together on terminal (deferred, so _remote_history
         reads prior turns without the current input)."""
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
         # This turn's tool block-rows, for LLM-history persistence only. Kept
@@ -893,15 +955,12 @@ class ResponsesHandler:
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
-        # Stage attachments + project instructions into the workspace before the
-        # pod runs, so it can read them off the shared mount (no other channel).
-        # Off the event loop: the copies are blocking fs I/O (multi-MB uploads,
-        # EFS latency) and would otherwise stall every other SSE stream on this
-        # worker. Safe to share the producer session with the thread — nothing
-        # else touches it until the reply stream below starts.
-        await asyncio.to_thread(self._stage_remote_workspace_files, producer_session, conv_id)
+        producer_scope: TenantScope | None = None
+        producer_session: ScopedSession | None = None
 
         async def replies_as_stream_events():
+            if producer_session is None or producer_scope is None:
+                raise RuntimeError("Remote producer session is not initialized")
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
             from cowork.services.task_objects import (
@@ -949,11 +1008,12 @@ class ResponsesHandler:
                         for event in step_stream_events(data):
                             yield event
                     elif kind == "turn_memory":
-                        self._persist_turn_memory(
-                            producer_session,
+                        await asyncio.to_thread(
+                            self._persist_turn_memory_in_new_session,
                             conv_id,
                             data.get("entries") or [],
                             self.principal,
+                            producer_scope,
                         )
                     elif kind == "turn_history":
                         # Slice-assign, not extend: the pod emits one frame per
@@ -1015,6 +1075,12 @@ class ResponsesHandler:
             if persisted:
                 return
             persisted = True
+            if producer_session is None:
+                logger.error(
+                    "[responses] cannot persist remote turn without a session for conversation %s",
+                    conv_id,
+                )
+                return
             try:
                 # Re-anchor first: the conversation may be gone or out of scope.
                 svc = ConversationService(producer_session)
@@ -1042,6 +1108,19 @@ class ResponsesHandler:
                 logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
 
         try:
+            # Stage attachments + project instructions before the pod runs. The
+            # copies use a worker-owned session, so cancellation can safely close
+            # this producer without racing blocking EFS or database work.
+            producer_scope = scope_from_principal(self.principal)
+            await asyncio.to_thread(
+                self._stage_remote_workspace_files_in_new_session,
+                conv_id,
+                producer_scope,
+            )
+            producer_session = ScopedSession(
+                get_open_session(),
+                producer_scope,
+            )
             # Persist the user message (pending) as the first thing this producer
             # does (ENG-1231) — see the note in handle(). Committed here, before
             # streaming, so a refresh/reconnect mid-turn shows the question via
@@ -1104,7 +1183,8 @@ class ResponsesHandler:
             await buffer.close("error")
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
-            producer_session.close()
+            if producer_session is not None:
+                producer_session.close()
 
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the

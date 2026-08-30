@@ -14,9 +14,10 @@ import pytest
 from fastapi import HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from cowork.api.v1.endpoints import memory as memory_endpoints
 from cowork.api.v1.endpoints import project_files, projects, skills
 from cowork.api.v1.endpoints.compat import stubs as compat_stubs
 from cowork.common.settings.app_settings import get_app_settings
@@ -34,6 +35,7 @@ from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
 from cowork.schemas.skills import SkillCreateRequest, SkillResponse, SkillUpdateRequest
 from cowork.services.memory import MemoryService, apply_turn_memory, build_turn_memory
 from cowork.services import memory as memory_service_module
+from cowork.services import shared_resources as shared_resource_module
 from cowork.harnesses.memory.store import ProjectMemoryStore
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService, attachment_purpose
@@ -2187,15 +2189,14 @@ def test_nested_postgres_resource_locks_share_one_dedicated_connection(
 
         def execute(self, statement, parameters):
             self.calls.append((str(statement), parameters))
+            return SimpleNamespace(scalar=lambda: True)
 
         def close(self):
             self.closed += 1
 
     connection = FakeConnection()
 
-    class FakeBind:
-        dialect = SimpleNamespace(name="postgresql")
-
+    class FakeLockEngine:
         def __init__(self):
             self.connects = 0
 
@@ -2203,9 +2204,21 @@ def test_nested_postgres_resource_locks_share_one_dedicated_connection(
             self.connects += 1
             return connection
 
+    lock_engine = FakeLockEngine()
+
+    class FakeBind:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def connect(self):
+            pytest.fail("advisory locks must not consume the ORM QueuePool")
+
     bind = FakeBind()
     scoped = _scoped(org_engine, ALICE)
     monkeypatch.setattr(scoped, "get_bind", lambda: bind)
+    monkeypatch.setattr(
+        "cowork.services.shared_resources._database_lock_engine",
+        lambda current_bind: lock_engine,
+    )
     access = SharedResourceAccess(scoped, _principal(ALICE))
 
     with access._database_locks.lock(ORG, PROJECT, "project-id"):
@@ -2214,7 +2227,7 @@ def test_nested_postgres_resource_locks_share_one_dedicated_connection(
             PROJECT_INSTRUCTIONS,
             "project-id",
         ):
-            assert bind.connects == 1
+            assert lock_engine.connects == 1
             assert connection.closed == 0
 
     operations = [
@@ -2222,8 +2235,89 @@ def test_nested_postgres_resource_locks_share_one_dedicated_connection(
         for statement, _parameters in connection.calls
     ]
     assert operations == ["lock", "lock", "unlock", "unlock"]
-    assert bind.connects == 1
+    assert lock_engine.connects == 1
     assert connection.closed == 1
+
+
+def test_postgres_resource_lock_engine_is_unpooled_and_autocommit(monkeypatch):
+    captured = {}
+    lock_engine = object()
+
+    def fake_create_engine(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return lock_engine
+
+    monkeypatch.setattr(shared_resource_module.sa, "create_engine", fake_create_engine)
+    shared_resource_module._DATABASE_LOCK_ENGINES.clear()
+    bind = SimpleNamespace(url="postgresql+psycopg://user:pass@db/cowork")
+    try:
+        assert shared_resource_module._database_lock_engine(bind) is lock_engine
+    finally:
+        shared_resource_module._DATABASE_LOCK_ENGINES.clear()
+
+    assert captured["url"] == bind.url
+    assert captured["poolclass"] is NullPool
+    assert captured["isolation_level"] == "AUTOCOMMIT"
+    assert captured["connect_args"]["connect_timeout"] <= 10
+
+
+def test_postgres_resource_lock_has_a_bounded_wait(org_engine, monkeypatch):
+    class FakeConnection:
+        def __init__(self):
+            self.closed = 0
+
+        def execute(self, statement, parameters):
+            return SimpleNamespace(scalar=lambda: False)
+
+        def close(self):
+            self.closed += 1
+
+    connection = FakeConnection()
+    lock_engine = SimpleNamespace(connect=lambda: connection)
+    bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    scoped = _scoped(org_engine, ALICE)
+    monkeypatch.setattr(scoped, "get_bind", lambda: bind)
+    monkeypatch.setattr(
+        "cowork.services.shared_resources._database_lock_engine",
+        lambda current_bind: lock_engine,
+    )
+    monkeypatch.setattr(
+        "cowork.services.shared_resources.RESOURCE_LOCK_TIMEOUT_SECONDS",
+        0,
+    )
+
+    access = SharedResourceAccess(scoped, _principal(ALICE))
+    with pytest.raises(HTTPException) as busy:
+        with access.coordination_lock(PROJECT, "busy-project"):
+            pytest.fail("a busy resource must not enter the mutation window")
+
+    assert busy.value.status_code == 503
+    assert connection.closed == 1
+
+
+def test_process_resource_lock_has_a_bounded_wait(org_engine, monkeypatch):
+    key = f"busy-{uuid4()}"
+    holder = SharedResourceAccess(_scoped(org_engine, ALICE), _principal(ALICE))
+    waiter = SharedResourceAccess(_scoped(org_engine, ALICE), _principal(ALICE))
+    monkeypatch.setattr(
+        shared_resource_module,
+        "RESOURCE_LOCK_TIMEOUT_SECONDS",
+        0,
+    )
+
+    def contend() -> HTTPException:
+        try:
+            with waiter.coordination_lock(PROJECT, key):
+                pytest.fail("a busy process lock must not enter the mutation window")
+        except HTTPException as exc:
+            return exc
+
+    with holder.coordination_lock(PROJECT, key):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            busy = pool.submit(contend).result(timeout=5)
+
+    assert busy.status_code == 503
 
 
 def test_stale_skill_waiter_cannot_leave_a_ghost_attribution(org_engine):
@@ -2356,7 +2450,10 @@ def test_stale_complete_skill_claim_is_recovered_before_mutations(org_engine):
 
 
 @pytest.mark.asyncio
-async def test_stale_incomplete_skill_claim_is_cleaned_before_import(org_engine):
+async def test_stale_incomplete_skill_claim_is_cleaned_before_import(
+    org_engine,
+    monkeypatch,
+):
     alice = _scoped(org_engine, ALICE)
     slug = "recovered-import"
     _leave_expired_incomplete_skill_claim(alice, slug)
@@ -2371,7 +2468,8 @@ async def test_stale_incomplete_skill_claim_is_cleaned_before_import(org_engine)
         ),
     )
 
-    created = await skills.upload_skill(upload, alice, _principal(ALICE))
+    monkeypatch.setattr(skills, "get_open_session", lambda: Session(org_engine))
+    created = await skills.upload_skill(upload, alice.scope, _principal(ALICE))
 
     service = SkillService(alice.scope)
     assert created["id"] == slug
@@ -2383,6 +2481,128 @@ async def test_stale_incomplete_skill_claim_is_cleaned_before_import(org_engine)
         if event.resource_kind == SKILL and event.resource_key == slug
     ]
     assert actions == ["create"]
+
+
+@pytest.mark.asyncio
+async def test_skill_upload_endpoint_offloads_the_owned_session_worker(monkeypatch):
+    captured = {}
+    scope = TenantScope(org_mode=True, org_id=ORG, user_id=ALICE)
+    principal = _principal(ALICE)
+    upload = UploadFile(filename="worker.md", file=io.BytesIO(b"skill bytes"))
+
+    async def fake_run_in_threadpool(function, *args):
+        captured["function"] = function
+        captured["args"] = args
+        return {"worker": True}
+
+    monkeypatch.setattr(skills, "run_in_threadpool", fake_run_in_threadpool)
+
+    result = await skills.upload_skill(upload, scope, principal)
+
+    assert result == {"worker": True}
+    assert captured["function"] is skills._upload_skill_in_new_session
+    assert captured["args"] == (b"skill bytes", "worker.md", scope, principal)
+
+
+@pytest.mark.asyncio
+async def test_skill_upload_worker_keeps_the_event_loop_responsive(monkeypatch):
+    import asyncio
+    from threading import Event, get_ident
+
+    started = Event()
+    release = Event()
+    worker_thread = {}
+
+    def blocking_worker(*args):
+        worker_thread["id"] = get_ident()
+        started.set()
+        release.wait(timeout=5)
+        return {"worker": True}
+
+    monkeypatch.setattr(skills, "_upload_skill_in_new_session", blocking_worker)
+    upload = UploadFile(filename="worker.md", file=io.BytesIO(b"skill bytes"))
+    task = asyncio.create_task(
+        skills.upload_skill(
+            upload,
+            TenantScope(org_mode=True, org_id=ORG, user_id=ALICE),
+            _principal(ALICE),
+        )
+    )
+    try:
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+        assert started.is_set()
+        assert task.done() is False
+        assert worker_thread["id"] != get_ident()
+    finally:
+        release.set()
+
+    assert await task == {"worker": True}
+
+
+def test_skill_upload_worker_closes_its_session_on_failure(monkeypatch):
+    class RawSession:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    raw_session = RawSession()
+    scoped = SimpleNamespace()
+    monkeypatch.setattr(skills, "get_open_session", lambda: raw_session)
+    monkeypatch.setattr(skills, "ScopedSession", lambda raw, scope: scoped)
+
+    def fail_upload(*args):
+        raise RuntimeError("upload failed")
+
+    monkeypatch.setattr(skills, "_upload_skill_bytes", fail_upload)
+
+    with pytest.raises(RuntimeError, match="upload failed"):
+        skills._upload_skill_in_new_session(
+            b"skill bytes",
+            "worker.md",
+            TenantScope(org_mode=True, org_id=ORG, user_id=ALICE),
+            _principal(ALICE),
+        )
+
+    assert raw_session.closed == 1
+
+
+def test_memory_endpoints_run_as_sync_workers():
+    import inspect
+
+    assert not inspect.iscoroutinefunction(memory_endpoints.list_memory)
+    assert not inspect.iscoroutinefunction(memory_endpoints.update_memory)
+    assert not inspect.iscoroutinefunction(memory_endpoints.delete_memory)
+
+
+def test_memory_worker_closes_its_owned_session(monkeypatch):
+    class RawSession:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    raw_session = RawSession()
+    scoped = SimpleNamespace(scope=LOCAL_SCOPE)
+    monkeypatch.setattr(memory_endpoints, "get_open_session", lambda: raw_session)
+    monkeypatch.setattr(
+        memory_endpoints,
+        "ScopedSession",
+        lambda raw, scope: scoped,
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        with memory_endpoints._memory_service(LOCAL_SCOPE, None) as service:
+            assert service.session is scoped
+            raise RuntimeError("worker failed")
+
+    assert raw_session.closed == 1
 
 
 def test_skill_noop_semantic_actions_and_delete_compensation(

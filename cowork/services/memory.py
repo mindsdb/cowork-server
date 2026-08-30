@@ -387,6 +387,14 @@ class MemoryService:
         category: MemorySlot,
         project_id: UUID | None = None,
     ) -> MemoryResponse:
+        return self.get_memory_sync(scope, category, project_id)
+
+    def get_memory_sync(
+        self,
+        scope: MemoryScope,
+        category: MemorySlot,
+        project_id: UUID | None = None,
+    ) -> MemoryResponse:
         scope = MemoryScope(scope)
         category = MemorySlot(category)
         content, read_verified = self._read_for_response(scope, category, project_id)
@@ -405,6 +413,15 @@ class MemoryService:
         content: str,
         project_id: UUID | None = None,
     ) -> MemoryResponse:
+        return self.update_memory_sync(scope, category, content, project_id)
+
+    def update_memory_sync(
+        self,
+        scope: MemoryScope,
+        category: MemorySlot,
+        content: str,
+        project_id: UUID | None = None,
+    ) -> MemoryResponse:
         scope = MemoryScope(scope)
         category = MemorySlot(category)
         self._write(scope, category, content, project_id)
@@ -416,11 +433,25 @@ class MemoryService:
         category: MemorySlot,
         project_id: UUID | None = None,
     ) -> None:
+        self.delete_memory_sync(scope, category, project_id)
+
+    def delete_memory_sync(
+        self,
+        scope: MemoryScope,
+        category: MemorySlot,
+        project_id: UUID | None = None,
+    ) -> None:
         scope = MemoryScope(scope)
         category = MemorySlot(category)
         self._delete(scope, category, project_id)
 
     async def list_memory(self, project_id: UUID | None = None) -> list[MemoryResponse]:
+        return self.list_memory_sync(project_id)
+
+    def list_memory_sync(
+        self,
+        project_id: UUID | None = None,
+    ) -> list[MemoryResponse]:
         items: list[MemoryResponse] = []
 
         for category in MemorySlot:

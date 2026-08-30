@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import logging
+import os
 import re
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -15,7 +16,7 @@ import sqlalchemy as sa
 from cowork.common.paths import (
     PinnedDir,
     dir_mkdir,
-    dir_rename_into,
+    dir_rename,
     dir_rmtree,
     pinned_dir,
     safe_join,
@@ -280,18 +281,48 @@ class ProjectService:
                 if not exist_ok:
                     raise
 
-    def _rename_in_root(self, old: Path, new: Path) -> None:
-        """Rename *old* to *new*, where *new* is a direct child of the root.
+    def _trusted_project_root(self, path: Path) -> tuple[Path, str]:
+        """Return the trusted direct-child root and name for ``path``.
 
-        Only the DESTINATION is pinned. The source is passed absolute on
-        purpose: a legacy row still on a pre-org-keyed path lives outside this
-        root entirely, and that path is one we already hold rather than one an
-        agent can redirect us into. The destination is the side an attacker
-        would aim at another org, so that is the side that must not be
-        re-walked.
+        Org rows may still point at the old unkeyed projects root. Both that
+        root and the current org root are server configuration, but neither may
+        be resolved here: following a swapped root symlink would turn the
+        containment check into the cross-tenant traversal it is meant to stop.
         """
-        with self._root_fd() as root:
-            dir_rename_into(root, old, self._child_name(new))
+        absolute = Path(os.path.abspath(path))
+        path_parent = Path(os.path.abspath(absolute.parent))
+        canonical_parent = (
+            Path(os.path.realpath(path_parent.parent)) / path_parent.name
+        )
+        roots = (self._root_dir(), Path(get_app_settings().project.root_dir))
+        for candidate in roots:
+            configured = Path(os.path.abspath(candidate))
+            # Resolve stable ancestors (for macOS /var -> /private/var), but
+            # append the agent-writable projects-root component without
+            # following it. ``pinned_dir(..., nofollow_base=True)`` can then
+            # reject a swapped root symlink at use time.
+            root = Path(os.path.realpath(configured.parent)) / configured.name
+            if canonical_parent == root and absolute.name not in {"", ".", ".."}:
+                return root, absolute.name
+        raise ValueError(f"{path} is not a direct child of a trusted projects root")
+
+    def _rename_in_root(self, old: Path, new: Path) -> None:
+        """Rename between trusted project roots without re-walking either path."""
+        source_root, source_name = self._trusted_project_root(old)
+        destination_root, destination_name = self._trusted_project_root(new)
+        if source_root == destination_root:
+            with pinned_dir(source_root, nofollow_base=True) as root:
+                dir_rename(root, source_name, root, destination_name)
+            return
+        with pinned_dir(
+            source_root,
+            nofollow_base=True,
+        ) as source, pinned_dir(
+            destination_root,
+            create=True,
+            nofollow_base=True,
+        ) as destination:
+            dir_rename(source, source_name, destination, destination_name)
 
     def _rmtree_in_root(self, path: Path) -> None:
         with self._root_fd() as root:

@@ -53,6 +53,49 @@ def test_import_duplicate(svc: SkillService):
         svc.import_skill(VALID, filename="x.md")
 
 
+def test_skill_dir_rejects_a_symlink_escape(svc: SkillService):
+    container = svc.root
+    svc.root = container / "skills"
+    outside = container / "outside"
+    svc.root.mkdir()
+    outside.mkdir()
+    (svc.root / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Invalid skill name"):
+        svc._skill_dir("escape")
+
+
+def test_discard_incomplete_skill_removes_external_symlink_only(svc: SkillService):
+    container = svc.root
+    svc.root = container / "skills"
+    outside = container / "outside"
+    svc.root.mkdir()
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    link = svc.root / "escape"
+    link.symlink_to(outside, target_is_directory=True)
+
+    assert svc.discard_incomplete_skill("escape") is True
+
+    assert not link.exists()
+    assert (outside / "keep.txt").read_text() == "keep"
+
+
+def test_discard_incomplete_skill_preserves_same_root_target(svc: SkillService):
+    svc.create_skill(
+        "real-skill",
+        "Canonical instructions",
+        description="Canonical skill",
+    )
+    link = svc.root / "alias"
+    link.symlink_to(svc.root / "real-skill", target_is_directory=True)
+
+    assert svc.discard_incomplete_skill("alias") is True
+
+    assert not link.exists()
+    assert svc.get_skill("real-skill").instructions == "Canonical instructions"
+
+
 def test_rename_failure_restores_source_and_preserves_racing_destination(
     svc: SkillService,
     monkeypatch,
