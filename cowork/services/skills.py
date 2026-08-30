@@ -253,12 +253,24 @@ class SkillService:
         )
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    def _skill_dir(self, slug: str) -> Path:
+    def _skill_entry(self, slug: str) -> Path:
+        """Return the validated lexical entry without following a slug symlink."""
         validate_name(slug)
-        skill_dir = (self.root / slug).resolve()
-        if not skill_dir.is_relative_to(self.root.resolve()):
+        root = os.path.abspath(self.root)
+        entry = os.path.abspath(os.path.join(root, slug))
+        root_prefix = root if root.endswith(os.sep) else f"{root}{os.sep}"
+        if not entry.startswith(root_prefix):
             raise ValueError(f"Invalid skill name: {slug!r}")
-        return skill_dir
+        return Path(entry)
+
+    def _skill_dir(self, slug: str) -> Path:
+        entry = self._skill_entry(slug)
+        root = os.path.realpath(self.root)
+        skill_dir = os.path.realpath(entry)
+        root_prefix = root if root.endswith(os.sep) else f"{root}{os.sep}"
+        if not skill_dir.startswith(root_prefix):
+            raise ValueError(f"Invalid skill name: {slug!r}")
+        return Path(skill_dir)
 
     def _is_immutable_builtin(self, slug: str) -> bool:
         return bool(
@@ -346,8 +358,7 @@ class SkillService:
         empty directories, temporary files, symlinks, malformed frontmatter, and
         a file whose declared identity does not match its directory.
         """
-        validate_name(slug)
-        skill_dir = self.root / slug
+        skill_dir = self._skill_entry(slug)
         skill_file = skill_dir / SKILL_FILE
         try:
             if skill_dir.is_symlink() or not skill_dir.is_dir():
@@ -367,13 +378,12 @@ class SkillService:
         Symlinks and non-directory entries are moved as entries and then unlinked;
         they are never followed by ``rmtree``.
         """
-        validate_name(slug)
         if self.has_complete_skill(slug):
             return False
-        source = self.root / slug
+        source = self._skill_entry(slug)
         staging_root = self.root / ".incomplete-staging"
         staging_root.mkdir(parents=True, exist_ok=True)
-        staged = staging_root / f"{slug}-{uuid4()}"
+        staged = staging_root / f"{source.name}-{uuid4()}"
         try:
             os.replace(source, staged)
         except FileNotFoundError:
@@ -674,7 +684,7 @@ class SkillService:
             return None
         trash = self.root / ".delete-staging"
         trash.mkdir(parents=True, exist_ok=True)
-        staged = trash / f"{slug}-{uuid4()}"
+        staged = trash / f"{skill_dir.name}-{uuid4()}"
         os.replace(skill_dir, staged)
         return staged
 

@@ -12,12 +12,15 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 from threading import Lock, RLock
+import time
 from typing import Any, Callable, Iterator
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from fastapi import HTTPException, status
+from sqlalchemy.pool import NullPool
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession
 from cowork.models.shared_resource import (
     SharedResourceAttribution,
@@ -33,9 +36,13 @@ PROJECT_MEMORY = "project_memory"
 PROJECT_INSTRUCTIONS = "project_instructions"
 SKILL_PROJECT_REFERENCES = "skill_project_references"
 CLAIM_TTL = timedelta(minutes=5)
+RESOURCE_LOCK_TIMEOUT_SECONDS = 10.0
+ADVISORY_LOCK_RETRY_SECONDS = 0.05
 
 _PROCESS_LOCKS: dict[tuple[str, str, str], RLock] = {}
 _PROCESS_LOCKS_GUARD = Lock()
+_DATABASE_LOCK_ENGINES: dict[object, Any] = {}
+_DATABASE_LOCK_ENGINES_GUARD = Lock()
 
 
 def _utc_now() -> datetime:
@@ -63,13 +70,50 @@ def _process_lock(org_id: str, kind: str, key: str) -> RLock:
         return _PROCESS_LOCKS.setdefault(identity, RLock())
 
 
+def _resource_busy() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="The resource is busy; retry the request",
+    )
+
+
+def _database_lock_engine(bind: Any) -> Any:
+    """Return an unpooled engine reserved for session advisory locks.
+
+    ORM sessions and advisory locks have opposite acquisition orders across
+    request flows. Keeping advisory connections outside the ORM QueuePool
+    prevents those flows from filling that pool while each waits for a second
+    slot. ``NullPool`` also makes closing the outer lock connection release the
+    physical PostgreSQL session immediately.
+    """
+    url = bind.url
+    with _DATABASE_LOCK_ENGINES_GUARD:
+        engine = _DATABASE_LOCK_ENGINES.get(url)
+        if engine is None:
+            settings = get_app_settings()
+            engine = sa.create_engine(
+                url,
+                poolclass=NullPool,
+                pool_pre_ping=settings.database.pool_pre_ping,
+                isolation_level="AUTOCOMMIT",
+                connect_args={
+                    "connect_timeout": max(
+                        1,
+                        min(10, settings.database.pool_timeout),
+                    )
+                },
+            )
+            _DATABASE_LOCK_ENGINES[url] = engine
+        return engine
+
+
 class _DatabaseResourceLocks:
     """One request's cross-replica locks on one dedicated connection.
 
     PostgreSQL session advisory locks survive commits made by the request's ORM
-    session. Nested project cascades share one extra pooled connection rather
-    than consuming one connection per project child. SQLite tests/local mode
-    use only the keyed process lock.
+    session. Nested project cascades share one unpooled lock connection rather
+    than opening one connection per project child. SQLite tests/local mode use
+    only the keyed process lock.
     """
 
     def __init__(self, session: ScopedSession) -> None:
@@ -78,14 +122,23 @@ class _DatabaseResourceLocks:
         self.depth = 0
 
     @contextmanager
-    def lock(self, org_id: str, kind: str, key: str) -> Iterator[None]:
+    def lock(
+        self,
+        org_id: str,
+        kind: str,
+        key: str,
+        *,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
         bind = self.session.get_bind()
         if bind.dialect.name != "postgresql":
             yield
             return
 
+        if deadline is None:
+            deadline = time.monotonic() + RESOURCE_LOCK_TIMEOUT_SECONDS
         owns_connection = self.connection is None
-        connection = self.connection or bind.connect()
+        connection = self.connection or _database_lock_engine(bind).connect()
         if owns_connection:
             self.connection = connection
         self.depth += 1
@@ -97,11 +150,19 @@ class _DatabaseResourceLocks:
         )
         acquired = False
         try:
-            connection.execute(
-                sa.text("SELECT pg_advisory_lock(:lock_key)"),
-                {"lock_key": lock_key},
-            )
-            acquired = True
+            while True:
+                acquired = bool(
+                    connection.execute(
+                        sa.text("SELECT pg_try_advisory_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    ).scalar()
+                )
+                if acquired:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _resource_busy()
+                time.sleep(min(ADVISORY_LOCK_RETRY_SECONDS, remaining))
             yield
         finally:
             try:
@@ -313,12 +374,31 @@ class SharedResourceAccess:
         org_id = self.session.scope.org_id
         if org_id is None:
             raise RuntimeError("Organization scope disappeared during coordination")
-        with _process_lock(org_id, namespace, key), self._database_locks.lock(
-            org_id,
-            namespace,
-            key,
-        ):
+        with self._resource_lock(org_id, namespace, key):
             yield
+
+    @contextmanager
+    def _resource_lock(
+        self,
+        org_id: str,
+        kind: str,
+        key: str,
+    ) -> Iterator[None]:
+        deadline = time.monotonic() + RESOURCE_LOCK_TIMEOUT_SECONDS
+        process_lock = _process_lock(org_id, kind, key)
+        remaining = max(0.0, deadline - time.monotonic())
+        if not process_lock.acquire(timeout=remaining):
+            raise _resource_busy()
+        try:
+            with self._database_locks.lock(
+                org_id,
+                kind,
+                key,
+                deadline=deadline,
+            ):
+                yield
+        finally:
+            process_lock.release()
 
     @contextmanager
     def mutation_lock(
@@ -344,9 +424,7 @@ class SharedResourceAccess:
         org_id = self.session.scope.org_id
         if org_id is None:
             raise RuntimeError("Organization scope disappeared during mutation")
-        with _process_lock(org_id, kind, key), self._database_locks.lock(
-            org_id, kind, key
-        ):
+        with self._resource_lock(org_id, kind, key):
             row = self._find(kind, key)
             created_placeholder = False
             if row is None:

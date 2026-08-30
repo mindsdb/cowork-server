@@ -131,7 +131,7 @@ def _remote_handler(monkeypatch, saved):
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
     monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
-    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
 
 
@@ -246,6 +246,206 @@ def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
         ("apply", "/projects/renamed", entries),
         "lock-exit",
     ]
+
+
+def test_memory_worker_closes_raw_session_when_scoping_fails(monkeypatch):
+    class RawSession:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    raw = RawSession()
+    monkeypatch.setattr(responses_mod, "get_open_session", lambda: raw)
+
+    def fail_to_scope(session, scope):
+        assert session is raw
+        raise RuntimeError("scope failed")
+
+    monkeypatch.setattr(responses_mod, "ScopedSession", fail_to_scope)
+
+    ResponsesHandler._persist_turn_memory_in_new_session(
+        uuid4(),
+        [{"text": "remember"}],
+        object(),
+        _FakeScope(),
+    )
+
+    assert raw.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_stage_closes_buffer_and_worker_session(monkeypatch):
+    import asyncio
+    from threading import Event
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    started = Event()
+    release = Event()
+    worker_closed = Event()
+    sessions = []
+
+    class FakeSession:
+        def __init__(self):
+            self.closed = 0
+            sessions.append(self)
+
+        def close(self):
+            self.closed += 1
+            worker_closed.set()
+
+    monkeypatch.setattr(
+        responses_mod,
+        "ScopedSession",
+        lambda raw, scope: FakeSession(),
+    )
+
+    def blocking_stage(session, conv_id):
+        assert session is sessions[0]
+        started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(
+        ResponsesHandler,
+        "_stage_remote_workspace_files",
+        staticmethod(blocking_stage),
+    )
+
+    class Buffer(_FakeBuffer):
+        def __init__(self):
+            self.closed = None
+
+        async def close(self, reason, extra=None):
+            self.closed = reason
+
+    buffer = Buffer()
+    task = asyncio.create_task(
+        handler._produce_remote(
+            conv_id=uuid4(),
+            input_text="hi",
+            original_content="hi",
+            model="anton",
+            harness_id="anton",
+            buffer=buffer,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True),
+            timeout=5,
+        )
+
+        assert buffer.closed == "cancelled"
+        assert sessions[0].closed == 0
+    finally:
+        release.set()
+
+    assert await asyncio.to_thread(worker_closed.wait, 5)
+    assert sessions[0].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_memory_uses_a_worker_owned_session(monkeypatch):
+    import asyncio
+    from threading import Event
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._stage_remote_workspace_files_in_new_session = lambda *args: None
+    handler._remote_artifacts_context = lambda session, conv_id: None
+    handler._remote_memory = lambda session, conv_id: {}
+    handler._remote_workspace = lambda session, conv_id: {}
+    started = Event()
+    release = Event()
+    worker_closed = Event()
+    sessions = []
+    used_sessions = []
+    used_principals = []
+    captured_scopes = []
+    producer_scope = _FakeScope()
+    monkeypatch.setattr(
+        responses_mod,
+        "scope_from_principal",
+        lambda principal: producer_scope,
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.closed = 0
+            self.index = len(sessions)
+            sessions.append(self)
+
+        def close(self):
+            self.closed += 1
+            if self.index == 1:
+                worker_closed.set()
+
+    def fake_scoped_session(raw, scope):
+        captured_scopes.append(scope)
+        return FakeSession()
+
+    monkeypatch.setattr(responses_mod, "ScopedSession", fake_scoped_session)
+
+    def blocking_persist(session, conv_id, entries, principal):
+        used_sessions.append(session)
+        used_principals.append(principal)
+        started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(
+        ResponsesHandler,
+        "_persist_turn_memory",
+        staticmethod(blocking_persist),
+    )
+
+    async def fake_replies(**kwargs):
+        yield "turn_memory", {"entries": [{"text": "remember"}]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class Buffer(_FakeBuffer):
+        def __init__(self):
+            self.closed = None
+
+        async def close(self, reason, extra=None):
+            self.closed = reason
+
+    buffer = Buffer()
+    task = asyncio.create_task(
+        handler._produce_remote(
+            conv_id=uuid4(),
+            input_text="hi",
+            original_content="hi",
+            model="anton",
+            harness_id="anton",
+            buffer=buffer,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True),
+            timeout=5,
+        )
+
+        assert buffer.closed == "cancelled"
+        assert len(sessions) == 2
+        assert used_sessions == [sessions[1]]
+        assert used_principals == [handler.principal]
+        assert captured_scopes == [producer_scope, producer_scope]
+        assert sessions[0].closed == 1
+        assert sessions[1].closed == 0
+    finally:
+        release.set()
+
+    assert await asyncio.to_thread(worker_closed.wait, 5)
+    assert sessions[1].closed == 1
 
 
 @pytest.mark.asyncio

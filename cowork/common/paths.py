@@ -153,15 +153,25 @@ def dir_rmtree(d: PinnedDir, name: str) -> None:
         shutil.rmtree(d.path / name)
 
 
-def dir_rename_into(d: PinnedDir, src: str | Path, name: str) -> None:
-    """Rename the absolute path *src* to child *name* of *d*.
-
-    Only the destination is pinned; *src* is passed as an absolute path (see
-    ``ProjectService._rename_in_root``)."""
-    if d.fd is not None:
-        os.rename(str(src), name, dst_dir_fd=d.fd)
+def dir_rename(
+    source: PinnedDir,
+    source_name: str,
+    destination: PinnedDir,
+    destination_name: str,
+) -> None:
+    """Rename one pinned direct child to another pinned direct child."""
+    if source.fd is not None and destination.fd is not None:
+        os.rename(
+            source_name,
+            destination_name,
+            src_dir_fd=source.fd,
+            dst_dir_fd=destination.fd,
+        )
     else:
-        os.rename(str(src), str(d.path / name))
+        os.rename(
+            source.path / source_name,
+            destination.path / destination_name,
+        )
 
 
 def dir_scandir(d: PinnedDir) -> "Iterator[os.DirEntry[str]]":
