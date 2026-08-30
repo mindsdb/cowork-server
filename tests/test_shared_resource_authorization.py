@@ -2713,6 +2713,168 @@ def test_skill_noop_semantic_actions_and_delete_compensation(
     ]
 
 
+def test_skill_rename_conflict_restores_source_when_destination_claim_races(
+    org_engine,
+    monkeypatch,
+):
+    alice = _scoped(org_engine, ALICE)
+    created = skills.create_skill(
+        SkillCreateRequest(label="rename claim source", instructions="Original"),
+        alice,
+        _principal(ALICE),
+    )
+    source_slug = created["id"]
+    destination_slug = "rename-claim-destination"
+    service = SkillService(alice.scope)
+    source_file = service._skill_dir(source_slug) / "SKILL.md"
+    source_bytes = source_file.read_bytes()
+    access = SharedResourceAccess(alice, _principal(ALICE))
+    source_attribution = access._find(SKILL, source_slug)
+    claim, claim_token = access.reserve_claim(SKILL, destination_slug)
+    assert source_attribution is not None
+    assert claim is not None and claim_token is not None
+
+    real_has_attribution = SharedResourceAccess.has_attribution
+
+    def miss_destination_during_preflight(self, kind, key):
+        if kind == SKILL and key == destination_slug:
+            return False
+        return real_has_attribution(self, kind, key)
+
+    monkeypatch.setattr(
+        SharedResourceAccess,
+        "has_attribution",
+        miss_destination_during_preflight,
+    )
+
+    with pytest.raises(HTTPException) as conflict:
+        skills.update_skill(
+            source_slug,
+            SkillUpdateRequest(label="rename claim destination"),
+            alice,
+            _principal(ALICE),
+        )
+
+    assert conflict.value.status_code == 409
+    assert source_file.read_bytes() == source_bytes
+    assert not service._skill_dir(destination_slug).exists()
+    restored_source = SharedResourceAccess(alice, _principal(ALICE))._find(
+        SKILL,
+        source_slug,
+    )
+    surviving_claim = SharedResourceAccess(alice, _principal(ALICE))._find(
+        SKILL,
+        destination_slug,
+    )
+    assert restored_source is not None
+    assert restored_source.id == source_attribution.id
+    assert surviving_claim is not None
+    assert surviving_claim.pending_claim_token == claim_token
+    assert [
+        event.action for event in alice.exec(alice.select(SharedResourceMutation)).all()
+    ] == ["create"]
+
+
+def test_skill_rename_authorizes_source_before_disclosing_destination_claim(
+    org_engine,
+):
+    alice = _scoped(org_engine, ALICE)
+    created = skills.create_skill(
+        SkillCreateRequest(label="private rename source", instructions="Original"),
+        alice,
+        _principal(ALICE),
+    )
+    destination_slug = "claimed-rename-destination"
+    claim, claim_token = SharedResourceAccess(
+        alice,
+        _principal(ALICE),
+    ).reserve_claim(SKILL, destination_slug)
+    assert claim is not None and claim_token is not None
+
+    bob = _scoped(org_engine, BOB)
+    with pytest.raises(HTTPException) as denied:
+        skills.update_skill(
+            created["id"],
+            SkillUpdateRequest(label="claimed rename destination"),
+            bob,
+            _principal(BOB),
+        )
+
+    assert denied.value.status_code == 403
+    surviving_claim = SharedResourceAccess(alice, _principal(ALICE))._find(
+        SKILL,
+        destination_slug,
+    )
+    assert surviving_claim is not None
+    assert surviving_claim.pending_claim_token == claim_token
+    assert SkillService(alice.scope).get_skill(created["id"]).instructions == "Original"
+
+
+def test_skill_rename_to_packaged_identity_preserves_immutable_response(org_engine):
+    alice = _scoped(org_engine, ALICE)
+    service = SkillService(alice.scope)
+    service.ensure_builtin_skills()
+    created = skills.create_skill(
+        SkillCreateRequest(label="builtin rename source", instructions="Original"),
+        alice,
+        _principal(ALICE),
+    )
+
+    with pytest.raises(HTTPException) as immutable:
+        skills.update_skill(
+            created["id"],
+            SkillUpdateRequest(label="skill-creator"),
+            alice,
+            _principal(ALICE),
+        )
+
+    assert immutable.value.status_code == 403
+    assert service.get_skill(created["id"]).instructions == "Original"
+    assert service.get_skill("skill-creator").name == "skill-creator"
+
+
+def test_skill_rename_recovers_expired_empty_destination_claim(org_engine):
+    alice = _scoped(org_engine, ALICE)
+    created = skills.create_skill(
+        SkillCreateRequest(label="expired rename source", instructions="Original"),
+        alice,
+        _principal(ALICE),
+    )
+    source_slug = created["id"]
+    destination_slug = "expired-rename-destination"
+    service = SkillService(alice.scope)
+    access = SharedResourceAccess(alice, _principal(ALICE))
+    source_attribution = access._find(SKILL, source_slug)
+    claim, claim_token = access.reserve_claim(SKILL, destination_slug)
+    assert source_attribution is not None
+    assert claim is not None and claim_token is not None
+    claim.pending_claim_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    alice.add(claim)
+    alice.commit()
+
+    renamed = skills.update_skill(
+        source_slug,
+        SkillUpdateRequest(label="expired rename destination"),
+        alice,
+        _principal(ALICE),
+    )
+
+    assert renamed["id"] == destination_slug
+    assert not service._skill_dir(source_slug).exists()
+    assert service.get_skill(destination_slug).instructions == "Original"
+    destination_attribution = SharedResourceAccess(
+        alice,
+        _principal(ALICE),
+    )._find(SKILL, destination_slug)
+    assert destination_attribution is not None
+    assert destination_attribution.id == source_attribution.id
+    assert destination_attribution.created_by_id == ALICE
+    assert destination_attribution.pending_claim_token is None
+    assert [
+        event.action for event in alice.exec(alice.select(SharedResourceMutation)).all()
+    ] == ["create", "rename"]
+
+
 def test_skill_audit_failure_restores_noncanonical_bytes_and_metadata(
     org_engine,
     monkeypatch,
