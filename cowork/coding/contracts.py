@@ -305,6 +305,30 @@ class CodingSession(BaseModel):
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list)
     status: SessionStatus = SessionStatus.ready
+    # Compatibility projection of the durable control-plane records. The
+    # session remains the existing renderer/runtime contract while Task and
+    # TaskRun become the canonical durable identities.
+    task_id: str | None = None
+    run_id: str | None = None
+    computer_id: str | None = None
+    run_status: Literal[
+        "queued",
+        "preparing",
+        "ready",
+        "running",
+        "awaiting_approval",
+        "completed",
+        "cancelled",
+        "interrupted",
+        "failed",
+        "recovering",
+    ] | None = None
+    computer_name: str | None = None
+    computer_status: Literal["online", "offline", "draining"] | None = None
+    computer_is_local: bool = True
+    resource_ids: list[str] = Field(default_factory=list, max_length=64)
+    scope_all_project_resources: bool = True
+    runtime_epoch: int = Field(default=1, ge=1)
     project_id: str | None = None
     project_name: str | None = None
     source_path: str
@@ -387,6 +411,8 @@ class GitState(BaseModel):
 class SessionCreateRequest(BaseModel):
     path: str | None = Field(default=None, min_length=1, max_length=32_768)
     project_id: str | None = Field(default=None, min_length=1, max_length=128)
+    resource_ids: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    computer_id: str | None = Field(default=None, min_length=1, max_length=128)
     prompt: str = Field(min_length=1, max_length=200_000)
     engine_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: str | None = Field(default=None, min_length=1, max_length=256)
@@ -407,6 +433,11 @@ class SessionCreateRequest(BaseModel):
             raise ValueError("Choose exactly one Code Project or folder")
         return self
 
+    @field_validator("resource_ids")
+    @classmethod
+    def unique_resources(cls, value: list[str] | None) -> list[str] | None:
+        return list(dict.fromkeys(value)) if value is not None else None
+
 
 class SessionUpdateRequest(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=256)
@@ -417,6 +448,10 @@ class SessionUpdateRequest(BaseModel):
     network_access: bool | None = None
     web_search: bool | None = None
     additional_dirs: list[str] | None = Field(default=None, max_length=16)
+
+
+class SessionRecoverRequest(BaseModel):
+    computer_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class TurnRequest(BaseModel):
