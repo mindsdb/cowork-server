@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +27,12 @@ from cowork.coding.contracts import (
     SessionStatus,
     SessionUpdateRequest,
     WorkspaceKind,
+    utc_now,
+)
+from cowork.coding.control_models import (
+    ComputerCapabilities,
+    RunStatus,
+    RuntimeEvent,
 )
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
@@ -33,6 +40,7 @@ from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
+    RepositoryResource,
 )
 from cowork.coding.turns import EventBuffer, terminal_status
 from cowork.coding.workspace import WorkspaceError
@@ -82,6 +90,226 @@ def test_completed_task_persists_events_and_reuses_live_engine_runtime(tmp_path:
     events = service.events(created.id).items
     assert [event.text for event in events if event.type == EventType.user_message] == ["First turn", "Second turn"]
     assert service.get_session(created.id).event_count == len(events)
+
+
+def test_remote_runtime_claims_a_portable_task_without_receiving_local_paths(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    registration = service.control.issue_registration_token()
+    remote, _ = service.control.register_runtime(
+        registration,
+        "Build computer",
+        ComputerCapabilities(
+            platform="linux",
+            architecture="test",
+            runtime_version="test-runtime",
+            agent_engines=["fake"],
+            shells=["bash"],
+        ),
+    )
+    code_project = service.projects.create(ProjectCreateRequest(
+        name="Portable project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url="https://example.test/repo.git",
+            local_path=str(repo),
+        )],
+    ))
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=code_project.id,
+            computer_id=remote.id,
+            prompt="Build remotely",
+            engine_id="fake",
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+
+    assert engine.prompts == []
+    assert service.control.store.get_run(created.run_id or "").status == RunStatus.queued
+    leased = service.control.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+    task = service.control.store.get_task(run.task_id)
+    runtime_project = service.control.runtime_project(code_project, task.resource_scope, remote.id)
+    repository_resource = runtime_project.resources[0]
+    assert isinstance(repository_resource, RepositoryResource)
+    assert repository_resource.local_path is None
+    assert repository_resource.source_url == "https://example.test/repo.git"
+
+    def send(seq: int, status: str) -> None:
+        service.accept_runtime_event(RuntimeEvent(
+            run_id=run.id,
+            computer_id=remote.id,
+            lease_id=lease_id,
+            epoch=run.epoch,
+            seq=seq,
+            kind="status",
+            payload={"status": status},
+        ))
+
+    send(1, "ready")
+    send(2, "running")
+    service.accept_runtime_event(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=3,
+        kind="event",
+        payload={"event": {
+            "type": "agent_message",
+            "title": "Agent",
+            "text": "Remote work is complete.",
+            "phase": "completed",
+        }},
+    ))
+    send(4, "completed")
+    assert service.get_session(created.id).status == SessionStatus.completed
+    assert any(event.text == "Remote work is complete." for event in service.events(created.id).items)
+
+    continued = service.submit_turn(created.id, "One more change", CREDS)
+    assert continued.run_id != run.id
+    assert service.control.store.get_run(continued.run_id or "").status == RunStatus.queued
+
+
+def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    registration = service.control.issue_registration_token()
+    remote, _ = service.control.register_runtime(
+        registration,
+        "Build computer",
+        ComputerCapabilities(
+            platform="linux",
+            architecture="test",
+            runtime_version="test-runtime",
+            agent_engines=["fake"],
+            shells=["bash"],
+        ),
+    )
+    project = service.projects.create(ProjectCreateRequest(
+        name="Portable project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url="https://example.test/repo.git",
+            local_path=str(repo),
+        )],
+    ))
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            computer_id=remote.id,
+            prompt="Build remotely",
+            engine_id="fake",
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    leased = service.control.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+    initial = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert [item.kind for item in initial] == ["start"]
+    service.control.acknowledge_command(run.id, initial[0].id, remote.id, lease_id, run.epoch)
+
+    def event(seq: int, kind: str, payload: dict[str, object]) -> None:
+        service.accept_runtime_event(RuntimeEvent(
+            run_id=run.id,
+            computer_id=remote.id,
+            lease_id=lease_id,
+            epoch=run.epoch,
+            seq=seq,
+            kind=kind,
+            payload=payload,
+        ))
+
+    event(1, "status", {"status": "ready"})
+    event(2, "status", {"status": "running"})
+    queued = service.queue_turn(created.id, "Run this after the current work")
+    assert [item.prompt for item in queued.queued_instructions] == ["Run this after the current work"]
+    event(3, "turn_completed", {"status": "completed"})
+
+    resumed = service.get_session(created.id)
+    assert resumed.run_id == run.id
+    assert resumed.queued_instructions == []
+    event_count = len(service.events(created.id).items)
+    event(4, "checkpoint", {"waiting": "start", "workspaceReady": True})
+    assert len(service.events(created.id).items) == event_count
+    assert service.get_session(created.id).status == SessionStatus.completed
+    commands = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert len(commands) == 1
+    assert commands[0].kind == "start"
+    assert commands[0].payload == {"prompt": "Run this after the current work"}
+
+    service.control.acknowledge_command(run.id, commands[0].id, remote.id, lease_id, run.epoch)
+    event(5, "status", {"status": "running"})
+    event(6, "turn_completed", {"status": "completed"})
+    follow_up = service.submit_turn(created.id, "One more change", CREDS)
+    assert follow_up.run_id == run.id
+    commands = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert len(commands) == 1
+    assert commands[0].payload == {"prompt": "One more change"}
+
+
+def test_remote_run_state_is_projected_and_can_be_restored(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    registration = service.control.issue_registration_token()
+    remote, _ = service.control.register_runtime(
+        registration,
+        "Build computer",
+        ComputerCapabilities(
+            platform="linux",
+            architecture="test",
+            runtime_version="test-runtime",
+            agent_engines=["fake"],
+            shells=["bash"],
+        ),
+    )
+    project = service.projects.create(ProjectCreateRequest(
+        name="Portable project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url="https://example.test/repo.git",
+            local_path=str(repo),
+        )],
+    ))
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            computer_id=remote.id,
+            prompt="Build remotely",
+            engine_id="fake",
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    assert created.run_status == "queued"
+    assert created.computer_name == "Build computer"
+    assert created.computer_status == "online"
+
+    leased = service.control.acquire_lease(remote.id)
+    assert leased is not None
+    run, _ = leased
+    run.lease_expires_at = utc_now() - timedelta(seconds=1)
+    service.control.store.save_run(run)
+    interrupted = service.get_session(created.id)
+    assert interrupted.run_status == "recovering"
+    assert interrupted.last_error == "The computer stopped responding. The task can be resumed safely."
+
+    restored = service.recover(created.id)
+    assert restored.run_status == "recovering"
+    assert restored.runtime_epoch == 3
+    assert restored.computer_id == remote.id
 
 
 def test_failed_adapter_stream_closes_the_runtime_before_another_turn_can_reuse_it(tmp_path: Path) -> None:
