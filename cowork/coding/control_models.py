@@ -74,6 +74,7 @@ class Computer(BaseModel):
     schema_version: int = CONTROL_SCHEMA_VERSION
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     name: str = Field(min_length=1, max_length=120)
+    is_local: bool = False
     status: ComputerStatus = ComputerStatus.online
     capabilities: ComputerCapabilities
     registration_epoch: int = Field(default=1, ge=1)
@@ -81,6 +82,7 @@ class Computer(BaseModel):
     last_seen_at: datetime = Field(default_factory=utc_now)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    revoked_at: datetime | None = None
 
 
 class RuntimeCredential(BaseModel):

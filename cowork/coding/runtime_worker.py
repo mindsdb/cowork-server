@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import platform
 import sys
 import threading
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -41,7 +45,9 @@ from cowork.coding.workspace import WorkspaceManager
 
 
 class RuntimeClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,12 @@ class RuntimeIdentity:
     computer_id: str
     runtime_token: str
     name: str
+
+
+@dataclass(frozen=True)
+class StoredRuntimeIdentity:
+    server_url: str
+    identity: RuntimeIdentity
 
 
 class RemoteRuntimeClient:
@@ -208,7 +220,10 @@ class RemoteRuntimeClient:
                 detail = str(response.json().get("detail") or "")
             except (ValueError, AttributeError):
                 pass
-            raise RuntimeClientError(detail or f"Runtime request failed ({response.status_code})") from exc
+            raise RuntimeClientError(
+                detail or f"Runtime request failed ({response.status_code})",
+                response.status_code,
+            ) from exc
 
     @staticmethod
     def _persisted_computer_id(root: Path) -> str | None:
@@ -221,19 +236,85 @@ class RemoteRuntimeClient:
     def _save_computer_id(root: Path, computer_id: str) -> None:
         root.mkdir(parents=True, exist_ok=True)
         target = root / "computer-id"
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(computer_id + "\n", encoding="utf-8")
+        _atomic_write(target, computer_id + "\n")
+
+
+def _atomic_write(target: Path, contents: str, mode: int | None = None) -> None:
+    temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_text(contents, encoding="utf-8")
+        if mode is not None:
+            os.chmod(temporary, mode)
         os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_runtime_identity(root: Path) -> StoredRuntimeIdentity | None:
+    try:
+        payload = json.loads((root / "runtime-identity.json").read_text(encoding="utf-8"))
+        return StoredRuntimeIdentity(
+            server_url=str(payload["server_url"]),
+            identity=RuntimeIdentity(
+                computer_id=str(payload["computer_id"]),
+                runtime_token=str(payload["runtime_token"]),
+                name=str(payload["name"]),
+            ),
+        )
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def save_runtime_identity(root: Path, server_url: str, identity: RuntimeIdentity) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "runtime-identity.json"
+    _atomic_write(target, json.dumps({
+        "server_url": server_url.rstrip("/"),
+        "computer_id": identity.computer_id,
+        "runtime_token": identity.runtime_token,
+        "name": identity.name,
+    }) + "\n", mode=0o600)
+
+
+class RuntimeLoop(Protocol):
+    def run_once(self, wait_seconds: float = 0) -> bool: ...
+
+
+def run_runtime_forever(
+    runtime: RuntimeLoop,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Keep an outbound runtime alive through transient control-plane outages."""
+
+    retry_delay = 1.0
+    while True:
+        try:
+            runtime.run_once(wait_seconds=20)
+            retry_delay = 1.0
+        except (httpx.TransportError, RuntimeClientError) as exc:
+            if isinstance(exc, RuntimeClientError) and exc.status_code not in {429, 500, 502, 503, 504}:
+                raise
+            print(
+                f"MindsHub Code is temporarily unreachable; reconnecting in {retry_delay:g}s "
+                f"({exc})",
+                file=sys.stderr,
+            )
+            sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30.0)
 
 
 class CodeOnlyRuntime:
     """Prepare isolated workspaces and run an agent without a desktop UI."""
+
+    HEARTBEAT_INTERVAL_SECONDS = 10.0
 
     def __init__(
         self,
         root: Path,
         client: RemoteRuntimeClient,
         registry: CodingEngineRegistry = engine_registry,
+        heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self.root = root
         self.client = client
@@ -242,12 +323,21 @@ class CodeOnlyRuntime:
         self._approval_lock = threading.Lock()
         self._approval_waiters: dict[str, tuple[threading.Event, dict[str, str]]] = {}
         self._pending_commands: list[RuntimeCommand] = []
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
 
     def run_once(self, wait_seconds: float = 0) -> bool:
         self.client.heartbeat()
         lease = self.client.lease(wait_seconds)
         if lease is None:
             return False
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=self._heartbeat_while_active,
+            args=(heartbeat_stop,),
+            name=f"runtime-heartbeat-{lease.run.id[:8]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
             self._execute(lease)
         except BaseException as exc:
@@ -256,7 +346,27 @@ class CodeOnlyRuntime:
             except RuntimeClientError:
                 pass
             raise
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=2)
         return True
+
+    def _heartbeat_while_active(self, stop: threading.Event) -> None:
+        """Keep the computer online while workspace or agent work blocks the lease loop."""
+
+        while not stop.is_set():
+            try:
+                self.client.heartbeat(active_run_count=1)
+            except httpx.TransportError:
+                # The event/command paths surface control-plane outages to the
+                # main run. A transient heartbeat failure must not kill useful
+                # local work or produce an unhandled daemon-thread exception.
+                pass
+            except RuntimeClientError as exc:
+                if exc.status_code not in {429, 500, 502, 503, 504}:
+                    return
+            if stop.wait(self._heartbeat_interval_seconds):
+                return
 
     def _execute(self, lease: RuntimeLease) -> None:
         if lease.project is None:
@@ -524,18 +634,31 @@ class CodeOnlyRuntime:
 
 
 def main() -> None:
-    server_url = os.environ.get("COWORK_RUNTIME_SERVER", "").strip()
-    registration_token = os.environ.get("COWORK_RUNTIME_REGISTRATION_TOKEN", "").strip()
-    root_value = os.environ.get("COWORK_RUNTIME_ROOT", "").strip()
-    name = os.environ.get("COWORK_RUNTIME_NAME", platform.node() or "Code runtime")
-    if not server_url or not registration_token or not root_value:
-        raise SystemExit("Runtime server, registration token, and root are required")
-    root = Path(root_value).expanduser().resolve()
-    client = RemoteRuntimeClient.register(server_url, registration_token, name, root)
+    parser = argparse.ArgumentParser(description="Connect this computer to MindsHub Code")
+    parser.add_argument("--server", default=os.environ.get("COWORK_RUNTIME_SERVER", ""))
+    parser.add_argument("--code", default=os.environ.get("COWORK_RUNTIME_REGISTRATION_TOKEN", ""))
+    parser.add_argument("--name", default=os.environ.get("COWORK_RUNTIME_NAME", platform.node() or "Code runtime"))
+    parser.add_argument("--root", default=os.environ.get("COWORK_RUNTIME_ROOT", "~/.mindshub-code"))
+    args = parser.parse_args()
+
+    root = Path(args.root).expanduser().resolve()
+    stored = load_runtime_identity(root)
+    server_url = str(args.server).strip()
+    if not server_url and stored:
+        server_url = stored.server_url
+    registration_token = str(args.code).strip()
+    if registration_token:
+        if not server_url:
+            raise SystemExit("--server is required when connecting a computer")
+        client = RemoteRuntimeClient.register(server_url, registration_token, str(args.name).strip(), root)
+        save_runtime_identity(root, server_url, client.identity)
+    elif stored:
+        client = RemoteRuntimeClient(server_url or stored.server_url, stored.identity)
+    else:
+        raise SystemExit("Connect this computer from Settings → Code → Computers first")
     runtime = CodeOnlyRuntime(root, client)
     try:
-        while True:
-            runtime.run_once(wait_seconds=20)
+        run_runtime_forever(runtime)
     finally:
         client.close()
 
