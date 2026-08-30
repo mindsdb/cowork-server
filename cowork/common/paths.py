@@ -100,7 +100,8 @@ class PinnedDir:
     Callers MUST go through the ``dir_*`` helpers below rather than read ``fd``
     or ``path`` directly, so the one platform branch stays in one place. Every
     child *name* passed to a helper must already be a validated single path
-    component (the call sites guarantee this); the helpers do not re-check it.
+    component. Destructive helpers defensively repeat that direct-child check
+    beside their filesystem sink.
     """
 
     fd: int | None
@@ -144,6 +145,21 @@ def dir_mkdir(d: PinnedDir, name: str) -> None:
         os.mkdir(name, dir_fd=d.fd)
     else:
         os.mkdir(d.path / name)
+
+
+def dir_rmdir(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Directory removal path must be a direct-child name")
+    if d.fd is not None:
+        os.rmdir(safe_name, dir_fd=d.fd)
+    else:
+        os.rmdir(d.path / safe_name)
 
 
 def dir_rmtree(d: PinnedDir, name: str) -> None:
