@@ -447,6 +447,34 @@ def _project_for_name(name: str, scoped: ScopedSession) -> Project:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+def _instructions_fields_from_access(
+    project: Project,
+    access: SharedResourceAccess,
+    *,
+    modified: float | None,
+) -> dict[str, Any]:
+    """Render instruction metadata with the caller's current lock owner."""
+    key = project_resource_key(project.id)
+    pending = access.claim_is_pending(PROJECT_INSTRUCTIONS, key)
+    fallback_modified_at = (
+        datetime.fromtimestamp(modified, tz=timezone.utc)
+        if modified is not None
+        else None
+    )
+    can_change = not pending and access.can_change(project.created_by)
+    return {
+        "attribution": access.attribution(
+            PROJECT_INSTRUCTIONS,
+            key,
+            fallback_modified_at=fallback_modified_at,
+        ),
+        "capabilities": MutableResourceCapabilities(
+            can_edit=can_change,
+            can_delete=can_change,
+        ),
+    }
+
+
 def _instructions_fields(
     project: Project,
     scoped: ScopedSession,
@@ -469,24 +497,11 @@ def _instructions_fields(
                     key,
                     resource_exists=lambda: instructions_path.is_file(),
                 )
-    pending = access.claim_is_pending(PROJECT_INSTRUCTIONS, key)
-    fallback_modified_at = (
-        datetime.fromtimestamp(modified, tz=timezone.utc)
-        if modified is not None
-        else None
+    return _instructions_fields_from_access(
+        project,
+        access,
+        modified=modified,
     )
-    can_change = not pending and access.can_change(project.created_by)
-    return {
-        "attribution": access.attribution(
-            PROJECT_INSTRUCTIONS,
-            key,
-            fallback_modified_at=fallback_modified_at,
-        ),
-        "capabilities": MutableResourceCapabilities(
-            can_edit=can_change,
-            can_delete=can_change,
-        ),
-    }
 
 
 def _require_instructions_change(
@@ -1235,10 +1250,9 @@ def write_project_file(
             raise
         try:
             response.update(
-                _instructions_fields(
+                _instructions_fields_from_access(
                     project,
-                    scoped,
-                    principal,
+                    access,
                     modified=st.st_mtime,
                 )
             )
