@@ -50,6 +50,14 @@ jobs:
       # @emailsink.dev tenant reused across runs. The hostnames come from a
       # committed env file rather than GitHub Environment variables, so a change
       # is a reviewable diff (same as mindshub_inference).
+      #
+      # That provisioning call goes to auth's Service over cluster DNS, not to
+      # the public host. Cloudflare Access fronts auth.<env>.mindshub.ai/v1/internal*
+      # and answers the POST with an HTML error page before it reaches Django.
+      # The runner is in the environment's cluster, so the Service's fully
+      # qualified name needs no Cloudflare credential and no extra Kubernetes
+      # permission, matching auth's own tests-integration.yml and the
+      # auth.<env>.svc.cluster.local address our chart already gives the ingress.
       - name: Resolve the target and the identity source
         env:
           DEPLOY_ENV: ${{ inputs.deploy-env }}
@@ -75,7 +83,7 @@ jobs:
             set +a
             {
               echo "COWORK_BASE_URL=${COWORK_BASE_URL}"
-              echo "TEST_USER_PROVISION_URL=${COWORK_AUTH_BASE_URL}/v1/internal/test-users/"
+              echo "TEST_USER_PROVISION_URL=${COWORK_AUTH_INTERNAL_BASE_URL}/v1/internal/test-users/"
             } >> "$GITHUB_ENV"
           fi
 
