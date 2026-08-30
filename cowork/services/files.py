@@ -67,13 +67,33 @@ def remove_conversation_workspace_dir(
         conv_seg = str(UUID(str(conversation_id)))
     except (ValueError, TypeError):
         return
-    target = Path(project_path) / "conversations" / conv_seg
+    project = Path(project_path)
+    project_name = os.path.basename(project.name)
+    if (
+        project_name != project.name
+        or project_name in {"", ".", ".."}
+        or "\\" in project_name
+        or "\0" in project_name
+    ):
+        return
     try:
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target, ignore_errors=True)
+        with pinned_dir(project.parent, nofollow_base=True) as parent:
+            project_dir = open_pinned_child(parent, project_name)
+            try:
+                conversations = open_pinned_child(project_dir, "conversations")
+                try:
+                    dir_rmtree(conversations, conv_seg)
+                finally:
+                    conversations.close()
+            finally:
+                project_dir.close()
+    except FileNotFoundError:
+        return
     except OSError:
         logger.warning(
-            "could not remove conversation workspace dir %s", target, exc_info=True
+            "could not remove conversation workspace dir %s",
+            Path(project_path) / "conversations" / conv_seg,
+            exc_info=True,
         )
 
 

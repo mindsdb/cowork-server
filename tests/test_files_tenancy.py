@@ -525,6 +525,49 @@ def test_remove_conversation_workspace_dir_is_noop_on_desktop(tmp_path, monkeypa
     assert ws.exists(), "desktop conversation delete must not rmtree a project subdir"
 
 
+def test_remove_conversation_workspace_dir_refuses_a_symlinked_parent(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    outside = tmp_path / "outside"
+    victim = outside / conv
+    proj.mkdir()
+    victim.mkdir(parents=True)
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    (proj / "conversations").symlink_to(outside, target_is_directory=True)
+
+    remove_conversation_workspace_dir(proj, conv)
+
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_remove_conversation_workspace_dir_refuses_a_symlinked_project(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+
+    conv = str(uuid4())
+    real_project = tmp_path / "real-project"
+    victim = real_project / "conversations" / conv
+    victim.mkdir(parents=True)
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    project_link = tmp_path / "project-link"
+    project_link.symlink_to(real_project, target_is_directory=True)
+
+    remove_conversation_workspace_dir(project_link, conv)
+
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
 def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
     """A typo-fix edit (same length, same mtime second) must still re-stage —
     the old size+mtime skip could serve stale instructions."""
