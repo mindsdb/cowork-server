@@ -20,7 +20,7 @@ from anton.core.tools.skill_format import (
     parse_skill_dir,
     validate_name,
 )
-from cowork.common.paths import safe_join
+from cowork.common.paths import dir_rmtree, pinned_dir, safe_join
 from cowork.common.settings import get_app_settings
 from cowork.db.scoped import TenantScope, scoped_storage_root
 from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
@@ -289,6 +289,20 @@ class SkillService:
         self.root.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
+    def _rmtree_direct_child(
+        root: Path,
+        name: str,
+        *,
+        ignore_errors: bool = False,
+    ) -> None:
+        try:
+            with pinned_dir(root, nofollow_base=True) as directory:
+                dir_rmtree(directory, name)
+        except OSError:
+            if not ignore_errors:
+                raise
+
+    @staticmethod
     def _slug_from_label(label: str) -> str:
         """Normalize a user-supplied label into a slug, rejecting empties.
 
@@ -399,7 +413,7 @@ class SkillService:
         if staged.is_symlink() or not staged.is_dir():
             staged.unlink(missing_ok=True)
         else:
-            shutil.rmtree(staged)
+            self._rmtree_direct_child(staging_root, staged.name)
         return True
 
     # ── writes ───────────────────────────────────────────────────────────────
@@ -616,7 +630,11 @@ class SkillService:
                 # reconciles links; sibling files are already in place.
                 self._write(skill)
             except Exception:
-                shutil.rmtree(dest, ignore_errors=True)
+                self._rmtree_direct_child(
+                    self.root,
+                    dest.name,
+                    ignore_errors=True,
+                )
                 raise
         else:
             self._write(skill, create=True)
@@ -638,7 +656,7 @@ class SkillService:
         if only.is_dir():
             for item in list(only.iterdir()):
                 shutil.move(str(item), str(src_dir / item.name))
-            only.rmdir()
+            SkillService._rmtree_direct_child(src_dir, only.name)
             return SkillService._normalize_skill_dir(src_dir)
         if only.suffix.lower() == ".md" and only.name != SKILL_FILE:
             only.rename(src_dir / SKILL_FILE)
@@ -678,7 +696,7 @@ class SkillService:
         skill_dir = self._skill_dir(slug)
         if not skill_dir.exists():
             return False
-        shutil.rmtree(skill_dir)
+        self._rmtree_direct_child(self.root, skill_dir.name)
         if self._link_projects:
             remove_skill_links(slug)
         return True
@@ -699,9 +717,16 @@ class SkillService:
     def restore_staged_delete(self, slug: str, staged: Path) -> None:
         os.replace(staged, self._skill_dir(slug))
 
-    @staticmethod
-    def finalize_staged_delete(staged: Path) -> None:
-        shutil.rmtree(staged, ignore_errors=True)
+    def finalize_staged_delete(self, staged: Path) -> None:
+        trash = Path(os.path.abspath(self.root / ".delete-staging"))
+        staged = Path(os.path.abspath(staged))
+        if staged.parent != trash:
+            raise ValueError("Invalid staged skill deletion path")
+        self._rmtree_direct_child(
+            trash,
+            staged.name,
+            ignore_errors=True,
+        )
 
     def project_reference_slugs(self, project_name: str) -> list[str]:
         """Canonical skill identities whose metadata names ``project_name``."""
@@ -820,7 +845,11 @@ class SkillService:
         except Exception:
             tmp.unlink(missing_ok=True)
             if create:
-                shutil.rmtree(skill_dir, ignore_errors=True)
+                self._rmtree_direct_child(
+                    self.root,
+                    skill_dir.name,
+                    ignore_errors=True,
+                )
             raise
         # Project per-project links to match the skill's metadata (desktop only).
         if self._link_projects and reconcile:
