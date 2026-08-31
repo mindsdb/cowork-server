@@ -68,7 +68,7 @@ def recover_run(
             )
         if not allow_recreate:
             raise NoEligibleComputer(
-                "Moving this task starts a fresh workspace and requires confirmation"
+                "Moving this task starts a fresh working copy and requires confirmation"
             )
 
     run.computer_id = target.id
@@ -90,7 +90,7 @@ def recover_run(
             workspace.workspace_kind = None
             workspace.base_revision = None
             workspace.task_branch = None
-            workspace.detail = "Recreating an isolated workspace from the task snapshot"
+            workspace.detail = "Recreating an isolated working copy from the task snapshot"
             store.save_workspace(workspace)
     return saved
 
@@ -102,9 +102,9 @@ def _option(computer: Computer, *, preserves_changes: bool) -> RecoveryOption:
         preserves_workspace_changes=preserves_changes,
         recommended=preserves_changes,
         detail=(
-            "Resume the preserved workspace and its current changes."
+            "Resume the saved working copy and its current changes."
             if preserves_changes
-            else "Create a fresh isolated workspace from the task's saved repository definitions. "
+            else "Create a fresh isolated working copy from the task's saved repository definitions. "
             "Changes that were not pushed are not carried over."
         ),
     )

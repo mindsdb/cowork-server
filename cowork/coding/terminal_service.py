@@ -37,7 +37,14 @@ class TaskTerminalService:
         session = self.get_session(session_id)
         return TerminalTabPage(items=[self._state(session_id, tab) for tab in session.terminal_tabs])
 
-    def create(self, session_id: str, label: str | None = None) -> TerminalTabState:
+    def create(
+        self,
+        session_id: str,
+        label: str | None = None,
+        *,
+        project_action_id: str | None = None,
+        project_resource_id: str | None = None,
+    ) -> TerminalTabState:
         with self.runtimes.session_lock(session_id):
             session = self.get_session(session_id)
             if len(session.terminal_tabs) >= 12:
@@ -45,6 +52,8 @@ class TaskTerminalService:
             tab = TerminalTab(
                 id=str(uuid.uuid4()),
                 label=label or self._next_label(session.terminal_tabs),
+                project_action_id=project_action_id,
+                project_resource_id=project_resource_id,
             )
             self.store.update_session(
                 session_id,
@@ -57,7 +66,7 @@ class TaskTerminalService:
         with self.runtimes.session_lock(session_id):
             session = self.get_session(session_id)
             original = self._require_tab(session, terminal_id)
-            updated = TerminalTab(id=terminal_id, label=label, created_at=original.created_at)
+            updated = original.model_copy(update={"label": label})
 
             def apply(current: CodingSession) -> None:
                 for index, item in enumerate(current.terminal_tabs):

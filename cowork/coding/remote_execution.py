@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 
+from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
 from cowork.coding.contracts import (
     CodingEvent,
@@ -22,6 +23,7 @@ from cowork.coding.control_models import (
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.redaction import redact_text
+from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
 from cowork.coding.store import CodingStore
 
 
@@ -85,6 +87,7 @@ class RemoteExecutionCoordinator:
         session: CodingSession,
         prompt: str,
         attachments: list[InputReference] | tuple[InputReference, ...],
+        intent: CommandIntent,
     ) -> CodingSession:
         if not session.run_id:
             raise RuntimeError("Remote task is missing its Task Run")
@@ -93,7 +96,7 @@ class RemoteExecutionCoordinator:
         command = self.control.queue_command(
             session.run_id,
             "start",
-            {"prompt": prompt},
+            intent.runtime_payload(prompt),
             f"turn-{uuid.uuid4().hex}",
         )
         self.store.append_event(
@@ -123,7 +126,7 @@ class RemoteExecutionCoordinator:
         command = self.control.queue_command(
             session.run_id,
             "start",
-            {"prompt": instruction.prompt},
+            CommandIntent.parse(instruction.prompt).runtime_payload(instruction.prompt),
             f"queued-turn-{instruction.id}",
         )
 
@@ -298,6 +301,50 @@ class RemoteExecutionCoordinator:
             if delivery.provider == "github" and delivery.external_url:
                 issue("github", delivery.connection_name, delivery.external_url, ["pull_request_status"])
         return capabilities
+
+    def acquire_lease(self, computer_id: str) -> RuntimeLease | None:
+        """Lease one portable task and freeze its complete execution contract.
+
+        Keeping this assembly below the HTTP layer makes the same lifecycle
+        usable by the API, in-process verification, and future transports.
+        """
+        acquired = self.control.acquire_lease(computer_id)
+        if acquired is None:
+            return None
+        run, lease_id = acquired
+        task = self.control.store.get_task(run.task_id)
+        runtime_project = self.control.runtime_project_for_task(task, computer_id)
+        # One-time compatibility for tasks created before immutable execution
+        # snapshots. Once leased, recovery no longer depends on live Project
+        # metadata.
+        if runtime_project is None and task.project_id:
+            project = self.projects.get(task.project_id)
+            scoped_resources = self.control.scoped_resources(project, task.resource_scope)
+            runtime_project = self.control.runtime_project(project, task.resource_scope, computer_id)
+            task.execution_project = self.control.execution_project_snapshot(project, scoped_resources)
+            self.control.store.save_task(task)
+        session = self.store.load_session(task.id)
+        return RuntimeLease(
+            task=task,
+            run=run,
+            lease_id=lease_id,
+            agent_token=self.control.issue_run_token(run.id),
+            project=runtime_project,
+            execution=RuntimeExecutionConfig(
+                engine_id=session.engine_id,
+                model=session.model,
+                permission_mode=session.permission_mode,
+                reasoning_effort=session.reasoning_effort,
+                service_tier=session.service_tier,
+                personality=session.personality,
+                network_access=session.network_access,
+                web_search=session.web_search,
+                developer_instructions=session.developer_instructions,
+                environment=session.environment,
+            ),
+            connector_capabilities=self.connector_capabilities(session),
+            workspaces=self.control.store.list_workspaces(run.id),
+        )
 
     def _accept_workspace(self, run: TaskRun, event: RuntimeEvent) -> TaskRun:
         raw_items = event.payload.get("items")

@@ -318,21 +318,27 @@ class WorkspaceManager:
         if self._git_root(root) is None:
             return []
         changes = self._changes_since(root, base_revision)
+        working_status = {path: status for status, path in self._status_entries(root)}
         files: list[DiffFile] = []
         remaining_bytes = MAX_TOTAL_DIFF_BYTES
         for status, rel_path in changes[:MAX_DIFF_FILES]:
             path = root / rel_path
+            staged, unstaged = self._review_status(working_status.get(rel_path))
             if remaining_bytes <= 0:
                 files.append(
                     DiffFile(
                         path=rel_path,
                         status=status,
+                        staged=staged,
+                        unstaged=unstaged,
                         patch="Inline diff omitted because this task has a large combined patch. Open the worktree to review it.",
                     )
                 )
                 continue
             if status == "??":
-                item = self._untracked_diff(root, path, rel_path)
+                item = self._untracked_diff(root, path, rel_path).model_copy(
+                    update={"staged": staged, "unstaged": unstaged}
+                )
                 files.append(item)
                 remaining_bytes -= len(item.patch.encode("utf-8"))
                 continue
@@ -340,6 +346,8 @@ class WorkspaceManager:
                 item = DiffFile(
                     path=rel_path,
                     status=status,
+                    staged=staged,
+                    unstaged=unstaged,
                     patch="Large file changed. Open the worktree to review it.",
                     binary=True,
                 )
@@ -360,6 +368,8 @@ class WorkspaceManager:
             item = DiffFile(
                 path=rel_path,
                 status=status,
+                staged=staged,
+                unstaged=unstaged,
                 additions=additions,
                 deletions=deletions,
                 patch=patch,
@@ -377,6 +387,56 @@ class WorkspaceManager:
                 )
             )
         return files
+
+    def review_file_action(self, workspace_path: str, rel_path: str, action: str) -> None:
+        """Apply one bounded Git review action to a task worktree file."""
+
+        root = Path(workspace_path)
+        path = self._validated_git_path(rel_path)
+        if self._git_root(root) != root.resolve():
+            raise WorkspaceError("Review actions require a Git task workspace")
+        with self._mutation_lock:
+            if action == "stage":
+                self.git.run(root, "add", "--", path)
+                return
+            if action == "unstage":
+                result = self.git.run(root, "restore", "--staged", "--", path, check=False)
+                if result.returncode != 0:
+                    self.git.run(root, "reset", "HEAD", "--", path)
+                return
+            if action == "discard":
+                status = dict((entry_path, entry_status) for entry_status, entry_path in self._status_entries(root)).get(path)
+                if status == "??":
+                    target = root / Path(*PurePosixPath(path).parts)
+                    parent = target.parent.resolve()
+                    try:
+                        parent.relative_to(root.resolve())
+                    except ValueError as exc:
+                        raise WorkspaceError("The selected file is outside this task workspace") from exc
+                    if target.is_dir() and not target.is_symlink():
+                        raise WorkspaceError("Discard files individually")
+                    target.unlink(missing_ok=True)
+                    return
+                self.git.run(root, "restore", "--source=HEAD", "--staged", "--worktree", "--", path)
+                return
+            raise WorkspaceError("Unsupported review action")
+
+    @staticmethod
+    def _validated_git_path(value: str) -> str:
+        path = PurePosixPath(value.replace("\\", "/"))
+        if value.startswith(("/", "\\")) or path.is_absolute() or not path.parts or path == PurePosixPath("."):
+            raise WorkspaceError("Choose a file inside this task workspace")
+        if any(part in {"", ".", ".."} for part in path.parts) or "\x00" in value:
+            raise WorkspaceError("Choose a file inside this task workspace")
+        return path.as_posix()
+
+    @staticmethod
+    def _review_status(status: str | None) -> tuple[bool, bool]:
+        if not status:
+            return False, False
+        if status == "??":
+            return False, True
+        return status[0] not in {" ", "?"}, status[1] not in {" ", "?"}
 
     def _changes_since(self, root: Path, base_revision: str) -> list[tuple[str, str]]:
         """Return committed, staged, unstaged, and untracked paths vs base."""
