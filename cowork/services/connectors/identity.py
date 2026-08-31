@@ -118,7 +118,7 @@ def spec_secret_fields(connector_id: str, method: str | None) -> list[str]:
     return sorted(secret)
 
 
-def connection_display_name(fields: dict) -> str | None:
+def connection_display_name(fields: dict, engine: str = "") -> str | None:
     """Human-facing identity for a saved connection, or None.
 
     Non-secret identity only (``email`` / ``account_email``, else ``host``
@@ -127,9 +127,18 @@ def connection_display_name(fields: dict) -> str | None:
     (see ``ConnectionSummaryResponse.user_label``); this function is the
     *subtitle* source only. Returns None when there's nothing meaningful —
     the caller then falls back to the slug.
+
+    ``account_name`` is checked first only for ``supabase``: its
+    ``account_email`` is a synthetic ``org:<slug>`` placeholder (see
+    ``_fetch_userinfo_supabase``), not a real email, so the human org name is
+    more useful there. Every other engine populates a real ``account_email``
+    already, and ``account_name`` there is just a free-text display name —
+    preferring it for all engines would collapse the subtitle for any two
+    accounts that share a name but have different emails.
     """
     f = fields or {}
-    for key in ("email", "account_email"):
+    keys = ("account_name", "email", "account_email") if engine == "supabase" else ("email", "account_email")
+    for key in keys:
         val = str(f.get(key, "")).strip()
         if val:
             return val

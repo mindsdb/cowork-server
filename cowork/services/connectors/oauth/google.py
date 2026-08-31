@@ -26,7 +26,7 @@ import logging as _logging
 
 _log = _logging.getLogger("cowork.oauth")
 
-_SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
+_SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "google-drive":     ("google_drive_client_id",     "google_drive_client_secret"),
     "google-calendar":  ("google_calendar_client_id",  "google_calendar_client_secret"),
     "gmail":            ("gmail_client_id",             "gmail_client_secret"),
@@ -34,10 +34,24 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str]] = {
     "google-analytics": ("google_analytics_client_id",  "google_analytics_client_secret"),
     "linear":           ("linear_client_id",            "linear_client_secret"),
     "github":           ("github_client_id",            "github_client_secret"),
+    "supabase":         ("supabase_client_id",          "supabase_client_secret"),
+    "posthog":          ("posthog_client_id",           None),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
 _ENGINE_TO_SERVICE: dict[str, str] = {cfg.engine: svc for svc, cfg in OAUTH_SERVICES.items()}
+
+
+def _credentials_complete(client_id: str, client_secret: str, secret_attr: str | None) -> bool:
+    """True once `client_id` is set and, for providers that actually have a
+    client_secret (`secret_attr` is not `None`), `client_secret` is set too.
+    Public, PKCE-only providers (`secret_attr is None`, e.g. PostHog) need
+    only `client_id` — a present-but-empty `client_secret` there is correct,
+    not "not configured yet". One helper for every place that needs this
+    check (`_resolve_credentials`, `start`'s BYOK bypass, `callback`'s
+    cached-credentials branch, `get_catalogue`, and the `/credentials`
+    endpoint) so the rule can't drift between call sites."""
+    return bool(client_id and (client_secret or not secret_attr))
 
 
 def _fetch_userinfo_google(access_token: str) -> dict[str, Any]:
@@ -60,6 +74,31 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     return {"email": viewer.get("email", ""), "name": viewer.get("name", "")}
 
 
+def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
+    """PostHog's own user object — email plus optional first/last name.
+    PostHog's OAuth authorize/token endpoints are region-agnostic
+    (`oauth.posthog.com`), but the resource API is split by region
+    (us.posthog.com / eu.posthog.com) and a token issued for one region is
+    not guaranteed to be accepted by the other's host. Try US Cloud first
+    (the default/most common case) and fall back to EU Cloud on failure,
+    rather than requiring the caller to know the account's region upfront."""
+    try:
+        result = _json_request(
+            "https://us.posthog.com/api/users/@me/",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    except HTTPException:
+        result = _json_request(
+            "https://eu.posthog.com/api/users/@me/",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    email = str(result.get("email") or "").strip()
+    first_name = str(result.get("first_name") or "").strip()
+    last_name = str(result.get("last_name") or "").strip()
+    name = " ".join(part for part in (first_name, last_name) if part)
+    return {"email": email, "name": name or email}
+
+
 def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
     """GitHub's `email` is frequently null — the app only requests `read:user`,
     not `user:email`, and even with that scope a user can keep their email
@@ -79,6 +118,28 @@ def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
     return {"email": email or login, "name": name or login}
 
 
+def _fetch_userinfo_supabase(access_token: str) -> dict[str, Any]:
+    """Resolve a Supabase OAuth grant to a stable organization identity."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    organizations: list[dict[str, Any]] = []
+    try:
+        result = _json_request("https://api.supabase.com/v1/organizations", headers=headers)
+        organizations = result if isinstance(result, list) else result.get("organizations", [])
+    except HTTPException:
+        pass
+    if not organizations:
+        result = _json_request("https://api.supabase.com/v1/projects", headers=headers)
+        projects = result if isinstance(result, list) else result.get("projects", [])
+        organizations = [
+            {"slug": project.get("organization_slug"), "name": project.get("organization_name")}
+            for project in projects if project.get("organization_slug")
+        ]
+    first = organizations[0] if organizations else {}
+    slug = str(first.get("slug") or "").strip()
+    name = str(first.get("name") or slug).strip()
+    return {"email": f"org:{slug}" if slug else "", "name": name}
+
+
 # engine → identity-fetch function. The one piece of connector onboarding
 # that can't be pure spec-JSON data — response shape (REST vs GraphQL) is
 # genuinely provider-specific code, not configuration. New OAuth-builtin
@@ -91,6 +152,8 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "google_analytics_4": _fetch_userinfo_google,
     "linear": _fetch_userinfo_linear,
     "github": _fetch_userinfo_github,
+    "supabase": _fetch_userinfo_supabase,
+    "posthog": _fetch_userinfo_posthog,
 }
 
 
@@ -117,11 +180,51 @@ def _revoke_github(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_supabase(token: str, client_id: str, client_secret: str) -> None:
+    """Supabase's OAuth revoke endpoint doesn't fit the generic RFC-7009
+    form-body pattern the other connectors use: it requires a JSON body
+    naming `client_id`, `client_secret`, and the `refresh_token` specifically
+    (revoking only an access_token isn't supported and wouldn't remove
+    mindshub from the user's Supabase-side Authorized Apps list, since that
+    list reflects the underlying grant, not any one short-lived token)."""
+    request = Request(
+        "https://api.supabase.com/v1/oauth/revoke",
+        data=json.dumps({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": token,
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
+def _revoke_posthog(token: str, client_id: str, client_secret: str) -> None:
+    """PostHog is a public client — there's no client_secret to authenticate
+    the revoke call with (unlike GitHub's Basic-auth grant-revoke above), so
+    per RFC 7009 a public client just identifies itself with `client_id` in
+    the form body alongside the token. `client_secret` is accepted for a
+    uniform call signature with the other `_REVOKE_HANDLERS` entries but
+    unused."""
+    request = Request(
+        "https://oauth.posthog.com/oauth/revoke/",
+        data=urlencode({"token": token, "client_id": client_id}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
 # engine → custom revoke function, for providers whose revoke call doesn't
 # fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
 # Checked before the generic path in revoke() below.
 _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
+    "posthog": _revoke_posthog,
+    "supabase": _revoke_supabase,
 }
 
 
@@ -142,8 +245,10 @@ class OAuthService:
     def _resolve_credentials(self, service: str, settings: OAuthSettings) -> tuple[str, str]:
         id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
         client_id = getattr(settings, id_attr)
-        client_secret = getattr(settings, secret_attr)
-        if not client_id or not client_secret:
+        # `secret_attr` is `None` for public, PKCE-only providers (PostHog) —
+        # no client_secret exists to look up, and none is required.
+        client_secret = getattr(settings, secret_attr) if secret_attr else ""
+        if not _credentials_complete(client_id, client_secret, secret_attr):
             raise HTTPException(status_code=400, detail=f"OAuth credentials not configured for {service}.")
         return client_id, client_secret
 
@@ -174,7 +279,8 @@ class OAuthService:
         return None
 
     def start(self, service: str, settings: OAuthSettings, *, client_id: str = "", client_secret: str = "", extra_fields: dict[str, str] | None = None) -> OAuthStartResponse:
-        if client_id and client_secret:
+        _, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
+        if _credentials_complete(client_id, client_secret, secret_attr):
             cid, csecret = client_id, client_secret
         else:
             cid, csecret = self._resolve_credentials(service, settings)
@@ -259,7 +365,8 @@ class OAuthService:
 
         pending_client_id = str(pending.get("clientId", "")).strip()
         pending_client_secret = str(pending.get("clientSecret", "")).strip()
-        if pending_client_id and pending_client_secret:
+        _, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service]
+        if _credentials_complete(pending_client_id, pending_client_secret, secret_attr):
             client_id, client_secret = pending_client_id, pending_client_secret
         else:
             try:
@@ -303,6 +410,7 @@ class OAuthService:
                 client_secret=client_secret,
                 redirect_uri=str(pending.get("redirectUri") or self._redirect_uri(service, settings)),
                 verifier=str(pending.get("verifier", "")),
+                token_auth_style=oauth_cfg.token_auth_style,
             )
             access_token = str(token_data.get("access_token", "")).strip()
             if not access_token:
@@ -387,6 +495,14 @@ class OAuthService:
         token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
         if not token:
             return
+        if engine == "supabase" and not fields.get("refresh_token", "").strip():
+            # Supabase's revoke endpoint only accepts a refresh_token (see
+            # _revoke_supabase) — falling back to the access_token here and
+            # sending it under the "refresh_token" label just gets rejected
+            # by Supabase, and that failure is logged as a warning below, so
+            # disconnect would look like it worked while the grant stays live.
+            _log.warning("Cannot revoke %s/%s remotely — no refresh_token stored", engine, name)
+            return
         _log.info("Revoking OAuth token for %s/%s", engine, name)
         if custom_revoke is not None:
             if oauth_settings is None:
@@ -433,8 +549,8 @@ class OAuthService:
             engine = cfg.engine
             id_attr, secret_attr = _SERVICE_CREDENTIAL_ATTRS[service_id]
             cid = getattr(oauth_settings, id_attr, "")
-            csecret = getattr(oauth_settings, secret_attr, "")
-            ready = bool(cid and csecret)
+            csecret = getattr(oauth_settings, secret_attr, "") if secret_attr else ""
+            ready = _credentials_complete(cid, csecret, secret_attr)
             config_error = "" if ready else f"OAuth credentials not configured for {service_id}."
 
             connections = []
@@ -483,20 +599,34 @@ class OAuthService:
         client_secret: str,
         redirect_uri: str,
         verifier: str,
+        token_auth_style: str = "body",
     ) -> dict[str, Any]:
+        data = {
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+            "code_verifier": verifier,
+        }
+        headers = None
+
+        if token_auth_style == "basic":
+            credentials = base64.b64encode(
+                f"{client_id}:{client_secret}".encode("utf-8")
+            ).decode("ascii")
+            headers = {"Authorization": f"Basic {credentials}"}
+        else:
+            data["client_id"] = client_id
+            # Public PKCE-only providers such as PostHog must not receive an
+            # empty client_secret.
+            if client_secret:
+                data["client_secret"] = client_secret
+
         return _json_request(
             token_url,
             method="POST",
-            data={
-                "code": code,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-                "code_verifier": verifier,
-            },
+            data=data,
+            headers=headers,
         )
-
 
 def _json_request(
     url: str,

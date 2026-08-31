@@ -40,6 +40,18 @@ class OAuthConfig(BaseModel):
     # directly instead of a random free port. Omit for providers that
     # accept any loopback port (the default, matches Google's behavior).
     redirect_port: int | None = None
+    # The hostname advertised in a desktop loopback redirect URI. Keep this
+    # restricted to loopback names: providers such as Supabase allow HTTP for
+    # `localhost`, while the listener itself remains bound to 127.0.0.1.
+    redirect_host: str = "127.0.0.1"
+
+    @field_validator("redirect_host")
+    @classmethod
+    def _validate_redirect_host(cls, v: str) -> str:
+        if v not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("redirect_host must be a loopback hostname")
+        return v
+
     # Only set on the `browser_oauth_builtin` method — the service-id slug
     # (e.g. "google-drive") used in the /connectors/oauth/{service}/... web
     # fallback routes. The engine name and this slug have already diverged
@@ -53,6 +65,10 @@ class OAuthConfig(BaseModel):
     # False means "skip this behavior silently," never a faked success.
     supports_refresh: bool = True
     supports_revoke: bool = True
+    # Client authentication method at the token endpoint. Most providers
+    # accept credentials in the form body; Supabase Management API OAuth uses
+    # HTTP Basic authentication.
+    token_auth_style: str = "body"
 
 
 class ConnectorMethod(BaseModel):
@@ -228,6 +244,17 @@ class PickedFile(BaseModel):
 
 class PatchPickedFilesBody(BaseModel):
     files: list[PickedFile] = Field(default_factory=list)
+
+
+class PickerTokenResponse(BaseModel):
+    """What the SPA needs to build a Google Picker itself. `api_key` is
+    auth's `picker_api_key` under a different name, so this pins a rename
+    the client would otherwise only assert by hand."""
+
+    access_token: str
+    account_email: str = ""
+    api_key: str
+    app_id: str
 
 
 class OAuthStartRequest(BaseModel):

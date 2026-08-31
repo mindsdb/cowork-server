@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -204,6 +205,25 @@ def default_turn_minds_api_host() -> str:
     return default_minds_api_host()
 
 
+def default_minds_auth_host() -> str:
+    """MindsHub auth-service host, derived from the API host rather than built.
+
+    Auth is a sibling of the API host with the leading service token swapped, in
+    both host shapes: ``api.staging.mindshub.ai`` -> ``auth.staging.mindshub.ai``
+    and ``api-pr-42.dev.mindshub.ai`` -> ``auth-pr-42.dev.mindshub.ai``. Deriving
+    from the already-resolved turn host instead of re-reading ENV is what keeps
+    the two in lockstep: a per-PR env has its own auth database, so a host built
+    from the ENV slug alone would send a PR env's reads to dev's auth, which
+    answers 401 for a caller it has never seen. ``default_turn_minds_api_host``
+    already solves that from the namespace, so this inherits the answer.
+
+    This is the PUBLIC host. It is not ``TurnQueueSettings.auth_internal_base_url``,
+    which is a ClusterIP address for the secret-authenticated mint routes and is
+    unreachable from a desktop install.
+    """
+    return re.sub(r"^(https?://)api([.-])", r"\1auth\2", default_turn_minds_api_host())
+
+
 def default_publish_url() -> str:
     """Environment-aware MindsHub publish/view URL."""
     slug = _env_slug()
@@ -337,6 +357,11 @@ class OAuthSettings(Settings):
     github_client_id: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_ID"))
     github_client_secret: str = Field(default="", validation_alias=AliasChoices("GITHUB_CLIENT_SECRET"))
 
+    supabase_client_id: str = Field(default="", validation_alias=AliasChoices("SUPABASE_CLIENT_ID"))
+    supabase_client_secret: str = Field(default="", validation_alias=AliasChoices("SUPABASE_CLIENT_SECRET"))
+
+    posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
+
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
     google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
@@ -350,6 +375,18 @@ class OAuthSettings(Settings):
         default_factory=lambda: str(cowork_home() / "oauth_state.json"),
         description="Path to the file used to persist pending OAuth state",
     )
+    auth_service_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("AUTH_SERVICE_BASE_URL", "COWORK_TURN_AUTH_INTERNAL_BASE_URL"),
+        description=(
+            "Base URL of the auth service's public API, used in org/cloud mode to proxy the "
+            "OAuth Connector Lifecycle (start/status/catalogue), the Google Drive Picker token "
+            "mint, and the turn-key oauth-token base URL anton calls directly. This is the same "
+            "auth service TurnQueueSettings.auth_internal_base_url reaches (just different, "
+            "public /v1/... routes instead of /internal/...) — accepts that env var as a "
+            "fallback so a single k8s config value covers both."
+        ),
+    )  # AUTH_SERVICE_BASE_URL
 
 
 class MemorySettings(Settings):
@@ -541,17 +578,30 @@ class AppSettings(Settings):
             "mount and is gone on pod restart."
         ),
     )
-    ask_user_enabled: bool = Field(
+    hub_workspaces_force_on: bool = Field(
         default=False,
+        validation_alias=AliasChoices("COWORK_HUB_WORKSPACES_FORCE_ON"),
+        description=(
+            "Development override that turns the MindsHub workspace surfaces on "
+            "where no Statsig rule targets you. ON only: it cannot switch the "
+            "surfaces off, so it can never be used to escape the kill switch. "
+            "The switch itself is auth's `authorization_ui` gate, declared in "
+            "that repo's configs/statsig_gates.json and read through the "
+            "entitlements payload; this exists so the surface can be walked "
+            "before a rule exists for your environment. Never set in a deployed "
+            "environment."
+        ),
+    )
+    ask_user_enabled: bool = Field(
+        default=True,
         validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),
         description=(
             "Whether the agent may ask interactive multiple-choice questions "
-            "(the `ask_user` tool). Off by default because the renderer must "
-            "ship first: the frontend and this server are versioned "
-            "independently, and a client that does not know the "
-            "`response.ask_user` event drops it silently, leaving the agent "
-            "apparently hung until the question times out. Turn on only after "
-            "the frontend is rolled out."
+            "(the `ask_user` tool). On by default now that the renderer "
+            "support (the `response.ask_user` card) has shipped; kept as a "
+            "kill switch because a renderer that does not know the event "
+            "drops it silently, stalling the agent until the question times "
+            "out. Set to false to degrade to plain-text questions (ENG-1984)."
         ),
     )
     surface_override: str = Field(
@@ -592,13 +642,34 @@ class AppSettings(Settings):
         ),
     )
     identity_enforce: Literal["audit", "enforce"] = Field(
-        default="audit",
+        default="enforce",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
-            "Org-mode identity enforcement. 'audit' (default): requests without "
-            "identity headers are logged and allowed through. 'enforce': they "
-            "are rejected with 401. Flip to 'enforce' once the audit log shows "
-            "all legitimate identity-less callers are handled."
+            "Org-mode identity enforcement. 'enforce' (default): a request "
+            "without identity headers is rejected with 401. 'audit': it is "
+            "logged and allowed through, which is the rollout mode the org "
+            "cutover needed and now has to be asked for. Dropping the env var "
+            "must not reopen the no-principal path, so the default is the "
+            "closed one."
+        ),
+    )
+    organization_boundary_mode: Literal["audit", "enforce"] = Field(
+        default="enforce",
+        validation_alias=AliasChoices("COWORK_ORGANIZATION_BOUNDARY_MODE"),
+        description=(
+            "Canonical-web expected-organization boundary. 'enforce' (default) "
+            "returns a mandatory-reload response before the route runs. "
+            "'audit' logs missing or mismatched browser context and lets the "
+            "request continue. API keys and non-browser credentials are exempt."
+        ),
+    )
+    organization_switch_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
+        description=(
+            "Advertise canonical-web organization switching only when the "
+            "expected-organization boundary is also enforced. Defaults off so "
+            "deploying protocol support cannot expose the picker."
         ),
     )
     owner: str = Field(
