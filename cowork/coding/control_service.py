@@ -8,11 +8,13 @@ import secrets
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from cowork.coding.connector_delegation import ConnectorDelegationService
 from cowork.coding.contracts import CodingSession, SessionStatus, utc_now
+from cowork.coding.control_errors import RuntimeAuthenticationError, StaleRuntimeEvent
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     TERMINAL_RUN_STATUSES,
@@ -23,12 +25,14 @@ from cowork.coding.control_models import (
     ComputerStatus,
     ConnectorGrant,
     ExecutionWorkspace,
+    RecoveryPlan,
     ResourceAvailability,
     ResourceAvailabilityPage,
     RunStatus,
     RuntimeCommand,
     RuntimeCredential,
     RuntimeEvent,
+    RuntimeRegistrationCredential,
     TaskControlSnapshot,
     TaskResourceScope,
     TaskRun,
@@ -42,7 +46,16 @@ from cowork.coding.project_models import (
     ProjectResource,
     RepositoryResource,
 )
+from cowork.coding.redaction import redact_text, sanitize
+from cowork.coding.run_recovery import (
+    NoEligibleComputer,
+    build_recovery_plan,
+)
+from cowork.coding.run_recovery import (
+    recover_run as apply_recovery,
+)
 from cowork.coding.run_state import transition_run
+from cowork.coding.security_audit import record_security_event
 
 if TYPE_CHECKING:
     from cowork.coding.contracts import TaskWorkspace
@@ -62,18 +75,6 @@ _SESSION_STATUS: dict[SessionStatus, RunStatus] = {
 }
 
 
-class RuntimeAuthenticationError(RuntimeError):
-    pass
-
-
-class StaleRuntimeEvent(RuntimeError):
-    pass
-
-
-class NoEligibleComputer(RuntimeError):
-    pass
-
-
 class ControlPlaneService:
     """Durable Task/Run/Computer orchestration above local execution details."""
 
@@ -85,8 +86,13 @@ class ControlPlaneService:
     ) -> None:
         self.root = root
         self.store = store or LocalControlPlaneStore(root)
+        self.connector_delegation = ConnectorDelegationService(self.store)
         self._lock = threading.RLock()
-        self._registration_tokens: dict[str, datetime] = {}
+        # Protocol records are useful for retries and audit, but are not user
+        # task history. Bound them at service start so a long-lived desktop or
+        # tenant cannot accumulate an ever-growing polling surface.
+        now = utc_now()
+        self.store.prune(now - timedelta(days=30), now - timedelta(days=90))
         self.local_computer = self._register_local(capabilities)
 
     @staticmethod
@@ -148,8 +154,12 @@ class ControlPlaneService:
 
     def issue_registration_token(self) -> str:
         token = secrets.token_urlsafe(36)
-        with self._lock:
-            self._registration_tokens[self._digest(token)] = utc_now() + timedelta(minutes=10)
+        digest = self._digest(token)
+        self.store.save_registration_credential(RuntimeRegistrationCredential(
+            id=digest,
+            token_hash=digest,
+            expires_at=utc_now() + timedelta(minutes=10),
+        ))
         return token
 
     def register_runtime(
@@ -161,9 +171,7 @@ class ControlPlaneService:
     ) -> tuple[Computer, str]:
         self._require_protocol(capabilities.protocol_versions)
         token_hash = self._digest(registration_token)
-        with self._lock:
-            expires = self._registration_tokens.pop(token_hash, None)
-        if expires is None or expires <= utc_now():
+        if not self.store.consume_registration_credential(token_hash, utc_now()):
             raise RuntimeAuthenticationError("Runtime registration expired or was already used")
         identifier = computer_id or f"computer-{uuid.uuid4().hex}"
         try:
@@ -185,6 +193,14 @@ class ControlPlaneService:
             token_hash=self._digest(runtime_token),
             registration_epoch=epoch,
         ))
+        record_security_event(self.store,
+            "runtime.register",
+            "completed",
+            "runtime",
+            computer.id,
+            computer_id=computer.id,
+            detail=f"protocol={RUNTIME_PROTOCOL_VERSION}",
+        )
         return self.store.save_computer(computer), runtime_token
 
     def authenticate_runtime(self, computer_id: str, runtime_token: str) -> Computer:
@@ -341,8 +357,10 @@ class ControlPlaneService:
             id=task_id,
             title=title,
             prompt=prompt,
+            engine_id=engine_id,
             project_id=project.id if project else None,
             resource_scope=scope,
+            execution_project=self.execution_project_snapshot(project, resources),
         )
         run = TaskRun(
             id=f"run-{uuid.uuid4().hex}",
@@ -374,6 +392,17 @@ class ControlPlaneService:
             "resources": resources,
         })
 
+    def runtime_project_for_task(self, task: CodeTask, computer_id: str) -> CodeProject | None:
+        """Resolve a lease from the immutable task snapshot, never live project state."""
+
+        if task.execution_project is None:
+            return None
+        return self.runtime_project(
+            task.execution_project,
+            TaskResourceScope(all_project_resources=True),
+            computer_id,
+        )
+
     def set_run_status(self, run_id: str, status: RunStatus, *, error: str | None = None) -> TaskRun:
         run = self.store.get_run(run_id)
         transition_run(run, status, error=error)
@@ -392,6 +421,8 @@ class ControlPlaneService:
             computer_id=computer.id,
             status=RunStatus.ready if computer.id == self.local_computer.id else RunStatus.queued,
             epoch=previous.epoch + 1,
+            workspace_resume_mode="restore",
+            recovery_count=previous.recovery_count,
         ))
         for workspace in self.store.list_workspaces(previous.id):
             self.store.save_workspace(workspace.model_copy(update={
@@ -447,8 +478,13 @@ class ControlPlaneService:
             task = self.store.save_task(CodeTask(
                 id=task_id,
                 title=session.title,
+                engine_id=session.engine_id,
                 project_id=session.project_id,
                 resource_scope=scope,
+                execution_project=self.execution_project_snapshot(
+                    project,
+                    self._scoped_resources(project, scope),
+                ),
                 source_contexts=session.source_contexts,
                 deliveries=session.deliveries,
             ))
@@ -477,6 +513,12 @@ class ControlPlaneService:
         if not session.run_id:
             raise ValueError("Coding session has not been linked to a Task Run")
         run = self.store.get_run(session.run_id)
+        if run.computer_id != self.local_computer.id:
+            # A remote runtime owns the canonical Task Run lifecycle.  The
+            # CodingSession is only a compatibility read model for the
+            # renderer, so ordinary UI events must never project its stale
+            # status back into a leased/fenced remote run.
+            return run
         target = _SESSION_STATUS[session.status]
         if run.status != target:
             try:
@@ -494,18 +536,14 @@ class ControlPlaneService:
     def acquire_lease(self, computer_id: str) -> tuple[TaskRun, str] | None:
         with self._lock:
             self.expire_leases()
-            candidates = [
-                run for run in self.store.list_runs()
-                if run.computer_id == computer_id and run.status in {RunStatus.queued, RunStatus.recovering}
-            ]
-            if not candidates:
-                return None
-            run = min(candidates, key=lambda item: item.created_at)
             lease_id = secrets.token_urlsafe(32)
-            run.lease_id = lease_id
-            run.lease_expires_at = utc_now() + _LEASE_DURATION
-            transition_run(run, RunStatus.preparing)
-            self.store.save_run(run)
+            run = self.store.claim_run(
+                computer_id,
+                lease_id,
+                utc_now() + _LEASE_DURATION,
+            )
+            if run is None:
+                return None
             return run, lease_id
 
     def renew_lease(self, event: RuntimeEvent) -> TaskRun:
@@ -514,11 +552,16 @@ class ControlPlaneService:
             run.lease_expires_at = utc_now() + _LEASE_DURATION
             run.last_event_seq = event.seq
             if event.kind == "checkpoint":
-                run.checkpoint = event.payload
+                checkpoint = sanitize(event.payload)
+                run.checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
             if event.kind == "status" and isinstance(event.payload.get("status"), str):
                 transition_run(run, RunStatus(event.payload["status"]))
             if event.kind == "error":
-                transition_run(run, RunStatus.failed, error=str(event.payload.get("detail", "Runtime failed")))
+                transition_run(
+                    run,
+                    RunStatus.failed,
+                    error=redact_text(str(event.payload.get("detail", "Runtime failed")))[:4_000],
+                )
             return self.store.save_run(run)
 
     def queue_command(
@@ -559,22 +602,14 @@ class ControlPlaneService:
         resource_constraints: dict[str, str] | None = None,
         ttl: timedelta = timedelta(minutes=15),
     ) -> tuple[ConnectorGrant, str]:
-        run = self.store.get_run(run_id)
-        if run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
-            raise ValueError("Connector access is unavailable after a Task Run ends")
-        token = secrets.token_urlsafe(40)
-        grant = ConnectorGrant(
-            id=f"grant-{uuid.uuid4().hex}",
-            run_id=run.id,
-            epoch=run.epoch,
-            provider=provider,
-            connection_name=connection_name,
-            actions=actions,
-            resource_constraints=resource_constraints or {},
-            token_hash=self._digest(token),
-            expires_at=utc_now() + ttl,
+        return self.connector_delegation.issue(
+            run_id,
+            provider,
+            connection_name,
+            actions,
+            resource_constraints,
+            ttl,
         )
-        return self.store.save_grant(grant), token
 
     def authorize_connector(
         self,
@@ -582,29 +617,18 @@ class ControlPlaneService:
         token: str,
         action: str,
         constraints: dict[str, str] | None = None,
+        computer_id: str | None = None,
     ) -> ConnectorGrant:
-        grant = self.store.get_grant(grant_id)
-        run = self.store.get_run(grant.run_id)
-        if grant.revoked_at or grant.expires_at <= utc_now():
-            raise RuntimeAuthenticationError("Connector capability expired")
-        if grant.epoch != run.epoch or run.status in TERMINAL_RUN_STATUSES:
-            raise RuntimeAuthenticationError("Connector capability belongs to a stale Task Run")
-        if not hmac.compare_digest(grant.token_hash, self._digest(token)):
-            raise RuntimeAuthenticationError("Connector capability authentication failed")
-        if action not in grant.actions:
-            raise RuntimeAuthenticationError("Connector capability does not allow this action")
-        for name, expected in (constraints or {}).items():
-            allowed = grant.resource_constraints.get(name)
-            if allowed is not None and not hmac.compare_digest(allowed, expected):
-                raise RuntimeAuthenticationError("Connector capability is outside its resource scope")
-        return grant
+        return self.connector_delegation.authorize(
+            grant_id,
+            token,
+            action,
+            constraints,
+            computer_id,
+        )
 
     def revoke_connector_grants(self, run_id: str) -> None:
-        now = utc_now()
-        for grant in self.store.list_grants(run_id):
-            if grant.revoked_at is None:
-                grant.revoked_at = now
-                self.store.save_grant(grant)
+        self.connector_delegation.revoke_for_run(run_id)
 
     def claim_commands(self, run_id: str, computer_id: str, lease_id: str, epoch: int) -> list[RuntimeCommand]:
         with self._lock:
@@ -636,11 +660,11 @@ class ControlPlaneService:
         with self._lock:
             run = self.store.get_run(run_id)
             self._require_fence(run, computer_id, lease_id, epoch)
-            command = next(
-                (item for item in self.store.list_commands(run_id) if item.id == command_id),
-                None,
-            )
-            if command is None:
+            try:
+                command = self.store.get_command(command_id)
+            except KeyError:
+                raise KeyError("Runtime command not found")
+            if command.run_id != run_id:
                 raise KeyError("Runtime command not found")
             if command.epoch != run.epoch:
                 raise StaleRuntimeEvent("Runtime command belongs to a stale epoch")
@@ -658,11 +682,11 @@ class ControlPlaneService:
         deadline = time.monotonic() + timeout
         while True:
             run = self.store.get_run(run_id)
-            command = next(
-                (item for item in self.store.list_commands(run_id) if item.id == command_id),
-                None,
-            )
-            if command is None:
+            try:
+                command = self.store.get_command(command_id)
+            except KeyError:
+                raise KeyError("Runtime command not found")
+            if command.run_id != run_id:
                 raise KeyError("Runtime command not found")
             if command.epoch != run.epoch:
                 raise StaleRuntimeEvent("Runtime command belongs to a superseded execution")
@@ -672,21 +696,44 @@ class ControlPlaneService:
                 raise RuntimeError("The selected computer did not answer in time")
             time.sleep(0.05)
 
-    def recover_run(self, run_id: str, computer_id: str | None = None) -> TaskRun:
+    def delete_task(self, run_id: str) -> None:
+        """Remove canonical control records after compatibility cleanup succeeds."""
+
+        run = self.store.get_run(run_id)
+        self.store.delete_task(run.task_id)
+
+    def recovery_plan(self, run_id: str) -> RecoveryPlan:
+        run = self.store.get_run(run_id)
+        task = self.store.get_task(run.task_id)
+        project = task.execution_project
+        eligible = (
+            self.eligible_computers(
+                project,
+                TaskResourceScope(all_project_resources=True),
+                task.engine_id,
+            )
+            if project is not None
+            else []
+        )
+        return build_recovery_plan(self.store, run, eligible)
+
+    def recover_run(
+        self,
+        run_id: str,
+        computer_id: str | None = None,
+        *,
+        allow_recreate: bool = False,
+    ) -> TaskRun:
         with self._lock:
             run = self.store.get_run(run_id)
             target_computer = computer_id or run.computer_id
             computer = self.store.get_computer(target_computer)
-            if computer.status != ComputerStatus.online:
-                raise NoEligibleComputer("Choose an online computer to resume this task")
-            run.computer_id = target_computer
-            run.epoch += 1
-            run.lease_id = None
-            run.lease_expires_at = None
-            run.last_event_seq = 0
-            run.checkpoint = {}
-            transition_run(run, RunStatus.recovering)
-            return self.store.save_run(run)
+            return apply_recovery(
+                self.store,
+                run,
+                computer,
+                allow_recreate=allow_recreate,
+            )
 
     def expire_stale_computers(self) -> None:
         threshold = utc_now() - _OFFLINE_AFTER
@@ -709,6 +756,8 @@ class ControlPlaneService:
                     run.epoch += 1
                     run.last_event_seq = 0
                     run.checkpoint = {}
+                    run.workspace_resume_mode = "restore"
+                    run.recovery_count += 1
                     run.status = RunStatus.recovering
                     run.last_error = "The computer stopped responding. The task can be resumed safely."
                     self.store.save_run(run)
@@ -810,6 +859,19 @@ class ControlPlaneService:
         if missing:
             raise ValueError(f"Unknown project resources: {', '.join(missing)}")
         return [by_id[resource_id] for resource_id in scope.resource_ids]
+
+    @staticmethod
+    def execution_project_snapshot(
+        project: CodeProject | None,
+        resources: list[ProjectResource],
+    ) -> CodeProject | None:
+        if project is None:
+            return None
+        return CodeProject.model_validate({
+            **project.model_dump(mode="python"),
+            "resources": [resource.model_copy(deep=True) for resource in resources],
+            "folders": [],
+        })
 
     def _fenced_run(self, event: RuntimeEvent) -> TaskRun:
         if event.protocol_version != RUNTIME_PROTOCOL_VERSION:

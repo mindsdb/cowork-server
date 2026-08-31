@@ -372,7 +372,7 @@ class CodeOnlyRuntime:
             raise RuntimeClientError("A remote Task Run requires portable project resources")
         prepared = (
             self.workspaces.restore(lease.task.id, lease.project, lease.workspaces)
-            if lease.run.epoch > 1
+            if lease.run.workspace_resume_mode == "restore"
             else self.workspaces.prepare(lease.task.id, lease.project)
         )
         self.client.event(lease, "workspace", {

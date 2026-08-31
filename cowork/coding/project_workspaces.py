@@ -11,6 +11,7 @@ from pathlib import Path
 
 from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
 from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
+from cowork.coding.git_transport import validate_git_source
 from cowork.coding.project_models import (
     CodeProject,
     LocalFolderResource,
@@ -235,9 +236,30 @@ class ProjectWorkspaceManager:
 
     def _repository_cache(self, resource: RepositoryResource) -> Path:
         assert resource.source_url is not None
-        key = hashlib.sha256(resource.source_url.encode()).hexdigest()[:24]
+        try:
+            source_url = validate_git_source(resource.source_url)
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        key = hashlib.sha256(source_url.encode()).hexdigest()[:24]
         root = self.workspaces.root / "repositories" / key
         if root.is_dir():
+            result = self.workspaces.git.run(
+                root,
+                "fetch",
+                "--prune",
+                "--no-tags",
+                "origin",
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "Git fetch failed").strip()
+                raise WorkspaceError(f"Could not update {resource.name}: {detail[:2_000]}")
+            branch = resource.default_branch or self._remote_default_branch(root)
+            if branch:
+                remote_ref = f"refs/remotes/origin/{branch}"
+                available = self.workspaces.git.run(root, "rev-parse", "--verify", remote_ref, check=False)
+                if available.returncode == 0:
+                    self.workspaces.git.run(root, "checkout", "-B", branch, remote_ref)
             return root
         root.parent.mkdir(parents=True, exist_ok=True)
         temporary = root.with_name(f".{root.name}.tmp")
@@ -248,7 +270,7 @@ class ProjectWorkspaceManager:
                 root.parent,
                 "clone",
                 "--no-tags",
-                resource.source_url,
+                source_url,
                 str(temporary),
                 check=False,
             )
@@ -260,6 +282,17 @@ class ProjectWorkspaceManager:
             if temporary.exists():
                 shutil.rmtree(temporary)
         return root
+
+    def _remote_default_branch(self, root: Path) -> str | None:
+        result = self.workspaces.git.run(
+            root,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+            check=False,
+        )
+        value = result.stdout.strip()
+        return value.removeprefix("origin/") if value else None
 
     def fork(
         self,
