@@ -236,6 +236,25 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
+# The exception-shaped type name the remote producer sends when no reply
+# arrives for a turn. `cowork.turnqueue.producer.UNRESPONSIVE_WORKER_ERROR` is
+# built from this constant, so the string it puts on the reply stream and the
+# branch below cannot drift apart.
+WORKER_UNRESPONSIVE_TYPE_NAME = "TurnWorkerUnresponsive"
+
+# Wire-level code for "the worker never answered". Distinct from
+# GENERIC_TURN_ERROR_CODE on purpose: this one means the turn never ran, which
+# is an infrastructure fault, while anton_error means anton ran and raised
+# something we don't recognise. They were indistinguishable until 2026-08-31,
+# when every scratchpad pod failed to start and the resulting outage read as an
+# agent bug for four hours.
+WORKER_UNRESPONSIVE_CODE = "worker_unresponsive"
+
+WORKER_UNRESPONSIVE_MESSAGE = (
+    "The agent didn't start, so this turn never ran. That's a fault on our "
+    "side rather than a problem with your request. Try again in a moment."
+)
+
 
 def is_image_format_error(exc: Exception) -> bool:
     """Detect the Anthropic 400 raised when an image reaches the model as
@@ -896,6 +915,11 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     text = (error or "").strip()
     type_name, _, message = text.partition(":")
     message = message.strip()
+    if type_name == WORKER_UNRESPONSIVE_TYPE_NAME:
+        # Not a model or provider failure: nothing ran. The producer synthesises
+        # this when the reply stream stays silent past its idle bound, so the
+        # remedy is to look at the worker, not at the turn's content.
+        return WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
     if type_name == "TokenLimitExceeded":
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if type_name == "ProviderOverloadedError":

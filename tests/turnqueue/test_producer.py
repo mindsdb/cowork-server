@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
 
 
@@ -368,7 +369,9 @@ async def test_unresponsive_worker_fails_the_turn_instead_of_spinning(monkeypatc
     # and the caller persists a failure so a reload shows the error card.
     kind, data = items[-1]
     assert kind == "turn_failed"
-    assert data["code"] == "anton_error"
+    # Its own code, not the generic one (ENG-2126): nothing ran, so the card
+    # has to say the turn never started rather than blame the agent.
+    assert data["code"] == te.WORKER_UNRESPONSIVE_CODE
     assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
 
 
