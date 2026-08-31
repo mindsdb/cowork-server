@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 from urllib.parse import urlparse
 
 import httpx
+from anton.core.llm.provider import ProviderAuthError
 
+from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 
 if TYPE_CHECKING:
@@ -109,6 +111,20 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+
+async def _current_runtime_minds_credential() -> str:
+    """Return the desktop's current MindsHub credential for one LLM request.
+
+    Providers built from a handed-over runtime credential must not fall back to
+    the seed captured when the chat session was created. That seed can be an
+    expired access token after the desktop refreshes or signs out.
+    """
+    credential = runtime_credential.get_minds_credential()
+    if credential is None:
+        raise ProviderAuthError(
+            "The MindsHub session credential is no longer available."
+        )
+    return credential
 
 
 def provider_base_url(
@@ -1144,6 +1160,14 @@ def build_llm_client(effort_override: str | None = None):
         if role == Provider.MINDS_CLOUD:
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
+            # The runtime credential is local-only by contract. A static
+            # settings/env key and every org-mode per-turn credential leave
+            # this callback unset and keep their existing lifetime.
+            api_key_provider = (
+                _current_runtime_minds_credential
+                if runtime_credential.get_minds_credential() is not None
+                else None
+            )
             # The MindsHub gateway executes web_search / web_fetch server-side
             # over its chat.completions passthrough:
             # - the flavor must be set, or OpenAIProvider defaults to generic,
@@ -1157,6 +1181,7 @@ def build_llm_client(effort_override: str | None = None):
                 api_key=key.get_secret_value(),
                 base_url=base,
                 flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
+                api_key_provider=api_key_provider,
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
