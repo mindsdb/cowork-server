@@ -372,7 +372,13 @@ def test_code_only_runtime_reuses_the_workspace_for_follow_up_turns(tmp_path: Pa
         run_id=run.id,
         epoch=run.epoch,
         kind="start",
-        payload={"prompt": "Follow-up turn"},
+        payload={
+            "prompt": "/review",
+            "engine_prompt": "/review",
+            "command": "review",
+            "goal_action": "",
+            "goal_objective": None,
+        },
     )
     client = FakeRuntimeClient(lease, first, [follow_up])
     engine = FakeEngine()
@@ -381,7 +387,8 @@ def test_code_only_runtime_reuses_the_workspace_for_follow_up_turns(tmp_path: Pa
 
     assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
 
-    assert engine.prompts == ["First turn", "Follow-up turn"]
+    assert engine.prompts == ["First turn"]
+    assert engine.reviews == 1
     assert engine.existing_ids == [None]
     assert client.acknowledged == [first.id, follow_up.id, "command-release"]
     assert len([item for item in client.events if item[0] == "workspace"]) == 1
@@ -429,6 +436,19 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         kind="steer",
         payload={"prompt": "Change direction"},
     )
+    status = RuntimeCommand(
+        id="command-status",
+        run_id=run.id,
+        epoch=run.epoch,
+        kind="agent_command",
+        payload={
+            "prompt": "/status",
+            "engine_prompt": "/status",
+            "command": "status",
+            "goal_action": "",
+            "goal_objective": None,
+        },
+    )
     cancel = RuntimeCommand(
         id="command-cancel",
         run_id=run.id,
@@ -436,7 +456,7 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         kind="cancel",
     )
     client = FakeRuntimeClient(lease, start)
-    client._commands.extend([steer, cancel])
+    client._commands.extend([steer, status, cancel])
     engine = FakeEngine(block_until_cancel=True)
     registry = CodingEngineRegistry()
     registry.register(engine)
@@ -445,5 +465,9 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
 
     assert engine.steers == [("turn-1", "Change direction")]
     assert engine.cancels == ["turn-1"]
-    assert {start.id, steer.id, cancel.id, "command-release"}.issubset(client.acknowledged)
+    assert {start.id, steer.id, status.id, cancel.id, "command-release"}.issubset(client.acknowledged)
+    assert any(
+        kind == "event" and (payload.get("event") or {}).get("title") == "Task status"
+        for kind, payload in client.events
+    )
     assert ("turn_completed", {"status": "cancelled"}) in client.events

@@ -345,6 +345,9 @@ class ProjectWorkspaceManager:
                 files.append(file.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
         return files
 
+    def review_file_action(self, workspace: TaskWorkspace, path: str, action: str) -> None:
+        self.workspaces.review_file_action(workspace.workspace_path, path, action)
+
     def git_states(self, workspaces: list[TaskWorkspace]) -> list[GitState]:
         return [
             self.workspaces.git_state(workspace.source_path, workspace.workspace_path).model_copy(

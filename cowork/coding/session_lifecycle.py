@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from pathlib import Path
 
 from cowork.coding.contracts import (
     CodingEvent,
@@ -12,12 +13,11 @@ from cowork.coding.contracts import (
     utc_now,
 )
 from cowork.coding.engines.base import EngineCredentials
-from cowork.coding.operation_types import EventEmitter, MaintenanceSession
-from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_service import CodeProjectService
+from cowork.coding.control_models import RunStatus
+from cowork.coding.control_service import ControlPlaneService
+from cowork.coding.operation_types import EventEmitter, GetExecutionProject, MaintenanceSession
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.runtime import RuntimeManager, engine_workspace_path
-from cowork.coding.session_factory import project_instructions
 from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import RunningTurn
@@ -35,8 +35,8 @@ class SessionLifecycleOperations:
         store: CodingStore,
         workspaces: WorkspaceManager,
         project_workspaces: ProjectWorkspaceManager,
-        projects: CodeProjectService,
-        playbooks: PlaybookService,
+        execution_project: GetExecutionProject,
+        control: ControlPlaneService,
         skill_runtime: SkillRuntimeResolver,
         runtimes: RuntimeManager,
         running: dict[str, RunningTurn],
@@ -47,8 +47,8 @@ class SessionLifecycleOperations:
         self.store = store
         self.workspaces = workspaces
         self.project_workspaces = project_workspaces
-        self.projects = projects
-        self.playbooks = playbooks
+        self.execution_project = execution_project
+        self.control = control
         self.skill_runtime = skill_runtime
         self.runtimes = runtimes
         self.running = running
@@ -111,7 +111,19 @@ class SessionLifecycleOperations:
 
     def _fork_reserved(self, parent: CodingSession, credentials: EngineCredentials) -> CodingSession:
         new_id = str(uuid.uuid4())
-        project = self.projects.get(parent.project_id) if parent.project_id else None
+        project = self.execution_project(parent)
+        parent_task = self.control.store.get_task(parent.task_id) if parent.task_id else None
+        control_snapshot = self.control.create_task_run(
+            task_id=new_id,
+            title=f"{parent.title} (fork)"[:200],
+            prompt=parent_task.prompt if parent_task else "",
+            project=project,
+            requested_resource_ids=None,
+            computer_id=parent.computer_id,
+            engine_id=parent.engine_id,
+            standalone_computer_id=self.control.local_computer.id if project is None else None,
+        )
+        self.control.set_run_status(control_snapshot.run.id, RunStatus.preparing)
         if project and parent.workspaces:
             prepared_project = self.project_workspaces.fork(new_id, project, parent.workspaces)
             prepared = prepared_project.primary
@@ -124,19 +136,7 @@ class SessionLifecycleOperations:
                 **project.environment.variables,
                 **{name: str(port) for name, port in child_ports.items()},
             }
-            try:
-                guidance, _ = self.playbooks.guidance(project.id) if project.playbook else ("", None)
-            except Exception:
-                self.project_workspaces.cleanup(new_id, child_workspaces)
-                raise
-            instructions = project_instructions(
-                project,
-                child_workspaces,
-                parent.source_contexts,
-                guidance,
-            )
-            if parent.skill_instructions:
-                instructions = f"{instructions}\n\n{parent.skill_instructions}".strip()
+            instructions = self._forked_instructions(parent, child_workspaces)
         else:
             prepared = self.workspaces.fork(
                 new_id,
@@ -153,6 +153,18 @@ class SessionLifecycleOperations:
 
         prepared_kind = prepared.workspace_kind if isinstance(prepared, TaskWorkspace) else prepared.kind
         prepared_warning = None if isinstance(prepared, TaskWorkspace) else prepared.warning
+        control_workspaces = child_workspaces or [
+            TaskWorkspace(
+                folder_id=parent.resource_ids[0] if parent.resource_ids else "folder",
+                folder_name=Path(parent.source_path).name or "Folder",
+                source_path=str(prepared.source_path),
+                workspace_path=str(prepared.workspace_path),
+                workspace_kind=prepared_kind,
+                repository_root=str(prepared.repository_root) if prepared.repository_root else None,
+                base_revision=prepared.base_revision,
+                source_dirty=prepared.source_dirty,
+            )
+        ]
         try:
             child_skill_roots = self.skill_runtime.clone(parent.id, new_id)
             parent_runtime = self.runtimes.open_locked(parent, credentials)
@@ -160,6 +172,17 @@ class SessionLifecycleOperations:
                 update={
                     "id": new_id,
                     "title": f"{parent.title} (fork)"[:200],
+                    "task_id": control_snapshot.task.id,
+                    "run_id": control_snapshot.run.id,
+                    "computer_id": control_snapshot.computer.id,
+                    "run_status": RunStatus.completed.value,
+                    "runtime_epoch": control_snapshot.run.epoch,
+                    "resource_ids": (
+                        [item.id for item in project.resources]
+                        if project
+                        else [control_workspaces[0].folder_id]
+                    ),
+                    "scope_all_project_resources": True,
                     "workspace_path": str(prepared.workspace_path),
                     "workspace_kind": prepared_kind,
                     "repository_root": str(prepared.repository_root) if prepared.repository_root else None,
@@ -190,6 +213,12 @@ class SessionLifecycleOperations:
                 tuple(child.additional_dirs),
             )
             self.store.save_session(child)
+            self.control.attach_prepared_workspaces(
+                control_snapshot.run.id,
+                control_workspaces,
+            )
+            self.control.set_run_status(control_snapshot.run.id, RunStatus.ready)
+            self.control.set_run_status(control_snapshot.run.id, RunStatus.completed)
             self.store.copy_event_history(parent.id, child)
             self.emit(
                 child.id,
@@ -218,4 +247,23 @@ class SessionLifecycleOperations:
                 self.store.delete_session(new_id)
             except FileNotFoundError:
                 pass
+            try:
+                self.control.delete_task(control_snapshot.run.id)
+            except KeyError:
+                pass
             raise
+
+    @staticmethod
+    def _forked_instructions(
+        parent: CodingSession,
+        child_workspaces: list[TaskWorkspace],
+    ) -> str:
+        """Retarget the parent's frozen instructions without rereading live project state."""
+
+        instructions = parent.developer_instructions
+        child_by_id = {workspace.folder_id: workspace for workspace in child_workspaces}
+        for workspace in parent.workspaces:
+            child = child_by_id.get(workspace.folder_id)
+            if child is not None:
+                instructions = instructions.replace(workspace.workspace_path, child.workspace_path)
+        return instructions

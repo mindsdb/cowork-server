@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cowork.coding.contracts import (
     DeliveryRecord,
     SourceContext,
+    TaskCapability,
     WorkspaceKind,
     utc_now,
 )
@@ -63,12 +64,18 @@ class ComputerCapabilities(BaseModel):
     has_git: bool = True
     has_terminal: bool = True
     supports_local_folders: bool = True
+    task_capabilities: list[TaskCapability] = Field(default_factory=list, max_length=32)
     max_concurrent_runs: int = Field(default=4, ge=1, le=64)
 
     @field_validator("protocol_versions", "agent_engines", "shells")
     @classmethod
     def unique_values(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+    @field_validator("task_capabilities")
+    @classmethod
+    def unique_task_capabilities(cls, value: list[TaskCapability]) -> list[TaskCapability]:
+        return list(dict.fromkeys(value))
 
 
 class Computer(BaseModel):
@@ -237,7 +244,17 @@ class RuntimeCommand(BaseModel):
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     run_id: str = Field(min_length=1, max_length=128)
     epoch: int = Field(ge=1)
-    kind: Literal["prepare", "start", "steer", "approve", "cancel", "checkpoint", "operation", "release"]
+    kind: Literal[
+        "prepare",
+        "start",
+        "steer",
+        "agent_command",
+        "approve",
+        "cancel",
+        "checkpoint",
+        "operation",
+        "release",
+    ]
     payload: dict[str, object] = Field(default_factory=dict)
     idempotency_key: str = Field(default="", max_length=256)
     created_at: datetime = Field(default_factory=utc_now)
