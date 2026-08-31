@@ -14,6 +14,7 @@ from cowork.coding.contracts import (  # noqa: F401
     SourceContext,
     utc_now,
 )
+from cowork.coding.git_transport import validate_git_source
 from cowork.coding.skill_models import ProjectSkillSource
 
 
@@ -65,6 +66,8 @@ class RepositoryResource(BaseModel):
             raise ValueError("repository resources require a remote URL or local checkout")
         if not self.source_url and not self.computer_id:
             raise ValueError("a local-only repository must identify its computer")
+        if self.source_url:
+            self.source_url = validate_git_source(self.source_url)
         if self.source_url and not self.repository:
             provider, identity = repository_identity(self.source_url)
             self.provider = provider
@@ -207,12 +210,23 @@ class CodeProject(BaseModel):
             folder.model_dump(mode="python") if isinstance(folder, ProjectFolder) else folder
             for folder in value["folders"]
         ]
+        # A legacy base branch is repository metadata. Preserve that signal in
+        # the first typed representation instead of projecting every folder to
+        # ``LocalFolderResource`` and irreversibly dropping it before the
+        # service can inspect the checkout.
         value["resources"] = [
             {
-                "kind": "local_folder",
+                **(
+                    {
+                        "kind": "repository",
+                        "local_path": folder["path"],
+                        "default_branch": folder.get("base_branch"),
+                    }
+                    if folder.get("base_branch")
+                    else {"kind": "local_folder", "path": folder["path"]}
+                ),
                 "id": folder["id"],
                 "name": folder["name"],
-                "path": folder["path"],
                 "computer_id": computer_id,
                 "commands": folder.get("commands", []),
             }

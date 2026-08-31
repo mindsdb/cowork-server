@@ -4,9 +4,11 @@ from pathlib import Path
 
 import httpx
 import pytest
-
 from anton.core.datasources.data_vault import LocalDataVault
-from cowork.api.v1.endpoints.connectors.connections import validate_and_save_developer_connection
+
+from cowork.api.v1.endpoints.connectors.connections import (
+    validate_and_save_developer_connection,
+)
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.schemas.connectors import DirectSaveRequest
 from cowork.services.connectors.developer_validation import (
@@ -35,6 +37,44 @@ def test_github_token_is_verified_and_resolves_account_identity() -> None:
         )
 
     assert result.account_email == "ian-mindsdb"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://github.enterprise.example",
+        "https://127.0.0.1:8443",
+        "https://169.254.169.254",
+        "https://10.0.0.5",
+    ],
+)
+def test_github_enterprise_rejects_insecure_or_private_base_urls(base_url: str) -> None:
+    with _client(lambda _request: pytest.fail("network called")) as client:
+        with pytest.raises(DeveloperCredentialError):
+            validate_developer_connection(
+                "github",
+                "fine-grained-pat",
+                {"access_token": "github_pat_secret", "base_url": base_url},
+                client=client,
+            )
+
+
+def test_github_enterprise_resolves_every_address_before_sending_credentials() -> None:
+    def resolve(_host, _port, **_kwargs):
+        return [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+            (2, 1, 6, "", ("127.0.0.1", 443)),
+        ]
+
+    with _client(lambda _request: pytest.fail("network called")) as client:
+        with pytest.raises(DeveloperCredentialError, match="publicly routable"):
+            validate_developer_connection(
+                "github",
+                "fine-grained-pat",
+                {"access_token": "github_pat_secret", "base_url": "https://github.enterprise.example"},
+                client=client,
+                resolver=resolve,
+            )
 
 
 def test_linear_key_is_verified_and_resolves_account_identity() -> None:

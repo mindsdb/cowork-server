@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import shutil
 import stat
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from cowork.coding.contracts import (
     WorkspaceInspection,
     WorkspaceKind,
 )
+from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.workspace_key import managed_key
 from cowork.common.settings.app_settings import get_app_settings
@@ -98,6 +100,10 @@ class GitRunner:
             child_environment = os.environ.copy()
             child_environment["GIT_TERMINAL_PROMPT"] = "0"
             child_environment.update(environment or {})
+            # This is deliberately assigned after caller-provided values.
+            # Project configuration cannot re-enable command-capable helpers
+            # such as ``ext`` at the execution boundary.
+            child_environment["GIT_ALLOW_PROTOCOL"] = ALLOWED_GIT_PROTOCOLS
             result = subprocess.run(
                 ["git", *args],
                 # The directory is an explicit desktop capability selected by
@@ -575,10 +581,18 @@ class WorkspaceManager:
                 raise WorkspaceError("Refusing to remove an unmanaged worktree path")
             source = Path(source_path)
             if actual.exists():
-                if base_revision:
+                if base_revision and source.is_dir():
                     self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch")
-                self.git.run(source, "worktree", "remove", "--force", str(actual))
-            self.git.run(source, "worktree", "prune")
+                if source.is_dir():
+                    self.git.run(source, "worktree", "remove", "--force", str(actual))
+                else:
+                    # The user may move/delete the source checkout after the
+                    # task was created. The managed path has already passed
+                    # the ownership check above; removing it directly makes
+                    # task deletion durable without touching arbitrary files.
+                    shutil.rmtree(actual)
+            if source.is_dir():
+                self.git.run(source, "worktree", "prune")
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""

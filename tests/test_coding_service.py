@@ -20,12 +20,14 @@ from coding_service_fakes import (
 
 from cowork.coding.contracts import (
     CodingEvent,
+    DeliveryRecord,
     EventType,
     InputReference,
     PermissionMode,
     SessionCreateRequest,
     SessionStatus,
     SessionUpdateRequest,
+    SourceContext,
     WorkspaceKind,
     utc_now,
 )
@@ -33,6 +35,7 @@ from cowork.coding.control_models import (
     ComputerCapabilities,
     RunStatus,
     RuntimeEvent,
+    TaskRun,
 )
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
@@ -40,8 +43,11 @@ from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
+    PublishRequest,
+    PullRequestActionRequest,
     RepositoryResource,
 )
+from cowork.coding.remote_execution import RemoteExecutionCoordinator
 from cowork.coding.turns import EventBuffer, terminal_status
 from cowork.coding.workspace import WorkspaceError
 
@@ -175,6 +181,204 @@ def test_remote_runtime_claims_a_portable_task_without_receiving_local_paths(tmp
     continued = service.submit_turn(created.id, "One more change", CREDS)
     assert continued.run_id != run.id
     assert service.control.store.get_run(continued.run_id or "").status == RunStatus.queued
+
+
+def test_compatibility_events_cannot_overwrite_a_remote_runtime_lifecycle(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    registration = service.control.issue_registration_token()
+    remote, _ = service.control.register_runtime(
+        registration,
+        "Build computer",
+        ComputerCapabilities(
+            platform="linux",
+            architecture="test",
+            runtime_version="test-runtime",
+            agent_engines=["fake"],
+            shells=["bash"],
+        ),
+    )
+    project = service.projects.create(ProjectCreateRequest(
+        name="Portable project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url="https://example.test/repo.git",
+            local_path=str(repo),
+        )],
+    ))
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            computer_id=remote.id,
+            prompt="Build remotely",
+            engine_id="fake",
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    leased = service.control.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+    service.accept_runtime_event(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=1,
+        kind="status",
+        payload={"status": "ready"},
+    ))
+    service.accept_runtime_event(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=2,
+        kind="status",
+        payload={"status": "running"},
+    ))
+
+    queued = service.queue_turn(created.id, "No longer needed")
+    service.accept_runtime_event(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=3,
+        kind="status",
+        payload={"status": "ready"},
+    ))
+    session = service.store.load_session(created.id)
+    session.status = SessionStatus.completed
+    service.store.save_session(session)
+    service.remove_queued_turn(created.id, queued.queued_instructions[0].id)
+
+    canonical = service.control.store.get_run(run.id)
+    assert canonical.status == RunStatus.ready
+    assert canonical.lease_id == lease_id
+    assert canonical.last_event_seq == 3
+
+
+def test_remote_approval_text_is_redacted_before_reaching_the_ui() -> None:
+    run = TaskRun(id="run", task_id="task", computer_id="remote", status=RunStatus.awaiting_approval)
+    pending, event = RemoteExecutionCoordinator._coding_event(run, RuntimeEvent(
+        run_id=run.id,
+        computer_id=run.computer_id,
+        lease_id="lease",
+        epoch=1,
+        seq=1,
+        kind="approval",
+        payload={
+            "approvalId": "approval",
+            "params": {
+                "title": "Use token=secret-value",
+                "command": "Authorization: Bearer secret-value",
+                "cwd": "/tmp/password=secret-value",
+            },
+        },
+    ))
+
+    assert pending is not None
+    assert pending.title == "Use token=[redacted]"
+    assert pending.detail == "Authorization: Bearer [redacted]"
+    assert pending.cwd == "/tmp/password=[redacted]"
+    assert "secret-value" not in event.model_dump_json()
+
+
+def test_remote_cancel_is_deduplicated_per_turn_not_per_runtime_epoch(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    registration = service.control.issue_registration_token()
+    remote, _ = service.control.register_runtime(
+        registration,
+        "Build computer",
+        ComputerCapabilities(
+            platform="linux",
+            architecture="test",
+            runtime_version="test-runtime",
+            agent_engines=["fake"],
+            shells=["bash"],
+        ),
+    )
+    project = service.projects.create(ProjectCreateRequest(
+        name="Portable project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url="https://example.test/repo.git",
+            local_path=str(repo),
+        )],
+    ))
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            computer_id=remote.id,
+            prompt="First turn",
+            engine_id="fake",
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    leased = service.control.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+    initial = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    service.control.acknowledge_command(run.id, initial[0].id, remote.id, lease_id, run.epoch)
+
+    def status(seq: int, value: str) -> None:
+        service.accept_runtime_event(RuntimeEvent(
+            run_id=run.id,
+            computer_id=remote.id,
+            lease_id=lease_id,
+            epoch=run.epoch,
+            seq=seq,
+            kind="status",
+            payload={"status": value},
+        ))
+
+    status(1, "ready")
+    status(2, "running")
+    service.cancel(created.id)
+    service.cancel(created.id)
+    first_cancel = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert [command.kind for command in first_cancel] == ["cancel"]
+    service.control.acknowledge_command(run.id, first_cancel[0].id, remote.id, lease_id, run.epoch)
+
+    status(3, "ready")
+    service.submit_turn(created.id, "Second turn", CREDS)
+    next_start = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert [command.kind for command in next_start] == ["start"]
+    service.control.acknowledge_command(run.id, next_start[0].id, remote.id, lease_id, run.epoch)
+    status(4, "running")
+    service.cancel(created.id)
+    second_cancel = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert [command.kind for command in second_cancel] == ["cancel"]
+    assert second_cancel[0].idempotency_key != first_cancel[0].idempotency_key
+
+
+def test_deleting_task_survives_a_moved_source_repository(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Inspect it"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    workspace = Path(service.get_session(created.id).workspace_path)
+    repo.rename(tmp_path / "moved")
+
+    service.delete_session(created.id)
+
+    with pytest.raises(KeyError):
+        service.get_session(created.id)
+    with pytest.raises(KeyError):
+        service.control.store.get_run(created.run_id or "")
+    assert not workspace.exists()
 
 
 def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_path: Path) -> None:
@@ -1266,6 +1470,123 @@ def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_pa
     assert integrations.calls[0]["head"] == task.workspaces[0].task_branch
     assert service.get_session(task.id).deliveries[0].action == "draft_pull_request"
     assert service.delivery_plan(task.id).items[0].status == "published"
+
+
+def test_pull_request_actions_are_limited_to_deliveries_linked_to_the_task(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(ProjectCreateRequest(
+        name="Delivery authorization",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+    task = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Prepare delivery"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, task.id, SessionStatus.completed)
+
+    class Integrations:
+        def __init__(self) -> None:
+            self.requests: list[PullRequestActionRequest] = []
+
+        def pull_request_action(self, _project, request):
+            self.requests.append(request)
+            return SimpleNamespace(url=request.target_url)
+
+    integrations = Integrations()
+    request = PullRequestActionRequest(
+        target_url="https://github.example/pulls/7",
+        action="ready",
+        confirmed=True,
+    )
+    with pytest.raises(WorkspaceError, match="not linked"):
+        service.pull_request_action(task.id, request, integrations)  # type: ignore[arg-type]
+    assert integrations.requests == []
+
+    service.record_delivery(task.id, DeliveryRecord(
+        provider="github",
+        action="draft_pull_request",
+        target_url="https://github.example/repository",
+        status="published",
+        external_url="https://github.example/pulls/7/",
+        connection_name="Team GitHub",
+    ))
+    service.pull_request_action(task.id, request, integrations)  # type: ignore[arg-type]
+
+    assert integrations.requests[0].connection_name == "Team GitHub"
+
+
+def test_external_updates_are_limited_to_work_items_linked_to_the_task(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Source authorization",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+    task = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            prompt="Implement the issue",
+            source_contexts=[SourceContext(
+                provider="linear",
+                kind="issue",
+                url="https://linear.example/ENG-7",
+                connection_name="Team Linear",
+            )],
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, task.id, SessionStatus.completed)
+
+    class Integrations:
+        def __init__(self) -> None:
+            self.requests: list[PublishRequest] = []
+
+        def publish(self, _project, request):
+            self.requests.append(request)
+            return DeliveryRecord(
+                provider=request.provider,
+                action=request.action,
+                target_url=request.target_url,
+                status="published",
+            )
+
+    integrations = Integrations()
+    with pytest.raises(WorkspaceError, match="not linked"):
+        service.publish_task_update(
+            task.id,
+            PublishRequest(
+                provider="linear",
+                action="progress",
+                target_url="https://linear.example/ENG-99",
+                text="Progress",
+                confirmed=True,
+            ),
+            integrations,  # type: ignore[arg-type]
+        )
+    assert integrations.requests == []
+
+    service.publish_task_update(
+        task.id,
+        PublishRequest(
+            provider="linear",
+            action="progress",
+            target_url="https://linear.example/ENG-7/",
+            text="Progress",
+            confirmed=True,
+        ),
+        integrations,  # type: ignore[arg-type]
+    )
+    assert integrations.requests[0].connection_name == "Team Linear"
 
 
 def test_project_delivery_can_publish_a_selected_repository_with_its_own_copy(tmp_path: Path) -> None:
