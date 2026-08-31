@@ -381,7 +381,7 @@ class CodeOnlyRuntime:
         )
         prepared = (
             self.workspaces.restore(lease.task.id, lease.project, lease.workspaces)
-            if can_restore
+            if lease.run.workspace_resume_mode == "restore" and can_restore
             else self.workspaces.prepare(lease.task.id, lease.project)
         )
         self.client.event(lease, "workspace", {

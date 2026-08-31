@@ -14,10 +14,10 @@ import pytest
 from fastapi import HTTPException
 
 
-def _request(host):
-    """Minimal stand-in for a Starlette Request — only `.client.host` matters."""
+def _request(host, *, headers=None):
+    """Minimal stand-in for the request boundary used by the guard."""
     client = SimpleNamespace(host=host) if host is not None else None
-    return SimpleNamespace(client=client)
+    return SimpleNamespace(client=client, headers=headers or {})
 
 
 def test_require_local_allows_loopback():
@@ -25,6 +25,27 @@ def test_require_local_allows_loopback():
 
     require_local(_request("127.0.0.1"))
     require_local(_request("::1"))
+    require_local(_request("127.0.0.1", headers={"host": "localhost:26866"}))
+    require_local(_request("::1", headers={"host": "[::1]:26866"}))
+
+
+def test_require_local_rejects_dns_rebinding_and_cross_site_origins(monkeypatch):
+    from cowork.api.v1.endpoints.guards import require_local
+    from cowork.common.settings.app_settings import get_app_settings
+
+    with pytest.raises(HTTPException, match="local host"):
+        require_local(_request("127.0.0.1", headers={"host": "attacker.example"}))
+
+    monkeypatch.setenv("COWORK_ALLOWED_ORIGINS", '["http://localhost:5173"]')
+    get_app_settings.cache_clear()
+    try:
+        with pytest.raises(HTTPException, match="trusted local origin"):
+            require_local(_request(
+                "127.0.0.1",
+                headers={"host": "127.0.0.1:26866", "origin": "https://attacker.example"},
+            ))
+    finally:
+        get_app_settings.cache_clear()
 
 
 @pytest.mark.parametrize("host", ["10.0.0.5", "0.0.0.0", "192.168.1.10", "", None])

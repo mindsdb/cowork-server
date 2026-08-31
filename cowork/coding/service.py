@@ -20,7 +20,6 @@ from cowork.coding.contracts import (
     ApprovalDecision,
     CodingEvent,
     CodingSession,
-    DeliveryRecord,
     EngineCapabilities,
     EventPage,
     EventType,
@@ -39,23 +38,18 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.control_models import RunStatus, RuntimeEvent, TaskRun
 from cowork.coding.control_service import ControlPlaneService
+from cowork.coding.control_store import ControlPlaneStore
 from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
-from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_models import (
-    DeliveryPlan,
-    DraftPullRequestRequest,
-    PullRequestActionRequest,
-    PullRequestStatus,
-)
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_tasks import ProjectTaskOperations
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
 from cowork.coding.runtime import RuntimeManager
+from cowork.coding.service_delivery import CodingDeliveryOperations
 from cowork.coding.session_factory import CodingSessionFactory
 from cowork.coding.session_lifecycle import SessionLifecycleOperations
 from cowork.coding.shells import shell_inventory
@@ -72,13 +66,14 @@ from cowork.services.skills import CodeSkillService
 logger = logging.getLogger(__name__)
 
 
-class CodingService:
+class CodingService(CodingDeliveryOperations):
     def __init__(
         self,
         root: Path,
         registry: CodingEngineRegistry | None = None,
         store: CodingStore | None = None,
         workspaces: WorkspaceManager | None = None,
+        control_store: ControlPlaneStore | None = None,
     ) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -90,6 +85,7 @@ class CodingService:
         self.control = ControlPlaneService(
             root,
             ControlPlaneService.default_capabilities(available_engines, shell_options),
+            control_store,
         )
         self.project_store = CodeProjectStore(root, self.control.local_computer.id)
         self.skill_library = SkillLibraryService(root, self.project_store, self.workspaces.git)
@@ -244,8 +240,12 @@ class CodingService:
             self.remote.release_workspace(session)
             self.store.delete_session(session.id)
             self.skill_runtime.cleanup(session.id)
+            if session.run_id:
+                self.control.delete_task(session.run_id)
             return
         self.lifecycle.delete_session(session_id)
+        if session.run_id:
+            self.control.delete_task(session.run_id)
 
     def rename_session(self, session_id: str, title: str) -> CodingSession:
         return self.lifecycle.rename_session(session_id, title)
@@ -621,7 +621,10 @@ class CodingService:
                 session.run_id,
                 "cancel",
                 {},
-                f"cancel-{session.runtime_epoch}",
+                # One cancellation per canonical remote turn. Repeated clicks
+                # before the runtime advances are deduplicated, while a later
+                # turn in the same epoch receives a new sequence-backed key.
+                f"cancel-{run.epoch}-{run.last_event_seq}",
             )
             return session
         engine: EngineSession | None = None
@@ -650,8 +653,21 @@ class CodingService:
                 engine.cancel(turn_id)
         return self.get_session(session_id)
 
-    def recover(self, session_id: str, computer_id: str | None = None) -> CodingSession:
-        return self.remote.recover(session_id, computer_id)
+    def recovery_plan(self, session_id: str):
+        return self.remote.recovery_plan(session_id)
+
+    def recover(
+        self,
+        session_id: str,
+        computer_id: str | None = None,
+        *,
+        allow_recreate: bool = False,
+    ) -> CodingSession:
+        return self.remote.recover(
+            session_id,
+            computer_id,
+            allow_recreate=allow_recreate,
+        )
 
     def resolve_approval(self, session_id: str, approval_id: str, decision: ApprovalDecision) -> CodingSession:
         session = self.get_session(session_id)
@@ -712,32 +728,6 @@ class CodingService:
             self.remote.require_idle(session, "running project validation")
             return list(self.remote.operation(session, "validate", timeout=610).get("items") or [])
         return self.project_tasks.validate_project(session_id)
-
-    def delivery_plan(
-        self,
-        session_id: str,
-        integrations: DeveloperIntegrationService | None = None,
-    ) -> DeliveryPlan:
-        return self.task_delivery.plan(session_id, integrations)
-
-    def create_draft_pull_requests(
-        self,
-        session_id: str,
-        request: DraftPullRequestRequest,
-        integrations: DeveloperIntegrationService,
-    ) -> list[DeliveryRecord]:
-        return self.task_delivery.create_drafts(session_id, request, integrations)
-
-    def record_delivery(self, session_id: str, delivery: DeliveryRecord) -> DeliveryRecord:
-        return self.task_delivery.record(session_id, delivery)
-
-    def pull_request_action(
-        self,
-        session_id: str,
-        request: PullRequestActionRequest,
-        integrations: DeveloperIntegrationService,
-    ) -> PullRequestStatus:
-        return self.task_delivery.pull_request_action(session_id, request, integrations)
 
     def discover_models(self, engine_id: str, credentials: EngineCredentials) -> list[str]:
         return self.registry.get(engine_id).discover_models(credentials)

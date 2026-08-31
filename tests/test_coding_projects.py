@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +29,7 @@ from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.session_factory import project_instructions, task_title
-from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import GitRunner, WorkspaceError, WorkspaceManager
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -80,7 +80,7 @@ def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path
         "id": "legacy",
         "name": "Legacy",
         "folders": [
-            {"id": "repo", "name": "Repo", "path": str(repo), "commands": []},
+            {"id": "repo", "name": "Repo", "path": str(repo), "base_branch": "staging", "commands": []},
             {"id": "notes", "name": "Notes", "path": str(notes), "commands": []},
         ],
     }), encoding="utf-8")
@@ -92,6 +92,7 @@ def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path
     assert isinstance(migrated.resources[0], RepositoryResource)
     assert migrated.resources[0].local_path == str(repo.resolve())
     assert migrated.resources[0].computer_id == "computer-local"
+    assert migrated.resources[0].default_branch == "staging"
     assert isinstance(migrated.resources[1], LocalFolderResource)
     assert migrated.resources[1].path == str(notes.resolve())
     assert migrated.resources[1].computer_id == "computer-local"
@@ -153,6 +154,38 @@ def test_task_titles_are_compact_and_end_cleanly() -> None:
 
     assert len(title) == 72
     assert title.endswith("…")
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "ext::sh -c touch /tmp/cowork-git-rce",
+        "file:///private/repository",
+        "git://example.com/repository.git",
+        "http://example.com/repository.git",
+        "https://token@example.com/repository.git",
+    ],
+)
+def test_repository_resources_reject_unsafe_git_transports(source_url: str) -> None:
+    with pytest.raises(ValidationError, match="repository"):
+        RepositoryResource(id="repo", name="Repo", source_url=source_url)
+
+
+def test_git_runner_cannot_have_its_transport_allowlist_overridden(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    GitRunner().run(
+        tmp_path,
+        "status",
+        environment={"GIT_ALLOW_PROTOCOL": "ext:file:https:ssh"},
+    )
+
+    assert captured["GIT_ALLOW_PROTOCOL"] == "file:https:ssh"
 
 
 def test_project_workspace_isolates_git_and_non_git_folders_and_hands_off_together(tmp_path: Path) -> None:
@@ -244,6 +277,34 @@ def test_project_workspace_restores_only_recorded_task_paths(tmp_path: Path) -> 
         manager.restore("recoverable-task", project, [unsafe])
 
     manager.cleanup("recoverable-task", list(prepared.workspaces))
+
+
+def test_remote_repository_cache_fetches_before_each_new_task(tmp_path: Path) -> None:
+    source = repository(tmp_path, "remote-source")
+    branch = git(source, "branch", "--show-current")
+    project = CodeProject(
+        id="portable-project",
+        name="Portable",
+        resources=[RepositoryResource(
+            id="app",
+            name="App",
+            source_url=str(source),
+            default_branch=branch,
+        )],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    first = manager.prepare("first-task", project)
+    manager.cleanup("first-task", list(first.workspaces))
+
+    (source / "README.md").write_text("new revision\n", encoding="utf-8")
+    git(source, "add", "README.md")
+    git(source, "commit", "-m", "new revision")
+    latest = git(source, "rev-parse", "HEAD")
+
+    second = manager.prepare("second-task", project)
+    assert second.primary.base_revision == latest
+    assert (Path(second.primary.workspace_path) / "README.md").read_text(encoding="utf-8") == "new revision\n"
+    manager.cleanup("second-task", list(second.workspaces))
 
 
 def test_multi_folder_handoff_preflights_every_folder_before_changing_any_source(tmp_path: Path) -> None:

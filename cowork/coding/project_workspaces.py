@@ -11,6 +11,7 @@ from pathlib import Path
 
 from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
 from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
+from cowork.coding.git_transport import validate_git_source
 from cowork.coding.project_models import (
     CodeProject,
     LocalFolderResource,
@@ -235,7 +236,11 @@ class ProjectWorkspaceManager:
 
     def _repository_cache(self, resource: RepositoryResource) -> Path:
         assert resource.source_url is not None
-        key = hashlib.sha256(resource.source_url.encode()).hexdigest()[:24]
+        try:
+            source_url = validate_git_source(resource.source_url)
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        key = hashlib.sha256(source_url.encode()).hexdigest()[:24]
         root = self.workspaces.root / "repositories" / key
         if root.is_dir():
             self._refresh_repository_cache(root, resource)
@@ -249,7 +254,7 @@ class ProjectWorkspaceManager:
                 root.parent,
                 "clone",
                 "--no-tags",
-                resource.source_url,
+                source_url,
                 str(temporary),
                 check=False,
             )
@@ -283,7 +288,7 @@ class ProjectWorkspaceManager:
             "HEAD",
             check=False,
         ).stdout.strip()
-        branch = resource.default_branch or current
+        branch = resource.default_branch or self._remote_default_branch(root) or current
         if not branch:
             return
         valid = self.workspaces.git.run(
@@ -309,6 +314,17 @@ class ProjectWorkspaceManager:
             self.workspaces.git.run(root, "reset", "--hard", remote_ref)
         else:
             self.workspaces.git.run(root, "branch", "--force", branch, remote_ref)
+
+    def _remote_default_branch(self, root: Path) -> str | None:
+        result = self.workspaces.git.run(
+            root,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+            check=False,
+        )
+        value = result.stdout.strip()
+        return value.removeprefix("origin/") if value else None
 
     def fork(
         self,

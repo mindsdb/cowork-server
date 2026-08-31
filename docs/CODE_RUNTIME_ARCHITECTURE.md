@@ -1,13 +1,13 @@
 # MindsHub Code runtime architecture
 
-Status: implemented protocol v1 for the desktop control plane and an outbound code-only runtime.
+Status: implemented protocol v1 for the desktop control plane and an outbound code-only runtime. The control records also have a transactional, tenant-namespaced SQL adapter for a hosted control plane; hosted Code routes remain deliberately disabled until the rest of the Task read model is tenant-native.
 
 ## Product model
 
 MindsHub Code keeps durable work separate from the computer that happens to execute it:
 
 - A `CodeProject` owns shared resources, connector references, skills and task defaults.
-- A `CodeTask` owns the prompt, source contexts, resource scope and delivery history.
+- A `CodeTask` owns the prompt, source contexts, immutable execution-resource snapshot and delivery history.
 - A `TaskRun` is one fenced execution attempt assigned to a `Computer`.
 - An `ExecutionWorkspace` records the execution machine's claim for one scoped resource. Its path is execution data, not Project identity.
 - A `ConnectorGrant` is short-lived authority for one action against one external resource.
@@ -20,7 +20,7 @@ Projects are never assigned to a computer. Repository resources are portable whe
 
 `ControlPlaneService` owns Computers, Tasks, Task Runs, workspace claims, commands, credentials, grants, leasing and recovery. Storage is accessed through `ControlPlaneStore`; `LocalControlPlaneStore` is the development/desktop adapter. Creating a Task, its first Run and initial workspace claims is journalled as a single recoverable transaction.
 
-The desktop adapter serializes multi-record lease, command and Task/Run mutations within the process. A tenant-scoped production store must preserve the same contract with database transactions and compare-and-swap fencing; replacing the adapter must not turn the current process lock into a distributed-systems assumption.
+The desktop adapter serializes multi-record lease, command and Task/Run mutations within the process. `SqlControlPlaneStore` implements the same contract over the Cowork database with a structural namespace on every record, transactions for Task/Run/workspace creation, row-locked one-use registration and grant consumption, and `FOR UPDATE SKIP LOCKED` run claiming. This prevents two API/scheduler replicas from leasing the same Run. The namespace is the permission boundary: no unscoped query method exists.
 
 The existing `CodingSession` remains a compatibility/read model for the current desktop event timeline, approvals and renderer. Canonical Computer and Run state is projected onto it at read time. This lets the UI migrate without making an undocumented Codex process the durable Task identity.
 
@@ -50,7 +50,7 @@ The protocol version is `1.0`. Runtime requests carry a computer identity, lease
 - A stale computer, lease, epoch, duplicate sequence or old command is rejected.
 - UI timeline sequence numbers never advance the runtime protocol cursor.
 
-An expired runtime therefore cannot publish late events, approvals, commits or command results into a recovered task.
+An expired runtime therefore cannot publish late events, approvals, commits or command results into a recovered task. Registration authority is one-use and durable, so registration remains correct when the pairing request reaches another API replica.
 
 ## Credential boundary
 
@@ -59,9 +59,11 @@ Long-lived MindsHub, GitHub and Linear credentials remain in the control plane.
 - The runtime has a hashed-at-rest computer token for registration/leases only.
 - Each leased run receives a new per-run agent token; only its digest is durable.
 - Inference is proxied centrally and authenticates that run/computer/epoch/lease token.
-- Linked GitHub/Linear items receive exact-URL, action-scoped `ConnectorGrant`s with short expiry.
+- Linked GitHub/Linear items receive exact-URL, action-, run-, epoch- and computer-scoped `ConnectorGrant`s with short expiry and bounded use.
 - The runtime writes these short-lived capabilities to a mode `0600` file, exposes them through an agent-neutral MCP server and deletes the file when the run closes.
 - OAuth tokens never enter a lease, event, Task, Project, command, log or execution config.
+
+Connector capabilities are derived from the Task's immutable execution snapshot, not mutable Project settings. Invocation is atomically authorized and consumed, and secret-free allow/deny/revoke events are appended to the security audit collection. External updates and PR mutations are additionally restricted to work items and published PRs linked to that Task.
 
 Remote Git checkouts use ordinary Git credentials configured on the execution computer. Branch publication is split deliberately: the runtime pushes a normal branch without receiving central OAuth, then the control plane creates the draft PR with the configured GitHub connector. A future hosted runtime can replace that checkout transport with a central scoped Git proxy without changing Task, Run or engine contracts.
 
@@ -69,17 +71,36 @@ Remote Git checkouts use ordinary Git credentials configured on the execution co
 
 Run transitions are explicit in `run_state.py`. A normal turn completion returns the Run to `ready`, retaining its workspace and agent session for follow-ups. Explicit release completes the Run and clears workspace paths and connector grants. Lease/computer loss increments the fencing epoch and moves the Run to `recovering`, surfaced to users as **Ready to resume**, while preserving Project, Task, source contexts, events and delivery metadata.
 
+A recovery on the original computer restores its preserved isolated workspace. Moving a portable repository-only task to a different computer is an explicit **fresh workspace** operation: it rebuilds from the Task's frozen repository definitions and never claims that unpushed files moved with the conversation. Local folders and repositories without clone URLs remain pinned to their originating computer. The recovery API returns these options and consequences before the user confirms a move.
+
 Queued follow-ups are durable in the compatibility Task read model. A completed remote turn atomically removes the oldest queued instruction from the UI queue and persists an idempotent `start` command for the same fenced Run.
+
+## A-quality lifecycle gate
+
+Code changes are not considered **A quality** when only their local happy path
+works. Every changed durable concept must be verified across its complete
+cross-layer lifecycle: typed contract and migration, local and SQL persistence,
+control-plane transition, runtime/lease boundary, compatibility projection, API
+error, and renderer state. The applicable create, resume, cancel, recover,
+delete, migrate, retention and upgrade paths require behavioral regressions at
+the seams where ownership changes.
+
+In particular, canonical Run state may flow into compatibility/read models but
+must never be written back from a stale remote projection; product-lifetime
+collections must be indexed and retained deliberately; and destructive actions
+must remain recoverable or visibly retryable at the UI boundary. A green unit
+test for one class is therefore necessary but insufficient—the release gate is
+the cross-layer invariant.
 
 ## Extraction path
 
-The local store is intentionally an adapter, not the architecture:
+The local store is intentionally an adapter, not the architecture. The SQL control-record adapter and runtime distribution contract are implemented; the remaining hosted activation work is intentionally gated rather than exposing partially tenant-scoped Code APIs:
 
-- replace `ControlPlaneStore` with a tenant-scoped database implementation;
-- host the runtime router on the central service;
+- move the compatibility `CodingSession`, Project and event read models to the same central tenant boundary;
+- bind control-store namespaces to authenticated organization/project authorization rather than deployment configuration;
 - retain the versioned runtime and engine contracts;
 - supervise multiple `CodeOnlyRuntime` workers for higher per-computer capacity;
 - add a scoped Git smart-HTTP proxy for hosted/private-repository checkout;
-- move compatibility `CodingSession` projection into a query/read-model layer once all clients consume Tasks and Runs directly.
+- move compatibility projection into a query/read-model layer once all clients consume Tasks and Runs directly.
 
 No cloud scheduler, Kubernetes provisioner or multi-agent coordinator is part of protocol v1.

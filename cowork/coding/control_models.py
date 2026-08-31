@@ -13,6 +13,7 @@ from cowork.coding.contracts import (
     WorkspaceKind,
     utc_now,
 )
+from cowork.coding.project_models import CodeProject
 
 CONTROL_SCHEMA_VERSION = 1
 RUNTIME_PROTOCOL_VERSION = "1.0"
@@ -95,6 +96,16 @@ class RuntimeCredential(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class RuntimeRegistrationCredential(BaseModel):
+    """One-use registration authority stored centrally as a digest."""
+
+    id: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]+$")
+    token_hash: str = Field(min_length=64, max_length=64)
+    expires_at: datetime
+    consumed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class TaskRunCredential(BaseModel):
     """Per-run agent credential; only its digest reaches durable storage."""
 
@@ -129,8 +140,13 @@ class CodeTask(BaseModel):
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     title: str = Field(min_length=1, max_length=200)
     prompt: str = Field(default="", max_length=200_000)
+    engine_id: str = Field(default="codex", min_length=1, max_length=128)
     project_id: str | None = Field(default=None, max_length=128)
     resource_scope: TaskResourceScope = Field(default_factory=TaskResourceScope)
+    # The resources a task may touch are frozen when the task is created.  A
+    # project can evolve independently without silently broadening an existing
+    # task or changing the repositories used by a recovered run.
+    execution_project: CodeProject | None = None
     source_contexts: list[SourceContext] = Field(default_factory=list, max_length=24)
     deliveries: list[DeliveryRecord] = Field(default_factory=list, max_length=250)
     created_at: datetime = Field(default_factory=utc_now)
@@ -148,6 +164,8 @@ class TaskRun(BaseModel):
     lease_expires_at: datetime | None = None
     last_event_seq: int = Field(default=0, ge=0)
     checkpoint: dict[str, object] = Field(default_factory=dict)
+    workspace_resume_mode: Literal["prepare", "restore", "recreate"] = "prepare"
+    recovery_count: int = Field(default=0, ge=0)
     last_error: str | None = Field(default=None, max_length=4_000)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -175,6 +193,10 @@ class ConnectorGrant(BaseModel):
     schema_version: int = CONTROL_SCHEMA_VERSION
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     run_id: str = Field(min_length=1, max_length=128)
+    # Legacy desktop grants had no computer binding. They deserialize to a
+    # sentinel that can never match a registered runtime and therefore fail
+    # closed instead of breaking startup or inheriting broader authority.
+    computer_id: str = Field(default="legacy-unbound", min_length=1, max_length=128)
     epoch: int = Field(default=1, ge=1)
     provider: Literal["github", "linear"]
     connection_name: str = Field(min_length=1, max_length=512)
@@ -182,6 +204,9 @@ class ConnectorGrant(BaseModel):
     resource_constraints: dict[str, str] = Field(default_factory=dict, max_length=32)
     token_hash: str = Field(min_length=64, max_length=64)
     expires_at: datetime
+    max_uses: int = Field(default=100, ge=1, le=10_000)
+    use_count: int = Field(default=0, ge=0)
+    last_used_at: datetime | None = None
     revoked_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -189,6 +214,21 @@ class ConnectorGrant(BaseModel):
     @classmethod
     def unique_actions(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(value))
+
+
+class SecurityAuditEvent(BaseModel):
+    """Append-only, secret-free record of sensitive control-plane decisions."""
+
+    schema_version: int = CONTROL_SCHEMA_VERSION
+    id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_-]+$")
+    action: str = Field(min_length=1, max_length=120)
+    outcome: Literal["allowed", "denied", "completed"]
+    actor_type: Literal["user", "runtime", "agent", "system"]
+    target_id: str = Field(default="", max_length=160)
+    run_id: str | None = Field(default=None, max_length=128)
+    computer_id: str | None = Field(default=None, max_length=128)
+    detail: str = Field(default="", max_length=1_000)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class RuntimeCommand(BaseModel):
@@ -253,3 +293,16 @@ class TaskControlSnapshot(BaseModel):
     run: TaskRun
     computer: Computer
     workspaces: list[ExecutionWorkspace] = Field(default_factory=list)
+
+
+class RecoveryOption(BaseModel):
+    computer: Computer
+    mode: Literal["restore", "recreate"]
+    preserves_workspace_changes: bool
+    recommended: bool = False
+    detail: str = Field(default="", max_length=1_000)
+
+
+class RecoveryPlan(BaseModel):
+    run_id: str
+    options: list[RecoveryOption] = Field(default_factory=list)
