@@ -12,11 +12,11 @@ from cowork.coding.project_models import CodeProject
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.skill_models import (
     ProjectSkillSource,
-    SkillProjectAssignment,
     SkillLibraryDocument,
     SkillLibraryItem,
     SkillLibraryPage,
     SkillLibrarySource,
+    SkillProjectAssignment,
     TeamSkillSource,
 )
 from cowork.coding.skill_source_store import SkillSourceStore
