@@ -1221,8 +1221,14 @@ class ResponsesHandler:
                 # if it raises we just fall back to the generic auth message
                 # (no reconnectable flag), so the stream still closes cleanly.
                 try:
-                    from cowork.common.settings.user_settings import Provider
-                    provider = get_user_settings().resolved_planning_provider
+                    settings = get_user_settings()
+                    role = getattr(exc, "role", None)
+                    if role == "coding":
+                        provider = settings.resolved_coding_provider
+                    elif role == "router":
+                        provider = settings.resolved_router_provider
+                    else:
+                        provider = settings.resolved_planning_provider
                     reconnectable = provider == Provider.MINDS_CLOUD
                     message = auth_error_detail(provider.label, reconnectable)
                     extra = {"reconnectable": reconnectable, "provider_label": provider.label}
@@ -1279,7 +1285,6 @@ class ResponsesHandler:
                 failed_model = overloaded_info[1] if overloaded_info else ""
                 extra = {"model": failed_model}
                 try:
-                    from cowork.common.settings.user_settings import Provider
                     s = get_user_settings()
                     # The nudge keys on WHICH provider overloaded. anton passes the
                     # actual failing model (planning OR coding); map it back to its

@@ -11,12 +11,15 @@ provider classes and capturing the constructor kwargs:
   - openai-compatible uses its dedicated key + its own base;
   - anthropic gets no base_url kwarg (its SDK has no such arg).
 """
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import SecretStr
 
 from anton.core.llm.openai import OpenAIProvider as _RealOpenAIProvider
+from anton.core.llm.provider import ProviderAuthError
+from cowork.common.settings import runtime_credential
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.services.providers import GEMINI_BASE_URL
 
@@ -84,6 +87,7 @@ def test_gemini_targets_google_with_shared_key_fallback(build):
     kw = calls["openai"][-1]
     assert kw["api_key"] == "AIza-shared"
     assert kw["base_url"] == GEMINI_BASE_URL  # Google, NOT the contaminated slot
+    assert "api_key_provider" not in kw
 
 
 def test_openai_never_inherits_contaminated_base(build):
@@ -97,6 +101,7 @@ def test_openai_never_inherits_contaminated_base(build):
     kw = calls["openai"][-1]
     assert kw["api_key"] == "sk-openai"
     assert kw["base_url"] is None  # SDK default host, never the shared slot
+    assert "api_key_provider" not in kw
 
 
 def test_openai_compatible_uses_dedicated_key_and_own_base(build):
@@ -113,6 +118,7 @@ def test_openai_compatible_uses_dedicated_key_and_own_base(build):
     kw = calls["openai"][-1]
     assert kw["api_key"] == "sk-compat"  # dedicated slot, not shared openai
     assert kw["base_url"] == "https://my-proxy.example.com/v1"
+    assert "api_key_provider" not in kw
 
 
 def test_anthropic_gets_no_base_url_kwarg(build):
@@ -127,6 +133,7 @@ def test_anthropic_gets_no_base_url_kwarg(build):
     kw = calls["anthropic"][-1]
     assert kw["api_key"] == "sk-ant"
     assert "base_url" not in kw  # AnthropicProvider takes no base_url kwarg
+    assert "api_key_provider" not in kw
 
 
 def test_missing_key_error_names_the_actual_provider(build):
@@ -157,7 +164,8 @@ def test_openai_compatible_without_base_raises(build):
         build(settings)
 
 
-def test_minds_cloud_uses_minds_key_and_derived_base(build):
+def test_static_minds_cloud_key_stays_static(build, monkeypatch):
+    monkeypatch.setattr(runtime_credential, "get_minds_credential", lambda: None)
     settings = UserSettings(
         planning_provider=Provider.MINDS_CLOUD,
         coding_provider=Provider.MINDS_CLOUD,
@@ -169,6 +177,67 @@ def test_minds_cloud_uses_minds_key_and_derived_base(build):
     kw = calls["openai"][-1]
     assert kw["api_key"] == "mdb-key"  # minds slot, not the OpenAI slot
     assert kw["base_url"] == "https://api.mindshub.ai/v1"
+    assert kw["api_key_provider"] is None
+
+
+def test_org_mode_minds_cloud_key_stays_static(build, monkeypatch):
+    monkeypatch.setattr(
+        runtime_credential,
+        "get_app_settings",
+        lambda: SimpleNamespace(tenancy_mode="org"),
+    )
+    monkeypatch.setattr(runtime_credential, "_minds_credential", "desktop-token")
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("per-turn-key"),
+        minds_url="https://api.mindshub.ai",
+    )
+    _client, calls = build(settings)
+    kw = calls["openai"][-1]
+    assert kw["api_key"] == "per-turn-key"
+    assert kw["api_key_provider"] is None
+
+
+@pytest.mark.asyncio
+async def test_local_minds_cloud_provider_rereads_runtime_credential(build, monkeypatch):
+    current = {"credential": "token-A"}
+    monkeypatch.setattr(
+        runtime_credential,
+        "get_minds_credential",
+        lambda: current["credential"],
+    )
+
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("token-A"),
+        minds_url="https://api.mindshub.ai",
+    )
+    _client, calls = build(settings)
+    provider_calls = len(calls["openai"])
+    assert provider_calls == 3  # router, planning, and coding
+    credential_providers = [kw["api_key_provider"] for kw in calls["openai"]]
+
+    assert all(kw["api_key"] == "token-A" for kw in calls["openai"])
+    assert [await provider() for provider in credential_providers] == [
+        "token-A",
+        "token-A",
+        "token-A",
+    ]
+
+    current["credential"] = "token-B"
+    assert [await provider() for provider in credential_providers] == [
+        "token-B",
+        "token-B",
+        "token-B",
+    ]
+    assert len(calls["openai"]) == provider_calls
+
+    current["credential"] = None
+    for provider in credential_providers:
+        with pytest.raises(ProviderAuthError):
+            await provider()
 
 
 # ── Reasoning effort follows the model, not the role (ENG-1632) ────────
