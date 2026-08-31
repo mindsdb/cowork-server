@@ -14,6 +14,7 @@ from cowork.coding.project_models import (
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.workspace import GitRunner, WorkspaceError
 
+
 class PlaybookService:
     """Cache, inspect, and normalize a project's Git-backed team playbook."""
 
