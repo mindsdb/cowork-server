@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Annotated
 
@@ -53,26 +54,35 @@ async def list_connections(scope: ScopeDep, request: Request):
     return ConnectionsService(scope).list()
 
 
-# Non-secret fields surfaced from auth's live-token response — mirrors
-# anton's TurnKeyDataVault._TURNKEY_RESPONSE_FIELDS allowlist (minus
+# Non-secret fields surfaced from auth's connection-detail response —
+# mirrors anton's TurnKeyDataVault._TURNKEY_RESPONSE_FIELDS allowlist (minus
 # access_token, which this read-only detail view never needs to hold).
-_ORG_CONNECTION_DETAIL_FIELDS = ("account_email", "token_type", "scope", "expires_at")
+# `status`/`_picked_files` are handled separately below, not through this
+# passthrough allowlist: `status` because "" is a valid absent-value here
+# but "active"/"needs_reconnect" are never falsy, so the shared `if
+# detail.get(k)` guard is fine for it too; `_picked_files` because its shape
+# has to change (see below) rather than being a straight passthrough.
+_ORG_CONNECTION_DETAIL_FIELDS = ("account_email", "token_type", "scope", "expires_at", "status")
 
 
 @router.get("/{engine}/{name}", response_model=ConnectionDetailResponse)
 async def get_connection(engine: str, name: str, scope: ScopeDep, request: Request):
     if scope.org_mode:
-        # auth has no standalone "read connection metadata" endpoint yet —
-        # the turn-key token endpoint is the only source for a connection's
-        # non-secret fields (account_email etc.), so reading connection
-        # detail here mints a live token as a side effect. Known limitation:
-        # a connection stuck needing reconnect surfaces as a 403 from auth
-        # rather than a normal detail response with a "needs_reconnect"
-        # status — the catalogue (list_connections) is the only place that
-        # can show that state today. See the OAuth Proxy + Data Vault
-        # blueprint for a follow-up "connection detail" auth endpoint.
-        token = await auth_proxy.proxy_token(engine, request, OAuthSettings(), name=name)
-        fields = {k: token[k] for k in _ORG_CONNECTION_DETAIL_FIELDS if token.get(k)}
+        # ENG-2097: this used to call proxy_token, whose fixed response
+        # shape never carried _picked_files — files persisted correctly via
+        # patch_picked_files below, they just had no read path back to this
+        # panel. proxy_connection_detail is a real read of the stored row
+        # instead (no refresh/provider call as a side effect), and as a
+        # bonus also surfaces a stuck connection's real status instead of
+        # proxy_token's 403 — closing the "known limitation" this comment
+        # used to describe.
+        detail = await auth_proxy.proxy_connection_detail(engine, name, request, OAuthSettings())
+        fields = {k: detail[k] for k in _ORG_CONNECTION_DETAIL_FIELDS if detail.get(k)}
+        # Desktop's local vault stores this as a JSON-encoded string
+        # (ConnectionsService._load_picked_files/merge_picked_files) —
+        # CustomizeView.jsx's JSON.parse(fields._picked_files) expects that
+        # same shape, not the native list auth's Data Vault holds it as.
+        fields["_picked_files"] = json.dumps(detail.get("picked_files") or [])
         return ConnectionDetailResponse(engine=engine, name=name, fields=fields)
     record = ConnectionsService(scope).get(engine, name)
     if record is None:
