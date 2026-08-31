@@ -363,6 +363,14 @@ async def test_download_skips_the_comment_layer(tmp_path, monkeypatch):
         ("a\r\nX-Injected: 1.txt", "aX-Injected: 1.txt", "aX-Injected%3A%201.txt"),
         # Non-ASCII survives only in the RFC 5987 spelling; the ASCII one degrades.
         ("rapport-\u00e9.xlsx", "rapport-.xlsx", "rapport-%C3%A9.xlsx"),
+        # A fully non-ASCII stem must not degrade to a hidden ".xlsx" dotfile
+        # (review finding on #413: two such names also collide, so a second
+        # `curl -OJ` fails outright).
+        ("\u62a5\u544a.xlsx", "download.xlsx", "%E6%8A%A5%E5%91%8A.xlsx"),
+        ("\u8a55\u4fa1", "download", "%E8%A9%95%E4%BE%A1"),
+        # Multi-extension names: rpartition on the last dot left these hidden.
+        ("\u62a5\u544a.tar.gz", "download.tar.gz", "%E6%8A%A5%E5%91%8A.tar.gz"),
+        ("\u6a21\u578b.v1.2.xlsx", "download.v1.2.xlsx", "%E6%A8%A1%E5%9E%8B.v1.2.xlsx"),
     ),
 )
 async def test_download_filename_cannot_inject_headers(

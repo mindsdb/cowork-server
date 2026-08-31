@@ -77,6 +77,14 @@ def _attachment_disposition(filename: str) -> str:
     cleaned = "".join(ch for ch in filename if ch.isprintable())
     ascii_name = cleaned.encode("ascii", "ignore").decode("ascii")
     ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"').strip() or "download"
+    # A fully non-ASCII stem leaves only the extension(s) behind — "报告.xlsx"
+    # -> ".xlsx", "报告.tar.gz" -> ".tar.gz" — a HIDDEN dotfile on macOS/Linux.
+    # Prefix rather than rpartition: splitting on the last dot rescued only
+    # single-extension names (review pass 2 on #413). Distinct artifacts can
+    # still degrade to the same "download.xlsx" — acceptable, since the ASCII
+    # spelling is a fallback and `filename*` below carries the exact name.
+    if ascii_name.startswith("."):
+        ascii_name = "download" + ascii_name
     return (
         f'attachment; filename="{ascii_name}"; '
         f"filename*=UTF-8''{quote(cleaned or 'download', safe='')}"
