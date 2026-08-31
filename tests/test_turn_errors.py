@@ -19,6 +19,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
+from anton.core.llm.provider import ProviderAuthError
 from cowork.handlers import turn_errors as te
 from cowork.handlers.responses import ResponsesHandler
 
@@ -443,15 +444,22 @@ def test_collect_raises_400_with_curated_message_for_token_limit():
 # ── Provider auth (401) → provider_auth ──────────────────────────────
 
 
-def test_detects_auth_error_from_openai_401_message():
-    # anton's openai provider maps a gateway 401 to this ConnectionError message.
-    exc = ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+def test_detects_canonical_provider_auth_error():
+    exc = ProviderAuthError("provider rejected the credential")
     assert te.is_auth_error(exc) is True
 
 
-def test_detects_auth_error_from_anthropic_401_message():
-    exc = ConnectionError("Invalid API key — check your ANTHROPIC_API_KEY environment variable.")
-    assert te.is_auth_error(exc) is True
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid API key — check your OpenAI API key configuration.",
+        "Invalid API key — check your ANTHROPIC_API_KEY environment variable.",
+    ],
+)
+def test_connection_error_auth_lookalikes_are_not_provider_auth(message):
+    exc = ConnectionError(message)
+    assert te.is_auth_error(exc) is False
+    assert te.friendly_turn_error(exc) is None
 
 
 def test_bare_401_not_flagged():
@@ -463,7 +471,7 @@ def test_bare_401_not_flagged():
 
 def test_auth_error_maps_to_provider_auth_code():
     code, message = te.friendly_turn_error(
-        ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+        ProviderAuthError("provider rejected the credential")
     )
     assert code == te.AUTH_ERROR_CODE == "provider_auth"
     assert "reconnect" in message.lower()
@@ -489,6 +497,28 @@ def test_response_failed_payload_carries_auth_fields():
     assert p["reconnectable"] is True and p["provider_label"] == "MindsHub"
     # Unrelated failures keep the original shape (no extra keys).
     assert "reconnectable" not in te.response_failed_payload("boom", "anton_error")
+
+
+async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _FakeSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+        resolved_router_provider = Provider.OPENAI
+
+    exc = ProviderAuthError("provider rejected the credential")
+    exc.role = "coding"
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert payload["reconnectable"] is False
+    assert payload["provider_label"] == Provider.ANTHROPIC.label
 
 
 # ── Model-403 (model_access_denied / model_disabled), legacy back-compat ─
@@ -555,7 +585,7 @@ def test_token_limit_wins_over_model_403():
 
 
 def test_auth_error_not_shadowed_by_model_mapping():
-    exc = ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+    exc = ProviderAuthError("provider rejected the credential")
     code, _ = te.friendly_turn_error(exc)
     assert code == te.AUTH_ERROR_CODE
 
@@ -655,6 +685,23 @@ def _gateway_failure(status_code, reason=None, message="Server returned an upstr
 def _byok_failure(status_code, message="Server returned an upstream error"):
     """A failure from the user's own provider (BYOK), not the gateway."""
     return _failure(status_code, message=message, url="https://api.openai.com/v1/chat/completions")
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected_code"),
+    [
+        (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
+        (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "rate_limited", te.RATE_LIMITED_CODE),
+        (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
+        (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
+    ],
+)
+def test_typed_auth_narrowing_preserves_gateway_reason_mapping(
+    status, reason, expected_code
+):
+    code, _ = te.friendly_turn_error(_gateway_failure(status, reason=reason))
+    assert code == expected_code
 
 
 def test_http_error_context_walks_cause_chain():
@@ -1019,12 +1066,18 @@ def test_reason_header_wins_over_status():
     assert code == te.TOKEN_LIMIT_CODE
 
 
-def test_401_status_not_captured_by_wallet_branches():
-    # A gateway 401 (bad credential) still falls to the auth mapping — the new
-    # status-based branches only fire for 402/429/503.
+def test_untyped_gateway_401_stays_generic():
+    # A status and familiar copy cannot prove that the active LLM credential is
+    # invalid. Only Anton's canonical typed exception selects provider_auth.
     exc = _gateway_failure(
         401, message="Invalid API key — check your OpenAI API key configuration."
     )
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_typed_gateway_401_maps_to_provider_auth():
+    exc = ProviderAuthError("provider rejected the credential")
+    exc.__cause__ = _FakeAPIStatusError(401, url=_minds_gateway_url())
     code, _ = te.friendly_turn_error(exc)
     assert code == te.AUTH_ERROR_CODE
 
@@ -1187,8 +1240,22 @@ def test_remote_error_overloaded_passes_curated_copy():
 
 def test_remote_error_auth():
     from cowork.handlers.turn_errors import remote_turn_error, AUTH_ERROR_CODE
-    code, _ = remote_turn_error("ConnectionError: Invalid API key - check your configuration.")
+    code, _ = remote_turn_error("ProviderAuthError: provider rejected the credential")
     assert code == AUTH_ERROR_CODE
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "ConnectionError: Invalid API key - check your configuration.",
+        "ConnectionError: Server returned 401 - Unauthorized",
+    ],
+)
+def test_remote_untyped_auth_lookalikes_are_redacted(error):
+    code, message = te.remote_turn_error(error)
+    assert code == te.GENERIC_TURN_ERROR_CODE
+    assert message == te.GENERIC_TURN_ERROR_MESSAGE
+    assert "api key" not in message.lower()
 
 
 def test_remote_error_unknown_is_redacted():

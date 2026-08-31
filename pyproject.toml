@@ -81,13 +81,14 @@ override-dependencies = ["pillow>=12.3.0"]
 # derivation (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`)
 # from this Anton commit, and persists what Anton only derives in memory — the
 # two must agree on the value or one artifact ends up with two identities.
-# This is Anton's staging head (mindsdb/anton#407); `main` has none of those
-# symbols yet, so pinning back to `branch = "main"` before Anton's next
-# staging → main release makes every artifact endpoint fail to import.
+# The same staging pin also supplies the typed provider-auth error and the
+# per-request API-key supplier used to refresh desktop credentials without
+# rebuilding an active session. `main` has neither feature yet, so pinning back
+# to `branch = "main"` before Anton's next staging → main release breaks both.
 # Flip it back in that release: the image installs from this lockfile
 # (`uv sync --frozen`), so a rev on a staging commit must not reach a
 # cowork-server main build.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "61ec5db6a6fdbb868bb43c30c98b9c52dd542fa3" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "a38aa2315767ba4355fdd9bd50bd04171e9bc948" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 

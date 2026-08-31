@@ -8,6 +8,11 @@ shared loopback port.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+from pydantic import SecretStr
+
+from cowork.common.settings.user_settings import Provider, UserSettings
+
 
 def test_health_reports_owner_from_app_settings():
     from cowork.api.v1.endpoints import health
@@ -58,6 +63,76 @@ def test_health_reports_org_mode():
 
 def test_health_org_mode_false_on_desktop():
     assert _health_with("local")["org_mode"] is False
+
+
+@pytest.mark.parametrize(
+    ("planning", "coding", "expected"),
+    [
+        (Provider.MINDS_CLOUD, Provider.OPENAI, True),
+        (Provider.OPENAI, Provider.MINDS_CLOUD, True),
+        (Provider.OPENAI, Provider.OPENAI, False),
+    ],
+)
+def test_health_reports_when_required_roles_need_the_runtime_minds_credential(
+    planning, coding, expected
+):
+    from cowork.api.v1.endpoints import health
+
+    settings = SimpleNamespace(
+        config_status={},
+        resolved_planning_provider=planning,
+        resolved_coding_provider=coding,
+    )
+    with (
+        patch.object(
+            health,
+            "get_app_settings",
+            return_value=SimpleNamespace(owner="", tenancy_mode="local"),
+        ),
+        patch.object(health, "get_user_settings", return_value=settings),
+    ):
+        body = health.health()
+
+    assert body["minds_runtime_credential_required"] is expected
+
+
+def test_health_runtime_requirement_uses_resolved_provider_fallback():
+    from cowork.api.v1.endpoints import health
+
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI,
+        coding_provider=Provider.OPENAI,
+        minds_api_key=SecretStr("mdb-runtime"),
+        openai_api_key=None,
+        minds_url="https://api.mindshub.ai",
+    )
+
+    assert settings.resolved_planning_provider is Provider.MINDS_CLOUD
+    assert settings.resolved_coding_provider is Provider.MINDS_CLOUD
+    assert health._minds_runtime_credential_required(settings, org_mode=False) is True
+
+
+def test_health_router_only_minds_use_does_not_gate_required_direct_roles():
+    from cowork.api.v1.endpoints import health
+
+    settings = SimpleNamespace(
+        resolved_planning_provider=Provider.OPENAI,
+        resolved_coding_provider=Provider.OPENAI,
+        resolved_router_provider=Provider.MINDS_CLOUD,
+    )
+
+    assert health._minds_runtime_credential_required(settings, org_mode=False) is False
+
+
+def test_health_org_mode_never_requires_the_desktop_runtime_credential():
+    from cowork.api.v1.endpoints import health
+
+    settings = SimpleNamespace(
+        resolved_planning_provider=Provider.MINDS_CLOUD,
+        resolved_coding_provider=Provider.MINDS_CLOUD,
+    )
+
+    assert health._minds_runtime_credential_required(settings, org_mode=True) is False
 
 
 # ─── aid: the join key the desktop app cannot compute itself (ENG-1689) ───────

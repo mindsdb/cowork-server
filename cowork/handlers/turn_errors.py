@@ -26,6 +26,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
+from anton.core.llm.provider import ProviderAuthError
+
 from cowork.common.settings.app_settings import default_minds_url
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
@@ -170,6 +172,11 @@ AUTH_ERROR_USER_MESSAGE = (
 # Wire-level code for the auth case. The renderer branches on it to offer a
 # "Reconnect" action (re-provision the key in place) instead of "Subscribe".
 AUTH_ERROR_CODE = "provider_auth"
+
+# Canonical Anton exception name after its remote scrubber converts an
+# exception to ``"TypeName: message"``. Remote errors no longer carry Python
+# type identity, so an exact name is the only typed discriminator left.
+PROVIDER_AUTH_ERROR_TYPE_NAME = "ProviderAuthError"
 
 # Wire-level codes for the model-403 case — the gateway rejected the requested
 # MODEL (the credential itself is fine). Only older pre-wallet gateway/anton
@@ -387,19 +394,13 @@ def provider_overloaded_info(exc: Exception) -> tuple[str, str] | None:
 
 
 def is_auth_error(exc: Exception) -> bool:
-    """Detect an **LLM-provider** auth failure — a 401 from the model gateway
-    because the credential it sees is invalid (revoked / rotated / never
-    provisioned / wrong org).
+    """Whether ``exc`` is Anton's canonical LLM-provider auth failure.
 
-    Matched narrowly on anton's specific 401 copy — both providers raise a
-    ``ConnectionError`` whose message starts ``Invalid API key — …``
-    (``openai.py`` / ``anthropic.py``). Deliberately does NOT match a bare
-    "401"/"unauthorized" anywhere in the text: that would mislabel an unrelated
-    failure (e.g. a connector/tool API 401 that bubbles up) as a provider-auth
-    error and pop the wrong "Reconnect" card. Credit/quota exhaustion (402/429)
-    is handled by ``is_token_limit_error`` (checked first).
+    Provider and tool errors can contain arbitrary 401 or invalid-key text. Only
+    Anton's typed exception proves the failed credential belongs to the active
+    LLM provider and may select the reconnect/update-key card.
     """
-    return "invalid api key" in str(exc).lower()
+    return isinstance(exc, ProviderAuthError)
 
 
 def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
@@ -943,7 +944,7 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         # turn still shows the UNNAMED copy. Naming it needs anton to carry the
         # code+model through _scrub's wire format (tracked separately).
         return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
-    if type_name == "ConnectionError" and "api key" in message.lower():
+    if type_name == PROVIDER_AUTH_ERROR_TYPE_NAME:
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     if type_name == "ContentValidationError":
         # ENG-1992: the repair itself (stripping the offending image blocks
