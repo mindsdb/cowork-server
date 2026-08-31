@@ -618,7 +618,13 @@ class CodexEngineSession:
                     "cwd": str(self._terminal_workspace),
                     "env": codex_config.interactive_shell_environment(command, self._terminal_workspace),
                     "processId": process_id,
-                    "sandboxPolicy": self._sandbox_policy,
+                    # This is a user-controlled shell (and the execution path
+                    # for an explicitly clicked project action), not an agent
+                    # tool call. Agent permissions continue to govern turns;
+                    # applying them here makes Read only silently block local
+                    # preview ports and makes the terminal unlike a normal
+                    # developer shell.
+                    "sandboxPolicy": {"type": "dangerFullAccess"},
                     "size": {"cols": cols, "rows": rows},
                     "streamStdin": True,
                     "streamStdoutStderr": True,
