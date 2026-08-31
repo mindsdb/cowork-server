@@ -297,6 +297,41 @@ A request with no valid pair is answered 401 before any route runs, except on
 `/api/v1/health/`, which the kubelet probes with no headers, and the channel
 webhook paths, which third parties call.
 
+### How the browser stays in one organization
+
+Canonical Cowork web sends `X-Cowork-Expected-Organization-Id` with every
+authenticated browser API request.
+`TrustedHeaderMiddleware._organization_boundary_response` compares it with the
+normalized `X-Organization-Id` supplied by the auth gateway before the route
+runs. It applies only to Keycloak-shaped bearer JWTs. MindsDB API keys, opaque
+service credentials, requests without a bearer, CORS preflights, health checks,
+and channel webhooks keep their existing behavior.
+
+`COWORK_ORGANIZATION_BOUNDARY_MODE=audit` logs a missing, malformed, or changed
+expected organization and lets the request continue. In `enforce` mode, a
+missing header returns 426 and a malformed or changed value returns 409. Both
+responses carry `X-Cowork-Organization-Reload: required`, a JSON `code` and
+`detail`, and `Cache-Control: no-store`. The browser reloads instead of letting
+an old document continue under a new Keycloak organization. A request already
+inside a route keeps the `Principal` created at its start, so a concurrent
+session change cannot retarget that in-flight operation.
+
+`GET /api/v1/capabilities/organization-switch` is authenticated and returns
+protocol version 1. It reports `expectedOrganizationEnforced: true` only when
+both identity and expected-organization enforcement are active. It reports
+`enabled: true` only when those boundaries are active and
+`COWORK_ORGANIZATION_SWITCH_ENABLED=true`.
+
+Roll this out in four separate steps:
+
+1. Deploy the capability-aware Cowork client. The picker stays hidden.
+2. Deploy cowork-server with the organization boundary in `audit` and switching
+   disabled.
+3. Set the boundary to `enforce` on every replica while switching remains
+   disabled, then verify the capability still reports `enabled: false`.
+4. Enable switching separately and verify the capability reports all three
+   required values.
+
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
 
@@ -489,6 +524,8 @@ Environment variables fall into two namespaces:
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
 | `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |
 | `COWORK_IDENTITY_ENFORCE` | `enforce` | Org mode only. `enforce` answers 401 to a request carrying no valid identity headers. `audit` logs it and lets it through, which is the rollout mode the org cutover used; it now has to be asked for. |
+| `COWORK_ORGANIZATION_BOUNDARY_MODE` | `enforce` | Canonical web only. `enforce` requires a browser JWT request to name the trusted organization it expects. `audit` logs violations and accepts them for a staged rollout. Long-lived Helm environments explicitly start in `audit`. |
+| `COWORK_ORGANIZATION_SWITCH_ENABLED` | `false` | Enables the version 1 organization-switch capability only while identity and expected-organization enforcement are both active. |
 | `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
