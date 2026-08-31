@@ -7,8 +7,10 @@ vault record is created, otherwise an invalid token would appear connected.
 """
 from __future__ import annotations
 
+import ipaddress
+import socket
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -42,6 +44,7 @@ def validate_developer_connection(
     values: dict[str, Any],
     *,
     client: httpx.Client | None = None,
+    resolver: Callable[..., list[tuple]] = socket.getaddrinfo,
 ) -> ValidatedDeveloperIdentity:
     """Validate a GitHub or Linear personal credential and return its identity."""
     allowed = _METHODS.get(connector_id)
@@ -54,7 +57,7 @@ def validate_developer_connection(
     active_client = client or httpx.Client(timeout=15.0, follow_redirects=False)
     try:
         if connector_id == "github":
-            return _validate_github(values, active_client)
+            return _validate_github(values, active_client, resolver)
         return _validate_linear(values, active_client)
     except httpx.HTTPError as exc:
         raise DeveloperProviderUnavailable(
@@ -65,7 +68,11 @@ def validate_developer_connection(
             active_client.close()
 
 
-def _validate_github(values: dict[str, Any], client: httpx.Client) -> ValidatedDeveloperIdentity:
+def _validate_github(
+    values: dict[str, Any],
+    client: httpx.Client,
+    resolver: Callable[..., list[tuple]],
+) -> ValidatedDeveloperIdentity:
     token = str(values.get("access_token") or "").strip()
     if not token:
         raise DeveloperCredentialError("Enter a GitHub personal access token.")
@@ -73,7 +80,7 @@ def _validate_github(values: dict[str, Any], client: httpx.Client) -> ValidatedD
     base_url = str(values.get("base_url") or "https://github.com").strip().rstrip("/")
     parsed = urlparse(base_url)
     if (
-        parsed.scheme not in {"http", "https"}
+        parsed.scheme != "https"
         or not parsed.hostname
         or parsed.username
         or parsed.password
@@ -81,6 +88,9 @@ def _validate_github(values: dict[str, Any], client: httpx.Client) -> ValidatedD
         or parsed.fragment
     ):
         raise DeveloperCredentialError("Enter a valid GitHub base URL.")
+
+    if base_url.casefold() != "https://github.com":
+        _require_public_host(parsed.hostname, resolver)
 
     api_url = "https://api.github.com" if base_url.casefold() == "https://github.com" else f"{base_url}/api/v3"
     response = client.get(
@@ -101,6 +111,31 @@ def _validate_github(values: dict[str, Any], client: httpx.Client) -> ValidatedD
     if not identity:
         raise DeveloperCredentialError("GitHub accepted the token but did not return an account identity.")
     return ValidatedDeveloperIdentity(account_email=identity)
+
+
+def _require_public_host(hostname: str, resolver: Callable[..., list[tuple]]) -> None:
+    """Reject private/custom GitHub endpoints before attaching credentials."""
+
+    try:
+        literal = ipaddress.ip_address(hostname)
+        addresses = [literal]
+    except ValueError:
+        try:
+            records = resolver(hostname, 443, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise DeveloperProviderUnavailable(
+                "The GitHub Enterprise host could not be resolved. Check the base URL."
+            ) from exc
+        addresses = []
+        for record in records:
+            try:
+                addresses.append(ipaddress.ip_address(record[4][0]))
+            except (IndexError, ValueError):
+                continue
+    if not addresses or any(not address.is_global for address in addresses):
+        raise DeveloperCredentialError(
+            "GitHub Enterprise must use a publicly routable HTTPS host."
+        )
 
 
 def _validate_linear(values: dict[str, Any], client: httpx.Client) -> ValidatedDeveloperIdentity:

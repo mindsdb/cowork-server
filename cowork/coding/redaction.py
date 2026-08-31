@@ -8,7 +8,7 @@ MAX_SANITIZED_CHARS = 128 * 1024
 MAX_REDACTION_INPUT_CHARS = 256 * 1024
 _SENSITIVE_KEY = re.compile(r"(authorization|api.?key|token|password|secret|credential|cookie)", re.IGNORECASE)
 _SENSITIVE_TEXT = re.compile(
-    r"(?i)((?:authorization|api[_-]?key|access[_-]?token|password|secret|cookie)\s*[:=]\s*(?:bearer\s+)?)([^\s,;&]+)"
+    r"(?i)((?:authorization|api[_-]?key|(?:access[_-]?)?token|password|secret|cookie)\s*[:=]\s*(?:bearer\s+)?)([^\s,;&]+)"
 )
 
 

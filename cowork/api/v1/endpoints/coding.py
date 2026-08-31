@@ -74,7 +74,10 @@ from cowork.coding.project_models import (
     WorkItemSearchRequest,
 )
 from cowork.coding.redaction import redact_text
-from cowork.coding.runtime_protocol import ComputerUpdateRequest, RegistrationTokenResponse
+from cowork.coding.runtime_protocol import (
+    ComputerUpdateRequest,
+    RegistrationTokenResponse,
+)
 from cowork.coding.service import CodingService, get_coding_service
 from cowork.coding.shells import shell_inventory
 from cowork.coding.skill_models import (
@@ -587,7 +590,17 @@ def cancel(session_id: str):
 
 @router.post("/sessions/{session_id}/recover")
 def recover(session_id: str, body: SessionRecoverRequest):
-    return _call(_service().recover, session_id, body.computer_id)
+    return _call(
+        _service().recover,
+        session_id,
+        body.computer_id,
+        allow_recreate=body.allow_recreate,
+    )
+
+
+@router.get("/sessions/{session_id}/recovery-options")
+def recovery_options(session_id: str):
+    return _call(_service().recovery_plan, session_id)
 
 
 @router.get("/sessions/{session_id}/terminals", response_model=TerminalTabPage)
@@ -814,21 +827,9 @@ def pull_request_action(session_id: str, body: PullRequestActionRequest, integra
 
 @router.post("/sessions/{session_id}/publish")
 def publish_task_update(session_id: str, body: PublishRequest, integrations: IntegrationsDep):
-    coding = _service()
-    task = _call(coding.get_session, session_id)
-    if not task.project_id:
-        raise HTTPException(status_code=409, detail="This task is not linked to a Code Project")
-    project = _call(coding.projects.get, task.project_id)
-    delivery = _call(integrations.publish, project, body)
-    return coding.record_delivery(task.id, delivery)
+    return _call(_service().publish_task_update, session_id, body, integrations)
 
 
 @router.post("/sessions/{session_id}/source-action")
 def source_action(session_id: str, body: SourceActionRequest, integrations: IntegrationsDep):
-    coding = _service()
-    task = _call(coding.get_session, session_id)
-    if not task.project_id:
-        raise HTTPException(status_code=409, detail="This task is not linked to a Code Project")
-    project = _call(coding.projects.get, task.project_id)
-    delivery = _call(integrations.complete_source, project, body)
-    return coding.record_delivery(task.id, delivery)
+    return _call(_service().complete_task_source, session_id, body, integrations)

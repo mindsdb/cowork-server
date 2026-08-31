@@ -13,7 +13,12 @@ from cowork.coding.contracts import (
     SessionStatus,
     TaskWorkspace,
 )
-from cowork.coding.control_models import RunStatus, RuntimeEvent, TaskRun
+from cowork.coding.control_models import (
+    RunStatus,
+    RuntimeEvent,
+    TaskResourceScope,
+    TaskRun,
+)
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.redaction import redact_text
@@ -141,7 +146,19 @@ class RemoteExecutionCoordinator:
         )
         return self.get_session(session.id)
 
-    def recover(self, session_id: str, computer_id: str | None = None) -> CodingSession:
+    def recovery_plan(self, session_id: str):
+        session = self.get_session(session_id)
+        if not session.run_id:
+            raise RuntimeError("This task does not have a recoverable run")
+        return self.control.recovery_plan(session.run_id)
+
+    def recover(
+        self,
+        session_id: str,
+        computer_id: str | None = None,
+        *,
+        allow_recreate: bool = False,
+    ) -> CodingSession:
         session = self.get_session(session_id)
         if not session.run_id or not session.task_id:
             raise RuntimeError("This task does not have a recoverable run")
@@ -149,15 +166,23 @@ class RemoteExecutionCoordinator:
         if run.status not in {RunStatus.interrupted, RunStatus.failed, RunStatus.recovering}:
             raise RuntimeError("This task does not need to be restored")
         task = self.control.store.get_task(session.task_id)
-        project = self.projects.get(task.project_id) if task.project_id else None
-        eligible = self.control.eligible_computers(project, task.resource_scope, session.engine_id)
+        project = task.execution_project
+        if project is None and task.project_id:
+            project = self.projects.get(task.project_id)
+        eligible = self.control.eligible_computers(
+            project,
+            TaskResourceScope(all_project_resources=True) if task.execution_project else task.resource_scope,
+            session.engine_id,
+        )
         target = computer_id or run.computer_id
         if not any(item.id == target for item in eligible):
-            if computer_id is None and eligible:
+            if computer_id is None and any(item.id == run.computer_id for item in eligible):
+                target = run.computer_id
+            elif computer_id is None and len(eligible) == 1:
                 target = eligible[0].id
             else:
                 raise RuntimeError("No online computer can restore this task with its selected resources")
-        recovered = self.control.recover_run(run.id, target)
+        recovered = self.control.recover_run(run.id, target, allow_recreate=allow_recreate)
         session.computer_id = recovered.computer_id
         session.runtime_epoch = recovered.epoch
         session.status = SessionStatus.ready
@@ -215,9 +240,12 @@ class RemoteExecutionCoordinator:
     def connector_capabilities(self, session: CodingSession) -> list[ConnectorCapability]:
         """Issue exact, short-lived connector authority for one leased run."""
 
-        if not session.run_id or not session.project_id:
+        if not session.run_id or not session.task_id:
             return []
-        project = self.projects.get(session.project_id)
+        task = self.control.store.get_task(session.task_id)
+        project = task.execution_project
+        if project is None:
+            return []
         self.control.revoke_connector_grants(session.run_id)
         capabilities: list[ConnectorCapability] = []
         issued: set[tuple[str, str, str, tuple[str, ...]]] = set()
@@ -352,9 +380,11 @@ class RemoteExecutionCoordinator:
                 id=str(event.payload.get("approvalId") or ""),
                 method=str(event.payload.get("method") or "runtime"),
                 kind=str(data.get("kind") or "command"),
-                title=str(data.get("title") or "Approve agent action"),
-                detail=str(data.get("reason") or data.get("command") or "The agent needs your approval."),
-                cwd=str(data.get("cwd")) if data.get("cwd") else None,
+                title=redact_text(str(data.get("title") or "Approve agent action"))[:512],
+                detail=redact_text(str(
+                    data.get("reason") or data.get("command") or "The agent needs your approval."
+                ))[:8_192],
+                cwd=redact_text(str(data.get("cwd")))[:32_768] if data.get("cwd") else None,
                 risk=str(data.get("risk") or "review"),
                 scope=str(data.get("scope") or "once"),
                 allow_session=bool(data.get("allowSession")),
@@ -385,7 +415,7 @@ class RemoteExecutionCoordinator:
         return None, CodingEvent(
             type=EventType.error if run.status == RunStatus.failed else EventType.session,
             title=title,
-            text=str(event.payload.get("detail") or run.last_error or ""),
+            text=redact_text(str(event.payload.get("detail") or run.last_error or "")),
             phase=(
                 "failed" if run.status in {RunStatus.failed, RunStatus.interrupted}
                 else "completed" if run.status in {RunStatus.completed, RunStatus.cancelled}

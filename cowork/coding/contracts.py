@@ -451,6 +451,7 @@ class SessionUpdateRequest(BaseModel):
 
 class SessionRecoverRequest(BaseModel):
     computer_id: str | None = Field(default=None, min_length=1, max_length=128)
+    allow_recreate: bool = False
 
 
 class TurnRequest(BaseModel):
