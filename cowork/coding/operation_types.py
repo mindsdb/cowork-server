@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager
 from typing import Protocol
 
 from cowork.coding.contracts import CodingEvent, CodingSession
+from cowork.coding.project_models import CodeProject
 
 
 class EventEmitter(Protocol):
@@ -18,3 +19,4 @@ class EventEmitter(Protocol):
 
 MaintenanceSession = Callable[[str, str], AbstractContextManager[CodingSession]]
 GetSession = Callable[[str], CodingSession]
+GetExecutionProject = Callable[[CodingSession], CodeProject | None]

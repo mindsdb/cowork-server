@@ -15,7 +15,7 @@ from cowork.coding.project_models import (
     PullRequestStatus,
     SourceActionRequest,
 )
-from cowork.coding.project_service import CodeProjectService
+from cowork.coding.operation_types import GetExecutionProject
 from cowork.coding.project_tasks import ProjectTaskOperations
 from cowork.coding.redaction import redact_text
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
@@ -30,14 +30,14 @@ class TaskDeliveryService:
         self,
         store: CodingStore,
         control: ControlPlaneService,
-        projects: CodeProjectService,
+        execution_project: GetExecutionProject,
         local: ProjectTaskOperations,
         remote: RemoteExecutionCoordinator,
         get_session: Callable[[str], CodingSession],
     ) -> None:
         self.store = store
         self.control = control
-        self.projects = projects
+        self.execution_project = execution_project
         self.local = local
         self.remote = remote
         self.get_session = get_session
@@ -166,9 +166,10 @@ class TaskDeliveryService:
         self.control.store.save_task(task)
 
     def _project(self, session: CodingSession) -> CodeProject:
-        if not session.project_id:
-            raise RuntimeError("This task is not linked to a Code Project")
-        return self.projects.get(session.project_id)
+        project = self.execution_project(session)
+        if project is None:
+            raise RuntimeError("This task's saved Code Project is unavailable")
+        return project
 
     @staticmethod
     def _linked_pull_request(session: CodingSession, target_url: str) -> DeliveryRecord:

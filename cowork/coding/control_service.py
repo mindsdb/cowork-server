@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cowork.coding.connector_delegation import ConnectorDelegationService
-from cowork.coding.contracts import CodingSession, SessionStatus, utc_now
+from cowork.coding.contracts import CodingSession, SessionStatus, TaskCapability, utc_now
 from cowork.coding.control_errors import RuntimeAuthenticationError, StaleRuntimeEvent
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
@@ -108,6 +108,7 @@ class ControlPlaneService:
             has_git=True,
             has_terminal=True,
             supports_local_folders=True,
+            task_capabilities=list(TaskCapability),
         )
 
     def list_computers(self) -> ComputerPage:
@@ -264,7 +265,7 @@ class ControlPlaneService:
         scope: TaskResourceScope,
         engine_id: str | None = None,
     ) -> list[Computer]:
-        resources = self._scoped_resources(project, scope)
+        resources = self.scoped_resources(project, scope)
         eligible = []
         for computer in self.list_computers().items:
             capabilities = computer.capabilities
@@ -342,7 +343,7 @@ class ControlPlaneService:
             all_project_resources=requested_resource_ids is None,
             resource_ids=requested_resource_ids or [],
         )
-        resources = self._scoped_resources(project, scope)
+        resources = self.scoped_resources(project, scope)
         eligible = self.eligible_computers(project, scope, engine_id)
         if project is None and standalone_computer_id:
             eligible = [item for item in eligible if item.id == standalone_computer_id]
@@ -378,7 +379,7 @@ class ControlPlaneService:
 
     def runtime_project(self, project: CodeProject, scope: TaskResourceScope, computer_id: str) -> CodeProject:
         resources: list[ProjectResource] = []
-        for resource in self._scoped_resources(project, scope):
+        for resource in self.scoped_resources(project, scope):
             if (
                 isinstance(resource, RepositoryResource)
                 and resource.source_url
@@ -483,7 +484,7 @@ class ControlPlaneService:
                 resource_scope=scope,
                 execution_project=self.execution_project_snapshot(
                     project,
-                    self._scoped_resources(project, scope),
+                    self.scoped_resources(project, scope),
                 ),
                 source_contexts=session.source_contexts,
                 deliveries=session.deliveries,
@@ -849,7 +850,7 @@ class ControlPlaneService:
         return bool(resource.source_url) or resource.computer_id == computer.id
 
     @staticmethod
-    def _scoped_resources(project: CodeProject | None, scope: TaskResourceScope) -> list[ProjectResource]:
+    def scoped_resources(project: CodeProject | None, scope: TaskResourceScope) -> list[ProjectResource]:
         if project is None:
             return []
         if scope.all_project_resources:

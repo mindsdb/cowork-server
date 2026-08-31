@@ -58,6 +58,8 @@ def test_diff_includes_uncommitted_untracked_deleted_and_committed_changes(tmp_p
     first = {item.path: item for item in manager.diff(str(worktree), prepared.base_revision)}
     assert set(first) == {"keep.txt", "new.txt", "remove.txt"}
     assert first["new.txt"].status == "??"
+    assert first["new.txt"].unstaged is True
+    assert first["new.txt"].staged is False
     assert first["keep.txt"].additions == 1
     assert first["keep.txt"].deletions == 1
 
@@ -66,6 +68,43 @@ def test_diff_includes_uncommitted_untracked_deleted_and_committed_changes(tmp_p
     committed = {item.path: item for item in manager.diff(str(worktree), prepared.base_revision)}
     assert set(committed) == {"keep.txt", "new.txt", "remove.txt"}
     assert committed["new.txt"].status == "A"
+    assert committed["new.txt"].staged is False
+    assert committed["new.txt"].unstaged is False
+
+
+def test_review_file_actions_stage_unstage_and_discard(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-review", str(repo), False)
+    worktree = prepared.workspace_path
+    (worktree / "keep.txt").write_text("changed\n", encoding="utf-8")
+    (worktree / "new.txt").write_text("new\n", encoding="utf-8")
+
+    manager.review_file_action(str(worktree), "keep.txt", "stage")
+    staged = {item.path: item for item in manager.diff(str(worktree), prepared.base_revision)}
+    assert staged["keep.txt"].staged is True
+    assert staged["keep.txt"].unstaged is False
+
+    manager.review_file_action(str(worktree), "keep.txt", "unstage")
+    unstaged = {item.path: item for item in manager.diff(str(worktree), prepared.base_revision)}
+    assert unstaged["keep.txt"].staged is False
+    assert unstaged["keep.txt"].unstaged is True
+
+    manager.review_file_action(str(worktree), "keep.txt", "discard")
+    manager.review_file_action(str(worktree), "new.txt", "discard")
+    assert manager.diff(str(worktree), prepared.base_revision) == []
+    assert (worktree / "keep.txt").read_text(encoding="utf-8") == "base\n"
+    assert not (worktree / "new.txt").exists()
+
+
+@pytest.mark.parametrize("path", ["../outside.txt", "/tmp/outside.txt", "nested/../../outside.txt"])
+def test_review_file_actions_reject_paths_outside_workspace(tmp_path: Path, path: str) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare(f"session-review-{len(path)}", str(repo), False)
+
+    with pytest.raises(WorkspaceError, match="inside this task workspace"):
+        manager.review_file_action(str(prepared.workspace_path), path, "discard")
 
 
 def test_diff_bounds_large_tracked_file_content(tmp_path: Path) -> None:

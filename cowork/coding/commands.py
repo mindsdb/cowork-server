@@ -51,6 +51,17 @@ class CommandIntent:
             "existing instructions, and document concise commands and conventions for future coding agents."
         )
 
+    def runtime_payload(self, display_prompt: str) -> dict[str, str | None]:
+        """Serialize the parsed intent once for an agent-neutral remote worker."""
+
+        return {
+            "prompt": display_prompt,
+            "engine_prompt": self.engine_prompt(display_prompt),
+            "command": self.name,
+            "goal_action": self.goal_action,
+            "goal_objective": self.goal_objective,
+        }
+
     def validate_attachments(self, has_attachments: bool) -> None:
         if has_attachments and self.name in _ATTACHMENTLESS_COMMANDS:
             raise ValueError(f"/{self.name} does not accept file attachments")

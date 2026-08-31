@@ -38,6 +38,34 @@ class PermissionMode(str, Enum):
     full_access = "full_access"
 
 
+class TaskCapability(str, Enum):
+    """Versioned user-visible operations an execution computer actually supports."""
+
+    files = "files"
+    review = "review"
+    terminal = "terminal"
+    project_actions = "project_actions"
+    slash_commands = "slash_commands"
+    task_controls = "task_controls"
+    extensions = "extensions"
+    platform_settings = "platform_settings"
+    fork = "fork"
+    open_workspace = "open_workspace"
+
+
+class TaskCapabilities(BaseModel):
+    files: bool = True
+    review: bool = True
+    terminal: bool = True
+    project_actions: bool = True
+    slash_commands: bool = True
+    task_controls: bool = True
+    extensions: bool = True
+    platform_settings: bool = True
+    fork: bool = True
+    open_workspace: bool = True
+
+
 class TerminalShellPreference(str, Enum):
     auto = "auto"
     bash = "bash"
@@ -59,6 +87,7 @@ class EventType(str, Enum):
     command = "command"
     file_change = "file_change"
     diff = "diff"
+    child_work = "child_work"
     approval = "approval"
     usage = "usage"
     error = "error"
@@ -88,6 +117,7 @@ class EngineCommand(BaseModel):
 
 
 class EngineCapabilities(BaseModel):
+    manifest_version: int = 2
     id: str
     label: str
     adapter_version: str
@@ -99,6 +129,7 @@ class EngineCapabilities(BaseModel):
     supports_diff_events: bool = False
     supports_models: bool = False
     supports_terminal: bool = False
+    features: dict[str, Literal["supported", "unsupported"]] = Field(default_factory=dict)
     commands: list[EngineCommand] = Field(default_factory=list)
 
 
@@ -175,6 +206,21 @@ class InputReference(BaseModel):
     name: str = Field(min_length=1, max_length=512)
     path: str = Field(min_length=1, max_length=32_768)
     kind: Literal["mention", "local_image"] = "mention"
+    resource_id: str | None = Field(default=None, min_length=1, max_length=128)
+    relative_path: str | None = Field(default=None, min_length=1, max_length=32_768)
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    content_hash: str | None = Field(default=None, min_length=64, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_precise_reference(self) -> InputReference:
+        if bool(self.resource_id) != bool(self.relative_path):
+            raise ValueError("resource_id and relative_path must be provided together")
+        if bool(self.line_start) != bool(self.line_end):
+            raise ValueError("line_start and line_end must be provided together")
+        if self.line_start and self.line_end and self.line_end < self.line_start:
+            raise ValueError("line_end must not be before line_start")
+        return self
 
 
 class QueuedInstruction(BaseModel):
@@ -279,6 +325,8 @@ class ResolvedSkill(BaseModel):
 class TerminalTab(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     label: str = Field(min_length=1, max_length=80)
+    project_action_id: str | None = Field(default=None, min_length=1, max_length=160)
+    project_resource_id: str | None = Field(default=None, min_length=1, max_length=120)
     created_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("label")
@@ -326,6 +374,7 @@ class CodingSession(BaseModel):
     computer_name: str | None = None
     computer_status: Literal["online", "offline", "draining"] | None = None
     computer_is_local: bool = True
+    task_capabilities: TaskCapabilities = Field(default_factory=TaskCapabilities)
     resource_ids: list[str] = Field(default_factory=list, max_length=64)
     scope_all_project_resources: bool = True
     runtime_epoch: int = Field(default=1, ge=1)
@@ -384,6 +433,8 @@ class DiffFile(BaseModel):
     deletions: int = 0
     patch: str = ""
     binary: bool = False
+    staged: bool = False
+    unstaged: bool = False
 
     @field_validator("patch")
     @classmethod

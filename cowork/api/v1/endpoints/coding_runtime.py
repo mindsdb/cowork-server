@@ -20,7 +20,6 @@ from cowork.coding.runtime_protocol import (
     ComputerRegistrationResponse,
     RuntimeCommandAckRequest,
     RuntimeCommandPage,
-    RuntimeExecutionConfig,
     RuntimeFenceRequest,
     RuntimeLease,
     RuntimeLeaseRequest,
@@ -101,47 +100,9 @@ async def acquire_runtime_lease(
     _authenticate(request, computer_id)
     deadline = asyncio.get_running_loop().time() + body.wait_seconds
     while True:
-        acquired = _control().acquire_lease(computer_id)
-        if acquired is not None:
-            run, lease_id = acquired
-            service = get_coding_service()
-            task = service.control.store.get_task(run.task_id)
-            runtime_project = service.control.runtime_project_for_task(task, computer_id)
-            # Compatibility for tasks created before immutable execution
-            # snapshots existed.  Once leased, persist the snapshot so future
-            # recovery no longer depends on mutable Project metadata.
-            if runtime_project is None and task.project_id:
-                project = service.projects.get(task.project_id)
-                runtime_project = service.control.runtime_project(project, task.resource_scope, computer_id)
-                task.execution_project = service.control.execution_project_snapshot(
-                    project,
-                    service.control._scoped_resources(project, task.resource_scope),
-                )
-                service.control.store.save_task(task)
-            session = service.store.load_session(task.id)
-            agent_token = service.control.issue_run_token(run.id)
-            connector_capabilities = service.runtime_connector_capabilities(session)
-            return RuntimeLease(
-                task=task,
-                run=run,
-                lease_id=lease_id,
-                agent_token=agent_token,
-                project=runtime_project,
-                execution=RuntimeExecutionConfig(
-                    engine_id=session.engine_id,
-                    model=session.model,
-                    permission_mode=session.permission_mode,
-                    reasoning_effort=session.reasoning_effort,
-                    service_tier=session.service_tier,
-                    personality=session.personality,
-                    network_access=session.network_access,
-                    web_search=session.web_search,
-                    developer_instructions=session.developer_instructions,
-                    environment=session.environment,
-                ),
-                connector_capabilities=connector_capabilities,
-                workspaces=service.control.store.list_workspaces(run.id),
-            )
+        lease = get_coding_service().remote.acquire_lease(computer_id)
+        if lease is not None:
+            return lease
         if asyncio.get_running_loop().time() >= deadline:
             return None
         await asyncio.sleep(0.25)

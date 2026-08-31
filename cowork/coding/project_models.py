@@ -12,6 +12,7 @@ from cowork.coding.contracts import (  # noqa: F401
     DeliveryRecord,
     PermissionMode,
     SourceContext,
+    TerminalShellPreference,
     utc_now,
 )
 from cowork.coding.git_transport import validate_git_source
@@ -28,7 +29,7 @@ class ProjectCommand(BaseModel):
     id: str = Field(min_length=1, max_length=160)
     label: str = Field(min_length=1, max_length=120)
     argv: list[str] = Field(min_length=1, max_length=64)
-    phase: Literal["setup", "validate"]
+    phase: Literal["setup", "validate", "run"]
 
     @field_validator("argv")
     @classmethod
@@ -36,6 +37,38 @@ class ProjectCommand(BaseModel):
         if any(not item or "\x00" in item for item in value):
             raise ValueError("command arguments cannot be empty or contain NUL bytes")
         return value
+
+
+class ProjectActionRunRequest(BaseModel):
+    resource_id: str = Field(min_length=1, max_length=120)
+    command_id: str = Field(min_length=1, max_length=160)
+    shell: TerminalShellPreference = TerminalShellPreference.auto
+    cols: int = Field(default=120, ge=1, le=1_000)
+    rows: int = Field(default=30, ge=1, le=1_000)
+
+
+class ProjectActionRunResponse(BaseModel):
+    terminal_id: str
+    label: str
+    preview_url: str | None = None
+
+
+class ProjectActionSummary(BaseModel):
+    id: str
+    resource_id: str
+    label: str
+    resource_name: str
+
+
+class ProjectActionPage(BaseModel):
+    items: list[ProjectActionSummary] = Field(default_factory=list)
+    preview_url: str | None = None
+
+
+class ReviewFileActionRequest(BaseModel):
+    folder_id: str | None = Field(default=None, min_length=1, max_length=120)
+    path: str = Field(min_length=1, max_length=32_768)
+    action: Literal["stage", "unstage", "discard"]
 
 
 class ProjectFolder(BaseModel):

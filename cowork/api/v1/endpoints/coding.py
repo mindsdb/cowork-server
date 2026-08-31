@@ -66,6 +66,10 @@ from cowork.coding.project_models import (
     ProjectCreateRequest,
     ProjectFolder,
     ProjectPage,
+    ProjectActionRunRequest,
+    ProjectActionRunResponse,
+    ProjectActionPage,
+    ReviewFileActionRequest,
     ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
@@ -89,6 +93,12 @@ from cowork.coding.skill_models import (
     SkillSourceItemsRequest,
 )
 from cowork.coding.workspace import WorkspaceError
+from cowork.coding.workspace_models import (
+    WorkspaceEntryPage,
+    WorkspaceFileContent,
+    WorkspaceResourcePage,
+    WorkspaceSearchPage,
+)
 from cowork.common.settings.user_settings import Provider, provider_api_key_str
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
@@ -436,6 +446,60 @@ def workspace_files(
     return {"items": _call(_service().workspace_files, session_id, query, limit)}
 
 
+@router.get(
+    "/sessions/{session_id}/workspace/resources",
+    response_model=WorkspaceResourcePage,
+)
+def workspace_resources(session_id: str):
+    return _call(_service().workspace_resources, session_id)
+
+
+@router.get(
+    "/sessions/{session_id}/workspace/entries",
+    response_model=WorkspaceEntryPage,
+)
+def workspace_entries(
+    session_id: str,
+    resource_id: str = Query(alias="resourceId", min_length=1, max_length=128),
+    path: str = Query(default="", max_length=32_768),
+):
+    return _call(_service().workspace_entries, session_id, resource_id, path)
+
+
+@router.get(
+    "/sessions/{session_id}/workspace/file",
+    response_model=WorkspaceFileContent,
+)
+def workspace_file(
+    session_id: str,
+    resource_id: str = Query(alias="resourceId", min_length=1, max_length=128),
+    path: str = Query(min_length=1, max_length=32_768),
+    line_start: int | None = Query(default=None, alias="lineStart", ge=1),
+    line_end: int | None = Query(default=None, alias="lineEnd", ge=1),
+):
+    return _call(
+        _service().workspace_file,
+        session_id,
+        resource_id,
+        path,
+        line_start,
+        line_end,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/workspace/search",
+    response_model=WorkspaceSearchPage,
+)
+def workspace_search(
+    session_id: str,
+    query: str = Query(min_length=1, max_length=512),
+    resource_id: str | None = Query(default=None, alias="resourceId", max_length=128),
+    limit: int = Query(default=60, ge=1, le=100),
+):
+    return _call(_service().workspace_search, session_id, query, resource_id, limit)
+
+
 @router.get("/sessions/{session_id}/extensions")
 def extensions(session_id: str, session: SessionDep, scope: ScopeDep):
     return _call(
@@ -606,6 +670,26 @@ def recovery_options(session_id: str):
 @router.get("/sessions/{session_id}/terminals", response_model=TerminalTabPage)
 def terminals(session_id: str):
     return _call(_service().terminals, session_id)
+
+
+@router.post("/sessions/{session_id}/project-actions/run", response_model=ProjectActionRunResponse)
+def run_project_action(
+    session_id: str,
+    body: ProjectActionRunRequest,
+    session: SessionDep,
+    scope: ScopeDep,
+):
+    return _call(
+        _service().run_project_action,
+        session_id,
+        body,
+        _credentials(_settings(session, scope)),
+    )
+
+
+@router.get("/sessions/{session_id}/project-actions", response_model=ProjectActionPage)
+def project_actions(session_id: str):
+    return _call(_service().project_action_page, session_id)
 
 
 @router.post("/sessions/{session_id}/terminals", response_model=TerminalTabState)
@@ -781,6 +865,19 @@ def git_states(session_id: str):
 @router.get("/sessions/{session_id}/diff")
 def diff(session_id: str):
     return {"files": _call(_service().diff, session_id)}
+
+
+@router.post("/sessions/{session_id}/review/file")
+def review_file(session_id: str, body: ReviewFileActionRequest):
+    return {
+        "files": _call(
+            _service().review_file_action,
+            session_id,
+            body.folder_id,
+            body.path,
+            body.action,
+        )
+    }
 
 
 @router.post("/sessions/{session_id}/branch")
