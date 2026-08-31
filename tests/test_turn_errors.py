@@ -1240,6 +1240,10 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # ENG-1992 — a content-shaped rejection the server already repaired;
         # distinct copy from image_format (no re-upload needed).
         "content_recovery",
+        # ENG-2126 — the worker never answered, so the turn never ran. Split off
+        # anton_error because the two need opposite next steps: this one is ours
+        # to fix, and reads as an agent bug while it shares that code.
+        "worker_unresponsive",
         "anton_error",
     }
 
@@ -1538,3 +1542,45 @@ def test_the_unknown_origin_residual_is_not_remote_reachable():
     with pytest.raises(RuntimeError):
         _ = detached.url
     assert te._origin_is_known_third_party(None) is False
+
+
+# -- remote_turn_error: an unresponsive worker is not an agent error ----------
+#
+# These pin the distinction the 2026-08-31 outage needed and did not have. Every
+# scratchpad pod failed to start, so no turn ever reached anton, and the failure
+# still surfaced as the generic anton_error. Nothing in the user-facing string or
+# the wire code said "infrastructure", which is why the cause took hours to find.
+
+def test_remote_error_unresponsive_worker_is_not_the_generic_code():
+    code, msg = te.remote_turn_error(
+        "TurnWorkerUnresponsive: the turn worker stopped responding"
+    )
+    assert code == te.WORKER_UNRESPONSIVE_CODE
+    assert code != te.GENERIC_TURN_ERROR_CODE
+    assert msg == te.WORKER_UNRESPONSIVE_MESSAGE
+    assert msg != te.GENERIC_TURN_ERROR_MESSAGE
+
+
+def test_producer_error_string_is_built_from_the_type_name_we_branch_on():
+    """The producer's literal and this module's branch must not drift.
+
+    They lived in two files as two literals. A rename in either one would have
+    silently returned the turn to the generic code.
+    """
+    from cowork.turnqueue.producer import UNRESPONSIVE_WORKER_ERROR
+
+    assert UNRESPONSIVE_WORKER_ERROR.startswith(te.WORKER_UNRESPONSIVE_TYPE_NAME + ":")
+    code, _ = te.remote_turn_error(UNRESPONSIVE_WORKER_ERROR)
+    assert code == te.WORKER_UNRESPONSIVE_CODE
+
+
+def test_remote_error_unmapped_type_still_falls_through_to_generic():
+    """The negative case: anton raising something we don't know stays generic.
+
+    Redacting an unrecognised provider error is the point of the fallback, so
+    the new branch must not widen it.
+    """
+    code, msg = te.remote_turn_error("ModuleNotFoundError: No module named 'httpx'")
+    assert code == te.GENERIC_TURN_ERROR_CODE
+    assert msg == te.GENERIC_TURN_ERROR_MESSAGE
+    assert "httpx" not in msg
