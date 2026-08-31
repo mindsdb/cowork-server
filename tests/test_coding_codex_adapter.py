@@ -555,6 +555,37 @@ def test_terminal_write_does_not_retry_unrelated_rpc_failures(monkeypatch) -> No
     assert engine_session._client.calls == 1
 
 
+def test_user_terminal_is_not_restricted_by_agent_permissions() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeClient:
+        def request(self, method: str, params: dict[str, object], *, response_model: object) -> object:
+            calls.append((method, params))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = FakeClient()
+    engine_session._closed = codex_module.threading.Event()
+    engine_session._terminal_workspace = Path("/tmp/preview")
+    engine_session._sandbox_policy = {"type": "readOnly", "networkAccess": False}
+    engine_session._terminal_handlers = {"process-1": lambda *_args: None}
+    engine_session._terminal_lock = codex_module.threading.Lock()
+    engine_session._secrets = ()
+    exits: list[tuple[int | None, str | None]] = []
+
+    engine_session._run_terminal(
+        "process-1",
+        100,
+        30,
+        codex_module.TerminalShellPreference.bash,
+        lambda code, error: exits.append((code, error)),
+    )
+
+    assert calls[0][0] == "command/exec"
+    assert calls[0][1]["sandboxPolicy"] == {"type": "dangerFullAccess"}
+    assert exits == [(0, None)]
+
+
 class _Payload:
     def __init__(self, data: dict) -> None:
         self.data = data
