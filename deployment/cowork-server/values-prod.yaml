@@ -60,6 +60,12 @@ deployment:
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
 
+    # Keep browser switching dark while the boundary is observed in audit.
+    - name: COWORK_ORGANIZATION_BOUNDARY_MODE
+      value: "audit"
+    - name: COWORK_ORGANIZATION_SWITCH_ENABLED
+      value: "false"
+
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.mindshub.ai/v1"
 

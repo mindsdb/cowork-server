@@ -653,6 +653,25 @@ class AppSettings(Settings):
             "closed one."
         ),
     )
+    organization_boundary_mode: Literal["audit", "enforce"] = Field(
+        default="enforce",
+        validation_alias=AliasChoices("COWORK_ORGANIZATION_BOUNDARY_MODE"),
+        description=(
+            "Canonical-web expected-organization boundary. 'enforce' (default) "
+            "returns a mandatory-reload response before the route runs. "
+            "'audit' logs missing or mismatched browser context and lets the "
+            "request continue. API keys and non-browser credentials are exempt."
+        ),
+    )
+    organization_switch_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
+        description=(
+            "Advertise canonical-web organization switching only when the "
+            "expected-organization boundary is also enforced. Defaults off so "
+            "deploying protocol support cannot expose the picker."
+        ),
+    )
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(
