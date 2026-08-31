@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from cowork.coding.contracts import ExtensionInventory, PermissionMode
+import pytest
+
+from cowork.coding.contracts import EventType, ExtensionInventory, PermissionMode
 from cowork.coding.engines import codex as codex_module
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
@@ -344,6 +346,18 @@ def test_plain_dict_notification_payload_is_supported() -> None:
     assert event.text == "hello"
 
 
+def test_collaboration_items_map_to_visible_child_work() -> None:
+    event = codex_events.map_codex_notification(
+        "item/started",
+        {"item": {"id": "worker-1", "type": "collabAgentToolCall", "prompt": "Audit the API boundary"}},
+    )
+
+    assert event is not None
+    assert event.type == EventType.child_work
+    assert event.title == "Audit the API boundary"
+    assert event.item_id == "worker-1"
+
+
 def test_nested_payload_sanitizer_has_a_global_budget() -> None:
     payload: object = "leaf"
     for _ in range(8):
@@ -491,6 +505,54 @@ def test_goal_updates_use_native_thread_lifecycle(monkeypatch) -> None:
         ("edit", "session-1", "Ship safely"),
         ("clear", "session-1"),
     ]
+
+
+def test_terminal_write_waits_for_codex_process_registration(monkeypatch) -> None:
+    from openai_codex.errors import InvalidRequestError
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, method: str, params: dict[str, object], *, response_model: object) -> object:
+            assert method == "command/exec/write"
+            assert params == {"processId": "process-1", "deltaBase64": "aGkK"}
+            self.calls += 1
+            if self.calls == 1:
+                raise InvalidRequestError(-32600, "no active command/exec for process id process-1")
+            return response_model.model_validate({})
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = FakeClient()
+    engine_session._closed = codex_module.threading.Event()
+    monkeypatch.setattr(codex_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(codex_module, "_TERMINAL_WRITE_RETRY_SECONDS", 0.0)
+
+    engine_session.write_terminal("process-1", "aGkK")
+
+    assert engine_session._client.calls == 2
+
+
+def test_terminal_write_does_not_retry_unrelated_rpc_failures(monkeypatch) -> None:
+    from openai_codex.errors import InvalidRequestError
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, *_args, **_kwargs) -> None:
+            self.calls += 1
+            raise InvalidRequestError(-32600, "terminal input was rejected")
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = FakeClient()
+    engine_session._closed = codex_module.threading.Event()
+    monkeypatch.setattr(codex_module, "_TERMINAL_WRITE_RETRY_SECONDS", 0.0)
+
+    with pytest.raises(InvalidRequestError, match="terminal input was rejected"):
+        engine_session.write_terminal("process-1", "aGkK")
+
+    assert engine_session._client.calls == 1
 
 
 class _Payload:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 import time
 from datetime import timedelta
@@ -20,6 +21,7 @@ from coding_service_fakes import (
 
 from cowork.coding.contracts import (
     CodingEvent,
+    CodingSession,
     DeliveryRecord,
     EventType,
     InputReference,
@@ -35,6 +37,7 @@ from cowork.coding.control_models import (
     ComputerCapabilities,
     RunStatus,
     RuntimeEvent,
+    TaskCapability,
     TaskRun,
 )
 from cowork.coding.project_models import (
@@ -43,11 +46,14 @@ from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
+    ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
     RepositoryResource,
 )
+from cowork.coding.project_service import CodeProjectService
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
+from cowork.coding.store import CodingStore
 from cowork.coding.turns import EventBuffer, terminal_status
 from cowork.coding.workspace import WorkspaceError
 
@@ -76,6 +82,39 @@ def test_task_creation_requires_exactly_one_project_or_folder() -> None:
         SessionCreateRequest(prompt="Build it")
     with pytest.raises(ValueError, match="exactly one"):
         SessionCreateRequest(path="/folder", project_id="project", prompt="Build it")
+
+
+def test_service_startup_survives_a_task_referencing_an_invalid_project(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root = tmp_path / "coding"
+    CodingStore(root).save_session(CodingSession(
+        id="task-with-invalid-project",
+        title="Recover this task",
+        engine_id="fake",
+        engine_adapter_version="1",
+        model="fake-model",
+        status=SessionStatus.completed,
+        project_id="invalid-project",
+        source_path=str(workspace),
+        workspace_path=str(workspace),
+        workspace_kind=WorkspaceKind.local_copy,
+    ))
+    original_get = CodeProjectService.get
+
+    def invalid_project(self, project_id: str):
+        if project_id == "invalid-project":
+            raise ValueError("stored project no longer passes validation")
+        return original_get(self, project_id)
+
+    monkeypatch.setattr(CodeProjectService, "get", invalid_project)
+
+    service = service_with(tmp_path, FakeEngine())
+
+    assert service.get_session("task-with-invalid-project").project_id == "invalid-project"
 
 
 def test_completed_task_persists_events_and_reuses_live_engine_runtime(tmp_path: Path) -> None:
@@ -218,6 +257,18 @@ def test_compatibility_events_cannot_overwrite_a_remote_runtime_lifecycle(tmp_pa
         "fake",
         "fake-model",
     )
+    assert created.task_capabilities.files is False
+    assert created.task_capabilities.review is False  # Legacy runtimes fail closed until they advertise support.
+    with pytest.raises(RuntimeError, match="Task files stay on the computer"):
+        service.workspace_files(created.id)
+    with pytest.raises(RuntimeError, match="Task files stay on the computer"):
+        service.workspace_resources(created.id)
+    with pytest.raises(RuntimeError, match="Task files stay on the computer"):
+        service.workspace_entries(created.id, "repo")
+    with pytest.raises(RuntimeError, match="Task files stay on the computer"):
+        service.workspace_file(created.id, "repo", "README.md")
+    with pytest.raises(RuntimeError, match="Task files stay on the computer"):
+        service.workspace_search(created.id, "README")
     leased = service.control.acquire_lease(remote.id)
     assert leased is not None
     run, lease_id = leased
@@ -394,6 +445,7 @@ def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_pa
             runtime_version="test-runtime",
             agent_engines=["fake"],
             shells=["bash"],
+            task_capabilities=[TaskCapability.slash_commands],
         ),
     )
     project = service.projects.create(ProjectCreateRequest(
@@ -436,6 +488,11 @@ def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_pa
 
     event(1, "status", {"status": "ready"})
     event(2, "status", {"status": "running"})
+    service.steer(created.id, "/status")
+    immediate = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+    assert [item.kind for item in immediate] == ["agent_command"]
+    assert immediate[0].payload["command"] == "status"
+    service.control.acknowledge_command(run.id, immediate[0].id, remote.id, lease_id, run.epoch)
     queued = service.queue_turn(created.id, "Run this after the current work")
     assert [item.prompt for item in queued.queued_instructions] == ["Run this after the current work"]
     event(3, "turn_completed", {"status": "completed"})
@@ -450,16 +507,28 @@ def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_pa
     commands = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
     assert len(commands) == 1
     assert commands[0].kind == "start"
-    assert commands[0].payload == {"prompt": "Run this after the current work"}
+    assert commands[0].payload == {
+        "prompt": "Run this after the current work",
+        "engine_prompt": "Run this after the current work",
+        "command": "",
+        "goal_action": "",
+        "goal_objective": None,
+    }
 
     service.control.acknowledge_command(run.id, commands[0].id, remote.id, lease_id, run.epoch)
     event(5, "status", {"status": "running"})
     event(6, "turn_completed", {"status": "completed"})
-    follow_up = service.submit_turn(created.id, "One more change", CREDS)
+    follow_up = service.submit_turn(created.id, "/review", CREDS)
     assert follow_up.run_id == run.id
     commands = service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
     assert len(commands) == 1
-    assert commands[0].payload == {"prompt": "One more change"}
+    assert commands[0].payload == {
+        "prompt": "/review",
+        "engine_prompt": "/review",
+        "command": "review",
+        "goal_action": "",
+        "goal_objective": None,
+    }
 
 
 def test_remote_run_state_is_projected_and_can_be_restored(tmp_path: Path) -> None:
@@ -1322,6 +1391,10 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
     child = service.fork_session(parent.id, CREDS)
 
     assert child.id != parent.id
+    assert child.task_id != parent.task_id
+    assert child.run_id != parent.run_id
+    assert service.control.store.get_task(child.task_id).id == child.task_id
+    assert service.control.store.get_run(child.run_id).task_id == child.task_id
     assert child.workspace_path != parent.workspace_path
     assert child.pinned is False
     assert Path(child.workspace_path, "README.md").read_text(encoding="utf-8") == "forked work\n"
@@ -1364,6 +1437,10 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
 
     child = service.fork_session(parent.id, CREDS)
 
+    assert child.task_id != parent.task_id
+    assert child.run_id != parent.run_id
+    assert service.control.store.get_task(child.task_id).id == child.task_id
+    assert service.control.store.get_run(child.run_id).task_id == child.task_id
     assert child.project_id == project.id
     assert len(child.workspaces) == 2
     assert all(item.workspace_path != parent.workspaces[index].workspace_path for index, item in enumerate(child.workspaces))
@@ -1378,6 +1455,83 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert child.workspaces[1].workspace_path in child.developer_instructions
     assert engine.forked_workspaces[-1] == str(Path(child.workspaces[0].workspace_path).parent)
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
+
+
+def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path: Path) -> None:
+    app = repository(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "guide.md").write_text("base\n", encoding="utf-8")
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Scoped",
+            folders=[
+                ProjectFolder(
+                    id="app",
+                    name="App",
+                    path=str(app),
+                    commands=[ProjectCommand(
+                        id="snapshot-check",
+                        label="Snapshot check",
+                        argv=[sys.executable, "-c", "print('snapshot')"],
+                        phase="validate",
+                    )],
+                ),
+                ProjectFolder(
+                    id="docs",
+                    name="Docs",
+                    path=str(docs),
+                    commands=[ProjectCommand(
+                        id="unscoped-check",
+                        label="Unscoped check",
+                        argv=[sys.executable, "-c", "raise SystemExit(1)"],
+                        phase="validate",
+                    )],
+                ),
+            ],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    parent = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            resource_ids=["app"],
+            prompt="Work only on the app",
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, parent.id, SessionStatus.completed)
+
+    live = service.projects.get(project.id)
+    changed_resources = [
+        resource.model_copy(update={
+            "commands": [ProjectCommand(
+                id="live-check",
+                label="Live check",
+                argv=[sys.executable, "-c", "raise SystemExit(1)"],
+                phase="validate",
+            )]
+        })
+        if resource.id == "app"
+        else resource
+        for resource in live.resources
+    ]
+    service.projects.update(project.id, ProjectUpdateRequest(resources=changed_resources))
+
+    results = service.validate_project(parent.id)
+    child = service.fork_session(parent.id, CREDS)
+
+    assert [(result["label"], result["return_code"]) for result in results] == [("Snapshot check", 0)]
+    assert parent.resource_ids == ["app"]
+    assert [workspace.folder_id for workspace in parent.workspaces] == ["app"]
+    assert child.resource_ids == ["app"]
+    assert [workspace.folder_id for workspace in child.workspaces] == ["app"]
+    assert child.task_id != parent.task_id
+    assert child.run_id != parent.run_id
 
 
 def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(tmp_path: Path) -> None:

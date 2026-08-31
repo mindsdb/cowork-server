@@ -59,6 +59,11 @@ class EngineInputReference:
     name: str
     path: str
     kind: str
+    resource_id: str | None = None
+    relative_path: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    content_hash: str | None = None
 
 
 class EngineSession(Protocol):

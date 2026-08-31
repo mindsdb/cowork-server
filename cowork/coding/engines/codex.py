@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,9 @@ from cowork.common.settings.app_settings import get_app_settings
 ADAPTER_VERSION = "1"
 
 _EXPECTED_ACTIVE_TURN = re.compile(r"expected active turn id `([^`]+)`")
+_TERMINAL_NOT_READY = "no active command/exec for process id"
+_TERMINAL_WRITE_READY_TIMEOUT_SECONDS = 5.0
+_TERMINAL_WRITE_RETRY_SECONDS = 0.02
 
 
 class CodexEngine:
@@ -57,6 +61,17 @@ class CodexEngine:
             supports_diff_events=True,
             supports_models=True,
             supports_terminal=True,
+            features={
+                "turns": "supported",
+                "steering": "supported",
+                "approvals": "supported",
+                "reasoning": "supported",
+                "diff_events": "supported",
+                "models": "supported",
+                "terminal": "supported",
+                "goals": "supported",
+                "forking": "supported",
+            },
             commands=[
                 EngineCommand(name="goal", label="Goal", description="View it alone, or set, edit, pause, resume, or clear a durable objective", argument_hint="set|edit|pause|resume|clear", action="goal"),
                 EngineCommand(name="review", label="Review", description="Review the current working changes", action="turn"),
@@ -515,13 +530,28 @@ class CodexEngineSession:
             base64.b64decode(data_base64, validate=True)
         except (ValueError, TypeError) as exc:
             raise ValueError("Terminal input is not valid base64") from exc
+        from openai_codex.errors import InvalidRequestError
         from openai_codex.generated.v2_all import CommandExecWriteResponse
 
-        self._client.request(
-            "command/exec/write",
-            {"processId": process_id, "deltaBase64": data_base64},
-            response_model=CommandExecWriteResponse,
-        )
+        # command/exec is a long-running RPC. The SDK starts it on a worker
+        # thread, so a user's first keystroke (or a managed Run action) can
+        # reach app-server just before that process is registered. Retry only
+        # that explicit readiness response; every other RPC failure remains
+        # immediate and visible.
+        deadline = time.monotonic() + _TERMINAL_WRITE_READY_TIMEOUT_SECONDS
+        while True:
+            try:
+                self._client.request(
+                    "command/exec/write",
+                    {"processId": process_id, "deltaBase64": data_base64},
+                    response_model=CommandExecWriteResponse,
+                )
+                return
+            except InvalidRequestError as exc:
+                if _TERMINAL_NOT_READY not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                if self._closed.wait(_TERMINAL_WRITE_RETRY_SECONDS):
+                    raise RuntimeError("The coding runtime is no longer connected") from exc
 
     def resize_terminal(self, process_id: str, cols: int, rows: int) -> None:
         from openai_codex.generated.v2_all import CommandExecResizeResponse

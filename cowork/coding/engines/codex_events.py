@@ -70,6 +70,8 @@ def payload_dict(payload: object) -> dict[str, Any]:
 
 def event_type_for_item(item_type: str) -> EventType:
     lowered = item_type.lower()
+    if "collab" in lowered or "subagent" in lowered or "sub_agent" in lowered:
+        return EventType.child_work
     if "command" in lowered:
         return EventType.command
     if "file" in lowered or "patch" in lowered:
@@ -82,6 +84,12 @@ def event_type_for_item(item_type: str) -> EventType:
 
 
 def item_title(item_type: str, item: dict) -> str:
+    if event_type_for_item(item_type) == EventType.child_work:
+        for key in ("description", "prompt", "message"):
+            value = string(item.get(key))
+            if value:
+                return value.splitlines()[0][:160]
+        return "Parallel work"
     for key in ("name", "command", "path", "title"):
         value = string(item.get(key))
         if value:

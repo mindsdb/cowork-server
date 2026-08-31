@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -97,6 +98,47 @@ def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path
     assert migrated.resources[1].path == str(notes.resolve())
     assert migrated.resources[1].computer_id == "computer-local"
     assert len(CodeProjectService(root, computer_id="computer-local").get("legacy").resources) == 2
+
+
+def test_project_store_instances_share_catalogue_lock_and_atomic_temp_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "coding"
+    first_store = CodeProjectStore(root)
+    second_store = CodeProjectStore(root)
+    assert first_store._lock is second_store._lock
+
+    folder = tmp_path / "project"
+    folder.mkdir()
+    project = CodeProject(
+        id="shared",
+        name="Shared",
+        folders=[ProjectFolder(id="project", name="Project", path=str(folder))],
+    )
+    first_store.create(project)
+    sources: list[Path] = []
+    real_replace = os.replace
+
+    def record_replace(source, target) -> None:
+        sources.append(Path(source))
+        real_replace(source, target)
+
+    monkeypatch.setattr(project_store_module.os, "replace", record_replace)
+    threads = [
+        threading.Thread(target=store.save, args=(project.model_copy(deep=True),))
+        for store in (first_store, second_store)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(sources) == 2
+    assert sources[0] != sources[1]
+    assert all(path.name.startswith(".shared.") for path in sources)
+    assert not list(first_store.root.glob("*.tmp"))
+    assert second_store.get(project.id).name == "Shared"
 
 
 def test_related_project_updates_roll_back_after_a_mid_write_failure(
