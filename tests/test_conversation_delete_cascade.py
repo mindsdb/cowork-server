@@ -351,3 +351,286 @@ def test_delete_turn_discards_stream_buffers(session):
 
     svc.delete_turn(conv.id, 0)
     assert not buf.exists(), "stale stream buffers must be discarded on turn delete"
+
+
+# ── schedule + channel references: released, not deleted ──────────────────
+from datetime import datetime, timezone  # noqa: E402
+
+import sqlalchemy as sa  # noqa: E402
+from sqlalchemy import event  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
+from sqlmodel import SQLModel, create_engine  # noqa: E402
+
+from cowork.models.channel import ChannelBinding, ChannelSession  # noqa: E402
+from cowork.models.schedule import Schedule, ScheduleRun  # noqa: E402
+from cowork.schemas.schedules import RunStatus  # noqa: E402
+from cowork.scheduler import _apply_success_write_back  # noqa: E402
+from cowork.services.channel_bindings import ChannelBindingService  # noqa: E402
+from cowork.services.schedules import ScheduleRunService, ScheduleService  # noqa: E402
+
+_WHEN = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+
+def _schedule(session, project_id=GENERAL_PROJECT_ID, title="Daily report") -> Schedule:
+    schedule = Schedule(
+        title=title, prompt="Summarize", cadence="daily", next_run_at=_WHEN,
+        model="default", project_id=project_id,
+    )
+    session.add(schedule)
+    session.commit()
+    session.refresh(schedule)
+    return schedule
+
+
+def _finished_run(session, schedule_id, conversation_id) -> ScheduleRun:
+    """A run that produced a conversation, built the way the scheduler builds
+    one, create_run then finish_run, so the row carries a real status and
+    duration rather than hand-set values."""
+    runs = ScheduleRunService(ScopedSession(session, LOCAL_SCOPE))
+    run = runs.create_run(schedule_id, is_manual=True)
+    return runs.finish_run(run.id, conversation_id=conversation_id)
+
+
+def _binding(session, conversation_id, group_id, project_id=GENERAL_PROJECT_ID) -> ChannelBinding:
+    binding = ChannelBinding(
+        channel_type="telegram", external_group_id=group_id,
+        external_thread_key="__default__", anton_conversation_id=conversation_id,
+        anton_project_id=project_id, trigger_rule="always",
+    )
+    session.add(binding)
+    session.commit()
+    session.refresh(binding)
+    return binding
+
+
+def _orphaned_run_count(session, schedule_id) -> int:
+    """The desktop-side check from the ticket's walkthrough: SQLite will not
+    raise on its own, so a left join is the only thing that catches an orphan.
+    Scoped to one schedule's runs, because the shared test database carries
+    rows other tests wrote raw and this must not assert on those."""
+    return len(session.exec(
+        sa.select(ScheduleRun.id)
+        .outerjoin(Conversation, Conversation.id == ScheduleRun.conversation_id)
+        .where(
+            ScheduleRun.schedule_id == schedule_id,
+            ScheduleRun.conversation_id.is_not(None),
+            Conversation.id.is_(None),
+        )
+    ).all())
+
+
+def test_delete_conversation_releases_its_schedule_and_binding(session):
+    """The three references nothing else clears. On Postgres leaving any of them
+    is a ForeignKeyViolation that 500s the delete; on SQLite it is a silent
+    orphan. Either way the rows themselves must survive: a run is audit history,
+    and a binding is a live external chat."""
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    conv = svc.create_conversation("scheduled run", project_id=GENERAL_PROJECT_ID)
+    schedule = _schedule(session)
+    run = _finished_run(session, schedule.id, conv.id)
+    schedule.last_result_conversation_id = conv.id
+    session.add(schedule)
+    session.commit()
+    binding = _binding(session, conv.id, "release-on-delete-test")
+    session.add(ChannelSession(binding_id=binding.id, external_session_key="k",
+                               anton_session_id=str(conv.id)))
+    session.commit()
+    run_status, run_duration = run.status, run.duration_ms
+    assert run_duration is not None, "precondition: the run recorded a duration"
+
+    try:
+        assert svc.delete_conversation(conv.id) is True
+        session.expire_all()
+
+        assert session.get(Conversation, conv.id) is None, "the conversation is gone"
+        # The run survives with its verdict intact. Only the link is released.
+        kept_run = session.get(ScheduleRun, run.id)
+        assert kept_run is not None, "run history must outlive the chat it produced"
+        assert kept_run.conversation_id is None
+        assert (kept_run.status, kept_run.duration_ms) == (run_status, run_duration)
+        # So does the schedule, still on its cadence.
+        kept_schedule = session.get(Schedule, schedule.id)
+        assert kept_schedule is not None and kept_schedule.enabled is True
+        assert kept_schedule.last_result_conversation_id is None
+        # So does the binding, so the external chat stays bound to its project.
+        kept_binding = session.get(ChannelBinding, binding.id)
+        assert kept_binding is not None
+        assert kept_binding.anton_conversation_id is None
+        assert kept_binding.anton_project_id == GENERAL_PROJECT_ID
+        # Its session rows go with the pointer, as in every other detach.
+        # anton_session_id would otherwise name a conversation that is gone.
+        assert session.exec(
+            select(ChannelSession).where(ChannelSession.binding_id == binding.id)
+        ).all() == []
+        assert _orphaned_run_count(session, schedule.id) == 0
+    finally:
+        row = session.get(ChannelBinding, binding.id)
+        if row is not None:
+            ChannelBindingService(ScopedSession(session, LOCAL_SCOPE)).delete(row.id)
+        ScheduleService(ScopedSession(session, LOCAL_SCOPE)).delete_schedule(schedule.id)
+        # A red run above leaves the conversation behind in the shared
+        # session-scoped test.db; sweep it so later tests never see it.
+        if session.get(Conversation, conv.id) is not None:
+            ConversationService(ScopedSession(session, LOCAL_SCOPE)).delete_conversation(conv.id)
+
+
+def test_delete_conversation_leaves_another_conversations_run_alone(session):
+    """The release is keyed on one conversation id. A sibling run pointing at a
+    different conversation must keep its link."""
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    doomed = svc.create_conversation("doomed", project_id=GENERAL_PROJECT_ID)
+    keep = svc.create_conversation("keep", project_id=GENERAL_PROJECT_ID)
+    schedule = _schedule(session, title="Two runs")
+    doomed_run = _finished_run(session, schedule.id, doomed.id)
+    keep_run = _finished_run(session, schedule.id, keep.id)
+
+    try:
+        assert svc.delete_conversation(doomed.id) is True
+        session.expire_all()
+
+        assert session.get(ScheduleRun, doomed_run.id).conversation_id is None
+        assert session.get(ScheduleRun, keep_run.id).conversation_id == keep.id
+        assert _orphaned_run_count(session, schedule.id) == 0
+    finally:
+        ScheduleService(ScopedSession(session, LOCAL_SCOPE)).delete_schedule(schedule.id)
+        # `keep` (and `doomed`, on a red run) live in the shared test.db;
+        # sweep them so later tests never see them.
+        for conv_id in (doomed.id, keep.id):
+            if session.get(Conversation, conv_id) is not None:
+                ConversationService(ScopedSession(session, LOCAL_SCOPE)).delete_conversation(conv_id)
+
+
+def _fk_enforcing_engine():
+    """A throwaway engine that enforces foreign keys, which the shared test
+    database deliberately does not.
+
+    This is the only way the unit suite sees what cloud Postgres sees. It must
+    stay local to this test: the shared conftest engine has tests that rely on
+    enforcement being off, notably the two project-delete fault-injection tests
+    above, which leave a live conversation under a deleted project on purpose.
+    """
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+
+    @event.listens_for(engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    SQLModel.metadata.create_all(engine)
+    return engine
+
+
+def test_delete_conversation_does_not_violate_a_foreign_key(tmp_path):
+    """The production failure itself, reproduced. With foreign keys enforced the
+    unfixed cascade raises IntegrityError on the conversations DELETE, which is
+    the 500 users saw. Runs on its own engine, with autoflush off to match the
+    session factory the server actually uses."""
+    engine = _fk_enforcing_engine()
+    with Session(engine, autoflush=False, expire_on_commit=False) as s:
+        project = Project(name="fk-project", path=str(tmp_path / "fk-project"))
+        s.add(project)
+        s.commit()
+        scoped = ScopedSession(s, LOCAL_SCOPE)
+        conv = ConversationService(scoped).create_conversation("run", project_id=project.id)
+        schedule = _schedule(s, project_id=project.id, title="FK schedule")
+        run = _finished_run(s, schedule.id, conv.id)
+        schedule.last_result_conversation_id = conv.id
+        s.add(schedule)
+        s.commit()
+        binding = _binding(s, conv.id, "fk-group", project_id=project.id)
+
+        assert ConversationService(scoped).delete_conversation(conv.id) is True
+
+        s.expire_all()
+        assert s.get(Conversation, conv.id) is None
+        assert s.get(ScheduleRun, run.id).conversation_id is None
+        assert s.get(Schedule, schedule.id).last_result_conversation_id is None
+        assert s.get(ChannelBinding, binding.id).anton_conversation_id is None
+
+
+def test_finishing_a_run_whose_conversation_was_deleted_mid_flight(tmp_path):
+    """A run holds its conversation id for the whole run and writes it back at
+    the end, so deleting the chat mid-run used to point the run at a row that
+    was already gone. On Postgres that write raises, the scheduler logs and
+    moves on, and the run is stranded at `running` forever: has_active_run then
+    reports the schedule busy and the due-check skips it on every poll.
+
+    Two sessions on purpose, because production is two sessions. The scheduler
+    keeps one for the whole run and it CREATED the conversation, so the
+    instance sits in that session's identity map (the factory runs
+    expire_on_commit=False) while the user's request session deletes the row.
+    A single-session version expunges the instance at the delete's commit, so
+    even a `Session.get` in still_exists then truly queries — it would
+    green-light an existence check that never asks the database.
+    """
+    engine = _fk_enforcing_engine()
+    with Session(engine, autoflush=False, expire_on_commit=False) as scheduler_s, \
+         Session(engine, autoflush=False, expire_on_commit=False) as request_s:
+        project = Project(name="midflight", path=str(tmp_path / "midflight"))
+        scheduler_s.add(project)
+        scheduler_s.commit()
+        scoped = ScopedSession(scheduler_s, LOCAL_SCOPE)
+        # Created on the scheduler's own session, exactly as execute_schedule's
+        # cron path does — this is what parks it in the identity map.
+        conv = ConversationService(scoped).create_conversation("in flight", project_id=project.id)
+        schedule = _schedule(scheduler_s, project_id=project.id, title="Mid-flight schedule")
+        runs = ScheduleRunService(scoped)
+        run = runs.create_run(schedule.id, is_manual=True)
+        runs.set_run_conversation(run.id, conv.id)
+
+        # The user deletes the chat from their own request session while the
+        # turn is still streaming.
+        assert ConversationService(
+            ScopedSession(request_s, LOCAL_SCOPE)
+        ).delete_conversation(conv.id) is True
+
+        # The race ordering: the scheduler attaches the conversation again
+        # after the delete. Must neither raise nor resurrect the pointer.
+        runs.set_run_conversation(run.id, conv.id)
+
+        # The success branch points the schedule back at the conversation id
+        # it captured before the delete.
+        _apply_success_write_back(schedule, runs, conv.id, scheduler_s)
+        scheduler_s.commit()
+
+        # And the finally block still reports the outcome with the same id.
+        finished = runs.finish_run(run.id, conversation_id=conv.id)
+
+        assert finished.status == RunStatus.success, "the run must not be left running"
+        assert finished.conversation_id is None
+        scheduler_s.expire_all()
+        assert scheduler_s.get(Schedule, schedule.id).last_result_conversation_id is None
+        assert scheduler_s.get(ScheduleRun, run.id).conversation_id is None
+        assert _orphaned_run_count(scheduler_s, schedule.id) == 0
+        assert runs.has_active_run(schedule.id) is False, "a stranded run would wedge the schedule"
+
+
+def test_run_writes_converge_when_the_delete_wins_the_race(tmp_path, monkeypatch):
+    """still_exists is a read followed by a separate write, so a delete can
+    commit between the two; the write's own commit then raises. Both writers
+    must roll back and converge on the released pointer instead of stranding
+    the run at `running`."""
+    engine = _fk_enforcing_engine()
+    with Session(engine, autoflush=False, expire_on_commit=False) as s:
+        project = Project(name="race", path=str(tmp_path / "race"))
+        s.add(project)
+        s.commit()
+        scoped = ScopedSession(s, LOCAL_SCOPE)
+        conv = ConversationService(scoped).create_conversation("raced", project_id=project.id)
+        schedule = _schedule(s, project_id=project.id, title="Race schedule")
+        runs = ScheduleRunService(scoped)
+        run = runs.create_run(schedule.id, is_manual=True)
+
+        assert ConversationService(scoped).delete_conversation(conv.id) is True
+        # Freeze the check on the answer it gave before the delete committed.
+        monkeypatch.setattr(runs, "still_exists", lambda cid: cid)
+
+        runs.set_run_conversation(run.id, conv.id)
+        s.expire_all()
+        assert s.get(ScheduleRun, run.id).conversation_id is None
+
+        finished = runs.finish_run(run.id, conversation_id=conv.id)
+        assert finished.status == RunStatus.success
+        assert finished.conversation_id is None

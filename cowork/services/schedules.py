@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID
 
-from cowork.db.scoped import ScopedSession
+import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
+
+from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
+from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
@@ -103,6 +107,43 @@ class ScheduleService:
         self.session.commit()
         return True
 
+    def release_conversation(self, conversation_id: UUID) -> None:
+        """Let go of a conversation that is being deleted, keeping the rows.
+
+        Two columns point at a conversation: a run records the one it produced,
+        and a schedule records the one its last run produced. Neither is the
+        run's own data, and both are nullable, so tidying a chat releases the
+        link and leaves the run history it is an audit trail of. Every reader
+        tolerates the empty pointer: both response schemas declare the fields
+        `UUID | None`, and the desktop already renders a run with no
+        conversation.
+
+        Staged into the caller's transaction, never committed here: whoever is
+        deleting the conversation commits once, so a crash cannot leave a
+        conversation whose contents are gone.
+
+        Keyed on the conversation id alone, and run on the raw session on
+        purpose. Both `select` helpers would narrow this: the scoped layer adds
+        an org filter for `Schedule`, and `_owned_select` adds an owner filter
+        on top. A conversation id is already the narrowest possible key, and a
+        project delete cascades conversations belonging to several members, so
+        either filter can only hide a row that still has to be released. Hiding
+        one puts the foreign-key violation straight back. A core UPDATE also
+        keeps the flush hook out of it, which would otherwise adopt a row whose
+        org_id is NULL into whoever triggered the delete.
+        """
+        raw = unsafe_unscoped_session(self.session)
+        raw.execute(
+            sa.update(ScheduleRun)
+            .where(ScheduleRun.conversation_id == conversation_id)
+            .values(conversation_id=None)
+        )
+        raw.execute(
+            sa.update(Schedule)
+            .where(Schedule.last_result_conversation_id == conversation_id)
+            .values(last_result_conversation_id=None)
+        )
+
     def pause_schedule(self, schedule_id: UUID) -> Schedule:
         schedule = self.get_schedule(schedule_id)
         schedule.enabled = False
@@ -186,15 +227,51 @@ class ScheduleRunService:
         finished = run.finished_at
         return finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
 
+    def still_exists(self, conversation_id: UUID | None) -> UUID | None:
+        """The conversation id back, or None once the conversation is gone.
+
+        A run holds its conversation id in a local for the whole run and writes
+        it back at the end, so a user who deletes that chat mid-run leaves every
+        later write pointing at a row that no longer exists. On Postgres each
+        one raises, and the scheduler swallows the exception, which strands the
+        run at `running`: `has_active_run` then reports the schedule busy and
+        the due-check skips it on every poll until a restart reaps it. Writing
+        NULL instead loses only the link to a conversation the user deleted on
+        purpose.
+
+        Read on the raw session so the org filter cannot answer "gone" for a
+        conversation that is merely out of scope, which would drop a live link.
+
+        A core SELECT, not `Session.get`: the session factory runs with
+        `expire_on_commit=False`, so `get` answers from the identity map with
+        no query at all, and the scheduler's session is the one that created
+        this conversation. `get` would report it alive for the whole run,
+        however long ago another session deleted it. Only a statement asks
+        the database.
+        """
+        if conversation_id is None:
+            return None
+        raw = unsafe_unscoped_session(self.session)
+        row = raw.execute(
+            sa.select(Conversation.id).where(Conversation.id == conversation_id)
+        ).first()
+        return conversation_id if row is not None else None
+
     def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> None:
         """Attach the run's conversation as soon as it is known — before the
         turn executes — so the UI can open a run that is still in flight."""
         run = self.session.get(ScheduleRun, run_id)
         if run is None:
             return
-        run.conversation_id = conversation_id
+        run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # The delete landed between still_exists' read and this commit,
+            # and its release already nulled the column in the database. The
+            # run simply has no conversation to point at.
+            self.session.rollback()
 
     def finish_run(
         self,
@@ -213,9 +290,17 @@ class ScheduleRunService:
         run.status = status or (RunStatus.failed if error else RunStatus.success)
         run.error = error
         if conversation_id is not None:
-            run.conversation_id = conversation_id
+            run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # The delete landed between still_exists' read and this commit,
+            # and its release already nulled the column in the database.
+            # Rewrite without the pointer rather than stranding the run at
+            # `running`, which would wedge the schedule until a restart.
+            self.session.rollback()
+            return self.finish_run(run_id, error=error, status=status)
         self.session.refresh(run)
         return run
 

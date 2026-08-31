@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "alembic>=1.17.0",
-    "anton-agent>=2.26.8.9.1,<3",
+    "anton-agent>=2.26.8.23.1,<3",
     # Capped <49: 49+ drops the macOS universal2 wheel, breaking Intel-Mac installs.
     "cryptography>=48.0.0,<49",
     "fastapi>=0.136.1",
@@ -77,7 +77,17 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
+# Stacked feature dependency: cowork-server imports the artifact-identity
+# derivation (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`)
+# from this Anton commit, and persists what Anton only derives in memory — the
+# two must agree on the value or one artifact ends up with two identities.
+# This is Anton's staging head (mindsdb/anton#407); `main` has none of those
+# symbols yet, so pinning back to `branch = "main"` before Anton's next
+# staging → main release makes every artifact endpoint fail to import.
+# Flip it back in that release: the image installs from this lockfile
+# (`uv sync --frozen`), so a rev on a staging commit must not reach a
+# cowork-server main build.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "61ec5db6a6fdbb868bb43c30c98b9c52dd542fa3" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
