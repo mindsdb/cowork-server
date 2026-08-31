@@ -112,6 +112,18 @@ async def proxy_picked_files(engine: str, name: str, files: list[dict], request:
     return result.get("files", [])
 
 
+async def proxy_connection_detail(engine: str, name: str, request: Request, settings: OAuthSettings) -> dict:
+    """Read-only connection metadata via auth's Data Vault (org mode has no
+    local vault of its own to read from): status, non-secret token fields,
+    and the connection's persisted Google-Picker file grant. No refresh, no
+    provider call as a side effect — unlike proxy_token, this is a plain
+    read of the stored row, so it's what get_connection's org-mode branch
+    uses instead (ENG-2097: proxy_token's fixed response shape never carried
+    the picked-files grant, so it had persisted server-side but had no read
+    path back to this panel)."""
+    return await _relay("GET", f"/v1/oauth/{engine}/{name}", request=request, settings=settings)
+
+
 async def proxy_delete(engine: str, name: str, request: Request, settings: OAuthSettings) -> None:
     """Disconnect a connection via auth's Data Vault (org mode has no local
     vault of its own to delete from). auth 404s on an unknown connection,
