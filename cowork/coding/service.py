@@ -264,6 +264,7 @@ class CodingService(
     def delete_session(self, session_id: str) -> None:
         session = self.get_session(session_id)
         if self._is_remote(session):
+            self.remote.require_idle(session, "deleting this coding task")
             self.remote.release_workspace(session)
             self.store.delete_session(session.id)
             self.skill_runtime.cleanup(session.id)

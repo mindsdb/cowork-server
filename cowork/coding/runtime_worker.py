@@ -49,6 +49,7 @@ class CodeOnlyRuntime:
         client: RemoteRuntimeClient,
         registry: CodingEngineRegistry = engine_registry,
         heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+        approval_timeout_seconds: float = 600,
     ) -> None:
         self.root = root
         self.client = client
@@ -58,6 +59,7 @@ class CodeOnlyRuntime:
         self._approval_waiters: dict[str, tuple[threading.Event, dict[str, str]]] = {}
         self._pending_commands: list[RuntimeCommand] = []
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._approval_timeout_seconds = max(0, approval_timeout_seconds)
 
     def run_once(self, wait_seconds: float = 0) -> bool:
         self.client.heartbeat()
@@ -480,13 +482,17 @@ class CodeOnlyRuntime:
             "method": method,
             "params": params or {},
         })
-        deadline = time.monotonic() + 600
+        deadline = time.monotonic() + self._approval_timeout_seconds
         try:
             while time.monotonic() < deadline:
                 if resolved.wait(timeout=5):
                     self.client.event(lease, "status", {"status": "running"})
                     return {"decision": decision.get("decision", "decline")}
                 self.client.event(lease, "checkpoint", {"waitingForApproval": approval_id})
+            # The engine will continue after receiving the decline. Persist
+            # that transition before returning so the control plane and UI do
+            # not remain indefinitely stuck in awaiting_approval.
+            self.client.event(lease, "status", {"status": "running"})
             return {"decision": "decline"}
         finally:
             with self._approval_lock:

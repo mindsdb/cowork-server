@@ -355,6 +355,51 @@ def test_code_only_runtime_keeps_heartbeating_during_a_blocking_run(tmp_path: Pa
     assert client.heartbeat_counts.count(1) >= 3
 
 
+def test_remote_approval_timeout_returns_the_run_to_running(tmp_path: Path) -> None:
+    run = TaskRun(
+        id="run-approval-timeout",
+        task_id="task-approval-timeout",
+        computer_id="remote-computer",
+        status=RunStatus.running,
+        lease_id="lease-approval-timeout",
+    )
+    lease = RuntimeLease(
+        task=CodeTask(id=run.task_id, title="Approval timeout", prompt="Build"),
+        run=run,
+        lease_id=run.lease_id or "lease-approval-timeout",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        project=CodeProject(
+            id="approval-project",
+            name="Approval project",
+            resources=[RepositoryResource(
+                id="repo",
+                name="Repo",
+                source_url="https://example.test/repo.git",
+            )],
+        ),
+        execution=RuntimeExecutionConfig(
+            engine_id="fake",
+            model="fake-model",
+            permission_mode=PermissionMode.workspace,
+        ),
+    )
+    client = FakeRuntimeClient(
+        lease,
+        RuntimeCommand(id="command-start", run_id=run.id, epoch=run.epoch, kind="start"),
+    )
+    runtime = CodeOnlyRuntime(
+        tmp_path / "runtime",
+        client,
+        approval_timeout_seconds=0,
+    )
+
+    assert runtime._approval(lease, "command", {"title": "Run tests"}) == {
+        "decision": "decline"
+    }
+    statuses = [payload.get("status") for kind, payload in client.events if kind == "status"]
+    assert statuses == ["awaiting_approval", "running"]
+
+
 def test_code_only_runtime_serves_git_and_terminal_operations_after_a_turn(tmp_path: Path) -> None:
     source = repository(tmp_path)
     project = CodeProject(

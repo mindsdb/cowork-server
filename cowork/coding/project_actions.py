@@ -35,12 +35,25 @@ def terminal_command_line(
 
     windows = computer.capabilities.platform == "windows"
     shells = set(computer.capabilities.shells)
-    posix = not windows or shell == TerminalShellPreference.bash or (
-        shell == TerminalShellPreference.auto and TerminalShellPreference.bash.value in shells
-    )
+    resolved = shell
+    if windows and shell in {TerminalShellPreference.auto, TerminalShellPreference.system}:
+        resolved = next(
+            (
+                candidate
+                for candidate in (
+                    TerminalShellPreference.bash,
+                    TerminalShellPreference.pwsh,
+                    TerminalShellPreference.powershell,
+                    TerminalShellPreference.cmd,
+                )
+                if candidate.value in shells
+            ),
+            TerminalShellPreference.cmd,
+        )
+    posix = not windows or resolved == TerminalShellPreference.bash
     if posix:
         return f"cd {shlex.quote(cwd)} && {shlex.join(argv)}\n"
-    if shell == TerminalShellPreference.cmd:
+    if resolved == TerminalShellPreference.cmd:
         if any(any(character in value for character in "&|<>^%\r\n") for value in (cwd, *argv)):
             raise WorkspaceError("Managed project actions need Bash or PowerShell when values contain shell metacharacters")
         return f"cd /d {subprocess.list2cmdline([cwd])} && {subprocess.list2cmdline(argv)}\r\n"

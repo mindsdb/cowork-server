@@ -232,8 +232,11 @@ class RemoteExecutionCoordinator:
         )
         try:
             self.control.wait_for_command(run.id, command.id, timeout=5)
-        except RuntimeError:
+        except RuntimeError as exc:
             self.control.set_run_status(run.id, RunStatus.interrupted, error="Workspace release was not acknowledged")
+            raise RuntimeError(
+                "The selected computer did not release this task workspace; retry when it is online"
+            ) from exc
 
     @staticmethod
     def require_idle(session: CodingSession, action: str) -> None:

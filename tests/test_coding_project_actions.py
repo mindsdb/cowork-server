@@ -132,6 +132,12 @@ def test_serializes_project_actions_for_supported_shells() -> None:
         computer=computer("windows", ["auto", "pwsh"]),
         shell=TerminalShellPreference.auto,
     ) == "Set-Location -LiteralPath 'C:\\Code\\My App'; & 'npm' 'run' 'dev'\r\n"
+    assert terminal_command_line(
+        argv=["npm", "run", "dev"],
+        cwd=r"C:\Code\My App",
+        computer=computer("windows", ["auto", "cmd"]),
+        shell=TerminalShellPreference.auto,
+    ) == 'cd /d "C:\\Code\\My App" && npm run dev\r\n'
 
 
 def test_runs_scoped_action_in_named_terminal(tmp_path: Path) -> None:
