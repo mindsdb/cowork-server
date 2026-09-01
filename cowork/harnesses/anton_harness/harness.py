@@ -93,6 +93,31 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     return applied
 
 
+def _verifier_latch_kwarg(config_cls) -> dict[str, int]:
+    """``{"verifier_latch_threshold": 1}`` for ``ChatSessionConfig``, or ``{}``.
+
+    This server builds a fresh ChatSession per message, so anton's no-verdict
+    counter dies with the turn: every message contributes at most one, its
+    default threshold of two is never reached, and a verifier that fails the
+    same way every time re-diagnosed on every message instead of latching once.
+    One is the threshold that matches this lifecycle.
+
+    Guarded the way ``surface_kwarg`` is and for the same reason: anton is
+    pinned by rev here and by a version floor on the desktop wheel, so the
+    installed copy can predate this field, and an unexpected keyword to a plain
+    dataclass would raise on EVERY turn.
+    """
+    import dataclasses
+
+    try:
+        if not any(f.name == "verifier_latch_threshold" for f in dataclasses.fields(config_cls)):
+            return {}
+        return {"verifier_latch_threshold": 1}
+    except Exception:  # pragma: no cover - defensive: never fail a turn over this
+        logger.warning("could not set the verifier latch threshold", exc_info=True)
+        return {}
+
+
 def _apply_model_override(anton_settings, model: str | None) -> list[str]:
     """A per-conversation model pick (the composer's dropdown) overrides
     planning/coding/router for THIS call only — the account-wide
@@ -1094,6 +1119,7 @@ class AntonHarness:
             # and both report harness="anton" (ENG-1459). Only the deployment
             # knows which, so it is resolved here rather than by anton.
             **surface_kwarg(ChatSessionConfig),
+            **_verifier_latch_kwarg(ChatSessionConfig),
             proactive_dashboards=anton_settings.proactive_dashboards,
             act_first=anton_settings.act_first,
             # "Conversation started" stamp for the cache-stable prompt prefix
