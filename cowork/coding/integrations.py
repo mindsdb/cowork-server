@@ -358,15 +358,7 @@ class DeveloperIntegrationService:
         connection: ProjectConnection,
         fields: dict[str, Any],
     ) -> SourceContext:
-        path_parts = urlparse(request.url).path.rstrip("/").split("/")
-        # Linear's canonical browser URL appends a human-readable title slug:
-        # /issue/ENG-289/schedule-task-state-is-not-accurate. Extract the issue
-        # identifier by shape so both canonical links and short pasted links
-        # resolve to the same GraphQL resource.
-        identifier = next(
-            (part for part in path_parts if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*-\d+", part)),
-            path_parts[-1],
-        )
+        identifier = self._linear_identifier(request.url)
         token = self._secret(fields, "access_token", "api_key", "token")
         issue = self._linear_issue(identifier, token)
         return SourceContext(
@@ -464,7 +456,7 @@ class DeveloperIntegrationService:
         return response.json().get("html_url")
 
     def _publish_linear(self, request: PublishRequest, fields: dict[str, Any]) -> str | None:
-        identifier = urlparse(request.target_url).path.rstrip("/").split("/")[-1]
+        identifier = self._linear_identifier(request.target_url)
         token = self._secret(fields, "access_token", "api_key", "token")
         issue_id = str(self._linear_issue(identifier, token)["id"])
         response = self._request(
@@ -512,7 +504,7 @@ class DeveloperIntegrationService:
         )
 
     def _complete_linear_source(self, request: SourceActionRequest, fields: dict[str, Any]) -> None:
-        identifier = urlparse(request.target_url).path.rstrip("/").split("/")[-1]
+        identifier = self._linear_identifier(request.target_url)
         token = self._secret(fields, "access_token", "api_key", "token")
         issue = self._linear_issue(identifier, token)
         response = self._request(
@@ -549,6 +541,16 @@ class DeveloperIntegrationService:
         if update.get("errors") or not (((update.get("data") or {}).get("issueUpdate") or {}).get("success")):
             message = ((update.get("errors") or [{}])[0].get("message") or "Linear could not complete this issue")
             raise WorkspaceError(str(message))
+
+    @staticmethod
+    def _linear_identifier(url: str) -> str:
+        path_parts = urlparse(url).path.rstrip("/").split("/")
+        # Canonical Linear URLs append a human-readable title slug after the
+        # stable identifier: /issue/ENG-289/fix-login.
+        return next(
+            (part for part in path_parts if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*-\d+", part)),
+            path_parts[-1],
+        )
 
     def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         try:

@@ -293,7 +293,9 @@ class CodingSession(BaseModel):
     guidance_summary: str | None = None
     developer_instructions: str = ""
     resolved_skills: list[ResolvedSkill] = Field(default_factory=list)
-    skill_roots: list[str] = Field(default_factory=list)
+    # ``None`` identifies legacy tasks created before task-scoped resolution.
+    # An empty list is an intentional snapshot with no shared Code skills.
+    skill_roots: list[str] | None = None
     skill_instructions: str = ""
     environment: dict[str, str] = Field(default_factory=dict)
     allocated_ports: dict[str, int] = Field(default_factory=dict)

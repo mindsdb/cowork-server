@@ -152,7 +152,7 @@ class CodexEngineSession:
         )
         self._client = CodexClient(config=client_config, approval_handler=approval_handler)
         self._workspace = workspace
-        self._skill_roots = tuple(config.skill_roots)
+        self._skill_roots = None if config.skill_roots is None else tuple(config.skill_roots)
         self._model = config.model
         self._reasoning_effort = config.reasoning_effort
         self._service_tier = config.service_tier
@@ -452,8 +452,9 @@ class CodexEngineSession:
     def _register_skill_roots(self) -> None:
         from openai_codex.generated.v2_all import SkillsExtraRootsSetResponse
 
-        roots = [Path(root).expanduser() for root in getattr(self, "_skill_roots", [])]
-        if not roots:
+        configured_roots = getattr(self, "_skill_roots", None)
+        roots = [Path(root).expanduser() for root in configured_roots or ()]
+        if configured_roots is None:
             # Backward compatibility for sessions created before task-scoped
             # skill snapshots existed. Keep the fallback inside Code's own
             # store; the general Cowork catalogue must never leak into Code.
