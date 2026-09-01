@@ -238,6 +238,7 @@ class ProjectWorkspaceManager:
         key = hashlib.sha256(resource.source_url.encode()).hexdigest()[:24]
         root = self.workspaces.root / "repositories" / key
         if root.is_dir():
+            self._refresh_repository_cache(root, resource)
             return root
         root.parent.mkdir(parents=True, exist_ok=True)
         temporary = root.with_name(f".{root.name}.tmp")
@@ -260,6 +261,54 @@ class ProjectWorkspaceManager:
             if temporary.exists():
                 shutil.rmtree(temporary)
         return root
+
+    def _refresh_repository_cache(self, root: Path, resource: RepositoryResource) -> None:
+        fetched = self.workspaces.git.run(
+            root,
+            "fetch",
+            "--no-tags",
+            "--prune",
+            "origin",
+            check=False,
+        )
+        if fetched.returncode != 0:
+            detail = (fetched.stderr or fetched.stdout or "Git fetch failed").strip()
+            raise WorkspaceError(f"Could not refresh {resource.name}: {detail[:2_000]}")
+
+        current = self.workspaces.git.run(
+            root,
+            "symbolic-ref",
+            "--short",
+            "-q",
+            "HEAD",
+            check=False,
+        ).stdout.strip()
+        branch = resource.default_branch or current
+        if not branch:
+            return
+        valid = self.workspaces.git.run(
+            root,
+            "check-ref-format",
+            "--branch",
+            branch,
+            check=False,
+        )
+        if valid.returncode != 0:
+            raise WorkspaceError(f"Base branch is invalid: {branch}")
+        remote_ref = f"refs/remotes/origin/{branch}"
+        available = self.workspaces.git.run(
+            root,
+            "rev-parse",
+            "--verify",
+            remote_ref,
+            check=False,
+        )
+        if available.returncode != 0:
+            raise WorkspaceError(f"Base branch is unavailable after refresh: {branch}")
+        if branch == current:
+            self.workspaces.git.run(root, "reset", "--hard", remote_ref)
+        else:
+            self.workspaces.git.run(root, "branch", "--force", branch, remote_ref)
 
     def fork(
         self,

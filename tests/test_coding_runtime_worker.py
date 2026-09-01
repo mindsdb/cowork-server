@@ -5,9 +5,9 @@ from pathlib import Path
 from coding_service_fakes import FakeEngine, repository
 
 from cowork.coding.contracts import PermissionMode
-from cowork.coding.control_models import CodeTask, RunStatus, RuntimeCommand, TaskRun
+from cowork.coding.control_models import CodeTask, ExecutionWorkspace, RunStatus, RuntimeCommand, TaskRun
 from cowork.coding.engines.registry import CodingEngineRegistry
-from cowork.coding.project_models import CodeProject, RepositoryResource
+from cowork.coding.project_models import CodeProject, ProjectCommand, RepositoryResource
 from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
 from cowork.coding.runtime_worker import CodeOnlyRuntime, RuntimeIdentity
 
@@ -144,6 +144,101 @@ def test_code_only_runtime_prepares_a_portable_repo_and_runs_the_agent(tmp_path:
         kind == "event" and (payload.get("event") or {}).get("text") == "done"
         for kind, payload in client.events
     )
+
+
+def test_code_only_runtime_runs_project_setup_before_the_agent(tmp_path: Path) -> None:
+    source = repository(tmp_path)
+    project = CodeProject(
+        id="setup-project",
+        name="Setup project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url=str(source),
+            commands=[ProjectCommand(
+                id="setup",
+                label="Prepare dependencies",
+                argv=["git", "status", "--short"],
+                phase="setup",
+            )],
+        )],
+    )
+    run = TaskRun(
+        id="run-setup",
+        task_id="task-setup",
+        computer_id="remote-computer",
+        status=RunStatus.preparing,
+        lease_id="lease-setup",
+    )
+    lease = RuntimeLease(
+        task=CodeTask(id="task-setup", title="Setup task", prompt="Build"),
+        run=run,
+        lease_id="lease-setup",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        project=project,
+        execution=RuntimeExecutionConfig(
+            engine_id="fake",
+            model="fake-model",
+            permission_mode=PermissionMode.workspace,
+        ),
+    )
+    command = RuntimeCommand(id="command-setup", run_id=run.id, epoch=1, kind="start")
+    client = FakeRuntimeClient(lease, command)
+    registry = CodingEngineRegistry()
+    registry.register(FakeEngine())
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    setup_event = next(
+        payload["event"]
+        for kind, payload in client.events
+        if kind == "event" and (payload.get("event") or {}).get("title") == "Prepare dependencies"
+    )
+    assert setup_event["phase"] == "completed"
+    assert client.calls.index("event:event:") < client.calls.index("event:status:ready")
+
+
+def test_recovery_on_another_computer_prepares_new_workspaces(tmp_path: Path) -> None:
+    source = repository(tmp_path)
+    project = CodeProject(
+        id="recovery-project",
+        name="Recovery project",
+        resources=[RepositoryResource(id="repo", name="Repo", source_url=str(source))],
+    )
+    run = TaskRun(
+        id="run-recovery",
+        task_id="task-recovery",
+        computer_id="remote-computer",
+        status=RunStatus.recovering,
+        lease_id="lease-recovery",
+        epoch=2,
+    )
+    lease = RuntimeLease(
+        task=CodeTask(id="task-recovery", title="Recovery task", prompt="Resume"),
+        run=run,
+        lease_id="lease-recovery",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        project=project,
+        execution=RuntimeExecutionConfig(
+            engine_id="fake",
+            model="fake-model",
+            permission_mode=PermissionMode.workspace,
+        ),
+        workspaces=[ExecutionWorkspace(
+            id="workspace-recovery",
+            run_id=run.id,
+            resource_id="repo",
+            computer_id="previous-computer",
+            path="/workspace/that-only-existed-on-the-previous-computer",
+        )],
+    )
+    command = RuntimeCommand(id="command-recovery", run_id=run.id, epoch=2, kind="start")
+    client = FakeRuntimeClient(lease, command)
+    registry = CodingEngineRegistry()
+    registry.register(FakeEngine())
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+    assert client.workspace_readmes == ["base\n"]
 
 
 def test_code_only_runtime_serves_git_and_terminal_operations_after_a_turn(tmp_path: Path) -> None:

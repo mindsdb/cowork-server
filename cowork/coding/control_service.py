@@ -382,6 +382,7 @@ class ControlPlaneService:
                 computer_id=run.computer_id,
             )
             record.status = WorkspaceStatus.ready
+            record.computer_id = run.computer_id
             record.path = workspace.workspace_path
             record.workspace_kind = workspace.workspace_kind
             record.base_revision = workspace.base_revision
