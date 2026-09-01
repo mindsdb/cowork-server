@@ -8,6 +8,7 @@ talk over 127.0.0.1, so the legitimate flow is unaffected.
 """
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +47,26 @@ def test_require_local_rejects_dns_rebinding_and_cross_site_origins(monkeypatch)
             ))
     finally:
         get_app_settings.cache_clear()
+
+
+def test_require_local_trusts_the_test_client_host_only_through_the_fixture(monkeypatch):
+    from cowork.api.v1.endpoints import guards
+
+    monkeypatch.setattr(guards, "_TRUSTED_LOOPBACK_HOSTS", guards._TRUSTED_LOOPBACK_HOSTS - {"testserver"})
+    with pytest.raises(HTTPException, match="local host"):
+        guards.require_local(_request("127.0.0.1", headers={"host": "testserver"}))
+
+
+def test_testserver_does_not_appear_in_production_code():
+    import cowork
+
+    root = Path(cowork.__file__).parent
+    offenders = [
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if "testserver" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == []
 
 
 @pytest.mark.parametrize("host", ["10.0.0.5", "0.0.0.0", "192.168.1.10", "", None])

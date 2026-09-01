@@ -24,6 +24,7 @@ from cowork.coding.control_models import (
     TaskRun,
     WorkspaceStatus,
 )
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_service import (
     ControlPlaneService,
     NoEligibleComputer,
@@ -327,7 +328,7 @@ def test_queued_work_moves_between_computers_only_by_audited_reassignment(tmp_pa
     leased = service.acquire_lease(second.id)
     assert leased is not None
     assert leased[0].id == moved.id
-    with pytest.raises(ValueError, match="queued"):
+    with pytest.raises(StateConflict, match="queued"):
         service.reassign_queued_run(moved.id, first.id)
     with pytest.raises(NoEligibleComputer, match="cannot access"):
         service.reassign_queued_run(bound.run.id, second.id)
@@ -705,6 +706,31 @@ def test_connector_capabilities_are_short_lived_scoped_and_revocable(tmp_path: P
     service.revoke_connector_grants(snapshot.run.id)
     with pytest.raises(RuntimeAuthenticationError, match="expired"):
         service.authorize_connector(grant.id, token, "read_source")
+
+
+def test_connector_constraints_compare_non_ascii_values_in_constant_time(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    snapshot = service.create_task_run(
+        task_id="unicode-constraint",
+        title="Unicode constraint",
+        prompt="Read one repository",
+        project=None,
+        requested_resource_ids=None,
+        computer_id=None,
+        engine_id="codex",
+        standalone_computer_id=service.local_computer.id,
+    )
+    grant, token = service.issue_connector_grant(
+        snapshot.run.id,
+        "github",
+        "work-account",
+        ["read_source"],
+        {"repository": "acme/dépôt"},
+    )
+
+    assert service.authorize_connector(grant.id, token, "read_source", {"repository": "acme/dépôt"}).use_count == 1
+    with pytest.raises(RuntimeAuthenticationError, match="outside its resource scope"):
+        service.authorize_connector(grant.id, token, "read_source", {"repository": "acme/depot"})
 
 
 def test_legacy_unbound_connector_grants_load_but_fail_closed(tmp_path: Path) -> None:
