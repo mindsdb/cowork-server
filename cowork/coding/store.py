@@ -27,6 +27,7 @@ class CodingStore:
         self._recent_events: deque[tuple[str, CodingEvent]] = deque(maxlen=MAX_RECENT_EVENTS)
         self._last_sequences: dict[str, int] = {}
         self._retained_counts: dict[str, int] = {}
+        self._source_event_ids: dict[str, set[str]] = {}
 
     def _dir(self, session_id: str) -> Path:
         if not session_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in session_id):
@@ -93,6 +94,7 @@ class CodingStore:
             )
             self._last_sequences.pop(session_id, None)
             self._retained_counts.pop(session_id, None)
+            self._source_event_ids.pop(session_id, None)
             self._changed.notify_all()
 
     def copy_event_history(self, source_id: str, target: CodingSession) -> None:
@@ -107,6 +109,7 @@ class CodingStore:
             self.save_session(target)
             self._last_sequences.pop(target.id, None)
             self._retained_counts.pop(target.id, None)
+            self._source_event_ids.pop(target.id, None)
 
     def append_event(
         self,
@@ -114,19 +117,31 @@ class CodingStore:
         event: CodingEvent,
         update: Callable[[CodingSession], None] | None = None,
     ) -> CodingEvent:
-        """Append against current metadata so concurrent callbacks cannot regress it."""
+        """Append against current metadata so concurrent callbacks cannot regress it.
+
+        An event carrying a ``source_event_id`` already stored for the session is
+        a redelivery: ``update`` is still applied, so metadata a crash left
+        behind catches up, but the stored event is returned instead of a copy.
+        """
         with self._lock:
             session = self.load_session(session_id)
-            if update is not None:
-                update(session)
             last_sequence = self._last_sequences.get(session_id)
             retained_count = self._retained_counts.get(session_id)
-            if last_sequence is None or retained_count is None:
+            source_ids = self._source_event_ids.get(session_id)
+            if last_sequence is None or retained_count is None or source_ids is None:
                 stored = self.events_after(session_id)
                 if last_sequence is None:
                     last_sequence = stored[-1].seq if stored else 0
                 if retained_count is None:
                     retained_count = len(stored)
+                if source_ids is None:
+                    source_ids = {item.source_event_id for item in stored if item.source_event_id}
+                    self._source_event_ids[session_id] = source_ids
+            if update is not None:
+                update(session)
+            if event.source_event_id and event.source_event_id in source_ids:
+                self.save_session(session)
+                return next(item for item in self.events_after(session_id) if item.source_event_id == event.source_event_id)
             event.seq = max(session.event_count, last_sequence) + 1
             session.event_count = event.seq
             target_dir = self._dir(session.id)
@@ -137,6 +152,8 @@ class CodingStore:
                 handle.flush()
             self._last_sequences[session_id] = event.seq
             self._retained_counts[session_id] = retained_count + 1
+            if event.source_event_id:
+                source_ids.add(event.source_event_id)
             self._recent_events.append((session.id, event))
             if self._retained_counts[session_id] > MAX_EVENTS or path.stat().st_size > MAX_EVENT_FILE_BYTES:
                 self._compact_events(session)
@@ -195,6 +212,7 @@ class CodingStore:
         temp.write_text("".join(event.model_dump_json() + "\n" for event in events), encoding="utf-8")
         os.replace(temp, path)
         self._retained_counts[session.id] = len(events)
+        self._source_event_ids[session.id] = {item.source_event_id for item in events if item.source_event_id}
         if events:
             first_retained = events[0].seq
             self._recent_events = deque(

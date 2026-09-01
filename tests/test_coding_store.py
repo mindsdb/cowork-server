@@ -62,6 +62,34 @@ def test_event_sequence_recovers_when_a_crash_leaves_metadata_behind(tmp_path: P
     assert restarted.load_session(item.id).event_count == 3
 
 
+def test_redelivery_reapplies_an_update_a_crash_left_unsaved(tmp_path: Path) -> None:
+    store = CodingStore(tmp_path)
+    item = session()
+    item.status = SessionStatus.running
+    item.active_turn_id = "turn-1"
+    store.save_session(item)
+    metadata = tmp_path / "sessions" / item.id / "session.json"
+    before_update = metadata.read_bytes()
+
+    def complete_turn(current: CodingSession) -> None:
+        current.status = SessionStatus.completed
+        current.active_turn_id = None
+
+    def completed_event() -> CodingEvent:
+        return CodingEvent(type=EventType.session, title="Completed", source_event_id="runtime-event-1")
+
+    stored = store.append_event(item.id, completed_event(), complete_turn)
+    metadata.write_bytes(before_update)
+
+    redelivered = CodingStore(tmp_path).append_event(item.id, completed_event(), complete_turn)
+
+    restored = store.load_session(item.id)
+    assert restored.status == SessionStatus.completed
+    assert restored.active_turn_id is None
+    assert redelivered.seq == stored.seq
+    assert [event.seq for event in store.events_after(item.id)] == [1]
+
+
 def test_reconcile_marks_orphaned_turn_interrupted(tmp_path: Path) -> None:
     store = CodingStore(tmp_path)
     item = session()

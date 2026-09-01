@@ -69,12 +69,14 @@ class ApplyPlan:
             raise ValueError("a local-copy handoff plan cannot contain a Git patch")
 
 
-def _truncate_at_file_boundary(patch: Path, limit: int) -> None:
-    """Cut a combined patch at the last whole-file diff that fits in ``limit`` bytes."""
+def _truncate_at_file_boundary(patch: Path, limit: int) -> int:
+    """Cut a combined patch at the last whole-file diff that fits in ``limit`` bytes; return the kept size."""
     with patch.open("rb") as handle:
         head = handle.read(limit)
     boundary = head.rfind(b"\ndiff --git ")
-    os.truncate(patch, boundary + 1 if boundary >= 0 else 0)
+    kept = boundary + 1 if boundary >= 0 else 0
+    os.truncate(patch, kept)
+    return kept
 
 
 class GitRunner:
@@ -704,8 +706,11 @@ class WorkspaceManager:
             temp.unlink()
             return None
         if truncate and size > MAX_TOTAL_DIFF_BYTES:
-            _truncate_at_file_boundary(temp, MAX_TOTAL_DIFF_BYTES)
+            size = _truncate_at_file_boundary(temp, MAX_TOTAL_DIFF_BYTES)
             snapshot.with_name(f"{filename}.truncated").write_text(SNAPSHOT_TRUNCATED_MARKER, encoding="utf-8")
+            if not size:
+                temp.unlink()
+                return None
         os.replace(temp, snapshot)
         return snapshot
 

@@ -544,6 +544,23 @@ def test_missing_source_cache_does_not_hide_the_rest_of_the_library(tmp_path: Pa
     assert page.sources[0].error == "The managed skill source cache is unavailable; reconnect the source"
 
 
+def test_document_for_a_team_item_with_a_missing_cache_reports_the_source_conflict(tmp_path: Path) -> None:
+    skills_repo = repository(tmp_path, "engineering-skills")
+    add_skill(skills_repo, "Review standard.")
+    service = service_with(tmp_path, FakeEngine())
+    source = service.skill_library.add(
+        str(skills_repo),
+        git(skills_repo, "branch", "--show-current"),
+        "Engineering standards",
+    )
+    (item,) = service.skill_library.list().items
+    cache = Path(service.skill_library.store.get(source.id).cache_path)
+    cache.rename(cache.with_name(f"{cache.name}-missing"))
+
+    with pytest.raises(WorkspaceError, match="The managed skill source cache is unavailable; reconnect the source"):
+        service.skill_library.document(CodeSkillService(), item.id)
+
+
 def test_discovery_skips_vendor_trees_and_only_indexes_github_workflows(tmp_path: Path) -> None:
     (tmp_path / "skills" / "release").mkdir(parents=True)
     (tmp_path / "skills" / "release" / "SKILL.md").write_text("Release safely.\n", encoding="utf-8")

@@ -32,6 +32,8 @@ from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
     DeveloperProviderUnavailable,
+    PinnedHostError,
+    PinnedHostTransport,
     require_public_host,
 )
 
@@ -54,17 +56,17 @@ class DeveloperIntegrationService:
     def __init__(
         self,
         scope: TenantScope | None,
-        client: httpx.Client | None = None,
+        transport: httpx.BaseTransport | None = None,
         resolver: Callable[..., list[tuple]] = socket.getaddrinfo,
     ) -> None:
         self.connections = ConnectionsService(scope)
-        self._owns_client = client is None
-        self.client = client or httpx.Client(timeout=20.0, follow_redirects=True)
+        self._egress = PinnedHostTransport(transport or httpx.HTTPTransport(), resolver)
+        # As with httpx itself, a caller-supplied transport owns routing and bypasses environment proxies.
+        self.client = self._egress.client(timeout=20.0, follow_redirects=True, trust_env=transport is None)
         self._resolver = resolver
 
     def close(self) -> None:
-        if self._owns_client:
-            self.client.close()
+        self.client.close()
 
     def statuses(self, project: CodeProject) -> list[IntegrationStatus]:
         available = {(item.engine, item.name): item for item in self.connections.list()}
@@ -226,6 +228,11 @@ class DeveloperIntegrationService:
         """Create ephemeral Git HTTP auth without putting a token in argv or persisted state."""
         _, fields = self._connection(project, "github", connection_name)
         _, token, host = self._github_credentials(fields)
+        if host != "github.com":
+            try:
+                require_public_host(host, self._resolver)
+            except (DeveloperCredentialError, DeveloperProviderUnavailable) as exc:
+                raise WorkspaceError(str(exc)) from exc
         owner, repository = self._github_repository(repository_url, host)
         base = str(fields.get("base_url") or fields.get("url") or "https://github.com").rstrip("/")
         parsed = urlparse(base)
@@ -570,6 +577,8 @@ class DeveloperIntegrationService:
                 if hops > self.client.max_redirects:
                     raise WorkspaceError("The connected developer tool is currently unavailable")
                 response = self.client.send(response.next_request, follow_redirects=False)
+        except PinnedHostError as exc:
+            raise WorkspaceError(str(exc)) from exc
         except httpx.HTTPError as exc:
             raise WorkspaceError("The connected developer tool is currently unavailable") from exc
         if response.status_code in {401, 403}:
@@ -613,10 +622,7 @@ class DeveloperIntegrationService:
         if parsed.scheme != "https" or not host:
             raise WorkspaceError("The GitHub connection URL must be a valid HTTPS URL; reconnect it")
         if host != "github.com":
-            try:
-                require_public_host(host, self._resolver)
-            except (DeveloperCredentialError, DeveloperProviderUnavailable) as exc:
-                raise WorkspaceError(str(exc)) from exc
+            self._egress.pin(host)
         api = "https://api.github.com" if base == "https://github.com" else f"{base}/api/v3"
         token = self._secret(fields, "access_token", "personal_access_token", "token", "api_key")
         return api, token, host

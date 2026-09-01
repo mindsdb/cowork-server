@@ -433,6 +433,8 @@ class CodeOnlyRuntime:
             try:
                 for command in self._take_commands(lease):
                     self._route_command(lease, session, operations, turn_id, cancelled, command)
+                if stop.is_set():
+                    return
                 self.client.event(lease, "checkpoint", {"activeTurn": turn_id})
             except RuntimeClientError:
                 return
