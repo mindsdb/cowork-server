@@ -30,16 +30,20 @@ from cowork.coding.contracts import (
     SessionStatus,
     SessionUpdateRequest,
     SourceContext,
+    TaskCapabilities,
     WorkspaceKind,
     utc_now,
 )
 from cowork.coding.context import is_context_exhaustion_error
+from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.control_models import (
+    CodeTask,
     ComputerCapabilities,
     RunStatus,
     RuntimeEvent,
     TaskCapability,
     TaskRun,
+    WorkspaceStatus,
 )
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
@@ -54,6 +58,7 @@ from cowork.coding.project_models import (
 )
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
+from cowork.coding.service import CodingService
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import EventBuffer, terminal_status
 from cowork.coding.workspace import WorkspaceError
@@ -645,6 +650,7 @@ def test_remote_run_state_is_projected_and_can_be_restored(tmp_path: Path) -> No
     run, _ = leased
     run.lease_expires_at = utc_now() - timedelta(seconds=1)
     service.control.store.save_run(run)
+    service.expire_stale_state()
     interrupted = service.get_session(created.id)
     assert interrupted.run_status == "recovering"
     assert interrupted.last_error == "The computer stopped responding. The task can be resumed safely."
@@ -653,6 +659,231 @@ def test_remote_run_state_is_projected_and_can_be_restored(tmp_path: Path) -> No
     assert restored.run_status == "recovering"
     assert restored.runtime_epoch == 3
     assert restored.computer_id == remote.id
+
+
+def remote_task(tmp_path: Path, service, prompt: str = "Build remotely"):
+    """Register a connected computer and queue one portable task on it."""
+    repo = repository(tmp_path)
+    remote, _ = service.control.register_runtime(
+        service.control.issue_registration_token(),
+        "Build computer",
+        ComputerCapabilities(
+            platform="linux",
+            architecture="test",
+            runtime_version="test-runtime",
+            agent_engines=["fake"],
+            shells=["bash"],
+        ),
+    )
+    project = service.projects.create(ProjectCreateRequest(
+        name="Portable project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url="https://example.test/repo.git",
+            local_path=str(repo),
+        )],
+    ))
+    created = service.create_session(
+        SessionCreateRequest(project_id=project.id, computer_id=remote.id, prompt=prompt, engine_id="fake"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    return created, remote
+
+
+def runtime_event(service, run: TaskRun, lease_id: str, seq: int, kind: str, payload: dict[str, object]) -> TaskRun:
+    return service.accept_runtime_event(RuntimeEvent(
+        run_id=run.id,
+        computer_id=run.computer_id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=seq,
+        kind=kind,
+        payload=payload,
+    ))
+
+
+def test_cancel_during_remote_approval_completes_the_turn(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "running"})
+    runtime_event(service, run, lease_id, 3, "status", {"status": "awaiting_approval"})
+    runtime_event(service, run, lease_id, 4, "approval", {"approvalId": "approval-1", "method": "command"})
+
+    service.cancel(created.id)
+    runtime_event(service, run, lease_id, 5, "turn_completed", {"status": "cancelled"})
+
+    assert {command.kind for command in service.control.store.list_commands(run.id)} == {"start", "cancel"}
+    assert service.control.store.get_run(run.id).status == RunStatus.ready
+    session = service.get_session(created.id)
+    assert session.status == SessionStatus.cancelled
+    assert session.pending_approval is None
+
+
+def test_release_workspace_timeout_reports_the_offline_computer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+
+    def never_answers(_run_id: str, _command_id: str, timeout: float = 20.0):
+        raise RuntimeError("The selected computer did not answer in time")
+
+    monkeypatch.setattr(service.control, "wait_for_command", never_answers)
+    with pytest.raises(RuntimeError, match="did not release this task workspace; retry when it is online"):
+        service.remote.release_workspace(service.get_session(created.id))
+
+    assert service.control.store.get_run(run.id).status == RunStatus.ready
+    assert {command.kind for command in service.control.store.list_commands(run.id)} == {"start", "release"}
+
+
+def spy_on_control_store_writes(store, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    writes: list[str] = []
+
+    def recording(name: str, original):
+        def spy(*args, **kwargs):
+            writes.append(name)
+            return original(*args, **kwargs)
+
+        return spy
+
+    for name in dir(store):
+        if name.startswith(("save_", "update_", "claim_", "create_", "delete_", "consume_", "prune")):
+            monkeypatch.setattr(store, name, recording(name, getattr(store, name)))
+    return writes
+
+
+def service_with_expiry(tmp_path: Path, interval_seconds: float) -> CodingService:
+    registry = CodingEngineRegistry()
+    registry.register(FakeEngine())
+    return CodingService(tmp_path / "coding", registry=registry, expiry_interval_seconds=interval_seconds)
+
+
+def test_listing_sessions_performs_no_control_plane_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = service_with_expiry(tmp_path, interval_seconds=3600)
+    created, remote = remote_task(tmp_path, service)
+    run, _ = service.control.acquire_lease(remote.id)
+    service.control.store.update_run(run.id, lambda current: setattr(current, "lease_expires_at", utc_now() - timedelta(seconds=1)))
+    stale = service.control.store.get_computer(remote.id)
+    stale.last_seen_at = utc_now() - timedelta(minutes=5)
+    service.control.store.save_computer(stale)
+    template = service.store.load_session(created.id)
+    for index in range(49):
+        task = CodeTask(id=f"task-{index}", title=f"Task {index}")
+        clone = TaskRun(id=f"run-{index}", task_id=task.id, computer_id=service.control.local_computer.id)
+        service.control.store.create_task_run(task, clone, [])
+        service.store.save_session(template.model_copy(update={"id": task.id, "task_id": task.id, "run_id": clone.id}))
+    writes = spy_on_control_store_writes(service.control.store, monkeypatch)
+
+    listed = service.list_sessions()
+
+    assert len(listed.items) == 50
+    assert writes == []
+    assert service.control.store.get_run(run.id).status == RunStatus.preparing
+
+    service.expire_stale_state()
+    assert service.control.store.get_run(run.id).status == RunStatus.recovering
+    assert service.control.store.get_computer(remote.id).status.value == "offline"
+
+
+def test_expiry_runs_on_a_timer_and_stops_with_the_service(tmp_path: Path) -> None:
+    service = service_with_expiry(tmp_path, interval_seconds=0.01)
+    _, remote = remote_task(tmp_path, service)
+    run, _ = service.control.acquire_lease(remote.id)
+    service.control.store.update_run(run.id, lambda current: setattr(current, "lease_expires_at", utc_now() - timedelta(seconds=1)))
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.control.store.get_run(run.id).status != RunStatus.recovering:
+        time.sleep(0.01)
+    assert service.control.store.get_run(run.id).status == RunStatus.recovering
+
+    service.close_all()
+    service._expiry_thread.join(timeout=1)
+    assert not service._expiry_thread.is_alive()
+
+
+def test_continuing_a_task_persists_the_durable_session_not_the_projected_view(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "completed"})
+    projected = service.get_session(created.id)
+    assert (projected.run_status, projected.computer_name) == ("completed", "Build computer")
+
+    continued = service.submit_turn(created.id, "One more change", CREDS)
+
+    durable = service.store.load_session(created.id)
+    assert durable.run_id == continued.run_id != run.id
+    assert durable.status == SessionStatus.ready
+    assert (durable.run_status, durable.computer_name, durable.computer_status) == (None, None, None)
+    assert durable.computer_is_local is True
+    assert durable.task_capabilities == TaskCapabilities()
+    assert continued.run_status == "queued"
+
+
+def test_follow_up_after_a_released_remote_run_reprovisions_its_workspaces(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "workspace", {"items": [{
+        "folder_id": "repo",
+        "folder_name": "Repo",
+        "source_path": "/remote/source",
+        "workspace_path": "/remote/worktrees/repo",
+        "workspace_kind": "git_worktree",
+        "base_revision": "abc123",
+    }]})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 3, "status", {"status": "completed"})
+    released = service.control.store.list_workspaces(run.id)
+    assert [(item.status, item.path) for item in released] == [(WorkspaceStatus.released, "")]
+
+    continued = service.submit_turn(created.id, "One more change", CREDS)
+    lease = service.remote.acquire_lease(remote.id)
+
+    assert lease is not None
+    assert lease.run.id == continued.run_id != run.id
+    assert lease.run.workspace_resume_mode == "prepare"
+    assert [(item.resource_id, item.status, item.path) for item in lease.workspaces] == [
+        ("repo", WorkspaceStatus.pending, ""),
+    ]
+
+
+def test_interrupted_local_task_resumes_on_a_follow_up_run(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.block_until_release = True
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Long-running turn"), CREDS, "fake", "fake-model"
+    )
+    assert engine.started.wait(timeout=1)
+    service.prepare_shutdown()
+    engine.release_events.set()
+    wait_for_status(service, created.id, SessionStatus.interrupted)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and created.id in service._running:
+        time.sleep(0.01)
+    interrupted_run = service.control.store.get_run(created.run_id or "")
+    assert interrupted_run.status == RunStatus.interrupted
+
+    restarted = service_with(tmp_path, FakeEngine())
+    resumed = restarted.submit_turn(created.id, "Pick up where you left off", CREDS)
+    wait_for_status(restarted, created.id, SessionStatus.completed)
+
+    assert resumed.run_id != interrupted_run.id
+    finished = restarted.get_session(created.id)
+    assert finished.run_status == "completed"
+    assert finished.runtime_epoch == interrupted_run.epoch + 1
+    assert restarted.control.store.get_run(interrupted_run.id).status == RunStatus.interrupted
 
 
 def test_failed_adapter_stream_closes_the_runtime_before_another_turn_can_reuse_it(tmp_path: Path) -> None:
@@ -1302,7 +1533,10 @@ def test_queued_instruction_runs_as_the_next_turn_and_is_persisted(tmp_path: Pat
         time.sleep(0.01)
     assert engine.prompts == ["First turn", "Long second turn", "Run this after the current work"]
     wait_for_status(service, created.id, SessionStatus.completed)
-    assert service.get_session(created.id).queued_instructions == []
+    finished = service.get_session(created.id)
+    assert finished.queued_instructions == []
+    assert finished.run_id != queued.run_id
+    assert finished.run_status == "completed"
 
 
 def test_queued_instruction_can_be_removed_before_it_runs(tmp_path: Path) -> None:

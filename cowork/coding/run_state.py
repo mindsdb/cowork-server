@@ -6,7 +6,13 @@ from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, TaskR
 
 _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.queued: frozenset({RunStatus.preparing, RunStatus.cancelled, RunStatus.failed}),
-    RunStatus.preparing: frozenset({RunStatus.ready, RunStatus.cancelled, RunStatus.failed, RunStatus.interrupted}),
+    RunStatus.preparing: frozenset({
+        RunStatus.ready,
+        RunStatus.cancelled,
+        RunStatus.failed,
+        RunStatus.interrupted,
+        RunStatus.recovering,
+    }),
     RunStatus.ready: frozenset({
         RunStatus.running,
         RunStatus.completed,
@@ -25,6 +31,7 @@ _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     }),
     RunStatus.awaiting_approval: frozenset({
         RunStatus.running,
+        RunStatus.ready,
         RunStatus.cancelled,
         RunStatus.interrupted,
         RunStatus.failed,

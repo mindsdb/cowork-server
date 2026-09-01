@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -412,9 +413,10 @@ def test_leases_fence_stale_and_duplicate_runtime_events(tmp_path: Path) -> None
         kind="status",
         payload={"status": "ready"},
     )
-    assert service.renew_lease(event).status == RunStatus.ready
+    assert service.accept_event(event).status == RunStatus.ready
+    assert service.accept_event(event).last_event_seq == 1
     with pytest.raises(StaleRuntimeEvent, match="sequence is stale"):
-        service.renew_lease(event)
+        service.accept_event(event.model_copy(update={"id": "event-reusing-a-sequence"}))
 
     recovered = service.recover_run(
         snapshot.run.id,
@@ -423,7 +425,7 @@ def test_leases_fence_stale_and_duplicate_runtime_events(tmp_path: Path) -> None
     )
     assert recovered.epoch == run.epoch + 1
     with pytest.raises(StaleRuntimeEvent, match="ownership changed"):
-        service.renew_lease(event.model_copy(update={"seq": 2}))
+        service.accept_event(event.model_copy(update={"seq": 2}))
 
 
 def test_runtime_checkpoint_and_error_payloads_are_sanitized_before_persistence(tmp_path: Path) -> None:
@@ -446,7 +448,7 @@ def test_runtime_checkpoint_and_error_payloads_are_sanitized_before_persistence(
     assert leased is not None
     run, lease_id = leased
 
-    checkpoint = service.renew_lease(RuntimeEvent(
+    checkpoint = service.accept_event(RuntimeEvent(
         run_id=run.id,
         computer_id=remote.id,
         lease_id=lease_id,
@@ -455,7 +457,7 @@ def test_runtime_checkpoint_and_error_payloads_are_sanitized_before_persistence(
         kind="checkpoint",
         payload={"authorization": "Bearer secret-token", "detail": "token=secret-token"},
     ))
-    failed = service.renew_lease(RuntimeEvent(
+    failed = service.accept_event(RuntimeEvent(
         run_id=run.id,
         computer_id=remote.id,
         lease_id=lease_id,
@@ -524,7 +526,7 @@ def test_recovered_run_can_be_leased_for_workspace_preparation(tmp_path: Path) -
     assert run.status == RunStatus.preparing
     assert run.epoch == recovered.epoch
     assert lease_id != first[1]
-    assert service.renew_lease(RuntimeEvent(
+    assert service.accept_event(RuntimeEvent(
         run_id=run.id,
         computer_id=remote.id,
         lease_id=lease_id,
@@ -812,3 +814,17 @@ def test_runtime_commands_are_idempotent_retryable_and_acknowledged(tmp_path: Pa
     acknowledged = service.acknowledge_command(run.id, first.id, remote.id, lease_id, run.epoch)
     assert acknowledged.acked_at is not None
     assert service.claim_commands(run.id, remote.id, lease_id, run.epoch) == []
+
+
+def test_run_status_is_only_assigned_by_the_transition_table() -> None:
+    import cowork.coding
+
+    root = Path(cowork.coding.__file__).parent
+    offenders = [
+        f"{path.relative_to(root)}:{number}"
+        for path in root.rglob("*.py")
+        if path.name != "run_state.py"
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        if re.search(r"\brun\.status\s*=(?!=)", line)
+    ]
+    assert offenders == []

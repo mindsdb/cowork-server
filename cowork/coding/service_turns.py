@@ -16,7 +16,7 @@ from cowork.coding.contracts import (
     SessionStatus,
     TaskCapability,
 )
-from cowork.coding.control_models import RunStatus, RuntimeEvent, TaskRun
+from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeEvent, TaskRun
 from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
 from cowork.services.skills import CodeSkillService
@@ -68,14 +68,20 @@ class CodingTurnOperations:
         if not session.run_id:
             return session
         run = self.control.store.get_run(session.run_id)
-        if run.status not in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
+        finished = run.status in TERMINAL_RUN_STATUSES or (
+            run.status == RunStatus.interrupted and run.computer_id == self.control.local_computer.id
+        )
+        if not finished:
             return session
         continued = self.control.continue_task(session.task_id or session.id, run.id)
-        session.run_id = continued.id
-        session.runtime_epoch = continued.epoch
-        session.status = SessionStatus.ready
-        session.last_error = None
-        self.store.save_session(session)
+
+        def link(current: CodingSession) -> None:
+            current.run_id = continued.id
+            current.runtime_epoch = continued.epoch
+            current.status = SessionStatus.ready
+            current.last_error = None
+
+        self.store.update_session(session.id, link)
         return self.get_session(session.id)
 
     def accept_runtime_event(self, event: RuntimeEvent) -> TaskRun:
@@ -345,7 +351,7 @@ class CodingTurnOperations:
             "Wait for the active turn to finish before resuming queued work",
         ):
             while True:
-                session = self.get_session(session_id)
+                session = self._continue_completed_task(self.get_session(session_id))
                 if not session.queued_instructions:
                     return session
                 instruction = session.queued_instructions[0]
