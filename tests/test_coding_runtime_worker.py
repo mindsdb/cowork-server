@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -751,3 +752,99 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         for kind, payload in client.events
     )
     assert ("turn_completed", {"status": "cancelled"}) in client.events
+
+
+def _remote_lease(tmp_path: Path, name: str) -> tuple[RuntimeLease, RuntimeCommand]:
+    source = repository(tmp_path)
+    run = TaskRun(
+        id=f"run-{name}",
+        task_id=f"task-{name}",
+        computer_id="remote-computer",
+        status=RunStatus.preparing,
+        lease_id=f"lease-{name}",
+    )
+    lease = RuntimeLease(
+        task=CodeTask(id=run.task_id, title=name, prompt="Start"),
+        run=run,
+        lease_id=f"lease-{name}",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        project=CodeProject(
+            id=f"{name}-project",
+            name=f"{name} project",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url=str(source))],
+        ),
+        execution=RuntimeExecutionConfig(
+            engine_id="fake",
+            model="fake-model",
+            permission_mode=PermissionMode.workspace,
+        ),
+    )
+    start = RuntimeCommand(
+        id="command-start",
+        run_id=run.id,
+        epoch=run.epoch,
+        kind="start",
+        payload={"prompt": "Start"},
+    )
+    return lease, start
+
+
+def test_command_router_reports_a_failing_handler_and_still_acts_on_cancel(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "failing-steer")
+    steer = RuntimeCommand(
+        id="command-steer",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="steer",
+        payload={"prompt": "Change direction"},
+    )
+    cancel = RuntimeCommand(id="command-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
+    client = FakeRuntimeClient(lease, start)
+    client._commands.extend([steer, cancel])
+    engine = FakeEngine(block_until_cancel=True)
+    engine.steer_error = True
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    assert engine.steers == []
+    assert engine.cancels == ["turn-1"]
+    assert client.results[steer.id] == (None, "adapter rejected steer")
+    assert client.results[cancel.id] == (None, None)
+    assert ("turn_completed", {"status": "cancelled"}) in client.events
+
+
+def test_release_claimed_during_a_turn_is_acknowledged_after_the_turn(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "early-release")
+    release = RuntimeCommand(
+        id="command-release-early",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="release",
+    )
+    cancel = RuntimeCommand(id="command-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
+    client = FakeRuntimeClient(lease, start)
+    client._commands.extend([release, cancel])
+    registry = CodingEngineRegistry()
+    registry.register(FakeEngine(block_until_cancel=True))
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    assert client.acknowledged == [start.id, cancel.id, release.id]
+    assert client.calls.index("event:turn_completed:cancelled") < client.calls.index(f"ack:{release.id}")
+    assert client.calls.index(f"ack:{release.id}") < client.calls.index("event:status:completed")
+
+
+def test_approval_ids_are_unique_per_request(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "approval-ids")
+    client = FakeRuntimeClient(lease, start)
+    runtime = CodeOnlyRuntime(tmp_path / "runtime", client, approval_timeout_seconds=0)
+
+    runtime._approval(lease, "command", {"title": "Run tests"})
+    runtime._approval(lease, "command", {"title": "Run tests"})
+
+    approval_ids = [str(payload["approvalId"]) for kind, payload in client.events if kind == "approval"]
+    assert len(set(approval_ids)) == 2
+    for approval_id in approval_ids:
+        uuid.UUID(approval_id.removeprefix(f"approval-{lease.run.id}-"))
