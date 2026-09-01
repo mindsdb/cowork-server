@@ -68,6 +68,7 @@ class ControlPlaneStore(Protocol):
         workspaces: list[ExecutionWorkspace],
     ) -> tuple[CodeTask, TaskRun, list[ExecutionWorkspace]]: ...
     def claim_run(self, computer_id: str, lease_id: str, lease_expires_at: datetime) -> TaskRun | None: ...
+    def update_run(self, run_id: str, operation: Callable[[TaskRun], None]) -> TaskRun: ...
     def delete_task(self, task_id: str) -> None: ...
     def prune(self, auxiliary_older_than: datetime, audit_older_than: datetime) -> int: ...
 
@@ -291,9 +292,14 @@ class LocalControlPlaneStore:
             return self.save_run(run)
 
     def update_run(self, run_id: str, operation: Callable[[TaskRun], None]) -> TaskRun:
+        """Read, mutate, and persist one run under the store lock; unchanged runs are not rewritten."""
+
         with self._lock:
             run = self.get_run(run_id)
+            before = run.model_dump(mode="json")
             operation(run)
+            if run.model_dump(mode="json") == before:
+                return run
             return self.save_run(run)
 
     def _save(self, collection: str, document: Document) -> Document:

@@ -45,7 +45,7 @@ def build_recovery_plan(
 
 def recover_run(
     store: ControlPlaneStore,
-    run: TaskRun,
+    run_id: str,
     target: Computer,
     *,
     allow_recreate: bool,
@@ -55,35 +55,37 @@ def recover_run(
     if target.status != ComputerStatus.online:
         raise NoEligibleComputer("Choose an online computer to resume this task")
 
-    moving = target.id != run.computer_id
-    if moving:
-        task = store.get_task(run.task_id)
-        project = task.execution_project
-        if project is None or any(
-            not isinstance(resource, RepositoryResource) or not resource.source_url
-            for resource in project.resources
-        ):
-            raise NoEligibleComputer(
-                "This task includes resources that only exist on its original computer"
-            )
-        if not allow_recreate:
-            raise NoEligibleComputer(
-                "Moving this task starts a fresh working copy and requires confirmation"
-            )
+    def fence(run: TaskRun) -> None:
+        moving = target.id != run.computer_id
+        if moving:
+            task = store.get_task(run.task_id)
+            project = task.execution_project
+            if project is None or any(
+                not isinstance(resource, RepositoryResource) or not resource.source_url
+                for resource in project.resources
+            ):
+                raise NoEligibleComputer(
+                    "This task includes resources that only exist on its original computer"
+                )
+            if not allow_recreate:
+                raise NoEligibleComputer(
+                    "Moving this task starts a fresh working copy and requires confirmation"
+                )
+        run.computer_id = target.id
+        run.epoch += 1
+        run.lease_id = None
+        run.lease_expires_at = None
+        run.last_event_seq = 0
+        run.last_event_id = None
+        run.checkpoint = {}
+        run.workspace_resume_mode = "recreate" if moving else "restore"
+        run.recovery_count += 1
+        transition_run(run, RunStatus.recovering)
 
-    run.computer_id = target.id
-    run.epoch += 1
-    run.lease_id = None
-    run.lease_expires_at = None
-    run.last_event_seq = 0
-    run.checkpoint = {}
-    run.workspace_resume_mode = "recreate" if moving else "restore"
-    run.recovery_count += 1
-    transition_run(run, RunStatus.recovering)
-    saved = store.save_run(run)
+    saved = store.update_run(run_id, fence)
 
-    if moving:
-        for workspace in store.list_workspaces(run.id):
+    if saved.workspace_resume_mode == "recreate":
+        for workspace in store.list_workspaces(saved.id):
             workspace.computer_id = target.id
             workspace.status = WorkspaceStatus.pending
             workspace.path = ""

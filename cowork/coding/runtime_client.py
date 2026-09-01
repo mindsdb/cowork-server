@@ -30,6 +30,10 @@ from cowork.coding.runtime_protocol import (
 from cowork.coding.shells import shell_inventory
 
 
+_EVENT_DELIVERY_ATTEMPTS = 3
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
 class RuntimeClientError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
@@ -52,11 +56,19 @@ class StoredRuntimeIdentity:
 class RemoteRuntimeClient:
     """Authenticated outbound client for the versioned execution protocol."""
 
-    def __init__(self, server_url: str, identity: RuntimeIdentity, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        server_url: str,
+        identity: RuntimeIdentity,
+        client: httpx.Client | None = None,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.server_url = server_url.rstrip("/")
         self.identity = identity
         self.client = client or httpx.Client(timeout=30.0)
         self._owns_client = client is None
+        self._sleep = sleep
         self._sequence_lock = threading.Lock()
         self._sequences: dict[str, int] = {}
 
@@ -143,13 +155,27 @@ class RemoteRuntimeClient:
                 kind=kind,
                 payload=payload or {},
             )
-            response = self.client.post(
-                self._url(f"runs/{lease.run.id}/events"),
-                headers=self._headers(),
-                json=event.model_dump(mode="json"),
-            )
-            self._raise(response)
+            self._deliver(event)
             self._sequences[lease.run.id] = sequence
+
+    def _deliver(self, event: RuntimeEvent) -> None:
+        """Redeliver the same event id on transient failures; the control plane deduplicates it."""
+
+        for attempt in range(1, _EVENT_DELIVERY_ATTEMPTS + 1):
+            try:
+                response = self.client.post(
+                    self._url(f"runs/{event.run_id}/events"),
+                    headers=self._headers(),
+                    json=event.model_dump(mode="json"),
+                )
+            except httpx.TransportError:
+                if attempt == _EVENT_DELIVERY_ATTEMPTS:
+                    raise
+            else:
+                if response.status_code not in _RETRYABLE_STATUSES or attempt == _EVENT_DELIVERY_ATTEMPTS:
+                    self._raise(response)
+                    return
+            self._sleep(0.5 * attempt)
 
     def commands(self, lease: RuntimeLease) -> list[RuntimeCommand]:
         response = self.client.post(

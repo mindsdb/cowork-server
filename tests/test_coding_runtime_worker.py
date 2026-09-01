@@ -34,6 +34,7 @@ from cowork.coding.runtime_protocol import (
 )
 from cowork.coding.runtime_worker import (
     CodeOnlyRuntime,
+    RemoteRuntimeClient,
     RuntimeIdentity,
     RuntimeClientError,
     load_runtime_identity,
@@ -272,6 +273,64 @@ def test_runtime_identity_is_created_owner_only_without_a_chmod(monkeypatch, tmp
     assert mode == 0o600
     assert flags & os.O_EXCL
     assert (tmp_path / "runtime-identity.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_runtime_client_redelivers_the_same_event_after_a_transient_failure() -> None:
+    lease, _ = _lease_only("redelivery")
+    statuses = iter([500, 200])
+    posted: list[dict[str, object]] = []
+
+    def control_plane(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(next(statuses), json={})
+
+    delays: list[float] = []
+    client = RemoteRuntimeClient(
+        "https://control.example.test",
+        RuntimeIdentity("remote-computer", "runtime-secret", "Remote"),
+        httpx.Client(transport=httpx.MockTransport(control_plane)),
+        sleep=delays.append,
+    )
+
+    client.event(lease, "status", {"status": "ready"})
+
+    assert [(item["seq"], item["kind"]) for item in posted] == [(1, "status"), (1, "status")]
+    assert posted[0]["id"] == posted[1]["id"]
+    assert delays == [0.5]
+
+
+def test_runtime_client_gives_up_redelivery_on_a_rejected_event() -> None:
+    lease, _ = _lease_only("rejected")
+    attempts: list[int] = []
+
+    def control_plane(request: httpx.Request) -> httpx.Response:
+        attempts.append(json.loads(request.content)["seq"])
+        return httpx.Response(409, json={"detail": "Runtime event sequence is stale"})
+
+    client = RemoteRuntimeClient(
+        "https://control.example.test",
+        RuntimeIdentity("remote-computer", "runtime-secret", "Remote"),
+        httpx.Client(transport=httpx.MockTransport(control_plane)),
+        sleep=lambda _delay: pytest.fail("a rejected event must not be redelivered"),
+    )
+
+    with pytest.raises(RuntimeClientError, match="stale") as raised:
+        client.event(lease, "status", {"status": "ready"})
+
+    assert raised.value.status_code == 409
+    assert attempts == [1]
+
+
+def _lease_only(name: str) -> tuple[RuntimeLease, RuntimeCommand]:
+    run = TaskRun(id=f"run-{name}", task_id=f"task-{name}", computer_id="remote-computer", lease_id=f"lease-{name}")
+    lease = RuntimeLease(
+        task=CodeTask(id=run.task_id, title=name, prompt="Start"),
+        run=run,
+        lease_id=f"lease-{name}",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        execution=RuntimeExecutionConfig(engine_id="fake", model="fake-model", permission_mode=PermissionMode.workspace),
+    )
+    return lease, RuntimeCommand(id="command-start", run_id=run.id, epoch=run.epoch, kind="start")
 
 
 def test_runtime_reconnects_with_bounded_backoff_after_transport_failure() -> None:

@@ -72,6 +72,8 @@ class CodingService(
     CodingTerminalOperations,
     CodingTurnOperations,
 ):
+    EXPIRY_INTERVAL_SECONDS = 5.0
+
     def __init__(
         self,
         root: Path,
@@ -79,6 +81,7 @@ class CodingService(
         store: CodingStore | None = None,
         workspaces: WorkspaceManager | None = None,
         control_store: ControlPlaneStore | None = None,
+        expiry_interval_seconds: float = EXPIRY_INTERVAL_SECONDS,
     ) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -210,6 +213,26 @@ class CodingService(
                 session.resource_ids = [item.resource_id for item in snapshot.workspaces]
                 self.store.save_session(session, touch_updated_at=False)
             self.project_workspaces.restore_ports(session.id, session.allocated_ports)
+        self._expiry_stop = threading.Event()
+        self._expiry_thread = threading.Thread(
+            target=self._expire_periodically,
+            args=(expiry_interval_seconds,),
+            name="coding-expiry",
+            daemon=True,
+        )
+        self._expiry_thread.start()
+
+    def expire_stale_state(self) -> None:
+        """Mark silent computers offline and abandoned leases recovering."""
+        self.control.expire_stale_computers()
+        self.control.expire_leases()
+
+    def _expire_periodically(self, interval_seconds: float) -> None:
+        while not self._expiry_stop.wait(interval_seconds):
+            try:
+                self.expire_stale_state()
+            except Exception:
+                logger.exception("Could not expire stale coding control-plane state")
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
@@ -233,8 +256,6 @@ class CodingService(
 
         if not session.run_id:
             return session
-        self.control.expire_stale_computers()
-        self.control.expire_leases()
         try:
             run = self.control.store.get_run(session.run_id)
             computer = self.control.store.get_computer(run.computer_id)
@@ -457,6 +478,7 @@ class CodingService(
 
     def close_all(self) -> None:
         """Stop every task-owned engine runtime during application shutdown."""
+        self._expiry_stop.set()
         self.prepare_shutdown()
         self.runtimes.close_all()
 
