@@ -39,6 +39,11 @@ from cowork.coding.runtime_client import (
 from cowork.coding.runtime_protocol import RuntimeLease
 from cowork.coding.workspace import WorkspaceManager
 
+_TURN_COMMANDS = frozenset({"steer", "agent_command", "approve", "cancel"})
+_COMMAND_ROUTER_JOIN_SECONDS = 30.0
+_NO_ACTIVE_TURN = "There is no active turn"
+_UNSUPPORTED_COMMAND = "The selected computer does not support that command"
+
 
 class CodeOnlyRuntime:
     """Prepare isolated workspaces and run an agent without a desktop UI."""
@@ -69,6 +74,8 @@ class CodeOnlyRuntime:
         lease = self.client.lease(wait_seconds)
         if lease is None:
             return False
+        with self._pending_lock:
+            self._pending_commands = []
         heartbeat_stop = threading.Event()
         heartbeat_thread = threading.Thread(
             target=self._heartbeat_while_active,
@@ -261,10 +268,15 @@ class CodeOnlyRuntime:
                         selected = command
                     else:
                         self._defer_command(command)
-                elif command.kind == "operation" and selected is None:
-                    self._complete_operation(lease, operations, command)
+                elif command.kind == "operation":
+                    if selected is None:
+                        self._complete_operation(lease, operations, command)
+                    else:
+                        self._defer_command(command)
+                elif command.kind in _TURN_COMMANDS:
+                    self.client.acknowledge(lease, command, error=_NO_ACTIVE_TURN)
                 else:
-                    self._defer_command(command)
+                    self.client.acknowledge(lease, command, error=_UNSUPPORTED_COMMAND)
             if selected is not None:
                 return selected
             self.client.event(lease, "checkpoint", {"waiting": "start", "workspaceReady": True})
@@ -297,7 +309,7 @@ class CodeOnlyRuntime:
                 self.client.event(lease, "event", {"event": event.model_dump(mode="json")})
         finally:
             stop.set()
-            command_thread.join()
+            command_thread.join(timeout=_COMMAND_ROUTER_JOIN_SECONDS)
         self.client.event(lease, "turn_completed", {
             "status": "cancelled" if cancelled.is_set() else "completed",
         })
@@ -465,6 +477,7 @@ class CodeOnlyRuntime:
                 with self._approval_lock:
                     waiter = self._approval_waiters.get(approval_id)
                 if waiter is None:
+                    self.client.acknowledge(lease, command, error="That approval is no longer pending")
                     return
                 waiter[1]["decision"] = str(command.payload.get("decision") or "decline")
                 waiter[0].set()
@@ -472,6 +485,7 @@ class CodeOnlyRuntime:
                 self._complete_operation(lease, operations, command)
                 return
             else:
+                self.client.acknowledge(lease, command, error=_UNSUPPORTED_COMMAND)
                 return
         except RuntimeClientError:
             raise
@@ -482,12 +496,17 @@ class CodeOnlyRuntime:
 
     def _take_commands(self, lease: RuntimeLease) -> list[RuntimeCommand]:
         with self._pending_lock:
-            pending, self._pending_commands = self._pending_commands, []
-        return [*pending, *self.client.commands(lease)]
+            pending = list(self._pending_commands)
+        claimed = self.client.commands(lease)
+        with self._pending_lock:
+            taken = {command.id for command in pending}
+            self._pending_commands = [command for command in self._pending_commands if command.id not in taken]
+        return [*pending, *claimed]
 
     def _defer_command(self, command: RuntimeCommand) -> None:
         with self._pending_lock:
-            self._pending_commands.append(command)
+            if all(pending.id != command.id for pending in self._pending_commands):
+                self._pending_commands.append(command)
 
     def _complete_operation(
         self,

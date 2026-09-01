@@ -25,6 +25,7 @@ from cowork.coding.contracts import (
     DeliveryAutomationClaimRequest,
     DeliveryAutomationPolicy,
     EventPage,
+    QueueRunRequest,
     RenameSessionRequest,
     SessionCreateRequest,
     SessionPage,
@@ -642,11 +643,17 @@ def steer_queued_turn(session_id: str, instruction_id: str):
 
 
 @router.post("/sessions/{session_id}/queue/run")
-def run_next_queued(session_id: str, session: SessionDep, scope: ScopeDep):
+def run_next_queued(
+    session_id: str,
+    session: SessionDep,
+    scope: ScopeDep,
+    body: QueueRunRequest | None = None,
+):
     return _call(
         _service().run_next_queued,
         session_id,
         _credentials(_settings(session, scope)),
+        instruction_id=body.instruction_id if body is not None else None,
     )
 
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import itertools
+import logging
 import subprocess
 import sys
 import threading
@@ -9,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
+
 from coding_service_fakes import (
     CREDS,
     FakeEngine,
@@ -25,7 +30,10 @@ from cowork.coding.contracts import (
     DeliveryRecord,
     EventType,
     InputReference,
+    PendingApproval,
     PermissionMode,
+    QueuedInstruction,
+    QueueRunRequest,
     SessionCreateRequest,
     SessionStatus,
     SessionUpdateRequest,
@@ -34,8 +42,8 @@ from cowork.coding.contracts import (
     WorkspaceKind,
     utc_now,
 )
+from cowork.api.v1.endpoints import coding
 from cowork.coding.context import is_context_exhaustion_error
-from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.control_models import (
     CodeTask,
     ComputerCapabilities,
@@ -58,9 +66,8 @@ from cowork.coding.project_models import (
 )
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
-from cowork.coding.service import CodingService
 from cowork.coding.store import CodingStore
-from cowork.coding.turns import EventBuffer, terminal_status
+from cowork.coding.turns import EventBuffer, finish_turn, mark_running, terminal_status
 from cowork.coding.workspace import WorkspaceError
 
 
@@ -139,6 +146,52 @@ def test_service_startup_survives_a_task_referencing_an_invalid_project(
     service = service_with(tmp_path, FakeEngine())
 
     assert service.get_session("task-with-invalid-project").project_id == "invalid-project"
+
+
+def stored_local_session(tmp_path: Path, status: SessionStatus) -> CodingSession:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = CodingSession(
+        id="stored-task",
+        title="Stored task",
+        engine_id="fake",
+        engine_adapter_version="1",
+        model="fake-model",
+        status=status,
+        source_path=str(workspace),
+        workspace_path=str(workspace),
+        workspace_kind=WorkspaceKind.local_copy,
+    )
+    CodingStore(tmp_path / "coding").save_session(session)
+    return session
+
+
+def test_finishing_a_turn_with_a_pending_approval_completes_the_run(tmp_path: Path) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.ready)
+    service = service_with(tmp_path, FakeEngine())
+    pending = PendingApproval(id="approval-1", method="command", kind="command", title="Run it", detail="ls", risk="low", scope="once")
+    service._emit(session.id, CodingEvent(type=EventType.session, phase="started"), mark_running)
+    service._emit(session.id, CodingEvent(type=EventType.approval, phase="pending"), lambda current: service._open_approval(current, pending))
+    run_id = service.get_session(session.id).run_id
+    assert service.control.store.get_run(run_id).status == RunStatus.awaiting_approval
+
+    service._emit(session.id, CodingEvent(type=EventType.session, phase="completed"), lambda current: finish_turn(current, SessionStatus.completed))
+
+    assert service.control.store.get_run(run_id).status == RunStatus.completed
+    assert service.get_session(session.id).pending_approval is None
+
+
+def test_invalid_run_transition_during_emit_is_logged_with_both_statuses(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.completed)
+    service = service_with(tmp_path, FakeEngine())
+
+    with caplog.at_level(logging.ERROR, logger="cowork.coding.service"):
+        service._emit(session.id, CodingEvent(type=EventType.session, phase="started"), mark_running)
+
+    (record,) = [item for item in caplog.records if "synchronize" in item.getMessage()]
+    assert record.levelno == logging.ERROR
+    assert "from completed to running" in record.getMessage()
+    assert service.control.store.get_run(service.get_session(session.id).run_id).status == RunStatus.completed
 
 
 def test_completed_task_persists_events_and_reuses_live_engine_runtime(tmp_path: Path) -> None:
@@ -760,14 +813,8 @@ def spy_on_control_store_writes(store, monkeypatch: pytest.MonkeyPatch) -> list[
     return writes
 
 
-def service_with_expiry(tmp_path: Path, interval_seconds: float) -> CodingService:
-    registry = CodingEngineRegistry()
-    registry.register(FakeEngine())
-    return CodingService(tmp_path / "coding", registry=registry, expiry_interval_seconds=interval_seconds)
-
-
 def test_listing_sessions_performs_no_control_plane_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    service = service_with_expiry(tmp_path, interval_seconds=3600)
+    service = service_with(tmp_path, FakeEngine(), expiry_interval_seconds=3600)
     created, remote = remote_task(tmp_path, service)
     run, _ = service.control.acquire_lease(remote.id)
     service.control.store.update_run(run.id, lambda current: setattr(current, "lease_expires_at", utc_now() - timedelta(seconds=1)))
@@ -794,7 +841,7 @@ def test_listing_sessions_performs_no_control_plane_writes(tmp_path: Path, monke
 
 
 def test_expiry_runs_on_a_timer_and_stops_with_the_service(tmp_path: Path) -> None:
-    service = service_with_expiry(tmp_path, interval_seconds=0.01)
+    service = service_with(tmp_path, FakeEngine(), expiry_interval_seconds=0.01)
     _, remote = remote_task(tmp_path, service)
     run, _ = service.control.acquire_lease(remote.id)
     service.control.store.update_run(run.id, lambda current: setattr(current, "lease_expires_at", utc_now() - timedelta(seconds=1)))
@@ -807,6 +854,155 @@ def test_expiry_runs_on_a_timer_and_stops_with_the_service(tmp_path: Path) -> No
     service.close_all()
     service._expiry_thread.join(timeout=1)
     assert not service._expiry_thread.is_alive()
+
+
+def test_close_all_leaves_no_expiry_thread_behind(tmp_path: Path) -> None:
+    before = {thread.ident for thread in threading.enumerate() if thread.name == "coding-expiry"}
+    service = service_with(tmp_path, FakeEngine())
+    assert service._expiry_thread.is_alive()
+
+    service.close_all()
+
+    survivors = [thread for thread in threading.enumerate() if thread.name == "coding-expiry" and thread.ident not in before]
+    assert survivors == []
+
+
+def acknowledge(service, run: TaskRun, lease_id: str, command, error: str | None = None):
+    return service.acknowledge_runtime_command(
+        run.id, command.id, run.computer_id, lease_id, run.epoch, None, error,
+    )
+
+
+def command_results(service, session_id: str) -> list[CodingEvent]:
+    return [item for item in service.events(session_id).items if item.type == EventType.command_result]
+
+
+def test_concurrent_duplicate_acks_surface_one_command_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "running"})
+    service.steer(created.id, "Change direction")
+    (steer,) = [item for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch) if item.kind == "steer"]
+    store = service.control.store
+    original_get_command = store.get_command
+    both_read_before_either_acks = threading.Barrier(2, timeout=0.5)
+    reads = itertools.count()
+
+    def get_command(command_id: str):
+        if next(reads) < 2:
+            with contextlib.suppress(threading.BrokenBarrierError):
+                both_read_before_either_acks.wait()
+        return original_get_command(command_id)
+
+    monkeypatch.setattr(store, "get_command", get_command)
+    acks = [threading.Thread(target=acknowledge, args=(service, run, lease_id, steer, "rejected")) for _ in range(2)]
+    for thread in acks:
+        thread.start()
+    for thread in acks:
+        thread.join(timeout=5)
+
+    assert service.control.store.get_command(steer.id).acked_at is not None
+    assert len(command_results(service, created.id)) == 1
+
+
+def test_rejected_remote_command_is_surfaced_once_as_a_redacted_command_result(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "running"})
+    service.steer(created.id, "Change direction")
+    (steer,) = [item for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch) if item.kind == "steer"]
+
+    acknowledge(service, run, lease_id, steer, error="adapter rejected steer: Authorization: Bearer secret-token")
+    acknowledge(service, run, lease_id, steer, error="adapter rejected steer: Authorization: Bearer secret-token")
+
+    (result,) = command_results(service, created.id)
+    assert result.title == "Steer rejected"
+    assert result.phase == "failed"
+    assert result.data == {"command": "steer", "commandId": steer.id}
+    assert "secret-token" not in result.text
+    assert result.text == "adapter rejected steer: Authorization: Bearer [redacted]"
+    assert result.turn_id is None
+
+
+def test_successful_turn_commands_report_completion_but_operations_stay_silent(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "running"})
+    service.cancel(created.id)
+    operation = service.control.queue_command(run.id, "operation", {"operation": "diff"}, "operation-diff-1")
+    claimed = {item.kind: item for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)}
+
+    acknowledge(service, run, lease_id, claimed["start"])
+    acknowledge(service, run, lease_id, claimed["cancel"])
+    acknowledge(service, run, lease_id, operation, error="The task execution workspace is no longer available")
+
+    (result,) = command_results(service, created.id)
+    assert (result.title, result.phase, result.text) == ("Cancel accepted", "completed", "")
+    assert result.data == {"command": "cancel", "commandId": claimed["cancel"].id}
+
+
+def test_failed_queued_start_is_reported_without_requeuing_the_instruction(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "running"})
+    queued = service.queue_turn(created.id, "Run this after the current work")
+    instruction_id = queued.queued_instructions[0].id
+    runtime_event(service, run, lease_id, 3, "turn_completed", {"status": "completed"})
+    assert service.get_session(created.id).queued_instructions == []
+    (start,) = [
+        item for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+        if item.idempotency_key == f"queued-turn-{instruction_id}"
+    ]
+
+    acknowledge(service, run, lease_id, start, error="The engine could not start the turn")
+
+    (result,) = command_results(service, created.id)
+    assert (result.title, result.phase) == ("Turn rejected", "failed")
+    assert result.data["commandId"] == start.id
+    assert service.get_session(created.id).queued_instructions == []
+
+
+def test_queue_run_with_an_instruction_id_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "running"})
+    queued = service.queue_turn(created.id, "Run this after the current work")
+    instruction_id = queued.queued_instructions[0].id
+    runtime_event(service, run, lease_id, 3, "turn_completed", {"status": "cancelled"})
+    assert [item.id for item in service.get_session(created.id).queued_instructions] == [instruction_id]
+    monkeypatch.setattr(coding, "_service", lambda: service)
+    monkeypatch.setattr(coding, "_settings", lambda _session, _scope: None)
+    monkeypatch.setattr(coding, "_credentials", lambda _settings: CREDS)
+
+    def run_queued(body: QueueRunRequest | None) -> CodingSession:
+        return coding.run_next_queued(created.id, session=None, scope=None, body=body)
+
+    with pytest.raises(HTTPException) as stale:
+        run_queued(QueueRunRequest(instruction_id="not-the-head"))
+    assert stale.value.status_code == 409
+    assert [item.id for item in service.get_session(created.id).queued_instructions] == [instruction_id]
+
+    started = run_queued(QueueRunRequest(instruction_id=instruction_id))
+    assert started.queued_instructions == []
+    starts = [item for item in service.control.store.list_commands(run.id) if item.idempotency_key == f"queued-turn-{instruction_id}"]
+    assert len(starts) == 1
+
+    with pytest.raises(HTTPException) as repeated:
+        run_queued(QueueRunRequest(instruction_id=instruction_id))
+    assert repeated.value.status_code == 409
+    assert service.get_session(created.id).queued_instructions == []
+    assert len([item for item in service.control.store.list_commands(run.id) if item.kind == "start"]) == 2
+    assert run_queued(None).queued_instructions == []
 
 
 def test_continuing_a_task_persists_the_durable_session_not_the_projected_view(tmp_path: Path) -> None:
@@ -1315,6 +1511,29 @@ def test_status_and_compact_commands_do_not_start_model_turns(tmp_path: Path) ->
     text = "\n".join(event.text for event in service.events(created.id).items)
     assert "Goal (active): Ship it" in text
     assert "compacting the task context" in text
+
+
+def test_queue_continues_after_an_immediate_command_without_reusing_its_id(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    first = QueuedInstruction(id="queued-status", prompt="/status")
+    second = QueuedInstruction(id="queued-turn", prompt="Second turn")
+    service.store.update_session(
+        created.id,
+        lambda session: session.queued_instructions.extend([first, second]),
+    )
+
+    started = service.run_next_queued(created.id, CREDS, first.id)
+    assert started.status == SessionStatus.running
+    wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert engine.prompts == ["First turn", "Second turn"]
+    assert service.get_session(created.id).queued_instructions == []
 
 
 def test_immediate_command_reservation_prevents_a_new_turn_from_racing_compaction(tmp_path: Path) -> None:

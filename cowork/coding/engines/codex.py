@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,17 @@ _TERMINAL_NOT_READY = "no active command/exec for process id"
 _TERMINAL_WRITE_READY_TIMEOUT_SECONDS = 5.0
 _TERMINAL_WRITE_RETRY_SECONDS = 0.02
 _CANCEL_WATCHDOG_TIMEOUT_SECONDS = 5.0
+_CANCEL_WIND_DOWN_TIMEOUT_SECONDS = 60.0
+
+
+@dataclass
+class _CancelWatch:
+    acknowledged: threading.Event = field(default_factory=threading.Event)
+    finished: threading.Event = field(default_factory=threading.Event)
+
+    def settle(self) -> None:
+        self.acknowledged.set()
+        self.finished.set()
 
 
 class CodexEngine:
@@ -188,7 +200,7 @@ class CodexEngineSession:
         self._sandbox_policy = launch.sandbox_policy
         self._secrets = tuple(value for value in (credentials.minds_api_key,) if value)
         self._closed = threading.Event()
-        self._cancel_watchdogs: dict[str, threading.Event] = {}
+        self._cancel_watchdogs: dict[str, _CancelWatch] = {}
         self._cancel_lock = threading.Lock()
         self._terminal_handlers: dict[str, TerminalOutputHandler] = {}
         self._terminal_lock = threading.Lock()
@@ -375,15 +387,15 @@ class CodexEngineSession:
         # still converge instead of waiting forever to start its fallback.
         start_watchdog = False
         with self._cancel_lock:
-            acknowledged = self._cancel_watchdogs.get(turn_id)
-            if acknowledged is None:
-                acknowledged = threading.Event()
-                self._cancel_watchdogs[turn_id] = acknowledged
+            watch = self._cancel_watchdogs.get(turn_id)
+            if watch is None:
+                watch = _CancelWatch()
+                self._cancel_watchdogs[turn_id] = watch
                 start_watchdog = True
         if start_watchdog:
             threading.Thread(
                 target=self._cancel_watchdog,
-                args=(acknowledged,),
+                args=(watch,),
                 name="codex-cancel-watchdog",
                 daemon=True,
             ).start()
@@ -392,7 +404,7 @@ class CodexEngineSession:
             self._client.cancel_goal_operation(goal_state)
         else:
             self._client.turn_interrupt(self._session_id, turn_id)
-        acknowledged.set()
+        watch.acknowledged.set()
 
     def compact(self) -> None:
         self._client.thread_compact(self._session_id)
@@ -430,7 +442,7 @@ class CodexEngineSession:
         for kind, method, params, response_model in calls:
             try:
                 response = self._client.request(method, params, response_model=response_model)
-                add_extension_response(inventory, kind, response)
+                add_extension_response(inventory, kind, response, skill_roots=self._skill_roots or ())
             except Exception as exc:  # noqa: BLE001 - one unavailable extension must not hide the rest.
                 inventory.errors.append(f"{kind}: {redact_text(str(exc), self._secrets)[:1_000]}")
         return inventory
@@ -578,32 +590,43 @@ class CodexEngineSession:
             return
         self._closed.set()
         with self._cancel_lock:
-            watchdogs = list(self._cancel_watchdogs.values())
+            watches = list(self._cancel_watchdogs.values())
             self._cancel_watchdogs.clear()
-        for watchdog in watchdogs:
-            watchdog.set()
+        for watch in watches:
+            watch.settle()
         try:
             terminate_descendants(self._app_server_pid())
         finally:
             self._client.close()
 
-    def _cancel_watchdog(self, acknowledged: threading.Event) -> None:
-        if acknowledged.wait(timeout=_CANCEL_WATCHDOG_TIMEOUT_SECONDS) or self._closed.is_set():
-            return
-        # Interrupt is cooperative. If app-server does not acknowledge it, tear
-        # down the turn's child processes first; only if that still does not
-        # unblock the interrupt, close the session so Stop cannot leave work
-        # running invisibly after the UI reports cancellation.
-        terminate_descendants(self._app_server_pid())
-        if acknowledged.wait(timeout=_CANCEL_WATCHDOG_TIMEOUT_SECONDS) or self._closed.is_set():
-            return
-        self.close()
+    def _cancel_watchdog(self, watch: _CancelWatch) -> None:
+        if not self._settled(watch.acknowledged, _CANCEL_WATCHDOG_TIMEOUT_SECONDS):
+            # Interrupt is cooperative. If app-server does not acknowledge it,
+            # tear down the turn's child processes first; only if that still
+            # does not unblock the interrupt, close the session so Stop cannot
+            # leave work running invisibly after the UI reports cancellation.
+            terminate_descendants(self._app_server_pid())
+            if not self._settled(watch.acknowledged, _CANCEL_WATCHDOG_TIMEOUT_SECONDS):
+                self.close()
+                return
+        if not self._settled(watch.finished, _CANCEL_WIND_DOWN_TIMEOUT_SECONDS):
+            # The interrupt was accepted but the turn never wound down. Codex
+            # app-server does not expose ownership for individual descendants,
+            # so killing its process tree while retaining this session would
+            # also silently kill interactive terminals that the UI still marks
+            # as live. Close the runtime instead: the manager will discard it,
+            # terminal exit handlers reconcile their buffers, and the next turn
+            # opens a clean session.
+            self.close()
+
+    def _settled(self, event: threading.Event, timeout: float) -> bool:
+        return event.wait(timeout=timeout) or self._closed.is_set()
 
     def _finish_cancel_watchdog(self, turn_id: str) -> None:
         with self._cancel_lock:
-            watchdog = self._cancel_watchdogs.pop(turn_id, None)
-        if watchdog is not None:
-            watchdog.set()
+            watch = self._cancel_watchdogs.pop(turn_id, None)
+        if watch is not None:
+            watch.settle()
 
     def _run_terminal(
         self,

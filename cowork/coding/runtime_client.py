@@ -237,7 +237,9 @@ class RemoteRuntimeClient:
                 response.status_code,
             ) from exc
 
-def _atomic_write(target: Path, contents: str, mode: int = 0o666) -> None:
+def atomic_write(target: Path, contents: str, mode: int = 0o666) -> None:
+    """Replace ``target`` through a uniquely named temporary file created with ``mode``."""
+
     temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
@@ -265,7 +267,7 @@ def load_runtime_identity(root: Path) -> StoredRuntimeIdentity | None:
 
 def save_runtime_identity(root: Path, server_url: str, identity: RuntimeIdentity) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    _atomic_write(root / "runtime-identity.json", json.dumps({
+    atomic_write(root / "runtime-identity.json", json.dumps({
         "server_url": server_url.rstrip("/"),
         "computer_id": identity.computer_id,
         "runtime_token": identity.runtime_token,

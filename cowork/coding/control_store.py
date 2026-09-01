@@ -12,6 +12,7 @@ from typing import ClassVar, Protocol, TypeVar
 from pydantic import BaseModel
 
 from cowork.coding.contracts import utc_now
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import (
     CodeTask,
     Computer,
@@ -420,7 +421,7 @@ class LocalControlPlaneStore:
                 for collection, document in documents:
                     target = self._path(collection, str(document.id))
                     if target.exists():
-                        raise ValueError(f"{collection.rstrip('s')} already exists")
+                        raise StateConflict(f"{collection.rstrip('s')} already exists")
                     stage = target.parent / f".{document.id}.{transaction_id}.tmp"
                     stage.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
                     entries.append({

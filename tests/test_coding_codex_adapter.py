@@ -276,6 +276,69 @@ def test_extension_inventory_normalizes_codex_skills_and_mcp_servers() -> None:
     assert inventory.mcp_servers[0].detail == "2 tools · 0 resources"
 
 
+def _codex_skill(name: str, path: Path, scope: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        description=f"{name} skill",
+        short_description=None,
+        enabled=True,
+        scope=scope,
+        path=path,
+    )
+
+
+def _skills_inventory(skills: list[SimpleNamespace], skill_roots: tuple[Path, ...]) -> ExtensionInventory:
+    inventory = ExtensionInventory()
+    add_extension_response(
+        inventory,
+        "skills",
+        SimpleNamespace(data=[SimpleNamespace(skills=skills)]),
+        skill_roots=skill_roots,
+    )
+    return inventory
+
+
+def test_extension_inventory_folds_a_skill_installed_in_both_skill_roots(tmp_path: Path) -> None:
+    snapshot_root = tmp_path / "snapshot"
+    user_root = tmp_path / "codex" / "skills"
+    user_copy = _codex_skill("Thermo Nuclear Review", user_root / "thermo-nuclear-review" / "SKILL.md", "user")
+    snapshot_copy = _codex_skill("thermo-nuclear-review", snapshot_root / "thermo-nuclear-review" / "SKILL.md", "repo")
+
+    inventory = _skills_inventory([user_copy, snapshot_copy], (snapshot_root,))
+
+    assert [entry.path for entry in inventory.skills] == [str(snapshot_copy.path)]
+    surviving = inventory.skills[0]
+    assert [hidden.path for hidden in surviving.supersedes] == [str(user_copy.path)]
+    assert surviving.supersedes[0].label == "Thermo Nuclear Review"
+    assert surviving.supersedes[0].description == "Thermo Nuclear Review skill"
+    assert surviving.detail == "repo · also installed in user"
+
+
+def test_extension_inventory_keeps_a_pathless_skill_out_of_the_snapshot_root(tmp_path: Path) -> None:
+    snapshot_root = tmp_path / "snapshot"
+    pathless = _codex_skill("review", None, "user")
+    snapshot_copy = _codex_skill("review", snapshot_root / "review" / "SKILL.md", "repo")
+
+    inventory = _skills_inventory([pathless, snapshot_copy], (snapshot_root,))
+
+    assert [entry.path for entry in inventory.skills] == [str(snapshot_copy.path)]
+    assert inventory.skills[0].supersedes[0].path is None
+
+
+def test_extension_inventory_keeps_distinct_skills_and_single_user_skills_untouched(tmp_path: Path) -> None:
+    snapshot_root = tmp_path / "snapshot"
+    user_root = tmp_path / "codex" / "skills"
+    review = _codex_skill("review", user_root / "review" / "SKILL.md", "user")
+    deploy = _codex_skill("deploy", snapshot_root / "deploy" / "SKILL.md", "repo")
+
+    inventory = _skills_inventory([review, deploy], (snapshot_root,))
+
+    assert [entry.id for entry in inventory.skills] == ["review", "deploy"]
+    assert all(entry.supersedes == [] for entry in inventory.skills)
+    assert inventory.skills[0].detail == "user"
+    assert inventory.skills[1].detail == "repo"
+
+
 def test_code_and_user_skill_roots_use_current_codex_rpc_name(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, dict[str, object], object]] = []
 
@@ -471,8 +534,8 @@ def test_slow_cooperative_cancel_keeps_terminals_and_session_alive(monkeypatch) 
     monkeypatch.setattr(codex_module, "terminate_descendants", lambda pid: calls.append(f"terminate:{pid}"))
 
     engine_session.cancel("turn-1")
-    watchdogs[0].run()
     events = list(engine_session.events("turn-1"))
+    watchdogs[0].run()
 
     assert calls == ["interrupt"]
     assert events[-1].data == {"status": "interrupted"}
@@ -494,11 +557,33 @@ def test_unacknowledged_interrupt_terminates_turn_processes_before_closing(monke
     monkeypatch.setattr(codex_module, "_CANCEL_WATCHDOG_TIMEOUT_SECONDS", 0.0)
     monkeypatch.setattr(codex_module, "terminate_descendants", lambda pid: calls.append(f"terminate:{pid}"))
 
-    engine_session._cancel_watchdog(codex_module.threading.Event())
+    engine_session._cancel_watchdog(codex_module._CancelWatch())
 
     assert calls[0] == "terminate:4321"
     assert calls[-1] == "close"
     assert engine_session.is_closed
+
+
+def test_acknowledged_interrupt_that_never_winds_down_closes_and_reconciles_the_runtime(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class FakeClient:
+        _proc = SimpleNamespace(pid=4321)
+
+        def close(self) -> None:
+            calls.append("close")
+
+    engine_session = _cancellable_session(FakeClient())
+    monkeypatch.setattr(codex_module, "_CANCEL_WIND_DOWN_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(codex_module, "terminate_descendants", lambda pid: calls.append(f"terminate:{pid}"))
+    watch = codex_module._CancelWatch()
+    watch.acknowledged.set()
+
+    engine_session._cancel_watchdog(watch)
+
+    assert calls == ["terminate:4321", "close"]
+    assert engine_session.is_closed
+    assert set(engine_session._terminal_handlers) == {"terminal-1"}
 
 
 def test_close_fails_loudly_when_the_sdk_process_handle_is_renamed(monkeypatch) -> None:

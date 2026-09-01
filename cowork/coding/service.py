@@ -46,6 +46,7 @@ from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_tasks import ProjectTaskOperations
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
+from cowork.coding.run_state import InvalidRunTransition
 from cowork.coding.runtime import RuntimeManager
 from cowork.coding.service_delivery import CodingDeliveryOperations
 from cowork.coding.service_terminals import CodingTerminalOperations
@@ -481,6 +482,7 @@ class CodingService(
         self._expiry_stop.set()
         self.prepare_shutdown()
         self.runtimes.close_all()
+        self._expiry_thread.join(timeout=1)
 
     def prepare_shutdown(self) -> int:
         """Checkpoint active turns before the desktop terminates the sidecar tree."""
@@ -537,6 +539,8 @@ class CodingService(
         stored = self.store.append_event(session_id, event, update)
         try:
             self.control.sync_session(self.store.load_session(session_id))
+        except InvalidRunTransition as exc:
+            logger.error("Could not synchronize Task Run state for coding task %s: %s", session_id, exc)
         except (KeyError, ValueError):
             logger.exception("Could not synchronize Task Run state for coding task %s", session_id)
         return stored

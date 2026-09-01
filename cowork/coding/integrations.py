@@ -229,8 +229,6 @@ class DeveloperIntegrationService:
         owner, repository = self._github_repository(repository_url, host)
         base = str(fields.get("base_url") or fields.get("url") or "https://github.com").rstrip("/")
         parsed = urlparse(base)
-        if parsed.scheme != "https":
-            raise WorkspaceError("GitHub branch publishing requires an HTTPS connection URL")
         remote_url = f"{parsed.scheme}://{parsed.netloc}/{owner}/{repository}.git"
         encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
         return GitPushCredentials(
@@ -570,7 +568,7 @@ class DeveloperIntegrationService:
                     raise WorkspaceError("The connected developer tool redirected to another host")
                 hops += 1
                 if hops > self.client.max_redirects:
-                    raise httpx.TooManyRedirects("Exceeded maximum allowed redirects.", request=response.next_request)
+                    raise WorkspaceError("The connected developer tool is currently unavailable")
                 response = self.client.send(response.next_request, follow_redirects=False)
         except httpx.HTTPError as exc:
             raise WorkspaceError("The connected developer tool is currently unavailable") from exc

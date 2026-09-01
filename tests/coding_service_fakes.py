@@ -249,7 +249,18 @@ class FakeEngine:
         return ["fake-model"]
 
 
-def service_with(tmp_path: Path, engine: FakeEngine) -> CodingService:
+_open_services: list[CodingService] = []
+
+
+def service_with(tmp_path: Path, engine: FakeEngine, **options) -> CodingService:
     registry = CodingEngineRegistry()
     registry.register(engine)
-    return CodingService(tmp_path / "coding", registry=registry)
+    service = CodingService(tmp_path / "coding", registry=registry, **options)
+    _open_services.append(service)
+    return service
+
+
+def close_services() -> None:
+    """Stop every service a test built through ``service_with``; the conftest fixture calls this per test."""
+    while _open_services:
+        _open_services.pop().close_all()

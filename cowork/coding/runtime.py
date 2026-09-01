@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,7 @@ class RuntimeManager:
         self._registry = registry
         self._approval_request = approval_request
         self._lock = threading.RLock()
-        self._session_locks: dict[str, threading.RLock] = {}
+        self._session_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
         self._runtimes: dict[str, EngineSession] = {}
         self._terminals: dict[tuple[str, str], TerminalBuffer] = {}
         self._closed = False
