@@ -96,16 +96,17 @@ async def acquire_runtime_lease(
     body: RuntimeLeaseRequest,
     request: Request,
 ):
-    _require_protocol(body.protocol_version)
-    _authenticate(request, computer_id)
+    def authenticated_attempt() -> RuntimeLease | None:
+        _require_protocol(body.protocol_version)
+        _authenticate(request, computer_id)
+        return get_coding_service().remote.acquire_lease(computer_id)
+
     deadline = time.monotonic() + body.wait_seconds
-    while True:
-        lease = await asyncio.to_thread(get_coding_service().remote.acquire_lease, computer_id)
-        if lease is not None:
-            return lease
-        if time.monotonic() >= deadline:
-            return None
+    lease = await asyncio.to_thread(authenticated_attempt)
+    while lease is None and time.monotonic() < deadline:
         await asyncio.sleep(0.25)
+        lease = await asyncio.to_thread(get_coding_service().remote.acquire_lease, computer_id)
+    return lease
 
 
 @router.post("/runs/{run_id}/events")
