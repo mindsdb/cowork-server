@@ -18,6 +18,7 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.control_models import (
     RunStatus,
+    RuntimeCommand,
     RuntimeEvent,
     TaskResourceScope,
     TaskRun,
@@ -93,6 +94,42 @@ class RemoteExecutionCoordinator:
         if run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
             self.control.release_workspaces(run.id)
             self.control.revoke_connector_grants(run.id)
+
+    def acknowledge_command(
+        self,
+        run_id: str,
+        command_id: str,
+        computer_id: str,
+        lease_id: str,
+        epoch: int,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> RuntimeCommand:
+        """Record a worker's acknowledgement and tell the session how its command fared.
+
+        Operation results are consumed synchronously by ``operation`` and are
+        not user-visible commands, so they never produce a timeline entry.
+        """
+
+        command, first_ack = self.control.acknowledge_command(
+            run_id, command_id, computer_id, lease_id, epoch, result, error,
+        )
+        if not first_ack or command.kind == "operation":
+            return command
+        if command.error is None and command.kind not in _REPORTED_SUCCESSES:
+            return command
+        label = _COMMAND_LABELS.get(command.kind, command.kind.replace("_", " ").capitalize())
+        self.store.append_event(
+            self.control.store.get_run(run_id).task_id,
+            CodingEvent(
+                type=EventType.command_result,
+                title=f"{label} {'rejected' if command.error else 'accepted'}",
+                text=command.error or "",
+                phase="failed" if command.error else "completed",
+                data={"command": command.kind, "commandId": command.id},
+            ),
+        )
+        return command
 
     def queue_turn(
         self,
@@ -527,6 +564,17 @@ _SESSION_STATUS = {
     RunStatus.interrupted: SessionStatus.interrupted,
     RunStatus.failed: SessionStatus.failed,
     RunStatus.recovering: SessionStatus.interrupted,
+}
+
+_REPORTED_SUCCESSES = frozenset({"steer", "cancel", "approve"})
+
+_COMMAND_LABELS = {
+    "start": "Turn",
+    "steer": "Steer",
+    "agent_command": "Command",
+    "approve": "Approval",
+    "cancel": "Cancel",
+    "release": "Release",
 }
 
 _STATUS_TITLES = {

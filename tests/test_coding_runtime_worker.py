@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from coding_service_fakes import FakeEngine, repository
+from coding_service_fakes import FakeEngine, FakeSession, repository
 
 from cowork.coding.contracts import PermissionMode
 from cowork.coding.control_models import (
@@ -32,6 +32,7 @@ from cowork.coding.runtime_protocol import (
     RuntimeExecutionConfig,
     RuntimeLease,
 )
+from cowork.coding import runtime_worker
 from cowork.coding.runtime_worker import (
     CodeOnlyRuntime,
     RemoteRuntimeClient,
@@ -55,6 +56,7 @@ class FakeRuntimeClient:
         self._lease = lease
         self._commands = [command]
         self._after_turn = after_turn or []
+        self.mid_turn: list[RuntimeCommand] = []
         self.events: list[tuple[str, dict[str, object]]] = []
         self.acknowledged: list[str] = []
         self.results: dict[str, tuple[dict[str, object] | None, str | None]] = {}
@@ -75,6 +77,9 @@ class FakeRuntimeClient:
         self.events.append((kind, payload or {}))
         status = str((payload or {}).get("status") or "")
         self.calls.append(f"event:{kind}:{status}")
+        if kind == "status" and status == "running":
+            self._commands.extend(self.mid_turn)
+            self.mid_turn = []
         if kind == "workspace":
             for item in (payload or {}).get("items", []):
                 workspace_path = Path(str(item["workspace_path"]))
@@ -97,6 +102,8 @@ class FakeRuntimeClient:
         result: dict[str, object] | None = None,
         error: str | None = None,
     ) -> None:
+        if command.run_id != _lease.run.id:
+            raise RuntimeClientError("Runtime command not found", 404)
         self.acknowledged.append(command.id)
         self.calls.append(f"ack:{command.id}")
         self.results[command.id] = (result, error)
@@ -820,7 +827,7 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         kind="cancel",
     )
     client = FakeRuntimeClient(lease, start)
-    client._commands.extend([steer, status, cancel])
+    client.mid_turn = [steer, status, cancel]
     engine = FakeEngine(block_until_cancel=True)
     registry = CodingEngineRegistry()
     registry.register(engine)
@@ -883,7 +890,7 @@ def test_command_router_reports_a_failing_handler_and_still_acts_on_cancel(tmp_p
     )
     cancel = RuntimeCommand(id="command-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
     client = FakeRuntimeClient(lease, start)
-    client._commands.extend([steer, cancel])
+    client.mid_turn = [steer, cancel]
     engine = FakeEngine(block_until_cancel=True)
     engine.steer_error = True
     registry = CodingEngineRegistry()
@@ -908,7 +915,7 @@ def test_release_claimed_during_a_turn_is_acknowledged_after_the_turn(tmp_path: 
     )
     cancel = RuntimeCommand(id="command-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
     client = FakeRuntimeClient(lease, start)
-    client._commands.extend([release, cancel])
+    client.mid_turn = [release, cancel]
     registry = CodingEngineRegistry()
     registry.register(FakeEngine(block_until_cancel=True))
 
@@ -917,6 +924,183 @@ def test_release_claimed_during_a_turn_is_acknowledged_after_the_turn(tmp_path: 
     assert client.acknowledged == [start.id, cancel.id, release.id]
     assert client.calls.index("event:turn_completed:cancelled") < client.calls.index(f"ack:{release.id}")
     assert client.calls.index(f"ack:{release.id}") < client.calls.index("event:status:completed")
+
+
+def test_stale_turn_commands_between_turns_are_rejected_not_applied_to_the_next_turn(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "stale-cancel")
+    stale_cancel = RuntimeCommand(id="command-stale-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
+    stale_steer = RuntimeCommand(
+        id="command-stale-steer",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="steer",
+        payload={"prompt": "Too late"},
+    )
+    client = FakeRuntimeClient(lease, stale_cancel)
+    client._commands.extend([stale_steer, start])
+    engine = FakeEngine()
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    assert client.results[stale_cancel.id] == (None, "There is no active turn")
+    assert client.results[stale_steer.id] == (None, "There is no active turn")
+    assert client.calls.index(f"ack:{stale_cancel.id}") < client.calls.index("event:status:running")
+    assert engine.cancels == []
+    assert engine.steers == []
+    assert ("turn_completed", {"status": "completed"}) in client.events
+
+
+def test_unknown_and_orphaned_commands_are_acknowledged_with_an_error(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "unknown-kinds")
+    prepare = RuntimeCommand(id="command-prepare", run_id=lease.run.id, epoch=lease.run.epoch, kind="prepare")
+    checkpoint = RuntimeCommand(id="command-checkpoint", run_id=lease.run.id, epoch=lease.run.epoch, kind="checkpoint")
+    orphan_approve = RuntimeCommand(
+        id="command-orphan-approve",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="approve",
+        payload={"approvalId": "approval-that-already-timed-out", "decision": "approve_once"},
+    )
+    cancel = RuntimeCommand(id="command-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
+    client = FakeRuntimeClient(lease, prepare)
+    client._commands.append(start)
+    client.mid_turn = [checkpoint, orphan_approve, cancel]
+    registry = CodingEngineRegistry()
+    registry.register(FakeEngine(block_until_cancel=True))
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    unsupported = "The selected computer does not support that command"
+    assert client.results[prepare.id] == (None, unsupported)
+    assert client.results[checkpoint.id] == (None, unsupported)
+    assert client.results[orphan_approve.id] == (None, "That approval is no longer pending")
+    assert client.results[cancel.id] == (None, None)
+
+
+class SequentialLeaseClient(FakeRuntimeClient):
+    """Hand out several leases in turn and only the commands addressed to the active run."""
+
+    def __init__(
+        self,
+        leases: list[RuntimeLease],
+        commands: list[RuntimeCommand],
+        mid_turn: dict[str, list[RuntimeCommand]],
+    ) -> None:
+        super().__init__(leases[0], commands[0])
+        self._leases = list(leases)
+        self._commands = list(commands)
+        self._mid_turn = mid_turn
+
+    def lease(self, wait_seconds: float = 0) -> RuntimeLease | None:
+        return self._leases.pop(0) if self._leases else None
+
+    def commands(self, lease: RuntimeLease) -> list[RuntimeCommand]:
+        matching = [item for item in self._commands if item.run_id == lease.run.id]
+        self._commands = [item for item in self._commands if item.run_id != lease.run.id]
+        return matching
+
+    def event(self, lease: RuntimeLease, kind: str, payload: dict[str, object] | None = None) -> None:
+        if kind == "status" and (payload or {}).get("status") == "running":
+            self.mid_turn = self._mid_turn.pop(lease.run.id, [])
+        super().event(lease, kind, payload)
+
+
+def test_release_redelivered_during_a_long_turn_does_not_leak_into_the_next_lease(tmp_path: Path) -> None:
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+    first_lease, first_start = _remote_lease(tmp_path / "first", "first")
+    second_lease, second_start = _remote_lease(tmp_path / "second", "second")
+    first_start = first_start.model_copy(update={"id": "start-first", "payload": {"prompt": "Start first"}})
+    second_start = second_start.model_copy(update={"id": "start-second", "payload": {"prompt": "Start second"}})
+    release = RuntimeCommand(id="release-first", run_id=first_lease.run.id, epoch=first_lease.run.epoch, kind="release")
+    redelivered = release.model_copy(update={"delivery_count": 2})
+    cancel = RuntimeCommand(id="cancel-first", run_id=first_lease.run.id, epoch=first_lease.run.epoch, kind="cancel")
+    client = SequentialLeaseClient(
+        [first_lease, second_lease],
+        [first_start, second_start],
+        {first_lease.run.id: [release, redelivered, cancel]},
+    )
+    engine = FakeEngine()
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+    runtime = CodeOnlyRuntime(tmp_path / "runtime", client, registry)
+
+    engine.block_until_cancel = True
+    assert runtime.run_once()
+    engine.block_until_cancel = False
+    assert runtime.run_once()
+
+    assert engine.prompts == ["Start first", "Start second"]
+    assert client.acknowledged.count(release.id) == 1
+    assert client.acknowledged.index(second_start.id) > client.acknowledged.index(release.id)
+    assert client.results["command-release"] == ({}, None)
+    assert [payload.get("status") for kind, payload in client.events if kind == "status"].count("completed") == 2
+
+
+def test_deferred_commands_survive_a_failed_claim(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "failed-claim")
+    client = FakeRuntimeClient(lease, start)
+    runtime = CodeOnlyRuntime(tmp_path / "runtime", client, CodingEngineRegistry())
+    release = RuntimeCommand(id="command-release", run_id=lease.run.id, epoch=lease.run.epoch, kind="release")
+    runtime._defer_command(release)
+    claim = client.commands
+
+    def failing_claim(_lease: RuntimeLease) -> list[RuntimeCommand]:
+        client.commands = claim
+        raise RuntimeClientError("restarting", 503)
+
+    client.commands = failing_claim
+    with pytest.raises(RuntimeClientError, match="restarting"):
+        runtime._take_commands(lease)
+
+    assert runtime._take_commands(lease) == [release, start]
+    assert runtime._take_commands(lease) == []
+
+
+def test_turn_completes_even_when_a_command_handler_hangs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lease, start = _remote_lease(tmp_path, "hanging-steer")
+    steer = RuntimeCommand(
+        id="command-hanging-steer",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="steer",
+        payload={"prompt": "Change direction"},
+    )
+    client = FakeRuntimeClient(lease, start)
+    client.mid_turn = [steer]
+    engine = FakeEngine()
+    engine.block_until_release = True
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+    steer_started = threading.Event()
+    release_steer = threading.Event()
+
+    def hanging_steer(self: FakeSession, turn_id: str, prompt: str, attachments=()) -> None:
+        steer_started.set()
+        release_steer.wait(timeout=5)
+        self.engine.steers.append((turn_id, prompt))
+
+    monkeypatch.setattr(FakeSession, "steer", hanging_steer)
+    monkeypatch.setattr(runtime_worker, "_COMMAND_ROUTER_JOIN_SECONDS", 0.05)
+    runtime = CodeOnlyRuntime(tmp_path / "runtime", client, registry)
+    worker = threading.Thread(target=runtime.run_once, daemon=True)
+    worker.start()
+    assert steer_started.wait(timeout=5)
+    engine.release_events.set()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("turn_completed", {"status": "completed"}) not in client.events:
+        time.sleep(0.01)
+    assert ("turn_completed", {"status": "completed"}) in client.events
+    assert steer.id not in client.acknowledged
+
+    release_steer.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert engine.steers == [("turn-1", "Change direction")]
+    assert steer.id in client.acknowledged
 
 
 def test_approval_ids_are_unique_per_request(tmp_path: Path) -> None:

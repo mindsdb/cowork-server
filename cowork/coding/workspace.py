@@ -8,6 +8,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import IO
 
 from cowork.coding.contracts import (
     DiffFile,
@@ -28,6 +29,9 @@ class WorkspaceError(RuntimeError):
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024
+SNAPSHOT_TRUNCATED_MARKER = (
+    "Snapshot truncated because this task has a large combined patch. Open the worktree to recover the rest.\n"
+)
 _TASK_ROOT_METADATA = (".DS_Store", "Thumbs.db", "desktop.ini")
 
 
@@ -65,6 +69,14 @@ class ApplyPlan:
             raise ValueError("a local-copy handoff plan cannot contain a Git patch")
 
 
+def _truncate_at_file_boundary(patch: Path, limit: int) -> None:
+    """Cut a combined patch at the last whole-file diff that fits in ``limit`` bytes."""
+    with patch.open("rb") as handle:
+        head = handle.read(limit)
+    boundary = head.rfind(b"\ndiff --git ")
+    os.truncate(patch, boundary + 1 if boundary >= 0 else 0)
+
+
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
@@ -91,6 +103,7 @@ class GitRunner:
         *args: str,
         check: bool = True,
         input_text: str | None = None,
+        stdin: IO[bytes] | None = None,
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         if _org_mode():
@@ -112,6 +125,7 @@ class GitRunner:
                 cwd=str(working_directory),  # lgtm[py/path-injection]
                 env=child_environment,
                 input=input_text,
+                stdin=stdin,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -287,13 +301,7 @@ class WorkspaceManager:
             try:
                 snapshot = self._snapshot_changes(session_id, current, revision, "fork.patch")
                 if snapshot is not None:
-                    self.git.run(
-                        target,
-                        "apply",
-                        "--whitespace=nowarn",
-                        "-",
-                        input_text=snapshot.read_text(encoding="utf-8"),
-                    )
+                    self._apply_patch(target, snapshot)
             except Exception:
                 self.git.run(source, "worktree", "remove", "--force", str(target), check=False)
                 self.git.run(source, "worktree", "prune", check=False)
@@ -539,8 +547,7 @@ class WorkspaceManager:
         snapshot = self._snapshot_changes(session_id, workspace, base_revision, "handoff.patch")
         if snapshot is None:
             return ApplyPlan(kind=WorkspaceKind.git_worktree)
-        patch = snapshot.read_text(encoding="utf-8")
-        check = self.git.run(source, "apply", "--check", "--whitespace=nowarn", "-", check=False, input_text=patch)
+        check = self._apply_patch(source, snapshot, "--check", check=False)
         if check.returncode != 0:
             detail = (check.stderr or check.stdout or "The changes conflict with the source working tree").strip()
             raise WorkspaceError(f"Handoff stopped before changing the source: {detail[:2_000]}")
@@ -566,13 +573,7 @@ class WorkspaceManager:
             return
         if plan.kind != WorkspaceKind.git_worktree or plan.git_patch is None:
             raise WorkspaceError("Invalid Git handoff plan")
-        self.git.run(
-            Path(source_path),
-            "apply",
-            "--whitespace=nowarn",
-            "-",
-            input_text=plan.git_patch.read_text(encoding="utf-8"),
-        )
+        self._apply_patch(Path(source_path), plan.git_patch)
 
     def rollback_checked(
         self,
@@ -595,14 +596,7 @@ class WorkspaceManager:
             return
         if plan.kind != WorkspaceKind.git_worktree or plan.git_patch is None:
             raise WorkspaceError("Invalid Git handoff plan")
-        self.git.run(
-            Path(source_path),
-            "apply",
-            "--reverse",
-            "--whitespace=nowarn",
-            "-",
-            input_text=plan.git_patch.read_text(encoding="utf-8"),
-        )
+        self._apply_patch(Path(source_path), plan.git_patch, "--reverse")
 
     def cleanup(
         self,
@@ -632,7 +626,7 @@ class WorkspaceManager:
             source = Path(source_path)
             if actual.exists():
                 if base_revision and source.is_dir():
-                    self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch")
+                    self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch", truncate=True)
                 if source.is_dir():
                     self.git.run(source, "worktree", "remove", "--force", str(actual))
                 else:
@@ -679,6 +673,8 @@ class WorkspaceManager:
         workspace: Path,
         base_revision: str,
         filename: str,
+        *,
+        truncate: bool = False,
     ) -> Path | None:
         untracked = [path for status, path in self._status_entries(workspace) if status == "??"]
         if untracked:
@@ -694,16 +690,30 @@ class WorkspaceManager:
                 "--pathspec-file-nul",
                 input_text="\0".join(untracked) + "\0",
             )
-        patch = self.git.run(workspace, "diff", "--binary", base_revision).stdout
-        if not patch:
-            return None
         snapshot_dir = self.snapshots_root / session_id
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot = snapshot_dir / filename
         temp = snapshot.with_suffix(".tmp")
-        temp.write_text(patch, encoding="utf-8")
+        try:
+            self.git.run(workspace, "diff", "--binary", f"--output={temp.resolve()}", base_revision)
+        except Exception:
+            temp.unlink(missing_ok=True)
+            raise
+        size = temp.stat().st_size
+        if not size:
+            temp.unlink()
+            return None
+        if truncate and size > MAX_TOTAL_DIFF_BYTES:
+            _truncate_at_file_boundary(temp, MAX_TOTAL_DIFF_BYTES)
+            snapshot.with_name(f"{filename}.truncated").write_text(SNAPSHOT_TRUNCATED_MARKER, encoding="utf-8")
         os.replace(temp, snapshot)
         return snapshot
+
+    def _apply_patch(
+        self, cwd: Path, patch: Path, *flags: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        with patch.open("rb") as handle:
+            return self.git.run(cwd, "apply", *flags, "--whitespace=nowarn", "-", check=check, stdin=handle)
 
     def _status_lines(self, root: Path) -> list[str]:
         return [line for line in self.git.run(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.splitlines() if line]

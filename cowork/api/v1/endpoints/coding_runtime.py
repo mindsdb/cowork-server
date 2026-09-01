@@ -154,7 +154,7 @@ def acknowledge_runtime_command(
     _require_protocol(body.protocol_version)
     _authenticate(request, computer_id)
     try:
-        return _control().acknowledge_command(
+        return get_coding_service().acknowledge_runtime_command(
             run_id,
             body.command_id,
             computer_id,

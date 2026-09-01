@@ -7,12 +7,22 @@ import pytest
 from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_status
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.guidance_items import discover_guidance_items
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
 from cowork.coding.skill_models import ProjectSkillSource, SkillProjectAssignment, TeamSkillSource
-from cowork.coding.workspace import WorkspaceError
+from cowork.coding.workspace import GitRunner, WorkspaceError
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.skills import CodeSkillService, SkillService
+
+
+class GitSpy(GitRunner):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(self, cwd: Path, *args: str, **kwargs):
+        self.calls.append(args)
+        return super().run(cwd, *args, **kwargs)
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -211,7 +221,7 @@ def test_source_catalogue_enforces_repository_branch_uniqueness(tmp_path: Path) 
         available_revision=source.available_revision,
         cache_path=str(tmp_path / "unused"),
     )
-    with pytest.raises(ValueError, match="already in the Skills Library"):
+    with pytest.raises(StateConflict, match="already in the Skills Library"):
         service.skill_library.store.create(duplicate)
 
 
@@ -303,6 +313,80 @@ def test_skill_document_exposes_contained_text_files_for_read_only_preview(tmp_p
 
     with pytest.raises(WorkspaceError, match="not part of this skill"):
         service.skill_library.document(CodeSkillService(), item.id, "../../README.md")
+
+
+def test_skill_document_resolves_by_id_without_running_git(tmp_path: Path) -> None:
+    skills_repo = repository(tmp_path, "engineering-skills")
+    add_skill(skills_repo, "Review version one.")
+    service = service_with(tmp_path, FakeEngine())
+    spy = GitSpy()
+    service.skill_library.git = spy
+    source = service.skill_library.add(
+        str(skills_repo),
+        git(skills_repo, "branch", "--show-current"),
+        "Engineering standards",
+    )
+    item = service.skill_library.list().items[0]
+    add_skill(skills_repo, "Review version two.")
+    assert service.skill_library.refresh(source.id).update_available is True
+    assert spy.calls
+    spy.calls.clear()
+
+    document = service.skill_library.document(CodeSkillService(), item.id)
+    builtin = service.skill_library.document(CodeSkillService(), "personal:thermo-nuclear-code-quality-review")
+
+    assert spy.calls == []
+    assert document.item == item
+    assert "Review version one." in document.content
+    assert builtin.item.origin == "built_in"
+    assert builtin.selected_path == "SKILL.md"
+    with pytest.raises(KeyError, match="Skill library item not found"):
+        service.skill_library.document(CodeSkillService(), f"{source.id}:skills/missing/SKILL.md")
+    with pytest.raises(KeyError, match="Skill library item not found"):
+        service.skill_library.document(CodeSkillService(), "personal:../escape")
+
+
+def test_catalogue_folds_a_personal_skill_under_the_enabled_team_skill_of_the_same_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = tmp_path / "storage"
+    monkeypatch.setenv("COWORK_HOME", str(storage))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(storage / "skills"))
+    get_app_settings.cache_clear()
+    try:
+        code_skills = CodeSkillService()
+        code_skills.create_skill(label="Review", description="My own review.", instructions="Review my way.")
+        skills_repo = repository(tmp_path, "engineering-skills")
+        skill_path = add_skill(skills_repo, "Review the team's way.")
+        project_repo = repository(tmp_path, "product")
+        service = service_with(tmp_path / "coding", FakeEngine())
+        project = service.projects.create(
+            ProjectCreateRequest(
+                name="Product",
+                folders=[ProjectFolder(id="product", name="Product", path=str(project_repo))],
+            )
+        )
+        source = service.skill_library.add(
+            str(skills_repo),
+            git(skills_repo, "branch", "--show-current"),
+            "Engineering standards",
+        )
+
+        unassigned = service.skill_library.catalog(code_skills, project.id)
+        service.skill_library.set_project_items(project.id, source.id, [skill_path])
+        assigned = service.skill_library.catalog(code_skills, project.id)
+        unscoped = service.skill_library.catalog(code_skills)
+
+        assert {item.id for item in unassigned.items} >= {f"{source.id}:{skill_path}", "personal:review"}
+        reviews = [item for item in assigned.items if item.name.casefold() == "review"]
+        assert [(item.id, item.origin, item.source_name) for item in reviews] == [
+            (f"{source.id}:{skill_path}", "team", "Engineering standards")
+        ]
+        assert [(item.id, item.source_name) for item in reviews[0].supersedes] == [("personal:review", "Yours")]
+        assert {item.id for item in unscoped.items} >= {f"{source.id}:{skill_path}", "personal:review"}
+        assert all(item.supersedes == [] for item in unscoped.items)
+    finally:
+        get_app_settings.cache_clear()
 
 
 def test_team_instructions_flow_through_the_agent_neutral_runtime_contract(tmp_path: Path) -> None:

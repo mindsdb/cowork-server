@@ -23,6 +23,8 @@ from cowork.coding.runtime_protocol import RuntimeLease
 from cowork.coding.terminal import TerminalBuffer
 from cowork.coding.workspace import WorkspaceError
 
+_MAX_COMPLETED_RESULTS = 256
+
 
 class RuntimeWorkspaceOperations:
     """Execute workspace-owned commands behind the fenced runtime protocol."""
@@ -79,6 +81,8 @@ class RuntimeWorkspaceOperations:
                 except Exception as exc:  # noqa: BLE001 - crosses a typed process boundary.
                     result = (None, str(exc)[:4_000])
             self._completed[command.id] = result
+            while len(self._completed) > _MAX_COMPLETED_RESULTS:
+                del self._completed[next(iter(self._completed))]
             return result
 
     def release(self) -> None:

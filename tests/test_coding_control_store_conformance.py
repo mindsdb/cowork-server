@@ -10,10 +10,12 @@ from cowork.coding.contracts import utc_now
 from cowork.coding.control_models import (
     CodeTask,
     ComputerCapabilities,
+    ExecutionWorkspace,
     RunStatus,
     RuntimeEvent,
     TaskRun,
 )
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_service import ControlPlaneService, StaleRuntimeEvent
 from cowork.coding.control_store import ControlPlaneStore, LocalControlPlaneStore
 from cowork.coding.project_models import CodeProject, RepositoryResource
@@ -21,13 +23,17 @@ from cowork.coding.sql_control_store import SqlControlPlaneStore
 from cowork.db.session import get_session_factory
 
 
+def sql_store(tmp_path: Path) -> SqlControlPlaneStore:
+    engine = create_engine(f"sqlite:///{tmp_path / 'control.db'}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    return SqlControlPlaneStore(get_session_factory(engine), "org-conformance")
+
+
 @pytest.fixture(params=["local", "sql"])
 def store(request: pytest.FixtureRequest, tmp_path: Path) -> ControlPlaneStore:
     if request.param == "local":
         return LocalControlPlaneStore(tmp_path / "local")
-    engine = create_engine(f"sqlite:///{tmp_path / 'control.db'}", connect_args={"check_same_thread": False})
-    SQLModel.metadata.create_all(engine)
-    return SqlControlPlaneStore(get_session_factory(engine), "org-conformance")
+    return sql_store(tmp_path)
 
 
 def capabilities() -> ComputerCapabilities:
@@ -90,6 +96,31 @@ def test_update_run_persists_the_operation_and_leaves_nothing_behind_on_failure(
     assert store.get_run("run").checkpoint == {"phase": "one"}
     with pytest.raises(KeyError):
         store.update_run("missing", lambda run: None)
+
+
+def test_sql_update_run_rolls_back_the_operation_s_other_writes_with_the_run(tmp_path: Path) -> None:
+    store = sql_store(tmp_path)
+    store.create_task_run(CodeTask(id="task", title="Task"), TaskRun(id="run", task_id="task", computer_id="c"), [])
+
+    def half_applied(run: TaskRun) -> None:
+        store.save_workspace(ExecutionWorkspace(id="workspace", run_id=run.id, resource_id="repo", computer_id="c"))
+        assert [item.id for item in store.list_workspaces(run.id)] == ["workspace"]
+        run.checkpoint = {"phase": "two"}
+        raise RuntimeError("side effect failed")
+
+    with pytest.raises(RuntimeError, match="side effect failed"):
+        store.update_run("run", half_applied)
+
+    assert store.list_workspaces("run") == []
+    assert store.get_run("run").checkpoint == {}
+
+
+def test_creating_a_task_run_twice_is_a_state_conflict(store: ControlPlaneStore) -> None:
+    store.create_task_run(CodeTask(id="task", title="Task"), TaskRun(id="run", task_id="task", computer_id="c"), [])
+
+    with pytest.raises(StateConflict, match="already exists"):
+        store.create_task_run(CodeTask(id="other", title="Other"), TaskRun(id="run", task_id="other", computer_id="c"), [])
+    assert store.get_run("run").task_id == "task"
 
 
 def test_update_run_without_changes_does_not_rewrite_the_record(store: ControlPlaneStore) -> None:
