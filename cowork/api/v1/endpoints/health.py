@@ -77,8 +77,8 @@ def _minds_runtime_credential_required(
     if org_mode:
         return False
     return Provider.MINDS_CLOUD in (
-        getattr(settings, "resolved_planning_provider", None),
-        getattr(settings, "resolved_coding_provider", None),
+        settings.resolved_planning_provider,
+        settings.resolved_coding_provider,
     )
 
 
