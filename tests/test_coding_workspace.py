@@ -191,3 +191,36 @@ def test_git_runner_refuses_before_spawning_in_org_mode(monkeypatch, tmp_path: P
         GitRunner().run(tmp_path, "status")
 
     get_app_settings.cache_clear()
+
+
+def test_git_runner_rejects_an_unavailable_working_directory_before_spawning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: pytest.fail("Git must not spawn"))
+
+    with pytest.raises(WorkspaceError, match="available local folder"):
+        GitRunner().run(tmp_path / "missing", "status")
+
+
+@pytest.mark.parametrize(
+    ("method", "command_output"),
+    [
+        ("changes", "M\0../../outside.txt\0"),
+        ("status", "?? ../../outside.txt\0"),
+    ],
+)
+def test_git_reported_paths_are_revalidated_before_file_operations(
+    tmp_path: Path, method: str, command_output: str
+) -> None:
+    class UntrustedGitOutput:
+        def run(self, _cwd: Path, *args: str, **_kwargs) -> subprocess.CompletedProcess[str]:
+            output = command_output if (method == "changes" and args[0] == "diff") or args[0] == "status" else ""
+            return subprocess.CompletedProcess(["git", *args], 0, stdout=output, stderr="")
+
+    manager = WorkspaceManager(tmp_path / "coding", git=UntrustedGitOutput())
+
+    with pytest.raises(WorkspaceError, match="inside this task workspace"):
+        if method == "changes":
+            manager._changes_since(tmp_path, "base")
+        else:
+            manager._status_entries(tmp_path)
