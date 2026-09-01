@@ -106,9 +106,16 @@ def resolve_shell(
     if not executable:
         executable = os.environ.get("COMSPEC", "cmd.exe") if on_windows else "/bin/sh"
     executable_name = Path(executable.replace("\\", "/")).name.casefold()
-    return [executable] if on_windows and executable_name in {
+    if on_windows and executable_name in {
         "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
-    } else [executable, "--login"]
+    }:
+        return [executable]
+    if executable_name in {"bash", "bash.exe", "zsh", "zsh.exe", "fish", "fish.exe"}:
+        return [executable, "--login"]
+    # POSIX only standardises login-shell behaviour through argv[0]. Shells
+    # such as dash (commonly /bin/sh) reject the GNU-style --login flag, so a
+    # portable fallback must start without shell-specific arguments.
+    return [executable]
 
 
 def shell_environment(command: list[str], working_directory: Path | None = None) -> dict[str, str]:

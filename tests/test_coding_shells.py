@@ -13,6 +13,15 @@ def test_explicit_unavailable_shell_falls_back_to_automatic() -> None:
     ]
 
 
+def test_posix_fallback_does_not_assume_a_gnu_login_flag() -> None:
+    assert shells.resolve_shell(
+        TerminalShellPreference.system,
+        commands={},
+        windows=False,
+        system_shell="/bin/sh",
+    ) == ["/bin/sh"]
+
+
 def test_shell_inventory_starts_with_an_explained_automatic_choice() -> None:
     inventory = shells.shell_inventory()
 

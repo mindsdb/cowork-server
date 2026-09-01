@@ -101,8 +101,6 @@ class CodingService:
             store=self.store,
             workspaces=self.workspaces,
             project_workspaces=self.project_workspaces,
-            projects=self.projects,
-            playbooks=self.playbooks,
             skill_runtime=self.skill_runtime,
             runtimes=self.runtimes,
             running=self._running,
