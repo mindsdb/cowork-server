@@ -473,6 +473,42 @@ def test_terminal_start_failure_is_not_left_running(tmp_path: Path) -> None:
     assert failed.error == "Terminal process failed to start"
 
 
+def test_terminal_start_reads_config_after_acquiring_runtime_lock(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+
+    runtime_lock = service.runtimes.session_lock(created.id)
+    runtime_lock.acquire()
+    errors: list[BaseException] = []
+
+    def start_terminal() -> None:
+        try:
+            service.start_terminal(created.id, CREDS, 100, 30)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = threading.Thread(target=start_terminal)
+    thread.start()
+    time.sleep(0.05)
+    service.runtimes.close_locked(created.id)
+    service.store.update_session(
+        created.id,
+        lambda current: setattr(current, "model", "updated-model"),
+    )
+    engine.is_closed = False
+    runtime_lock.release()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert engine.configs[-1].model == "updated-model"
+
+
 def test_goal_command_uses_engine_goal_lifecycle(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
@@ -646,6 +682,17 @@ def test_task_controls_persist_and_restart_idle_runtime(tmp_path: Path) -> None:
     assert config.personality == "friendly"
     assert config.network_access is True
     assert config.web_search is True
+
+    cleared = service.update_session_config(
+        created.id,
+        SessionUpdateRequest(reasoning_effort=None),
+    )
+    assert cleared.reasoning_effort is None
+
+    engine.is_closed = False
+    service.submit_turn(created.id, "Third turn", CREDS)
+    wait_for_status(service, created.id, SessionStatus.completed)
+    assert engine.configs[-1].reasoning_effort is None
 
 
 def test_steering_reaches_active_engine_and_is_recorded(tmp_path: Path) -> None:

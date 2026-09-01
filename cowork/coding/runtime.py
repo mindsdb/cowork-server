@@ -129,22 +129,32 @@ class RuntimeManager:
         rows: int,
     ) -> TerminalPage:
         with self.session_lock(session.id):
-            with self._lock:
-                current = self._terminals.get(session.id)
-            if current is not None and current.is_running:
-                return current.page()
+            return self.start_terminal_locked(session, credentials, cols, rows)
 
-            runtime = self.open_locked(session, credentials)
-            process_id = str(uuid.uuid4())
-            terminal = TerminalBuffer(process_id)
-            with self._lock:
-                self._terminals[session.id] = terminal
-            try:
-                runtime.start_terminal(process_id, cols, rows, terminal.append, terminal.finish)
-            except Exception:
-                terminal.finish(None, "Terminal process failed to start")
-                raise
-            return terminal.page()
+    def start_terminal_locked(
+        self,
+        session: CodingSession,
+        credentials: EngineCredentials,
+        cols: int,
+        rows: int,
+    ) -> TerminalPage:
+        """Start a terminal while the caller owns ``session_lock``."""
+        with self._lock:
+            current = self._terminals.get(session.id)
+        if current is not None and current.is_running:
+            return current.page()
+
+        runtime = self.open_locked(session, credentials)
+        process_id = str(uuid.uuid4())
+        terminal = TerminalBuffer(process_id)
+        with self._lock:
+            self._terminals[session.id] = terminal
+        try:
+            runtime.start_terminal(process_id, cols, rows, terminal.append, terminal.finish)
+        except Exception:
+            terminal.finish(None, "Terminal process failed to start")
+            raise
+        return terminal.page()
 
     def write_terminal(self, session_id: str, data_base64: str) -> TerminalPage:
         runtime, terminal = self._active_terminal(session_id)

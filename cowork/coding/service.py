@@ -571,7 +571,12 @@ class CodingService:
             ) as session:
                 if self.runtimes.terminal_is_running(session_id):
                     raise RuntimeError("Stop the task terminal before changing task controls")
-                values = updates.model_dump(exclude_none=True)
+                values = updates.model_dump(exclude_unset=True)
+                values = {
+                    name: value
+                    for name, value in values.items()
+                    if value is not None or name == "reasoning_effort"
+                }
                 if "additional_dirs" in values:
                     values["additional_dirs"] = validate_directories(values["additional_dirs"])
                 next_permission = values.get("permission_mode", session.permission_mode)
@@ -598,9 +603,10 @@ class CodingService:
         cols: int,
         rows: int,
     ) -> TerminalPage:
-        session = self.get_session(session_id)
         try:
-            return self.runtimes.start_terminal(session, credentials, cols, rows)
+            with self.runtimes.session_lock(session_id):
+                session = self.get_session(session_id)
+                return self.runtimes.start_terminal_locked(session, credentials, cols, rows)
         except Exception as exc:
             message = safe_engine_error(str(exc), credentials)
             raise RuntimeError(message) from exc
