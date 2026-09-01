@@ -161,13 +161,14 @@ def verifier_latch_kwarg(config_cls, stored) -> dict[str, object]:
     customer-visible bug, and the pin is bumped by hand after anton merges, so
     the gap must not be invisible in the environment that has it.
     """
+    import copy
     import dataclasses
 
     try:
         if not any(f.name == "initial_verifier_latch" for f in dataclasses.fields(config_cls)):
             _warn_latch_unsupported_once()
             return {}
-        return {"initial_verifier_latch": stored}
+        return {"initial_verifier_latch": copy.deepcopy(stored)}
     except Exception:  # pragma: no cover - defensive: never fail a turn over this
         logger.warning("could not pass the stored verifier latch", exc_info=True)
         return {}
