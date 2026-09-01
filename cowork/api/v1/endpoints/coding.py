@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 from collections.abc import Callable
 from typing import Annotated
 
@@ -30,7 +31,18 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
+from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.redaction import redact_text
+from cowork.coding.project_models import (
+    DraftPullRequestRequest,
+    PlaybookConfigureRequest,
+    PlaybookItemsRequest,
+    PublishRequest,
+    ProjectCreateRequest,
+    ProjectPage,
+    ProjectUpdateRequest,
+    SourceContextRequest,
+)
 from cowork.coding.service import CodingService, get_coding_service
 from cowork.coding.workspace import WorkspaceError
 from cowork.common.settings.user_settings import Provider, provider_api_key_str
@@ -39,6 +51,7 @@ from cowork.db.session import get_session
 from cowork.services.settings import SettingService
 
 router = APIRouter(dependencies=[Depends(require_local), Depends(require_local_tenancy)])
+logger = logging.getLogger(__name__)
 SessionDep = Annotated[Session, Depends(get_session)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
@@ -58,6 +71,17 @@ def _credentials(settings) -> EngineCredentials:
     )
 
 
+def _integration_service(scope: ScopeDep):
+    integrations = DeveloperIntegrationService(scope)
+    try:
+        yield integrations
+    finally:
+        integrations.close()
+
+
+IntegrationsDep = Annotated[DeveloperIntegrationService, Depends(_integration_service)]
+
+
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
@@ -71,6 +95,11 @@ def _call[Result](operation: Callable[..., Result], *args, **kwargs) -> Result:
     try:
         return operation(*args, **kwargs)
     except Exception as exc:
+        if not isinstance(exc, (KeyError, ValueError, WorkspaceError, RuntimeError)):
+            logger.exception(
+                "Unexpected coding operation failure in %s",
+                getattr(operation, "__qualname__", type(operation).__name__),
+            )
         raise _http_error(exc) from exc
 
 
@@ -123,6 +152,12 @@ def models(session: SessionDep, scope: ScopeDep, engine_id: str = Query(default=
     return {"items": _call(_service().discover_models, engine_id, _credentials(settings))}
 
 
+@router.post("/runtime/prepare-shutdown")
+def prepare_shutdown():
+    """Persist resumable task state before the desktop stops the process tree."""
+    return {"interrupted": _service().prepare_shutdown()}
+
+
 @router.api_route("/inference/{path:path}", methods=["GET", "POST"])
 async def inference_proxy(path: str, request: Request, session: SessionDep, scope: ScopeDep):
     if path not in _INFERENCE_PATHS:
@@ -169,6 +204,78 @@ async def inference_proxy(path: str, request: Request, session: SessionDep, scop
 @router.get("/workspace/inspect")
 def inspect_workspace(path: str):
     return _service().inspect_workspace(path)
+
+
+@router.get("/projects", response_model=ProjectPage)
+def list_code_projects():
+    return _service().projects.list()
+
+
+@router.post("/projects")
+def create_code_project(body: ProjectCreateRequest):
+    return _call(_service().projects.create, body)
+
+
+@router.get("/projects/{project_id}")
+def get_code_project(project_id: str):
+    return _call(_service().projects.get, project_id)
+
+
+@router.patch("/projects/{project_id}")
+def update_code_project(project_id: str, body: ProjectUpdateRequest):
+    return _call(_service().projects.update, project_id, body)
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+def delete_code_project(project_id: str):
+    _call(_service().delete_project, project_id)
+
+
+@router.get("/projects/{project_id}/folders")
+def inspect_code_project_folders(project_id: str):
+    return {"items": _call(_service().projects.inspect_folders, project_id)}
+
+
+@router.post("/projects/{project_id}/playbook")
+def configure_code_project_playbook(project_id: str, body: PlaybookConfigureRequest):
+    return _call(_service().playbooks.configure, project_id, body.repository, body.branch)
+
+
+@router.get("/projects/{project_id}/playbook")
+def code_project_playbook(project_id: str):
+    return _call(_service().playbooks.status, project_id)
+
+
+@router.delete("/projects/{project_id}/playbook", status_code=204)
+def remove_code_project_playbook(project_id: str):
+    _call(_service().playbooks.remove, project_id)
+
+
+@router.post("/projects/{project_id}/playbook/refresh")
+def refresh_code_project_playbook(project_id: str):
+    return _call(_service().playbooks.refresh, project_id)
+
+
+@router.post("/projects/{project_id}/playbook/apply")
+def apply_code_project_playbook(project_id: str):
+    return _call(_service().playbooks.apply_update, project_id)
+
+
+@router.post("/projects/{project_id}/playbook/items")
+def update_code_project_playbook_items(project_id: str, body: PlaybookItemsRequest):
+    return _call(_service().playbooks.set_enabled, project_id, body.enabled_paths)
+
+
+@router.get("/projects/{project_id}/integrations")
+def code_project_integrations(project_id: str, integrations: IntegrationsDep):
+    project = _call(_service().projects.get, project_id)
+    return {"items": _call(integrations.statuses, project)}
+
+
+@router.post("/projects/{project_id}/source-context")
+def read_code_project_source(project_id: str, body: SourceContextRequest, integrations: IntegrationsDep):
+    project = _call(_service().projects.get, project_id)
+    return _call(integrations.read, project, body)
 
 
 @router.get("/sessions", response_model=SessionPage)
@@ -315,6 +422,11 @@ def remove_queued_turn(session_id: str, instruction_id: str):
     return _call(_service().remove_queued_turn, session_id, instruction_id)
 
 
+@router.post("/sessions/{session_id}/queue/{instruction_id}/steer")
+def steer_queued_turn(session_id: str, instruction_id: str):
+    return _call(_service().steer_queued_turn, session_id, instruction_id)
+
+
 @router.post("/sessions/{session_id}/queue/run")
 def run_next_queued(session_id: str, session: SessionDep, scope: ScopeDep):
     return _call(
@@ -406,6 +518,11 @@ def git_state(session_id: str):
     return _call(_service().git_state, session_id)
 
 
+@router.get("/sessions/{session_id}/git/all")
+def git_states(session_id: str):
+    return {"items": _call(_service().git_states, session_id)}
+
+
 @router.get("/sessions/{session_id}/diff")
 def diff(session_id: str):
     return {"files": _call(_service().diff, session_id)}
@@ -424,3 +541,40 @@ def commit(session_id: str, body: CommitRequest):
 @router.post("/sessions/{session_id}/apply")
 def apply_to_source(session_id: str):
     return _call(_service().apply_to_source, session_id)
+
+
+@router.post("/sessions/{session_id}/validate")
+def validate_project(session_id: str):
+    return {"items": _call(_service().validate_project, session_id)}
+
+
+@router.get("/sessions/{session_id}/delivery")
+def delivery_plan(session_id: str, integrations: IntegrationsDep):
+    return _call(_service().delivery_plan, session_id, integrations)
+
+
+@router.post("/sessions/{session_id}/draft-pull-requests")
+def create_draft_pull_requests(session_id: str, body: DraftPullRequestRequest, integrations: IntegrationsDep):
+    return {
+        "items": _call(
+            _service().create_draft_pull_requests,
+            session_id,
+            body,
+            integrations,
+        )
+    }
+
+
+@router.post("/sessions/{session_id}/publish")
+def publish_task_update(session_id: str, body: PublishRequest, integrations: IntegrationsDep):
+    coding = _service()
+    task = _call(coding.get_session, session_id)
+    if not task.project_id:
+        raise HTTPException(status_code=409, detail="This task is not linked to a Code Project")
+    project = _call(coding.projects.get, task.project_id)
+    delivery = _call(integrations.publish, project, body)
+    coding.store.update_session(
+        task.id,
+        lambda current: current.deliveries.append(delivery),
+    )
+    return delivery
