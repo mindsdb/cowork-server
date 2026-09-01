@@ -328,6 +328,39 @@ def test_runtime_client_gives_up_redelivery_on_a_rejected_event() -> None:
     assert attempts == [1]
 
 
+def test_runtime_client_advances_the_sequence_after_an_event_fails_every_delivery() -> None:
+    lease, _ = _lease_only("gap")
+    applied: list[tuple[int, str]] = []
+    responses: list[int] = []
+
+    def control_plane_whose_responses_were_lost(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["kind"] == "status":
+            if not applied:
+                applied.append((body["seq"], body["id"]))
+            raise httpx.ConnectError("response lost")
+        if body["seq"] <= applied[-1][0]:
+            responses.append(409)
+            return httpx.Response(409, json={"detail": "Runtime event sequence is stale"})
+        applied.append((body["seq"], body["id"]))
+        responses.append(200)
+        return httpx.Response(200, json={})
+
+    client = RemoteRuntimeClient(
+        "https://control.example.test",
+        RuntimeIdentity("remote-computer", "runtime-secret", "Remote"),
+        httpx.Client(transport=httpx.MockTransport(control_plane_whose_responses_were_lost)),
+        sleep=lambda _delay: None,
+    )
+
+    with pytest.raises(httpx.TransportError):
+        client.event(lease, "status", {"status": "ready"})
+    client.event(lease, "checkpoint", {"waiting": "start"})
+
+    assert [seq for seq, _ in applied] == [1, 2]
+    assert responses == [200]
+
+
 def _lease_only(name: str) -> tuple[RuntimeLease, RuntimeCommand]:
     run = TaskRun(id=f"run-{name}", task_id=f"task-{name}", computer_id="remote-computer", lease_id=f"lease-{name}")
     lease = RuntimeLease(
@@ -1100,6 +1133,49 @@ def test_turn_completes_even_when_a_command_handler_hangs(tmp_path: Path, monkey
     worker.join(timeout=5)
     assert not worker.is_alive()
     assert engine.steers == [("turn-1", "Change direction")]
+    assert steer.id in client.acknowledged
+
+
+def test_router_emits_no_turn_checkpoint_after_the_turn_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lease, start = _remote_lease(tmp_path, "late-checkpoint")
+    steer = RuntimeCommand(
+        id="command-late-steer",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="steer",
+        payload={"prompt": "Change direction"},
+    )
+    client = FakeRuntimeClient(lease, start)
+    client.mid_turn = [steer]
+    engine = FakeEngine()
+    engine.block_until_release = True
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+    steer_started = threading.Event()
+    release_steer = threading.Event()
+
+    def hanging_steer(self: FakeSession, turn_id: str, prompt: str, attachments=()) -> None:
+        steer_started.set()
+        release_steer.wait(timeout=5)
+        self.engine.steers.append((turn_id, prompt))
+
+    monkeypatch.setattr(FakeSession, "steer", hanging_steer)
+    monkeypatch.setattr(runtime_worker, "_COMMAND_ROUTER_JOIN_SECONDS", 0.05)
+    runtime = CodeOnlyRuntime(tmp_path / "runtime", client, registry)
+    worker = threading.Thread(target=runtime.run_once, daemon=True)
+    worker.start()
+    assert steer_started.wait(timeout=5)
+    engine.release_events.set()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("turn_completed", {"status": "completed"}) not in client.events:
+        time.sleep(0.01)
+    release_steer.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    completed_at = client.events.index(("turn_completed", {"status": "completed"}))
+    assert ("checkpoint", {"activeTurn": "turn-1"}) not in client.events[completed_at:]
     assert steer.id in client.acknowledged
 
 

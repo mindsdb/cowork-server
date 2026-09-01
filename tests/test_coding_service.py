@@ -12,7 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from coding_service_fakes import (
     CREDS,
@@ -43,7 +44,9 @@ from cowork.coding.contracts import (
     utc_now,
 )
 from cowork.api.v1.endpoints import coding
+from cowork.api.v1.endpoints.guards import require_local
 from cowork.coding.context import is_context_exhaustion_error
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import (
     CodeTask,
     ComputerCapabilities,
@@ -53,6 +56,8 @@ from cowork.coding.control_models import (
     TaskRun,
     WorkspaceStatus,
 )
+from cowork.db.scoped import get_tenant_scope
+from cowork.db.session import get_session
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     DraftPullRequestSpec,
@@ -192,6 +197,21 @@ def test_invalid_run_transition_during_emit_is_logged_with_both_statuses(tmp_pat
     assert record.levelno == logging.ERROR
     assert "from completed to running" in record.getMessage()
     assert service.control.store.get_run(service.get_session(session.id).run_id).status == RunStatus.completed
+
+
+def test_emit_swallows_only_missing_runs_and_state_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.ready)
+    service = service_with(tmp_path, FakeEngine())
+    failures = iter([StateConflict("Coding session has not been linked to a Task Run"), ValueError("unexpected")])
+
+    def failing_sync(_session) -> None:
+        raise next(failures)
+
+    monkeypatch.setattr(service.control, "sync_session", failing_sync)
+
+    service._emit(session.id, CodingEvent(type=EventType.session, phase="started"), mark_running)
+    with pytest.raises(ValueError, match="unexpected"):
+        service._emit(session.id, CodingEvent(type=EventType.session, phase="progress"))
 
 
 def test_completed_task_persists_events_and_reuses_live_engine_runtime(tmp_path: Path) -> None:
@@ -968,6 +988,36 @@ def test_failed_queued_start_is_reported_without_requeuing_the_instruction(tmp_p
     assert (result.title, result.phase) == ("Turn rejected", "failed")
     assert result.data["commandId"] == start.id
     assert service.get_session(created.id).queued_instructions == []
+
+
+def test_queue_run_accepts_an_optional_body_over_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    runtime_event(service, run, lease_id, 2, "status", {"status": "running"})
+    queued = service.queue_turn(created.id, "Run this after the current work")
+    instruction_id = queued.queued_instructions[0].id
+    runtime_event(service, run, lease_id, 3, "turn_completed", {"status": "cancelled"})
+    monkeypatch.setattr(coding, "_service", lambda: service)
+    monkeypatch.setattr(coding, "_settings", lambda _session, _scope: None)
+    monkeypatch.setattr(coding, "_credentials", lambda _settings: CREDS)
+    app = FastAPI()
+    app.include_router(coding.router, prefix="/api/v1/coding")
+    app.dependency_overrides[require_local] = lambda: None
+    app.dependency_overrides[get_session] = lambda: None
+    app.dependency_overrides[get_tenant_scope] = lambda: None
+
+    with TestClient(app) as client:
+        stale = client.post(f"/api/v1/coding/sessions/{created.id}/queue/run", json={"instruction_id": "not-the-head"})
+        started = client.post(f"/api/v1/coding/sessions/{created.id}/queue/run", json={"instruction_id": instruction_id})
+        bodiless = client.post(f"/api/v1/coding/sessions/{created.id}/queue/run")
+
+    assert stale.status_code == 409
+    assert started.status_code == 200
+    assert CodingSession.model_validate(started.json()).queued_instructions == []
+    assert bodiless.status_code == 200
+    assert len([item for item in service.control.store.list_commands(run.id) if item.kind == "start"]) == 2
 
 
 def test_queue_run_with_an_instruction_id_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1970,6 +2020,22 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
 
     service.delete_session(parent.id)
     assert Path(child.workspace_path).is_dir()
+
+
+def test_fork_writes_the_durable_session_without_the_control_plane_projection(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    parent = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Build the feature"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, parent.id, SessionStatus.completed)
+
+    child = service.fork_session(parent.id, CREDS)
+
+    stored = service.store.load_session(child.id)
+    assert (stored.run_status, stored.computer_name, stored.computer_status) == (None, None, None)
+    assert stored.task_capabilities == service.store.load_session(parent.id).task_capabilities
+    assert child.run_status == "completed"
 
 
 def test_failed_fork_preparation_does_not_leave_control_records(

@@ -27,6 +27,7 @@ from cowork.coding.contracts import (
     TaskCapability,
     WorkspaceInspection,
 )
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import RunStatus
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.control_store import ControlPlaneStore
@@ -312,7 +313,7 @@ class CodingService(
     def fork_session(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
         session = self.get_session(session_id)
         self._require_task_capability(session, TaskCapability.fork)
-        return self.lifecycle.fork_session(session_id, credentials)
+        return self.get_session(self.lifecycle.fork_session(session_id, credentials).id)
 
     def events(self, session_id: str, after: int = 0) -> EventPage:
         self.get_session(session_id)
@@ -541,7 +542,7 @@ class CodingService(
             self.control.sync_session(self.store.load_session(session_id))
         except InvalidRunTransition as exc:
             logger.error("Could not synchronize Task Run state for coding task %s: %s", session_id, exc)
-        except (KeyError, ValueError):
+        except (KeyError, StateConflict):
             logger.exception("Could not synchronize Task Run state for coding task %s", session_id)
         return stored
 

@@ -201,3 +201,30 @@ def test_worker_redelivery_applies_a_workspace_event_whose_first_application_fai
     assert [item.title for item in service.events(task.id).items].count("Workspace prepared") == 1
     assert engine.prompts == ["Build remotely"]
     assert session.run_status == "completed"
+
+
+def test_redelivery_after_a_crash_between_event_and_sequence_writes_appends_once(tmp_path: Path) -> None:
+    service, computer, task = connected_task(tmp_path, FakeEngine())
+    lease = service.remote.acquire_lease(computer.id)
+    assert lease is not None
+    event = RuntimeEvent(
+        run_id=lease.run.id,
+        computer_id=computer.id,
+        lease_id=lease.lease_id,
+        epoch=lease.run.epoch,
+        seq=lease.run.last_event_seq + 1,
+        kind="event",
+        payload={"event": {"type": "session", "title": "Remote progress", "text": "step one"}},
+    )
+    service.accept_runtime_event(event)
+
+    def crash_before_sequence_write(run) -> None:
+        run.last_event_seq = lease.run.last_event_seq
+        run.last_event_id = lease.run.last_event_id
+
+    service.control.store.update_run(lease.run.id, crash_before_sequence_write)
+    service.accept_runtime_event(event)
+
+    titles = [item.title for item in service.events(task.id).items]
+    assert titles.count("Remote progress") == 1
+    assert service.control.store.get_run(lease.run.id).last_event_seq == event.seq

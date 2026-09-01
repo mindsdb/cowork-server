@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
+from httpx._utils import get_environment_proxies
 
 
 class DeveloperCredentialError(ValueError):
@@ -43,7 +45,7 @@ def validate_developer_connection(
     method: str | None,
     values: dict[str, Any],
     *,
-    client: httpx.Client | None = None,
+    transport: httpx.BaseTransport | None = None,
     resolver: Callable[..., list[tuple]] = socket.getaddrinfo,
 ) -> ValidatedDeveloperIdentity:
     """Validate a GitHub or Linear personal credential and return its identity."""
@@ -53,25 +55,30 @@ def validate_developer_connection(
     if method not in allowed:
         raise DeveloperCredentialError("Choose a supported connection method.")
 
-    owns_client = client is None
-    active_client = client or httpx.Client(timeout=15.0, follow_redirects=False)
+    egress = PinnedHostTransport(
+        transport or httpx.HTTPTransport(),
+        resolver,
+        pinned_transport_factory=(lambda: transport) if transport is not None else httpx.HTTPTransport,
+    )
+    client = egress.client(timeout=15.0, follow_redirects=False, trust_env=transport is None)
     try:
         if connector_id == "github":
-            return _validate_github(values, active_client, resolver)
-        return _validate_linear(values, active_client)
+            return _validate_github(values, client, egress)
+        return _validate_linear(values, client)
+    except PinnedHostError as exc:
+        raise exc.reason from exc
     except httpx.HTTPError as exc:
         raise DeveloperProviderUnavailable(
             f"{connector_id.title()} could not be reached. Try again in a moment."
         ) from exc
     finally:
-        if owns_client:
-            active_client.close()
+        client.close()
 
 
 def _validate_github(
     values: dict[str, Any],
     client: httpx.Client,
-    resolver: Callable[..., list[tuple]],
+    egress: PinnedHostTransport,
 ) -> ValidatedDeveloperIdentity:
     token = str(values.get("access_token") or "").strip()
     if not token:
@@ -90,7 +97,7 @@ def _validate_github(
         raise DeveloperCredentialError("Enter a valid GitHub base URL.")
 
     if base_url.casefold() != "https://github.com":
-        require_public_host(parsed.hostname, resolver)
+        egress.pin(parsed.hostname)
 
     api_url = "https://api.github.com" if base_url.casefold() == "https://github.com" else f"{base_url}/api/v3"
     response = client.get(
@@ -113,8 +120,11 @@ def _validate_github(
     return ValidatedDeveloperIdentity(account_email=identity)
 
 
-def require_public_host(hostname: str, resolver: Callable[..., list[tuple]]) -> None:
-    """Reject private/custom GitHub endpoints before attaching credentials."""
+def require_public_host(
+    hostname: str,
+    resolver: Callable[..., list[tuple]],
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Reject private/custom GitHub endpoints before attaching credentials; return the validated addresses."""
 
     try:
         literal = ipaddress.ip_address(hostname)
@@ -136,6 +146,112 @@ def require_public_host(hostname: str, resolver: Callable[..., list[tuple]]) -> 
         raise DeveloperCredentialError(
             "GitHub Enterprise must use a publicly routable HTTPS host."
         )
+    return addresses
+
+
+class PinnedHostError(httpx.ConnectError):
+    """A pinned host failed the public-address check when the request resolved it."""
+
+    def __init__(self, reason: Exception, request: httpx.Request) -> None:
+        super().__init__(str(reason), request=request)
+        self.reason = reason
+
+
+class PinnedHostTransport(httpx.BaseTransport):
+    """Connect pinned hosts to an address validated at resolution time.
+
+    Resolving once and connecting to the validated address closes the window
+    in which a host that passed the public-address check rebinds to a private
+    one before the connection is made. The original hostname is kept for the
+    ``Host`` header and for SNI/certificate verification.
+    """
+
+    def __init__(
+        self,
+        inner: httpx.BaseTransport,
+        resolver: Callable[..., list[tuple]],
+        hosts: set[str] | None = None,
+        pinned_transport_factory: Callable[[], httpx.BaseTransport] | None = None,
+    ) -> None:
+        self._inner = inner
+        self._resolver = resolver
+        self._hosts = set() if hosts is None else hosts
+        self._pinned_transport_factory = pinned_transport_factory or (lambda: inner)
+        self._pinned_transports: dict[str, httpx.BaseTransport] = {}
+        self._transport_lock = threading.Lock()
+        self._closed = False
+
+    def pin(self, host: str) -> None:
+        self._hosts.add(host)
+
+    def client(self, *, trust_env: bool = True, **options: Any) -> httpx.Client:
+        """Build a client whose environment-proxy routes pin the same hosts as the direct one."""
+        proxies = get_environment_proxies() if trust_env else {}
+        mounts = {
+            pattern: None if proxy is None else PinnedHostTransport(
+                httpx.HTTPTransport(proxy=proxy),
+                self._resolver,
+                self._hosts,
+                pinned_transport_factory=lambda proxy=proxy: httpx.HTTPTransport(proxy=proxy),
+            )
+            for pattern, proxy in proxies.items()
+        }
+        return httpx.Client(transport=self, mounts=mounts, **options)
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        host = (request.url.host or "").casefold()
+        if host not in self._hosts:
+            return self._inner.handle_request(request)
+        try:
+            addresses = require_public_host(host, self._resolver)
+        except (DeveloperCredentialError, DeveloperProviderUnavailable) as exc:
+            raise PinnedHostError(exc, request) from exc
+        transport = self._transport_for(host)
+        for address in addresses[:-1]:
+            try:
+                return transport.handle_request(self._pinned(request, host, str(address)))
+            except httpx.ConnectError:
+                continue
+        return transport.handle_request(self._pinned(request, host, str(addresses[-1])))
+
+    def _transport_for(self, host: str) -> httpx.BaseTransport:
+        # HTTP connection pools key connections by the rewritten IP origin.
+        # Two Enterprise hosts can legitimately resolve to one address, but
+        # they must never share a pool: a keep-alive connection authenticated
+        # for one virtual host could otherwise carry the other host's token.
+        with self._transport_lock:
+            if self._closed:
+                raise RuntimeError("Pinned host transport is closed")
+            transport = self._pinned_transports.get(host)
+            if transport is None:
+                transport = self._pinned_transport_factory()
+                self._pinned_transports[host] = transport
+            return transport
+
+    @staticmethod
+    def _pinned(request: httpx.Request, host: str, address: str) -> httpx.Request:
+        return httpx.Request(
+            request.method,
+            request.url.copy_with(host=address),
+            headers=request.headers,
+            stream=request.stream,
+            extensions={**request.extensions, "sni_hostname": host},
+        )
+
+    def close(self) -> None:
+        with self._transport_lock:
+            if self._closed:
+                return
+            self._closed = True
+            transports = [self._inner, *self._pinned_transports.values()]
+            self._pinned_transports.clear()
+        closed: set[int] = set()
+        for transport in transports:
+            identity = id(transport)
+            if identity in closed:
+                continue
+            closed.add(identity)
+            transport.close()
 
 
 def _validate_linear(values: dict[str, Any], client: httpx.Client) -> ValidatedDeveloperIdentity:
