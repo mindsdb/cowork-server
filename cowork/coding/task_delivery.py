@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from cowork.coding.contracts import CodingSession, DeliveryRecord
+from cowork.coding.contracts import CodingSession, DeliveryRecord, SourceContext
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.project_models import (
@@ -10,14 +10,17 @@ from cowork.coding.project_models import (
     DeliveryPlan,
     DeliveryPlanItem,
     DraftPullRequestRequest,
+    PublishRequest,
     PullRequestActionRequest,
     PullRequestStatus,
+    SourceActionRequest,
 )
-from cowork.coding.project_service import CodeProjectService
+from cowork.coding.operation_types import GetExecutionProject
 from cowork.coding.project_tasks import ProjectTaskOperations
 from cowork.coding.redaction import redact_text
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
 from cowork.coding.store import CodingStore
+from cowork.coding.workspace import WorkspaceError
 
 
 class TaskDeliveryService:
@@ -27,14 +30,14 @@ class TaskDeliveryService:
         self,
         store: CodingStore,
         control: ControlPlaneService,
-        projects: CodeProjectService,
+        execution_project: GetExecutionProject,
         local: ProjectTaskOperations,
         remote: RemoteExecutionCoordinator,
         get_session: Callable[[str], CodingSession],
     ) -> None:
         self.store = store
         self.control = control
-        self.projects = projects
+        self.execution_project = execution_project
         self.local = local
         self.remote = remote
         self.get_session = get_session
@@ -110,13 +113,49 @@ class TaskDeliveryService:
         self._sync(session_id)
         return delivery
 
+    def publish_update(
+        self,
+        session_id: str,
+        request: PublishRequest,
+        integrations: DeveloperIntegrationService,
+    ) -> DeliveryRecord:
+        session = self.get_session(session_id)
+        source = self._linked_source(session, request.provider, request.target_url)
+        self._require_connection(request.connection_name, source.connection_name)
+        delivery = integrations.publish(
+            self._project(session),
+            request.model_copy(update={"connection_name": request.connection_name or source.connection_name}),
+        )
+        return self.record(session_id, delivery)
+
+    def complete_source(
+        self,
+        session_id: str,
+        request: SourceActionRequest,
+        integrations: DeveloperIntegrationService,
+    ) -> DeliveryRecord:
+        session = self.get_session(session_id)
+        source = self._linked_source(session, request.provider, request.target_url)
+        self._require_connection(request.connection_name, source.connection_name)
+        delivery = integrations.complete_source(
+            self._project(session),
+            request.model_copy(update={"connection_name": request.connection_name or source.connection_name}),
+        )
+        return self.record(session_id, delivery)
+
     def pull_request_action(
         self,
         session_id: str,
         request: PullRequestActionRequest,
         integrations: DeveloperIntegrationService,
     ) -> PullRequestStatus:
-        return self.local.pull_request_action(session_id, request, integrations)
+        session = self.get_session(session_id)
+        delivery = self._linked_pull_request(session, request.target_url)
+        self._require_connection(request.connection_name, delivery.connection_name)
+        authorized_request = request.model_copy(update={
+            "connection_name": request.connection_name or delivery.connection_name,
+        })
+        return self.local.pull_request_action(session_id, authorized_request, integrations)
 
     def _sync(self, session_id: str) -> None:
         session = self.store.load_session(session_id)
@@ -127,9 +166,48 @@ class TaskDeliveryService:
         self.control.store.save_task(task)
 
     def _project(self, session: CodingSession) -> CodeProject:
-        if not session.project_id:
-            raise RuntimeError("This task is not linked to a Code Project")
-        return self.projects.get(session.project_id)
+        project = self.execution_project(session)
+        if project is None:
+            raise RuntimeError("This task's saved Code Project is unavailable")
+        return project
+
+    @staticmethod
+    def _linked_pull_request(session: CodingSession, target_url: str) -> DeliveryRecord:
+        normalized_target = target_url.rstrip("/")
+        delivery = next(
+            (
+                item
+                for item in session.deliveries
+                if item.provider == "github"
+                and item.action == "draft_pull_request"
+                and item.status == "published"
+                and (item.external_url or "").rstrip("/") == normalized_target
+            ),
+            None,
+        )
+        if not delivery:
+            raise WorkspaceError("This pull request is not linked to this task")
+        return delivery
+
+    @staticmethod
+    def _linked_source(session: CodingSession, provider: str, target_url: str) -> SourceContext:
+        normalized_target = target_url.rstrip("/")
+        source = next(
+            (
+                item
+                for item in session.source_contexts
+                if item.provider == provider and item.url.rstrip("/") == normalized_target
+            ),
+            None,
+        )
+        if not source:
+            raise WorkspaceError("This work item is not linked to this task")
+        return source
+
+    @staticmethod
+    def _require_connection(requested: str | None, linked: str | None) -> None:
+        if requested and requested != linked:
+            raise WorkspaceError("This work item is linked through a different connection")
 
     @staticmethod
     def _load_pull_request_statuses(

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
+
+import httpx
+import pytest
 
 from coding_service_fakes import FakeEngine, repository
 
@@ -9,7 +13,14 @@ from cowork.coding.control_models import CodeTask, ExecutionWorkspace, RunStatus
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.project_models import CodeProject, ProjectCommand, RepositoryResource
 from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
-from cowork.coding.runtime_worker import CodeOnlyRuntime, RuntimeIdentity
+from cowork.coding.runtime_worker import (
+    CodeOnlyRuntime,
+    RuntimeIdentity,
+    RuntimeClientError,
+    load_runtime_identity,
+    run_runtime_forever,
+    save_runtime_identity,
+)
 
 
 class FakeRuntimeClient:
@@ -29,10 +40,12 @@ class FakeRuntimeClient:
         self.results: dict[str, tuple[dict[str, object] | None, str | None]] = {}
         self.workspace_readmes: list[str] = []
         self.heartbeats = 0
+        self.heartbeat_counts: list[int] = []
         self.calls: list[str] = []
 
     def heartbeat(self, active_run_count: int = 0) -> None:
         self.heartbeats += 1
+        self.heartbeat_counts.append(active_run_count)
 
     def lease(self, wait_seconds: float = 0) -> RuntimeLease | None:
         lease, self._lease = self._lease, None
@@ -83,6 +96,52 @@ class FakeRuntimeClient:
 
     def inference_endpoint(self, _lease: RuntimeLease) -> str:
         return "https://control.example.test/api/v1/coding/runtime/inference"
+
+
+def test_runtime_identity_is_private_and_survives_restart(tmp_path: Path) -> None:
+    identity = RuntimeIdentity("remote-computer", "runtime-secret", "Build computer")
+    save_runtime_identity(tmp_path, "https://control.example.test/", identity)
+
+    stored = load_runtime_identity(tmp_path)
+    assert stored is not None
+    assert stored.server_url == "https://control.example.test"
+    assert stored.identity == identity
+    assert (tmp_path / "runtime-identity.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_runtime_reconnects_with_bounded_backoff_after_transport_failure() -> None:
+    class UnreachableRuntime:
+        calls = 0
+
+        def run_once(self, wait_seconds: float = 0) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                raise httpx.ConnectError("offline")
+            raise RuntimeClientError("restarting", 503)
+
+    delays: list[float] = []
+
+    def stop_after_two_retries(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 2:
+            raise StopIteration
+
+    runtime = UnreachableRuntime()
+    with pytest.raises(StopIteration):
+        run_runtime_forever(runtime, sleep=stop_after_two_retries)
+
+    assert runtime.calls == 2
+    assert delays == [1.0, 2.0]
+
+
+def test_runtime_does_not_retry_revoked_credentials() -> None:
+    class RevokedRuntime:
+        def run_once(self, wait_seconds: float = 0) -> bool:
+            raise RuntimeClientError("revoked", 401)
+
+    sleep = pytest.fail
+    with pytest.raises(RuntimeClientError, match="revoked"):
+        run_runtime_forever(RevokedRuntime(), sleep=sleep)
 
 
 def test_code_only_runtime_prepares_a_portable_repo_and_runs_the_agent(tmp_path: Path) -> None:
@@ -241,6 +300,106 @@ def test_recovery_on_another_computer_prepares_new_workspaces(tmp_path: Path) ->
     assert client.workspace_readmes == ["base\n"]
 
 
+def test_code_only_runtime_keeps_heartbeating_during_a_blocking_run(tmp_path: Path) -> None:
+    run = TaskRun(
+        id="run-heartbeat",
+        task_id="task-heartbeat",
+        computer_id="remote-computer",
+        status=RunStatus.preparing,
+        lease_id="lease-heartbeat",
+    )
+    lease = RuntimeLease(
+        task=CodeTask(id="task-heartbeat", title="Heartbeat task", prompt="Build"),
+        run=run,
+        lease_id="lease-heartbeat",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        project=CodeProject(
+            id="heartbeat-project",
+            name="Heartbeat project",
+            resources=[RepositoryResource(
+                id="repo",
+                name="Repo",
+                source_url="https://example.test/repo.git",
+            )],
+        ),
+        execution=RuntimeExecutionConfig(
+            engine_id="fake",
+            model="fake-model",
+            permission_mode=PermissionMode.workspace,
+        ),
+    )
+    client = FakeRuntimeClient(
+        lease,
+        RuntimeCommand(
+            id="command-start",
+            run_id=run.id,
+            epoch=run.epoch,
+            kind="start",
+        ),
+    )
+
+    class BlockingRuntime(CodeOnlyRuntime):
+        def _execute(self, _lease: RuntimeLease) -> None:
+            deadline = time.monotonic() + 1
+            while client.heartbeat_counts.count(1) < 3 and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+    runtime = BlockingRuntime(
+        tmp_path / "runtime",
+        client,
+        heartbeat_interval_seconds=0.01,
+    )
+    assert runtime.run_once()
+
+    assert client.heartbeat_counts[0] == 0
+    assert client.heartbeat_counts.count(1) >= 3
+
+
+def test_remote_approval_timeout_returns_the_run_to_running(tmp_path: Path) -> None:
+    run = TaskRun(
+        id="run-approval-timeout",
+        task_id="task-approval-timeout",
+        computer_id="remote-computer",
+        status=RunStatus.running,
+        lease_id="lease-approval-timeout",
+    )
+    lease = RuntimeLease(
+        task=CodeTask(id=run.task_id, title="Approval timeout", prompt="Build"),
+        run=run,
+        lease_id=run.lease_id or "lease-approval-timeout",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        project=CodeProject(
+            id="approval-project",
+            name="Approval project",
+            resources=[RepositoryResource(
+                id="repo",
+                name="Repo",
+                source_url="https://example.test/repo.git",
+            )],
+        ),
+        execution=RuntimeExecutionConfig(
+            engine_id="fake",
+            model="fake-model",
+            permission_mode=PermissionMode.workspace,
+        ),
+    )
+    client = FakeRuntimeClient(
+        lease,
+        RuntimeCommand(id="command-start", run_id=run.id, epoch=run.epoch, kind="start"),
+    )
+    runtime = CodeOnlyRuntime(
+        tmp_path / "runtime",
+        client,
+        approval_timeout_seconds=0,
+    )
+
+    assert runtime._approval(lease, "command", {"title": "Run tests"}) == {
+        "decision": "decline"
+    }
+    statuses = [payload.get("status") for kind, payload in client.events if kind == "status"]
+    assert statuses == ["awaiting_approval", "running"]
+
+
 def test_code_only_runtime_serves_git_and_terminal_operations_after_a_turn(tmp_path: Path) -> None:
     source = repository(tmp_path)
     project = CodeProject(
@@ -353,7 +512,13 @@ def test_code_only_runtime_reuses_the_workspace_for_follow_up_turns(tmp_path: Pa
         run_id=run.id,
         epoch=run.epoch,
         kind="start",
-        payload={"prompt": "Follow-up turn"},
+        payload={
+            "prompt": "/review",
+            "engine_prompt": "/review",
+            "command": "review",
+            "goal_action": "",
+            "goal_objective": None,
+        },
     )
     client = FakeRuntimeClient(lease, first, [follow_up])
     engine = FakeEngine()
@@ -362,7 +527,8 @@ def test_code_only_runtime_reuses_the_workspace_for_follow_up_turns(tmp_path: Pa
 
     assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
 
-    assert engine.prompts == ["First turn", "Follow-up turn"]
+    assert engine.prompts == ["First turn"]
+    assert engine.reviews == 1
     assert engine.existing_ids == [None]
     assert client.acknowledged == [first.id, follow_up.id, "command-release"]
     assert len([item for item in client.events if item[0] == "workspace"]) == 1
@@ -410,6 +576,19 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         kind="steer",
         payload={"prompt": "Change direction"},
     )
+    status = RuntimeCommand(
+        id="command-status",
+        run_id=run.id,
+        epoch=run.epoch,
+        kind="agent_command",
+        payload={
+            "prompt": "/status",
+            "engine_prompt": "/status",
+            "command": "status",
+            "goal_action": "",
+            "goal_objective": None,
+        },
+    )
     cancel = RuntimeCommand(
         id="command-cancel",
         run_id=run.id,
@@ -417,7 +596,7 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         kind="cancel",
     )
     client = FakeRuntimeClient(lease, start)
-    client._commands.extend([steer, cancel])
+    client._commands.extend([steer, status, cancel])
     engine = FakeEngine(block_until_cancel=True)
     registry = CodingEngineRegistry()
     registry.register(engine)
@@ -426,5 +605,9 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
 
     assert engine.steers == [("turn-1", "Change direction")]
     assert engine.cancels == ["turn-1"]
-    assert {start.id, steer.id, cancel.id, "command-release"}.issubset(client.acknowledged)
+    assert {start.id, steer.id, status.id, cancel.id, "command-release"}.issubset(client.acknowledged)
+    assert any(
+        kind == "event" and (payload.get("event") or {}).get("title") == "Task status"
+        for kind, payload in client.events
+    )
     assert ("turn_completed", {"status": "cancelled"}) in client.events

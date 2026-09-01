@@ -44,7 +44,7 @@ _TURN_SKILL_FILE_MAX = 200_000
 # Desktop seeding (unkeyed store, DB sentinel) lives in migrations.py and shares
 # this version; org seeding (per-org store, file marker) is a SkillService method.
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills_builtin"
-BUILTIN_SKILLS_VERSION = 2
+BUILTIN_SKILLS_VERSION = 1
 #: Org-mode version marker, a file in the org's own store. See
 #: ``SkillService.ensure_builtin_skills`` for why this is not a Setting row.
 BUILTIN_SKILLS_MARKER = ".builtins_seeded"

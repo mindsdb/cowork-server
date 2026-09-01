@@ -48,6 +48,7 @@ class RuntimeWorkspaceOperations:
             "git_state": self._git_state,
             "git_states": self._git_states,
             "diff": self._diff,
+            "review_file": self._review_file,
             "branch": self._branch,
             "commit": self._commit,
             "validate": self._validate,
@@ -102,6 +103,16 @@ class RuntimeWorkspaceOperations:
 
     def _diff(self, _payload: dict[str, object]) -> dict[str, object]:
         return {"files": [item.model_dump(mode="json") for item in self.manager.diff(list(self.prepared.workspaces))]}
+
+    def _review_file(self, payload: dict[str, object]) -> dict[str, object]:
+        folder_id = str(payload.get("folder_id") or "")
+        workspace = next((item for item in self.prepared.workspaces if item.folder_id == folder_id), None)
+        if workspace is None:
+            raise WorkspaceError("Choose a file from this task")
+        if workspace.workspace_kind != WorkspaceKind.git_worktree:
+            raise WorkspaceError("Review actions require a Git task workspace")
+        self.manager.review_file_action(workspace, str(payload.get("path") or ""), str(payload.get("action") or ""))
+        return self._diff({})
 
     def _branch(self, payload: dict[str, object]) -> dict[str, object]:
         name = str(payload.get("name") or "").strip()

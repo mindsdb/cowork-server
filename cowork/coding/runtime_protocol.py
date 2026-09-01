@@ -84,3 +84,7 @@ class RuntimeCommandAckRequest(RuntimeFenceRequest):
 class RegistrationTokenResponse(BaseModel):
     registration_token: str
     expires_in_seconds: int = 600
+
+
+class ComputerUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)

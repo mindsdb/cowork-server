@@ -169,6 +169,7 @@ class TurnExecutor:
         engine_session: EngineSession | None = None
         turn_id = ""
         finished_status: SessionStatus | None = None
+        reservation_released = False
         try:
             session = self._get_session(session_id)
             engine_session = self._runtimes.open(session, credentials)
@@ -201,14 +202,18 @@ class TurnExecutor:
                 status = SessionStatus.interrupted
                 terminal_event = None
             finished_status = status
-            if terminal_event is not None:
-                self._emit(session_id, terminal_event, lambda current: finish_turn(current, status))
-            else:
-                self._store.update_session(session_id, lambda current: finish_turn(current, status))
+            # Make the terminal status and turn-slot release one observable
+            # transition. Otherwise the UI can see "Completed" and offer
+            # fork/archive immediately while the reservation still rejects it.
+            with self._state_lock:
+                if terminal_event is not None:
+                    self._emit(session_id, terminal_event, lambda current: finish_turn(current, status))
+                else:
+                    self._store.update_session(session_id, lambda current: finish_turn(current, status))
+                self._running.pop(session_id, None)
+                reservation_released = True
         except Exception as exc:  # noqa: BLE001 - engine adapters may surface arbitrary SDK failures.
             try:
-                self._record_failure(session_id, safe_engine_error(str(exc), credentials))
-            finally:
                 if engine_session is not None:
                     try:
                         # Once an adapter operation has failed, its protocol
@@ -221,9 +226,15 @@ class TurnExecutor:
                         # Codex adapter has its own process watchdog as the
                         # final teardown fallback.
                         pass
+            finally:
+                with self._state_lock:
+                    self._record_failure(session_id, safe_engine_error(str(exc), credentials))
+                    self._running.pop(session_id, None)
+                    reservation_released = True
         finally:
-            with self._state_lock:
-                self._running.pop(session_id, None)
+            if not reservation_released:
+                with self._state_lock:
+                    self._running.pop(session_id, None)
             if engine_session is not None:
                 self._runtimes.discard_if_closed(session_id, engine_session)
             if finished_status == SessionStatus.completed:
@@ -245,7 +256,7 @@ class TurnExecutor:
                 CodingEvent(
                     type=EventType.session,
                     title="Task interrupted",
-                    text="Cowork closed while this task was running. Send a follow-up to resume from the preserved workspace.",
+                    text="Cowork closed while this task was running. Send a follow-up to resume from the saved working copy.",
                     phase="failed",
                 ),
                 interrupt_turn,

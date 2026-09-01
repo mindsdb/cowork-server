@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from cowork.coding.contracts import ExtensionInventory, PermissionMode
+import pytest
+
+from cowork.coding.contracts import EventType, ExtensionInventory, PermissionMode
 from cowork.coding.engines import codex as codex_module
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
@@ -180,7 +182,8 @@ def test_turn_input_preserves_native_mentions_and_local_images() -> None:
     ]
 
 
-def test_codex_launch_policy_is_resolved_once_for_client_and_thread() -> None:
+def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch) -> None:
+    monkeypatch.delenv(codex_config.AUTO_COMPACT_TOKEN_LIMIT_ENV, raising=False)
     launch = codex_config.prepare_launch(
         EngineSessionConfig(
             model="fable",
@@ -209,11 +212,34 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread() -> None:
     assert 'model_reasoning_effort="high"' in launch.config_overrides
     assert 'service_tier="priority"' in launch.config_overrides
     assert 'web_search="live"' in launch.config_overrides
+    assert (
+        f"model_auto_compact_token_limit={codex_config.DEFAULT_AUTO_COMPACT_TOKEN_LIMIT}"
+        in launch.config_overrides
+    )
     assert any(item.startswith("mcp_servers.mindshub_code.command=") for item in launch.config_overrides)
     assert any('"cowork.coding.integration_mcp","/cowork-data","task-123"' in item for item in launch.config_overrides)
     assert launch.thread_params["developerInstructions"] == "Use the project playbook."
     assert launch.thread_params["approvalPolicy"] == launch.approval_policy
     assert launch.thread_params["sandbox"] == "workspace-write"
+
+
+def test_codex_auto_compact_threshold_can_be_tuned_for_runtime_verification(monkeypatch) -> None:
+    monkeypatch.setenv(codex_config.AUTO_COMPACT_TOKEN_LIMIT_ENV, "12000")
+
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(model="gpt", permission_mode=PermissionMode.workspace),
+        Path("/workspace"),
+        "http://127.0.0.1:26866/api/v1/coding/inference",
+    )
+
+    assert "model_auto_compact_token_limit=12000" in launch.config_overrides
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "0", "-1"])
+def test_codex_auto_compact_threshold_ignores_invalid_overrides(monkeypatch, value: str) -> None:
+    monkeypatch.setenv(codex_config.AUTO_COMPACT_TOKEN_LIMIT_ENV, value)
+
+    assert codex_config.auto_compact_token_limit() == codex_config.DEFAULT_AUTO_COMPACT_TOKEN_LIMIT
 
 
 def test_extension_inventory_normalizes_codex_skills_and_mcp_servers() -> None:
@@ -342,6 +368,18 @@ def test_plain_dict_notification_payload_is_supported() -> None:
     event = codex_events.map_codex_notification("item/agentMessage/delta", {"delta": "hello"})
     assert event is not None
     assert event.text == "hello"
+
+
+def test_collaboration_items_map_to_visible_child_work() -> None:
+    event = codex_events.map_codex_notification(
+        "item/started",
+        {"item": {"id": "worker-1", "type": "collabAgentToolCall", "prompt": "Audit the API boundary"}},
+    )
+
+    assert event is not None
+    assert event.type == EventType.child_work
+    assert event.title == "Audit the API boundary"
+    assert event.item_id == "worker-1"
 
 
 def test_nested_payload_sanitizer_has_a_global_budget() -> None:
@@ -491,6 +529,85 @@ def test_goal_updates_use_native_thread_lifecycle(monkeypatch) -> None:
         ("edit", "session-1", "Ship safely"),
         ("clear", "session-1"),
     ]
+
+
+def test_terminal_write_waits_for_codex_process_registration(monkeypatch) -> None:
+    from openai_codex.errors import InvalidRequestError
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, method: str, params: dict[str, object], *, response_model: object) -> object:
+            assert method == "command/exec/write"
+            assert params == {"processId": "process-1", "deltaBase64": "aGkK"}
+            self.calls += 1
+            if self.calls == 1:
+                raise InvalidRequestError(-32600, "no active command/exec for process id process-1")
+            return response_model.model_validate({})
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = FakeClient()
+    engine_session._closed = codex_module.threading.Event()
+    monkeypatch.setattr(codex_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(codex_module, "_TERMINAL_WRITE_RETRY_SECONDS", 0.0)
+
+    engine_session.write_terminal("process-1", "aGkK")
+
+    assert engine_session._client.calls == 2
+
+
+def test_terminal_write_does_not_retry_unrelated_rpc_failures(monkeypatch) -> None:
+    from openai_codex.errors import InvalidRequestError
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, *_args, **_kwargs) -> None:
+            self.calls += 1
+            raise InvalidRequestError(-32600, "terminal input was rejected")
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = FakeClient()
+    engine_session._closed = codex_module.threading.Event()
+    monkeypatch.setattr(codex_module, "_TERMINAL_WRITE_RETRY_SECONDS", 0.0)
+
+    with pytest.raises(InvalidRequestError, match="terminal input was rejected"):
+        engine_session.write_terminal("process-1", "aGkK")
+
+    assert engine_session._client.calls == 1
+
+
+def test_user_terminal_is_not_restricted_by_agent_permissions() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeClient:
+        def request(self, method: str, params: dict[str, object], *, response_model: object) -> object:
+            calls.append((method, params))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = FakeClient()
+    engine_session._closed = codex_module.threading.Event()
+    engine_session._terminal_workspace = Path("/tmp/preview")
+    engine_session._sandbox_policy = {"type": "readOnly", "networkAccess": False}
+    engine_session._terminal_handlers = {"process-1": lambda *_args: None}
+    engine_session._terminal_lock = codex_module.threading.Lock()
+    engine_session._secrets = ()
+    exits: list[tuple[int | None, str | None]] = []
+
+    engine_session._run_terminal(
+        "process-1",
+        100,
+        30,
+        codex_module.TerminalShellPreference.bash,
+        lambda code, error: exits.append((code, error)),
+    )
+
+    assert calls[0][0] == "command/exec"
+    assert calls[0][1]["sandboxPolicy"] == {"type": "dangerFullAccess"}
+    assert exits == [(0, None)]
 
 
 class _Payload:

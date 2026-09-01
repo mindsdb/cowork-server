@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 
 from cowork.coding.contracts import CodingSession, InputReference
 from cowork.coding.engines.base import EngineCredentials, EngineInputReference
 from cowork.coding.redaction import redact_text
+from cowork.coding.workspace_files import WorkspaceFileBrowser
 
 _EXCLUDED_WORKSPACE_DIRECTORIES = {
     ".git",
@@ -63,9 +65,14 @@ def validate_references(
         (Path(item.source_path).resolve(), Path(item.workspace_path).resolve())
         for item in session.workspaces
     ] or [(Path(session.source_path).resolve(), Path(session.workspace_path).resolve())]
+    browser = WorkspaceFileBrowser(session)
     workspace = mappings[0][1]
     for item in attachments:
-        path = Path(item.path)
+        path = (
+            browser.absolute_path(item.resource_id, item.relative_path)
+            if item.resource_id and item.relative_path
+            else Path(item.path)
+        )
         if not path.is_absolute():
             path = workspace / path
         try:
@@ -76,6 +83,10 @@ def validate_references(
             raise ValueError(f"Image attachment is not a file: {item.name}")
         if item.kind == "mention" and not (path.is_file() or path.is_dir()):
             raise ValueError(f"Referenced path is not a file or folder: {item.name}")
+        if item.content_hash and path.is_file():
+            actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual_hash != item.content_hash:
+                raise ValueError(f"Referenced file changed; select its lines again: {item.name}")
         for source, mapped_workspace in mappings:
             try:
                 relative = path.relative_to(source)
@@ -85,7 +96,16 @@ def validate_references(
             if workspace_file.is_file() or workspace_file.is_dir():
                 path = workspace_file
             break
-        resolved.append(EngineInputReference(name=item.name, path=str(path), kind=item.kind))
+        resolved.append(EngineInputReference(
+            name=item.name,
+            path=str(path),
+            kind=item.kind,
+            resource_id=item.resource_id,
+            relative_path=item.relative_path,
+            line_start=item.line_start,
+            line_end=item.line_end,
+            content_hash=item.content_hash,
+        ))
     return tuple(resolved)
 
 

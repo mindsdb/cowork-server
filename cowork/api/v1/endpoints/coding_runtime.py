@@ -6,6 +6,7 @@ import hmac
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session
 
+from cowork.api.v1.endpoints.guards import require_local_tenancy
 from cowork.coding.connector_capabilities import ConnectorInvocationRequest
 from cowork.coding.control_models import RUNTIME_PROTOCOL_VERSION, RuntimeEvent
 from cowork.coding.control_service import RuntimeAuthenticationError, StaleRuntimeEvent
@@ -19,7 +20,6 @@ from cowork.coding.runtime_protocol import (
     ComputerRegistrationResponse,
     RuntimeCommandAckRequest,
     RuntimeCommandPage,
-    RuntimeExecutionConfig,
     RuntimeFenceRequest,
     RuntimeLease,
     RuntimeLeaseRequest,
@@ -30,7 +30,10 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session as get_db_session
 from cowork.services.settings import SettingService
 
-router = APIRouter()
+# Remote computers are supported by the desktop control plane. Hosted/org
+# activation requires the tenant-bound service resolver and SQL store; until
+# that boundary is wired, fail closed rather than sharing desktop-global state.
+router = APIRouter(dependencies=[Depends(require_local_tenancy)])
 
 
 def _control():
@@ -97,41 +100,9 @@ async def acquire_runtime_lease(
     _authenticate(request, computer_id)
     deadline = asyncio.get_running_loop().time() + body.wait_seconds
     while True:
-        acquired = _control().acquire_lease(computer_id)
-        if acquired is not None:
-            run, lease_id = acquired
-            service = get_coding_service()
-            task = service.control.store.get_task(run.task_id)
-            project = service.projects.get(task.project_id) if task.project_id else None
-            runtime_project = (
-                service.control.runtime_project(project, task.resource_scope, computer_id)
-                if project
-                else None
-            )
-            session = service.store.load_session(task.id)
-            agent_token = service.control.issue_run_token(run.id)
-            connector_capabilities = service.runtime_connector_capabilities(session)
-            return RuntimeLease(
-                task=task,
-                run=run,
-                lease_id=lease_id,
-                agent_token=agent_token,
-                project=runtime_project,
-                execution=RuntimeExecutionConfig(
-                    engine_id=session.engine_id,
-                    model=session.model,
-                    permission_mode=session.permission_mode,
-                    reasoning_effort=session.reasoning_effort,
-                    service_tier=session.service_tier,
-                    personality=session.personality,
-                    network_access=session.network_access,
-                    web_search=session.web_search,
-                    developer_instructions=session.developer_instructions,
-                    environment=session.environment,
-                ),
-                connector_capabilities=connector_capabilities,
-                workspaces=service.control.store.list_workspaces(run.id),
-            )
+        lease = get_coding_service().remote.acquire_lease(computer_id)
+        if lease is not None:
+            return lease
         if asyncio.get_running_loop().time() >= deadline:
             return None
         await asyncio.sleep(0.25)
@@ -208,7 +179,10 @@ def invoke_connector_capability(
     _require_protocol(body.protocol_version)
     service = get_coding_service()
     try:
-        grant_record = service.control.store.get_grant(grant_id)
+        try:
+            grant_record = service.control.store.get_grant(grant_id)
+        except KeyError as exc:
+            raise RuntimeAuthenticationError("Connector capability authentication failed") from exc
         service.control.authenticate_run_token(
             grant_record.run_id,
             computer_id,
@@ -223,13 +197,19 @@ def invoke_connector_capability(
                 for name in ("repository", "target_url", "url")
                 if name in body.payload
             },
+            computer_id,
         )
         run = service.control.store.get_run(grant.run_id)
         if run.computer_id != computer_id:
             raise RuntimeAuthenticationError("Connector capability belongs to another computer")
         task = service.control.store.get_task(run.task_id)
-        if not task.project_id:
+        if not task.project_id or task.execution_project is None:
             raise ValueError("Connector capabilities require a Code Project")
+        if not any(
+            connection.provider == grant.provider and connection.name == grant.connection_name
+            for connection in task.execution_project.connections
+        ):
+            raise RuntimeAuthenticationError("Connector capability is outside the task execution snapshot")
         project = service.projects.get(task.project_id)
         integrations = DeveloperIntegrationService(scope)
         try:

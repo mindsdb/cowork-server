@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-import os
+import argparse
 import platform
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from cowork.coding.context import goal_status_text
 from cowork.coding.contracts import CodingEvent, EventType
-from cowork.coding.control_models import (
-    RUNTIME_PROTOCOL_VERSION,
-    ComputerCapabilities,
-    RuntimeCommand,
-    RuntimeEvent,
-)
+from cowork.coding.control_models import RuntimeCommand
 from cowork.coding.engines.base import (
     EngineCredentials,
     EngineMcpServer,
@@ -31,209 +26,30 @@ from cowork.coding.remote_integration_mcp import (
     write_remote_integration_config,
 )
 from cowork.coding.runtime_operations import RuntimeWorkspaceOperations
-from cowork.coding.runtime_protocol import (
-    ComputerRegistrationRequest,
-    ComputerRegistrationResponse,
-    RuntimeLease,
+from cowork.coding.runtime_client import (
+    RemoteRuntimeClient,
+    RuntimeClientError,
+    RuntimeIdentity,
+    load_runtime_identity,
+    run_runtime_forever,
+    save_runtime_identity,
 )
-from cowork.coding.shells import shell_inventory
+from cowork.coding.runtime_protocol import RuntimeLease
 from cowork.coding.workspace import WorkspaceManager
-
-
-class RuntimeClientError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class RuntimeIdentity:
-    computer_id: str
-    runtime_token: str
-    name: str
-
-
-class RemoteRuntimeClient:
-    """Authenticated outbound client for the versioned execution protocol."""
-
-    def __init__(self, server_url: str, identity: RuntimeIdentity, client: httpx.Client | None = None) -> None:
-        self.server_url = server_url.rstrip("/")
-        self.identity = identity
-        self.client = client or httpx.Client(timeout=30.0)
-        self._owns_client = client is None
-        self._sequence_lock = threading.Lock()
-        self._sequences: dict[str, int] = {}
-
-    @classmethod
-    def register(
-        cls,
-        server_url: str,
-        registration_token: str,
-        name: str,
-        root: Path,
-        registry: CodingEngineRegistry = engine_registry,
-    ) -> RemoteRuntimeClient:
-        persisted_id = cls._persisted_computer_id(root)
-        shells = [item.id.value for item in shell_inventory().items]
-        system = platform.system().lower()
-        capabilities = ComputerCapabilities(
-            platform="darwin" if system == "darwin" else "windows" if system == "windows" else "linux",
-            architecture=platform.machine() or "unknown",
-            runtime_version="cowork-code-runtime-1",
-            agent_engines=registry.available_ids(),
-            shells=shells,
-            has_git=True,
-            has_terminal=True,
-            supports_local_folders=True,
-            # One worker process retains one engine/workspace loop at a time.
-            # Advertise that truthfully until the runtime supervisor fans out.
-            max_concurrent_runs=1,
-        )
-        with httpx.Client(timeout=30.0) as client:
-            response = client.post(
-                f"{server_url.rstrip('/')}/api/v1/coding/runtime/register",
-                json=ComputerRegistrationRequest(
-                    registration_token=registration_token,
-                    computer_id=persisted_id,
-                    name=name,
-                    capabilities=capabilities,
-                ).model_dump(mode="json"),
-            )
-            cls._raise(response)
-            registered = ComputerRegistrationResponse.model_validate(response.json())
-        cls._save_computer_id(root, registered.computer.id)
-        return cls(
-            server_url,
-            RuntimeIdentity(registered.computer.id, registered.runtime_token, registered.computer.name),
-        )
-
-    def close(self) -> None:
-        if self._owns_client:
-            self.client.close()
-
-    def heartbeat(self, active_run_count: int = 0) -> None:
-        response = self.client.post(
-            self._url(f"computers/{self.identity.computer_id}/heartbeat"),
-            headers=self._headers(),
-            json={"protocol_version": RUNTIME_PROTOCOL_VERSION, "active_run_count": active_run_count},
-        )
-        self._raise(response)
-
-    def lease(self, wait_seconds: float = 0) -> RuntimeLease | None:
-        response = self.client.post(
-            self._url(f"computers/{self.identity.computer_id}/lease"),
-            headers=self._headers(),
-            json={"protocol_version": RUNTIME_PROTOCOL_VERSION, "wait_seconds": wait_seconds},
-        )
-        self._raise(response)
-        return RuntimeLease.model_validate(response.json()) if response.json() is not None else None
-
-    def event(
-        self,
-        lease: RuntimeLease,
-        kind: str,
-        payload: dict[str, object] | None = None,
-    ) -> None:
-        with self._sequence_lock:
-            sequence = self._sequences.get(lease.run.id, lease.run.last_event_seq) + 1
-            event = RuntimeEvent(
-                run_id=lease.run.id,
-                computer_id=self.identity.computer_id,
-                lease_id=lease.lease_id,
-                epoch=lease.run.epoch,
-                seq=sequence,
-                kind=kind,
-                payload=payload or {},
-            )
-            response = self.client.post(
-                self._url(f"runs/{lease.run.id}/events"),
-                headers=self._headers(),
-                json=event.model_dump(mode="json"),
-            )
-            self._raise(response)
-            self._sequences[lease.run.id] = sequence
-
-    def commands(self, lease: RuntimeLease) -> list[RuntimeCommand]:
-        response = self.client.post(
-            self._url(f"runs/{lease.run.id}/commands/claim"),
-            params={"computer_id": self.identity.computer_id},
-            headers=self._headers(),
-            json={
-                "protocol_version": RUNTIME_PROTOCOL_VERSION,
-                "lease_id": lease.lease_id,
-                "epoch": lease.run.epoch,
-            },
-        )
-        self._raise(response)
-        return [RuntimeCommand.model_validate(item) for item in response.json().get("items", [])]
-
-    def acknowledge(
-        self,
-        lease: RuntimeLease,
-        command: RuntimeCommand,
-        result: dict[str, object] | None = None,
-        error: str | None = None,
-    ) -> None:
-        response = self.client.post(
-            self._url(f"runs/{lease.run.id}/commands/ack"),
-            params={"computer_id": self.identity.computer_id},
-            headers=self._headers(),
-            json={
-                "protocol_version": RUNTIME_PROTOCOL_VERSION,
-                "lease_id": lease.lease_id,
-                "epoch": lease.run.epoch,
-                "command_id": command.id,
-                "result": result,
-                "error": error,
-            },
-        )
-        self._raise(response)
-
-    def inference_endpoint(self, lease: RuntimeLease) -> str:
-        return self._url(
-            f"computers/{self.identity.computer_id}/runs/{lease.run.id}/inference"
-        )
-
-    def _url(self, path: str) -> str:
-        return f"{self.server_url}/api/v1/coding/runtime/{path}"
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.identity.runtime_token}"}
-
-    @staticmethod
-    def _raise(response: httpx.Response) -> None:
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            detail = ""
-            try:
-                detail = str(response.json().get("detail") or "")
-            except (ValueError, AttributeError):
-                pass
-            raise RuntimeClientError(detail or f"Runtime request failed ({response.status_code})") from exc
-
-    @staticmethod
-    def _persisted_computer_id(root: Path) -> str | None:
-        try:
-            return (root / "computer-id").read_text(encoding="utf-8").strip() or None
-        except FileNotFoundError:
-            return None
-
-    @staticmethod
-    def _save_computer_id(root: Path, computer_id: str) -> None:
-        root.mkdir(parents=True, exist_ok=True)
-        target = root / "computer-id"
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(computer_id + "\n", encoding="utf-8")
-        os.replace(temporary, target)
 
 
 class CodeOnlyRuntime:
     """Prepare isolated workspaces and run an agent without a desktop UI."""
+
+    HEARTBEAT_INTERVAL_SECONDS = 10.0
 
     def __init__(
         self,
         root: Path,
         client: RemoteRuntimeClient,
         registry: CodingEngineRegistry = engine_registry,
+        heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+        approval_timeout_seconds: float = 600,
     ) -> None:
         self.root = root
         self.client = client
@@ -242,12 +58,22 @@ class CodeOnlyRuntime:
         self._approval_lock = threading.Lock()
         self._approval_waiters: dict[str, tuple[threading.Event, dict[str, str]]] = {}
         self._pending_commands: list[RuntimeCommand] = []
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._approval_timeout_seconds = max(0, approval_timeout_seconds)
 
     def run_once(self, wait_seconds: float = 0) -> bool:
         self.client.heartbeat()
         lease = self.client.lease(wait_seconds)
         if lease is None:
             return False
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=self._heartbeat_while_active,
+            args=(heartbeat_stop,),
+            name=f"runtime-heartbeat-{lease.run.id[:8]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
             self._execute(lease)
         except BaseException as exc:
@@ -256,7 +82,27 @@ class CodeOnlyRuntime:
             except RuntimeClientError:
                 pass
             raise
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=2)
         return True
+
+    def _heartbeat_while_active(self, stop: threading.Event) -> None:
+        """Keep the computer online while workspace or agent work blocks the lease loop."""
+
+        while not stop.is_set():
+            try:
+                self.client.heartbeat(active_run_count=1)
+            except httpx.TransportError:
+                # The event/command paths surface control-plane outages to the
+                # main run. A transient heartbeat failure must not kill useful
+                # local work or produce an unhandled daemon-thread exception.
+                pass
+            except RuntimeClientError as exc:
+                if exc.status_code not in {429, 500, 502, 503, 504}:
+                    return
+            if stop.wait(self._heartbeat_interval_seconds):
+                return
 
     def _execute(self, lease: RuntimeLease) -> None:
         if lease.project is None:
@@ -271,7 +117,7 @@ class CodeOnlyRuntime:
         )
         prepared = (
             self.workspaces.restore(lease.task.id, lease.project, lease.workspaces)
-            if can_restore
+            if lease.run.workspace_resume_mode == "restore" and can_restore
             else self.workspaces.prepare(lease.task.id, lease.project)
         )
         self.client.event(lease, "workspace", {
@@ -429,8 +275,11 @@ class CodeOnlyRuntime:
         start: RuntimeCommand,
     ) -> None:
         self.client.event(lease, "status", {"status": "running"})
-        turn_id = session.start_turn(str(start.payload.get("prompt") or lease.task.prompt))
+        turn_id = self._start_turn(lease, session, start)
         self.client.acknowledge(lease, start)
+        if turn_id is None:
+            self.client.event(lease, "turn_completed", {"status": "completed"})
+            return
         stop = threading.Event()
         cancelled = threading.Event()
         command_thread = threading.Thread(
@@ -450,6 +299,112 @@ class CodeOnlyRuntime:
             "status": "cancelled" if cancelled.is_set() else "completed",
         })
 
+    def _start_turn(
+        self,
+        lease: RuntimeLease,
+        session: EngineSession,
+        start: RuntimeCommand,
+    ) -> str | None:
+        command = str(start.payload.get("command") or "")
+        goal_action = str(start.payload.get("goal_action") or "")
+        objective = start.payload.get("goal_objective")
+        goal_objective = str(objective) if objective is not None else None
+        if self._run_immediate_command(lease, session, command, goal_action, goal_objective):
+            return None
+        if command == "goal":
+            if goal_action == "set":
+                return session.start_goal(goal_objective or "")
+            if goal_action == "resume":
+                return session.resume_goal()
+            goal = session.goal_status() if goal_action == "view" else session.update_goal(goal_action, goal_objective)
+            labels = {
+                "view": "Goal status",
+                "edit": "Goal updated",
+                "pause": "Goal paused",
+                "clear": "Goal cleared",
+            }
+            text = goal_status_text(goal) if goal else (
+                "No goal is active for this coding task."
+                if goal_action == "view"
+                else "The task goal has been cleared."
+            )
+            self._emit_session_event(lease, labels[goal_action], text, {"goal": goal or {}})
+            return None
+        if command == "review":
+            return session.start_review()
+        return session.start_turn(str(
+            start.payload.get("engine_prompt")
+            or start.payload.get("prompt")
+            or lease.task.prompt
+        ))
+
+    def _run_immediate_command(
+        self,
+        lease: RuntimeLease,
+        session: EngineSession,
+        command: str,
+        goal_action: str,
+        goal_objective: str | None,
+    ) -> bool:
+        if command == "compact":
+            session.compact()
+            self._emit_session_event(
+                lease,
+                "Compaction started",
+                "Codex compacted this task's context for future turns.",
+            )
+            return True
+        if command == "status":
+            goal = session.goal_status()
+            goal_line = goal_status_text(goal) if goal else "Goal: none"
+            self._emit_session_event(
+                lease,
+                "Task status",
+                "\n".join((
+                    f"Model: {lease.execution.model}",
+                    f"Permissions: {lease.execution.permission_mode.value}",
+                    f"Network: {'on' if lease.execution.network_access else 'off'}",
+                    goal_line,
+                )),
+                {"goal": goal or {}},
+            )
+            return True
+        if command == "goal" and goal_action in {"view", "edit", "pause", "clear"}:
+            goal = session.goal_status() if goal_action == "view" else session.update_goal(
+                goal_action,
+                goal_objective,
+            )
+            labels = {
+                "view": "Goal status",
+                "edit": "Goal updated",
+                "pause": "Goal paused",
+                "clear": "Goal cleared",
+            }
+            text = goal_status_text(goal) if goal else (
+                "No goal is active for this coding task."
+                if goal_action == "view"
+                else "The task goal has been cleared."
+            )
+            self._emit_session_event(lease, labels[goal_action], text, {"goal": goal or {}})
+            return True
+        return False
+
+    def _emit_session_event(
+        self,
+        lease: RuntimeLease,
+        title: str,
+        text: str,
+        data: dict[str, object] | None = None,
+    ) -> None:
+        event = CodingEvent(
+            type=EventType.session,
+            title=title,
+            text=text,
+            phase="completed",
+            data=data or {},
+        )
+        self.client.event(lease, "event", {"event": event.model_dump(mode="json")})
+
     def _route_commands(
         self,
         lease: RuntimeLease,
@@ -464,6 +419,23 @@ class CodeOnlyRuntime:
                 for command in self._take_commands(lease):
                     if command.kind == "steer":
                         session.steer(turn_id, str(command.payload.get("prompt") or ""))
+                    elif command.kind == "agent_command":
+                        action = str(command.payload.get("goal_action") or "")
+                        objective = command.payload.get("goal_objective")
+                        handled = self._run_immediate_command(
+                            lease,
+                            session,
+                            str(command.payload.get("command") or ""),
+                            action,
+                            str(objective) if objective is not None else None,
+                        )
+                        if not handled:
+                            self.client.acknowledge(
+                                lease,
+                                command,
+                                error="The command cannot run during an active turn",
+                            )
+                            continue
                     elif command.kind == "cancel":
                         session.cancel(turn_id)
                         cancelled.set()
@@ -510,13 +482,17 @@ class CodeOnlyRuntime:
             "method": method,
             "params": params or {},
         })
-        deadline = time.monotonic() + 600
+        deadline = time.monotonic() + self._approval_timeout_seconds
         try:
             while time.monotonic() < deadline:
                 if resolved.wait(timeout=5):
                     self.client.event(lease, "status", {"status": "running"})
                     return {"decision": decision.get("decision", "decline")}
                 self.client.event(lease, "checkpoint", {"waitingForApproval": approval_id})
+            # The engine will continue after receiving the decline. Persist
+            # that transition before returning so the control plane and UI do
+            # not remain indefinitely stuck in awaiting_approval.
+            self.client.event(lease, "status", {"status": "running"})
             return {"decision": "decline"}
         finally:
             with self._approval_lock:
@@ -524,18 +500,31 @@ class CodeOnlyRuntime:
 
 
 def main() -> None:
-    server_url = os.environ.get("COWORK_RUNTIME_SERVER", "").strip()
-    registration_token = os.environ.get("COWORK_RUNTIME_REGISTRATION_TOKEN", "").strip()
-    root_value = os.environ.get("COWORK_RUNTIME_ROOT", "").strip()
-    name = os.environ.get("COWORK_RUNTIME_NAME", platform.node() or "Code runtime")
-    if not server_url or not registration_token or not root_value:
-        raise SystemExit("Runtime server, registration token, and root are required")
-    root = Path(root_value).expanduser().resolve()
-    client = RemoteRuntimeClient.register(server_url, registration_token, name, root)
+    parser = argparse.ArgumentParser(description="Connect this computer to MindsHub Code")
+    parser.add_argument("--server", default=os.environ.get("COWORK_RUNTIME_SERVER", ""))
+    parser.add_argument("--code", default=os.environ.get("COWORK_RUNTIME_REGISTRATION_TOKEN", ""))
+    parser.add_argument("--name", default=os.environ.get("COWORK_RUNTIME_NAME", platform.node() or "Code runtime"))
+    parser.add_argument("--root", default=os.environ.get("COWORK_RUNTIME_ROOT", "~/.mindshub-code"))
+    args = parser.parse_args()
+
+    root = Path(args.root).expanduser().resolve()
+    stored = load_runtime_identity(root)
+    server_url = str(args.server).strip()
+    if not server_url and stored:
+        server_url = stored.server_url
+    registration_token = str(args.code).strip()
+    if registration_token:
+        if not server_url:
+            raise SystemExit("--server is required when connecting a computer")
+        client = RemoteRuntimeClient.register(server_url, registration_token, str(args.name).strip(), root)
+        save_runtime_identity(root, server_url, client.identity)
+    elif stored:
+        client = RemoteRuntimeClient(server_url or stored.server_url, stored.identity)
+    else:
+        raise SystemExit("Connect this computer from Settings → Code → Computers first")
     runtime = CodeOnlyRuntime(root, client)
     try:
-        while True:
-            runtime.run_once(wait_seconds=20)
+        run_runtime_forever(runtime)
     finally:
         client.close()
 
