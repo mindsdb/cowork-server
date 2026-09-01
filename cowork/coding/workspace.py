@@ -472,16 +472,6 @@ class WorkspaceManager:
                 changes[path] = status
         return [(status, path) for path, status in changes.items()]
 
-    @staticmethod
-    def _validated_git_path(value: str) -> str:
-        """Keep Git-reported file names inside the selected workspace."""
-        path = PurePosixPath(value.replace("\\", "/"))
-        if value.startswith(("/", "\\")) or path.is_absolute() or not path.parts or path == PurePosixPath("."):
-            raise WorkspaceError("Choose a file inside this task workspace")
-        if any(part in {"", ".", ".."} for part in path.parts) or "\x00" in value:
-            raise WorkspaceError("Choose a file inside this task workspace")
-        return path.as_posix()
-
     def create_branch(self, workspace_path: str, name: str) -> GitState:
         with self._mutation_lock:
             root = Path(workspace_path)
