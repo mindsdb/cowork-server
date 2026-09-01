@@ -43,7 +43,7 @@ class Conversation(BaseSQLModel, table=True):
     # Anton's completion-verifier latch, carried across the per-message session
     # rebuild. Opaque here: the shape is anton's contract and this row only
     # relays it. Model alias plus counters, so nothing secret.
-    verifier_latch: dict | None = Field(
+    verifier_latch: dict[str, object] | None = Field(
         default=None,
         sa_column=Column(JSON, nullable=True),
         description="Anton's verifier latch state for this conversation",

@@ -1132,6 +1132,11 @@ class AntonHarness:
             # and both report harness="anton" (ENG-1459). Only the deployment
             # knows which, so it is resolved here rather than by anton.
             **surface_kwarg(ChatSessionConfig),
+            # LOCAL PATH ONLY. `stream_response` refuses org mode above, which
+            # routes those turns to `_produce_remote`; that job carries no latch
+            # and returns none, so a cloud message still starts with a fresh
+            # one. Carrying it there needs a field on anton's TurnRequestV1 and
+            # one on the reply stream, both contracts held outside this repo.
             **verifier_latch_kwarg(ChatSessionConfig, conversation.verifier_latch),
             proactive_dashboards=anton_settings.proactive_dashboards,
             act_first=anton_settings.act_first,
