@@ -18,12 +18,12 @@ from cowork.coding.shells import resolve_shell, shell_environment
 # task runtimes are children of, and owned by, this process.
 LOCAL_PROXY_TOKEN = secrets.token_urlsafe(32)
 
-# MindsHub models used by Code Mode currently expose context windows of at
-# least 200k tokens. Codex does not receive auto-compaction metadata from the
-# normalized MindsHub model catalogue, so without an explicit threshold a
-# tool-heavy task can reach the provider's hard limit before Codex compacts it.
-# Keep enough headroom for the compaction request itself and the next turn.
-DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 180_000
+# Codex's local estimate can substantially under-count context forwarded
+# through the MindsHub Responses proxy (notably cached input and large tool
+# results). A conservative threshold makes compaction happen while the provider
+# still has ample room for the compaction request and the next turn. This is a
+# runtime safety limit, not the model's advertised context-window size.
+DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 36_000
 AUTO_COMPACT_TOKEN_LIMIT_ENV = "MINDSHUB_CODE_AUTO_COMPACT_TOKEN_LIMIT"
 
 
