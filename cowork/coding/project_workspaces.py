@@ -155,7 +155,7 @@ class ProjectWorkspaceManager:
                 for folder in project.folders:
                     key = self._key(session_id, folder.id)
                     item = self.workspaces.prepare(key, folder.path, True, folder.base_branch)
-                    prepared.append(self._task_workspace(session_id, project, folder, item))
+                    prepared.append(self._task_workspace(session_id, project.name, folder, item))
                 ports = self.ports.allocate(session_id, project.environment.port_names)
                 return PreparedProjectWorkspace(primary=prepared[0], workspaces=tuple(prepared), ports=ports)
             except Exception:
@@ -167,18 +167,21 @@ class ProjectWorkspaceManager:
     def fork(
         self,
         session_id: str,
-        project: CodeProject,
+        project_name: str,
         parent_workspaces: list[TaskWorkspace],
+        port_names: list[str],
     ) -> PreparedProjectWorkspace:
         """Copy every project workspace while preserving each original baseline."""
         with self._lock:
-            parent_by_id = {workspace.folder_id: workspace for workspace in parent_workspaces}
             prepared: list[TaskWorkspace] = []
             try:
-                for folder in project.folders:
-                    parent = parent_by_id.get(folder.id)
-                    if parent is None:
-                        raise WorkspaceError(f"The task is missing its {folder.name} workspace")
+                for parent in parent_workspaces:
+                    folder = ProjectFolder(
+                        id=parent.folder_id,
+                        name=parent.folder_name,
+                        path=parent.source_path,
+                        base_branch=parent.base_branch,
+                    )
                     key = self._key(session_id, folder.id)
                     item = self.workspaces.fork(
                         key,
@@ -187,8 +190,16 @@ class ProjectWorkspaceManager:
                         parent.workspace_kind,
                         parent.base_revision,
                     )
-                    prepared.append(self._task_workspace(session_id, project, folder, item, parent.base_branch))
-                ports = self.ports.allocate(session_id, project.environment.port_names)
+                    prepared.append(
+                        self._task_workspace(
+                            session_id,
+                            project_name,
+                            folder,
+                            item,
+                            parent.base_branch,
+                        )
+                    )
+                ports = self.ports.allocate(session_id, port_names)
                 return PreparedProjectWorkspace(primary=prepared[0], workspaces=tuple(prepared), ports=ports)
             except Exception:
                 for workspace in reversed(prepared):
@@ -283,7 +294,7 @@ class ProjectWorkspaceManager:
     def _task_workspace(
         self,
         session_id: str,
-        project: CodeProject,
+        project_name: str,
         folder: ProjectFolder,
         prepared: PreparedWorkspace,
         base_branch: str | None = None,
@@ -291,7 +302,7 @@ class ProjectWorkspaceManager:
         branch = None
         try:
             if prepared.kind == WorkspaceKind.git_worktree:
-                branch = self._task_branch(project.name, session_id)
+                branch = self._task_branch(project_name, session_id)
                 self.workspaces.create_branch(str(prepared.workspace_path), branch)
             resolved_base_branch = base_branch or folder.base_branch
             if prepared.kind == WorkspaceKind.git_worktree and not resolved_base_branch:

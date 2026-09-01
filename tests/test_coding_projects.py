@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from cowork.coding.contracts import SourceContext, WorkspaceKind
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
@@ -461,6 +462,21 @@ def test_project_update_preserves_typed_nested_settings(tmp_path: Path) -> None:
     assert projects.get(created.id) == updated
 
 
+def test_project_update_rejects_explicit_null_without_corrupting_record(tmp_path: Path) -> None:
+    folder = tmp_path / "product"
+    folder.mkdir()
+    projects = CodeProjectService(tmp_path / "coding")
+    created = projects.create(ProjectCreateRequest(
+        name="Product",
+        folders=[ProjectFolder(id="product", name="Product", path=str(folder))],
+    ))
+
+    with pytest.raises(ValidationError):
+        projects.update(created.id, ProjectUpdateRequest.model_validate({"folders": None}))
+
+    assert projects.get(created.id) == created
+
+
 def test_project_folder_inspection_reports_an_unavailable_base_branch(tmp_path: Path) -> None:
     repo = repository(tmp_path, "product")
     projects = CodeProjectService(tmp_path / "coding")
@@ -524,6 +540,26 @@ def test_project_rejects_unavailable_and_duplicate_folders(tmp_path: Path) -> No
                 folders=[
                     ProjectFolder(id="first", name="First", path=str(existing)),
                     ProjectFolder(id="second", name="Second", path=str(existing)),
+                ],
+            )
+        )
+
+
+def test_project_rejects_multiple_folders_from_one_git_repository(tmp_path: Path) -> None:
+    repo = repository(tmp_path, "product")
+    frontend = repo / "frontend"
+    backend = repo / "backend"
+    frontend.mkdir()
+    backend.mkdir()
+    service = CodeProjectService(tmp_path / "coding")
+
+    with pytest.raises(WorkspaceError, match="Git repository can only be added once"):
+        service.create(
+            ProjectCreateRequest(
+                name="Duplicate repository",
+                folders=[
+                    ProjectFolder(id="frontend", name="Frontend", path=str(frontend)),
+                    ProjectFolder(id="backend", name="Backend", path=str(backend)),
                 ],
             )
         )
