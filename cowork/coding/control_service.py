@@ -9,9 +9,9 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from cowork.coding.connector_delegation import ConnectorDelegationService
 from cowork.coding.contracts import CodingSession, SessionStatus, TaskCapability, utc_now
@@ -563,10 +563,16 @@ class ControlPlaneService:
             raise StaleRuntimeEvent("Runtime protocol version is not supported")
 
         def operation(run: TaskRun) -> None:
+            if event.seq == run.last_event_seq and event.id == run.last_event_id:
+                # A terminal event clears the lease as part of the same atomic
+                # transition. If its acknowledgement is lost, the authenticated
+                # runtime must still be able to redeliver that exact event and
+                # receive the same acknowledgement. Keep the ownership fence,
+                # but do not require a lease that the accepted event removed.
+                self._require_event_owner(run, event.computer_id, event.epoch)
+                return
             self._require_fence(run, event.computer_id, event.lease_id, event.epoch)
             run.lease_expires_at = utc_now() + _LEASE_DURATION
-            if event.seq == run.last_event_seq and event.id == run.last_event_id:
-                return
             if event.seq <= run.last_event_seq:
                 raise StaleRuntimeEvent("Runtime event sequence is stale")
             self._apply_event(run, event)
@@ -821,10 +827,17 @@ class ControlPlaneService:
             for candidate in self.store.list_runs():
                 if candidate.lease_expires_at is None or candidate.lease_expires_at >= now:
                     continue
-                self.store.update_run(candidate.id, lambda run: self._expire_lease(run, now))
+                workspaces = self.store.list_workspaces(candidate.id)
+                resume_mode = "restore" if workspaces and all(
+                    item.status == WorkspaceStatus.ready and item.path for item in workspaces
+                ) else "prepare"
+                self.store.update_run(
+                    candidate.id,
+                    lambda run, mode=resume_mode: self._expire_lease(run, now, mode),
+                )
 
     @staticmethod
-    def _expire_lease(run: TaskRun, now) -> None:
+    def _expire_lease(run: TaskRun, now: datetime, workspace_resume_mode: Literal["prepare", "restore"]) -> None:
         if run.lease_expires_at is None or run.lease_expires_at >= now:
             return
         if run.status not in {RunStatus.preparing, RunStatus.ready, RunStatus.running, RunStatus.awaiting_approval}:
@@ -835,7 +848,7 @@ class ControlPlaneService:
         run.last_event_seq = 0
         run.last_event_id = None
         run.checkpoint = {}
-        run.workspace_resume_mode = "restore"
+        run.workspace_resume_mode = workspace_resume_mode
         run.recovery_count += 1
         transition_run(
             run,
@@ -956,12 +969,18 @@ class ControlPlaneService:
 
     @staticmethod
     def _require_fence(run: TaskRun, computer_id: str, lease_id: str, epoch: int) -> None:
-        if run.computer_id != computer_id or run.epoch != epoch or not run.lease_id:
+        ControlPlaneService._require_event_owner(run, computer_id, epoch)
+        if not run.lease_id:
             raise StaleRuntimeEvent("Task Run ownership changed")
         if not hmac.compare_digest(run.lease_id, lease_id):
             raise StaleRuntimeEvent("Task Run lease is stale")
         if run.lease_expires_at is None or run.lease_expires_at < utc_now():
             raise StaleRuntimeEvent("Task Run lease expired")
+
+    @staticmethod
+    def _require_event_owner(run: TaskRun, computer_id: str, epoch: int) -> None:
+        if run.computer_id != computer_id or run.epoch != epoch:
+            raise StaleRuntimeEvent("Task Run ownership changed")
 
     @staticmethod
     def _fallback_workspace(session: CodingSession) -> TaskWorkspace:
