@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -25,8 +26,10 @@ def write_remote_integration_config(path: Path, config: RemoteIntegrationConfig)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(config.model_dump_json(indent=2) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
+    temporary.unlink(missing_ok=True)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(config.model_dump_json(indent=2) + "\n")
     temporary.replace(path)
     return path
 

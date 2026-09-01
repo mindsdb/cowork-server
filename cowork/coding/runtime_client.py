@@ -228,12 +228,12 @@ class RemoteRuntimeClient:
         _atomic_write(root / "computer-id", computer_id + "\n")
 
 
-def _atomic_write(target: Path, contents: str, mode: int | None = None) -> None:
+def _atomic_write(target: Path, contents: str, mode: int = 0o666) -> None:
     temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
     try:
-        temporary.write_text(contents, encoding="utf-8")
-        if mode is not None:
-            os.chmod(temporary, mode)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(contents)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
