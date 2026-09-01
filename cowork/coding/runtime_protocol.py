@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from cowork.coding.connector_capabilities import ConnectorCapability
-from cowork.coding.contracts import PermissionMode
+from cowork.coding.contracts import PermissionMode, Personality, ReasoningEffort, ServiceTier
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     CodeTask,
@@ -44,9 +44,9 @@ class RuntimeExecutionConfig(BaseModel):
     engine_id: str
     model: str
     permission_mode: PermissionMode
-    reasoning_effort: str | None = None
-    service_tier: str = "standard"
-    personality: str = "pragmatic"
+    reasoning_effort: ReasoningEffort | None = None
+    service_tier: ServiceTier = "standard"
+    personality: Personality = "pragmatic"
     network_access: bool = False
     web_search: bool = False
     developer_instructions: str = ""

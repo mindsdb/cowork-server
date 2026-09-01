@@ -38,6 +38,11 @@ class PermissionMode(str, Enum):
     full_access = "full_access"
 
 
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+ServiceTier = Literal["standard", "priority"]
+Personality = Literal["none", "friendly", "pragmatic"]
+
+
 class TaskCapability(str, Enum):
     """Versioned user-visible operations an execution computer actually supports."""
 
@@ -346,9 +351,9 @@ class CodingSession(BaseModel):
     engine_adapter_version: str
     model: str
     permission_mode: PermissionMode = PermissionMode.supervised
-    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
-    service_tier: Literal["standard", "priority"] = "standard"
-    personality: Literal["none", "friendly", "pragmatic"] = "pragmatic"
+    reasoning_effort: ReasoningEffort | None = None
+    service_tier: ServiceTier = "standard"
+    personality: Personality = "pragmatic"
     network_access: bool = False
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list)
@@ -469,9 +474,9 @@ class SessionCreateRequest(BaseModel):
     engine_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: str | None = Field(default=None, min_length=1, max_length=256)
     permission_mode: PermissionMode = PermissionMode.supervised
-    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
-    service_tier: Literal["standard", "priority"] = "standard"
-    personality: Literal["none", "friendly", "pragmatic"] = "pragmatic"
+    reasoning_effort: ReasoningEffort | None = None
+    service_tier: ServiceTier = "standard"
+    personality: Personality = "pragmatic"
     network_access: bool = False
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list, max_length=16)
@@ -494,9 +499,9 @@ class SessionCreateRequest(BaseModel):
 class SessionUpdateRequest(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=256)
     permission_mode: PermissionMode | None = None
-    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
-    service_tier: Literal["standard", "priority"] | None = None
-    personality: Literal["none", "friendly", "pragmatic"] | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    service_tier: ServiceTier | None = None
+    personality: Personality | None = None
     network_access: bool | None = None
     web_search: bool | None = None
     additional_dirs: list[str] | None = Field(default=None, max_length=16)
