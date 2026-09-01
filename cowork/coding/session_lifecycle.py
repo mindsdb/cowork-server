@@ -123,9 +123,22 @@ class SessionLifecycleOperations:
             engine_id=parent.engine_id,
             standalone_computer_id=self.control.local_computer.id if project is None else None,
         )
-        self.control.set_run_status(control_snapshot.run.id, RunStatus.preparing)
+        try:
+            self.control.set_run_status(control_snapshot.run.id, RunStatus.preparing)
+        except Exception:
+            self.control.delete_task(control_snapshot.run.id)
+            raise
         if project and parent.workspaces:
-            prepared_project = self.project_workspaces.fork(new_id, project, parent.workspaces)
+            try:
+                prepared_project = self.project_workspaces.fork(
+                    new_id,
+                    project.name,
+                    parent.workspaces,
+                    list(parent.allocated_ports),
+                )
+            except Exception:
+                self.control.delete_task(control_snapshot.run.id)
+                raise
             prepared = prepared_project.primary
             child_workspaces = list(prepared_project.workspaces)
             child_ports = prepared_project.ports
@@ -143,13 +156,17 @@ class SessionLifecycleOperations:
             }
             instructions = self._forked_instructions(parent, child_workspaces)
         else:
-            prepared = self.workspaces.fork(
-                new_id,
-                parent.source_path,
-                parent.workspace_path,
-                parent.workspace_kind,
-                parent.base_revision,
-            )
+            try:
+                prepared = self.workspaces.fork(
+                    new_id,
+                    parent.source_path,
+                    parent.workspace_path,
+                    parent.workspace_kind,
+                    parent.base_revision,
+                )
+            except Exception:
+                self.control.delete_task(control_snapshot.run.id)
+                raise
             child_workspaces = []
             child_ports = {}
             child_dirs = parent.additional_dirs

@@ -410,6 +410,57 @@ def test_remote_cancel_is_deduplicated_per_turn_not_per_runtime_epoch(tmp_path: 
     assert second_cancel[0].idempotency_key != first_cancel[0].idempotency_key
 
 
+def test_active_remote_task_must_stop_before_deletion(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    registration = service.control.issue_registration_token()
+    remote, _ = service.control.register_runtime(
+        registration,
+        "Build computer",
+        ComputerCapabilities(
+            platform="linux",
+            architecture="test",
+            runtime_version="test-runtime",
+            agent_engines=["fake"],
+            shells=["bash"],
+        ),
+    )
+    project = service.projects.create(ProjectCreateRequest(
+        name="Portable project",
+        resources=[RepositoryResource(
+            id="repo",
+            name="Repo",
+            source_url="https://example.test/repo.git",
+            local_path=str(repo),
+        )],
+    ))
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            computer_id=remote.id,
+            prompt="Keep working",
+            engine_id="fake",
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    run = service.control.store.get_run(created.run_id or "")
+    service.control.set_run_status(run.id, RunStatus.preparing)
+    service.control.set_run_status(run.id, RunStatus.ready)
+    service.control.set_run_status(run.id, RunStatus.running)
+    service.store.update_session(
+        created.id,
+        lambda current: setattr(current, "run_status", RunStatus.running.value),
+    )
+
+    with pytest.raises(RuntimeError, match="Wait for the remote agent"):
+        service.delete_session(created.id)
+
+    assert service.get_session(created.id).id == created.id
+    assert service.control.store.get_run(run.id).task_id == created.task_id
+
+
 def test_deleting_task_survives_a_moved_source_repository(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
@@ -1405,6 +1456,39 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
 
     service.delete_session(parent.id)
     assert Path(child.workspace_path).is_dir()
+
+
+def test_failed_fork_preparation_does_not_leave_control_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Fork cleanup",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+    parent = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Prepare parent"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, parent.id, SessionStatus.completed)
+    before = {task.id for task in service.control.store.list_tasks()}
+
+    def fail_fork(*_args, **_kwargs):
+        raise WorkspaceError("simulated fork failure")
+
+    monkeypatch.setattr(service.project_workspaces, "fork", fail_fork)
+
+    with pytest.raises(WorkspaceError, match="simulated fork failure"):
+        service.fork_session(parent.id, CREDS)
+
+    assert {task.id for task in service.control.store.list_tasks()} == before
+    assert {session.id for session in service.store.list_sessions()} == {parent.id}
 
 
 def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path: Path) -> None:
