@@ -70,7 +70,6 @@ def register_runtime(body: ComputerRegistrationRequest):
             body.registration_token,
             body.name,
             body.capabilities,
-            body.computer_id,
         )
     except RuntimeAuthenticationError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc

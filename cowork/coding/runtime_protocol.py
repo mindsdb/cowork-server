@@ -19,7 +19,6 @@ from cowork.coding.project_models import CodeProject
 class ComputerRegistrationRequest(BaseModel):
     protocol_version: str = RUNTIME_PROTOCOL_VERSION
     registration_token: str = Field(min_length=32, max_length=512)
-    computer_id: str | None = Field(default=None, max_length=128)
     name: str = Field(min_length=1, max_length=120)
     capabilities: ComputerCapabilities
 

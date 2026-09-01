@@ -60,3 +60,42 @@ def test_lease_long_poll_does_not_block_other_requests(
     assert health_response.status_code == 200
     assert health_elapsed < 0.5
     assert lease_statuses == [200]
+
+
+def test_legacy_computer_id_in_registration_body_never_touches_an_existing_computer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    control = service.control
+    capabilities = ComputerCapabilities(
+        platform="linux",
+        architecture="test",
+        runtime_version="test-runtime",
+        protocol_versions=["1.0"],
+    )
+    existing, existing_token = control.register_runtime(control.issue_registration_token(), "Existing", capabilities)
+    monkeypatch.setattr(coding_runtime, "get_coding_service", lambda: service)
+    app = FastAPI()
+    app.include_router(coding_runtime.router, prefix="/api/v1/coding/runtime")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/coding/runtime/register",
+            json={
+                "protocol_version": "1.0",
+                "registration_token": control.issue_registration_token(),
+                "computer_id": existing.id,
+                "name": "Imposter",
+                "capabilities": capabilities.model_dump(mode="json"),
+            },
+        )
+
+    assert response.status_code == 200
+    registered = response.json()["computer"]
+    assert registered["id"] != existing.id
+    assert registered["name"] == "Imposter"
+    current = control.authenticate_runtime(existing.id, existing_token)
+    assert current.name == existing.name
+    assert current.registration_epoch == existing.registration_epoch
+    assert {existing.id, registered["id"]} <= {item.id for item in control.list_computers().items}

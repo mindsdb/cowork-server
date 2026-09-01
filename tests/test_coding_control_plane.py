@@ -231,40 +231,22 @@ def test_this_computer_can_be_renamed_but_not_revoked(tmp_path: Path) -> None:
         restarted.revoke_computer(restarted.local_computer.id)
 
 
-def test_registration_cannot_take_over_an_existing_computer(tmp_path: Path) -> None:
+def test_every_registration_mints_a_distinct_computer(tmp_path: Path) -> None:
     service = ControlPlaneService(tmp_path, capabilities())
-    remote, runtime_token = register(service)
+    first, first_token = register(service, "Remote")
+    second, second_token = register(service, "Remote")
 
-    for existing_id in (remote.id, service.local_computer.id):
-        with pytest.raises(RuntimeAuthenticationError, match="already registered"):
-            service.register_runtime(
-                service.issue_registration_token(),
-                "Imposter",
-                capabilities(),
-                computer_id=existing_id,
-            )
-
-    current = service.authenticate_runtime(remote.id, runtime_token)
-    assert current.registration_epoch == remote.registration_epoch
-    assert current.name == remote.name
-    assert any(
-        item.action == "runtime.register" and item.outcome == "denied" and item.computer_id == remote.id
-        for item in service.store.list_audit_events()
-    )
+    assert first.id != second.id
+    assert first_token != second_token
+    assert service.authenticate_runtime(first.id, first_token).id == first.id
+    assert service.authenticate_runtime(second.id, second_token).id == second.id
 
 
-def test_revoked_computer_cannot_register_or_lease_again(tmp_path: Path) -> None:
+def test_revoked_computer_cannot_lease_again(tmp_path: Path) -> None:
     service = ControlPlaneService(tmp_path, capabilities())
     remote, _ = register(service)
     service.revoke_computer(remote.id)
 
-    with pytest.raises(RuntimeAuthenticationError, match="revoked"):
-        service.register_runtime(
-            service.issue_registration_token(),
-            remote.name,
-            capabilities(),
-            computer_id=remote.id,
-        )
     with pytest.raises(RuntimeAuthenticationError, match="revoked"):
         service.acquire_lease(remote.id)
     assert service.store.get_computer(remote.id).revoked_at is not None
@@ -278,13 +260,6 @@ def test_reconnection_requires_the_computers_existing_credential(tmp_path: Path)
     restarted = ControlPlaneService(tmp_path, capabilities())
     with pytest.raises(RuntimeAuthenticationError, match="failed"):
         restarted.authenticate_runtime(remote.id, "not-the-credential-issued-at-registration")
-    with pytest.raises(RuntimeAuthenticationError):
-        restarted.register_runtime(
-            restarted.issue_registration_token(),
-            remote.name,
-            capabilities(),
-            computer_id=remote.id,
-        )
     assert restarted.authenticate_runtime(remote.id, runtime_token).id == remote.id
 
 
