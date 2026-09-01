@@ -51,7 +51,8 @@ def _add_skills(inventory: ExtensionInventory, response: Any, skill_roots: Seque
                 surviving[key] = entry
             else:
                 kept.supersedes.append(entry)
-    for entry in surviving.values():
+    for key, entry in surviving.items():
+        entry.id = key
         if entry.supersedes:
             other_scopes = ", ".join(dict.fromkeys(other.detail for other in entry.supersedes))
             entry.detail = f"{entry.detail} · also installed in {other_scopes}"

@@ -144,6 +144,13 @@ class RemoteRuntimeClient:
         kind: str,
         payload: dict[str, object] | None = None,
     ) -> None:
+        """Deliver one sequenced event.
+
+        The sequence is consumed even when every delivery fails: the control
+        plane may have applied the event without the worker seeing the
+        acknowledgement, and it tolerates gaps but rejects a reused sequence.
+        """
+
         with self._sequence_lock:
             sequence = self._sequences.get(lease.run.id, lease.run.last_event_seq) + 1
             event = RuntimeEvent(
@@ -155,8 +162,10 @@ class RemoteRuntimeClient:
                 kind=kind,
                 payload=payload or {},
             )
-            self._deliver(event)
-            self._sequences[lease.run.id] = sequence
+            try:
+                self._deliver(event)
+            finally:
+                self._sequences[lease.run.id] = sequence
 
     def _deliver(self, event: RuntimeEvent) -> None:
         """Redeliver the same event id on transient failures; the control plane deduplicates it."""

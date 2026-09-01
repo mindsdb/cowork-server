@@ -76,6 +76,7 @@ class RemoteExecutionCoordinator:
 
     def _accept_update(self, run: TaskRun, event: RuntimeEvent) -> None:
         pending_approval, coding_event = self._coding_event(run, event)
+        coding_event.source_event_id = event.id
 
         def update(current: CodingSession) -> None:
             current.status = _SESSION_STATUS[run.status]
@@ -464,6 +465,7 @@ class RemoteExecutionCoordinator:
                 title="Workspace prepared",
                 text=f"{len(workspaces)} resource{'s' if len(workspaces) != 1 else ''} ready",
                 phase="completed",
+                source_event_id=event.id,
                 data={"computerId": run.computer_id, "runId": run.id},
             ),
             update,
@@ -486,6 +488,7 @@ class RemoteExecutionCoordinator:
                 title="Stopped" if outcome == "cancelled" else "Completed",
                 text="The task workspace remains available for review and follow-up.",
                 phase="completed",
+                source_event_id=event.id,
                 data={"computerId": run.computer_id, "runId": run.id},
             ),
             update,
