@@ -137,9 +137,29 @@ def setup_console_handler():
     return handler
 
 
+def _resolved_log_level_name() -> str:
+    """The configured log level, read the same way every other setting is.
+
+    Not `os.getenv`: the desktop keeps its config in `<COWORK_HOME>/.env`,
+    which no environment variable carries, so a customer who set LOG_LEVEL
+    there still got the WARNING default and a log holding nothing but uvicorn
+    access lines. AppSettings already reads that file (its env-file chain), and
+    pydantic-settings still ranks real environment variables above it, so a
+    deployment's LOG_LEVEL keeps winning.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    try:
+        return get_app_settings().log_level
+    except Exception:
+        # This runs at import, before anything can report a settings failure.
+        # Let the app's own get_app_settings() raise with its real message.
+        return os.getenv("LOG_LEVEL", "WARNING")
+
+
 def setup_logging():
     """Setup comprehensive logging configuration"""
-    log_level_str = os.getenv("LOG_LEVEL", "WARNING")
+    log_level_str = _resolved_log_level_name()
     enable_file_logging = os.getenv("ENABLE_FILE_LOGGING", "false").lower() == "true"
     log_dir = os.getenv("LOG_DIR", "logs")
 
