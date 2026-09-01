@@ -146,6 +146,37 @@ def test_redelivered_event_is_acknowledged_once_and_lower_sequences_are_stale(
     assert store.get_run(run.id).status == RunStatus.running
 
 
+def test_terminal_event_redelivery_is_acknowledged_after_the_event_clears_its_lease(
+    store: ControlPlaneStore,
+    tmp_path: Path,
+) -> None:
+    service, run, lease_id = leased_run(store, tmp_path)
+    terminal = status_event(run, lease_id, 1, "failed")
+    applied: list[RunStatus] = []
+
+    accepted = service.accept_event(terminal, lambda current: applied.append(current.status))
+    redelivered = service.accept_event(terminal, lambda current: applied.append(current.status))
+
+    assert accepted.lease_id is None
+    assert redelivered.status == RunStatus.failed
+    assert (redelivered.last_event_seq, redelivered.last_event_id) == (1, terminal.id)
+    assert applied == [RunStatus.failed]
+
+
+def test_expired_lease_prepares_a_workspace_that_was_never_published(
+    store: ControlPlaneStore,
+    tmp_path: Path,
+) -> None:
+    service, run, _ = leased_run(store, tmp_path)
+    store.update_run(run.id, lambda current: setattr(current, "lease_expires_at", utc_now() - timedelta(seconds=1)))
+
+    service.expire_leases()
+
+    recovered = store.get_run(run.id)
+    assert recovered.status == RunStatus.recovering
+    assert recovered.workspace_resume_mode == "prepare"
+
+
 def test_lifecycle_mutations_write_the_run_only_under_the_store_lock(
     store: ControlPlaneStore,
     tmp_path: Path,
