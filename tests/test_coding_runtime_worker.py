@@ -250,6 +250,30 @@ def test_runtime_identity_is_private_and_survives_restart(tmp_path: Path) -> Non
     assert (tmp_path / "runtime-identity.json").stat().st_mode & 0o777 == 0o600
 
 
+def test_runtime_identity_is_created_owner_only_without_a_chmod(monkeypatch, tmp_path: Path) -> None:
+    created: dict[str, tuple[int, int]] = {}
+    real_open = os.open
+
+    def recording_open(path, flags, mode=0o777, *args, **kwargs):
+        created[os.fspath(path)] = (flags, mode)
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "chmod", lambda *_args, **_kwargs: pytest.fail("mode must be set at creation"))
+    monkeypatch.setattr(Path, "chmod", lambda *_args, **_kwargs: pytest.fail("mode must be set at creation"))
+
+    save_runtime_identity(
+        tmp_path,
+        "https://control.example.test",
+        RuntimeIdentity("remote-computer", "runtime-secret", "Build computer"),
+    )
+
+    ((flags, mode),) = [item for path, item in created.items() if path.startswith(str(tmp_path))]
+    assert mode == 0o600
+    assert flags & os.O_EXCL
+    assert (tmp_path / "runtime-identity.json").stat().st_mode & 0o777 == 0o600
+
+
 def test_runtime_reconnects_with_bounded_backoff_after_transport_failure() -> None:
     class UnreachableRuntime:
         calls = 0

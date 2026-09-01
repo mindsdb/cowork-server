@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from datetime import timedelta
 from pathlib import Path
@@ -15,6 +16,38 @@ from cowork.coding.remote_integration_mcp import (
     RemoteIntegrationConfig,
     write_remote_integration_config,
 )
+
+
+def test_remote_mcp_config_is_created_owner_only_without_a_chmod(monkeypatch, tmp_path: Path) -> None:
+    created: dict[str, tuple[int, int]] = {}
+    real_open = os.open
+
+    def recording_open(path, flags, mode=0o777, *args, **kwargs):
+        created[os.fspath(path)] = (flags, mode)
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "chmod", lambda *_args, **_kwargs: pytest.fail("mode must be set at creation"))
+    monkeypatch.setattr(Path, "chmod", lambda *_args, **_kwargs: pytest.fail("mode must be set at creation"))
+    (tmp_path / "run.tmp").write_text("stale partial write", encoding="utf-8")
+
+    config_path = write_remote_integration_config(
+        tmp_path / "run.json",
+        RemoteIntegrationConfig(
+            server_url="https://control.example.test",
+            computer_id="computer-1",
+            run_id="run-1",
+            agent_token="agent-token-that-is-long-enough-for-runtime",
+            project_context={"project": "Product"},
+        ),
+    )
+
+    ((flags, mode),) = [item for path, item in created.items() if path.startswith(str(tmp_path))]
+    assert mode == 0o600
+    assert flags & os.O_EXCL
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert not (tmp_path / "run.tmp").exists()
+    assert "agent-token-that-is-long-enough-for-runtime" in config_path.read_text(encoding="utf-8")
 
 
 def test_remote_mcp_uses_only_the_exact_scoped_capability(tmp_path: Path) -> None:
