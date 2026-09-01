@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from cowork.coding import project_store as project_store_module
 from cowork.coding.contracts import SourceContext, WorkspaceKind
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.playbooks import PlaybookService
@@ -60,6 +62,53 @@ def test_new_code_projects_default_to_the_live_gpt_5_6_sol_catalog_id(tmp_path: 
     )
 
     assert project.default_model == "gpt"
+
+
+def test_related_project_updates_roll_back_after_a_mid_write_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = CodeProjectStore(tmp_path / "coding")
+    first_folder = tmp_path / "first"
+    second_folder = tmp_path / "second"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    first = store.create(
+        CodeProject(
+            id="first",
+            name="First",
+            folders=[ProjectFolder(id="first", name="First", path=str(first_folder))],
+        )
+    )
+    second = store.create(
+        CodeProject(
+            id="second",
+            name="Second",
+            folders=[ProjectFolder(id="second", name="Second", path=str(second_folder))],
+        )
+    )
+    second_target = store.root / "second.json"
+    real_replace = os.replace
+    failed = False
+
+    def fail_second_project_once(source, target) -> None:
+        nonlocal failed
+        if Path(target) == second_target and not failed:
+            failed = True
+            raise OSError("simulated storage failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(project_store_module.os, "replace", fail_second_project_once)
+
+    def rename(value: str):
+        return lambda project: setattr(project, "name", value)
+
+    with pytest.raises(OSError, match="simulated storage failure"):
+        store.update_many({first.id: rename("Changed first"), second.id: rename("Changed second")})
+
+    assert store.get(first.id).name == "First"
+    assert store.get(second.id).name == "Second"
+    assert not (store.root / ".transaction.json").exists()
 
 
 def test_task_titles_are_compact_and_end_cleanly() -> None:
@@ -144,6 +193,87 @@ def test_multi_folder_handoff_preflights_every_folder_before_changing_any_source
 
     assert (first_repo / "README.md").read_text(encoding="utf-8") == "first\n"
     assert (second_repo / "README.md").read_text(encoding="utf-8") == "user\n"
+
+
+def test_multi_folder_handoff_restores_every_source_after_an_apply_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = repository(tmp_path, "app")
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "plan.txt").write_text("original\n", encoding="utf-8")
+    project = CodeProject(
+        id="project-rollback",
+        name="Rollback",
+        folders=[
+            ProjectFolder(id="app", name="App", path=str(repo)),
+            ProjectFolder(id="notes", name="Notes", path=str(notes)),
+        ],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = manager.prepare("session-rollback", project)
+    (Path(prepared.workspaces[0].workspace_path) / "README.md").write_text("task\n", encoding="utf-8")
+    (Path(prepared.workspaces[1].workspace_path) / "plan.txt").write_text("task\n", encoding="utf-8")
+
+    def fail_after_partial_local_apply(source: Path, workspace: Path, changed: list[str]) -> list[str]:
+        (source / "plan.txt").write_text("partial\n", encoding="utf-8")
+        raise LocalCopyError("simulated handoff failure")
+
+    monkeypatch.setattr(
+        manager.workspaces.local_copies,
+        "apply_checked",
+        fail_after_partial_local_apply,
+    )
+
+    with pytest.raises(WorkspaceError, match="Every source folder was restored"):
+        manager.apply("session-rollback", list(prepared.workspaces))
+
+    assert (repo / "README.md").read_text(encoding="utf-8") == "app\n"
+    assert (notes / "plan.txt").read_text(encoding="utf-8") == "original\n"
+    assert (Path(prepared.workspaces[0].workspace_path) / "README.md").read_text(encoding="utf-8") == "task\n"
+    assert (Path(prepared.workspaces[1].workspace_path) / "plan.txt").read_text(encoding="utf-8") == "task\n"
+
+
+def test_multi_repository_commit_rolls_back_commits_without_losing_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repositories = [repository(tmp_path, name) for name in ("frontend", "server")]
+    project = CodeProject(
+        id="project-commit-rollback",
+        name="Commit rollback",
+        folders=[
+            ProjectFolder(id=name, name=name.title(), path=str(repo))
+            for name, repo in zip(("frontend", "server"), repositories, strict=True)
+        ],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = manager.prepare("session-commit-rollback", project)
+    for workspace in prepared.workspaces:
+        (Path(workspace.workspace_path) / "README.md").write_text("task\n", encoding="utf-8")
+    original_revisions = {
+        workspace.folder_id: git(Path(workspace.workspace_path), "rev-parse", "HEAD")
+        for workspace in prepared.workspaces
+    }
+    second_path = prepared.workspaces[1].workspace_path
+    real_commit = manager.workspaces.commit
+
+    def fail_second_commit(workspace_path: str, message: str):
+        if workspace_path == second_path:
+            raise WorkspaceError("simulated commit failure")
+        return real_commit(workspace_path, message)
+
+    monkeypatch.setattr(manager.workspaces, "commit", fail_second_commit)
+
+    with pytest.raises(WorkspaceError, match="No repositories were committed"):
+        manager.commit(list(prepared.workspaces), "Prepare change")
+
+    for workspace in prepared.workspaces:
+        root = Path(workspace.workspace_path)
+        assert git(root, "rev-parse", "HEAD") == original_revisions[workspace.folder_id]
+        assert (root / "README.md").read_text(encoding="utf-8") == "task\n"
+        assert git(root, "status", "--short") == "M README.md"
 
 
 def test_project_cleanup_preserves_real_files_at_the_task_root(tmp_path: Path) -> None:

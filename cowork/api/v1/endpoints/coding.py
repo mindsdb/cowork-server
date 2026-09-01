@@ -18,6 +18,9 @@ from cowork.coding.contracts import (
     ApprovalRequest,
     BranchRequest,
     CommitRequest,
+    DeliveryAutomationClaim,
+    DeliveryAutomationClaimRequest,
+    DeliveryAutomationPolicy,
     EventPage,
     RenameSessionRequest,
     SessionCreateRequest,
@@ -31,24 +34,37 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
+from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.integrations import DeveloperIntegrationService
-from cowork.coding.redaction import redact_text
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PlaybookConfigureRequest,
     PlaybookItemsRequest,
-    PublishRequest,
     ProjectCreateRequest,
     ProjectPage,
     ProjectUpdateRequest,
+    PublishRequest,
+    PullRequestActionRequest,
     SourceContextRequest,
+    SourceActionRequest,
+    WorkItemSearchRequest,
 )
+from cowork.coding.redaction import redact_text
 from cowork.coding.service import CodingService, get_coding_service
+from cowork.coding.skill_models import (
+    SkillLibraryDocument,
+    SkillLibraryPage,
+    SkillLibrarySource,
+    SkillSourceAssignmentsRequest,
+    SkillSourceCreateRequest,
+    SkillSourceItemsRequest,
+)
 from cowork.coding.workspace import WorkspaceError
 from cowork.common.settings.user_settings import Provider, provider_api_key_str
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.services.settings import SettingService
+from cowork.services.skills import CodeSkillService
 
 router = APIRouter(dependencies=[Depends(require_local), Depends(require_local_tenancy)])
 logger = logging.getLogger(__name__)
@@ -203,7 +219,70 @@ async def inference_proxy(path: str, request: Request, session: SessionDep, scop
 
 @router.get("/workspace/inspect")
 def inspect_workspace(path: str):
-    return _service().inspect_workspace(path)
+    return _call(_service().inspect_workspace, path)
+
+
+@router.get("/skills/library", response_model=SkillLibraryPage)
+def code_skill_library(
+    scope: ScopeDep,
+    project_id: str | None = Query(default=None, alias="projectId"),
+):
+    return _call(_service().skill_library.catalog, CodeSkillService(scope), project_id)
+
+
+@router.get("/skills/library/content", response_model=SkillLibraryDocument)
+def code_skill_document(
+    scope: ScopeDep,
+    item_id: str = Query(alias="itemId", min_length=1, max_length=2_000),
+    path: str | None = Query(default=None, max_length=2_000),
+):
+    return _call(_service().skill_library.document, CodeSkillService(scope), item_id, path)
+
+
+@router.post("/skills/sources", response_model=SkillLibrarySource)
+def add_code_skill_source(body: SkillSourceCreateRequest):
+    return _call(_service().skill_library.add, body.repository, body.branch, body.name)
+
+
+@router.post("/skills/sources/{source_id}/refresh", response_model=SkillLibrarySource)
+def refresh_code_skill_source(source_id: str):
+    return _call(_service().skill_library.refresh, source_id)
+
+
+@router.post("/skills/sources/{source_id}/apply", response_model=SkillLibrarySource)
+def apply_code_skill_source(source_id: str):
+    return _call(_service().skill_library.apply_update, source_id)
+
+
+@router.delete("/skills/sources/{source_id}", status_code=204)
+def remove_code_skill_source(source_id: str):
+    _call(_service().skill_library.remove, source_id)
+
+
+@router.put("/projects/{project_id}/skills/{source_id}", response_model=SkillLibraryPage)
+def update_code_project_skill_source(
+    project_id: str,
+    source_id: str,
+    body: SkillSourceItemsRequest,
+):
+    return _call(
+        _service().skill_library.set_project_items,
+        project_id,
+        source_id,
+        body.enabled_paths,
+    )
+
+
+@router.put("/skills/sources/{source_id}/projects", response_model=SkillLibraryPage)
+def update_code_skill_source_projects(
+    source_id: str,
+    body: SkillSourceAssignmentsRequest,
+):
+    return _call(
+        _service().skill_library.set_project_assignments,
+        source_id,
+        body.assignments,
+    )
 
 
 @router.get("/projects", response_model=ProjectPage)
@@ -278,6 +357,12 @@ def read_code_project_source(project_id: str, body: SourceContextRequest, integr
     return _call(integrations.read, project, body)
 
 
+@router.post("/projects/{project_id}/work-items/search")
+def search_code_project_work(project_id: str, body: WorkItemSearchRequest, integrations: IntegrationsDep):
+    project = _call(_service().projects.get, project_id)
+    return _call(integrations.search, project, body)
+
+
 @router.get("/sessions", response_model=SessionPage)
 def list_sessions(include_archived: bool = Query(default=False, alias="includeArchived")):
     return _service().list_sessions(include_archived)
@@ -292,6 +377,7 @@ def create_session(body: SessionCreateRequest, session: SessionDep, scope: Scope
         _credentials(settings),
         default_engine=settings.coding_agent_engine,
         default_model=settings.coding_agent_model,
+        code_skills=CodeSkillService(scope),
     )
 
 
@@ -339,6 +425,16 @@ def setup_windows_sandbox(session_id: str, session: SessionDep, scope: ScopeDep)
 @router.patch("/sessions/{session_id}")
 def update_session(session_id: str, body: SessionUpdateRequest):
     return _call(_service().update_session_config, session_id, body)
+
+
+@router.put("/sessions/{session_id}/delivery-policy")
+def update_delivery_policy(session_id: str, body: DeliveryAutomationPolicy):
+    return _call(DeliveryAutomationService(_service().store).update_policy, session_id, body)
+
+
+@router.post("/sessions/{session_id}/delivery-automation/claim", response_model=DeliveryAutomationClaim)
+def claim_delivery_automation(session_id: str, body: DeliveryAutomationClaimRequest):
+    return _call(DeliveryAutomationService(_service().store).claim_fix, session_id, body)
 
 
 @router.post("/sessions/{session_id}/rename")
@@ -565,6 +661,11 @@ def create_draft_pull_requests(session_id: str, body: DraftPullRequestRequest, i
     }
 
 
+@router.post("/sessions/{session_id}/pull-request-action")
+def pull_request_action(session_id: str, body: PullRequestActionRequest, integrations: IntegrationsDep):
+    return _call(_service().pull_request_action, session_id, body, integrations)
+
+
 @router.post("/sessions/{session_id}/publish")
 def publish_task_update(session_id: str, body: PublishRequest, integrations: IntegrationsDep):
     coding = _service()
@@ -577,4 +678,16 @@ def publish_task_update(session_id: str, body: PublishRequest, integrations: Int
         task.id,
         lambda current: current.deliveries.append(delivery),
     )
+    return delivery
+
+
+@router.post("/sessions/{session_id}/source-action")
+def source_action(session_id: str, body: SourceActionRequest, integrations: IntegrationsDep):
+    coding = _service()
+    task = _call(coding.get_session, session_id)
+    if not task.project_id:
+        raise HTTPException(status_code=409, detail="This task is not linked to a Code Project")
+    project = _call(coding.projects.get, task.project_id)
+    delivery = _call(integrations.complete_source, project, body)
+    coding.store.update_session(task.id, lambda current: current.deliveries.append(delivery))
     return delivery

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from coding_service_fakes import (
+    CREDS,
+    FakeEngine,
+    git,
+    repository,
+    service_with,
+    wait_for_status,
+    wait_for_steers,
+)
 
 from cowork.coding.contracts import (
     CodingEvent,
@@ -16,9 +25,11 @@ from cowork.coding.contracts import (
     SessionCreateRequest,
     SessionStatus,
     SessionUpdateRequest,
+    WorkspaceKind,
 )
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
+    DraftPullRequestSpec,
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
@@ -26,8 +37,6 @@ from cowork.coding.project_models import (
 )
 from cowork.coding.turns import EventBuffer, terminal_status
 from cowork.coding.workspace import WorkspaceError
-
-from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status, wait_for_steers
 
 
 def test_event_buffer_preserves_terminal_phase_when_coalescing_deltas() -> None:
@@ -114,6 +123,26 @@ def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None
     assert ready.data["workspaceKind"] == "local_copy"
     assert created.workspace_path != str(folder.resolve())
     assert created.source_path == str(folder.resolve())
+
+
+def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -> None:
+    repo = tmp_path / "unborn-repo"
+    repo.mkdir()
+    git(repo, "init")
+    (repo / "README.md").write_text("uncommitted source\n", encoding="utf-8")
+    service = service_with(tmp_path, FakeEngine())
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Start from this folder"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.workspace_kind == WorkspaceKind.local_copy
+    assert created.workspace_path != str(repo.resolve())
+    assert Path(created.workspace_path, "README.md").read_text(encoding="utf-8") == "uncommitted source\n"
 
 
 def test_git_mutation_cannot_race_a_new_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -966,7 +995,8 @@ def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_pa
     assert service.delivery_plan(task.id).items[0].status == "ready"
 
     class Integrations:
-        calls: list[dict] = []
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
 
         def create_draft_pull_request(self, _project, **kwargs):
             self.calls.append(kwargs)
@@ -993,6 +1023,69 @@ def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_pa
     assert integrations.calls[0]["head"] == task.workspaces[0].task_branch
     assert service.get_session(task.id).deliveries[0].action == "draft_pull_request"
     assert service.delivery_plan(task.id).items[0].status == "published"
+
+
+def test_project_delivery_can_publish_a_selected_repository_with_its_own_copy(tmp_path: Path) -> None:
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = repository(first_root)
+    second = repository(second_root)
+    for index, repo in enumerate((first, second), start=1):
+        remote = tmp_path / f"remote-{index}.git"
+        git(tmp_path, "init", "--bare", str(remote))
+        git(repo, "remote", "add", "origin", str(remote))
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Multi-repository delivery",
+        folders=[
+            ProjectFolder(id="frontend", name="Frontend", path=str(first)),
+            ProjectFolder(id="server", name="Server", path=str(second)),
+        ],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+    task = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Prepare both repositories"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, task.id, SessionStatus.completed)
+    for workspace in task.workspaces:
+        (Path(workspace.workspace_path) / "README.md").write_text(f"{workspace.folder_name}\n", encoding="utf-8")
+    service.commit(task.id, "Prepare delivery")
+
+    class Integrations:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def create_draft_pull_request(self, _project, **kwargs):
+            self.calls.append(kwargs)
+            return "https://github.example/draft/selected"
+
+        def git_push_credentials(self, _project, repository_url, _connection_name):
+            return SimpleNamespace(remote_url=repository_url, environment={})
+
+    integrations = Integrations()
+    records = service.create_draft_pull_requests(
+        task.id,
+        DraftPullRequestRequest(
+            title="Shared title",
+            body="Shared body",
+            confirmed=True,
+            drafts=[DraftPullRequestSpec(
+                folder_id="server",
+                title="Server-specific title",
+                body="Server-specific reviewer context",
+            )],
+        ),
+        integrations,  # type: ignore[arg-type]
+    )
+
+    assert [(record.folder_id, record.status) for record in records] == [("server", "published")]
+    assert integrations.calls[0]["title"] == "Server-specific title"
+    assert integrations.calls[0]["body"] == "Server-specific reviewer context"
 
 
 def test_deleting_a_project_removes_its_managed_playbook_cache(tmp_path: Path) -> None:

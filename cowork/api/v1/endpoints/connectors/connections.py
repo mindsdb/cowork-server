@@ -14,10 +14,16 @@ from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
     DirectSaveRequest,
+    DirectSaveResponse,
     PatchPickedFilesBody,
 )
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.oauth import auth_proxy
+from cowork.services.connectors.developer_validation import (
+    DeveloperCredentialError,
+    DeveloperProviderUnavailable,
+    validate_developer_connection,
+)
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry
@@ -84,22 +90,55 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
     return record
 
 
-@router.post("/save")
+@router.post("/save", response_model=DirectSaveResponse)
 def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     """Persist credentials to the vault without running a probe.
     Used after an OAuth PKCE flow (Electron main-process PKCE) where the
     token exchange already succeeded. Electron verifies the token and resolves
     account_email before calling this endpoint."""
+    return _persist_direct_connection(body, scope, dict(body.values))
+
+
+@router.post("/validate-and-save", response_model=DirectSaveResponse)
+def validate_and_save_developer_connection(body: DirectSaveRequest, scope: ScopeDep):
+    """Validate a Code developer-tool credential before storing it.
+
+    Built-in OAuth has already been verified by its token exchange and keeps
+    using ``/save``.  This route is for the personal-token fallback shown when
+    a desktop build has no hosted OAuth client configured.
+    """
+    try:
+        identity = validate_developer_connection(body.connector_id, body.method, body.values)
+    except DeveloperCredentialError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except DeveloperProviderUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+    values = {**body.values, **identity.as_fields()}
+    return _persist_direct_connection(body, scope, values)
+
+
+def _persist_direct_connection(
+    body: DirectSaveRequest,
+    scope: TenantScope,
+    values: dict,
+) -> dict[str, object]:
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
-    values = dict(body.values)
-    if values.get("access_token") or values.get("refresh_token"):
+    if body.method in {"browser_oauth_builtin", "oauth"} or values.get("refresh_token"):
         values["auth_type"] = "oauth"
     from pathlib import Path
     from anton.core.datasources.data_vault import LocalDataVault
     vault = LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
     try:
-        slug = persist_connection(body.connector_id, body.method, body.name, values, vault=vault)
+        slug = persist_connection(
+            body.connector_id,
+            body.method,
+            body.name,
+            values,
+            replace_existing=body.replace_existing,
+            vault=vault,
+        )
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
