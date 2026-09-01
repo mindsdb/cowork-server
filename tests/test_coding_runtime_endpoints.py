@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -111,6 +112,44 @@ def test_lease_long_polls_do_not_hold_threadpool_tokens_while_waiting(
     assert health_response.status_code == 200
     assert health_elapsed < 0.5
     assert lease_statuses == [200, 200, 200, 200]
+
+
+def test_lease_authentication_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    computer, runtime_token = service.control.register_runtime(
+        service.control.issue_registration_token(),
+        "Build computer",
+        ComputerCapabilities(platform="linux", architecture="test", runtime_version="test-runtime"),
+    )
+    authenticate = service.control.authenticate_runtime
+    on_event_loop: list[bool] = []
+
+    def recording_authenticate(computer_id: str, token: str):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_event_loop.append(False)
+        else:
+            on_event_loop.append(True)
+        return authenticate(computer_id, token)
+
+    monkeypatch.setattr(service.control, "authenticate_runtime", recording_authenticate)
+    monkeypatch.setattr(coding_runtime, "get_coding_service", lambda: service)
+    app = FastAPI()
+    app.include_router(coding_runtime.router, prefix="/api/v1/coding/runtime")
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/coding/runtime/computers/{computer.id}/lease",
+            headers={"Authorization": f"Bearer {runtime_token}"},
+            json={"protocol_version": "1.0", "wait_seconds": 0},
+        )
+
+    assert response.status_code == 200
+    assert on_event_loop == [False]
 
 
 def test_legacy_computer_id_in_registration_body_never_touches_an_existing_computer(
