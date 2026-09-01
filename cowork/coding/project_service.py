@@ -163,11 +163,18 @@ class CodeProjectService:
     ) -> list[ProjectResource]:
         existing_by_id = {resource.id: resource for resource in existing or []}
         resources: list[ProjectResource] = []
+        seen_repositories: set[str] = set()
         for folder in folders:
             current = existing_by_id.get(folder.id)
             inspection = self.workspaces.inspect(folder.path)
             if inspection.is_git:
                 root = Path(inspection.repository_root or inspection.path)
+                repository = str(root.resolve()).casefold()
+                if repository in seen_repositories:
+                    raise WorkspaceError(
+                        "A Git repository can only be added once; choose the repository root"
+                    )
+                seen_repositories.add(repository)
                 remote = self.workspaces.git.run(root, "config", "--get", "remote.origin.url", check=False).stdout.strip() or None
                 resources.append(RepositoryResource(
                     id=folder.id,

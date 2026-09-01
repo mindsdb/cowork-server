@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from cowork.coding.contracts import CodingEvent, EventType
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     ComputerCapabilities,
@@ -24,7 +25,7 @@ from cowork.coding.engines.base import (
     EngineSessionConfig,
 )
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
-from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.project_workspaces import PreparedProjectWorkspace, ProjectWorkspaceManager
 from cowork.coding.remote_integration_mcp import (
     RemoteIntegrationConfig,
     write_remote_integration_config,
@@ -260,15 +261,24 @@ class CodeOnlyRuntime:
     def _execute(self, lease: RuntimeLease) -> None:
         if lease.project is None:
             raise RuntimeClientError("A remote Task Run requires portable project resources")
+        can_restore = (
+            lease.run.epoch > 1
+            and bool(lease.workspaces)
+            and all(
+                item.computer_id == self.client.identity.computer_id
+                for item in lease.workspaces
+            )
+        )
         prepared = (
             self.workspaces.restore(lease.task.id, lease.project, lease.workspaces)
-            if lease.run.epoch > 1
+            if can_restore
             else self.workspaces.prepare(lease.task.id, lease.project)
         )
         self.client.event(lease, "workspace", {
             "items": [item.model_dump(mode="json") for item in prepared.workspaces],
             "ports": prepared.ports,
         })
+        setup_note = self._run_setup(lease, prepared)
         self.client.event(lease, "status", {
             "status": "ready",
             "detail": f"Prepared {len(prepared.workspaces)} project resource(s)",
@@ -316,7 +326,9 @@ class CodeOnlyRuntime:
                 network_access=lease.execution.network_access,
                 web_search=lease.execution.web_search,
                 additional_dirs=tuple(item.workspace_path for item in prepared.workspaces[1:]),
-                developer_instructions=lease.execution.developer_instructions,
+                developer_instructions="\n\n".join(
+                    item for item in (lease.execution.developer_instructions, setup_note) if item
+                ),
                 session_id=lease.task.id,
                 cowork_root=str(self.root / "coding"),
                 environment=tuple({
@@ -356,6 +368,36 @@ class CodeOnlyRuntime:
         finally:
             session.close()
             connector_config_path.unlink(missing_ok=True)
+
+    def _run_setup(self, lease: RuntimeLease, prepared: PreparedProjectWorkspace) -> str:
+        assert lease.project is not None
+        results = self.workspaces.run_commands(
+            lease.project,
+            list(prepared.workspaces),
+            "setup",
+            prepared.ports,
+        )
+        for result in results:
+            event = CodingEvent(
+                type=EventType.command,
+                title=result.label,
+                text=result.output,
+                phase="completed" if result.return_code == 0 else "failed",
+                data={
+                    "folderId": result.folder_id,
+                    "returnCode": result.return_code,
+                    "phase": "setup",
+                },
+            )
+            self.client.event(lease, "event", {"event": event.model_dump(mode="json")})
+        failed = next((result for result in results if result.return_code != 0), None)
+        if failed is None:
+            return ""
+        return (
+            f"MindsHub Code setup note: {failed.label!r} failed in project resource "
+            f"{failed.folder_id!r}. Inspect the workspace and recover as part of the task "
+            f"when relevant.\nSetup output:\n{failed.output[:8_000]}"
+        )
 
     def _wait_for_start(
         self,

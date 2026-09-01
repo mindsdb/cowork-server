@@ -459,6 +459,26 @@ def test_project_commands_are_shell_free_and_receive_unique_ports(tmp_path: Path
     assert (Path(prepared.primary.workspace_path) / "port.txt").read_text(encoding="utf-8") == str(prepared.ports["PORT"])
 
 
+def test_portable_repository_cache_refreshes_before_each_workspace(tmp_path: Path) -> None:
+    source = repository(tmp_path, "portable-source")
+    project = CodeProject(
+        id="portable-refresh",
+        name="Portable refresh",
+        resources=[RepositoryResource(id="repo", name="Repo", source_url=str(source))],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    first = manager.prepare("first-portable-task", project)
+    assert (Path(first.primary.workspace_path) / "README.md").read_text(encoding="utf-8") == "portable-source\n"
+    manager.cleanup("first-portable-task", list(first.workspaces))
+
+    (source / "README.md").write_text("fresh remote revision\n", encoding="utf-8")
+    git(source, "add", "README.md")
+    git(source, "commit", "-m", "advance remote")
+
+    second = manager.prepare("second-portable-task", project)
+    assert (Path(second.primary.workspace_path) / "README.md").read_text(encoding="utf-8") == "fresh remote revision\n"
+
+
 def test_playbook_refresh_shows_diff_before_applying_and_normalizes_guidance(tmp_path: Path) -> None:
     source = repository(tmp_path, "playbook-source")
     (source / "AGENTS.md").write_text("Keep tests green.\n", encoding="utf-8")
