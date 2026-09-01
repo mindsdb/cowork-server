@@ -12,6 +12,7 @@ from cowork.coding.engines.base import (
     EngineInputReference,
     EngineSessionConfig,
 )
+from cowork.coding import shells
 from cowork.coding.engines.codex_extensions import add_extension_response
 from cowork.coding.redaction import sanitize
 
@@ -86,6 +87,62 @@ def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
     }
     assert len(codex_config.LOCAL_PROXY_TOKEN) >= 32
     assert "mdb_real-secret" not in environment.values()
+
+
+def test_interactive_terminal_prefers_bash_over_the_users_shell(monkeypatch) -> None:
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setattr(
+        shells,
+        "_resolve_executable",
+        lambda candidate: "/opt/homebrew/bin/bash" if candidate == "bash" else candidate,
+    )
+
+    assert codex_config.interactive_shell() == ["/opt/homebrew/bin/bash", "--login"]
+
+
+def test_windows_skips_the_legacy_wsl_bash_launcher() -> None:
+    assert shells._windows_bash_is_compatible(r"C:\Program Files\Git\bin\bash.exe") is True
+    assert shells._windows_bash_is_compatible(r"C:\Windows\System32\bash.exe") is False
+
+
+def test_bash_terminal_suppresses_the_misleading_macos_zsh_notice() -> None:
+    assert codex_config.interactive_shell_environment(["/bin/bash", "--login"]) == {
+        "BASH_SILENCE_DEPRECATION_WARNING": "1",
+        "PREFIX": "",
+        "npm_config_prefix": "",
+    }
+    assert codex_config.interactive_shell_environment(["/bin/zsh", "--login"]) == {
+        "PREFIX": "",
+        "npm_config_prefix": "",
+    }
+
+
+def test_interactive_terminal_does_not_inherit_the_apps_private_npm_prefix(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("npm_config_prefix", "/Users/example/.hermes/node")
+
+    environment = codex_config.interactive_shell_environment(["/bin/zsh", "--login"])
+
+    assert environment["npm_config_prefix"] == ""
+    assert environment["PREFIX"] == ""
+
+
+def test_terminal_workspace_uses_a_human_label_without_changing_the_target(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspaces" / "7cf89628-023b-44e1-ab3d-498d8153cff4"
+    workspace.mkdir(parents=True)
+
+    alias = codex_config.terminal_workspace(
+        tmp_path / "cowork-data",
+        "7cf89628-023b-44e1-ab3d-498d8153cff4",
+        workspace,
+        "MindsHub Code QA",
+    )
+
+    assert alias.name == "MindsHub Code QA"
+    assert alias.is_symlink()
+    assert alias.resolve() == workspace.resolve()
+    assert codex_config.interactive_shell_environment(["/bin/bash", "--login"], alias)["PWD"] == str(alias)
 
 
 def test_codex_runtime_values_cannot_be_overridden_by_project_environment() -> None:

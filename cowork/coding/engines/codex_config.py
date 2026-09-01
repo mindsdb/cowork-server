@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
-import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cowork.coding.contracts import PermissionMode
+from cowork.coding.contracts import PermissionMode, TerminalShellPreference
 from cowork.coding.engines.base import EngineInputReference, EngineSessionConfig
+from cowork.coding.shells import resolve_shell, shell_environment
 
 # Process-local bearer credential for the inference proxy. A fixed string would
 # turn the credential-injecting loopback endpoint into a confused deputy for
@@ -99,14 +100,51 @@ def sandbox_policy(
     }
 
 
-def interactive_shell() -> list[str]:
-    if os.name == "nt":
-        shell = shutil.which("pwsh") or shutil.which("powershell") or os.environ.get("COMSPEC") or "cmd.exe"
-        return [shell]
-    configured = os.environ.get("SHELL")
-    shell = configured if configured and Path(configured).is_file() else None
-    shell = shell or ("/bin/zsh" if Path("/bin/zsh").is_file() else "/bin/sh")
-    return [shell, "-l"]
+def interactive_shell(
+    preference: TerminalShellPreference | str = TerminalShellPreference.auto,
+) -> list[str]:
+    """Compatibility seam for callers that resolve shells through Codex."""
+    return resolve_shell(preference)
+
+
+def interactive_shell_environment(
+    command: list[str],
+    working_directory: Path | None = None,
+) -> dict[str, str]:
+    return shell_environment(command, working_directory)
+
+
+def terminal_workspace(
+    cowork_root: Path,
+    session_id: str,
+    workspace: Path,
+    label: str,
+) -> Path:
+    """Create a logical cwd whose basename is meaningful in shell prompts.
+
+    Task isolation uses UUID-named directories. A managed symlink plus PWD
+    lets ordinary shell prompts display a project/folder name while commands
+    still operate on the exact same isolated files.
+    """
+    if not session_id:
+        return workspace
+    safe_label = re.sub(r"[^A-Za-z0-9._ -]+", "-", label).strip(" .-")[:64] or "Workspace"
+    parent = cowork_root / "terminal-workspaces" / session_id
+    alias = parent / safe_label
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(alias):
+            if alias.is_symlink() and alias.resolve() == workspace.resolve():
+                return alias
+            if not alias.is_symlink():
+                return workspace
+            alias.unlink()
+        alias.symlink_to(workspace.resolve(), target_is_directory=True)
+        return alias
+    except OSError:
+        # Windows may disallow symlink creation without Developer Mode. The
+        # terminal remains fully usable from its real isolated path.
+        return workspace
 
 
 def local_inference_base_url(port: int) -> str:

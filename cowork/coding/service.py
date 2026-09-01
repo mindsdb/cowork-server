@@ -31,6 +31,10 @@ from cowork.coding.contracts import (
     SessionStatus,
     SessionUpdateRequest,
     TerminalPage,
+    TerminalTab,
+    TerminalTabPage,
+    TerminalTabState,
+    TerminalShellPreference,
     WorkspaceInspection,
 )
 from cowork.coding.delivery import ProjectDeliveryService
@@ -560,12 +564,7 @@ class CodingService:
             ) as session:
                 if self.runtimes.terminal_is_running(session_id):
                     raise RuntimeError("Stop the task terminal before changing task controls")
-                values = updates.model_dump(exclude_unset=True)
-                values = {
-                    name: value
-                    for name, value in values.items()
-                    if value is not None or name == "reasoning_effort"
-                }
+                values = updates.model_dump(exclude_none=True)
                 if "additional_dirs" in values:
                     values["additional_dirs"] = validate_directories(values["additional_dirs"])
                 next_permission = values.get("permission_mode", session.permission_mode)
@@ -577,13 +576,122 @@ class CodingService:
                     lambda current: self._apply_config_update(current, values),
                 )
 
+    def terminals(self, session_id: str) -> TerminalTabPage:
+        session = self.get_session(session_id)
+        return TerminalTabPage(items=[self._terminal_state(session_id, tab) for tab in session.terminal_tabs])
+
+    def create_terminal_tab(self, session_id: str, label: str | None = None) -> TerminalTabState:
+        with self.runtimes.session_lock(session_id):
+            session = self.get_session(session_id)
+            if len(session.terminal_tabs) >= 12:
+                raise RuntimeError("This coding task already has 12 terminals")
+            tab = TerminalTab(
+                id=str(uuid.uuid4()),
+                label=label or self._next_terminal_label(session.terminal_tabs),
+            )
+            self.store.update_session(
+                session_id,
+                lambda current: current.terminal_tabs.append(tab),
+                touch_updated_at=False,
+            )
+            return self._terminal_state(session_id, tab)
+
+    def rename_terminal_tab(self, session_id: str, terminal_id: str, label: str) -> TerminalTabState:
+        with self.runtimes.session_lock(session_id):
+            session = self.get_session(session_id)
+            original = self._require_terminal_tab(session, terminal_id)
+            updated = TerminalTab(id=terminal_id, label=label, created_at=original.created_at)
+
+            def rename(current: CodingSession) -> None:
+                for index, item in enumerate(current.terminal_tabs):
+                    if item.id == terminal_id:
+                        current.terminal_tabs[index] = updated
+                        return
+                raise KeyError("terminal not found")
+
+            self.store.update_session(session_id, rename, touch_updated_at=False)
+            return self._terminal_state(session_id, updated)
+
+    def delete_terminal_tab(self, session_id: str, terminal_id: str) -> None:
+        with self.runtimes.session_lock(session_id):
+            session = self.get_session(session_id)
+            self._require_terminal_tab(session, terminal_id)
+            self.runtimes.remove_terminal(session_id, terminal_id)
+            self.store.update_session(
+                session_id,
+                lambda current: setattr(
+                    current,
+                    "terminal_tabs",
+                    [item for item in current.terminal_tabs if item.id != terminal_id],
+                ),
+                touch_updated_at=False,
+            )
+
+    def terminal_tab(self, session_id: str, terminal_id: str, after: int = 0) -> TerminalPage:
+        session = self.get_session(session_id)
+        self._require_terminal_tab(session, terminal_id)
+        return self.runtimes.terminal_page(session_id, terminal_id, after)
+
+    def wait_for_terminal_tab(
+        self,
+        session_id: str,
+        terminal_id: str,
+        after: int,
+        timeout: float = 15.0,
+    ) -> TerminalPage:
+        session = self.get_session(session_id)
+        self._require_terminal_tab(session, terminal_id)
+        return self.runtimes.wait_for_terminal(session_id, terminal_id, after, timeout)
+
+    def start_terminal_tab(
+        self,
+        session_id: str,
+        terminal_id: str,
+        credentials: EngineCredentials,
+        cols: int,
+        rows: int,
+        shell: TerminalShellPreference = TerminalShellPreference.auto,
+    ) -> TerminalPage:
+        with self.runtimes.session_lock(session_id):
+            session = self.get_session(session_id)
+            self._require_terminal_tab(session, terminal_id)
+            try:
+                return self.runtimes.start_terminal(session, credentials, terminal_id, cols, rows, shell)
+            except Exception as exc:
+                message = safe_engine_error(str(exc), credentials)
+                raise RuntimeError(message) from exc
+
+    def write_terminal_tab(self, session_id: str, terminal_id: str, data_base64: str) -> TerminalPage:
+        session = self.get_session(session_id)
+        self._require_terminal_tab(session, terminal_id)
+        return self.runtimes.write_terminal(session_id, terminal_id, data_base64)
+
+    def resize_terminal_tab(self, session_id: str, terminal_id: str, cols: int, rows: int) -> TerminalPage:
+        session = self.get_session(session_id)
+        self._require_terminal_tab(session, terminal_id)
+        return self.runtimes.resize_terminal(session_id, terminal_id, cols, rows)
+
+    def stop_terminal_tab(self, session_id: str, terminal_id: str) -> TerminalPage:
+        session = self.get_session(session_id)
+        self._require_terminal_tab(session, terminal_id)
+        return self.runtimes.stop_terminal(session_id, terminal_id)
+
+    # Compatibility seam for the original one-terminal desktop. Deployments
+    # can roll the server and renderer independently without breaking a task
+    # that still speaks the singular endpoint contract.
     def terminal(self, session_id: str, after: int = 0) -> TerminalPage:
-        self.get_session(session_id)
-        return self.runtimes.terminal_page(session_id, after)
+        session = self.get_session(session_id)
+        terminal_id = self._first_terminal_id(session)
+        return self.runtimes.terminal_page(session_id, terminal_id, after) if terminal_id else TerminalPage()
 
     def wait_for_terminal(self, session_id: str, after: int, timeout: float = 15.0) -> TerminalPage:
-        self.get_session(session_id)
-        return self.runtimes.wait_for_terminal(session_id, after, timeout)
+        session = self.get_session(session_id)
+        terminal_id = self._first_terminal_id(session)
+        return (
+            self.runtimes.wait_for_terminal(session_id, terminal_id, after, timeout)
+            if terminal_id
+            else TerminalPage()
+        )
 
     def start_terminal(
         self,
@@ -591,26 +699,60 @@ class CodingService:
         credentials: EngineCredentials,
         cols: int,
         rows: int,
+        shell: TerminalShellPreference = TerminalShellPreference.auto,
     ) -> TerminalPage:
-        try:
-            with self.runtimes.session_lock(session_id):
-                session = self.get_session(session_id)
-                return self.runtimes.start_terminal_locked(session, credentials, cols, rows)
-        except Exception as exc:
-            message = safe_engine_error(str(exc), credentials)
-            raise RuntimeError(message) from exc
+        session = self.get_session(session_id)
+        tab = session.terminal_tabs[0] if session.terminal_tabs else self.create_terminal_tab(session_id)
+        return self.start_terminal_tab(session_id, tab.id, credentials, cols, rows, shell)
 
     def write_terminal(self, session_id: str, data_base64: str) -> TerminalPage:
-        self.get_session(session_id)
-        return self.runtimes.write_terminal(session_id, data_base64)
+        session = self.get_session(session_id)
+        terminal_id = self._first_terminal_id(session)
+        if terminal_id is None:
+            raise RuntimeError("There is no terminal for this coding task")
+        return self.write_terminal_tab(session_id, terminal_id, data_base64)
 
     def resize_terminal(self, session_id: str, cols: int, rows: int) -> TerminalPage:
-        self.get_session(session_id)
-        return self.runtimes.resize_terminal(session_id, cols, rows)
+        session = self.get_session(session_id)
+        terminal_id = self._first_terminal_id(session)
+        if terminal_id is None:
+            raise RuntimeError("There is no terminal for this coding task")
+        return self.resize_terminal_tab(session_id, terminal_id, cols, rows)
 
     def stop_terminal(self, session_id: str) -> TerminalPage:
-        self.get_session(session_id)
-        return self.runtimes.stop_terminal(session_id)
+        session = self.get_session(session_id)
+        terminal_id = self._first_terminal_id(session)
+        if terminal_id is None:
+            raise RuntimeError("There is no terminal for this coding task")
+        return self.stop_terminal_tab(session_id, terminal_id)
+
+    def _terminal_state(self, session_id: str, tab: TerminalTab) -> TerminalTabState:
+        page = self.runtimes.terminal_page(session_id, tab.id)
+        return TerminalTabState(
+            **tab.model_dump(),
+            status=page.status,
+            exit_code=page.exit_code,
+            error=page.error,
+        )
+
+    @staticmethod
+    def _first_terminal_id(session: CodingSession) -> str | None:
+        return session.terminal_tabs[0].id if session.terminal_tabs else None
+
+    @staticmethod
+    def _require_terminal_tab(session: CodingSession, terminal_id: str) -> TerminalTab:
+        try:
+            return next(item for item in session.terminal_tabs if item.id == terminal_id)
+        except StopIteration as exc:
+            raise KeyError("terminal not found") from exc
+
+    @staticmethod
+    def _next_terminal_label(terminals: list[TerminalTab]) -> str:
+        existing = {item.label.casefold() for item in terminals}
+        number = 1
+        while f"terminal {number}".casefold() in existing:
+            number += 1
+        return f"Terminal {number}"
 
     def close_all(self) -> None:
         """Stop every task-owned engine runtime during application shutdown."""
