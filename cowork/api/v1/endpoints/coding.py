@@ -5,15 +5,18 @@ import hmac
 import json
 import logging
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Annotated
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
-from starlette.background import BackgroundTask
 
 from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
+from cowork.coding.connector_capabilities import (
+    ConnectorCapability,
+    ConnectorCapabilityIssueRequest,
+)
 from cowork.coding.contracts import (
     ApprovalRequest,
     BranchRequest,
@@ -25,39 +28,55 @@ from cowork.coding.contracts import (
     RenameSessionRequest,
     SessionCreateRequest,
     SessionPage,
+    SessionRecoverRequest,
     SessionUpdateRequest,
     TerminalCreateRequest,
     TerminalInputRequest,
     TerminalPage,
-    TerminalResizeRequest,
     TerminalRenameRequest,
-    TerminalStartRequest,
+    TerminalResizeRequest,
     TerminalShellInventory,
+    TerminalStartRequest,
     TerminalStatus,
     TerminalTabPage,
     TerminalTabState,
     TurnRequest,
 )
+from cowork.coding.control_models import TaskResourceScope
+from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
-from cowork.coding.delivery_automation import DeliveryAutomationService
+from cowork.coding.inference_proxy import (
+    inference_body as _inference_body,  # noqa: F401 - retained for endpoint-test compatibility.
+)
+from cowork.coding.inference_proxy import (
+    inference_headers as _inference_headers,  # noqa: F401 - retained for endpoint-test compatibility.
+)
+from cowork.coding.inference_proxy import (
+    inference_url as _inference_url,  # noqa: F401 - retained for endpoint-test compatibility.
+)
+from cowork.coding.inference_proxy import (
+    proxy_inference,
+)
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PlaybookConfigureRequest,
     PlaybookItemsRequest,
     ProjectCreateRequest,
+    ProjectFolder,
     ProjectPage,
     ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
-    SourceContextRequest,
     SourceActionRequest,
+    SourceContextRequest,
     WorkItemSearchRequest,
 )
 from cowork.coding.redaction import redact_text
-from cowork.coding.shells import shell_inventory
+from cowork.coding.runtime_protocol import RegistrationTokenResponse
 from cowork.coding.service import CodingService, get_coding_service
+from cowork.coding.shells import shell_inventory
 from cowork.coding.skill_models import (
     SkillLibraryDocument,
     SkillLibraryPage,
@@ -133,42 +152,10 @@ def _call[Result](operation: Callable[..., Result], *args, **kwargs) -> Result:
         raise _http_error(exc) from exc
 
 
-_INFERENCE_PATHS = {"models", "responses", "responses/compact"}
-
-
-def _inference_url(minds_url: str, path: str, query: str = "") -> str:
-    base = minds_url.rstrip("/")
-    if not base.endswith("/v1"):
-        base = f"{base}/v1"
-    url = f"{base}/{path}"
-    return f"{url}?{query}" if query else url
-
-
-def _inference_headers(request: Request, api_key: str) -> dict[str, str]:
-    headers = {"Authorization": f"Bearer {api_key}"}
-    for name in ("content-type",):
-        value = request.headers.get(name)
-        if value:
-            headers[name] = value
-    return headers
-
-
 def _require_inference_client(request: Request) -> None:
     scheme, _, credential = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not hmac.compare_digest(credential, LOCAL_PROXY_TOKEN):
         raise HTTPException(status_code=401, detail="invalid inference client")
-
-
-def _inference_body(body: bytes) -> bytes:
-    """Remove Codex-only transport metadata rejected by MindsHub Inference."""
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return body
-    if not isinstance(payload, dict) or "client_metadata" not in payload:
-        return body
-    payload.pop("client_metadata")
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 @router.get("/engines")
@@ -188,47 +175,42 @@ def prepare_shutdown():
     return {"interrupted": _service().prepare_shutdown()}
 
 
+@router.get("/computers")
+def coding_computers():
+    return _service().control.list_computers()
+
+
+@router.post("/runtime/registration-token", response_model=RegistrationTokenResponse)
+def runtime_registration_token():
+    return RegistrationTokenResponse(registration_token=_service().control.issue_registration_token())
+
+
+@router.post("/runs/{run_id}/connector-capabilities", response_model=ConnectorCapability)
+def issue_connector_capability(run_id: str, body: ConnectorCapabilityIssueRequest):
+    grant, token = _call(
+        _service().control.issue_connector_grant,
+        run_id,
+        body.provider,
+        body.connection_name,
+        list(body.actions),
+        body.resource_constraints,
+        timedelta(seconds=body.expires_in_seconds),
+    )
+    return ConnectorCapability(
+        id=grant.id,
+        provider=grant.provider,
+        token=token,
+        actions=grant.actions,
+        resource_constraints=grant.resource_constraints,
+        expires_at=grant.expires_at,
+    )
+
+
 @router.api_route("/inference/{path:path}", methods=["GET", "POST"])
 async def inference_proxy(path: str, request: Request, session: SessionDep, scope: ScopeDep):
-    if path not in _INFERENCE_PATHS:
-        raise HTTPException(status_code=404, detail="inference route not found")
     _require_inference_client(request)
-
     credentials = _credentials(_settings(session, scope))
-    if not credentials.minds_api_key:
-        raise HTTPException(status_code=409, detail="MindsHub is not connected")
-
-    body = _inference_body(await request.body())
-    client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
-    try:
-        upstream = await client.send(
-            client.build_request(
-                request.method,
-                _inference_url(credentials.minds_url, path, request.url.query),
-                headers=_inference_headers(request, credentials.minds_api_key),
-                content=body,
-            ),
-            stream=True,
-        )
-    except httpx.HTTPError as exc:
-        await client.aclose()
-        raise HTTPException(status_code=502, detail="MindsHub inference is unavailable") from exc
-
-    async def close_upstream() -> None:
-        await upstream.aclose()
-        await client.aclose()
-
-    response_headers = {
-        name: value
-        for name in ("content-type", "retry-after", "x-mindshub-dropped-params", "x-request-id")
-        if (value := upstream.headers.get(name))
-    }
-    return StreamingResponse(
-        upstream.aiter_bytes(),
-        status_code=upstream.status_code,
-        headers=response_headers,
-        background=BackgroundTask(close_upstream),
-    )
+    return await proxy_inference(request, path, credentials)
 
 
 @router.get("/workspace/inspect")
@@ -327,6 +309,38 @@ def delete_code_project(project_id: str):
 @router.get("/projects/{project_id}/folders")
 def inspect_code_project_folders(project_id: str):
     return {"items": _call(_service().projects.inspect_folders, project_id)}
+
+
+@router.post("/project-resources/inspect")
+def inspect_local_project_resource(body: ProjectFolder):
+    return _call(_service().projects.resolve_local_resource, body)
+
+
+@router.get("/projects/{project_id}/resources")
+def code_project_resources(project_id: str):
+    project = _call(_service().projects.get, project_id)
+    availability = _service().control.resource_availability(project)
+    states = {item.resource_id: item for item in availability.items}
+    return {
+        "items": [
+            {"resource": resource, "availability": states[resource.id]}
+            for resource in project.resources
+        ]
+    }
+
+
+@router.get("/projects/{project_id}/computers")
+def eligible_code_project_computers(
+    project_id: str,
+    resource_ids: list[str] | None = Query(default=None, alias="resourceId"),
+    engine_id: str | None = Query(default=None, alias="engineId"),
+):
+    project = _call(_service().projects.get, project_id)
+    scope = TaskResourceScope(
+        all_project_resources=resource_ids is None,
+        resource_ids=resource_ids or [],
+    )
+    return {"items": _call(_service().control.eligible_computers, project, scope, engine_id)}
 
 
 @router.post("/projects/{project_id}/playbook")
@@ -549,6 +563,11 @@ def run_next_queued(session_id: str, session: SessionDep, scope: ScopeDep):
 @router.post("/sessions/{session_id}/cancel")
 def cancel(session_id: str):
     return _call(_service().cancel, session_id)
+
+
+@router.post("/sessions/{session_id}/recover")
+def recover(session_id: str, body: SessionRecoverRequest):
+    return _call(_service().recover, session_id, body.computer_id)
 
 
 @router.get("/sessions/{session_id}/terminals", response_model=TerminalTabPage)
@@ -781,11 +800,7 @@ def publish_task_update(session_id: str, body: PublishRequest, integrations: Int
         raise HTTPException(status_code=409, detail="This task is not linked to a Code Project")
     project = _call(coding.projects.get, task.project_id)
     delivery = _call(integrations.publish, project, body)
-    coding.store.update_session(
-        task.id,
-        lambda current: current.deliveries.append(delivery),
-    )
-    return delivery
+    return coding.record_delivery(task.id, delivery)
 
 
 @router.post("/sessions/{session_id}/source-action")
@@ -796,5 +811,4 @@ def source_action(session_id: str, body: SourceActionRequest, integrations: Inte
         raise HTTPException(status_code=409, detail="This task is not linked to a Code Project")
     project = _call(coding.projects.get, task.project_id)
     delivery = _call(integrations.complete_source, project, body)
-    coding.store.update_session(task.id, lambda current: current.deliveries.append(delivery))
-    return delivery
+    return coding.record_delivery(task.id, delivery)

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -42,6 +43,88 @@ class ProjectFolder(BaseModel):
     path: str = Field(min_length=1, max_length=32_768)
     base_branch: str | None = Field(default=None, max_length=255)
     commands: list[ProjectCommand] = Field(default_factory=list, max_length=32)
+
+
+class RepositoryResource(BaseModel):
+    kind: Literal["repository"] = "repository"
+    id: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=120)
+    source_url: str | None = Field(default=None, max_length=8_192)
+    provider: Literal["github", "gitlab", "bitbucket", "git"] = "git"
+    repository: str | None = Field(default=None, max_length=512)
+    connector_name: str | None = Field(default=None, max_length=512)
+    local_path: str | None = Field(default=None, max_length=32_768)
+    computer_id: str | None = Field(default=None, max_length=128)
+    default_branch: str | None = Field(default=None, max_length=255)
+    checkout_strategy: Literal["worktree", "clone"] = "worktree"
+    commands: list[ProjectCommand] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def require_source(self) -> RepositoryResource:
+        if not self.source_url and not self.local_path:
+            raise ValueError("repository resources require a remote URL or local checkout")
+        if not self.source_url and not self.computer_id:
+            raise ValueError("a local-only repository must identify its computer")
+        if self.source_url and not self.repository:
+            provider, identity = repository_identity(self.source_url)
+            self.provider = provider
+            self.repository = identity
+        return self
+
+
+class LocalFolderResource(BaseModel):
+    kind: Literal["local_folder"] = "local_folder"
+    id: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=120)
+    path: str = Field(min_length=1, max_length=32_768)
+    computer_id: str = Field(min_length=1, max_length=128)
+    commands: list[ProjectCommand] = Field(default_factory=list, max_length=32)
+
+
+ProjectResource = Annotated[
+    RepositoryResource | LocalFolderResource,
+    Field(discriminator="kind"),
+]
+
+
+def repository_identity(source_url: str) -> tuple[Literal["github", "gitlab", "bitbucket", "git"], str]:
+    """Return a stable provider and repository identity without credentials."""
+
+    normalized = source_url.strip().removesuffix(".git").rstrip("/")
+    if normalized.startswith("git@") and ":" in normalized:
+        host, path = normalized[4:].split(":", 1)
+    else:
+        parsed = urlparse(normalized)
+        host = parsed.hostname or ""
+        path = parsed.path.lstrip("/")
+    provider: Literal["github", "gitlab", "bitbucket", "git"] = "git"
+    if host.casefold() in {"github.com", "www.github.com"}:
+        provider = "github"
+    elif host.casefold() in {"gitlab.com", "www.gitlab.com"}:
+        provider = "gitlab"
+    elif host.casefold() in {"bitbucket.org", "www.bitbucket.org"}:
+        provider = "bitbucket"
+    return provider, path or normalized
+
+
+def resource_folder(resource: ProjectResource) -> ProjectFolder:
+    if isinstance(resource, RepositoryResource):
+        return ProjectFolder(
+            id=resource.id,
+            name=resource.name,
+            # Remote-only repositories deliberately have no durable machine
+            # path.  The legacy projection still requires a non-empty display
+            # value; execution code resolves a real checkout before using it.
+            path=resource.local_path or resource.source_url or resource.name,
+            base_branch=resource.default_branch,
+            commands=resource.commands,
+        )
+    return ProjectFolder(
+        id=resource.id,
+        name=resource.name,
+        path=resource.path,
+        commands=resource.commands,
+    )
 
 
 class ProjectConnection(BaseModel):
@@ -96,10 +179,13 @@ class ProjectEnvironment(BaseModel):
 
 
 class CodeProject(BaseModel):
-    schema_version: int = 1
+    schema_version: int = 2
     id: str
     name: str = Field(min_length=1, max_length=120)
-    folders: list[ProjectFolder] = Field(min_length=1, max_length=24)
+    resources: list[ProjectResource] = Field(min_length=1, max_length=24)
+    # Compatibility projection used by the existing workspace/review layer.
+    # New durable code must use ``resources`` as its source of truth.
+    folders: list[ProjectFolder] = Field(default_factory=list, max_length=24)
     playbook: PlaybookReference | None = None
     skill_sources: list[ProjectSkillSource] = Field(default_factory=list, max_length=24)
     connections: list[ProjectConnection] = Field(default_factory=list, max_length=24)
@@ -110,14 +196,54 @@ class CodeProject(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_folders(cls, value):
+        if not isinstance(value, dict) or value.get("resources") or not value.get("folders"):
+            return value
+        value = dict(value)
+        computer_id = value.pop("_migration_computer_id", None) or "local"
+        folders = [
+            folder.model_dump(mode="python") if isinstance(folder, ProjectFolder) else folder
+            for folder in value["folders"]
+        ]
+        value["resources"] = [
+            {
+                "kind": "local_folder",
+                "id": folder["id"],
+                "name": folder["name"],
+                "path": folder["path"],
+                "computer_id": computer_id,
+                "commands": folder.get("commands", []),
+            }
+            for folder in folders
+        ]
+        value["schema_version"] = 2
+        return value
+
     @model_validator(mode="after")
-    def validate_unique_folders(self) -> CodeProject:
-        ids = [folder.id for folder in self.folders]
-        paths = [folder.path.casefold() for folder in self.folders]
+    def validate_unique_resources(self) -> CodeProject:
+        ids = [resource.id for resource in self.resources]
+        locations = [
+            (resource.source_url or resource.local_path or "").casefold()
+            if isinstance(resource, RepositoryResource)
+            else resource.path.casefold()
+            for resource in self.resources
+        ]
         if len(ids) != len(set(ids)):
-            raise ValueError("project folder ids must be unique")
-        if len(paths) != len(set(paths)):
+            raise ValueError("project resource ids must be unique")
+        if len(locations) != len(set(locations)):
             raise ValueError("the same folder cannot be added twice")
+        github_connections = [item.name for item in self.connections if item.provider == "github"]
+        if len(github_connections) == 1:
+            for resource in self.resources:
+                if (
+                    isinstance(resource, RepositoryResource)
+                    and resource.provider == "github"
+                    and not resource.connector_name
+                ):
+                    resource.connector_name = github_connections[0]
+        self.folders = [resource_folder(resource) for resource in self.resources]
         connections = [(item.provider, item.name) for item in self.connections]
         if len(connections) != len(set(connections)):
             raise ValueError("the same connection cannot be added twice")
@@ -129,7 +255,8 @@ class CodeProject(BaseModel):
 
 class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    folders: list[ProjectFolder] = Field(min_length=1, max_length=24)
+    resources: list[ProjectResource] | None = Field(default=None, min_length=1, max_length=24)
+    folders: list[ProjectFolder] | None = Field(default=None, min_length=1, max_length=24)
     connections: list[ProjectConnection] = Field(default_factory=list, max_length=24)
     environment: ProjectEnvironment = Field(default_factory=ProjectEnvironment)
     skill_sources: list[ProjectSkillSource] = Field(default_factory=list, max_length=24)
@@ -137,10 +264,17 @@ class ProjectCreateRequest(BaseModel):
     default_model: str = "gpt"
     permission_mode: PermissionMode = PermissionMode.supervised
 
+    @model_validator(mode="after")
+    def require_resources(self) -> ProjectCreateRequest:
+        if bool(self.resources) == bool(self.folders):
+            raise ValueError("provide exactly one project resource list")
+        return self
+
 
 class ProjectUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     folders: list[ProjectFolder] | None = Field(default=None, min_length=1, max_length=24)
+    resources: list[ProjectResource] | None = Field(default=None, min_length=1, max_length=24)
     playbook: PlaybookReference | None = None
     connections: list[ProjectConnection] | None = Field(default=None, max_length=24)
     environment: ProjectEnvironment | None = None
@@ -148,6 +282,12 @@ class ProjectUpdateRequest(BaseModel):
     default_engine_id: str | None = None
     default_model: str | None = None
     permission_mode: PermissionMode | None = None
+
+    @model_validator(mode="after")
+    def reject_duplicate_resource_inputs(self) -> ProjectUpdateRequest:
+        if self.resources is not None and self.folders is not None:
+            raise ValueError("update resources or legacy folders, not both")
+        return self
 
 
 class ProjectPage(BaseModel):
