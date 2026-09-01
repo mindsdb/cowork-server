@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from cowork.build_info import surface_kwarg
+from cowork.build_info import surface_kwarg, verifier_latch_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
@@ -20,6 +20,9 @@ from cowork.services.connectors.connections import service
 
 
 logger = get_logger(__name__)
+
+#: Distinguishes "anton has no such property" from "anton cleared the latch".
+_UNSET = object()
 
 
 def _vault_scratch_dir() -> Path:
@@ -91,31 +94,6 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
         setattr(anton_settings, attr, db_val)
         applied.append(attr)
     return applied
-
-
-def _verifier_latch_kwarg(config_cls) -> dict[str, int]:
-    """``{"verifier_latch_threshold": 1}`` for ``ChatSessionConfig``, or ``{}``.
-
-    This server builds a fresh ChatSession per message, so anton's no-verdict
-    counter dies with the turn: every message contributes at most one, its
-    default threshold of two is never reached, and a verifier that fails the
-    same way every time re-diagnosed on every message instead of latching once.
-    One is the threshold that matches this lifecycle.
-
-    Guarded the way ``surface_kwarg`` is and for the same reason: anton is
-    pinned by rev here and by a version floor on the desktop wheel, so the
-    installed copy can predate this field, and an unexpected keyword to a plain
-    dataclass would raise on EVERY turn.
-    """
-    import dataclasses
-
-    try:
-        if not any(f.name == "verifier_latch_threshold" for f in dataclasses.fields(config_cls)):
-            return {}
-        return {"verifier_latch_threshold": 1}
-    except Exception:  # pragma: no cover - defensive: never fail a turn over this
-        logger.warning("could not set the verifier latch threshold", exc_info=True)
-        return {}
 
 
 def _apply_model_override(anton_settings, model: str | None) -> list[str]:
@@ -568,6 +546,16 @@ class AntonHarness:
                         "[anton_harness] failed to persist history compaction for conversation %s",
                         conv_id,
                     )
+            if session is not None:
+                # NOT gated on seed_info: that is None whenever history
+                # compaction is off, and the latch has nothing to do with it.
+                try:
+                    self._persist_verifier_latch(conversation, session)
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to persist the verifier latch for conversation %s",
+                        conv_id,
+                    )
             # One dir diff → index the new artifacts and work out what this turn
             # touched. Runs on every exit (success, error, cancel), so an artifact
             # is always indexed. Synchronous by design: an `await` here would be
@@ -735,6 +723,31 @@ class AntonHarness:
             return
         ConversationService(adopt_scoped_session(db_session)).update_history_compaction(
             conversation.id, compaction["summary"], ordered_messages[idx].id,
+        )
+
+    @staticmethod
+    def _persist_verifier_latch(conversation: Conversation, session) -> None:
+        """Carry anton's verifier-latch state to this conversation's next turn.
+
+        `getattr` (not `session.verifier_latch` directly): an anton build
+        predating this property must degrade to today's behaviour, not raise.
+        None means anton cleared it — a successful verdict — so the column is
+        cleared too, unlike the compaction write which simply skips.
+        """
+        latch = getattr(session, "verifier_latch", _UNSET)
+        if latch is _UNSET:
+            return
+        if latch == conversation.verifier_latch:
+            return  # unchanged on most turns; do not commit for nothing
+        from sqlalchemy.orm import object_session
+        from cowork.db.scoped import adopt_scoped_session
+        from cowork.services.conversations import ConversationService
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            return
+        ConversationService(adopt_scoped_session(db_session)).update_verifier_latch(
+            conversation.id, latch,
         )
 
     @staticmethod
@@ -1119,7 +1132,7 @@ class AntonHarness:
             # and both report harness="anton" (ENG-1459). Only the deployment
             # knows which, so it is resolved here rather than by anton.
             **surface_kwarg(ChatSessionConfig),
-            **_verifier_latch_kwarg(ChatSessionConfig),
+            **verifier_latch_kwarg(ChatSessionConfig, conversation.verifier_latch),
             proactive_dashboards=anton_settings.proactive_dashboards,
             act_first=anton_settings.act_first,
             # "Conversation started" stamp for the cache-stable prompt prefix

@@ -499,6 +499,21 @@ class ConversationService:
         self.session.add(conversation)
         self.session.commit()
 
+    def update_verifier_latch(self, conversation_id: UUID, latch: dict | None) -> None:
+        """Persist anton's verifier-latch state, or clear it when None.
+
+        Clearing matters: None means a verdict succeeded, and a stale latch left
+        behind would keep verification off for the rest of the conversation.
+        Best-effort like `update_history_compaction` — it runs from a turn's
+        cleanup path, after the turn's real outcome is settled.
+        """
+        conversation = self._owned(conversation_id)
+        if conversation is None:
+            return
+        conversation.verifier_latch = latch
+        self.session.add(conversation)
+        self.session.commit()
+
     def delete_conversation(self, conversation_id: UUID) -> bool:
         """Owner-scoped delete for the request path: a member can only delete
         their own conversation."""

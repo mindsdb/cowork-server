@@ -127,6 +127,31 @@ def surface() -> str | None:
         return None
 
 
+def verifier_latch_kwarg(config_cls, stored) -> dict[str, object]:
+    """``{"initial_verifier_latch": stored}`` for ``ChatSessionConfig``, or ``{}``.
+
+    Lives beside ``surface_kwarg`` for the reason given in its docstring: more
+    than one path originates a turn, and each needs the same guard. anton's
+    verifier latch is ChatSession state, and this server rebuilds that object
+    per message, so without carrying it the no-verdict counter restarts at zero
+    every message, never reaches its threshold of two, and every message pays a
+    full-history hand-back instead of one per conversation.
+
+    Guarded like ``surface_kwarg``: anton is pinned by rev here and by a version
+    floor on the desktop wheel, so the installed copy can predate this field,
+    and an unexpected keyword to a plain dataclass would raise on EVERY turn.
+    """
+    import dataclasses
+
+    try:
+        if not any(f.name == "initial_verifier_latch" for f in dataclasses.fields(config_cls)):
+            return {}
+        return {"initial_verifier_latch": stored}
+    except Exception:  # pragma: no cover - defensive: never fail a turn over this
+        logger.warning("could not pass the stored verifier latch", exc_info=True)
+        return {}
+
+
 def surface_kwarg(config_cls) -> dict[str, str]:
     """``{"surface": ...}`` for ``ChatSessionConfig``, or ``{}`` — never raises.
 
