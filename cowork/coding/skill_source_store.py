@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from cowork.coding.contracts import utc_now
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.skill_models import TeamSkillSource
 
 
@@ -34,7 +35,7 @@ class SkillSourceStore:
         with self._lock:
             items = self._read()
             if any(item.id == source.id for item in items):
-                raise ValueError("Skill source already exists")
+                raise StateConflict("Skill source already exists")
             repository = source.repository.rstrip("/\\").casefold()
             branch = source.branch.casefold()
             if any(
@@ -42,7 +43,7 @@ class SkillSourceStore:
                 and item.branch.casefold() == branch
                 for item in items
             ):
-                raise ValueError("That repository branch is already in the Skills Library")
+                raise StateConflict("That repository branch is already in the Skills Library")
             items.append(source)
             self._write(items)
             return source

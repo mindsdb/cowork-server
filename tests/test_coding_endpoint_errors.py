@@ -18,6 +18,8 @@ from cowork.coding.workspace import WorkspaceError
         (KeyError("Task not found"), 404),
         (ValueError("/goal pause does not accept an objective"), 400),
         (StateConflict("Code Project already exists"), 409),
+        (StateConflict("Skill source already exists"), 409),
+        (StateConflict("That repository branch is already in the Skills Library"), 409),
         (InvalidRunTransition("Task Run cannot move from completed to running"), 409),
         (NoEligibleComputer("No online computer can access every resource"), 409),
         (WorkspaceError("The selected folder cannot be inspected"), 409),

@@ -811,8 +811,10 @@ def test_runtime_commands_are_idempotent_retryable_and_acknowledged(tmp_path: Pa
     assert retried[0].id == first.id
     assert retried[0].delivery_count == 2
 
-    acknowledged = service.acknowledge_command(run.id, first.id, remote.id, lease_id, run.epoch)
+    acknowledged, first_ack = service.acknowledge_command(run.id, first.id, remote.id, lease_id, run.epoch)
     assert acknowledged.acked_at is not None
+    assert first_ack
+    assert service.acknowledge_command(run.id, first.id, remote.id, lease_id, run.epoch) == (acknowledged, False)
     assert service.claim_commands(run.id, remote.id, lease_id, run.epoch) == []
 
 
@@ -820,11 +822,27 @@ def test_run_status_is_only_assigned_by_the_transition_table() -> None:
     import cowork.coding
 
     root = Path(cowork.coding.__file__).parent
+    status_write = re.compile(
+        r"\b(?P<assigned>\w+)\.status\s*=(?!=)"
+        r"|setattr\((?P<setattr>\w+),\s*[\"']status[\"']"
+        r"|\b(?P<copied>\w+)\.model_copy\(update=\{[^}]*[\"']status[\"']",
+    )
+    session_and_resource_writes = {
+        "control_service.py": {"computer", "existing", "record", "workspace"},
+        "remote_execution.py": {"current"},
+        "run_recovery.py": {"workspace"},
+        "service.py": {"session"},
+        "service_turns.py": {"current"},
+        "store.py": {"session"},
+        "turns.py": {"session"},
+    }
     offenders = [
         f"{path.relative_to(root)}:{number}"
         for path in root.rglob("*.py")
         if path.name != "run_state.py"
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
-        if re.search(r"\brun\.status\s*=(?!=)", line)
+        for match in status_write.finditer(line)
+        if (match.group("assigned") or match.group("setattr") or match.group("copied"))
+        not in session_and_resource_writes.get(path.name, set())
     ]
     assert offenders == []

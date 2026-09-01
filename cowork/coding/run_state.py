@@ -32,6 +32,7 @@ _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.awaiting_approval: frozenset({
         RunStatus.running,
         RunStatus.ready,
+        RunStatus.completed,
         RunStatus.cancelled,
         RunStatus.interrupted,
         RunStatus.failed,
