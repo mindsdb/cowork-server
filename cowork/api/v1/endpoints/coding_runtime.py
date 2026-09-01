@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session
@@ -70,7 +71,6 @@ def register_runtime(body: ComputerRegistrationRequest):
             body.registration_token,
             body.name,
             body.capabilities,
-            body.computer_id,
         )
     except RuntimeAuthenticationError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
@@ -96,16 +96,17 @@ async def acquire_runtime_lease(
     body: RuntimeLeaseRequest,
     request: Request,
 ):
-    _require_protocol(body.protocol_version)
-    _authenticate(request, computer_id)
-    deadline = asyncio.get_running_loop().time() + body.wait_seconds
-    while True:
-        lease = get_coding_service().remote.acquire_lease(computer_id)
-        if lease is not None:
-            return lease
-        if asyncio.get_running_loop().time() >= deadline:
-            return None
+    def authenticated_attempt() -> RuntimeLease | None:
+        _require_protocol(body.protocol_version)
+        _authenticate(request, computer_id)
+        return get_coding_service().remote.acquire_lease(computer_id)
+
+    deadline = time.monotonic() + body.wait_seconds
+    lease = await asyncio.to_thread(authenticated_attempt)
+    while lease is None and time.monotonic() < deadline:
         await asyncio.sleep(0.25)
+        lease = await asyncio.to_thread(get_coding_service().remote.acquire_lease, computer_id)
+    return lease
 
 
 @router.post("/runs/{run_id}/events")

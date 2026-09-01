@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import threading
 import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -9,10 +16,22 @@ import pytest
 from coding_service_fakes import FakeEngine, repository
 
 from cowork.coding.contracts import PermissionMode
-from cowork.coding.control_models import CodeTask, ExecutionWorkspace, RunStatus, RuntimeCommand, TaskRun
+from cowork.coding.control_models import (
+    CodeTask,
+    Computer,
+    ComputerCapabilities,
+    ExecutionWorkspace,
+    RunStatus,
+    RuntimeCommand,
+    TaskRun,
+)
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.project_models import CodeProject, ProjectCommand, RepositoryResource
-from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
+from cowork.coding.runtime_protocol import (
+    ComputerRegistrationResponse,
+    RuntimeExecutionConfig,
+    RuntimeLease,
+)
 from cowork.coding.runtime_worker import (
     CodeOnlyRuntime,
     RuntimeIdentity,
@@ -98,6 +117,128 @@ class FakeRuntimeClient:
         return "https://control.example.test/api/v1/coding/runtime/inference"
 
 
+class FakeControlPlane:
+    """Loopback HTTP stand-in for the runtime protocol's registration and idle loop."""
+
+    RUNTIME_TOKEN = "runtime-token-issued-by-the-fake-control-plane"
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, dict[str, object]]] = []
+        self._changed = threading.Condition()
+        control_plane = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - http.server naming
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                body = json.loads(raw) if raw else {}
+                with control_plane._changed:
+                    control_plane.requests.append((
+                        self.path,
+                        self.headers.get("Authorization") or "",
+                        body,
+                    ))
+                    control_plane._changed.notify_all()
+                if self.path.endswith("/register"):
+                    payload = ComputerRegistrationResponse(
+                        computer=Computer(
+                            id="computer-subprocess",
+                            name=str(body["name"]),
+                            capabilities=ComputerCapabilities.model_validate(body["capabilities"]),
+                        ),
+                        runtime_token=control_plane.RUNTIME_TOKEN,
+                    ).model_dump(mode="json")
+                elif self.path.endswith("/lease"):
+                    payload = None
+                else:
+                    payload = {}
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *_args: object) -> None:
+                return None
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_port}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def wait_for(self, path_suffix: str, timeout: float, still_running=lambda: True) -> tuple[str, str, dict[str, object]]:
+        deadline = time.monotonic() + timeout
+        with self._changed:
+            while True:
+                match = next((item for item in self.requests if item[0].endswith(path_suffix)), None)
+                if match is not None:
+                    return match
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not still_running():
+                    raise AssertionError(f"No request to {path_suffix!r}; saw {[item[0] for item in self.requests]}")
+                self._changed.wait(min(remaining, 0.1))
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def test_runtime_cli_registers_a_computer_with_the_control_plane(tmp_path: Path) -> None:
+    control_plane = FakeControlPlane()
+    registration_token = "registration-token-with-at-least-32-chars"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "cowork.coding.runtime_worker",
+            "--server",
+            control_plane.url,
+            "--code",
+            registration_token,
+            "--name",
+            "Subprocess computer",
+            "--root",
+            str(tmp_path / "root"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        try:
+            _, _, registration = control_plane.wait_for(
+                "/runtime/register",
+                timeout=60,
+                still_running=lambda: process.poll() is None,
+            )
+            _, heartbeat_auth, _ = control_plane.wait_for(
+                "/heartbeat",
+                timeout=30,
+                still_running=lambda: process.poll() is None,
+            )
+        except AssertionError as exc:
+            process.kill()
+            _, stderr = process.communicate(timeout=10)
+            raise AssertionError(f"{exc}\nworker stderr:\n{stderr}") from exc
+    finally:
+        process.terminate()
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=10)
+        control_plane.close()
+
+    assert registration["registration_token"] == registration_token
+    assert registration["name"] == "Subprocess computer"
+    assert "computer_id" not in registration
+    assert heartbeat_auth == f"Bearer {FakeControlPlane.RUNTIME_TOKEN}"
+    stored = load_runtime_identity(tmp_path / "root")
+    assert stored is not None
+    assert stored.identity.computer_id == "computer-subprocess"
+
+
 def test_runtime_identity_is_private_and_survives_restart(tmp_path: Path) -> None:
     identity = RuntimeIdentity("remote-computer", "runtime-secret", "Build computer")
     save_runtime_identity(tmp_path, "https://control.example.test/", identity)
@@ -106,6 +247,30 @@ def test_runtime_identity_is_private_and_survives_restart(tmp_path: Path) -> Non
     assert stored is not None
     assert stored.server_url == "https://control.example.test"
     assert stored.identity == identity
+    assert (tmp_path / "runtime-identity.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_runtime_identity_is_created_owner_only_without_a_chmod(monkeypatch, tmp_path: Path) -> None:
+    created: dict[str, tuple[int, int]] = {}
+    real_open = os.open
+
+    def recording_open(path, flags, mode=0o777, *args, **kwargs):
+        created[os.fspath(path)] = (flags, mode)
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "chmod", lambda *_args, **_kwargs: pytest.fail("mode must be set at creation"))
+    monkeypatch.setattr(Path, "chmod", lambda *_args, **_kwargs: pytest.fail("mode must be set at creation"))
+
+    save_runtime_identity(
+        tmp_path,
+        "https://control.example.test",
+        RuntimeIdentity("remote-computer", "runtime-secret", "Build computer"),
+    )
+
+    ((flags, mode),) = [item for path, item in created.items() if path.startswith(str(tmp_path))]
+    assert mode == 0o600
+    assert flags & os.O_EXCL
     assert (tmp_path / "runtime-identity.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -611,3 +776,99 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         for kind, payload in client.events
     )
     assert ("turn_completed", {"status": "cancelled"}) in client.events
+
+
+def _remote_lease(tmp_path: Path, name: str) -> tuple[RuntimeLease, RuntimeCommand]:
+    source = repository(tmp_path)
+    run = TaskRun(
+        id=f"run-{name}",
+        task_id=f"task-{name}",
+        computer_id="remote-computer",
+        status=RunStatus.preparing,
+        lease_id=f"lease-{name}",
+    )
+    lease = RuntimeLease(
+        task=CodeTask(id=run.task_id, title=name, prompt="Start"),
+        run=run,
+        lease_id=f"lease-{name}",
+        agent_token="agent-token-that-is-long-enough-for-runtime",
+        project=CodeProject(
+            id=f"{name}-project",
+            name=f"{name} project",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url=str(source))],
+        ),
+        execution=RuntimeExecutionConfig(
+            engine_id="fake",
+            model="fake-model",
+            permission_mode=PermissionMode.workspace,
+        ),
+    )
+    start = RuntimeCommand(
+        id="command-start",
+        run_id=run.id,
+        epoch=run.epoch,
+        kind="start",
+        payload={"prompt": "Start"},
+    )
+    return lease, start
+
+
+def test_command_router_reports_a_failing_handler_and_still_acts_on_cancel(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "failing-steer")
+    steer = RuntimeCommand(
+        id="command-steer",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="steer",
+        payload={"prompt": "Change direction"},
+    )
+    cancel = RuntimeCommand(id="command-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
+    client = FakeRuntimeClient(lease, start)
+    client._commands.extend([steer, cancel])
+    engine = FakeEngine(block_until_cancel=True)
+    engine.steer_error = True
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    assert engine.steers == []
+    assert engine.cancels == ["turn-1"]
+    assert client.results[steer.id] == (None, "adapter rejected steer")
+    assert client.results[cancel.id] == (None, None)
+    assert ("turn_completed", {"status": "cancelled"}) in client.events
+
+
+def test_release_claimed_during_a_turn_is_acknowledged_after_the_turn(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "early-release")
+    release = RuntimeCommand(
+        id="command-release-early",
+        run_id=lease.run.id,
+        epoch=lease.run.epoch,
+        kind="release",
+    )
+    cancel = RuntimeCommand(id="command-cancel", run_id=lease.run.id, epoch=lease.run.epoch, kind="cancel")
+    client = FakeRuntimeClient(lease, start)
+    client._commands.extend([release, cancel])
+    registry = CodingEngineRegistry()
+    registry.register(FakeEngine(block_until_cancel=True))
+
+    assert CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    assert client.acknowledged == [start.id, cancel.id, release.id]
+    assert client.calls.index("event:turn_completed:cancelled") < client.calls.index(f"ack:{release.id}")
+    assert client.calls.index(f"ack:{release.id}") < client.calls.index("event:status:completed")
+
+
+def test_approval_ids_are_unique_per_request(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "approval-ids")
+    client = FakeRuntimeClient(lease, start)
+    runtime = CodeOnlyRuntime(tmp_path / "runtime", client, approval_timeout_seconds=0)
+
+    runtime._approval(lease, "command", {"title": "Run tests"})
+    runtime._approval(lease, "command", {"title": "Run tests"})
+
+    approval_ids = [str(payload["approvalId"]) for kind, payload in client.events if kind == "approval"]
+    assert len(set(approval_ids)) == 2
+    for approval_id in approval_ids:
+        uuid.UUID(approval_id.removeprefix(f"approval-{lease.run.id}-"))

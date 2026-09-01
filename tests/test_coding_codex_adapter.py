@@ -422,6 +422,103 @@ def test_cancel_arms_watchdog_before_interrupt_rpc(monkeypatch) -> None:
     assert engine_session._cancel_watchdogs["turn-1"] is watchdog
 
 
+def _cancellable_session(client) -> codex_module.CodexEngineSession:
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = client
+    engine_session._session_id = "session-1"
+    engine_session._cancel_watchdogs = {}
+    engine_session._cancel_lock = codex_module.threading.Lock()
+    engine_session._goal_states = {}
+    engine_session._closed = codex_module.threading.Event()
+    engine_session._secrets = ()
+    engine_session._terminal_handlers = {"terminal-1": lambda *_args: None}
+    engine_session._terminal_lock = codex_module.threading.Lock()
+    return engine_session
+
+
+def test_slow_cooperative_cancel_keeps_terminals_and_session_alive(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class FakeClient:
+        _proc = SimpleNamespace(pid=4321)
+
+        def turn_interrupt(self, _session_id: str, _turn_id: str) -> None:
+            calls.append("interrupt")
+
+        def next_turn_notification(self, _turn_id: str):
+            return SimpleNamespace(
+                method="turn/completed",
+                payload={"turn": {"id": "turn-1", "status": "interrupted"}},
+            )
+
+        def unregister_turn_notifications(self, _turn_id: str) -> None:
+            return None
+
+        def close(self) -> None:
+            calls.append("close")
+
+    class CapturedThread:
+        def __init__(self, *, target, args, **_kwargs) -> None:
+            self.run = lambda: target(*args)
+
+        def start(self) -> None:
+            watchdogs.append(self)
+
+    watchdogs: list[CapturedThread] = []
+    engine_session = _cancellable_session(FakeClient())
+    monkeypatch.setattr(codex_module.threading, "Thread", CapturedThread)
+    monkeypatch.setattr(codex_module, "_CANCEL_WATCHDOG_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(codex_module, "terminate_descendants", lambda pid: calls.append(f"terminate:{pid}"))
+
+    engine_session.cancel("turn-1")
+    watchdogs[0].run()
+    events = list(engine_session.events("turn-1"))
+
+    assert calls == ["interrupt"]
+    assert events[-1].data == {"status": "interrupted"}
+    assert not engine_session.is_closed
+    assert set(engine_session._terminal_handlers) == {"terminal-1"}
+    assert engine_session._cancel_watchdogs == {}
+
+
+def test_unacknowledged_interrupt_terminates_turn_processes_before_closing(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class FakeClient:
+        _proc = SimpleNamespace(pid=4321)
+
+        def close(self) -> None:
+            calls.append("close")
+
+    engine_session = _cancellable_session(FakeClient())
+    monkeypatch.setattr(codex_module, "_CANCEL_WATCHDOG_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(codex_module, "terminate_descendants", lambda pid: calls.append(f"terminate:{pid}"))
+
+    engine_session._cancel_watchdog(codex_module.threading.Event())
+
+    assert calls[0] == "terminate:4321"
+    assert calls[-1] == "close"
+    assert engine_session.is_closed
+
+
+def test_close_fails_loudly_when_the_sdk_process_handle_is_renamed(monkeypatch) -> None:
+    class RenamedClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = RenamedClient()
+    engine_session = _cancellable_session(client)
+    monkeypatch.setattr(codex_module, "terminate_descendants", lambda pid: pytest.fail("teardown ran without a pid"))
+
+    with pytest.raises(AttributeError, match="_proc"):
+        engine_session.close()
+
+    assert client.closed
+
+
 def test_resume_goal_registers_routing_before_reactivating_the_goal(monkeypatch) -> None:
     order: list[str] = []
 
