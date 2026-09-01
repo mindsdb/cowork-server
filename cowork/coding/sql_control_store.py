@@ -292,10 +292,14 @@ class SqlControlPlaneStore:
             return run
 
     def update_run(self, run_id: str, operation: Callable[[TaskRun], None]) -> TaskRun:
+        """Mutate one run under a row lock so replicas serialize on the same record."""
+
         with self._session_factory.begin() as session:
             row = self._locked_row(session, "runs", run_id)
             run = TaskRun.model_validate(row.payload)
             operation(run)
+            if run.model_dump(mode="json") == row.payload:
+                return run
             run.updated_at = utc_now()
             row.payload = run.model_dump(mode="json")
             self._apply_projection(row, "runs", run)

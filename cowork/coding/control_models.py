@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Literal
@@ -170,6 +171,7 @@ class TaskRun(BaseModel):
     lease_id: str | None = Field(default=None, max_length=128)
     lease_expires_at: datetime | None = None
     last_event_seq: int = Field(default=0, ge=0)
+    last_event_id: str | None = Field(default=None, max_length=128)
     checkpoint: dict[str, object] = Field(default_factory=dict)
     workspace_resume_mode: Literal["prepare", "restore", "recreate"] = "prepare"
     recovery_count: int = Field(default=0, ge=0)
@@ -275,6 +277,12 @@ class RuntimeCommand(BaseModel):
 
 class RuntimeEvent(BaseModel):
     protocol_version: str = RUNTIME_PROTOCOL_VERSION
+    id: str = Field(
+        default_factory=lambda: f"event-{uuid.uuid4().hex}",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
     run_id: str = Field(min_length=1, max_length=128)
     computer_id: str = Field(min_length=1, max_length=128)
     lease_id: str = Field(min_length=1, max_length=128)
