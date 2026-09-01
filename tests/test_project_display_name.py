@@ -153,3 +153,17 @@ def test_rename_still_moves_the_directory_when_the_slug_changes(db):
     assert Path(renamed.path).name == "beta"
     assert not old_path.exists()
     assert display_label(renamed) == "beta"
+
+
+def test_the_label_reaches_the_wire(db):
+    """The renderer reads `display_name` off the project payload.
+
+    The projects endpoints return the model directly with no response_model, so
+    the field is exposed by adding it — but that is exactly the kind of thing a
+    later `response_model=` would silently strip, taking the whole feature with
+    it and leaving every project rendering its slug again.
+    """
+    project = _svc(db).create_project("Мій тестовий проєкт")
+    payload = project.model_dump(mode="json")
+    assert payload["display_name"] == "Мій тестовий проєкт"
+    assert payload["name"] == "untitled-project"

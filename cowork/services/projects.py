@@ -414,6 +414,15 @@ class ProjectService:
         project typed literally `My-Project` still collides with an existing
         slug-labelled `My-Project`. Space-separated, unlike `_unique_name`'s
         hyphen: this suffix is read by humans, not used as a path.
+
+        Known limitation, accepted. This is a read-then-write with no unique
+        constraint behind it, so two concurrent creates of the same name can
+        both pick the unsuffixed label. `_unique_name` has the same shape but
+        `mkdir` settles it; there is no equivalent backstop for a label, and
+        adding one means a unique index and a failure path on a column that
+        addresses nothing. The cost of losing the race is two rows reading the
+        same way in the sidebar -- which is where every non-Latin project
+        already was before this ticket -- and renaming either one fixes it.
         """
         taken = {
             (p.display_name or p.name)
