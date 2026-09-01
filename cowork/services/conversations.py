@@ -510,6 +510,11 @@ class ConversationService:
         conversation = self._owned(conversation_id)
         if conversation is None:
             return
+        if conversation.verifier_latch == latch:
+            # Unchanged on most turns. The caller checks too, but any caller
+            # gets this: it runs per turn, so an unconditional commit is write
+            # load and row contention for nothing.
+            return
         conversation.verifier_latch = latch
         self.session.add(conversation)
         self.session.commit()
