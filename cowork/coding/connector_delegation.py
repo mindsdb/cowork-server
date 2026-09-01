@@ -7,7 +7,7 @@ import uuid
 from datetime import timedelta
 
 from cowork.coding.contracts import utc_now
-from cowork.coding.control_errors import RuntimeAuthenticationError
+from cowork.coding.control_errors import RuntimeAuthenticationError, StateConflict
 from cowork.coding.control_models import (
     TERMINAL_RUN_STATUSES,
     ConnectorGrant,
@@ -35,7 +35,7 @@ class ConnectorDelegationService:
     ) -> tuple[ConnectorGrant, str]:
         run = self.store.get_run(run_id)
         if run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
-            raise ValueError("Connector access is unavailable after a Task Run ends")
+            raise StateConflict("Connector access is unavailable after a Task Run ends")
         token = secrets.token_urlsafe(40)
         grant = ConnectorGrant(
             id=f"grant-{uuid.uuid4().hex}",
@@ -171,7 +171,7 @@ class ConnectorDelegationService:
             if allowed is None:
                 continue
             supplied = requested.get(name)
-            if supplied is None or not hmac.compare_digest(allowed, supplied):
+            if supplied is None or not hmac.compare_digest(allowed.encode("utf-8"), supplied.encode("utf-8")):
                 raise RuntimeAuthenticationError("Connector capability is outside its resource scope")
 
     @staticmethod

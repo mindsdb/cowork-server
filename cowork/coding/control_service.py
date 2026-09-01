@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from cowork.coding.connector_delegation import ConnectorDelegationService
 from cowork.coding.contracts import CodingSession, SessionStatus, TaskCapability, utc_now
-from cowork.coding.control_errors import RuntimeAuthenticationError, StaleRuntimeEvent
+from cowork.coding.control_errors import RuntimeAuthenticationError, StaleRuntimeEvent, StateConflict
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     TERMINAL_RUN_STATUSES,
@@ -146,7 +146,7 @@ class ControlPlaneService:
             run.computer_id == computer_id and run.status not in TERMINAL_RUN_STATUSES
             for run in self.store.list_runs()
         ):
-            raise ValueError("Finish or move this computer's active tasks before revoking it")
+            raise StateConflict("Finish or move this computer's active tasks before revoking it")
         computer.registration_epoch += 1
         computer.status = ComputerStatus.offline
         computer.active_run_count = 0
@@ -758,7 +758,7 @@ class ControlPlaneService:
         with self._lock:
             run = self.store.get_run(run_id)
             if run.status != RunStatus.queued:
-                raise ValueError("Only queued Task Runs can be reassigned; recover a leased run instead")
+                raise StateConflict("Only queued Task Runs can be reassigned; recover a leased run instead")
             task = self.store.get_task(run.task_id)
             if task.execution_project is None:
                 raise NoEligibleComputer("This task includes resources that only exist on its original computer")

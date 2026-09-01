@@ -42,6 +42,7 @@ from cowork.coding.contracts import (
     TerminalTabState,
     TurnRequest,
 )
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TaskResourceScope
 from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.engines.base import EngineCredentials
@@ -147,8 +148,10 @@ IntegrationsDep = Annotated[DeveloperIntegrationService, Depends(_integration_se
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
-    if isinstance(exc, (ValueError, WorkspaceError, RuntimeError)):
+    if isinstance(exc, (StateConflict, WorkspaceError, RuntimeError)):
         return HTTPException(status_code=409, detail=redact_text(str(exc))[:4_000])
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=redact_text(str(exc))[:4_000])
     return HTTPException(status_code=500, detail="Coding operation failed")
 
 
