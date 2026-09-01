@@ -10,6 +10,8 @@ every test that runs after it.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from cowork.common.logger import _resolved_log_level_name
@@ -37,6 +39,13 @@ def env_file():
 
 
 def test_log_level_is_read_from_the_config_file(env_file, monkeypatch):
+    # The chain is [<COWORK_HOME>/.env, ".env"] and pydantic-settings is
+    # last-wins, so a developer's repo-local .env would beat the file under
+    # test. CI has none — `.env` is gitignored.
+    local = Path(".env")
+    if local.exists() and "LOG_LEVEL" in local.read_text(encoding="utf-8"):
+        pytest.skip("a repo-local .env sets LOG_LEVEL and wins the env-file chain")
+
     monkeypatch.delenv("LOG_LEVEL", raising=False)
     env_file.write_text("LOG_LEVEL=INFO\n", encoding="utf-8")
     get_app_settings.cache_clear()
