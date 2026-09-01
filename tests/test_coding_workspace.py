@@ -145,16 +145,17 @@ def test_apply_conflict_does_not_partially_change_source(tmp_path: Path) -> None
     assert (repo / "keep.txt").read_text(encoding="utf-8") == "from user\n"
 
 
-def test_direct_folder_requires_the_request_to_enable_direct_mode(tmp_path: Path) -> None:
+def test_non_git_folder_requires_isolation_and_uses_a_managed_copy(tmp_path: Path) -> None:
     folder = tmp_path / "plain"
     folder.mkdir()
     manager = WorkspaceManager(tmp_path / "coding")
-    with pytest.raises(WorkspaceError, match="Direct-folder mode was not enabled"):
+    with pytest.raises(WorkspaceError, match="Local folder isolation was not enabled"):
         manager.prepare("direct-1", str(folder), False)
 
     prepared = manager.prepare("direct-2", str(folder), True)
-    assert prepared.kind == WorkspaceKind.direct_folder
-    assert prepared.workspace_path == folder.resolve()
+    assert prepared.kind == WorkspaceKind.local_copy
+    assert prepared.workspace_path != folder.resolve()
+    assert prepared.workspace_path.is_dir()
 
 
 def test_cleanup_only_removes_the_managed_task_worktree(tmp_path: Path) -> None:
