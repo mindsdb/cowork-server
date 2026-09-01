@@ -67,10 +67,32 @@ def test_the_stored_latch_is_passed_when_anton_declares_the_field():
     }
 
 
-def test_an_anton_without_the_field_is_a_no_op():
+def test_an_anton_without_the_field_warns_once_and_is_a_no_op(monkeypatch):
     """Not a TypeError on every turn, which is what an unknown keyword to a
-    plain dataclass would cause."""
-    assert verifier_latch_kwarg(_OlderAntonConfig, _LATCH) == {}
+    plain dataclass would cause. Announced once, because the pin is bumped by
+    hand and a silent no-op here restores the bug this change fixes.
+
+    The module's logger is stubbed rather than captured: another test in this
+    suite calls `setup_logging`, whose `basicConfig(force=True)` makes any
+    capture-based assertion order-dependent.
+    """
+    import cowork.build_info as build_info
+
+    warnings: list[str] = []
+
+    class _Stub:
+        @staticmethod
+        def warning(message, *args, **kwargs):
+            warnings.append(message)
+
+    monkeypatch.setattr(build_info, "logger", _Stub)
+    monkeypatch.setattr(build_info, "_latch_unsupported_warned", False)
+
+    assert build_info.verifier_latch_kwarg(_OlderAntonConfig, _LATCH) == {}
+    assert build_info.verifier_latch_kwarg(_OlderAntonConfig, _LATCH) == {}
+
+    assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}"
+    assert "initial_verifier_latch" in warnings[0]
 
 
 def test_a_non_dataclass_is_a_no_op():
