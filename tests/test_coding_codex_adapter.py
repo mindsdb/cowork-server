@@ -182,7 +182,8 @@ def test_turn_input_preserves_native_mentions_and_local_images() -> None:
     ]
 
 
-def test_codex_launch_policy_is_resolved_once_for_client_and_thread() -> None:
+def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch) -> None:
+    monkeypatch.delenv(codex_config.AUTO_COMPACT_TOKEN_LIMIT_ENV, raising=False)
     launch = codex_config.prepare_launch(
         EngineSessionConfig(
             model="fable",
@@ -211,11 +212,34 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread() -> None:
     assert 'model_reasoning_effort="high"' in launch.config_overrides
     assert 'service_tier="priority"' in launch.config_overrides
     assert 'web_search="live"' in launch.config_overrides
+    assert (
+        f"model_auto_compact_token_limit={codex_config.DEFAULT_AUTO_COMPACT_TOKEN_LIMIT}"
+        in launch.config_overrides
+    )
     assert any(item.startswith("mcp_servers.mindshub_code.command=") for item in launch.config_overrides)
     assert any('"cowork.coding.integration_mcp","/cowork-data","task-123"' in item for item in launch.config_overrides)
     assert launch.thread_params["developerInstructions"] == "Use the project playbook."
     assert launch.thread_params["approvalPolicy"] == launch.approval_policy
     assert launch.thread_params["sandbox"] == "workspace-write"
+
+
+def test_codex_auto_compact_threshold_can_be_tuned_for_runtime_verification(monkeypatch) -> None:
+    monkeypatch.setenv(codex_config.AUTO_COMPACT_TOKEN_LIMIT_ENV, "12000")
+
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(model="gpt", permission_mode=PermissionMode.workspace),
+        Path("/workspace"),
+        "http://127.0.0.1:26866/api/v1/coding/inference",
+    )
+
+    assert "model_auto_compact_token_limit=12000" in launch.config_overrides
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "0", "-1"])
+def test_codex_auto_compact_threshold_ignores_invalid_overrides(monkeypatch, value: str) -> None:
+    monkeypatch.setenv(codex_config.AUTO_COMPACT_TOKEN_LIMIT_ENV, value)
+
+    assert codex_config.auto_compact_token_limit() == codex_config.DEFAULT_AUTO_COMPACT_TOKEN_LIMIT
 
 
 def test_extension_inventory_normalizes_codex_skills_and_mcp_servers() -> None:

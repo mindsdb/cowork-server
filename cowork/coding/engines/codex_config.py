@@ -18,6 +18,14 @@ from cowork.coding.shells import resolve_shell, shell_environment
 # task runtimes are children of, and owned by, this process.
 LOCAL_PROXY_TOKEN = secrets.token_urlsafe(32)
 
+# MindsHub models used by Code Mode currently expose context windows of at
+# least 200k tokens. Codex does not receive auto-compaction metadata from the
+# normalized MindsHub model catalogue, so without an explicit threshold a
+# tool-heavy task can reach the provider's hard limit before Codex compacts it.
+# Keep enough headroom for the compaction request itself and the next turn.
+DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 180_000
+AUTO_COMPACT_TOKEN_LIMIT_ENV = "MINDSHUB_CODE_AUTO_COMPACT_TOKEN_LIMIT"
+
 
 @dataclass(frozen=True)
 class CodexLaunchConfig:
@@ -157,6 +165,24 @@ def responses_base_url(raw_url: str) -> str:
     return base if base.endswith("/v1") else f"{base}/v1"
 
 
+def auto_compact_token_limit() -> int:
+    """Return the preventive Codex compaction threshold.
+
+    The environment override exists for deterministic runtime verification
+    and emergency tuning without shipping a desktop update. Invalid values
+    fail safe to the supported default instead of preventing Code Mode from
+    launching.
+    """
+    raw_value = os.environ.get(AUTO_COMPACT_TOKEN_LIMIT_ENV)
+    if raw_value is None:
+        return DEFAULT_AUTO_COMPACT_TOKEN_LIMIT
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return DEFAULT_AUTO_COMPACT_TOKEN_LIMIT
+    return value if value > 0 else DEFAULT_AUTO_COMPACT_TOKEN_LIMIT
+
+
 def toml_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -182,6 +208,7 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         f"model_providers.mindshub.base_url={toml_string(endpoint)}",
         'model_providers.mindshub.env_key="MINDSHUB_CODEX_API_KEY"',
         'model_providers.mindshub.wire_api="responses"',
+        f"model_auto_compact_token_limit={auto_compact_token_limit()}",
         f'approval_policy="{resolved_approval}"',
         f'sandbox_mode="{resolved_sandbox}"',
         f'web_search="{"live" if config.web_search else "disabled"}"',
