@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -60,6 +62,55 @@ def test_lease_long_poll_does_not_block_other_requests(
     assert health_response.status_code == 200
     assert health_elapsed < 0.5
     assert lease_statuses == [200]
+
+
+def test_lease_long_polls_do_not_hold_threadpool_tokens_while_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    computer, runtime_token = service.control.register_runtime(
+        service.control.issue_registration_token(),
+        "Build computer",
+        ComputerCapabilities(platform="linux", architecture="test", runtime_version="test-runtime"),
+    )
+    polls = threading.Semaphore(0)
+    monkeypatch.setattr(service.remote, "acquire_lease", lambda _computer_id: polls.release())
+    monkeypatch.setattr(coding_runtime, "get_coding_service", lambda: service)
+
+    @asynccontextmanager
+    async def two_threadpool_tokens(_app: FastAPI):
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 2
+        yield
+
+    app = FastAPI(lifespan=two_threadpool_tokens)
+    app.include_router(coding_runtime.router, prefix="/api/v1/coding/runtime")
+    app.include_router(health.router, prefix="/api/v1/health")
+    lease_statuses: list[int] = []
+
+    with TestClient(app) as client:
+        def poll_lease() -> None:
+            response = client.post(
+                f"/api/v1/coding/runtime/computers/{computer.id}/lease",
+                headers={"Authorization": f"Bearer {runtime_token}"},
+                json={"protocol_version": "1.0", "wait_seconds": 2},
+            )
+            lease_statuses.append(response.status_code)
+
+        pollers = [threading.Thread(target=poll_lease, name=f"lease-long-poll-{index}") for index in range(4)]
+        for poller in pollers:
+            poller.start()
+        for _ in range(2):
+            assert polls.acquire(timeout=5)
+        started = time.monotonic()
+        health_response = client.get("/api/v1/health/")
+        health_elapsed = time.monotonic() - started
+        for poller in pollers:
+            poller.join(timeout=5)
+
+    assert health_response.status_code == 200
+    assert health_elapsed < 0.5
+    assert lease_statuses == [200, 200, 200, 200]
 
 
 def test_legacy_computer_id_in_registration_body_never_touches_an_existing_computer(
