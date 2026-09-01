@@ -11,12 +11,18 @@ from cowork.coding.contracts import utc_now
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     CodeTask,
+    Computer,
     ComputerCapabilities,
     ComputerStatus,
+    ConnectorGrant,
     ExecutionWorkspace,
     RunStatus,
+    RuntimeCommand,
     RuntimeEvent,
+    RuntimeRegistrationCredential,
+    SecurityAuditEvent,
     TaskRun,
+    WorkspaceStatus,
 )
 from cowork.coding.control_service import (
     ControlPlaneService,
@@ -80,6 +86,82 @@ def test_task_run_bundle_rolls_back_if_local_persistence_is_interrupted(
     assert not (tmp_path / "control" / ".transaction.json").exists()
 
 
+def test_separate_store_instances_can_save_the_same_document_concurrently(tmp_path: Path) -> None:
+    stores = [LocalControlPlaneStore(tmp_path) for _ in range(12)]
+    computer = Computer(
+        id="shared-computer",
+        name="Shared computer",
+        capabilities=capabilities(),
+    )
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        saved = list(pool.map(
+            lambda store: store.save_computer(computer.model_copy(deep=True)),
+            stores,
+        ))
+
+    assert len(saved) == len(stores)
+    assert stores[0].get_computer(computer.id).name == computer.name
+    assert not list((tmp_path / "control" / "computers").glob("*.tmp"))
+
+
+def test_runtime_command_polling_uses_the_run_index_not_a_collection_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalControlPlaneStore(tmp_path)
+    store.save_command(RuntimeCommand(id="command-a", run_id="run-a", epoch=1, kind="start"))
+    store.save_command(RuntimeCommand(id="command-b", run_id="run-b", epoch=1, kind="start"))
+    monkeypatch.setattr(store, "_list", lambda *_args, **_kwargs: pytest.fail("full collection scan"))
+
+    assert [item.id for item in store.list_commands("run-a")] == ["command-a"]
+    assert store.get_command("command-b").run_id == "run-b"
+
+
+def test_deleting_a_control_task_cascades_through_its_run_records(tmp_path: Path) -> None:
+    store = LocalControlPlaneStore(tmp_path)
+    task = CodeTask(id="task", title="Task")
+    run = TaskRun(id="run", task_id=task.id, computer_id="computer")
+    workspace = ExecutionWorkspace(id="workspace", run_id=run.id, resource_id="repo", computer_id="computer")
+    store.create_task_run(task, run, [workspace])
+    store.save_command(RuntimeCommand(id="command", run_id=run.id, epoch=1, kind="start"))
+    store.save_audit_event(SecurityAuditEvent(
+        id="audit", action="task.start", outcome="completed", actor_type="system", run_id=run.id,
+    ))
+
+    store.delete_task(task.id)
+
+    with pytest.raises(KeyError):
+        store.get_task(task.id)
+    with pytest.raises(KeyError):
+        store.get_run(run.id)
+    assert store.list_workspaces(run.id) == []
+    assert store.list_commands(run.id) == []
+    assert store.list_audit_events(run.id) == []
+
+
+def test_control_store_prunes_expired_auxiliary_history_only(tmp_path: Path) -> None:
+    store = LocalControlPlaneStore(tmp_path)
+    old = utc_now() - timedelta(days=120)
+    task = store.save_task(CodeTask(id="task", title="Task"))
+    store.save_command(RuntimeCommand(
+        id="command", run_id="run", epoch=1, kind="start", created_at=old, acked_at=old,
+    ))
+    store.save_registration_credential(RuntimeRegistrationCredential(
+        id="0" * 64, token_hash="0" * 64, expires_at=old,
+    ))
+    store.save_audit_event(SecurityAuditEvent(
+        id="audit", action="task.start", outcome="completed", actor_type="system", created_at=old,
+    ))
+
+    removed = store.prune(utc_now() - timedelta(days=30), utc_now() - timedelta(days=90))
+
+    assert removed == 3
+    assert store.get_task(task.id).title == "Task"
+    assert store.list_commands() == []
+    assert store.list_audit_events() == []
+
+
 def project(local_computer_id: str) -> CodeProject:
     return CodeProject(
         id="product",
@@ -102,7 +184,15 @@ def project(local_computer_id: str) -> CodeProject:
 
 def test_registration_is_one_use_and_computers_survive_restart(tmp_path: Path) -> None:
     service = ControlPlaneService(tmp_path, capabilities())
-    computer, runtime_token = register(service)
+    registration_token = service.issue_registration_token()
+    # Registration authority is durable so a runtime may reach another API
+    # worker (or the service may restart) after the pairing code is shown.
+    service = ControlPlaneService(tmp_path, capabilities())
+    computer, runtime_token = service.register_runtime(
+        registration_token,
+        "Remote",
+        capabilities(),
+    )
     assert service.authenticate_runtime(computer.id, runtime_token).id == computer.id
     with pytest.raises(RuntimeAuthenticationError, match="already used"):
         service.register_runtime("invalid-token-that-is-long-enough-for-testing", "Other", capabilities())
@@ -112,6 +202,32 @@ def test_registration_is_one_use_and_computers_survive_restart(tmp_path: Path) -
     assert computer.id in persisted
     assert service.local_computer.id == restarted.local_computer.id
     assert restarted.authenticate_runtime(computer.id, runtime_token).id == computer.id
+
+
+def test_computers_can_be_named_and_remote_access_revoked(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, runtime_token = register(service, "Build computer")
+
+    renamed = service.rename_computer(remote.id, "  Release   runner  ")
+    assert renamed.name == "Release runner"
+    assert not renamed.is_local
+
+    service.revoke_computer(remote.id)
+    assert remote.id not in {item.id for item in service.list_computers().items}
+    with pytest.raises(RuntimeAuthenticationError, match="revoked"):
+        service.authenticate_runtime(remote.id, runtime_token)
+
+
+def test_this_computer_can_be_renamed_but_not_revoked(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    local = service.rename_computer(service.local_computer.id, "Ian's Mac")
+    assert local.name == "Ian's Mac"
+    assert local.is_local
+
+    restarted = ControlPlaneService(tmp_path, capabilities())
+    assert restarted.local_computer.name == "Ian's Mac"
+    with pytest.raises(ValueError, match="cannot be revoked"):
+        restarted.revoke_computer(restarted.local_computer.id)
 
 
 def test_local_folders_are_owner_bound_but_repositories_are_portable(tmp_path: Path) -> None:
@@ -140,6 +256,33 @@ def test_local_folders_are_owner_bound_but_repositories_are_portable(tmp_path: P
             computer_id=remote.id,
             engine_id="codex",
         )
+
+
+def test_task_resource_snapshot_is_immutable_when_project_changes(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    code_project = project(service.local_computer.id)
+    snapshot = service.create_task_run(
+        task_id="scoped-task",
+        title="Scoped task",
+        prompt="Only change the API",
+        project=code_project,
+        requested_resource_ids=["api"],
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+
+    code_project.resources[0].name = "Renamed after task creation"
+    code_project.resources.append(RepositoryResource(
+        id="web",
+        name="Web",
+        source_url="https://github.com/example/web.git",
+    ))
+
+    task = service.store.get_task(snapshot.task.id)
+    assert task.execution_project is not None
+    assert [(item.id, item.name) for item in task.execution_project.resources] == [("api", "API")]
+    assert [item.id for item in service.runtime_project_for_task(task, remote.id).resources] == ["api"]
 
 
 def test_no_project_folder_task_is_kept_on_its_owning_computer(tmp_path: Path) -> None:
@@ -194,10 +337,57 @@ def test_leases_fence_stale_and_duplicate_runtime_events(tmp_path: Path) -> None
     with pytest.raises(StaleRuntimeEvent, match="sequence is stale"):
         service.renew_lease(event)
 
-    recovered = service.recover_run(snapshot.run.id, service.local_computer.id)
+    recovered = service.recover_run(
+        snapshot.run.id,
+        service.local_computer.id,
+        allow_recreate=True,
+    )
     assert recovered.epoch == run.epoch + 1
     with pytest.raises(StaleRuntimeEvent, match="ownership changed"):
         service.renew_lease(event.model_copy(update={"seq": 2}))
+
+
+def test_runtime_checkpoint_and_error_payloads_are_sanitized_before_persistence(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    service.create_task_run(
+        task_id="sanitized",
+        title="Sanitized",
+        prompt="Run remotely",
+        project=CodeProject(
+            id="sanitized-project",
+            name="Sanitized",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    leased = service.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+
+    checkpoint = service.renew_lease(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=1,
+        kind="checkpoint",
+        payload={"authorization": "Bearer secret-token", "detail": "token=secret-token"},
+    ))
+    failed = service.renew_lease(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=2,
+        kind="error",
+        payload={"detail": "Authorization: Bearer secret-token"},
+    ))
+
+    assert checkpoint.checkpoint == {"authorization": "[redacted]", "detail": "token=[redacted]"}
+    assert failed.last_error == "Authorization: Bearer [redacted]"
 
 
 def test_only_one_concurrent_runtime_claim_can_acquire_a_queued_run(tmp_path: Path) -> None:
@@ -264,6 +454,48 @@ def test_recovered_run_can_be_leased_for_workspace_preparation(tmp_path: Path) -
         kind="status",
         payload={"status": "ready"},
     )).status == RunStatus.ready
+
+
+def test_cross_computer_recovery_recreates_only_portable_scoped_resources(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    first_computer, _ = register(service, "First")
+    second_computer, _ = register(service, "Second")
+    snapshot = service.create_task_run(
+        task_id="migrate-run",
+        title="Migrate run",
+        prompt="Continue elsewhere",
+        project=CodeProject(
+            id="portable-project",
+            name="Portable",
+            resources=[RepositoryResource(
+                id="repo",
+                name="Repo",
+                source_url="https://example.test/repo.git",
+            )],
+        ),
+        requested_resource_ids=None,
+        computer_id=first_computer.id,
+        engine_id="codex",
+    )
+    workspace = service.store.list_workspaces(snapshot.run.id)[0]
+    workspace.status = WorkspaceStatus.ready
+    workspace.path = "/old-computer/workspace"
+    service.store.save_workspace(workspace)
+    assert service.acquire_lease(first_computer.id) is not None
+    service.set_run_status(snapshot.run.id, RunStatus.interrupted)
+
+    recovered = service.recover_run(
+        snapshot.run.id,
+        second_computer.id,
+        allow_recreate=True,
+    )
+
+    assert recovered.workspace_resume_mode == "recreate"
+    assert recovered.recovery_count == 1
+    migrated = service.store.list_workspaces(snapshot.run.id)[0]
+    assert migrated.computer_id == second_computer.id
+    assert migrated.status == "pending"
+    assert migrated.path == ""
 
 
 def test_capacity_counts_only_computer_work_not_idle_task_history(tmp_path: Path) -> None:
@@ -357,6 +589,7 @@ def test_connector_capabilities_are_short_lived_scoped_and_revocable(tmp_path: P
         {"repository": "acme/repo"},
     ).connection_name == "work-account"
     assert token not in grant.model_dump_json()
+    assert grant.computer_id == snapshot.run.computer_id
     with pytest.raises(RuntimeAuthenticationError, match="does not allow"):
         service.authorize_connector(grant.id, token, "search_work")
     with pytest.raises(RuntimeAuthenticationError, match="outside its resource scope"):
@@ -369,6 +602,38 @@ def test_connector_capabilities_are_short_lived_scoped_and_revocable(tmp_path: P
     service.revoke_connector_grants(snapshot.run.id)
     with pytest.raises(RuntimeAuthenticationError, match="expired"):
         service.authorize_connector(grant.id, token, "read_source")
+
+
+def test_legacy_unbound_connector_grants_load_but_fail_closed(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    snapshot = service.create_task_run(
+        task_id="legacy-grant",
+        title="Legacy grant",
+        prompt="Read source",
+        project=None,
+        requested_resource_ids=None,
+        computer_id=None,
+        engine_id="codex",
+        standalone_computer_id=service.local_computer.id,
+    )
+    token = "legacy-secret"
+    grant = ConnectorGrant.model_validate({
+        "id": "grant-legacy",
+        "run_id": snapshot.run.id,
+        "provider": "github",
+        "connection_name": "work-account",
+        "actions": ["read_source"],
+        "token_hash": service._digest(token),
+        "expires_at": utc_now() + timedelta(minutes=5),
+    })
+    service.store.save_grant(grant)
+
+    assert grant.computer_id == "legacy-unbound"
+    with pytest.raises(RuntimeAuthenticationError, match="another computer"):
+        service.authorize_connector(grant.id, token, "read_source")
+    audit = service.store.list_audit_events(snapshot.run.id)
+    assert any(item.action == "connector.invoke" and item.outcome == "denied" for item in audit)
+    assert all(token not in item.model_dump_json() for item in audit)
 
 
 def test_agent_token_is_scoped_to_one_leased_run_epoch(tmp_path: Path) -> None:

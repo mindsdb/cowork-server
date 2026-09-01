@@ -12,6 +12,18 @@ from cowork.coding.contracts import utc_now
 from cowork.coding.project_models import CodeProject
 
 
+_ROOT_LOCKS_GUARD = threading.Lock()
+_ROOT_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _root_lock(root: Path) -> threading.RLock:
+    """Share one in-process lock across store instances for the same catalogue."""
+
+    key = root.resolve()
+    with _ROOT_LOCKS_GUARD:
+        return _ROOT_LOCKS.setdefault(key, threading.RLock())
+
+
 @dataclass(frozen=True)
 class _JournalEntry:
     project_id: str
@@ -26,16 +38,20 @@ class CodeProjectStore:
         self.root = root / "projects"
         self.migration_computer_id = migration_computer_id
         self.root.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._recover_transaction()
+        self._lock = _root_lock(self.root)
+        with self._lock:
+            self._recover_transaction()
 
     def save(self, project: CodeProject) -> CodeProject:
         with self._lock:
             project.updated_at = utc_now()
             target = self._path(project.id)
-            temp = target.with_suffix(".tmp")
-            temp.write_text(project.model_dump_json(indent=2) + "\n", encoding="utf-8")
-            os.replace(temp, target)
+            temp = self.root / f".{project.id}.{uuid.uuid4().hex}.tmp"
+            try:
+                temp.write_text(project.model_dump_json(indent=2) + "\n", encoding="utf-8")
+                os.replace(temp, target)
+            finally:
+                temp.unlink(missing_ok=True)
             return project
 
     def create(self, project: CodeProject) -> CodeProject:

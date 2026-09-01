@@ -5,7 +5,11 @@ import shutil
 import sys
 from pathlib import Path
 
-from cowork.coding.contracts import TerminalShellInventory, TerminalShellOption, TerminalShellPreference
+from cowork.coding.contracts import (
+    TerminalShellInventory,
+    TerminalShellOption,
+    TerminalShellPreference,
+)
 
 
 def shell_inventory(

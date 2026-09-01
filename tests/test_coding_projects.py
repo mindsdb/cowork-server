@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.session_factory import project_instructions, task_title
-from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import GitRunner, WorkspaceError, WorkspaceManager
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -80,7 +81,7 @@ def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path
         "id": "legacy",
         "name": "Legacy",
         "folders": [
-            {"id": "repo", "name": "Repo", "path": str(repo), "commands": []},
+            {"id": "repo", "name": "Repo", "path": str(repo), "base_branch": "staging", "commands": []},
             {"id": "notes", "name": "Notes", "path": str(notes), "commands": []},
         ],
     }), encoding="utf-8")
@@ -92,10 +93,52 @@ def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path
     assert isinstance(migrated.resources[0], RepositoryResource)
     assert migrated.resources[0].local_path == str(repo.resolve())
     assert migrated.resources[0].computer_id == "computer-local"
+    assert migrated.resources[0].default_branch == "staging"
     assert isinstance(migrated.resources[1], LocalFolderResource)
     assert migrated.resources[1].path == str(notes.resolve())
     assert migrated.resources[1].computer_id == "computer-local"
     assert len(CodeProjectService(root, computer_id="computer-local").get("legacy").resources) == 2
+
+
+def test_project_store_instances_share_catalogue_lock_and_atomic_temp_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "coding"
+    first_store = CodeProjectStore(root)
+    second_store = CodeProjectStore(root)
+    assert first_store._lock is second_store._lock
+
+    folder = tmp_path / "project"
+    folder.mkdir()
+    project = CodeProject(
+        id="shared",
+        name="Shared",
+        folders=[ProjectFolder(id="project", name="Project", path=str(folder))],
+    )
+    first_store.create(project)
+    sources: list[Path] = []
+    real_replace = os.replace
+
+    def record_replace(source, target) -> None:
+        sources.append(Path(source))
+        real_replace(source, target)
+
+    monkeypatch.setattr(project_store_module.os, "replace", record_replace)
+    threads = [
+        threading.Thread(target=store.save, args=(project.model_copy(deep=True),))
+        for store in (first_store, second_store)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(sources) == 2
+    assert sources[0] != sources[1]
+    assert all(path.name.startswith(".shared.") for path in sources)
+    assert not list(first_store.root.glob("*.tmp"))
+    assert second_store.get(project.id).name == "Shared"
 
 
 def test_related_project_updates_roll_back_after_a_mid_write_failure(
@@ -153,6 +196,38 @@ def test_task_titles_are_compact_and_end_cleanly() -> None:
 
     assert len(title) == 72
     assert title.endswith("…")
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "ext::sh -c touch /tmp/cowork-git-rce",
+        "file:///private/repository",
+        "git://example.com/repository.git",
+        "http://example.com/repository.git",
+        "https://token@example.com/repository.git",
+    ],
+)
+def test_repository_resources_reject_unsafe_git_transports(source_url: str) -> None:
+    with pytest.raises(ValidationError, match="repository"):
+        RepositoryResource(id="repo", name="Repo", source_url=source_url)
+
+
+def test_git_runner_cannot_have_its_transport_allowlist_overridden(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    GitRunner().run(
+        tmp_path,
+        "status",
+        environment={"GIT_ALLOW_PROTOCOL": "ext:file:https:ssh"},
+    )
+
+    assert captured["GIT_ALLOW_PROTOCOL"] == "file:https:ssh"
 
 
 def test_project_workspace_isolates_git_and_non_git_folders_and_hands_off_together(tmp_path: Path) -> None:
@@ -244,6 +319,34 @@ def test_project_workspace_restores_only_recorded_task_paths(tmp_path: Path) -> 
         manager.restore("recoverable-task", project, [unsafe])
 
     manager.cleanup("recoverable-task", list(prepared.workspaces))
+
+
+def test_remote_repository_cache_fetches_before_each_new_task(tmp_path: Path) -> None:
+    source = repository(tmp_path, "remote-source")
+    branch = git(source, "branch", "--show-current")
+    project = CodeProject(
+        id="portable-project",
+        name="Portable",
+        resources=[RepositoryResource(
+            id="app",
+            name="App",
+            source_url=str(source),
+            default_branch=branch,
+        )],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    first = manager.prepare("first-task", project)
+    manager.cleanup("first-task", list(first.workspaces))
+
+    (source / "README.md").write_text("new revision\n", encoding="utf-8")
+    git(source, "add", "README.md")
+    git(source, "commit", "-m", "new revision")
+    latest = git(source, "rev-parse", "HEAD")
+
+    second = manager.prepare("second-task", project)
+    assert second.primary.base_revision == latest
+    assert (Path(second.primary.workspace_path) / "README.md").read_text(encoding="utf-8") == "new revision\n"
+    manager.cleanup("second-task", list(second.workspaces))
 
 
 def test_multi_folder_handoff_preflights_every_folder_before_changing_any_source(tmp_path: Path) -> None:

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from cowork.coding.contracts import CodingEvent, EventType, WorkspaceKind
+from cowork.coding.contracts import CodingEvent, CodingSession, EventType, WorkspaceKind
 from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.integrations import DeveloperIntegrationService
-from cowork.coding.operation_types import EventEmitter, GetSession, MaintenanceSession
+from cowork.coding.operation_types import (
+    EventEmitter,
+    GetExecutionProject,
+    GetSession,
+    MaintenanceSession,
+)
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PullRequestActionRequest,
     PullRequestStatus,
 )
-from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.store import CodingStore
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
@@ -27,7 +31,7 @@ class ProjectTaskOperations:
         store: CodingStore,
         workspaces: WorkspaceManager,
         project_workspaces: ProjectWorkspaceManager,
-        projects: CodeProjectService,
+        execution_project: GetExecutionProject,
         delivery: ProjectDeliveryService,
     ) -> None:
         self.get_session = get_session
@@ -36,7 +40,7 @@ class ProjectTaskOperations:
         self.store = store
         self.workspaces = workspaces
         self.project_workspaces = project_workspaces
-        self.projects = projects
+        self.execution_project = execution_project
         self.delivery = delivery
 
     def git_state(self, session_id: str):
@@ -56,6 +60,26 @@ class ProjectTaskOperations:
         if session.workspaces:
             return self.project_workspaces.diff(session.workspaces)
         return self.workspaces.diff(session.workspace_path, session.base_revision)
+
+    def review_file_action(self, session_id: str, folder_id: str | None, path: str, action: str):
+        with self.maintenance_session(
+            session_id,
+            "Wait for the active turn to finish before changing review state",
+        ) as session:
+            if session.workspaces:
+                selected = next((item for item in session.workspaces if item.folder_id == folder_id), None)
+                if selected is None:
+                    raise WorkspaceError("Choose a file from this task")
+                if selected.workspace_kind != WorkspaceKind.git_worktree:
+                    raise WorkspaceError("Review actions require a Git task workspace")
+                self.workspaces.review_file_action(selected.workspace_path, path, action)
+            else:
+                if session.base_revision is None:
+                    raise WorkspaceError("Review actions require a Git task workspace")
+                self.workspaces.review_file_action(session.workspace_path, path, action)
+            if session.workspaces:
+                return self.project_workspaces.diff(session.workspaces)
+            return self.workspaces.diff(session.workspace_path, session.base_revision)
 
     def create_branch(self, session_id: str, name: str):
         with self.maintenance_session(
@@ -165,7 +189,7 @@ class ProjectTaskOperations:
         ) as session:
             if not session.project_id or not session.workspaces:
                 return []
-            project = self.projects.get(session.project_id)
+            project = self._project(session)
             results = self.project_workspaces.run_commands(
                 project,
                 session.workspaces,
@@ -197,7 +221,7 @@ class ProjectTaskOperations:
         session = self.get_session(session_id)
         if not session.project_id or not session.workspaces:
             raise WorkspaceError("This task is not linked to a Code Project")
-        project = self.projects.get(session.project_id)
+        project = self._project(session)
         return self.delivery.plan(session, project, integrations)
 
     def create_draft_pull_requests(
@@ -212,7 +236,7 @@ class ProjectTaskOperations:
         ) as session:
             if not session.project_id or not session.workspaces:
                 raise WorkspaceError("This task is not linked to a Code Project")
-            project = self.projects.get(session.project_id)
+            project = self._project(session)
             records = self.delivery.create_draft_pull_requests(session, project, request, integrations)
             self.store.update_session(
                 session.id,
@@ -246,7 +270,7 @@ class ProjectTaskOperations:
         ) as session:
             if not session.project_id:
                 raise WorkspaceError("This task is not linked to a Code Project")
-            project = self.projects.get(session.project_id)
+            project = self._project(session)
             status = integrations.pull_request_action(project, request)
             self.emit(
                 session.id,
@@ -262,3 +286,9 @@ class ProjectTaskOperations:
                 ),
             )
             return status
+
+    def _project(self, session: CodingSession):
+        project = self.execution_project(session)
+        if project is None:
+            raise WorkspaceError("This task's saved Code Project is unavailable")
+        return project

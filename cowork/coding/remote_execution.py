@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 
+from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
 from cowork.coding.contracts import (
     CodingEvent,
@@ -13,10 +14,16 @@ from cowork.coding.contracts import (
     SessionStatus,
     TaskWorkspace,
 )
-from cowork.coding.control_models import RunStatus, RuntimeEvent, TaskRun
+from cowork.coding.control_models import (
+    RunStatus,
+    RuntimeEvent,
+    TaskResourceScope,
+    TaskRun,
+)
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.redaction import redact_text
+from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
 from cowork.coding.store import CodingStore
 
 
@@ -80,6 +87,7 @@ class RemoteExecutionCoordinator:
         session: CodingSession,
         prompt: str,
         attachments: list[InputReference] | tuple[InputReference, ...],
+        intent: CommandIntent,
     ) -> CodingSession:
         if not session.run_id:
             raise RuntimeError("Remote task is missing its Task Run")
@@ -88,7 +96,7 @@ class RemoteExecutionCoordinator:
         command = self.control.queue_command(
             session.run_id,
             "start",
-            {"prompt": prompt},
+            intent.runtime_payload(prompt),
             f"turn-{uuid.uuid4().hex}",
         )
         self.store.append_event(
@@ -118,7 +126,7 @@ class RemoteExecutionCoordinator:
         command = self.control.queue_command(
             session.run_id,
             "start",
-            {"prompt": instruction.prompt},
+            CommandIntent.parse(instruction.prompt).runtime_payload(instruction.prompt),
             f"queued-turn-{instruction.id}",
         )
 
@@ -141,7 +149,19 @@ class RemoteExecutionCoordinator:
         )
         return self.get_session(session.id)
 
-    def recover(self, session_id: str, computer_id: str | None = None) -> CodingSession:
+    def recovery_plan(self, session_id: str):
+        session = self.get_session(session_id)
+        if not session.run_id:
+            raise RuntimeError("This task does not have a recoverable run")
+        return self.control.recovery_plan(session.run_id)
+
+    def recover(
+        self,
+        session_id: str,
+        computer_id: str | None = None,
+        *,
+        allow_recreate: bool = False,
+    ) -> CodingSession:
         session = self.get_session(session_id)
         if not session.run_id or not session.task_id:
             raise RuntimeError("This task does not have a recoverable run")
@@ -149,15 +169,23 @@ class RemoteExecutionCoordinator:
         if run.status not in {RunStatus.interrupted, RunStatus.failed, RunStatus.recovering}:
             raise RuntimeError("This task does not need to be restored")
         task = self.control.store.get_task(session.task_id)
-        project = self.projects.get(task.project_id) if task.project_id else None
-        eligible = self.control.eligible_computers(project, task.resource_scope, session.engine_id)
+        project = task.execution_project
+        if project is None and task.project_id:
+            project = self.projects.get(task.project_id)
+        eligible = self.control.eligible_computers(
+            project,
+            TaskResourceScope(all_project_resources=True) if task.execution_project else task.resource_scope,
+            session.engine_id,
+        )
         target = computer_id or run.computer_id
         if not any(item.id == target for item in eligible):
-            if computer_id is None and eligible:
+            if computer_id is None and any(item.id == run.computer_id for item in eligible):
+                target = run.computer_id
+            elif computer_id is None and len(eligible) == 1:
                 target = eligible[0].id
             else:
                 raise RuntimeError("No online computer can restore this task with its selected resources")
-        recovered = self.control.recover_run(run.id, target)
+        recovered = self.control.recover_run(run.id, target, allow_recreate=allow_recreate)
         session.computer_id = recovered.computer_id
         session.runtime_epoch = recovered.epoch
         session.status = SessionStatus.ready
@@ -204,8 +232,11 @@ class RemoteExecutionCoordinator:
         )
         try:
             self.control.wait_for_command(run.id, command.id, timeout=5)
-        except RuntimeError:
+        except RuntimeError as exc:
             self.control.set_run_status(run.id, RunStatus.interrupted, error="Workspace release was not acknowledged")
+            raise RuntimeError(
+                "The selected computer did not release this task workspace; retry when it is online"
+            ) from exc
 
     @staticmethod
     def require_idle(session: CodingSession, action: str) -> None:
@@ -215,9 +246,12 @@ class RemoteExecutionCoordinator:
     def connector_capabilities(self, session: CodingSession) -> list[ConnectorCapability]:
         """Issue exact, short-lived connector authority for one leased run."""
 
-        if not session.run_id or not session.project_id:
+        if not session.run_id or not session.task_id:
             return []
-        project = self.projects.get(session.project_id)
+        task = self.control.store.get_task(session.task_id)
+        project = task.execution_project
+        if project is None:
+            return []
         self.control.revoke_connector_grants(session.run_id)
         capabilities: list[ConnectorCapability] = []
         issued: set[tuple[str, str, str, tuple[str, ...]]] = set()
@@ -270,6 +304,50 @@ class RemoteExecutionCoordinator:
             if delivery.provider == "github" and delivery.external_url:
                 issue("github", delivery.connection_name, delivery.external_url, ["pull_request_status"])
         return capabilities
+
+    def acquire_lease(self, computer_id: str) -> RuntimeLease | None:
+        """Lease one portable task and freeze its complete execution contract.
+
+        Keeping this assembly below the HTTP layer makes the same lifecycle
+        usable by the API, in-process verification, and future transports.
+        """
+        acquired = self.control.acquire_lease(computer_id)
+        if acquired is None:
+            return None
+        run, lease_id = acquired
+        task = self.control.store.get_task(run.task_id)
+        runtime_project = self.control.runtime_project_for_task(task, computer_id)
+        # One-time compatibility for tasks created before immutable execution
+        # snapshots. Once leased, recovery no longer depends on live Project
+        # metadata.
+        if runtime_project is None and task.project_id:
+            project = self.projects.get(task.project_id)
+            scoped_resources = self.control.scoped_resources(project, task.resource_scope)
+            runtime_project = self.control.runtime_project(project, task.resource_scope, computer_id)
+            task.execution_project = self.control.execution_project_snapshot(project, scoped_resources)
+            self.control.store.save_task(task)
+        session = self.store.load_session(task.id)
+        return RuntimeLease(
+            task=task,
+            run=run,
+            lease_id=lease_id,
+            agent_token=self.control.issue_run_token(run.id),
+            project=runtime_project,
+            execution=RuntimeExecutionConfig(
+                engine_id=session.engine_id,
+                model=session.model,
+                permission_mode=session.permission_mode,
+                reasoning_effort=session.reasoning_effort,
+                service_tier=session.service_tier,
+                personality=session.personality,
+                network_access=session.network_access,
+                web_search=session.web_search,
+                developer_instructions=session.developer_instructions,
+                environment=session.environment,
+            ),
+            connector_capabilities=self.connector_capabilities(session),
+            workspaces=self.control.store.list_workspaces(run.id),
+        )
 
     def _accept_workspace(self, run: TaskRun, event: RuntimeEvent) -> TaskRun:
         raw_items = event.payload.get("items")
@@ -352,9 +430,11 @@ class RemoteExecutionCoordinator:
                 id=str(event.payload.get("approvalId") or ""),
                 method=str(event.payload.get("method") or "runtime"),
                 kind=str(data.get("kind") or "command"),
-                title=str(data.get("title") or "Approve agent action"),
-                detail=str(data.get("reason") or data.get("command") or "The agent needs your approval."),
-                cwd=str(data.get("cwd")) if data.get("cwd") else None,
+                title=redact_text(str(data.get("title") or "Approve agent action"))[:512],
+                detail=redact_text(str(
+                    data.get("reason") or data.get("command") or "The agent needs your approval."
+                ))[:8_192],
+                cwd=redact_text(str(data.get("cwd")))[:32_768] if data.get("cwd") else None,
                 risk=str(data.get("risk") or "review"),
                 scope=str(data.get("scope") or "once"),
                 allow_session=bool(data.get("allowSession")),
@@ -385,7 +465,7 @@ class RemoteExecutionCoordinator:
         return None, CodingEvent(
             type=EventType.error if run.status == RunStatus.failed else EventType.session,
             title=title,
-            text=str(event.payload.get("detail") or run.last_error or ""),
+            text=redact_text(str(event.payload.get("detail") or run.last_error or "")),
             phase=(
                 "failed" if run.status in {RunStatus.failed, RunStatus.interrupted}
                 else "completed" if run.status in {RunStatus.completed, RunStatus.cancelled}

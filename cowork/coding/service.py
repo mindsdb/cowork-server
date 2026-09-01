@@ -2,60 +2,55 @@ from __future__ import annotations
 
 import logging
 import threading
-import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
 from cowork.coding.approvals import ApprovalBroker
-from cowork.coding.commands import CodingCommandHandler, CommandIntent
-from cowork.coding.connector_capabilities import ConnectorCapability
+from cowork.coding.commands import CodingCommandHandler
 from cowork.coding.context import (
     validate_directories,
-    validate_references,
-    workspace_files,
 )
 from cowork.coding.contracts import (
     ApprovalDecision,
     CodingEvent,
     CodingSession,
-    DeliveryRecord,
     EngineCapabilities,
     EventPage,
     EventType,
-    InputReference,
     PendingApproval,
-    QueuedInstruction,
-    SessionCreateRequest,
     SessionPage,
     SessionStatus,
     SessionUpdateRequest,
-    TerminalPage,
-    TerminalShellPreference,
-    TerminalTabPage,
-    TerminalTabState,
+    TaskCapabilities,
+    TaskCapability,
     WorkspaceInspection,
 )
-from cowork.coding.control_models import RunStatus, RuntimeEvent, TaskRun
+from cowork.coding.control_models import RunStatus
 from cowork.coding.control_service import ControlPlaneService
+from cowork.coding.control_store import ControlPlaneStore
 from cowork.coding.delivery import ProjectDeliveryService
-from cowork.coding.engines.base import EngineCredentials, EngineSession
+from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
-from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_models import (
-    DeliveryPlan,
-    DraftPullRequestRequest,
-    PullRequestActionRequest,
-    PullRequestStatus,
-)
 from cowork.coding.project_service import CodeProjectService
+from cowork.coding.project_actions import ProjectActionService
+from cowork.coding.project_models import (
+    CodeProject,
+    ProjectActionPage,
+    ProjectActionRunRequest,
+    ProjectActionRunResponse,
+)
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_tasks import ProjectTaskOperations
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
 from cowork.coding.runtime import RuntimeManager
+from cowork.coding.service_delivery import CodingDeliveryOperations
+from cowork.coding.service_terminals import CodingTerminalOperations
+from cowork.coding.service_turns import CodingTurnOperations
+from cowork.coding.service_workspace_files import CodingWorkspaceFilesOperations
 from cowork.coding.session_factory import CodingSessionFactory
 from cowork.coding.session_lifecycle import SessionLifecycleOperations
 from cowork.coding.shells import shell_inventory
@@ -64,21 +59,26 @@ from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
 from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
-from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn, mark_running
+from cowork.coding.turns import RunningTurn, TurnExecutor
 from cowork.coding.workspace import WorkspaceManager
 from cowork.common.paths import cowork_home
-from cowork.services.skills import CodeSkillService
 
 logger = logging.getLogger(__name__)
 
 
-class CodingService:
+class CodingService(
+    CodingWorkspaceFilesOperations,
+    CodingDeliveryOperations,
+    CodingTerminalOperations,
+    CodingTurnOperations,
+):
     def __init__(
         self,
         root: Path,
         registry: CodingEngineRegistry | None = None,
         store: CodingStore | None = None,
         workspaces: WorkspaceManager | None = None,
+        control_store: ControlPlaneStore | None = None,
     ) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -90,6 +90,7 @@ class CodingService:
         self.control = ControlPlaneService(
             root,
             ControlPlaneService.default_capabilities(available_engines, shell_options),
+            control_store,
         )
         self.project_store = CodeProjectStore(root, self.control.local_computer.id)
         self.skill_library = SkillLibraryService(root, self.project_store, self.workspaces.git)
@@ -115,6 +116,8 @@ class CodingService:
             store=self.store,
             workspaces=self.workspaces,
             project_workspaces=self.project_workspaces,
+            execution_project=self._execution_project,
+            control=self.control,
             skill_runtime=self.skill_runtime,
             runtimes=self.runtimes,
             running=self._running,
@@ -127,7 +130,7 @@ class CodingService:
             store=self.store,
             workspaces=self.workspaces,
             project_workspaces=self.project_workspaces,
-            projects=self.projects,
+            execution_project=self._execution_project,
             delivery=self.delivery,
         )
         self.session_factory = CodingSessionFactory(
@@ -158,7 +161,7 @@ class CodingService:
         self.task_delivery = TaskDeliveryService(
             self.store,
             self.control,
-            self.projects,
+            self._execution_project,
             self.project_tasks,
             self.remote,
             self.get_session,
@@ -168,6 +171,14 @@ class CodingService:
             self.runtimes,
             self.remote,
             self.get_session,
+        )
+        self.project_actions = ProjectActionService(
+            get_session=self.get_session,
+            projects=self.projects,
+            terminals=self.task_terminals,
+            get_computer=self.control.store.get_computer,
+            local_computer_id=self.control.local_computer.id,
+            execution_project=self._execution_project,
         )
         self.turns = TurnExecutor(
             self.runtimes,
@@ -182,7 +193,13 @@ class CodingService:
         for session in self.store.list_sessions():
             try:
                 project = self.projects.get(session.project_id) if session.project_id else None
-            except KeyError:
+            except (KeyError, ValueError) as exc:
+                logger.warning(
+                    "Coding task %s references an unavailable project %s: %s",
+                    session.id,
+                    session.project_id,
+                    exc,
+                )
                 project = None
             snapshot = self.control.migrate_session(session, project)
             if not session.task_id or not session.run_id or not session.computer_id:
@@ -223,12 +240,18 @@ class CodingService:
             computer = self.control.store.get_computer(run.computer_id)
         except KeyError:
             return session
+        is_local = computer.id == self.control.local_computer.id
+        available = set(computer.capabilities.task_capabilities)
         return session.model_copy(update={
             "computer_id": computer.id,
             "run_status": run.status.value,
             "computer_name": computer.name,
             "computer_status": computer.status.value,
-            "computer_is_local": computer.id == self.control.local_computer.id,
+            "computer_is_local": is_local,
+            "task_capabilities": TaskCapabilities(**{
+                capability.value: is_local or capability in available
+                for capability in TaskCapability
+            }),
             "runtime_epoch": run.epoch,
             "last_error": run.last_error or session.last_error,
         })
@@ -241,11 +264,16 @@ class CodingService:
     def delete_session(self, session_id: str) -> None:
         session = self.get_session(session_id)
         if self._is_remote(session):
+            self.remote.require_idle(session, "deleting this coding task")
             self.remote.release_workspace(session)
             self.store.delete_session(session.id)
             self.skill_runtime.cleanup(session.id)
+            if session.run_id:
+                self.control.delete_task(session.run_id)
             return
         self.lifecycle.delete_session(session_id)
+        if session.run_id:
+            self.control.delete_task(session.run_id)
 
     def rename_session(self, session_id: str, title: str) -> CodingSession:
         return self.lifecycle.rename_session(session_id, title)
@@ -256,7 +284,12 @@ class CodingService:
             self.remote.release_workspace(session)
         return self.lifecycle.set_archived(session_id, archived)
 
+    def set_pinned(self, session_id: str, pinned: bool) -> CodingSession:
+        return self.lifecycle.set_pinned(session_id, pinned)
+
     def fork_session(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
+        session = self.get_session(session_id)
+        self._require_task_capability(session, TaskCapability.fork)
         return self.lifecycle.fork_session(session_id, credentials)
 
     def events(self, session_id: str, after: int = 0) -> EventPage:
@@ -269,386 +302,21 @@ class CodingService:
         items = self.store.wait_for_events(session_id, max(0, after), timeout)
         return EventPage(items=items, next_seq=items[-1].seq if items else max(0, after))
 
-    def create_session(
-        self,
-        request: SessionCreateRequest,
-        credentials: EngineCredentials,
-        default_engine: str,
-        default_model: str,
-        code_skills: CodeSkillService | None = None,
-    ) -> CodingSession:
-        session = self.session_factory.create(
-            request,
-            credentials,
-            default_engine,
-            default_model,
-            code_skills,
-        )
-        if self._is_remote(session):
-            self.remote.queue_turn(session, request.prompt, request.attachments)
-            return self.get_session(session.id)
-        try:
-            self.submit_turn(session.id, request.prompt, credentials, request.attachments)
-        except Exception:
-            self.session_factory.discard(session)
-            raise
-        return self.get_session(session.id)
+    def recovery_plan(self, session_id: str):
+        return self.remote.recovery_plan(session_id)
 
-    def submit_turn(
+    def recover(
         self,
         session_id: str,
-        prompt: str,
-        credentials: EngineCredentials,
-        attachments: list[InputReference] | tuple[InputReference, ...] = (),
-    ) -> CodingSession:
-        session = self._continue_completed_task(self.get_session(session_id))
-        if self._is_remote(session):
-            return self.remote.queue_turn(session, prompt, attachments)
-        return self._submit_turn(session_id, prompt, credentials, attachments)
-
-    def _continue_completed_task(self, session: CodingSession) -> CodingSession:
-        if not session.run_id:
-            return session
-        run = self.control.store.get_run(session.run_id)
-        if run.status not in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
-            return session
-        continued = self.control.continue_task(session.task_id or session.id, run.id)
-        session.run_id = continued.id
-        session.runtime_epoch = continued.epoch
-        session.status = SessionStatus.ready
-        session.last_error = None
-        self.store.save_session(session)
-        return self.get_session(session.id)
-
-    def accept_runtime_event(self, event: RuntimeEvent) -> TaskRun:
-        return self.remote.accept_event(event)
-
-    def _is_remote(self, session: CodingSession) -> bool:
-        return self.remote.is_remote(session)
-
-    def runtime_connector_capabilities(self, session: CodingSession) -> list[ConnectorCapability]:
-        return self.remote.connector_capabilities(session)
-
-    def _submit_turn(
-        self,
-        session_id: str,
-        prompt: str,
-        credentials: EngineCredentials,
-        attachments: list[InputReference] | tuple[InputReference, ...],
+        computer_id: str | None = None,
         *,
-        maintenance_reserved: bool = False,
+        allow_recreate: bool = False,
     ) -> CodingSession:
-        """Validate and launch one turn, optionally inside a service reservation."""
-        intent = CommandIntent.parse(prompt)
-        self.commands.validate(self.get_session(session_id), intent.name)
-        intent.validate_arguments()
-        intent.validate_attachments(bool(attachments))
-        if intent.runs_immediately:
-            if maintenance_reserved:
-                return self.commands.run_immediate(session_id, intent, prompt, credentials)
-            with self._maintenance_session(
-                session_id,
-                "Wait for the active turn to finish before running this command",
-            ):
-                return self.commands.run_immediate(session_id, intent, prompt, credentials)
-        with self._lock:
-            session = self.get_session(session_id)
-            if session_id in self._maintenance and not maintenance_reserved:
-                raise RuntimeError("This coding task is being updated. Try again in a moment")
-            if session_id in self._running or session.status in {SessionStatus.running, SessionStatus.awaiting_approval}:
-                raise RuntimeError("This coding task already has a running turn")
-            engine_attachments = validate_references(session, attachments)
-            self._emit(
-                session_id,
-                CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
-                mark_running,
-            )
-            thread = threading.Thread(
-                target=self.turns.execute,
-                args=(
-                    session_id,
-                    intent.engine_prompt(prompt),
-                    credentials,
-                    intent.goal_objective,
-                    engine_attachments,
-                    intent.is_review,
-                    intent.resumes_goal,
-                ),
-                name=f"coding-turn-{session_id[:8]}",
-                daemon=True,
-            )
-            # Reserve the slot before starting so two simultaneous HTTP calls
-            # cannot both launch a turn. The engine is filled by the worker.
-            self._running[session_id] = RunningTurn(engine=None, turn_id="", thread=thread)
-            response = self.get_session(session_id)
-            try:
-                thread.start()
-            except Exception as exc:
-                self._running.pop(session_id, None)
-                message = f"The coding worker could not start: {exc}"
-                self._emit(
-                    session_id,
-                    CodingEvent(type=EventType.error, title="Coding agent failed", text=message, phase="failed"),
-                    lambda current: fail_turn(current, False, message),
-                )
-                raise RuntimeError(message) from exc
-        return response
-
-    def steer(
-        self,
-        session_id: str,
-        prompt: str,
-        attachments: list[InputReference] | tuple[InputReference, ...] = (),
-    ) -> CodingSession:
-        session = self.get_session(session_id)
-        if self._is_remote(session):
-            if not session.run_id:
-                raise RuntimeError("Remote task is missing its Task Run")
-            if attachments:
-                raise RuntimeError("File attachments cannot steer a task on another computer yet")
-            run = self.control.store.get_run(session.run_id)
-            if run.status not in {RunStatus.running, RunStatus.awaiting_approval}:
-                raise RuntimeError("There is no active turn to steer")
-            command = self.control.queue_command(
-                session.run_id,
-                "steer",
-                {"prompt": prompt},
-                f"steer-{uuid.uuid4().hex}",
-            )
-            self.store.append_event(
-                session.id,
-                CodingEvent(
-                    type=EventType.user_message,
-                    title="Steering now",
-                    text=prompt,
-                    phase="pending",
-                    data={"commandId": command.id},
-                ),
-            )
-            return self.get_session(session.id)
-        intent = CommandIntent.parse(prompt)
-        intent.validate_arguments()
-        intent.validate_attachments(bool(attachments))
-        intent.validate_while_running()
-        engine: EngineSession | None = None
-        turn_id = ""
-        with self._lock:
-            session = self.get_session(session_id)
-            self.commands.validate(session, intent.name)
-            engine_attachments = validate_references(session, attachments)
-            running = self._running.get(session_id)
-            if running is None:
-                raise RuntimeError("There is no active turn to steer")
-            engine, turn_id = running.route_steer(
-                prompt,
-                engine_attachments,
-                require_ready=intent.runs_immediately,
-            )
-        if intent.runs_immediately:
-            if engine is None:
-                raise RuntimeError("Coding agent state is inconsistent")
-            self._emit(session.id, CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"))
-            if intent.name == "status":
-                self.commands.emit_status(session, engine)
-            else:
-                self.commands.emit_goal_result(
-                    session.id,
-                    engine,
-                    intent.goal_action,
-                    intent.goal_objective,
-                )
-            return self.get_session(session_id)
-        if engine is not None:
-            engine.steer(turn_id, prompt, engine_attachments)
-        self._emit(session.id, CodingEvent(type=EventType.user_message, title="Follow-up", text=prompt, phase="completed"))
-        return self.get_session(session_id)
-
-    def queue_turn(
-        self,
-        session_id: str,
-        prompt: str,
-        attachments: list[InputReference] | tuple[InputReference, ...] = (),
-    ) -> CodingSession:
-        intent = CommandIntent.parse(prompt)
-        intent.validate_arguments()
-        intent.validate_attachments(bool(attachments))
-        with self._lock:
-            session = self.get_session(session_id)
-            self.commands.validate(session, intent.name)
-            validate_references(session, attachments)
-            instruction = QueuedInstruction(
-                id=str(uuid.uuid4()),
-                prompt=prompt,
-                attachments=list(attachments),
-            )
-            if self._is_remote(session):
-                if attachments:
-                    raise RuntimeError("File attachments cannot be queued to another computer yet")
-                if not session.run_id or self.control.store.get_run(session.run_id).status not in {
-                    RunStatus.running,
-                    RunStatus.awaiting_approval,
-                }:
-                    raise RuntimeError("There is no active turn. Send this as a new turn instead")
-            elif session_id not in self._running:
-                raise RuntimeError("There is no active turn. Send this as a new turn instead")
-            if len(session.queued_instructions) >= 20:
-                raise RuntimeError("This coding task already has 20 queued instructions")
-            self._emit(
-                session_id,
-                CodingEvent(
-                    type=EventType.user_message,
-                    title="Queued next",
-                    text=prompt,
-                    phase="pending",
-                    data={"queueId": instruction.id},
-                ),
-                lambda current: current.queued_instructions.append(instruction),
-            )
-        return self.get_session(session_id)
-
-    def remove_queued_turn(self, session_id: str, instruction_id: str) -> CodingSession:
-        with self._lock:
-            session = self.get_session(session_id)
-            if not any(item.id == instruction_id for item in session.queued_instructions):
-                raise KeyError("queued instruction not found")
-            self._emit(
-                session_id,
-                CodingEvent(
-                    type=EventType.session,
-                    title="Queued instruction removed",
-                    text="The instruction will not run after the active turn.",
-                    phase="completed",
-                    data={"queueId": instruction_id},
-                ),
-                lambda current: self._remove_queued_instruction(current, instruction_id),
-            )
-        return self.get_session(session_id)
-
-    def steer_queued_turn(self, session_id: str, instruction_id: str) -> CodingSession:
-        """Promote one persisted queued instruction into the active turn.
-
-        The instruction is removed before crossing the engine boundary so a
-        turn completing concurrently cannot also start it as the next turn. If
-        the engine rejects the steer, the queue entry is restored in place for
-        an explicit retry or normal queued execution.
-        """
-        queue_index = 0
-        with self._lock:
-            session = self.get_session(session_id)
-            try:
-                queue_index, instruction = next(
-                    (index, item)
-                    for index, item in enumerate(session.queued_instructions)
-                    if item.id == instruction_id
-                )
-            except StopIteration as exc:
-                raise KeyError("queued instruction not found") from exc
-            remote = self._is_remote(session)
-            if not remote and session_id not in self._running:
-                raise RuntimeError("There is no active turn to steer")
-            self.store.update_session(
-                session_id,
-                lambda current: self._remove_queued_instruction(current, instruction_id),
-            )
-        try:
-            return self.steer(session_id, instruction.prompt, instruction.attachments)
-        except Exception:
-            with self._lock:
-                self.store.update_session(
-                    session_id,
-                    lambda current: self._restore_queued_instruction(current, instruction, queue_index),
-                )
-            raise
-
-    def run_next_queued(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
-        """Start the oldest queued instruction once the task is idle.
-
-        The queue is persisted with the task. This method is also exposed to the
-        renderer so an interrupted desktop restart can resume a pending queue.
-        """
-        # Completing an ordinary turn should not briefly reserve the task just
-        # to discover that its queue is empty. The fast path keeps a freshly
-        # completed task immediately available for the user's next message.
-        session = self.get_session(session_id)
-        if not session.queued_instructions:
-            return session
-        if self._is_remote(session):
-            return self.remote.start_next_queued(session)
-        with self._maintenance_session(
+        return self.remote.recover(
             session_id,
-            "Wait for the active turn to finish before resuming queued work",
-        ):
-            while True:
-                session = self.get_session(session_id)
-                if not session.queued_instructions:
-                    return session
-                instruction = session.queued_instructions[0]
-                instruction_id = instruction.id
-                self.store.update_session(
-                    session_id,
-                    lambda current, target_id=instruction_id: self._remove_queued_instruction(current, target_id),
-                )
-                try:
-                    result = self._submit_turn(
-                        session_id,
-                        instruction.prompt,
-                        credentials,
-                        instruction.attachments,
-                        maintenance_reserved=True,
-                    )
-                except Exception:
-                    queued_instruction = instruction
-                    self.store.update_session(
-                        session_id,
-                        lambda current, queued=queued_instruction: current.queued_instructions.insert(0, queued),
-                    )
-                    raise
-                if result.status in {SessionStatus.running, SessionStatus.awaiting_approval}:
-                    return result
-
-    def cancel(self, session_id: str) -> CodingSession:
-        session = self.get_session(session_id)
-        if self._is_remote(session):
-            if not session.run_id:
-                raise RuntimeError("Remote task is missing its Task Run")
-            run = self.control.store.get_run(session.run_id)
-            if run.status not in {RunStatus.running, RunStatus.awaiting_approval}:
-                raise RuntimeError("There is no active turn to stop")
-            self.control.queue_command(
-                session.run_id,
-                "cancel",
-                {},
-                f"cancel-{session.runtime_epoch}",
-            )
-            return session
-        engine: EngineSession | None = None
-        turn_id = ""
-        with self._lock:
-            running = self._running.get(session_id)
-            if running is None:
-                raise RuntimeError("There is no active turn to stop")
-            running.cancel_requested = True
-            if running.turn_id and running.engine is not None:
-                engine = running.engine
-                turn_id = running.turn_id
-        self._emit(
-            session_id,
-            CodingEvent(
-                type=EventType.session,
-                title="Stopping task",
-                text="Cancellation requested. The agent is cleaning up the active turn.",
-                phase="pending",
-            ),
+            computer_id,
+            allow_recreate=allow_recreate,
         )
-        try:
-            self.approvals.cancel_session(session_id)
-        finally:
-            if engine is not None:
-                engine.cancel(turn_id)
-        return self.get_session(session_id)
-
-    def recover(self, session_id: str, computer_id: str | None = None) -> CodingSession:
-        return self.remote.recover(session_id, computer_id)
 
     def resolve_approval(self, session_id: str, approval_id: str, decision: ApprovalDecision) -> CodingSession:
         session = self.get_session(session_id)
@@ -683,6 +351,17 @@ class CodingService:
             return list(self.remote.operation(session, "diff").get("files") or [])
         return self.project_tasks.diff(session_id)
 
+    def review_file_action(self, session_id: str, folder_id: str | None, path: str, action: str):
+        session = self.get_session(session_id)
+        if self._is_remote(session):
+            self.remote.require_idle(session, "changing review state")
+            return list(self.remote.operation(session, "review_file", {
+                "folder_id": folder_id,
+                "path": path,
+                "action": action,
+            }).get("files") or [])
+        return self.project_tasks.review_file_action(session_id, folder_id, path, action)
+
     def create_branch(self, session_id: str, name: str):
         session = self.get_session(session_id)
         if self._is_remote(session):
@@ -710,53 +389,27 @@ class CodingService:
             return list(self.remote.operation(session, "validate", timeout=610).get("items") or [])
         return self.project_tasks.validate_project(session_id)
 
-    def delivery_plan(
-        self,
-        session_id: str,
-        integrations: DeveloperIntegrationService | None = None,
-    ) -> DeliveryPlan:
-        return self.task_delivery.plan(session_id, integrations)
-
-    def create_draft_pull_requests(
-        self,
-        session_id: str,
-        request: DraftPullRequestRequest,
-        integrations: DeveloperIntegrationService,
-    ) -> list[DeliveryRecord]:
-        return self.task_delivery.create_drafts(session_id, request, integrations)
-
-    def record_delivery(self, session_id: str, delivery: DeliveryRecord) -> DeliveryRecord:
-        return self.task_delivery.record(session_id, delivery)
-
-    def pull_request_action(
-        self,
-        session_id: str,
-        request: PullRequestActionRequest,
-        integrations: DeveloperIntegrationService,
-    ) -> PullRequestStatus:
-        return self.task_delivery.pull_request_action(session_id, request, integrations)
-
     def discover_models(self, engine_id: str, credentials: EngineCredentials) -> list[str]:
         return self.registry.get(engine_id).discover_models(credentials)
 
     def extension_inventory(self, session_id: str, credentials: EngineCredentials):
         session = self.get_session(session_id)
+        self._require_task_capability(session, TaskCapability.extensions)
         runtime = self.runtimes.open(session, credentials)
         return runtime.extension_inventory()
 
     def platform_status(self, session_id: str, credentials: EngineCredentials):
         session = self.get_session(session_id)
+        self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).platform_status()
 
     def setup_windows_sandbox(self, session_id: str, credentials: EngineCredentials):
         session = self.get_session(session_id)
+        self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).setup_windows_sandbox()
 
-    def workspace_files(self, session_id: str, query: str = "", limit: int = 40) -> list[dict[str, str]]:
-        session = self.get_session(session_id)
-        return workspace_files(session, query, limit)
-
     def update_session_config(self, session_id: str, updates: SessionUpdateRequest) -> CodingSession:
+        self._require_task_capability(self.get_session(session_id), TaskCapability.task_controls)
         with self.runtimes.session_lock(session_id):  # noqa: SIM117 - preserve lock ordering.
             with self._maintenance_session(
                 session_id,
@@ -776,77 +429,31 @@ class CodingService:
                     lambda current: self._apply_config_update(current, values),
                 )
 
-    def terminals(self, session_id: str) -> TerminalTabPage:
-        return self.task_terminals.list(session_id)
-
-    def create_terminal_tab(self, session_id: str, label: str | None = None) -> TerminalTabState:
-        return self.task_terminals.create(session_id, label)
-
-    def rename_terminal_tab(self, session_id: str, terminal_id: str, label: str) -> TerminalTabState:
-        return self.task_terminals.rename(session_id, terminal_id, label)
-
-    def delete_terminal_tab(self, session_id: str, terminal_id: str) -> None:
-        self.task_terminals.delete(session_id, terminal_id)
-
-    def terminal_tab(self, session_id: str, terminal_id: str, after: int = 0) -> TerminalPage:
-        return self.task_terminals.page(session_id, terminal_id, after)
-
-    def wait_for_terminal_tab(
+    def run_project_action(
         self,
         session_id: str,
-        terminal_id: str,
-        after: int,
-        timeout: float = 15.0,
-    ) -> TerminalPage:
-        return self.task_terminals.wait(session_id, terminal_id, after, timeout)
-
-    def start_terminal_tab(
-        self,
-        session_id: str,
-        terminal_id: str,
+        request: ProjectActionRunRequest,
         credentials: EngineCredentials,
-        cols: int,
-        rows: int,
-        shell: TerminalShellPreference = TerminalShellPreference.auto,
-    ) -> TerminalPage:
-        return self.task_terminals.start(session_id, terminal_id, credentials, cols, rows, shell)
+    ) -> ProjectActionRunResponse:
+        return self.project_actions.run(session_id, request, credentials)
 
-    def write_terminal_tab(self, session_id: str, terminal_id: str, data_base64: str) -> TerminalPage:
-        return self.task_terminals.write(session_id, terminal_id, data_base64)
+    def project_action_page(self, session_id: str) -> ProjectActionPage:
+        return self.project_actions.list(session_id)
 
-    def resize_terminal_tab(self, session_id: str, terminal_id: str, cols: int, rows: int) -> TerminalPage:
-        return self.task_terminals.resize(session_id, terminal_id, cols, rows)
+    def _execution_project(self, session: CodingSession) -> CodeProject | None:
+        if not session.task_id:
+            return None
+        try:
+            return self.control.store.get_task(session.task_id).execution_project
+        except KeyError:
+            return None
 
-    def stop_terminal_tab(self, session_id: str, terminal_id: str) -> TerminalPage:
-        return self.task_terminals.stop(session_id, terminal_id)
-
-    # Compatibility seam for the original one-terminal desktop. Deployments
-    # can roll the server and renderer independently without breaking a task
-    # that still speaks the singular endpoint contract.
-    def terminal(self, session_id: str, after: int = 0) -> TerminalPage:
-        return self.task_terminals.legacy_page(session_id, after)
-
-    def wait_for_terminal(self, session_id: str, after: int, timeout: float = 15.0) -> TerminalPage:
-        return self.task_terminals.legacy_wait(session_id, after, timeout)
-
-    def start_terminal(
-        self,
-        session_id: str,
-        credentials: EngineCredentials,
-        cols: int,
-        rows: int,
-        shell: TerminalShellPreference = TerminalShellPreference.auto,
-    ) -> TerminalPage:
-        return self.task_terminals.legacy_start(session_id, credentials, cols, rows, shell)
-
-    def write_terminal(self, session_id: str, data_base64: str) -> TerminalPage:
-        return self.task_terminals.legacy_write(session_id, data_base64)
-
-    def resize_terminal(self, session_id: str, cols: int, rows: int) -> TerminalPage:
-        return self.task_terminals.legacy_resize(session_id, cols, rows)
-
-    def stop_terminal(self, session_id: str) -> TerminalPage:
-        return self.task_terminals.legacy_stop(session_id)
+    @staticmethod
+    def _require_task_capability(session: CodingSession, capability: TaskCapability) -> None:
+        if not getattr(session.task_capabilities, capability.value):
+            label = capability.value.replace("_", " ")
+            computer = session.computer_name or "this computer"
+            raise RuntimeError(f"{label.capitalize()} isn't available for tasks running on {computer}")
 
     def close_all(self) -> None:
         """Stop every task-owned engine runtime during application shutdown."""

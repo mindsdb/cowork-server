@@ -18,12 +18,12 @@ from cowork.schemas.connectors import (
     PatchPickedFilesBody,
 )
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
     DeveloperProviderUnavailable,
     validate_developer_connection,
 )
+from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry
