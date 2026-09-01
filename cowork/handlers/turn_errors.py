@@ -26,8 +26,6 @@ import json
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from anton.core.llm.provider import ProviderAuthError
-
 from cowork.common.settings.app_settings import default_minds_url
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
@@ -177,6 +175,19 @@ AUTH_ERROR_CODE = "provider_auth"
 # exception to ``"TypeName: message"``. Remote errors no longer carry Python
 # type identity, so an exact name is the only typed discriminator left.
 PROVIDER_AUTH_ERROR_TYPE_NAME = "ProviderAuthError"
+
+# Anton's pre-typed 401 copy, still emitted by the remote worker pods. Those run
+# the `minds-anton-scratchpad` image, whose anton is pinned in
+# scratchpad-controller (`values-staging.yaml`, `values-prod.yaml`) and bumped
+# independently of this server's vendored dep — `turnqueue/producer.py` says so
+# and relies on it to let the repos deploy in any order. Until both pins carry
+# anton's ProviderAuthError, dropping this prefix would silently downgrade every
+# hosted 401 to the generic code and take the Reconnect card with it.
+#
+# Safe here in a way the in-process `is_auth_error` is not: `remote_turn_error`
+# only ever reads anton's own `_scrub` output, never an arbitrary tool
+# exception, and the match is anchored to the start of the message.
+LEGACY_AUTH_ERROR_MESSAGE_PREFIX = "invalid api key"
 
 # Wire-level codes for the model-403 case — the gateway rejected the requested
 # MODEL (the credential itself is fine). Only older pre-wallet gateway/anton
@@ -380,8 +391,24 @@ def is_auth_error(exc: Exception) -> bool:
     Provider and tool errors can contain arbitrary 401 or invalid-key text. Only
     Anton's typed exception proves the failed credential belongs to the active
     LLM provider and may select the reconnect/update-key card.
+
+    Imported lazily like every other anton type in this module
+    (``ContentValidationError``, ``TokenLimitExceeded``, ``ModelUnavailableError``,
+    ``ProviderOverloadedError``). A module-scope import would turn an anton
+    without this symbol — staging and main today, and the ``branch = "main"``
+    pin this repo's pyproject documents — into a failed app import rather than
+    one missing error card.
     """
-    return isinstance(exc, ProviderAuthError)
+    try:
+        from anton.core.llm.provider import ProviderAuthError
+
+        return isinstance(exc, ProviderAuthError)
+    except Exception:
+        # A version-skewed anton predates the typed error, so its 401 still
+        # arrives as the bare ConnectionError copy the pods emit.
+        return isinstance(exc, ConnectionError) and str(exc).lower().startswith(
+            LEGACY_AUTH_ERROR_MESSAGE_PREFIX
+        )
 
 
 def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
@@ -920,7 +947,10 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         # turn still shows the UNNAMED copy. Naming it needs anton to carry the
         # code+model through _scrub's wire format (tracked separately).
         return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
-    if type_name == PROVIDER_AUTH_ERROR_TYPE_NAME:
+    if type_name == PROVIDER_AUTH_ERROR_TYPE_NAME or (
+        type_name == "ConnectionError"
+        and message.lower().startswith(LEGACY_AUTH_ERROR_MESSAGE_PREFIX)
+    ):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     if type_name == "ContentValidationError":
         # ENG-1992: the repair itself (stripping the offending image blocks
