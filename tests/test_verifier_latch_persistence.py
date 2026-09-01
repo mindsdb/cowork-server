@@ -8,7 +8,7 @@ every message instead of once per conversation.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 from sqlmodel import Session
@@ -31,7 +31,11 @@ _LATCH = {
 
 @dataclass
 class _CurrentConfig:
-    initial_verifier_latch: dict | None = None
+    """Mirrors anton's real declaration, which is keyword-only: a guard that
+    only recognised a positional field would report the feature as unsupported
+    and silently make it a no-op."""
+
+    initial_verifier_latch: dict | None = field(default=None, kw_only=True)
 
 
 @dataclass
