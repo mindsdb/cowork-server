@@ -183,8 +183,13 @@ def auto_compact_token_limit() -> int:
     return value if value > 0 else DEFAULT_AUTO_COMPACT_TOKEN_LIMIT
 
 
+_TOML_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def toml_string(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = _TOML_CONTROL_CHARACTER.sub(lambda match: f"\\u{ord(match.group()):04X}", escaped)
+    return f'"{escaped}"'
 
 
 def toml_array(values: tuple[str, ...]) -> str:
@@ -209,16 +214,16 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         'model_providers.mindshub.env_key="MINDSHUB_CODEX_API_KEY"',
         'model_providers.mindshub.wire_api="responses"',
         f"model_auto_compact_token_limit={auto_compact_token_limit()}",
-        f'approval_policy="{resolved_approval}"',
-        f'sandbox_mode="{resolved_sandbox}"',
-        f'web_search="{"live" if config.web_search else "disabled"}"',
+        f"approval_policy={toml_string(resolved_approval)}",
+        f"sandbox_mode={toml_string(resolved_sandbox)}",
+        f"web_search={toml_string('live' if config.web_search else 'disabled')}",
     ]
     if config.reasoning_effort:
-        overrides.append(f'model_reasoning_effort="{config.reasoning_effort}"')
+        overrides.append(f"model_reasoning_effort={toml_string(config.reasoning_effort)}")
     if config.service_tier:
-        overrides.append(f'service_tier="{config.service_tier}"')
+        overrides.append(f"service_tier={toml_string(config.service_tier)}")
     if config.personality and config.personality != "none":
-        overrides.append(f'personality="{config.personality}"')
+        overrides.append(f"personality={toml_string(config.personality)}")
     if config.mcp_servers:
         for server in config.mcp_servers:
             safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", server.name)
