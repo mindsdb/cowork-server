@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
+from cowork.coding.context import is_context_exhaustion_error
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -168,6 +169,10 @@ class RemoteExecutionCoordinator:
         run = self.control.store.get_run(session.run_id)
         if run.status not in {RunStatus.interrupted, RunStatus.failed, RunStatus.recovering}:
             raise RuntimeError("This task does not need to be restored")
+        refresh_agent_session = (
+            is_context_exhaustion_error(session.last_error)
+            or is_context_exhaustion_error(run.last_error)
+        )
         task = self.control.store.get_task(session.task_id)
         project = task.execution_project
         if project is None and task.project_id:
@@ -186,12 +191,39 @@ class RemoteExecutionCoordinator:
             else:
                 raise RuntimeError("No online computer can restore this task with its selected resources")
         recovered = self.control.recover_run(run.id, target, allow_recreate=allow_recreate)
-        session.computer_id = recovered.computer_id
-        session.runtime_epoch = recovered.epoch
-        session.status = SessionStatus.ready
-        session.pending_approval = None
-        session.last_error = None
-        self.store.save_session(session)
+
+        def mark_restored(current: CodingSession) -> None:
+            current.computer_id = recovered.computer_id
+            current.runtime_epoch = recovered.epoch
+            current.status = SessionStatus.ready
+            current.pending_approval = None
+            current.last_error = None
+            current.workspace_warning = None
+            if refresh_agent_session:
+                current.engine_session_id = None
+
+        if refresh_agent_session:
+            self.store.append_event(
+                session.id,
+                CodingEvent(
+                    type=EventType.session,
+                    title="Agent context refreshed",
+                    text=(
+                        "A fresh agent session is ready because the previous one reached its context limit. "
+                        "Your task history, workspace, and changes are preserved."
+                    ),
+                    phase="completed",
+                ),
+                mark_restored,
+            )
+        else:
+            self.store.update_session(session.id, mark_restored)
+
+        restored = self.get_session(session_id)
+        if recovered.computer_id == self.control.local_computer.id:
+            # No worker leases local runs. Complete their recovery transition
+            # synchronously so the renderer can accept the next instruction.
+            self.control.sync_session(restored)
         return self.get_session(session_id)
 
     def operation(

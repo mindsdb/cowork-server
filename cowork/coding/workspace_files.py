@@ -48,9 +48,12 @@ class WorkspaceFileBrowser:
     """Read-only, resource-scoped access to one task's prepared workspaces."""
 
     def __init__(self, session: CodingSession) -> None:
+        source_name = Path(session.source_path).name or "Folder"
         workspaces = list(session.workspaces) or [TaskWorkspace(
             folder_id="folder",
-            folder_name=Path(session.workspace_path).name,
+            # The isolated workspace directory is an internal task UUID. The
+            # source folder is the stable, human-facing resource identity.
+            folder_name=source_name,
             source_path=session.source_path,
             workspace_path=session.workspace_path,
             workspace_kind=session.workspace_kind,
