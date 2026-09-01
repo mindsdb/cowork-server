@@ -177,22 +177,35 @@ class ControlPlaneService:
         identifier = computer_id or f"computer-{uuid.uuid4().hex}"
         try:
             current = self.store.get_computer(identifier)
-            epoch = current.registration_epoch + 1
         except KeyError:
-            epoch = 1
+            current = None
+        if current is not None:
+            reason = "revoked" if current.revoked_at is not None else "already registered"
+            record_security_event(self.store,
+                "runtime.register",
+                "denied",
+                "runtime",
+                identifier,
+                computer_id=identifier,
+                detail=f"computer {reason}",
+            )
+            if current.revoked_at is not None:
+                raise RuntimeAuthenticationError("This computer has been revoked")
+            raise RuntimeAuthenticationError(
+                "This computer is already registered; reconnect with its existing credential"
+            )
         computer = Computer(
             id=identifier,
             name=self._computer_name(name),
             is_local=False,
             capabilities=capabilities,
-            registration_epoch=epoch,
         )
         runtime_token = secrets.token_urlsafe(40)
         self.store.save_runtime_credential(RuntimeCredential(
             id=identifier,
             computer_id=identifier,
             token_hash=self._digest(runtime_token),
-            registration_epoch=epoch,
+            registration_epoch=computer.registration_epoch,
         ))
         record_security_event(self.store,
             "runtime.register",
@@ -537,6 +550,8 @@ class ControlPlaneService:
 
     def acquire_lease(self, computer_id: str) -> tuple[TaskRun, str] | None:
         with self._lock:
+            if self.store.get_computer(computer_id).revoked_at is not None:
+                raise RuntimeAuthenticationError("This computer has been revoked")
             self.expire_leases()
             lease_id = secrets.token_urlsafe(32)
             run = self.store.claim_run(
@@ -736,6 +751,40 @@ class ControlPlaneService:
                 computer,
                 allow_recreate=allow_recreate,
             )
+
+    def reassign_queued_run(self, run_id: str, computer_id: str) -> TaskRun:
+        """Move a run that no computer has leased yet; leased runs go through recovery."""
+
+        with self._lock:
+            run = self.store.get_run(run_id)
+            if run.status != RunStatus.queued:
+                raise ValueError("Only queued Task Runs can be reassigned; recover a leased run instead")
+            task = self.store.get_task(run.task_id)
+            if task.execution_project is None:
+                raise NoEligibleComputer("This task includes resources that only exist on its original computer")
+            eligible = self.eligible_computers(
+                task.execution_project,
+                TaskResourceScope(all_project_resources=True),
+                task.engine_id,
+            )
+            if not any(item.id == computer_id for item in eligible):
+                raise NoEligibleComputer("That computer cannot access every resource selected for this task")
+            previous_computer_id = run.computer_id
+            run.computer_id = computer_id
+            for workspace in self.store.list_workspaces(run.id):
+                workspace.computer_id = computer_id
+                self.store.save_workspace(workspace)
+            saved = self.store.save_run(run)
+            record_security_event(self.store,
+                "run.reassign",
+                "completed",
+                "user",
+                run.id,
+                run_id=run.id,
+                computer_id=computer_id,
+                detail=f"from={previous_computer_id}",
+            )
+            return saved
 
     def expire_stale_computers(self) -> None:
         threshold = utc_now() - _OFFLINE_AFTER
