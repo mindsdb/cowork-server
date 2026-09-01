@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import hmac
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session
@@ -91,21 +91,21 @@ def heartbeat_runtime(
 
 
 @router.post("/computers/{computer_id}/lease", response_model=RuntimeLease | None)
-async def acquire_runtime_lease(
+def acquire_runtime_lease(
     computer_id: str,
     body: RuntimeLeaseRequest,
     request: Request,
 ):
     _require_protocol(body.protocol_version)
     _authenticate(request, computer_id)
-    deadline = asyncio.get_running_loop().time() + body.wait_seconds
+    deadline = time.monotonic() + body.wait_seconds
     while True:
         lease = get_coding_service().remote.acquire_lease(computer_id)
         if lease is not None:
             return lease
-        if asyncio.get_running_loop().time() >= deadline:
+        if time.monotonic() >= deadline:
             return None
-        await asyncio.sleep(0.25)
+        time.sleep(0.25)
 
 
 @router.post("/runs/{run_id}/events")
