@@ -276,6 +276,7 @@ def test_linear_issue_completion_uses_the_teams_completed_state(tmp_path: Path) 
         body = json.loads(request.content)
         requests.append(body)
         if "query CodeIssue" in body["query"]:
+            assert body["variables"] == {"id": "ENG-19"}
             return httpx.Response(200, json={"data": {"issue": {
                 "id": "issue-id", "identifier": "ENG-19", "title": "Delivery",
                 "url": "https://linear.app/work/issue/ENG-19",
@@ -293,7 +294,7 @@ def test_linear_issue_completion_uses_the_teams_completed_state(tmp_path: Path) 
     delivery = integration.complete_source(project(tmp_path), SourceActionRequest(
         provider="linear",
         action="complete",
-        target_url="https://linear.app/work/issue/ENG-19",
+        target_url="https://linear.app/work/issue/ENG-19/multi-repo-delivery",
         confirmed=True,
     ))
 
@@ -326,7 +327,7 @@ def test_linear_publish_resolves_the_issue_identifier_before_creating_a_comment(
     delivery = integration.publish(project(tmp_path), PublishRequest(
         provider="linear",
         action="result",
-        target_url="https://linear.app/work/issue/ENG-19",
+        target_url="https://linear.app/work/issue/ENG-19/multi-repo-delivery",
         text="Implemented and verified.",
         confirmed=True,
     ))

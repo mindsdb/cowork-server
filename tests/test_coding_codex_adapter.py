@@ -221,6 +221,36 @@ def test_code_and_user_skill_roots_use_current_codex_rpc_name(monkeypatch, tmp_p
     assert calls[0][1] == {"extraRoots": [str(code_skill_root), str(user_skill_root)]}
 
 
+def test_explicitly_empty_task_skill_snapshot_does_not_reload_global_code_skills(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeClient:
+        def request(self, method: str, params: dict[str, object], *, response_model: object) -> None:
+            calls.append((method, params))
+
+    cowork_skill_root = tmp_path / "skills"
+    code_skill_root = tmp_path / "code-skills"
+    user_skill_root = tmp_path / "user-codex" / "skills"
+    user_skill_root.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(user_skill_root.parent))
+    monkeypatch.setattr(
+        codex_module,
+        "get_app_settings",
+        lambda: SimpleNamespace(skill=SimpleNamespace(root_dir=str(cowork_skill_root))),
+    )
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = FakeClient()
+    engine_session._skill_roots = ()
+
+    engine_session._register_skill_roots()
+
+    assert not code_skill_root.exists()
+    assert calls == [("skills/extraRoots/set", {"extraRoots": [str(user_skill_root)]})]
+
+
 def test_nested_codex_error_maps_to_safe_text() -> None:
     event = codex_events.map_codex_notification(
         "error",

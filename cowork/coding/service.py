@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import lru_cache
