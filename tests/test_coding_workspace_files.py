@@ -41,6 +41,35 @@ def _session(*workspaces: TaskWorkspace) -> CodingSession:
     )
 
 
+def test_browser_labels_a_standalone_workspace_with_its_source_folder(tmp_path: Path) -> None:
+    source = tmp_path / "customer-app"
+    workspace = tmp_path / "workspaces" / "af8922aa-605c-4064-b639-4e95fbf2524e"
+    source.mkdir()
+    workspace.mkdir(parents=True)
+    (workspace / "package.json").write_text("{}\n", encoding="utf-8")
+    session = CodingSession(
+        id="task-1",
+        title="Browse files",
+        engine_id="codex",
+        engine_adapter_version="1",
+        model="gpt",
+        permission_mode=PermissionMode.supervised,
+        source_path=str(source),
+        workspace_path=str(workspace),
+        workspace_kind=WorkspaceKind.local_copy,
+        workspaces=[],
+    )
+
+    browser = WorkspaceFileBrowser(session)
+
+    assert [(item.id, item.name) for item in browser.resources().items] == [
+        ("folder", "customer-app"),
+    ]
+    [entry] = browser.entries("folder").items
+    assert entry.resource_name == "customer-app"
+    assert browser.file("folder", "package.json").resource_name == "customer-app"
+
+
 def test_browser_lists_multiple_resources_and_reads_bounded_lines(tmp_path: Path) -> None:
     api = tmp_path / "api"
     web = tmp_path / "web"
