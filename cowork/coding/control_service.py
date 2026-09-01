@@ -514,7 +514,7 @@ class ControlPlaneService:
 
     def sync_session(self, session: CodingSession) -> TaskRun:
         if not session.run_id:
-            raise ValueError("Coding session has not been linked to a Task Run")
+            raise StateConflict("Coding session has not been linked to a Task Run")
 
         def reconcile(run: TaskRun) -> None:
             if run.computer_id != self.local_computer.id:
@@ -523,9 +523,6 @@ class ControlPlaneService:
                 # renderer, so ordinary UI events must never project its stale
                 # status back into a leased/fenced remote run.
                 return
-            # Runtime sequencing is a fenced protocol cursor, not a UI timeline
-            # cursor. Local session events must never advance it or a valid event
-            # from another computer can be rejected as stale.
             transition_run(run, _SESSION_STATUS[session.status], error=session.last_error)
 
         return self.store.update_run(session.run_id, reconcile)
@@ -552,11 +549,14 @@ class ControlPlaneService:
     ) -> TaskRun:
         """Apply one fenced runtime event and record its sequence in a single run write.
 
-        ``apply`` runs inside the same store operation, so its side effects and
-        the sequence advance together: if either fails nothing is recorded and
-        the worker's redelivery is applied fresh. Redelivering the last applied
-        event returns the same acknowledgement without re-applying it; only an
-        older sequence, or a different event reusing one, is stale.
+        ``apply`` runs inside the same store operation, so the sequence never
+        advances unless every effect ran. In the SQL store those effects share
+        the run's transaction and roll back with it; in the local store each
+        write lands on its own, so a crash mid-way leaves them applied without
+        the sequence and redelivery redoes them (at-least-once). Redelivering
+        the last applied event returns the same acknowledgement without
+        re-applying it; only an older sequence, or a different event reusing
+        one, is stale.
         """
 
         if event.protocol_version != RUNTIME_PROTOCOL_VERSION:
@@ -695,7 +695,9 @@ class ControlPlaneService:
         epoch: int,
         result: dict[str, object] | None = None,
         error: str | None = None,
-    ) -> RuntimeCommand:
+    ) -> tuple[RuntimeCommand, bool]:
+        """Record the acknowledgement; the flag is True only for the first ack of a command."""
+
         with self._lock:
             run = self.store.get_run(run_id)
             self._require_fence(run, computer_id, lease_id, epoch)
@@ -707,13 +709,14 @@ class ControlPlaneService:
                 raise KeyError("Runtime command not found")
             if command.epoch != run.epoch:
                 raise StaleRuntimeEvent("Runtime command belongs to a stale epoch")
-            if command.acked_at is None:
+            first_ack = command.acked_at is None
+            if first_ack:
                 command.acked_at = utc_now()
                 command.claim_expires_at = None
                 command.result = result
                 command.error = error
                 self.store.save_command(command)
-            return command
+            return command, first_ack
 
     def wait_for_command(self, run_id: str, command_id: str, timeout: float = 20.0) -> RuntimeCommand:
         """Wait for one fenced runtime reply without hiding persistence behind memory."""

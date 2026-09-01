@@ -16,7 +16,8 @@ from cowork.coding.contracts import (
     SessionStatus,
     TaskCapability,
 )
-from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeEvent, TaskRun
+from cowork.coding.control_errors import StateConflict
+from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
 from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
 from cowork.services.skills import CodeSkillService
@@ -86,6 +87,18 @@ class CodingTurnOperations:
 
     def accept_runtime_event(self, event: RuntimeEvent) -> TaskRun:
         return self.remote.accept_event(event)
+
+    def acknowledge_runtime_command(
+        self,
+        run_id: str,
+        command_id: str,
+        computer_id: str,
+        lease_id: str,
+        epoch: int,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> RuntimeCommand:
+        return self.remote.acknowledge_command(run_id, command_id, computer_id, lease_id, epoch, result, error)
 
     def _is_remote(self, session: CodingSession) -> bool:
         return self.remote.is_remote(session)
@@ -339,9 +352,20 @@ class CodingTurnOperations:
                 )
             raise
 
-    def run_next_queued(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
-        """Start the oldest persisted instruction once the task is idle."""
+    def run_next_queued(
+        self,
+        session_id: str,
+        credentials: EngineCredentials,
+        instruction_id: str | None = None,
+    ) -> CodingSession:
+        """Start the oldest persisted instruction once the task is idle.
+
+        When the caller names the instruction it expects to start, a queue
+        whose head has moved on (typically because the same request already
+        succeeded) is a conflict and nothing runs.
+        """
         session = self.get_session(session_id)
+        self._require_queue_head(session, instruction_id)
         if not session.queued_instructions:
             return session
         if self._is_remote(session):
@@ -350,15 +374,18 @@ class CodingTurnOperations:
             session_id,
             "Wait for the active turn to finish before resuming queued work",
         ):
+            expected_instruction_id = instruction_id
             while True:
                 session = self._continue_completed_task(self.get_session(session_id))
+                self._require_queue_head(session, expected_instruction_id)
+                expected_instruction_id = None
                 if not session.queued_instructions:
                     return session
                 instruction = session.queued_instructions[0]
-                instruction_id = instruction.id
+                target_id = instruction.id
                 self.store.update_session(
                     session_id,
-                    lambda current, target_id=instruction_id: self._remove_queued_instruction(current, target_id),
+                    lambda current, target_id=target_id: self._remove_queued_instruction(current, target_id),
                 )
                 try:
                     result = self._submit_turn(
@@ -377,6 +404,14 @@ class CodingTurnOperations:
                     raise
                 if result.status in {SessionStatus.running, SessionStatus.awaiting_approval}:
                     return result
+
+    @staticmethod
+    def _require_queue_head(session: CodingSession, instruction_id: str | None) -> None:
+        if instruction_id is None:
+            return
+        head = session.queued_instructions[0].id if session.queued_instructions else None
+        if head != instruction_id:
+            raise StateConflict("That queued instruction is no longer next in the queue")
 
     def cancel(self, session_id: str) -> CodingSession:
         session = self.get_session(session_id)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import subprocess
 from pathlib import Path
 
@@ -152,6 +153,64 @@ def test_diff_bounds_the_combined_inline_patch(tmp_path: Path, monkeypatch: pyte
 
     assert rendered[0].patch
     assert rendered[1].patch.startswith("Inline diff omitted")
+
+
+def test_cleanup_snapshot_is_truncated_at_the_combined_patch_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-snapshot-budget", str(repo), False)
+    (prepared.workspace_path / "keep.txt").write_text("changed\n", encoding="utf-8")
+    (prepared.workspace_path / "large.bin").write_bytes(random.Random(0).randbytes(50_000))
+    monkeypatch.setattr(workspace_module, "MAX_TOTAL_DIFF_BYTES", 4_096)
+
+    manager.cleanup(
+        "session-snapshot-budget", str(repo), str(prepared.workspace_path), prepared.kind, prepared.base_revision
+    )
+
+    snapshot_dir = tmp_path / "coding" / "snapshots" / "session-snapshot-budget"
+    data = (snapshot_dir / "cleanup.patch").read_bytes()
+    assert data.startswith(b"diff --git a/keep.txt b/keep.txt")
+    assert b"large.bin" not in data
+    assert data.endswith(b"\n") and len(data) <= 4_096
+    assert (snapshot_dir / "cleanup.patch.truncated").read_text(encoding="utf-8") == (
+        workspace_module.SNAPSHOT_TRUNCATED_MARKER
+    )
+    git(repo, "apply", "--check", str(snapshot_dir / "cleanup.patch"))
+
+
+def test_handoff_and_fork_move_a_patch_over_the_cleanup_budget_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-handoff-budget", str(repo), False)
+    (prepared.workspace_path / "keep.txt").write_text("from task\n", encoding="utf-8")
+    (prepared.workspace_path / "new.bin").write_bytes(bytes(range(256)) * 20)
+    monkeypatch.setattr(workspace_module, "MAX_TOTAL_DIFF_BYTES", 1)
+
+    forked = manager.fork(
+        "session-fork-budget", str(repo), str(prepared.workspace_path), prepared.kind, prepared.base_revision
+    )
+    manager.apply_to_source("session-handoff-budget", str(repo), str(prepared.workspace_path), prepared.base_revision)
+
+    for root in (forked.workspace_path, repo):
+        assert (root / "keep.txt").read_text(encoding="utf-8") == "from task\n"
+        assert (root / "new.bin").read_bytes() == bytes(range(256)) * 20
+    assert not list((tmp_path / "coding" / "snapshots").rglob("*.truncated"))
+
+
+def test_failed_snapshot_leaves_no_partial_patch_behind(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-snapshot-failure", str(repo), False)
+    (prepared.workspace_path / "keep.txt").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError):
+        manager.cleanup("session-snapshot-failure", str(repo), str(prepared.workspace_path), prepared.kind, "no-such-rev")
+
+    assert list((tmp_path / "coding" / "snapshots" / "session-snapshot-failure").iterdir()) == []
 
 
 def test_apply_preflights_and_saves_recovery_patch(tmp_path: Path) -> None:

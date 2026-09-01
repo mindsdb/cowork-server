@@ -58,6 +58,14 @@ def db_schema():
     yield
 
 
+@pytest.fixture(autouse=True)
+def close_coding_services():
+    yield
+    from coding_service_fakes import close_services
+
+    close_services()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def trust_test_client_host():
     """Starlette's TestClient sends ``Host: testserver``; only tests trust it."""

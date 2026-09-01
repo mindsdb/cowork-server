@@ -39,6 +39,7 @@ class SkillLibraryItem(BaseModel):
     version: str | None = None
     enabled: bool = True
     enabled_project_ids: list[str] = Field(default_factory=list)
+    supersedes: list[SkillLibraryItem] = Field(default_factory=list)
 
 
 class SkillLibrarySource(BaseModel):

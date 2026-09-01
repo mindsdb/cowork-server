@@ -21,6 +21,7 @@ from cowork.coding.skill_models import (
 )
 from cowork.coding.skill_source_store import SkillSourceStore
 from cowork.coding.workspace import GitRunner, WorkspaceError
+from cowork.models.skill import Skill
 from cowork.services.skills import CodeSkillService
 
 _MAX_DOCUMENT_BYTES = 512_000
@@ -59,27 +60,7 @@ class SkillLibraryService:
                     self._source_status(source, 0, len(enabled_projects), str(exc))
                 )
                 continue
-            source_items = [
-                SkillLibraryItem(
-                    id=f"{source.id}:{spec.path}",
-                    kind=spec.kind,
-                    name=spec.name,
-                    description=spec.description,
-                    origin="team",
-                    source_id=source.id,
-                    source_name=source.name,
-                    path=spec.path,
-                    version=source.applied_revision,
-                    enabled=(
-                        selected is not None
-                        and spec.path in enabled_projects.get(selected.id, set())
-                    ),
-                    enabled_project_ids=sorted(
-                        project_id for project_id, paths in enabled_projects.items() if spec.path in paths
-                    ),
-                )
-                for spec in specs
-            ]
+            source_items = [self._team_item(source, spec, enabled_projects, selected) for spec in specs]
             items.extend(source_items)
             sources.append(self._source_status(source, len(source_items), len(enabled_projects)))
         return SkillLibraryPage(sources=sources, items=items)
@@ -90,22 +71,21 @@ class SkillLibraryService:
         selected_keys = {selected.id, selected.name} if selected else set()
         code_skills.ensure_builtin_skills()
         builtin_names = code_skills.builtin_skill_names()
+        # Mirrors SkillRuntimeResolver.resolve: a team skill enabled for the
+        # selected project is the one the task receives, so a same-named
+        # personal or built-in skill is folded under it instead of listed twice.
+        effective = {
+            normalize_name(item.name): item
+            for item in page.items
+            if item.kind == "skill" and item.enabled and normalize_name(item.name)
+        }
         for skill in code_skills.list_skills():
-            origin = "built_in" if skill.name in builtin_names else "personal"
-            page.items.append(
-                SkillLibraryItem(
-                    id=f"personal:{skill.name}",
-                    kind="skill",
-                    name=skill.display_name,
-                    description=skill.description,
-                    origin=origin,
-                    source_name="MindsHub" if origin == "built_in" else "Yours",
-                    path=skill.name,
-                    version=skill.updated_at.isoformat() if skill.updated_at else None,
-                    enabled=skill.enabled and (not skill.projects or bool(selected_keys.intersection(skill.projects))),
-                    enabled_project_ids=skill.projects,
-                )
-            )
+            item = self._personal_item(skill, builtin_names, selected_keys)
+            superseding = effective.get(normalize_name(skill.name))
+            if superseding is not None:
+                superseding.supersedes.append(item)
+                continue
+            page.items.append(item)
         return page
 
     def document(
@@ -115,10 +95,7 @@ class SkillLibraryService:
         selected_path: str | None = None,
     ) -> SkillLibraryDocument:
         """Return one library item's readable source without exposing arbitrary files."""
-        page = self.catalog(code_skills)
-        item = next((candidate for candidate in page.items if candidate.id == item_id), None)
-        if item is None:
-            raise KeyError("Skill library item not found")
+        item = self._item(code_skills, item_id)
 
         if item.origin == "team":
             if not item.source_id:
@@ -311,6 +288,65 @@ class SkillLibraryService:
     def cache_for(self, source_id: str) -> tuple[TeamSkillSource, Path]:
         source = self.store.get(source_id)
         return source, self._validated_cache(source)
+
+    def _item(self, code_skills: CodeSkillService, item_id: str) -> SkillLibraryItem:
+        """Resolve one catalogue id without walking every source."""
+        prefix, _, path = item_id.partition(":")
+        if prefix == "personal":
+            code_skills.ensure_builtin_skills()
+            try:
+                skill = code_skills.get_skill(path)
+            except ValueError as exc:
+                raise KeyError("Skill library item not found") from exc
+            return self._personal_item(skill, code_skills.builtin_skill_names(), set())
+        try:
+            source, cache = self.cache_for(prefix)
+        except KeyError as exc:
+            raise KeyError("Skill library item not found") from exc
+        spec = next((candidate for candidate in discover_guidance_items(cache) if candidate.path == path), None)
+        if spec is None:
+            raise KeyError("Skill library item not found")
+        enabled_projects = self._enabled_by_source(self.projects.list()).get(source.id, {})
+        return self._team_item(source, spec, enabled_projects, None)
+
+    @staticmethod
+    def _team_item(
+        source: TeamSkillSource,
+        spec: GuidanceItemSpec,
+        enabled_projects: dict[str, set[str]],
+        selected: CodeProject | None,
+    ) -> SkillLibraryItem:
+        return SkillLibraryItem(
+            id=f"{source.id}:{spec.path}",
+            kind=spec.kind,
+            name=spec.name,
+            description=spec.description,
+            origin="team",
+            source_id=source.id,
+            source_name=source.name,
+            path=spec.path,
+            version=source.applied_revision,
+            enabled=selected is not None and spec.path in enabled_projects.get(selected.id, set()),
+            enabled_project_ids=sorted(
+                project_id for project_id, paths in enabled_projects.items() if spec.path in paths
+            ),
+        )
+
+    @staticmethod
+    def _personal_item(skill: Skill, builtin_names: set[str], selected_keys: set[str]) -> SkillLibraryItem:
+        origin = "built_in" if skill.name in builtin_names else "personal"
+        return SkillLibraryItem(
+            id=f"personal:{skill.name}",
+            kind="skill",
+            name=skill.display_name,
+            description=skill.description,
+            origin=origin,
+            source_name="MindsHub" if origin == "built_in" else "Yours",
+            path=skill.name,
+            version=skill.updated_at.isoformat() if skill.updated_at else None,
+            enabled=skill.enabled and (not skill.projects or bool(selected_keys.intersection(skill.projects))),
+            enabled_project_ids=skill.projects,
+        )
 
     def _source_status(
         self,

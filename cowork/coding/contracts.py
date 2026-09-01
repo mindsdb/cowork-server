@@ -96,6 +96,7 @@ class EventType(str, Enum):
     approval = "approval"
     usage = "usage"
     error = "error"
+    command_result = "command_result"
 
 
 class ApprovalDecision(str, Enum):
@@ -145,6 +146,7 @@ class ExtensionEntry(BaseModel):
     status: str = "available"
     detail: str = ""
     path: str | None = None
+    supersedes: list[ExtensionEntry] = Field(default_factory=list)
 
 
 class ExtensionInventory(BaseModel):
@@ -515,6 +517,10 @@ class SessionRecoverRequest(BaseModel):
 class TurnRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=200_000)
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
+
+
+class QueueRunRequest(BaseModel):
+    instruction_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ApprovalRequest(BaseModel):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,6 +9,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from cowork.coding.connector_capabilities import ConnectorCapability
+from cowork.coding.runtime_client import atomic_write
 
 
 class RemoteIntegrationConfig(BaseModel):
@@ -25,12 +25,7 @@ def write_remote_integration_config(path: Path, config: RemoteIntegrationConfig)
     """Persist an ephemeral, owner-only MCP capability file for one run."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.unlink(missing_ok=True)
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(config.model_dump_json(indent=2) + "\n")
-    temporary.replace(path)
+    atomic_write(path, config.model_dump_json(indent=2) + "\n", mode=0o600)
     return path
 
 
