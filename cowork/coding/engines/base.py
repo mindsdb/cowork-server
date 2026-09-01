@@ -34,6 +34,7 @@ class EngineSessionConfig:
     web_search: bool = False
     additional_dirs: tuple[str, ...] = ()
     developer_instructions: str = ""
+    skill_roots: tuple[str, ...] | None = None
     environment: tuple[tuple[str, str], ...] = ()
     session_id: str = ""
     cowork_root: str = ""

@@ -5,7 +5,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from cowork.coding.contracts import DeliveryRecord, PermissionMode, SourceContext, utc_now
+# DeliveryRecord and SourceContext remain available from this long-standing
+# public model module for compatibility with existing callers.
+from cowork.coding.contracts import (  # noqa: F401
+    DeliveryRecord,
+    PermissionMode,
+    SourceContext,
+    utc_now,
+)
+from cowork.coding.skill_models import ProjectSkillSource
 
 
 def _valid_environment_name(name: str) -> bool:
@@ -93,6 +101,7 @@ class CodeProject(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     folders: list[ProjectFolder] = Field(min_length=1, max_length=24)
     playbook: PlaybookReference | None = None
+    skill_sources: list[ProjectSkillSource] = Field(default_factory=list, max_length=24)
     connections: list[ProjectConnection] = Field(default_factory=list, max_length=24)
     environment: ProjectEnvironment = Field(default_factory=ProjectEnvironment)
     default_engine_id: str = "codex"
@@ -112,6 +121,9 @@ class CodeProject(BaseModel):
         connections = [(item.provider, item.name) for item in self.connections]
         if len(connections) != len(set(connections)):
             raise ValueError("the same connection cannot be added twice")
+        source_ids = [item.source_id for item in self.skill_sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("the same skill source cannot be added twice")
         return self
 
 
@@ -120,6 +132,7 @@ class ProjectCreateRequest(BaseModel):
     folders: list[ProjectFolder] = Field(min_length=1, max_length=24)
     connections: list[ProjectConnection] = Field(default_factory=list, max_length=24)
     environment: ProjectEnvironment = Field(default_factory=ProjectEnvironment)
+    skill_sources: list[ProjectSkillSource] = Field(default_factory=list, max_length=24)
     default_engine_id: str = "codex"
     default_model: str = "gpt"
     permission_mode: PermissionMode = PermissionMode.supervised
@@ -131,6 +144,7 @@ class ProjectUpdateRequest(BaseModel):
     playbook: PlaybookReference | None = None
     connections: list[ProjectConnection] | None = Field(default=None, max_length=24)
     environment: ProjectEnvironment | None = None
+    skill_sources: list[ProjectSkillSource] | None = Field(default=None, max_length=24)
     default_engine_id: str | None = None
     default_model: str | None = None
     permission_mode: PermissionMode | None = None
@@ -174,6 +188,31 @@ class SourceContextRequest(BaseModel):
     connection_name: str | None = Field(default=None, max_length=512)
 
 
+class WorkItemSearchRequest(BaseModel):
+    provider: Literal["github", "linear"]
+    query: str = Field(default="", max_length=256)
+    connection_name: str | None = Field(default=None, max_length=512)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class WorkItemSummary(BaseModel):
+    provider: Literal["github", "linear"]
+    kind: Literal["issue", "pull_request"]
+    url: str = Field(min_length=1, max_length=8_192)
+    title: str = Field(default="", max_length=512)
+    external_id: str = Field(default="", max_length=512)
+    state: str = Field(default="", max_length=120)
+    scope: str = Field(default="", max_length=512)
+    assignee: str = Field(default="", max_length=512)
+    updated_at: str = Field(default="", max_length=120)
+    connection_name: str = Field(min_length=1, max_length=512)
+
+
+class WorkItemPage(BaseModel):
+    items: list[WorkItemSummary] = Field(default_factory=list, max_length=50)
+    incomplete: bool = False
+
+
 class PublishRequest(BaseModel):
     provider: Literal["github", "linear", "slack"]
     action: Literal["progress", "result"]
@@ -183,17 +222,92 @@ class PublishRequest(BaseModel):
     confirmed: bool = False
 
 
+class SourceActionRequest(BaseModel):
+    provider: Literal["github", "linear"]
+    action: Literal["complete"]
+    target_url: str = Field(min_length=1, max_length=8_192)
+    connection_name: str | None = Field(default=None, max_length=512)
+    confirmed: bool = False
+
+
+class DraftPullRequestSpec(BaseModel):
+    folder_id: str = Field(min_length=1, max_length=120)
+    title: str = Field(min_length=1, max_length=256)
+    body: str = Field(default="", max_length=100_000)
+
+
 class DraftPullRequestRequest(BaseModel):
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(default="", max_length=100_000)
+    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, max_length=24)
     connection_name: str | None = Field(default=None, max_length=512)
     confirmed: bool = False
+
+    @field_validator("drafts")
+    @classmethod
+    def validate_unique_drafts(cls, value: list[DraftPullRequestSpec]) -> list[DraftPullRequestSpec]:
+        folder_ids = [draft.folder_id for draft in value]
+        if len(folder_ids) != len(set(folder_ids)):
+            raise ValueError("each folder can have only one pull request specification")
+        return value
+
+
+class PullRequestActionRequest(BaseModel):
+    action: Literal["ready", "merge", "resolve_thread"]
+    target_url: str = Field(min_length=1, max_length=8_192)
+    connection_name: str | None = Field(default=None, max_length=512)
+    thread_id: str | None = Field(default=None, max_length=512)
+    confirmed: bool = False
+
+    @model_validator(mode="after")
+    def require_thread_identity(self) -> PullRequestActionRequest:
+        if (self.action == "resolve_thread") != bool(self.thread_id):
+            raise ValueError("resolve_thread actions require exactly one review thread identity")
+        return self
+
+
+class PullRequestAnnotation(BaseModel):
+    path: str = Field(default="", max_length=4_096)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    level: Literal["notice", "warning", "failure"] = "notice"
+    title: str = Field(default="", max_length=512)
+    message: str = Field(default="", max_length=20_000)
+
+
+class PullRequestCheck(BaseModel):
+    id: str = Field(default="", max_length=512)
+    name: str = Field(max_length=512)
+    state: Literal["passing", "failing", "pending", "neutral"]
+    url: str = Field(default="", max_length=8_192)
+    detail: str = Field(default="", max_length=20_000)
+    annotations: list[PullRequestAnnotation] = Field(default_factory=list, max_length=50)
+
+
+class PullRequestFeedback(BaseModel):
+    id: str = Field(default="", max_length=512)
+    author: str = Field(default="", max_length=512)
+    state: str = Field(default="commented", max_length=120)
+    body: str = Field(default="", max_length=20_000)
+    url: str = Field(default="", max_length=8_192)
+    path: str = Field(default="", max_length=4_096)
+    line: int | None = Field(default=None, ge=1)
+    created_at: str = Field(default="", max_length=120)
+    thread_id: str = Field(default="", max_length=512)
+    resolved: bool = False
+    outdated: bool = False
 
 
 class PullRequestStatus(BaseModel):
     state: Literal["draft", "open", "merged", "closed"]
     review_state: Literal["approved", "changes_requested", "pending", "none"]
     ci_state: Literal["passing", "failing", "pending", "none"]
+    number: int | None = None
+    title: str = Field(default="", max_length=512)
+    url: str = Field(default="", max_length=8_192)
+    updated_at: str = Field(default="", max_length=120)
+    checks: list[PullRequestCheck] = Field(default_factory=list, max_length=200)
+    feedback: list[PullRequestFeedback] = Field(default_factory=list, max_length=200)
     detail: str = ""
 
 
@@ -207,12 +321,9 @@ class DeliveryPlanItem(BaseModel):
     status: Literal["ready", "needs_commit", "no_changes", "unavailable", "published"]
     detail: str = ""
     external_url: str | None = None
+    connection_name: str | None = None
     pull_request_status: PullRequestStatus | None = None
     status_error: str | None = None
-
-
-class DeliveryPlan(BaseModel):
-    items: list[DeliveryPlanItem] = Field(default_factory=list)
 
 
 class IntegrationStatus(BaseModel):
@@ -221,3 +332,8 @@ class IntegrationStatus(BaseModel):
     label: str
     status: Literal["connected", "reconnect", "missing"]
     detail: str = ""
+
+
+class DeliveryPlan(BaseModel):
+    items: list[DeliveryPlanItem] = Field(default_factory=list)
+    integrations: list[IntegrationStatus] = Field(default_factory=list)

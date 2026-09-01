@@ -186,6 +186,20 @@ class TaskWorkspace(BaseModel):
     source_dirty: bool = False
 
 
+class SourceComment(BaseModel):
+    id: str = Field(default="", max_length=512)
+    author: str = Field(default="", max_length=512)
+    body: str = Field(default="", max_length=20_000)
+    url: str = Field(default="", max_length=8_192)
+    created_at: str = Field(default="", max_length=120)
+
+
+class SourceAttachment(BaseModel):
+    id: str = Field(default="", max_length=512)
+    title: str = Field(default="", max_length=512)
+    url: str = Field(min_length=1, max_length=8_192)
+
+
 class SourceContext(BaseModel):
     provider: Literal["github", "linear", "slack"]
     kind: Literal["issue", "pull_request", "conversation"]
@@ -194,11 +208,15 @@ class SourceContext(BaseModel):
     external_id: str = Field(default="", max_length=512)
     connection_name: str | None = Field(default=None, max_length=512)
     body: str = Field(default="", max_length=100_000)
+    state: str = Field(default="", max_length=120)
+    author: str = Field(default="", max_length=512)
+    comments: list[SourceComment] = Field(default_factory=list, max_length=100)
+    attachments: list[SourceAttachment] = Field(default_factory=list, max_length=100)
 
 
 class DeliveryRecord(BaseModel):
     provider: Literal["github", "linear", "slack"]
-    action: Literal["progress", "result", "draft_pull_request"]
+    action: Literal["progress", "result", "draft_pull_request", "complete_source"]
     target_url: str
     status: Literal["pending", "published", "failed"] = "pending"
     external_url: str | None = None
@@ -209,6 +227,42 @@ class DeliveryRecord(BaseModel):
     task_branch: str | None = None
     connection_name: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class DeliveryAutomationPolicy(BaseModel):
+    fix_failing_checks: bool = False
+    mark_ready_when_passing: bool = False
+    merge_when_approved: bool = False
+    complete_source_after_merge: bool = False
+    archive_after_merge: bool = False
+    max_fix_attempts: int = Field(default=2, ge=1, le=5)
+
+
+class DeliveryAutomationState(BaseModel):
+    fix_attempts: dict[str, int] = Field(default_factory=dict, max_length=128)
+
+
+class DeliveryAutomationClaimRequest(BaseModel):
+    fingerprint: str = Field(min_length=1, max_length=512)
+
+
+class DeliveryAutomationClaim(BaseModel):
+    claimed: bool
+    attempts: int
+    limit: int
+
+
+class ResolvedSkill(BaseModel):
+    id: str
+    kind: Literal["skill", "instructions", "workflow"]
+    name: str
+    description: str = ""
+    origin: Literal["team", "personal", "built_in"]
+    source_id: str | None = None
+    source_name: str
+    source_path: str
+    version: str | None = None
+    content_hash: str
 
 
 class CodingSession(BaseModel):
@@ -238,10 +292,17 @@ class CodingSession(BaseModel):
     workspace_warning: str | None = None
     guidance_summary: str | None = None
     developer_instructions: str = ""
+    resolved_skills: list[ResolvedSkill] = Field(default_factory=list)
+    # ``None`` identifies legacy tasks created before task-scoped resolution.
+    # An empty list is an intentional snapshot with no shared Code skills.
+    skill_roots: list[str] | None = None
+    skill_instructions: str = ""
     environment: dict[str, str] = Field(default_factory=dict)
     allocated_ports: dict[str, int] = Field(default_factory=dict)
     source_contexts: list[SourceContext] = Field(default_factory=list)
     deliveries: list[DeliveryRecord] = Field(default_factory=list)
+    delivery_policy: DeliveryAutomationPolicy = Field(default_factory=DeliveryAutomationPolicy)
+    delivery_automation: DeliveryAutomationState = Field(default_factory=DeliveryAutomationState)
     engine_session_id: str | None = None
     active_turn_id: str | None = None
     pending_approval: PendingApproval | None = None

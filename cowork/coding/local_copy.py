@@ -123,11 +123,19 @@ class LocalCopyManager:
         return changed
 
     def apply_checked(self, source: Path, workspace: Path, changed: list[str]) -> list[str]:
-        task = self._manifest(workspace)
+        self._replace_changed(source, workspace, changed)
+        return changed
+
+    def rollback_checked(self, source: Path, workspace: Path, changed: list[str]) -> None:
+        """Restore the pre-task versions of a checked handoff's paths."""
+        self._replace_changed(source, self._baseline_for(workspace), changed)
+
+    def _replace_changed(self, source: Path, desired: Path, changed: list[str]) -> None:
+        desired_manifest = self._manifest(desired)
         # Remove deleted paths first, deepest first. This makes file↔directory
         # replacements deterministic instead of attempting to copy a file over
         # a still-populated directory (or create a directory over a file).
-        removed = (relative for relative in changed if relative not in task)
+        removed = (relative for relative in changed if relative not in desired_manifest)
         for relative in sorted(removed, key=lambda value: (value.count("/"), value), reverse=True):
             target = self._safe_child(source, relative)
             if target.is_dir() and not target.is_symlink():
@@ -135,21 +143,20 @@ class LocalCopyManager:
             elif target.exists() or target.is_symlink():
                 target.unlink()
 
-        for relative in (item for item in changed if item in task):
+        for relative in (item for item in changed if item in desired_manifest):
             target = self._safe_child(source, relative)
-            task_path = self._safe_child(workspace, relative)
+            desired_path = self._safe_child(desired, relative)
             if target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target)
             target.parent.mkdir(parents=True, exist_ok=True)
-            if task_path.is_symlink():
+            if desired_path.is_symlink():
                 if target.exists() or target.is_symlink():
                     target.unlink()
-                target.symlink_to(os.readlink(task_path))
+                target.symlink_to(os.readlink(desired_path))
             else:
                 temp = target.with_name(f".{target.name}.cowork-tmp")
-                shutil.copy2(task_path, temp)
+                shutil.copy2(desired_path, temp)
                 os.replace(temp, target)
-        return changed
 
     def cleanup(self, key: str, workspace: Path) -> None:
         relative = managed_key(key)
@@ -196,7 +203,24 @@ class LocalCopyManager:
         result: dict[str, str] = {}
         if not root.is_dir():
             return result
-        for path in sorted(root.rglob("*")):
+        paths: list[Path] = []
+        # Keep Git metadata in isolated copies so nested repositories remain
+        # usable, but never scan it as source content for review or handoff.
+        for directory, directories, filenames in os.walk(root, topdown=True, followlinks=False):
+            current = Path(directory)
+            retained: list[str] = []
+            for name in sorted(directories):
+                path = current / name
+                if name == ".git":
+                    continue
+                if path.is_symlink():
+                    paths.append(path)
+                else:
+                    retained.append(name)
+            directories[:] = retained
+            paths.extend(current / name for name in sorted(filenames) if name != ".git")
+
+        for path in sorted(paths):
             relative = path.relative_to(root).as_posix()
             try:
                 info = path.lstat()

@@ -81,11 +81,13 @@ class ProjectDeliveryService:
                     status=status,
                     detail=detail,
                     external_url=existing.external_url if existing else None,
+                    connection_name=existing.connection_name if existing else None,
                     pull_request_status=pull_request_status,
                     status_error=status_error,
                 )
             )
-        return DeliveryPlan(items=items)
+        integration_statuses = integrations.statuses(project) if project and integrations else []
+        return DeliveryPlan(items=items, integrations=integration_statuses)
 
     def create_draft_pull_requests(
         self,
@@ -97,12 +99,16 @@ class ProjectDeliveryService:
         if not request.confirmed:
             raise WorkspaceError("Confirm draft pull-request creation before publishing branches")
         records: list[DeliveryRecord] = []
+        requested = {item.folder_id: item for item in request.drafts}
         for item in self.plan(session).items:
             if item.status in {"no_changes", "published"}:
+                continue
+            if requested and item.folder_id not in requested:
                 continue
             if item.status != "ready":
                 records.append(self._failed(item, item.detail))
                 continue
+            draft = requested.get(item.folder_id)
             try:
                 push = integrations.git_push_credentials(
                     project,
@@ -119,8 +125,8 @@ class ProjectDeliveryService:
                 external_url = integrations.create_draft_pull_request(
                     project,
                     repository_url=item.remote_url or "",
-                    title=request.title,
-                    body=request.body,
+                    title=draft.title if draft else request.title,
+                    body=draft.body if draft else request.body,
                     head=item.task_branch or "",
                     base_branch=item.base_branch or "",
                     connection_name=request.connection_name,

@@ -89,6 +89,7 @@ class RuntimeManager:
                 web_search=session.web_search,
                 additional_dirs=tuple(session.additional_dirs),
                 developer_instructions=session.developer_instructions,
+                skill_roots=None if session.skill_roots is None else tuple(session.skill_roots),
                 environment=tuple(session.environment.items()),
                 session_id=session.id,
                 cowork_root=str(self._root),
