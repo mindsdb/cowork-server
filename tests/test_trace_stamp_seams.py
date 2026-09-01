@@ -259,3 +259,78 @@ def test_the_surface_predicate_actually_rejects_a_bare_call():
     assert _declares_surface(accepted)
     assert _declares_surface(unpacked)
     assert not _declares_surface(bare), "the predicate accepts a call site with no surface"
+
+
+# ---------------------------------------------------------------------------
+# The same rule, for anton's verifier latch (ENG-2193).
+#
+# Fourth field, same seam, and written for the reason recorded above the surface
+# rule: delete the call site and every unit test still passes, because helper
+# tests and service tests never touch a turn.
+#
+# The latch is ChatSession state and this server rebuilds that object per
+# message, so a dropped call site silently restores the bug it fixed — anton's
+# no-verdict counter restarting at zero every message, never reaching two, and
+# every message paying a full-history hand-back.
+# ---------------------------------------------------------------------------
+
+# The connector probe originates a turn but has no conversation row, so there is
+# nowhere to carry a latch to. Exempt by path so the omission is a decision on
+# the record rather than a gap the rule cannot see.
+_LATCH_EXEMPT = {"cowork/services/connectors/probe.py"}
+
+
+def _declares_verifier_latch(call: ast.Call) -> bool:
+    if any(kw.arg == "initial_verifier_latch" for kw in call.keywords):
+        return True
+    # `**verifier_latch_kwarg(ChatSessionConfig, ...)` — a **-unpack has arg=None.
+    for kw in call.keywords:
+        if kw.arg is None and isinstance(kw.value, ast.Call):
+            func = kw.value.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if name == "verifier_latch_kwarg":
+                return True
+    return False
+
+
+def test_every_conversation_turn_carries_the_verifier_latch():
+    offenders = [
+        f"{path.relative_to(COWORK_ROOT.parent)}:{call.lineno}"
+        for path, call in _config_sites()
+        if str(path.relative_to(COWORK_ROOT.parent)) not in _LATCH_EXEMPT
+        and not _declares_verifier_latch(call)
+    ]
+    assert not offenders, (
+        "These ChatSessionConfig call sites build a per-message session without "
+        "carrying anton's verifier latch, so a deterministic verifier failure "
+        "re-diagnoses on every message. Pass "
+        "**verifier_latch_kwarg(ChatSessionConfig, conversation.verifier_latch) — "
+        f"see cowork/harnesses/anton_harness/harness.py: {offenders}"
+    )
+
+
+def test_the_latch_exemption_does_not_swallow_the_harness():
+    """The exemption is for the probe alone. If it ever covered the harness, the
+    rule above would pass while the only site that matters went unchecked."""
+    assert "cowork/harnesses/anton_harness/harness.py" not in _LATCH_EXEMPT
+    checked = {
+        str(path.relative_to(COWORK_ROOT.parent))
+        for path, _ in _config_sites()
+        if str(path.relative_to(COWORK_ROOT.parent)) not in _LATCH_EXEMPT
+    }
+    assert "cowork/harnesses/anton_harness/harness.py" in checked
+
+
+def test_the_latch_predicate_actually_rejects_a_bare_call():
+    """Positive control: a predicate weakened to `return True` must fail here."""
+    accepted = ast.parse("ChatSessionConfig(initial_verifier_latch=x)").body[0].value
+    unpacked = ast.parse(
+        "ChatSessionConfig(**verifier_latch_kwarg(ChatSessionConfig, stored))"
+    ).body[0].value
+    bare = ast.parse("ChatSessionConfig(llm_client=x)").body[0].value
+
+    assert _declares_verifier_latch(accepted)
+    assert _declares_verifier_latch(unpacked)
+    assert not _declares_verifier_latch(bare), (
+        "the predicate accepts a call site that carries no latch"
+    )

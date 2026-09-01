@@ -1,7 +1,8 @@
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlmodel import Field, Relationship
+from sqlalchemy import JSON
+from sqlmodel import Column, Field, Relationship
 
 from cowork.models.base import BaseSQLModel
 
@@ -38,6 +39,14 @@ class Conversation(BaseSQLModel, table=True):
     )
     reasoning_effort: str | None = Field(
         default=None, description="Reasoning effort the task's harness was launched with"
+    )
+    # Anton's completion-verifier latch, carried across the per-message session
+    # rebuild. Opaque here: the shape is anton's contract and this row only
+    # relays it. Model alias plus counters, so nothing secret.
+    verifier_latch: dict | None = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+        description="Anton's verifier latch state for this conversation",
     )
 
     project: "Project" = Relationship()
