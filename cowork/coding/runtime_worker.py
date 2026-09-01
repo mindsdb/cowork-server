@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,7 @@ class CodeOnlyRuntime:
         self._approval_lock = threading.Lock()
         self._approval_waiters: dict[str, tuple[threading.Event, dict[str, str]]] = {}
         self._pending_commands: list[RuntimeCommand] = []
+        self._pending_lock = threading.Lock()
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._approval_timeout_seconds = max(0, approval_timeout_seconds)
 
@@ -257,11 +260,11 @@ class CodeOnlyRuntime:
                     if selected is None:
                         selected = command
                     else:
-                        self._pending_commands.append(command)
+                        self._defer_command(command)
                 elif command.kind == "operation" and selected is None:
                     self._complete_operation(lease, operations, command)
                 else:
-                    self._pending_commands.append(command)
+                    self._defer_command(command)
             if selected is not None:
                 return selected
             self.client.event(lease, "checkpoint", {"waiting": "start", "workspaceReady": True})
@@ -294,7 +297,7 @@ class CodeOnlyRuntime:
                 self.client.event(lease, "event", {"event": event.model_dump(mode="json")})
         finally:
             stop.set()
-            command_thread.join(timeout=2)
+            command_thread.join()
         self.client.event(lease, "turn_completed", {
             "status": "cancelled" if cancelled.is_set() else "completed",
         })
@@ -417,49 +420,74 @@ class CodeOnlyRuntime:
         while not stop.wait(1):
             try:
                 for command in self._take_commands(lease):
-                    if command.kind == "steer":
-                        session.steer(turn_id, str(command.payload.get("prompt") or ""))
-                    elif command.kind == "agent_command":
-                        action = str(command.payload.get("goal_action") or "")
-                        objective = command.payload.get("goal_objective")
-                        handled = self._run_immediate_command(
-                            lease,
-                            session,
-                            str(command.payload.get("command") or ""),
-                            action,
-                            str(objective) if objective is not None else None,
-                        )
-                        if not handled:
-                            self.client.acknowledge(
-                                lease,
-                                command,
-                                error="The command cannot run during an active turn",
-                            )
-                            continue
-                    elif command.kind == "cancel":
-                        session.cancel(turn_id)
-                        cancelled.set()
-                    elif command.kind == "approve":
-                        approval_id = str(command.payload.get("approvalId") or "")
-                        with self._approval_lock:
-                            waiter = self._approval_waiters.get(approval_id)
-                        if waiter is None:
-                            continue
-                        waiter[1]["decision"] = str(command.payload.get("decision") or "decline")
-                        waiter[0].set()
-                    elif command.kind == "operation":
-                        self._complete_operation(lease, operations, command)
-                        continue
-                    else:
-                        continue
-                    self.client.acknowledge(lease, command)
+                    self._route_command(lease, session, operations, turn_id, cancelled, command)
                 self.client.event(lease, "checkpoint", {"activeTurn": turn_id})
             except RuntimeClientError:
                 return
 
+    def _route_command(
+        self,
+        lease: RuntimeLease,
+        session: EngineSession,
+        operations: RuntimeWorkspaceOperations,
+        turn_id: str,
+        cancelled: threading.Event,
+        command: RuntimeCommand,
+    ) -> None:
+        if command.kind in {"start", "release"}:
+            self._defer_command(command)
+            return
+        try:
+            if command.kind == "steer":
+                session.steer(turn_id, str(command.payload.get("prompt") or ""))
+            elif command.kind == "agent_command":
+                action = str(command.payload.get("goal_action") or "")
+                objective = command.payload.get("goal_objective")
+                handled = self._run_immediate_command(
+                    lease,
+                    session,
+                    str(command.payload.get("command") or ""),
+                    action,
+                    str(objective) if objective is not None else None,
+                )
+                if not handled:
+                    self.client.acknowledge(
+                        lease,
+                        command,
+                        error="The command cannot run during an active turn",
+                    )
+                    return
+            elif command.kind == "cancel":
+                session.cancel(turn_id)
+                cancelled.set()
+            elif command.kind == "approve":
+                approval_id = str(command.payload.get("approvalId") or "")
+                with self._approval_lock:
+                    waiter = self._approval_waiters.get(approval_id)
+                if waiter is None:
+                    return
+                waiter[1]["decision"] = str(command.payload.get("decision") or "decline")
+                waiter[0].set()
+            elif command.kind == "operation":
+                self._complete_operation(lease, operations, command)
+                return
+            else:
+                return
+        except RuntimeClientError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one failed handler must not stop command routing.
+            self.client.acknowledge(lease, command, error=str(exc)[:4_000])
+            return
+        self.client.acknowledge(lease, command)
+
     def _take_commands(self, lease: RuntimeLease) -> list[RuntimeCommand]:
-        pending, self._pending_commands = self._pending_commands, []
+        with self._pending_lock:
+            pending, self._pending_commands = self._pending_commands, []
         return [*pending, *self.client.commands(lease)]
+
+    def _defer_command(self, command: RuntimeCommand) -> None:
+        with self._pending_lock:
+            self._pending_commands.append(command)
 
     def _complete_operation(
         self,
@@ -471,7 +499,7 @@ class CodeOnlyRuntime:
         self.client.acknowledge(lease, command, result, error)
 
     def _approval(self, lease: RuntimeLease, method: str, params: dict[str, Any] | None) -> dict[str, str]:
-        approval_id = f"approval-{lease.run.id}-{int(time.time() * 1_000)}"
+        approval_id = f"approval-{lease.run.id}-{uuid.uuid4()}"
         resolved = threading.Event()
         decision: dict[str, str] = {}
         with self._approval_lock:
@@ -516,7 +544,7 @@ def main() -> None:
     if registration_token:
         if not server_url:
             raise SystemExit("--server is required when connecting a computer")
-        client = RemoteRuntimeClient.register(server_url, registration_token, str(args.name).strip(), root)
+        client = RemoteRuntimeClient.register(server_url, registration_token, str(args.name).strip())
         save_runtime_identity(root, server_url, client.identity)
     elif stored:
         client = RemoteRuntimeClient(server_url or stored.server_url, stored.identity)

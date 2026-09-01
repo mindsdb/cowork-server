@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from cowork.coding.connector_capabilities import ConnectorCapability
-from cowork.coding.contracts import PermissionMode
+from cowork.coding.contracts import PermissionMode, Personality, ReasoningEffort, ServiceTier
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     CodeTask,
@@ -19,7 +19,6 @@ from cowork.coding.project_models import CodeProject
 class ComputerRegistrationRequest(BaseModel):
     protocol_version: str = RUNTIME_PROTOCOL_VERSION
     registration_token: str = Field(min_length=32, max_length=512)
-    computer_id: str | None = Field(default=None, max_length=128)
     name: str = Field(min_length=1, max_length=120)
     capabilities: ComputerCapabilities
 
@@ -44,9 +43,9 @@ class RuntimeExecutionConfig(BaseModel):
     engine_id: str
     model: str
     permission_mode: PermissionMode
-    reasoning_effort: str | None = None
-    service_tier: str = "standard"
-    personality: str = "pragmatic"
+    reasoning_effort: ReasoningEffort | None = None
+    service_tier: ServiceTier = "standard"
+    personality: Personality = "pragmatic"
     network_access: bool = False
     web_search: bool = False
     developer_instructions: str = ""

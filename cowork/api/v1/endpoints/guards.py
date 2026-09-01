@@ -7,11 +7,13 @@ from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request, status
 
+_TRUSTED_LOOPBACK_HOSTS = frozenset({"localhost"})
+
 
 def _trusted_loopback_host(value: str) -> bool:
     parsed = urlparse(f"//{value}")
     hostname = (parsed.hostname or "").casefold()
-    if hostname in {"localhost", "testserver"}:
+    if hostname in _TRUSTED_LOOPBACK_HOSTS:
         return True
     try:
         return ipaddress.ip_address(hostname).is_loopback

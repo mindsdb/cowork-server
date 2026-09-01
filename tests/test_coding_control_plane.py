@@ -24,6 +24,7 @@ from cowork.coding.control_models import (
     TaskRun,
     WorkspaceStatus,
 )
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_service import (
     ControlPlaneService,
     NoEligibleComputer,
@@ -228,6 +229,84 @@ def test_this_computer_can_be_renamed_but_not_revoked(tmp_path: Path) -> None:
     assert restarted.local_computer.name == "Ian's Mac"
     with pytest.raises(ValueError, match="cannot be revoked"):
         restarted.revoke_computer(restarted.local_computer.id)
+
+
+def test_every_registration_mints_a_distinct_computer(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    first, first_token = register(service, "Remote")
+    second, second_token = register(service, "Remote")
+
+    assert first.id != second.id
+    assert first_token != second_token
+    assert service.authenticate_runtime(first.id, first_token).id == first.id
+    assert service.authenticate_runtime(second.id, second_token).id == second.id
+
+
+def test_revoked_computer_cannot_lease_again(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    service.revoke_computer(remote.id)
+
+    with pytest.raises(RuntimeAuthenticationError, match="revoked"):
+        service.acquire_lease(remote.id)
+    assert service.store.get_computer(remote.id).revoked_at is not None
+    assert remote.id not in {item.id for item in service.list_computers().items}
+
+
+def test_reconnection_requires_the_computers_existing_credential(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, runtime_token = register(service)
+
+    restarted = ControlPlaneService(tmp_path, capabilities())
+    with pytest.raises(RuntimeAuthenticationError, match="failed"):
+        restarted.authenticate_runtime(remote.id, "not-the-credential-issued-at-registration")
+    assert restarted.authenticate_runtime(remote.id, runtime_token).id == remote.id
+
+
+def test_queued_work_moves_between_computers_only_by_audited_reassignment(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    first, _ = register(service, "First")
+    second, _ = register(service, "Second")
+    snapshot = service.create_task_run(
+        task_id="queued-move",
+        title="Queued move",
+        prompt="Run wherever",
+        project=CodeProject(
+            id="portable-project",
+            name="Portable",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=first.id,
+        engine_id="codex",
+    )
+    bound = service.create_task_run(
+        task_id="bound-task",
+        title="Bound task",
+        prompt="Update notes",
+        project=project(service.local_computer.id),
+        requested_resource_ids=None,
+        computer_id=service.local_computer.id,
+        engine_id="codex",
+    )
+
+    moved = service.reassign_queued_run(snapshot.run.id, second.id)
+
+    assert moved.computer_id == second.id
+    assert moved.status == RunStatus.queued
+    assert {item.computer_id for item in service.store.list_workspaces(moved.id)} == {second.id}
+    assert any(
+        item.action == "run.reassign" and item.computer_id == second.id and first.id in item.detail
+        for item in service.store.list_audit_events(moved.id)
+    )
+    assert service.acquire_lease(first.id) is None
+    leased = service.acquire_lease(second.id)
+    assert leased is not None
+    assert leased[0].id == moved.id
+    with pytest.raises(StateConflict, match="queued"):
+        service.reassign_queued_run(moved.id, first.id)
+    with pytest.raises(NoEligibleComputer, match="cannot access"):
+        service.reassign_queued_run(bound.run.id, second.id)
 
 
 def test_local_folders_are_owner_bound_but_repositories_are_portable(tmp_path: Path) -> None:
@@ -602,6 +681,31 @@ def test_connector_capabilities_are_short_lived_scoped_and_revocable(tmp_path: P
     service.revoke_connector_grants(snapshot.run.id)
     with pytest.raises(RuntimeAuthenticationError, match="expired"):
         service.authorize_connector(grant.id, token, "read_source")
+
+
+def test_connector_constraints_compare_non_ascii_values_in_constant_time(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    snapshot = service.create_task_run(
+        task_id="unicode-constraint",
+        title="Unicode constraint",
+        prompt="Read one repository",
+        project=None,
+        requested_resource_ids=None,
+        computer_id=None,
+        engine_id="codex",
+        standalone_computer_id=service.local_computer.id,
+    )
+    grant, token = service.issue_connector_grant(
+        snapshot.run.id,
+        "github",
+        "work-account",
+        ["read_source"],
+        {"repository": "acme/dépôt"},
+    )
+
+    assert service.authorize_connector(grant.id, token, "read_source", {"repository": "acme/dépôt"}).use_count == 1
+    with pytest.raises(RuntimeAuthenticationError, match="outside its resource scope"):
+        service.authorize_connector(grant.id, token, "read_source", {"repository": "acme/depot"})
 
 
 def test_legacy_unbound_connector_grants_load_but_fail_closed(tmp_path: Path) -> None:

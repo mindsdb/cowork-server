@@ -6,9 +6,14 @@ from typing import Any
 REDACTED = "[redacted]"
 MAX_SANITIZED_CHARS = 128 * 1024
 MAX_REDACTION_INPUT_CHARS = 256 * 1024
-_SENSITIVE_KEY = re.compile(r"(authorization|api.?key|token|password|secret|credential|cookie)", re.IGNORECASE)
+_SENSITIVE_KEY_WORDS = r"(?:authorization|api.?key|token|password|secret|credential|cookie)"
+_SENSITIVE_KEY = re.compile(_SENSITIVE_KEY_WORDS, re.IGNORECASE)
 _SENSITIVE_TEXT = re.compile(
     r"(?i)((?:authorization|api[_-]?key|(?:access[_-]?)?token|password|secret|cookie)\s*[:=]\s*(?:bearer\s+)?)([^\s,;&]+)"
+)
+_SENSITIVE_JSON_TEXT = re.compile(
+    rf'("[^"\\]*{_SENSITIVE_KEY_WORDS}[^"\\]*"\s*:\s*")(?:[^"\\]|\\.)*(")',
+    re.IGNORECASE,
 )
 
 
@@ -16,6 +21,7 @@ def redact_text(value: str, secrets: tuple[str, ...] = ()) -> str:
     safe = value[:MAX_REDACTION_INPUT_CHARS]
     for secret in secrets:
         safe = safe.replace(secret, REDACTED)
+    safe = _SENSITIVE_JSON_TEXT.sub(lambda match: match.group(1) + REDACTED + match.group(2), safe)
     return _SENSITIVE_TEXT.sub(lambda match: match.group(1) + REDACTED, safe)
 
 

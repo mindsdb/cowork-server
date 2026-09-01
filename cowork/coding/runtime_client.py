@@ -66,10 +66,8 @@ class RemoteRuntimeClient:
         server_url: str,
         registration_token: str,
         name: str,
-        root: Path,
         registry: CodingEngineRegistry = engine_registry,
     ) -> RemoteRuntimeClient:
-        persisted_id = cls._persisted_computer_id(root)
         shells = [item.id.value for item in shell_inventory().items]
         system = platform.system().lower()
         capabilities = ComputerCapabilities(
@@ -96,14 +94,12 @@ class RemoteRuntimeClient:
                 f"{server_url.rstrip('/')}/api/v1/coding/runtime/register",
                 json=ComputerRegistrationRequest(
                     registration_token=registration_token,
-                    computer_id=persisted_id,
                     name=name,
                     capabilities=capabilities,
                 ).model_dump(mode="json"),
             )
             cls._raise(response)
             registered = ComputerRegistrationResponse.model_validate(response.json())
-        cls._save_computer_id(root, registered.computer.id)
         return cls(
             server_url,
             RuntimeIdentity(registered.computer.id, registered.runtime_token, registered.computer.name),
@@ -215,25 +211,12 @@ class RemoteRuntimeClient:
                 response.status_code,
             ) from exc
 
-    @staticmethod
-    def _persisted_computer_id(root: Path) -> str | None:
-        try:
-            return (root / "computer-id").read_text(encoding="utf-8").strip() or None
-        except FileNotFoundError:
-            return None
-
-    @staticmethod
-    def _save_computer_id(root: Path, computer_id: str) -> None:
-        root.mkdir(parents=True, exist_ok=True)
-        _atomic_write(root / "computer-id", computer_id + "\n")
-
-
-def _atomic_write(target: Path, contents: str, mode: int | None = None) -> None:
+def _atomic_write(target: Path, contents: str, mode: int = 0o666) -> None:
     temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
     try:
-        temporary.write_text(contents, encoding="utf-8")
-        if mode is not None:
-            os.chmod(temporary, mode)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(contents)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)

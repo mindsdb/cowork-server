@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from cowork.coding.connector_delegation import ConnectorDelegationService
 from cowork.coding.contracts import CodingSession, SessionStatus, TaskCapability, utc_now
-from cowork.coding.control_errors import RuntimeAuthenticationError, StaleRuntimeEvent
+from cowork.coding.control_errors import RuntimeAuthenticationError, StaleRuntimeEvent, StateConflict
 from cowork.coding.control_models import (
     RUNTIME_PROTOCOL_VERSION,
     TERMINAL_RUN_STATUSES,
@@ -146,7 +146,7 @@ class ControlPlaneService:
             run.computer_id == computer_id and run.status not in TERMINAL_RUN_STATUSES
             for run in self.store.list_runs()
         ):
-            raise ValueError("Finish or move this computer's active tasks before revoking it")
+            raise StateConflict("Finish or move this computer's active tasks before revoking it")
         computer.registration_epoch += 1
         computer.status = ComputerStatus.offline
         computer.active_run_count = 0
@@ -168,31 +168,24 @@ class ControlPlaneService:
         registration_token: str,
         name: str,
         capabilities: ComputerCapabilities,
-        computer_id: str | None = None,
     ) -> tuple[Computer, str]:
         self._require_protocol(capabilities.protocol_versions)
         token_hash = self._digest(registration_token)
         if not self.store.consume_registration_credential(token_hash, utc_now()):
             raise RuntimeAuthenticationError("Runtime registration expired or was already used")
-        identifier = computer_id or f"computer-{uuid.uuid4().hex}"
-        try:
-            current = self.store.get_computer(identifier)
-            epoch = current.registration_epoch + 1
-        except KeyError:
-            epoch = 1
+        identifier = f"computer-{uuid.uuid4().hex}"
         computer = Computer(
             id=identifier,
             name=self._computer_name(name),
             is_local=False,
             capabilities=capabilities,
-            registration_epoch=epoch,
         )
         runtime_token = secrets.token_urlsafe(40)
         self.store.save_runtime_credential(RuntimeCredential(
             id=identifier,
             computer_id=identifier,
             token_hash=self._digest(runtime_token),
-            registration_epoch=epoch,
+            registration_epoch=computer.registration_epoch,
         ))
         record_security_event(self.store,
             "runtime.register",
@@ -537,6 +530,8 @@ class ControlPlaneService:
 
     def acquire_lease(self, computer_id: str) -> tuple[TaskRun, str] | None:
         with self._lock:
+            if self.store.get_computer(computer_id).revoked_at is not None:
+                raise RuntimeAuthenticationError("This computer has been revoked")
             self.expire_leases()
             lease_id = secrets.token_urlsafe(32)
             run = self.store.claim_run(
@@ -736,6 +731,40 @@ class ControlPlaneService:
                 computer,
                 allow_recreate=allow_recreate,
             )
+
+    def reassign_queued_run(self, run_id: str, computer_id: str) -> TaskRun:
+        """Move a run that no computer has leased yet; leased runs go through recovery."""
+
+        with self._lock:
+            run = self.store.get_run(run_id)
+            if run.status != RunStatus.queued:
+                raise StateConflict("Only queued Task Runs can be reassigned; recover a leased run instead")
+            task = self.store.get_task(run.task_id)
+            if task.execution_project is None:
+                raise NoEligibleComputer("This task includes resources that only exist on its original computer")
+            eligible = self.eligible_computers(
+                task.execution_project,
+                TaskResourceScope(all_project_resources=True),
+                task.engine_id,
+            )
+            if not any(item.id == computer_id for item in eligible):
+                raise NoEligibleComputer("That computer cannot access every resource selected for this task")
+            previous_computer_id = run.computer_id
+            run.computer_id = computer_id
+            for workspace in self.store.list_workspaces(run.id):
+                workspace.computer_id = computer_id
+                self.store.save_workspace(workspace)
+            saved = self.store.save_run(run)
+            record_security_event(self.store,
+                "run.reassign",
+                "completed",
+                "user",
+                run.id,
+                run_id=run.id,
+                computer_id=computer_id,
+                detail=f"from={previous_computer_id}",
+            )
+            return saved
 
     def expire_stale_computers(self) -> None:
         threshold = utc_now() - _OFFLINE_AFTER

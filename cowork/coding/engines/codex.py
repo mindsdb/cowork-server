@@ -42,6 +42,7 @@ _EXPECTED_ACTIVE_TURN = re.compile(r"expected active turn id `([^`]+)`")
 _TERMINAL_NOT_READY = "no active command/exec for process id"
 _TERMINAL_WRITE_READY_TIMEOUT_SECONDS = 5.0
 _TERMINAL_WRITE_RETRY_SECONDS = 0.02
+_CANCEL_WATCHDOG_TIMEOUT_SECONDS = 5.0
 
 
 class CodexEngine:
@@ -374,15 +375,15 @@ class CodexEngineSession:
         # still converge instead of waiting forever to start its fallback.
         start_watchdog = False
         with self._cancel_lock:
-            completed = self._cancel_watchdogs.get(turn_id)
-            if completed is None:
-                completed = threading.Event()
-                self._cancel_watchdogs[turn_id] = completed
+            acknowledged = self._cancel_watchdogs.get(turn_id)
+            if acknowledged is None:
+                acknowledged = threading.Event()
+                self._cancel_watchdogs[turn_id] = acknowledged
                 start_watchdog = True
         if start_watchdog:
             threading.Thread(
                 target=self._cancel_watchdog,
-                args=(completed,),
+                args=(acknowledged,),
                 name="codex-cancel-watchdog",
                 daemon=True,
             ).start()
@@ -391,6 +392,7 @@ class CodexEngineSession:
             self._client.cancel_goal_operation(goal_state)
         else:
             self._client.turn_interrupt(self._session_id, turn_id)
+        acknowledged.set()
 
     def compact(self) -> None:
         self._client.thread_compact(self._session_id)
@@ -580,15 +582,21 @@ class CodexEngineSession:
             self._cancel_watchdogs.clear()
         for watchdog in watchdogs:
             watchdog.set()
-        terminate_descendants(self._app_server_pid())
-        self._client.close()
+        try:
+            terminate_descendants(self._app_server_pid())
+        finally:
+            self._client.close()
 
-    def _cancel_watchdog(self, completed: threading.Event) -> None:
-        if completed.wait(timeout=5.0) or self._closed.is_set():
+    def _cancel_watchdog(self, acknowledged: threading.Event) -> None:
+        if acknowledged.wait(timeout=_CANCEL_WATCHDOG_TIMEOUT_SECONDS) or self._closed.is_set():
             return
-        # Interrupt is cooperative. If app-server or a child command does not
-        # acknowledge it, tear down descendants so Stop cannot leave work
+        # Interrupt is cooperative. If app-server does not acknowledge it, tear
+        # down the turn's child processes first; only if that still does not
+        # unblock the interrupt, close the session so Stop cannot leave work
         # running invisibly after the UI reports cancellation.
+        terminate_descendants(self._app_server_pid())
+        if acknowledged.wait(timeout=_CANCEL_WATCHDOG_TIMEOUT_SECONDS) or self._closed.is_set():
+            return
         self.close()
 
     def _finish_cancel_watchdog(self, turn_id: str) -> None:
@@ -720,6 +728,7 @@ class CodexEngineSession:
             handler(base64.b64encode(value.encode()).decode(), stream, False)
 
     def _app_server_pid(self) -> int | None:
-        process = getattr(self._client, "_proc", None)
-        pid = getattr(process, "pid", None)
-        return pid if isinstance(pid, int) and pid > 0 else None
+        # The SDK keeps its app-server Popen private. Read it directly so a
+        # rename raises here instead of silently disabling process teardown.
+        process = self._client._proc
+        return process.pid if process is not None else None
