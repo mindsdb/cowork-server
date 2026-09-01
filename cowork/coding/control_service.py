@@ -168,32 +168,12 @@ class ControlPlaneService:
         registration_token: str,
         name: str,
         capabilities: ComputerCapabilities,
-        computer_id: str | None = None,
     ) -> tuple[Computer, str]:
         self._require_protocol(capabilities.protocol_versions)
         token_hash = self._digest(registration_token)
         if not self.store.consume_registration_credential(token_hash, utc_now()):
             raise RuntimeAuthenticationError("Runtime registration expired or was already used")
-        identifier = computer_id or f"computer-{uuid.uuid4().hex}"
-        try:
-            current = self.store.get_computer(identifier)
-        except KeyError:
-            current = None
-        if current is not None:
-            reason = "revoked" if current.revoked_at is not None else "already registered"
-            record_security_event(self.store,
-                "runtime.register",
-                "denied",
-                "runtime",
-                identifier,
-                computer_id=identifier,
-                detail=f"computer {reason}",
-            )
-            if current.revoked_at is not None:
-                raise RuntimeAuthenticationError("This computer has been revoked")
-            raise RuntimeAuthenticationError(
-                "This computer is already registered; reconnect with its existing credential"
-            )
+        identifier = f"computer-{uuid.uuid4().hex}"
         computer = Computer(
             id=identifier,
             name=self._computer_name(name),

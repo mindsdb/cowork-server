@@ -232,7 +232,7 @@ def test_runtime_cli_registers_a_computer_with_the_control_plane(tmp_path: Path)
 
     assert registration["registration_token"] == registration_token
     assert registration["name"] == "Subprocess computer"
-    assert registration["computer_id"] is None
+    assert "computer_id" not in registration
     assert heartbeat_auth == f"Bearer {FakeControlPlane.RUNTIME_TOKEN}"
     stored = load_runtime_identity(tmp_path / "root")
     assert stored is not None
