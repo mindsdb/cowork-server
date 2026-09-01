@@ -17,7 +17,13 @@ from cowork.coding.contracts import (
     SessionStatus,
     SessionUpdateRequest,
 )
-from cowork.coding.project_models import DraftPullRequestRequest, ProjectCommand, ProjectCreateRequest, ProjectFolder
+from cowork.coding.project_models import (
+    DraftPullRequestRequest,
+    ProjectCommand,
+    ProjectCreateRequest,
+    ProjectFolder,
+    ProjectUpdateRequest,
+)
 from cowork.coding.turns import EventBuffer, terminal_status
 from cowork.coding.workspace import WorkspaceError
 
@@ -855,6 +861,47 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert child.workspaces[1].workspace_path in child.developer_instructions
     assert engine.forked_workspaces[-1] == str(Path(child.workspaces[0].workspace_path).parent)
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
+
+
+def test_project_fork_uses_task_snapshot_after_project_folders_change(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    notes = tmp_path / "notes"
+    replacement = tmp_path / "replacement"
+    notes.mkdir()
+    replacement.mkdir()
+    (notes / "plan.txt").write_text("base\n", encoding="utf-8")
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Product",
+            folders=[
+                ProjectFolder(id="app", name="App", path=str(repo)),
+                ProjectFolder(id="notes", name="Notes", path=str(notes)),
+            ],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    parent = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, parent.id, SessionStatus.completed)
+    service.projects.update(
+        project.id,
+        ProjectUpdateRequest(
+            folders=[ProjectFolder(id="replacement", name="Replacement", path=str(replacement))]
+        ),
+    )
+
+    child = service.fork_session(parent.id, CREDS)
+
+    assert [item.folder_id for item in child.workspaces] == ["app", "notes"]
+    assert [item.source_path for item in child.workspaces] == [str(repo), str(notes)]
+    assert "replacement" not in child.developer_instructions
 
 
 def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(tmp_path: Path) -> None:

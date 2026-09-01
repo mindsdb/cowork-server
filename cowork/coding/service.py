@@ -45,7 +45,7 @@ from cowork.coding.project_models import DraftPullRequestRequest
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
-from cowork.coding.session_factory import CodingSessionFactory, project_instructions
+from cowork.coding.session_factory import CodingSessionFactory
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn, mark_running
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
@@ -165,30 +165,31 @@ class CodingService:
                 "Wait for the active turn to finish before forking this coding task",
             ) as parent:
                 new_id = str(uuid.uuid4())
-                project = self.projects.get(parent.project_id) if parent.project_id else None
-                if project and parent.workspaces:
-                    prepared_project = self.project_workspaces.fork(new_id, project, parent.workspaces)
+                if parent.project_id and parent.workspaces:
+                    prepared_project = self.project_workspaces.fork(
+                        new_id,
+                        parent.project_name or "project",
+                        parent.workspaces,
+                        list(parent.allocated_ports),
+                    )
                     prepared = prepared_project.primary
                     child_workspaces = list(prepared_project.workspaces)
                     child_ports = prepared_project.ports
                     parent_project_paths = {item.workspace_path for item in parent.workspaces[1:]}
                     external_dirs = [path for path in parent.additional_dirs if path not in parent_project_paths]
                     child_dirs = [item.workspace_path for item in child_workspaces[1:]] + external_dirs
+                    inherited_environment = {
+                        name: value
+                        for name, value in parent.environment.items()
+                        if name not in parent.allocated_ports
+                    }
                     child_environment = {
-                        **project.environment.variables,
+                        **inherited_environment,
                         **{name: str(port) for name, port in child_ports.items()},
                     }
-                    try:
-                        guidance, _ = self.playbooks.guidance(project.id) if project.playbook else ("", None)
-                    except Exception:
-                        self.project_workspaces.cleanup(new_id, child_workspaces)
-                        raise
-                    instructions = project_instructions(
-                        project,
-                        child_workspaces,
-                        parent.source_contexts,
-                        guidance,
-                    )
+                    instructions = parent.developer_instructions
+                    for old, new in zip(parent.workspaces, child_workspaces, strict=True):
+                        instructions = instructions.replace(old.workspace_path, new.workspace_path)
                 else:
                     prepared = self.workspaces.fork(
                         new_id,

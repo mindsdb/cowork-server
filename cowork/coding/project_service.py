@@ -46,14 +46,11 @@ class CodeProjectService:
 
     def update(self, project_id: str, request: ProjectUpdateRequest) -> CodeProject:
         project = self.get(project_id)
-        # Keep nested ProjectFolder/ProjectEnvironment instances typed. A
-        # model_dump here turns them into dictionaries; model_copy deliberately
-        # does not revalidate updates, so normalization would later crash on
-        # ``folder.path`` during an ordinary settings save.
         values = {name: getattr(request, name) for name in request.model_fields_set}
-        if "name" in values:
+        if values.get("name") is not None:
             values["name"] = self._name(values["name"])
-        return self.store.save(self._normalize(project.model_copy(update=values)))
+        candidate = CodeProject.model_validate({**project.model_dump(), **values})
+        return self.store.save(self._normalize(candidate))
 
     def delete(self, project_id: str, active_session_count: int) -> None:
         if active_session_count:
@@ -78,16 +75,24 @@ class CodeProjectService:
 
     def _normalize(self, project: CodeProject) -> CodeProject:
         normalized = []
-        seen: set[str] = set()
+        seen_paths: set[str] = set()
+        seen_repositories: set[str] = set()
         for folder in project.folders:
             inspection = self.workspaces.inspect(folder.path)
             if not inspection.exists or not inspection.is_directory:
                 raise WorkspaceError(f"Folder is unavailable: {folder.path}")
             path = str(Path(inspection.path).resolve())
             key = path.casefold()
-            if key in seen:
+            if key in seen_paths:
                 raise WorkspaceError("The same folder cannot be added twice")
-            seen.add(key)
+            seen_paths.add(key)
+            if inspection.is_git:
+                repository = str(Path(inspection.repository_root or inspection.path).resolve()).casefold()
+                if repository in seen_repositories:
+                    raise WorkspaceError(
+                        "A Git repository can only be added once; choose the repository root"
+                    )
+                seen_repositories.add(repository)
             normalized.append(folder.model_copy(update={"path": path}))
         return project.model_copy(update={"folders": normalized})
 
