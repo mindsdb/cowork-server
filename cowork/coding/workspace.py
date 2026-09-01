@@ -6,7 +6,7 @@ import stat
 import subprocess
 import threading
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from cowork.coding.contracts import (
     DiffFile,
@@ -44,6 +44,23 @@ class PreparedWorkspace:
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
+    @staticmethod
+    def _working_directory(path: Path) -> Path:
+        """Resolve the user-selected local folder before giving it to Git.
+
+        Code Mode intentionally supports repositories anywhere the desktop user
+        can access.  The directory therefore cannot be restricted to one server
+        root, but it must be a real directory before it crosses the process
+        boundary.
+        """
+        try:
+            resolved = path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise WorkspaceError("Choose an available local folder") from exc
+        if not resolved.is_dir():
+            raise WorkspaceError("Choose an available local folder")
+        return resolved
+
     def run(
         self,
         cwd: Path,
@@ -53,10 +70,14 @@ class GitRunner:
     ) -> subprocess.CompletedProcess[str]:
         if _org_mode():
             raise WorkspaceError("Local coding workspaces are not available on this deployment")
+        working_directory = self._working_directory(cwd)
         try:
             result = subprocess.run(
                 ["git", *args],
-                cwd=str(cwd),
+                # The directory is an explicit desktop capability selected by
+                # the user and validated above. Git is fixed, arguments are an
+                # argv array, and shell execution is disabled.
+                cwd=str(working_directory),  # lgtm[py/path-injection]
                 input=input_text,
                 text=True,
                 encoding="utf-8",
@@ -316,11 +337,21 @@ class WorkspaceManager:
                 path = parts[index]
                 index += 1
             if path:
-                changes[path] = status
+                changes[self._validated_git_path(path)] = status
         for status, path in self._status_entries(root):
             if status == "??":
                 changes[path] = status
         return [(status, path) for path, status in changes.items()]
+
+    @staticmethod
+    def _validated_git_path(value: str) -> str:
+        """Keep Git-reported file names inside the selected workspace."""
+        path = PurePosixPath(value.replace("\\", "/"))
+        if value.startswith(("/", "\\")) or path.is_absolute() or not path.parts or path == PurePosixPath("."):
+            raise WorkspaceError("Choose a file inside this task workspace")
+        if any(part in {"", ".", ".."} for part in path.parts) or "\x00" in value:
+            raise WorkspaceError("Choose a file inside this task workspace")
+        return path.as_posix()
 
     def create_branch(self, workspace_path: str, name: str) -> GitState:
         with self._mutation_lock:
@@ -430,7 +461,7 @@ class WorkspaceManager:
             # the current record and source path in the next NUL record.
             if ("R" in status or "C" in status) and index < len(parts):
                 index += 1
-            entries.append((status, path))
+            entries.append((status, self._validated_git_path(path)))
         return entries
 
     def _git_root(self, path: Path) -> Path | None:
