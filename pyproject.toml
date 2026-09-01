@@ -27,6 +27,7 @@ dependencies = [
     "openai-codex==0.147.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
     # Used to terminate the complete coding-agent subprocess tree on both
     # macOS and Windows; killing only the app-server can orphan commands.
     "psutil>=7.0",

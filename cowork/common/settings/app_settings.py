@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from dotenv import dotenv_values
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -252,6 +253,52 @@ def _env_file_chain() -> list[str]:
     return files
 
 
+def _dev_oauth_env_path() -> Path | None:
+    """Resolve the one developer OAuth file the desktop may delegate.
+
+    An unpackaged desktop checkout may point the sidecar at the one stable
+    developer file, ``~/.cowork-dev/.env``. Packaged apps never set the
+    pointer. Reject every other path rather than turning an environment
+    variable into an arbitrary dotenv-file loader.
+    """
+    raw = os.environ.get("COWORK_DEV_OAUTH_ENV_FILE", "").strip()
+    if not raw:
+        return None
+
+    requested = Path(raw).expanduser()
+    expected = Path.home() / ".cowork-dev" / ".env"
+    try:
+        if requested.resolve(strict=False) != expected.resolve(strict=False):
+            return None
+    except OSError:
+        return None
+    return expected
+
+
+_DEV_OAUTH_FIELDS = frozenset({
+    "GITHUB_CLIENT_ID",
+    "GITHUB_CLIENT_SECRET",
+    "LINEAR_CLIENT_ID",
+    "LINEAR_CLIENT_SECRET",
+})
+
+
+def _dev_oauth_settings_source() -> dict[str, str]:
+    """Read only GitHub/Linear client fields from the delegated dev file."""
+    path = _dev_oauth_env_path()
+    if path is None or not path.is_file():
+        return {}
+    try:
+        parsed = dotenv_values(path)
+    except (OSError, ValueError):
+        return {}
+    return {
+        env_name: value.strip()
+        for env_name in _DEV_OAUTH_FIELDS
+        if isinstance((value := parsed.get(env_name)), str) and value.strip()
+    }
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_env_file_chain(),
@@ -336,6 +383,21 @@ class ConnectorSettings(Settings):
 
 
 class OAuthSettings(Settings):
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        # Explicit values, process env, and the isolated COWORK_HOME dotenv all
+        # win. The fixed developer file is a narrow fallback and returns only
+        # the validation aliases for the two coding connectors.
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _dev_oauth_settings_source,
+            file_secret_settings,
+        )
+
     google_drive_client_id: str = Field(default="", validation_alias=AliasChoices("GOOGLE_DRIVE_CLIENT_ID"))
     google_drive_client_secret: str = Field(default="", validation_alias=AliasChoices("GOOGLE_DRIVE_CLIENT_SECRET"))
 
