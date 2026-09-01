@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from cowork.coding.contracts import utc_now
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, TaskRun
 
 _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
@@ -43,7 +44,7 @@ _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
 }
 
 
-class InvalidRunTransition(ValueError):
+class InvalidRunTransition(StateConflict):
     pass
 
 

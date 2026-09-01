@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import base64
 import re
+import socket
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -28,6 +29,11 @@ from cowork.coding.work_discovery import DeveloperWorkDiscovery
 from cowork.coding.workspace import WorkspaceError
 from cowork.db.scoped import TenantScope
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.developer_validation import (
+    DeveloperCredentialError,
+    DeveloperProviderUnavailable,
+    require_public_host,
+)
 
 
 @dataclass(frozen=True)
@@ -49,10 +55,12 @@ class DeveloperIntegrationService:
         self,
         scope: TenantScope | None,
         client: httpx.Client | None = None,
+        resolver: Callable[..., list[tuple]] = socket.getaddrinfo,
     ) -> None:
         self.connections = ConnectionsService(scope)
         self._owns_client = client is None
         self.client = client or httpx.Client(timeout=20.0, follow_redirects=True)
+        self._resolver = resolver
 
     def close(self) -> None:
         if self._owns_client:
@@ -554,7 +562,16 @@ class DeveloperIntegrationService:
 
     def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         try:
-            response = self.client.request(method, url, **kwargs)
+            response = self.client.request(method, url, follow_redirects=False, **kwargs)
+            hops = 0
+            while response.next_request is not None:
+                origin, target = response.request.url, response.next_request.url
+                if (target.scheme, target.host, target.port) != (origin.scheme, origin.host, origin.port):
+                    raise WorkspaceError("The connected developer tool redirected to another host")
+                hops += 1
+                if hops > self.client.max_redirects:
+                    raise httpx.TooManyRedirects("Exceeded maximum allowed redirects.", request=response.next_request)
+                response = self.client.send(response.next_request, follow_redirects=False)
         except httpx.HTTPError as exc:
             raise WorkspaceError("The connected developer tool is currently unavailable") from exc
         if response.status_code in {401, 403}:
@@ -593,9 +610,15 @@ class DeveloperIntegrationService:
 
     def _github_credentials(self, fields: dict[str, Any]) -> tuple[str, str, str]:
         base = str(fields.get("base_url") or fields.get("url") or "https://github.com").rstrip("/")
-        host = (urlparse(base).hostname or "").casefold()
-        if not host:
-            raise WorkspaceError("The GitHub connection URL is invalid; reconnect it")
+        parsed = urlparse(base)
+        host = (parsed.hostname or "").casefold()
+        if parsed.scheme != "https" or not host:
+            raise WorkspaceError("The GitHub connection URL must be a valid HTTPS URL; reconnect it")
+        if host != "github.com":
+            try:
+                require_public_host(host, self._resolver)
+            except (DeveloperCredentialError, DeveloperProviderUnavailable) as exc:
+                raise WorkspaceError(str(exc)) from exc
         api = "https://api.github.com" if base == "https://github.com" else f"{base}/api/v3"
         token = self._secret(fields, "access_token", "personal_access_token", "token", "api_key")
         return api, token, host
