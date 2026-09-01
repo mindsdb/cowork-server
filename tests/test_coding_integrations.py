@@ -48,10 +48,65 @@ def project(tmp_path: Path) -> CodeProject:
     )
 
 
-def service(handler, fields: dict[tuple[str, str], dict]) -> DeveloperIntegrationService:
-    integration = DeveloperIntegrationService(None, httpx.Client(transport=httpx.MockTransport(handler)))
+def service(handler, fields: dict[tuple[str, str], dict], **kwargs) -> DeveloperIntegrationService:
+    integration = DeveloperIntegrationService(None, httpx.Client(transport=httpx.MockTransport(handler)), **kwargs)
     integration.connections = FakeConnections(fields)  # type: ignore[assignment]
     return integration
+
+
+def private_resolver(_host, _port, **_kwargs):
+    return [(2, 1, 6, "", ("10.0.0.5", 443))]
+
+
+@pytest.mark.parametrize("base_url", ["http://github.com", "https://10.0.0.5", "https://ghe.internal.example"])
+def test_github_token_is_never_attached_to_an_insecure_or_private_base_url(tmp_path: Path, base_url: str) -> None:
+    integration = service(
+        lambda _request: pytest.fail("the token was sent to the network"),
+        {("github", "github-work"): {"access_token": "secret", "base_url": base_url}},
+        resolver=private_resolver,
+    )
+    current = project(tmp_path)
+
+    with pytest.raises(WorkspaceError):
+        integration.read(current, SourceContextRequest(
+            provider="github", kind="issue", url=f"{base_url}/mindsdb/cowork/issues/42",
+        ))
+    with pytest.raises(WorkspaceError):
+        integration.git_push_credentials(current, f"{base_url}/mindsdb/cowork.git", "github-work")
+    with pytest.raises(WorkspaceError):
+        integration.search(current, WorkItemSearchRequest(provider="github", query="login"))
+
+
+def test_github_requests_do_not_follow_redirects_to_another_host(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host != "api.github.com":
+            pytest.fail(f"followed a redirect to {request.url.host}")
+        return httpx.Response(302, headers={"Location": "https://attacker.example/repos/mindsdb/cowork/issues/42"})
+
+    integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
+
+    with pytest.raises(WorkspaceError, match="redirected to another host"):
+        integration.read(project(tmp_path), SourceContextRequest(
+            provider="github", kind="issue", url="https://github.com/mindsdb/cowork/issues/42",
+        ))
+
+
+def test_github_requests_still_follow_same_origin_redirects(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer secret"
+        if request.url.path == "/repos/mindsdb/cowork/issues/42":
+            return httpx.Response(301, headers={"Location": "https://api.github.com/repos/mindsdb/renamed/issues/42"})
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        assert request.url.path == "/repos/mindsdb/renamed/issues/42"
+        return httpx.Response(200, json={"title": "Renamed", "html_url": "https://github.com/mindsdb/renamed/issues/42"})
+
+    integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
+    context = integration.read(project(tmp_path), SourceContextRequest(
+        provider="github", kind="issue", url="https://github.com/mindsdb/cowork/issues/42",
+    ))
+
+    assert context.title == "Renamed"
 
 
 def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path) -> None:
