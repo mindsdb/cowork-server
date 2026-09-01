@@ -127,6 +127,21 @@ def surface() -> str | None:
         return None
 
 
+_latch_unsupported_warned = False
+
+
+def _warn_latch_unsupported_once() -> None:
+    global _latch_unsupported_warned
+    if _latch_unsupported_warned:
+        return
+    _latch_unsupported_warned = True
+    logger.warning(
+        "the installed anton has no initial_verifier_latch field, so the "
+        "completion-verifier latch will not survive between messages and a "
+        "failing verifier will re-diagnose on every one; bump the anton pin"
+    )
+
+
 def verifier_latch_kwarg(config_cls, stored) -> dict[str, object]:
     """``{"initial_verifier_latch": stored}`` for ``ChatSessionConfig``, or ``{}``.
 
@@ -140,11 +155,17 @@ def verifier_latch_kwarg(config_cls, stored) -> dict[str, object]:
     Guarded like ``surface_kwarg``: anton is pinned by rev here and by a version
     floor on the desktop wheel, so the installed copy can predate this field,
     and an unexpected keyword to a plain dataclass would raise on EVERY turn.
+
+    Unlike ``surface_kwarg`` the miss is announced once per process. An absent
+    ``surface`` degrades a trace; an absent latch silently restores a
+    customer-visible bug, and the pin is bumped by hand after anton merges, so
+    the gap must not be invisible in the environment that has it.
     """
     import dataclasses
 
     try:
         if not any(f.name == "initial_verifier_latch" for f in dataclasses.fields(config_cls)):
+            _warn_latch_unsupported_once()
             return {}
         return {"initial_verifier_latch": stored}
     except Exception:  # pragma: no cover - defensive: never fail a turn over this
