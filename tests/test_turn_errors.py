@@ -521,6 +521,58 @@ async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
     assert payload["provider_label"] == Provider.ANTHROPIC.label
 
 
+async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():
+    """An auth error can reach the handler without a role stamped on it.
+
+    Defaulting to planning would show a MindsHub "Reconnect" card for a failure
+    that may have been the BYOK Anthropic key, so an unattributable auth error
+    keeps the generic copy and no provider fields.
+    """
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _MixedSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+        resolved_router_provider = Provider.OPENAI
+
+    # role is never stamped: ProviderAuthError defaults it to None, and only
+    # LLMClient's confirmation wrappers set it.
+    exc = ProviderAuthError("provider rejected the credential")
+    assert exc.role is None
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert "reconnectable" not in payload
+    assert "provider_label" not in payload
+
+
+async def test_auth_without_a_role_still_names_an_unambiguous_provider():
+    """Both required roles agree, so there is nothing to attribute wrongly."""
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _MindsSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.MINDS_CLOUD
+        resolved_router_provider = Provider.OPENAI
+
+    exc = ProviderAuthError("provider rejected the credential")
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert payload["reconnectable"] is True
+    assert payload["provider_label"] == Provider.MINDS_CLOUD.label
+
+
 # ── Model-403 (model_access_denied / model_disabled), legacy back-compat ─
 #
 # Only pre-wallet gateway/anton versions emit these structured codes (a
@@ -1244,15 +1296,27 @@ def test_remote_error_auth():
     assert code == AUTH_ERROR_CODE
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        "ConnectionError: Invalid API key - check your configuration.",
-        "ConnectionError: Server returned 401 - Unauthorized",
-    ],
-)
-def test_remote_untyped_auth_lookalikes_are_redacted(error):
-    code, message = te.remote_turn_error(error)
+def test_remote_legacy_connection_error_still_maps_to_provider_auth():
+    """The remote worker pods still emit anton's pre-typed 401 copy.
+
+    They run the `minds-anton-scratchpad` image, pinned in scratchpad-controller
+    at anton `61ec5db6` (staging/dev) and `d4f1db2c` (prod). Neither carries
+    `ProviderAuthError`, and no PR in this ENG-2116 set bumps that image, so
+    keying only on the typed name would strip the Reconnect card from every
+    hosted 401.
+    """
+    code, message = te.remote_turn_error(
+        "ConnectionError: Invalid API key — check your OpenAI API key configuration."
+    )
+    assert code == te.AUTH_ERROR_CODE
+    assert message == te.AUTH_ERROR_USER_MESSAGE
+
+
+def test_remote_untyped_auth_lookalikes_are_redacted():
+    """A 401 that is not anton's anchored invalid-key copy stays generic."""
+    code, message = te.remote_turn_error(
+        "ConnectionError: Server returned 401 - Unauthorized"
+    )
     assert code == te.GENERIC_TURN_ERROR_CODE
     assert message == te.GENERIC_TURN_ERROR_MESSAGE
     assert "api key" not in message.lower()

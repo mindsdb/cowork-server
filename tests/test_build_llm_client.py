@@ -177,7 +177,7 @@ def test_static_minds_cloud_key_stays_static(build, monkeypatch):
     kw = calls["openai"][-1]
     assert kw["api_key"] == "mdb-key"  # minds slot, not the OpenAI slot
     assert kw["base_url"] == "https://api.mindshub.ai/v1"
-    assert kw["api_key_provider"] is None
+    assert "api_key_provider" not in kw
 
 
 def test_org_mode_minds_cloud_key_stays_static(build, monkeypatch):
@@ -196,7 +196,7 @@ def test_org_mode_minds_cloud_key_stays_static(build, monkeypatch):
     _client, calls = build(settings)
     kw = calls["openai"][-1]
     assert kw["api_key"] == "per-turn-key"
-    assert kw["api_key_provider"] is None
+    assert "api_key_provider" not in kw
 
 
 @pytest.mark.asyncio

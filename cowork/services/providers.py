@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 from urllib.parse import urlparse
 
 import httpx
-from anton.core.llm.provider import ProviderAuthError
 
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
@@ -121,10 +120,25 @@ async def _current_runtime_minds_credential() -> str:
     """
     credential = runtime_credential.get_minds_credential()
     if credential is None:
-        raise ProviderAuthError(
+        raise _provider_auth_error(
             "The MindsHub session credential is no longer available."
         )
     return credential
+
+
+def _provider_auth_error(message: str) -> ConnectionError:
+    """Anton's typed 401, or the bare ConnectionError an older anton maps to.
+
+    Imported lazily so a version-skewed anton loses the typed discriminator
+    rather than failing this module's import and taking the whole server's boot
+    with it. `handlers/turn_errors.is_auth_error` reads both shapes.
+    """
+    try:
+        from anton.core.llm.provider import ProviderAuthError
+
+        return ProviderAuthError(message)
+    except Exception:
+        return ConnectionError(f"Invalid API key — {message}")
 
 
 def provider_base_url(
@@ -1163,10 +1177,20 @@ def build_llm_client(effort_override: str | None = None):
             # The runtime credential is local-only by contract. A static
             # settings/env key and every org-mode per-turn credential leave
             # this callback unset and keep their existing lifetime.
-            api_key_provider = (
-                _current_runtime_minds_credential
+            #
+            # Splatted like effort_kw above, and for the same reason: an anton
+            # whose OpenAIProvider.__init__ predates the kwarg would TypeError
+            # on every MindsHub turn if we passed it unconditionally.
+            #
+            # This refreshes the MAIN-PROCESS provider only. anton snapshots
+            # export_connection_info().api_key once per ChatSession and hands
+            # that string to the scratchpad subprocess, which has no supplier —
+            # so a pad-side LLM call still runs on the construction-time token.
+            # ENG-2116 scopes that out; it needs a pad IPC contract.
+            credential_kw = (
+                {"api_key_provider": _current_runtime_minds_credential}
                 if runtime_credential.get_minds_credential() is not None
-                else None
+                else {}
             )
             # The MindsHub gateway executes web_search / web_fetch server-side
             # over its chat.completions passthrough:
@@ -1181,7 +1205,7 @@ def build_llm_client(effort_override: str | None = None):
                 api_key=key.get_secret_value(),
                 base_url=base,
                 flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
-                api_key_provider=api_key_provider,
+                **credential_kw,
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
