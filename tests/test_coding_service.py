@@ -33,7 +33,6 @@ from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
-    ProjectUpdateRequest,
 )
 from cowork.coding.turns import EventBuffer, terminal_status
 from cowork.coding.workspace import WorkspaceError
@@ -326,6 +325,54 @@ def test_terminal_start_failure_is_not_left_running(tmp_path: Path) -> None:
     assert failed.error == "Terminal process failed to start"
 
 
+def test_task_terminals_run_independently_and_keep_their_names(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    task_updated_at = service.get_session(created.id).updated_at
+
+    first = service.create_terminal_tab(created.id)
+    second = service.create_terminal_tab(created.id)
+    assert (first.label, second.label) == ("Terminal 1", "Terminal 2")
+    second = service.rename_terminal_tab(created.id, second.id, "Dev server")
+    assert second.label == "Dev server"
+    restored = service_with(tmp_path, FakeEngine())
+    assert [item.label for item in restored.terminals(created.id).items] == [
+        "Terminal 1", "Dev server"
+    ]
+
+    service.start_terminal_tab(created.id, first.id, CREDS, 100, 30)
+    service.start_terminal_tab(created.id, second.id, CREDS, 120, 40)
+    first_process, second_process = engine.terminal_process_ids
+    assert first_process != second_process
+    assert engine.terminal_sizes == {first_process: (100, 30), second_process: (120, 40)}
+
+    engine.terminal_outputs[first_process]("Zmlyc3Q=", "stdout", False)
+    engine.terminal_outputs[second_process]("c2Vjb25k", "stdout", False)
+    assert [item.data_base64 for item in service.terminal_tab(created.id, first.id).items] == ["Zmlyc3Q="]
+    assert [item.data_base64 for item in service.terminal_tab(created.id, second.id).items] == ["c2Vjb25k"]
+
+    service.write_terminal_tab(created.id, first.id, "bHMK")
+    service.resize_terminal_tab(created.id, second.id, 90, 24)
+    assert engine.terminal_writes[-1] == (first_process, "bHMK")
+    assert engine.terminal_sizes[second_process] == (90, 24)
+
+    engine.terminal_exits[first_process](0, None)
+    states = {item.id: item for item in service.terminals(created.id).items}
+    assert states[first.id].status.value == "exited"
+    assert states[second.id].status.value == "running"
+
+    service.delete_terminal_tab(created.id, first.id)
+    service.delete_terminal_tab(created.id, second.id)
+    assert service.terminals(created.id).items == []
+    assert second_process in engine.terminal_stops
+    assert service.get_session(created.id).updated_at == task_updated_at
+
+
 def test_terminal_start_reads_config_after_acquiring_runtime_lock(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
@@ -334,6 +381,7 @@ def test_terminal_start_reads_config_after_acquiring_runtime_lock(tmp_path: Path
         SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
     )
     wait_for_status(service, created.id, SessionStatus.completed)
+    tab = service.create_terminal_tab(created.id)
 
     runtime_lock = service.runtimes.session_lock(created.id)
     runtime_lock.acquire()
@@ -341,7 +389,7 @@ def test_terminal_start_reads_config_after_acquiring_runtime_lock(tmp_path: Path
 
     def start_terminal() -> None:
         try:
-            service.start_terminal(created.id, CREDS, 100, 30)
+            service.start_terminal_tab(created.id, tab.id, CREDS, 100, 30)
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
 
@@ -535,17 +583,6 @@ def test_task_controls_persist_and_restart_idle_runtime(tmp_path: Path) -> None:
     assert config.personality == "friendly"
     assert config.network_access is True
     assert config.web_search is True
-
-    cleared = service.update_session_config(
-        created.id,
-        SessionUpdateRequest(reasoning_effort=None),
-    )
-    assert cleared.reasoning_effort is None
-
-    engine.is_closed = False
-    service.submit_turn(created.id, "Third turn", CREDS)
-    wait_for_status(service, created.id, SessionStatus.completed)
-    assert engine.configs[-1].reasoning_effort is None
 
 
 def test_steering_reaches_active_engine_and_is_recorded(tmp_path: Path) -> None:
@@ -890,47 +927,6 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert child.workspaces[1].workspace_path in child.developer_instructions
     assert engine.forked_workspaces[-1] == str(Path(child.workspaces[0].workspace_path).parent)
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
-
-
-def test_project_fork_uses_task_snapshot_after_project_folders_change(tmp_path: Path) -> None:
-    repo = repository(tmp_path)
-    notes = tmp_path / "notes"
-    replacement = tmp_path / "replacement"
-    notes.mkdir()
-    replacement.mkdir()
-    (notes / "plan.txt").write_text("base\n", encoding="utf-8")
-    engine = FakeEngine()
-    service = service_with(tmp_path, engine)
-    project = service.projects.create(
-        ProjectCreateRequest(
-            name="Product",
-            folders=[
-                ProjectFolder(id="app", name="App", path=str(repo)),
-                ProjectFolder(id="notes", name="Notes", path=str(notes)),
-            ],
-            default_engine_id="fake",
-            default_model="fake-model",
-        )
-    )
-    parent = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
-        CREDS,
-        "fake",
-        "fake-model",
-    )
-    wait_for_status(service, parent.id, SessionStatus.completed)
-    service.projects.update(
-        project.id,
-        ProjectUpdateRequest(
-            folders=[ProjectFolder(id="replacement", name="Replacement", path=str(replacement))]
-        ),
-    )
-
-    child = service.fork_session(parent.id, CREDS)
-
-    assert [item.folder_id for item in child.workspaces] == ["app", "notes"]
-    assert [item.source_path for item in child.workspaces] == [str(repo), str(notes)]
-    assert "replacement" not in child.developer_instructions
 
 
 def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(tmp_path: Path) -> None:

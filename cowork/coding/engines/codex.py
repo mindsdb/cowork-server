@@ -19,6 +19,7 @@ from cowork.coding.contracts import (
     EventType,
     ExtensionInventory,
     RuntimePlatformStatus,
+    TerminalShellPreference,
 )
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
@@ -152,6 +153,12 @@ class CodexEngineSession:
         )
         self._client = CodexClient(config=client_config, approval_handler=approval_handler)
         self._workspace = workspace
+        self._terminal_workspace = codex_config.terminal_workspace(
+            cowork_root,
+            config.session_id,
+            workspace,
+            config.workspace_label,
+        )
         self._skill_roots = None if config.skill_roots is None else tuple(config.skill_roots)
         self._model = config.model
         self._reasoning_effort = config.reasoning_effort
@@ -476,6 +483,7 @@ class CodexEngineSession:
         process_id: str,
         cols: int,
         rows: int,
+        shell: TerminalShellPreference,
         output_handler: TerminalOutputHandler,
         exit_handler: TerminalExitHandler,
     ) -> None:
@@ -487,7 +495,7 @@ class CodexEngineSession:
             self._terminal_handlers[process_id] = output_handler
         worker = threading.Thread(
             target=self._run_terminal,
-            args=(process_id, cols, rows, exit_handler),
+            args=(process_id, cols, rows, shell, exit_handler),
             name=f"codex-terminal-{process_id[:8]}",
             daemon=True,
         )
@@ -560,6 +568,7 @@ class CodexEngineSession:
         process_id: str,
         cols: int,
         rows: int,
+        shell: TerminalShellPreference,
         exit_handler: TerminalExitHandler,
     ) -> None:
         from openai_codex.generated.v2_all import CommandExecResponse
@@ -567,11 +576,13 @@ class CodexEngineSession:
         exit_code: int | None = None
         error: str | None = None
         try:
+            command = codex_config.interactive_shell(shell)
             response = self._client.request(
                 "command/exec",
                 {
-                    "command": codex_config.interactive_shell(),
-                    "cwd": str(self._workspace),
+                    "command": command,
+                    "cwd": str(self._terminal_workspace),
+                    "env": codex_config.interactive_shell_environment(command, self._terminal_workspace),
                     "processId": process_id,
                     "sandboxPolicy": self._sandbox_policy,
                     "size": {"cols": cols, "rows": rows},

@@ -38,6 +38,17 @@ class PermissionMode(str, Enum):
     full_access = "full_access"
 
 
+class TerminalShellPreference(str, Enum):
+    auto = "auto"
+    bash = "bash"
+    zsh = "zsh"
+    fish = "fish"
+    system = "system"
+    pwsh = "pwsh"
+    powershell = "powershell"
+    cmd = "cmd"
+
+
 class EventType(str, Enum):
     session = "session"
     user_message = "user_message"
@@ -265,6 +276,20 @@ class ResolvedSkill(BaseModel):
     content_hash: str
 
 
+class TerminalTab(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=80)
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("label")
+    @classmethod
+    def clean_label(cls, value: str) -> str:
+        label = value.strip()
+        if not label:
+            raise ValueError("terminal names cannot be empty")
+        return label
+
+
 class CodingSession(BaseModel):
     schema_version: int = SCHEMA_VERSION
     id: str
@@ -307,6 +332,7 @@ class CodingSession(BaseModel):
     active_turn_id: str | None = None
     pending_approval: PendingApproval | None = None
     queued_instructions: list[QueuedInstruction] = Field(default_factory=list)
+    terminal_tabs: list[TerminalTab] = Field(default_factory=list, max_length=12)
     archived: bool = False
     last_error: str | None = None
     event_count: int = 0
@@ -448,9 +474,57 @@ class TerminalPage(BaseModel):
     error: str | None = None
 
 
+class TerminalTabState(TerminalTab):
+    status: TerminalStatus = TerminalStatus.stopped
+    exit_code: int | None = None
+    error: str | None = None
+
+
+class TerminalTabPage(BaseModel):
+    items: list[TerminalTabState] = Field(default_factory=list)
+
+
+class TerminalCreateRequest(BaseModel):
+    label: str | None = Field(default=None, max_length=80)
+
+    @field_validator("label")
+    @classmethod
+    def clean_optional_label(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        label = value.strip()
+        if not label:
+            raise ValueError("terminal names cannot be empty")
+        return label
+
+
+class TerminalRenameRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+
+    @field_validator("label")
+    @classmethod
+    def clean_label(cls, value: str) -> str:
+        label = value.strip()
+        if not label:
+            raise ValueError("terminal names cannot be empty")
+        return label
+
+
 class TerminalStartRequest(BaseModel):
     cols: int = Field(default=100, ge=1, le=1_000)
     rows: int = Field(default=30, ge=1, le=1_000)
+    shell: TerminalShellPreference = TerminalShellPreference.auto
+
+
+class TerminalShellOption(BaseModel):
+    id: TerminalShellPreference
+    label: str
+
+
+class TerminalShellInventory(BaseModel):
+    platform: str
+    resolved: TerminalShellPreference
+    items: list[TerminalShellOption]
 
 
 class TerminalInputRequest(BaseModel):
