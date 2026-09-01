@@ -180,6 +180,26 @@ def test_cleanup_snapshot_is_truncated_at_the_combined_patch_budget(
     git(repo, "apply", "--check", str(snapshot_dir / "cleanup.patch"))
 
 
+def test_cleanup_snapshot_keeps_only_the_note_when_the_first_file_exceeds_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-snapshot-oversized", str(repo), False)
+    (prepared.workspace_path / "large.bin").write_bytes(random.Random(0).randbytes(50_000))
+    monkeypatch.setattr(workspace_module, "MAX_TOTAL_DIFF_BYTES", 4_096)
+
+    manager.cleanup(
+        "session-snapshot-oversized", str(repo), str(prepared.workspace_path), prepared.kind, prepared.base_revision
+    )
+
+    snapshot_dir = tmp_path / "coding" / "snapshots" / "session-snapshot-oversized"
+    assert not (snapshot_dir / "cleanup.patch").exists()
+    assert (snapshot_dir / "cleanup.patch.truncated").read_text(encoding="utf-8") == (
+        workspace_module.SNAPSHOT_TRUNCATED_MARKER
+    )
+
+
 def test_handoff_and_fork_move_a_patch_over_the_cleanup_budget_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

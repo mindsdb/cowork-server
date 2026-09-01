@@ -175,6 +175,7 @@ class CodingEvent(BaseModel):
     phase: Literal["started", "progress", "completed", "failed", "pending"] | None = None
     item_id: str | None = None
     turn_id: str | None = None
+    source_event_id: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("title")

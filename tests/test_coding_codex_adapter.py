@@ -312,6 +312,19 @@ def test_extension_inventory_folds_a_skill_installed_in_both_skill_roots(tmp_pat
     assert surviving.supersedes[0].label == "Thermo Nuclear Review"
     assert surviving.supersedes[0].description == "Thermo Nuclear Review skill"
     assert surviving.detail == "repo · also installed in user"
+    assert len({entry.id for entry in inventory.skills}) == len(inventory.skills)
+
+
+def test_extension_inventory_ids_survivors_by_their_fold_key(tmp_path: Path) -> None:
+    user_root = tmp_path / "codex" / "skills"
+    titled = _codex_skill("Thermo Nuclear Review", user_root / "Thermo Nuclear Review" / "SKILL.md", "user")
+    hyphenated = _codex_skill("Thermo-Nuclear-Review", user_root / "thermo-nuclear-review" / "SKILL.md", "user")
+
+    inventory = _skills_inventory([titled, hyphenated], ())
+
+    assert [entry.id for entry in inventory.skills] == ["thermo-nuclear-review"]
+    assert inventory.skills[0].label == "Thermo Nuclear Review"
+    assert [hidden.id for hidden in inventory.skills[0].supersedes] == ["Thermo-Nuclear-Review"]
 
 
 def test_extension_inventory_keeps_a_pathless_skill_out_of_the_snapshot_root(tmp_path: Path) -> None:

@@ -13,13 +13,14 @@ from cowork.db.scoped import LOCAL_SCOPE
 from cowork.schemas.connectors import DirectSaveRequest
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
+    PinnedHostTransport,
     ValidatedDeveloperIdentity,
     validate_developer_connection,
 )
 
 
-def _client(handler) -> httpx.Client:
-    return httpx.Client(transport=httpx.MockTransport(handler))
+def _refusing_network() -> httpx.MockTransport:
+    return httpx.MockTransport(lambda _request: pytest.fail("network called"))
 
 
 def test_github_token_is_verified_and_resolves_account_identity() -> None:
@@ -28,15 +29,68 @@ def test_github_token_is_verified_and_resolves_account_identity() -> None:
         assert request.headers["Authorization"] == "Bearer github_pat_secret"
         return httpx.Response(200, json={"login": "ian-mindsdb", "email": None})
 
-    with _client(handle) as client:
-        result = validate_developer_connection(
-            "github",
-            "fine-grained-pat",
-            {"access_token": "github_pat_secret", "base_url": "https://github.com"},
-            client=client,
-        )
+    result = validate_developer_connection(
+        "github",
+        "fine-grained-pat",
+        {"access_token": "github_pat_secret", "base_url": "https://github.com"},
+        transport=httpx.MockTransport(handle),
+    )
 
     assert result.account_email == "ian-mindsdb"
+
+
+def test_github_enterprise_probe_connects_to_the_validated_address() -> None:
+    def resolve(_host, _port, **_kwargs):
+        return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://93.184.216.34/api/v3/user"
+        assert request.headers["Host"] == "github.enterprise.example"
+        assert request.extensions["sni_hostname"] == "github.enterprise.example"
+        assert request.headers["Authorization"] == "Bearer github_pat_secret"
+        return httpx.Response(200, json={"login": "ian-mindsdb"})
+
+    result = validate_developer_connection(
+        "github",
+        "fine-grained-pat",
+        {"access_token": "github_pat_secret", "base_url": "https://github.enterprise.example"},
+        transport=httpx.MockTransport(handle),
+        resolver=resolve,
+    )
+
+    assert result.account_email == "ian-mindsdb"
+
+
+def test_pinned_enterprise_hosts_with_one_address_receive_separate_connection_pools() -> None:
+    created: list[str] = []
+    seen: list[tuple[str, str, str]] = []
+
+    def factory() -> httpx.BaseTransport:
+        pool = f"pool-{len(created) + 1}"
+        created.append(pool)
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append((pool, request.headers["Host"], request.headers["Authorization"]))
+            return httpx.Response(200, json={"pool": pool})
+
+        return httpx.MockTransport(handle)
+
+    def resolve(_host, _port, **_kwargs):
+        return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+    transport = PinnedHostTransport(_refusing_network(), resolve, pinned_transport_factory=factory)
+    transport.pin("one.enterprise.example")
+    transport.pin("two.enterprise.example")
+    with transport.client(trust_env=False) as client:
+        one = client.get("https://one.enterprise.example/api/v3/user", headers={"Authorization": "Bearer one"})
+        two = client.get("https://two.enterprise.example/api/v3/user", headers={"Authorization": "Bearer two"})
+
+    assert one.json() == {"pool": "pool-1"}
+    assert two.json() == {"pool": "pool-2"}
+    assert seen == [
+        ("pool-1", "one.enterprise.example", "Bearer one"),
+        ("pool-2", "two.enterprise.example", "Bearer two"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -49,14 +103,13 @@ def test_github_token_is_verified_and_resolves_account_identity() -> None:
     ],
 )
 def test_github_enterprise_rejects_insecure_or_private_base_urls(base_url: str) -> None:
-    with _client(lambda _request: pytest.fail("network called")) as client:
-        with pytest.raises(DeveloperCredentialError):
-            validate_developer_connection(
-                "github",
-                "fine-grained-pat",
-                {"access_token": "github_pat_secret", "base_url": base_url},
-                client=client,
-            )
+    with pytest.raises(DeveloperCredentialError):
+        validate_developer_connection(
+            "github",
+            "fine-grained-pat",
+            {"access_token": "github_pat_secret", "base_url": base_url},
+            transport=_refusing_network(),
+        )
 
 
 def test_github_enterprise_resolves_every_address_before_sending_credentials() -> None:
@@ -66,15 +119,14 @@ def test_github_enterprise_resolves_every_address_before_sending_credentials() -
             (2, 1, 6, "", ("127.0.0.1", 443)),
         ]
 
-    with _client(lambda _request: pytest.fail("network called")) as client:
-        with pytest.raises(DeveloperCredentialError, match="publicly routable"):
-            validate_developer_connection(
-                "github",
-                "fine-grained-pat",
-                {"access_token": "github_pat_secret", "base_url": "https://github.enterprise.example"},
-                client=client,
-                resolver=resolve,
-            )
+    with pytest.raises(DeveloperCredentialError, match="publicly routable"):
+        validate_developer_connection(
+            "github",
+            "fine-grained-pat",
+            {"access_token": "github_pat_secret", "base_url": "https://github.enterprise.example"},
+            transport=_refusing_network(),
+            resolver=resolve,
+        )
 
 
 def test_linear_key_is_verified_and_resolves_account_identity() -> None:
@@ -84,13 +136,12 @@ def test_linear_key_is_verified_and_resolves_account_identity() -> None:
         assert b"CodeConnectorViewer" in request.content
         return httpx.Response(200, json={"data": {"viewer": {"id": "u1", "name": "Ian", "email": "ian@mindsdb.com"}}})
 
-    with _client(handle) as client:
-        result = validate_developer_connection(
-            "linear",
-            "personal-api-key",
-            {"api_key": "lin_api_secret"},
-            client=client,
-        )
+    result = validate_developer_connection(
+        "linear",
+        "personal-api-key",
+        {"api_key": "lin_api_secret"},
+        transport=httpx.MockTransport(handle),
+    )
 
     assert result.account_email == "ian@mindsdb.com"
 
@@ -104,9 +155,8 @@ def test_linear_key_is_verified_and_resolves_account_identity() -> None:
     ],
 )
 def test_missing_or_unsupported_credentials_fail_before_network(provider, method, values) -> None:
-    with _client(lambda _request: pytest.fail("network called")) as client:
-        with pytest.raises(DeveloperCredentialError):
-            validate_developer_connection(provider, method, values, client=client)
+    with pytest.raises(DeveloperCredentialError):
+        validate_developer_connection(provider, method, values, transport=_refusing_network())
 
 
 def test_validate_and_save_augments_the_vault_record_with_verified_identity(tmp_path: Path, monkeypatch) -> None:

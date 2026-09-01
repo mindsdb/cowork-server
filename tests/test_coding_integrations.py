@@ -49,7 +49,7 @@ def project(tmp_path: Path) -> CodeProject:
 
 
 def service(handler, fields: dict[tuple[str, str], dict], **kwargs) -> DeveloperIntegrationService:
-    integration = DeveloperIntegrationService(None, httpx.Client(transport=httpx.MockTransport(handler)), **kwargs)
+    integration = DeveloperIntegrationService(None, transport=httpx.MockTransport(handler), **kwargs)
     integration.connections = FakeConnections(fields)  # type: ignore[assignment]
     return integration
 
@@ -75,6 +75,178 @@ def test_github_token_is_never_attached_to_an_insecure_or_private_base_url(tmp_p
         integration.git_push_credentials(current, f"{base_url}/mindsdb/cowork.git", "github-work")
     with pytest.raises(WorkspaceError):
         integration.search(current, WorkItemSearchRequest(provider="github", query="login"))
+
+
+def public_resolver(_host, _port, **_kwargs):
+    return [(2, 1, 6, "", ("140.82.112.3", 443))]
+
+
+GHE_ISSUE = SourceContextRequest(
+    provider="github", kind="issue", url="https://ghe.example.com/mindsdb/cowork/issues/42",
+)
+GHE_FIELDS = {("github", "github-work"): {"access_token": "secret", "base_url": "https://ghe.example.com"}}
+
+
+def test_github_enterprise_requests_connect_to_the_address_validated_at_resolution(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "140.82.112.3"
+        assert request.headers["Host"] == "ghe.example.com"
+        assert request.extensions["sni_hostname"] == "ghe.example.com"
+        assert request.headers["Authorization"] == "Bearer secret"
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"title": "Pinned", "html_url": "https://ghe.example.com/mindsdb/cowork/issues/42"})
+
+    integration = service(handler, GHE_FIELDS, resolver=public_resolver)
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Pinned"
+
+
+def test_github_enterprise_request_is_refused_when_the_host_rebinds_to_a_private_address(tmp_path: Path) -> None:
+    answers = iter([public_resolver, private_resolver])
+
+    def rebinding_resolver(host, port, **kwargs):
+        return next(answers)(host, port, **kwargs)
+
+    served: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "140.82.112.3"
+        served.append(request.url.path)
+        return httpx.Response(200, json={"title": "Pinned"})
+
+    integration = service(handler, GHE_FIELDS, resolver=rebinding_resolver)
+
+    with pytest.raises(WorkspaceError, match="publicly routable"):
+        integration.read(project(tmp_path), GHE_ISSUE)
+    assert served == ["/api/v3/repos/mindsdb/cowork/issues/42"]
+
+
+def test_github_enterprise_hosts_are_resolved_once_per_request(tmp_path: Path) -> None:
+    resolutions: list[str] = []
+
+    def counting_resolver(host, port, **kwargs):
+        resolutions.append(host)
+        return public_resolver(host, port, **kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "140.82.112.3"
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Pinned"})
+
+    integration = service(handler, GHE_FIELDS, resolver=counting_resolver)
+    integration.read(project(tmp_path), GHE_ISSUE)
+
+    assert resolutions == ["ghe.example.com", "ghe.example.com"]
+
+
+def test_github_enterprise_requests_fall_back_to_the_next_validated_address(tmp_path: Path) -> None:
+    def dual_stack_resolver(_host, _port, **_kwargs):
+        return [(30, 1, 6, "", ("2606:4700::6810:1", 443, 0, 0)), (2, 1, 6, "", ("140.82.112.3", 443))]
+
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.host)
+        if request.url.host != "140.82.112.3":
+            raise httpx.ConnectError("Network is unreachable", request=request)
+        assert request.headers["Host"] == "ghe.example.com"
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Pinned"})
+
+    integration = service(handler, GHE_FIELDS, resolver=dual_stack_resolver)
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Pinned"
+    assert attempts[:2] == ["2606:4700::6810:1", "140.82.112.3"]
+
+
+def test_github_enterprise_requests_stay_pinned_through_an_environment_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    proxies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "140.82.112.3"
+        assert request.headers["Host"] == "ghe.example.com"
+        assert request.extensions["sni_hostname"] == "ghe.example.com"
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Pinned"})
+
+    def recording_transport(*, proxy=None, **_kwargs):
+        proxies.append(proxy)
+        return httpx.MockTransport(handler)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", recording_transport)
+    integration = DeveloperIntegrationService(None, resolver=public_resolver)
+    integration.connections = FakeConnections(GHE_FIELDS)  # type: ignore[assignment]
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Pinned"
+    assert "http://proxy.example:3128" in proxies
+
+
+def test_github_enterprise_same_origin_redirects_are_pinned_again(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "140.82.112.3"
+        assert request.headers["Host"] == "ghe.example.com"
+        if request.url.path == "/api/v3/repos/mindsdb/cowork/issues/42":
+            return httpx.Response(301, headers={"Location": "https://ghe.example.com/api/v3/repos/mindsdb/renamed/issues/42"})
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        assert request.url.path == "/api/v3/repos/mindsdb/renamed/issues/42"
+        return httpx.Response(200, json={"title": "Renamed"})
+
+    integration = service(handler, GHE_FIELDS, resolver=public_resolver)
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Renamed"
+
+
+def test_github_enterprise_request_fails_closed_when_the_host_has_no_addresses(tmp_path: Path) -> None:
+    integration = service(
+        lambda _request: pytest.fail("connected to a host that resolved to nothing"),
+        GHE_FIELDS,
+        resolver=lambda *_args, **_kwargs: [],
+    )
+
+    with pytest.raises(WorkspaceError, match="publicly routable"):
+        integration.read(project(tmp_path), GHE_ISSUE)
+
+
+def test_github_enterprise_ipv6_literal_host_keeps_its_brackets_and_port(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith("https://[2606:4700::6810:1]:8443/api/v3/")
+        assert request.headers["Host"] == "[2606:4700::6810:1]:8443"
+        assert request.extensions["sni_hostname"] == "2606:4700::6810:1"
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Literal"})
+
+    integration = service(
+        handler,
+        {("github", "github-work"): {"access_token": "secret", "base_url": "https://[2606:4700::6810:1]:8443"}},
+        resolver=lambda *_args, **_kwargs: pytest.fail("an address literal must not be resolved"),
+    )
+    context = integration.read(project(tmp_path), SourceContextRequest(
+        provider="github", kind="issue", url="https://[2606:4700::6810:1]:8443/mindsdb/cowork/issues/42",
+    ))
+
+    assert context.title == "Literal"
+
+
+def test_github_com_requests_are_sent_without_address_pinning(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.github.com"
+        assert "sni_hostname" not in request.extensions
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Public"})
+
+    integration = service(
+        handler,
+        {("github", "github-work"): {"access_token": "secret"}},
+        resolver=lambda *_args, **_kwargs: pytest.fail("github.com must not be resolved by the service"),
+    )
+    context = integration.read(project(tmp_path), SourceContextRequest(
+        provider="github", kind="issue", url="https://github.com/mindsdb/cowork/issues/42",
+    ))
+
+    assert context.title == "Public"
 
 
 def test_github_requests_do_not_follow_redirects_to_another_host(tmp_path: Path) -> None:

@@ -190,14 +190,13 @@ class SessionLifecycleOperations:
         try:
             child_skill_roots = self.skill_runtime.clone(parent.id, new_id)
             parent_runtime = self.runtimes.open_locked(parent, credentials)
-            child = parent.model_copy(
+            child = self.store.load_session(parent.id).model_copy(
                 update={
                     "id": new_id,
                     "title": f"{parent.title} (fork)"[:200],
                     "task_id": control_snapshot.task.id,
                     "run_id": control_snapshot.run.id,
                     "computer_id": control_snapshot.computer.id,
-                    "run_status": RunStatus.completed.value,
                     "runtime_epoch": control_snapshot.run.epoch,
                     "resource_ids": (
                         [item.id for item in project.resources]
