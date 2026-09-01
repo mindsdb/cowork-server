@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import time
 
@@ -90,7 +91,7 @@ def heartbeat_runtime(
 
 
 @router.post("/computers/{computer_id}/lease", response_model=RuntimeLease | None)
-def acquire_runtime_lease(
+async def acquire_runtime_lease(
     computer_id: str,
     body: RuntimeLeaseRequest,
     request: Request,
@@ -99,12 +100,12 @@ def acquire_runtime_lease(
     _authenticate(request, computer_id)
     deadline = time.monotonic() + body.wait_seconds
     while True:
-        lease = get_coding_service().remote.acquire_lease(computer_id)
+        lease = await asyncio.to_thread(get_coding_service().remote.acquire_lease, computer_id)
         if lease is not None:
             return lease
         if time.monotonic() >= deadline:
             return None
-        time.sleep(0.25)
+        await asyncio.sleep(0.25)
 
 
 @router.post("/runs/{run_id}/events")
