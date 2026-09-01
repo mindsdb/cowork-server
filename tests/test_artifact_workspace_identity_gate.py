@@ -6,6 +6,7 @@ signature would look tested while never running. These go over HTTP.
 """
 from __future__ import annotations
 
+import mimetypes
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -106,3 +107,59 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
     assert artifact_scope._sources_for_project_ref(object(), request_ref) == []
     assert seen == [server_id]
     assert seen[0] is server_id
+
+
+# ── ?download=1 is read at the route boundary (ENG-2044) ─────────────────────
+# test_artifact_draft_pinned_serving.py exercises the download behaviour by
+# calling the handler with `download=True`. That proves the header builder, not
+# that FastAPI parses the query string into the parameter — a `Query(False)`
+# default that leaks the `Query` object into a direct call, or a renamed
+# parameter, would leave those tests green while every real request ignored
+# the flag. These go over HTTP for the same reason the gate tests above do.
+
+# See test_artifact_draft_pinned_serving.py: the built-in mimetypes map has no
+# `.xlsx`, so the expectation is derived the way the route derives it.
+_XLSX = mimetypes.guess_type("model.xlsx")[0] or "application/octet-stream"
+
+
+@pytest.fixture
+def served_xlsx(tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "model"
+    folder.mkdir(parents=True)
+    (folder / "model.xlsx").write_bytes(b"PK\x03\x04sheet")
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    monkeypatch.setattr(
+        workspace_ep, "review_artifact_for_request",
+        lambda *_args: (source, folder, {"type": "file"}, True),
+    )
+    return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef/model.xlsx"
+
+
+@pytest.mark.parametrize("flag", ["1", "true"])
+def test_download_flag_reaches_the_handler_over_http(client, served_xlsx, flag):
+    res = client.get(f"{served_xlsx}?download={flag}")
+
+    assert res.status_code == 200, res.text
+    assert res.headers["content-disposition"] == (
+        "attachment; filename=\"model.xlsx\"; filename*=UTF-8''model.xlsx"
+    )
+    assert res.headers["content-type"].startswith(_XLSX)
+    assert res.headers["x-content-type-options"] == "nosniff"
+    assert res.content == b"PK\x03\x04sheet"
+
+
+@pytest.mark.parametrize("query", ["", "?download=0", "?download=false"])
+def test_preview_is_unchanged_without_the_flag(client, served_xlsx, query):
+    res = client.get(f"{served_xlsx}{query}")
+
+    assert res.status_code == 200, res.text
+    assert "content-disposition" not in res.headers
+    assert res.content == b"PK\x03\x04sheet"
