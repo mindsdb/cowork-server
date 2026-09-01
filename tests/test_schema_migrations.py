@@ -575,3 +575,48 @@ def test_migrated_schema_enforces_one_attribution_row_per_resource(
         "shared_resource_attributions lost its unique key; concurrent creates "
         f"can now record two creators. Unique indexes found: {unique_columns}"
     )
+
+
+def _table_columns(path, table_name: str) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _has_index(path, index_name: str) -> bool:
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+    return index_name in {row[0] for row in rows}
+
+
+def test_project_display_name_downgrade_keeps_the_projects_indexes(tmp_path, monkeypatch):
+    """ENG-1676. The display_name downgrade must not rebuild the projects table.
+
+    `op.batch_alter_table` recreates the table on SQLite, and
+    `uq_projects_default_per_org` is expression-based — SQLAlchemy cannot
+    reflect it (it warns and skips), so the rebuild drops it silently and every
+    *later* downgrade in the chain then dies on `DROP INDEX
+    uq_projects_default_per_org`. The failure surfaces in an unrelated
+    migration's test, which is what makes it worth pinning here by name.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "display_name.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert "display_name" in _table_columns(db_path, "projects")
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+    _downgrade_to(engine, uri, "a4c8e1f6b3d9")
+
+    assert "display_name" not in _table_columns(db_path, "projects")
+    # The whole point: the index survives the column drop.
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+    # And the chain still runs forward again afterwards.
+    _upgrade_to(engine, uri, "e2b7d4f9a1c3")
+    assert "display_name" in _table_columns(db_path, "projects")
+    assert _has_index(db_path, "uq_projects_default_per_org")

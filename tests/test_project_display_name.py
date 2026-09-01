@@ -1,0 +1,155 @@
+"""The user-facing project label (ENG-1676).
+
+`name` is the slug: the on-disk directory, the URL segment and the lookup key.
+It is produced by an ASCII allowlist, so a Cyrillic/CJK/Arabic name sanitized
+to nothing and the project was created as `untitled-project`, `-2`, `-3` — a
+whole project list collapsing into an unnamed sequence.
+
+`display_name` holds what the user typed. It is purely additive: nothing here
+may change a slug, a path, or how a project is addressed.
+"""
+from __future__ import annotations
+
+import pytest
+from sqlmodel import Session, SQLModel, create_engine
+from sqlalchemy.pool import StaticPool
+
+from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.models.project import Project
+from cowork.services.projects import (
+    GENERAL_PROJECT,
+    GENERAL_PROJECT_ID,
+    ProjectService,
+    display_label,
+)
+
+ORG = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+
+@pytest.fixture()
+def db(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as seed:
+        seed.add(Project(id=GENERAL_PROJECT_ID, name=GENERAL_PROJECT,
+                         path=str(tmp_path / "projects" / "general"), is_active=True))
+        seed.commit()
+    yield engine
+    get_app_settings.cache_clear()
+
+
+def _svc(engine) -> ProjectService:
+    return ProjectService(ScopedSession(Session(engine), TenantScope(org_mode=True, org_id=ORG, user_id="u1")))
+
+
+# ── the resolver ────────────────────────────────────────────────────────────
+
+def test_a_row_without_a_display_name_reads_as_its_slug():
+    """Every project that predates the column. No backfill ran, so this is the
+    state of all of them, and they must render exactly as they always have."""
+    assert display_label(Project(name="reports", display_name=None, path="/x")) == "reports"
+
+
+def test_a_row_with_a_display_name_reads_as_that():
+    assert display_label(Project(name="untitled-project", display_name="Мій проєкт", path="/x")) == "Мій проєкт"
+
+
+# ── creation ────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("typed", [
+    "Мій тестовий проєкт",   # Ukrainian — the reported case
+    "我的项目",                # Chinese
+    "テストプロジェクト",        # Japanese
+    "Δοκιμαστικό έργο",      # Greek
+    "مشروع تجريبي",           # Arabic
+    "פרויקט בדיקה",           # Hebrew
+    "Mon Projet Café",       # accented Latin — was silently mangled, not destroyed
+    "My Test Project",       # plain ASCII with spaces
+])
+def test_the_typed_name_survives_verbatim(db, typed):
+    project = _svc(db).create_project(typed)
+    assert display_label(project) == typed
+
+
+def test_the_slug_is_untouched_by_any_of_this(db):
+    """The whole safety argument: `name` still comes out of the same ASCII
+    sanitizer, so the directory, the routes and the lookup key are unchanged."""
+    project = _svc(db).create_project("Мій тестовий проєкт")
+    assert project.name == "untitled-project"
+    assert project.name in project.path
+
+
+def test_whitespace_only_input_stores_the_fallback_label_not_null(db):
+    """NULL is reserved for "predates the column". A project created now always
+    carries an explicit label, even when the user typed nothing meaningful —
+    otherwise the slug would leak through the resolver on a brand-new row."""
+    project = _svc(db).create_project("   ")
+    assert project.display_name == "untitled-project"
+    assert display_label(project) == "untitled-project"
+
+
+# ── duplicates ──────────────────────────────────────────────────────────────
+
+def test_two_projects_typed_the_same_do_not_display_the_same(db):
+    """Slugs already differ (`untitled-project`, `-2`), but the labels would
+    have been identical in the sidebar — the reason we dedupe on the label."""
+    svc = _svc(db)
+    first = svc.create_project("Мій проєкт")
+    second = svc.create_project("Мій проєкт")
+    third = svc.create_project("Мій проєкт")
+    assert [display_label(p) for p in (first, second, third)] == [
+        "Мій проєкт", "Мій проєкт 2", "Мій проєкт 3",
+    ]
+    assert first.name != second.name != third.name
+
+
+def test_a_literal_name_collides_with_an_older_slug_labelled_project(db):
+    """Dedupe compares the RESOLVED label, so a legacy row (display_name NULL,
+    labelled by its slug) still blocks that exact string."""
+    svc = _svc(db)
+    legacy = svc.create_project("reports")
+    assert legacy.name == "reports"
+    typed_the_slug = svc.create_project("reports")
+    assert display_label(typed_the_slug) == "reports 2"
+
+
+def test_the_human_suffix_is_a_space_not_the_slug_hyphen(db):
+    svc = _svc(db)
+    svc.create_project("Quarterly Review")
+    second = svc.create_project("Quarterly Review")
+    assert display_label(second) == "Quarterly Review 2"
+    assert display_label(second) != "Quarterly-Review-2"
+
+
+# ── rename ──────────────────────────────────────────────────────────────────
+
+def test_rename_updates_the_label_even_when_the_slug_cannot_move(db):
+    """Two different Cyrillic names sanitize to the same slug, so the rename
+    branch that moves the directory never fires — and the label still has to
+    follow, because the user did rename the project."""
+    svc = _svc(db)
+    project = svc.create_project("Перший проєкт")
+    slug_before = project.name
+    renamed = svc.update_project(project.id, name="Другий проєкт")
+    assert display_label(renamed) == "Другий проєкт"
+    assert renamed.name == slug_before  # nothing moved on disk
+
+
+def test_rename_still_moves_the_directory_when_the_slug_changes(db):
+    """Today's mechanics are deliberately untouched by this ticket."""
+    from pathlib import Path
+    svc = _svc(db)
+    project = svc.create_project("alpha")
+    old_path = Path(project.path)
+    assert old_path.exists()
+    renamed = svc.update_project(project.id, name="beta")
+    assert renamed.name == "beta"
+    assert Path(renamed.path).exists()
+    assert Path(renamed.path).name == "beta"
+    assert not old_path.exists()
+    assert display_label(renamed) == "beta"

@@ -352,7 +352,11 @@ def update_project(
                     access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
                 )
                 resolved_name = service.resolve_update_name(current, body.name)
-                if resolved_name == current.name:
+                label_target = service.resolve_display_label(current, body.name)
+                label_changes = label_target != (
+                    current.display_name or current.name
+                )
+                if resolved_name == current.name and not label_changes:
                     # Active selection remains member-wide and is not a protected
                     # project mutation, even when the client echoes a normalized or
                     # collision-resolved spelling of the current name.
@@ -361,6 +365,49 @@ def update_project(
                         name=None,
                         is_active=body.is_active,
                     )
+                elif resolved_name == current.name:
+                    # Same slug, different label. Every pair of Cyrillic names
+                    # sanitizes to the same slug (ENG-1676), so this is a real
+                    # rename that moves nothing: no directory hop, no skill
+                    # reference rewrite, so none of the move machinery below
+                    # applies. But the label is what every member sees, so it
+                    # must clear the same creator/admin gate as a slug rename
+                    # rather than riding the unprotected active-selection path
+                    # above.
+                    if current.name == GENERAL_PROJECT:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="The General project is immutable",
+                        )
+                    access.require_change(
+                        (
+                            attribution.created_by_id
+                            if attribution is not None
+                            else current.created_by
+                        )
+                        or current.created_by,
+                        detail="Only the project creator or an organization admin can rename this project",
+                    )
+                    updated, label_stage = service.stage_project_update(
+                        project_id,
+                        resolved_name=None,
+                        is_active=body.is_active,
+                        display_label=body.name,
+                    )
+                    try:
+                        access.stage_update(
+                            PROJECT,
+                            resource_key,
+                            action="rename",
+                            fallback_creator_id=updated.created_by,
+                        )
+                        updated = service.commit_staged_project_update(
+                            updated,
+                            label_stage,
+                        )
+                    except Exception:
+                        session.rollback()
+                        raise
                 else:
                     if current.name == GENERAL_PROJECT:
                         raise HTTPException(
