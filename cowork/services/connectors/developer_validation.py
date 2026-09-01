@@ -90,7 +90,7 @@ def _validate_github(
         raise DeveloperCredentialError("Enter a valid GitHub base URL.")
 
     if base_url.casefold() != "https://github.com":
-        _require_public_host(parsed.hostname, resolver)
+        require_public_host(parsed.hostname, resolver)
 
     api_url = "https://api.github.com" if base_url.casefold() == "https://github.com" else f"{base_url}/api/v3"
     response = client.get(
@@ -113,7 +113,7 @@ def _validate_github(
     return ValidatedDeveloperIdentity(account_email=identity)
 
 
-def _require_public_host(hostname: str, resolver: Callable[..., list[tuple]]) -> None:
+def require_public_host(hostname: str, resolver: Callable[..., list[tuple]]) -> None:
     """Reject private/custom GitHub endpoints before attaching credentials."""
 
     try:

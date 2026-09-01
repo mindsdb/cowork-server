@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cowork.coding.contracts import utc_now
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.project_models import CodeProject
 
 
@@ -57,7 +58,7 @@ class CodeProjectStore:
     def create(self, project: CodeProject) -> CodeProject:
         with self._lock:
             if self._path(project.id).exists():
-                raise ValueError("Code Project already exists")
+                raise StateConflict("Code Project already exists")
             return self.save(project)
 
     def get(self, project_id: str) -> CodeProject:
