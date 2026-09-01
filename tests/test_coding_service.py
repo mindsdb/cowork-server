@@ -33,6 +33,7 @@ from cowork.coding.contracts import (
     WorkspaceKind,
     utc_now,
 )
+from cowork.coding.context import is_context_exhaustion_error
 from cowork.coding.control_models import (
     ComputerCapabilities,
     RunStatus,
@@ -75,6 +76,24 @@ def test_event_buffer_preserves_terminal_phase_when_coalescing_deltas() -> None:
 def test_terminal_status_distinguishes_interruption_from_user_cancel() -> None:
     assert terminal_status("interrupted", cancel_requested=False) == SessionStatus.interrupted
     assert terminal_status("interrupted", cancel_requested=True) == SessionStatus.cancelled
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "maximum context length exceeded",
+        "context_length_exceeded",
+        "too many tokens for this request",
+        "the model context window limit reached",
+        "ran out of room in the model's context window",
+    ],
+)
+def test_context_exhaustion_errors_are_recognized(message: str) -> None:
+    assert is_context_exhaustion_error(message)
+
+
+def test_unrelated_engine_failures_are_not_treated_as_context_exhaustion() -> None:
+    assert not is_context_exhaustion_error("adapter stream disconnected")
 
 
 def test_task_creation_requires_exactly_one_project_or_folder() -> None:
@@ -649,6 +668,48 @@ def test_failed_adapter_stream_closes_the_runtime_before_another_turn_can_reuse_
 
     assert engine.closed == 1
     assert service.get_session(created.id).last_error == "adapter stream disconnected"
+
+
+def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.events_error = True
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Use all the context"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, created.id, SessionStatus.failed)
+    failed = service.get_session(created.id)
+    original_workspace = failed.workspace_path
+    assert failed.engine_session_id == "engine-session-1"
+    context_error = (
+        "Codex ran out of room in the model's context window. "
+        "Start a new thread or clear earlier history before retrying."
+    )
+    service.store.update_session(
+        created.id,
+        lambda current: setattr(current, "last_error", "The coding agent stopped unexpectedly"),
+    )
+    run = service.control.store.get_run(created.run_id or "")
+    run.last_error = context_error
+    service.control.store.save_run(run)
+
+    restored = service.recover(created.id)
+
+    assert restored.status == SessionStatus.ready
+    assert restored.run_status == RunStatus.ready.value
+    assert restored.engine_session_id is None
+    assert restored.last_error is None
+    assert restored.workspace_path == original_workspace
+    assert any(
+        event.title == "Agent context refreshed"
+        and "workspace" in event.text
+        and "preserved" in event.text
+        for event in service.events(created.id).items
+    )
 
 
 def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None:

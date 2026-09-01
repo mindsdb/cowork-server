@@ -131,6 +131,24 @@ def safe_engine_error(message: str, credentials: EngineCredentials) -> str:
     return redact_text(safe, secrets)
 
 
+def is_context_exhaustion_error(message: str | None) -> bool:
+    """Identify terminal model-context failures that cannot resume the same thread."""
+    normalized = (message or "").casefold()
+    return (
+        "maximum context length" in normalized
+        or "context length exceeded" in normalized
+        or "context_length_exceeded" in normalized
+        or "too many tokens" in normalized
+        or (
+            "context window" in normalized
+            and any(
+                marker in normalized
+                for marker in ("exhaust", "ran out", "too long", "full", "limit reached")
+            )
+        )
+    )
+
+
 def slash_command(prompt: str) -> tuple[str, str]:
     stripped = prompt.strip()
     if not stripped.startswith("/"):
