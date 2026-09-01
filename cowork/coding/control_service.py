@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -398,9 +399,7 @@ class ControlPlaneService:
         )
 
     def set_run_status(self, run_id: str, status: RunStatus, *, error: str | None = None) -> TaskRun:
-        run = self.store.get_run(run_id)
-        transition_run(run, status, error=error)
-        return self.store.save_run(run)
+        return self.store.update_run(run_id, lambda run: transition_run(run, status, error=error))
 
     def continue_task(self, task_id: str, previous_run_id: str) -> TaskRun:
         previous = self.store.get_run(previous_run_id)
@@ -409,21 +408,30 @@ class ControlPlaneService:
         computer = self.store.get_computer(previous.computer_id)
         if computer.status != ComputerStatus.online:
             raise NoEligibleComputer("The task's computer is offline")
+        workspaces = self.store.list_workspaces(previous.id)
+        restorable = bool(workspaces) and all(
+            item.status == WorkspaceStatus.ready and item.path for item in workspaces
+        )
         run = self.store.save_run(TaskRun(
             id=f"run-{uuid.uuid4().hex}",
             task_id=task_id,
             computer_id=computer.id,
             status=RunStatus.ready if computer.id == self.local_computer.id else RunStatus.queued,
             epoch=previous.epoch + 1,
-            workspace_resume_mode="restore",
+            workspace_resume_mode="restore" if restorable else "prepare",
             recovery_count=previous.recovery_count,
         ))
-        for workspace in self.store.list_workspaces(previous.id):
-            self.store.save_workspace(workspace.model_copy(update={
+        for workspace in workspaces:
+            record = workspace.model_copy(update={
                 "id": f"workspace-{uuid.uuid4().hex}",
                 "run_id": run.id,
-                "status": workspace.status,
-            }))
+            }) if restorable else ExecutionWorkspace(
+                id=f"workspace-{uuid.uuid4().hex}",
+                run_id=run.id,
+                resource_id=workspace.resource_id,
+                computer_id=computer.id,
+            )
+            self.store.save_workspace(record)
         return run
 
     def attach_prepared_workspaces(self, run_id: str, prepared: list[TaskWorkspace]) -> list[ExecutionWorkspace]:
@@ -507,26 +515,20 @@ class ControlPlaneService:
     def sync_session(self, session: CodingSession) -> TaskRun:
         if not session.run_id:
             raise ValueError("Coding session has not been linked to a Task Run")
-        run = self.store.get_run(session.run_id)
-        if run.computer_id != self.local_computer.id:
-            # A remote runtime owns the canonical Task Run lifecycle.  The
-            # CodingSession is only a compatibility read model for the
-            # renderer, so ordinary UI events must never project its stale
-            # status back into a leased/fenced remote run.
-            return run
-        target = _SESSION_STATUS[session.status]
-        if run.status != target:
-            try:
-                transition_run(run, target, error=session.last_error)
-            except ValueError:
-                # Reconciliation after app restart may skip intermediate UI
-                # states; the durable session is authoritative for local runs.
-                run.status = target
-                run.last_error = session.last_error
-        # Runtime sequencing is a fenced protocol cursor, not a UI timeline
-        # cursor. Local session events must never advance it or a valid event
-        # from another computer can be rejected as stale.
-        return self.store.save_run(run)
+
+        def reconcile(run: TaskRun) -> None:
+            if run.computer_id != self.local_computer.id:
+                # A remote runtime owns the canonical Task Run lifecycle.  The
+                # CodingSession is only a compatibility read model for the
+                # renderer, so ordinary UI events must never project its stale
+                # status back into a leased/fenced remote run.
+                return
+            # Runtime sequencing is a fenced protocol cursor, not a UI timeline
+            # cursor. Local session events must never advance it or a valid event
+            # from another computer can be rejected as stale.
+            transition_run(run, _SESSION_STATUS[session.status], error=session.last_error)
+
+        return self.store.update_run(session.run_id, reconcile)
 
     def acquire_lease(self, computer_id: str) -> tuple[TaskRun, str] | None:
         with self._lock:
@@ -543,23 +545,54 @@ class ControlPlaneService:
                 return None
             return run, lease_id
 
-    def renew_lease(self, event: RuntimeEvent) -> TaskRun:
-        with self._lock:
-            run = self._fenced_run(event)
+    def accept_event(
+        self,
+        event: RuntimeEvent,
+        apply: Callable[[TaskRun], None] | None = None,
+    ) -> TaskRun:
+        """Apply one fenced runtime event and record its sequence in a single run write.
+
+        ``apply`` runs inside the same store operation, so its side effects and
+        the sequence advance together: if either fails nothing is recorded and
+        the worker's redelivery is applied fresh. Redelivering the last applied
+        event returns the same acknowledgement without re-applying it; only an
+        older sequence, or a different event reusing one, is stale.
+        """
+
+        if event.protocol_version != RUNTIME_PROTOCOL_VERSION:
+            raise StaleRuntimeEvent("Runtime protocol version is not supported")
+
+        def operation(run: TaskRun) -> None:
+            self._require_fence(run, event.computer_id, event.lease_id, event.epoch)
             run.lease_expires_at = utc_now() + _LEASE_DURATION
+            if event.seq == run.last_event_seq and event.id == run.last_event_id:
+                return
+            if event.seq <= run.last_event_seq:
+                raise StaleRuntimeEvent("Runtime event sequence is stale")
+            self._apply_event(run, event)
+            if apply is not None:
+                apply(run)
             run.last_event_seq = event.seq
-            if event.kind == "checkpoint":
-                checkpoint = sanitize(event.payload)
-                run.checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
-            if event.kind == "status" and isinstance(event.payload.get("status"), str):
-                transition_run(run, RunStatus(event.payload["status"]))
-            if event.kind == "error":
-                transition_run(
-                    run,
-                    RunStatus.failed,
-                    error=redact_text(str(event.payload.get("detail", "Runtime failed")))[:4_000],
-                )
-            return self.store.save_run(run)
+            run.last_event_id = event.id
+
+        with self._lock:
+            return self.store.update_run(event.run_id, operation)
+
+    @staticmethod
+    def _apply_event(run: TaskRun, event: RuntimeEvent) -> None:
+        if event.kind == "checkpoint":
+            checkpoint = sanitize(event.payload)
+            run.checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+        elif event.kind == "status" and isinstance(event.payload.get("status"), str):
+            transition_run(run, RunStatus(event.payload["status"]))
+        elif event.kind == "turn_completed":
+            transition_run(run, RunStatus.ready)
+        elif event.kind == "error":
+            transition_run(
+                run,
+                RunStatus.failed,
+                error=redact_text(str(event.payload.get("detail", "Runtime failed")))[:4_000],
+            )
 
     def queue_command(
         self,
@@ -628,10 +661,10 @@ class ControlPlaneService:
         self.connector_delegation.revoke_for_run(run_id)
 
     def claim_commands(self, run_id: str, computer_id: str, lease_id: str, epoch: int) -> list[RuntimeCommand]:
-        with self._lock:
-            run = self.store.get_run(run_id)
+        claimed: list[RuntimeCommand] = []
+
+        def claim(run: TaskRun) -> None:
             self._require_fence(run, computer_id, lease_id, epoch)
-            claimed = []
             now = utc_now()
             for command in self.store.list_commands(run_id):
                 if command.acked_at is not None or command.epoch != run.epoch:
@@ -642,6 +675,9 @@ class ControlPlaneService:
                 command.claim_expires_at = now + _COMMAND_CLAIM_DURATION
                 command.delivery_count += 1
                 claimed.append(self.store.save_command(command))
+
+        with self._lock:
+            self.store.update_run(run_id, claim)
             return claimed
 
     def acknowledge_command(
@@ -723,11 +759,10 @@ class ControlPlaneService:
     ) -> TaskRun:
         with self._lock:
             run = self.store.get_run(run_id)
-            target_computer = computer_id or run.computer_id
-            computer = self.store.get_computer(target_computer)
+            computer = self.store.get_computer(computer_id or run.computer_id)
             return apply_recovery(
                 self.store,
-                run,
+                run.id,
                 computer,
                 allow_recreate=allow_recreate,
             )
@@ -750,11 +785,16 @@ class ControlPlaneService:
             if not any(item.id == computer_id for item in eligible):
                 raise NoEligibleComputer("That computer cannot access every resource selected for this task")
             previous_computer_id = run.computer_id
-            run.computer_id = computer_id
+
+            def reassign(current: TaskRun) -> None:
+                if current.status != RunStatus.queued:
+                    raise StateConflict("Only queued Task Runs can be reassigned; recover a leased run instead")
+                current.computer_id = computer_id
+
+            saved = self.store.update_run(run.id, reassign)
             for workspace in self.store.list_workspaces(run.id):
                 workspace.computer_id = computer_id
                 self.store.save_workspace(workspace)
-            saved = self.store.save_run(run)
             record_security_event(self.store,
                 "run.reassign",
                 "completed",
@@ -778,20 +818,30 @@ class ControlPlaneService:
     def expire_leases(self) -> None:
         with self._lock:
             now = utc_now()
-            for run in self.store.list_runs():
-                if run.lease_expires_at is None or run.lease_expires_at >= now:
+            for candidate in self.store.list_runs():
+                if candidate.lease_expires_at is None or candidate.lease_expires_at >= now:
                     continue
-                if run.status in {RunStatus.preparing, RunStatus.ready, RunStatus.running, RunStatus.awaiting_approval}:
-                    run.lease_id = None
-                    run.lease_expires_at = None
-                    run.epoch += 1
-                    run.last_event_seq = 0
-                    run.checkpoint = {}
-                    run.workspace_resume_mode = "restore"
-                    run.recovery_count += 1
-                    run.status = RunStatus.recovering
-                    run.last_error = "The computer stopped responding. The task can be resumed safely."
-                    self.store.save_run(run)
+                self.store.update_run(candidate.id, lambda run: self._expire_lease(run, now))
+
+    @staticmethod
+    def _expire_lease(run: TaskRun, now) -> None:
+        if run.lease_expires_at is None or run.lease_expires_at >= now:
+            return
+        if run.status not in {RunStatus.preparing, RunStatus.ready, RunStatus.running, RunStatus.awaiting_approval}:
+            return
+        run.lease_id = None
+        run.lease_expires_at = None
+        run.epoch += 1
+        run.last_event_seq = 0
+        run.last_event_id = None
+        run.checkpoint = {}
+        run.workspace_resume_mode = "restore"
+        run.recovery_count += 1
+        transition_run(
+            run,
+            RunStatus.recovering,
+            error="The computer stopped responding. The task can be resumed safely.",
+        )
 
     def _register_local(self, capabilities: ComputerCapabilities) -> Computer:
         identifier = self._local_computer_id()
@@ -903,15 +953,6 @@ class ControlPlaneService:
             "resources": [resource.model_copy(deep=True) for resource in resources],
             "folders": [],
         })
-
-    def _fenced_run(self, event: RuntimeEvent) -> TaskRun:
-        if event.protocol_version != RUNTIME_PROTOCOL_VERSION:
-            raise StaleRuntimeEvent("Runtime protocol version is not supported")
-        run = self.store.get_run(event.run_id)
-        self._require_fence(run, event.computer_id, event.lease_id, event.epoch)
-        if event.seq <= run.last_event_seq:
-            raise StaleRuntimeEvent("Runtime event sequence is stale")
-        return run
 
     @staticmethod
     def _require_fence(run: TaskRun, computer_id: str, lease_id: str, epoch: int) -> None:

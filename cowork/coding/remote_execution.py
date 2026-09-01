@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
+from functools import partial
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
@@ -47,21 +48,32 @@ class RemoteExecutionCoordinator:
         return bool(session.computer_id and session.computer_id != self.control.local_computer.id)
 
     def accept_event(self, event: RuntimeEvent) -> TaskRun:
-        run = self.control.renew_lease(event)
-        # Checkpoints are protocol heartbeats, not user-visible activity.  A
-        # remote worker sends them while an already-completed task waits for a
-        # follow-up command; projecting each one into the task timeline both
-        # floods the UI and makes the completed task appear to become "ready"
-        # again every polling interval.  The control plane has already stored
-        # the checkpoint and renewed the fenced lease above, so no read-model
-        # mutation is required here.
+        run = self.control.accept_event(event, self._applier(event))
+        if event.kind == "turn_completed" and run.status == RunStatus.ready and self._turn_outcome(event) == "completed":
+            latest = self.store.load_session(run.task_id)
+            if latest.queued_instructions:
+                self.start_next_queued(latest)
+        return run
+
+    def _applier(self, event: RuntimeEvent) -> Callable[[TaskRun], None] | None:
+        """Choose the read-model side effects that must land together with the event's sequence."""
+
         if event.kind == "checkpoint":
-            return run
+            # Checkpoints are protocol heartbeats, not user-visible activity.  A
+            # remote worker sends them while an already-completed task waits for
+            # a follow-up command; projecting each one into the task timeline
+            # both floods the UI and makes the completed task appear to become
+            # "ready" again every polling interval.  The control plane stores
+            # the checkpoint and renews the fenced lease, so no read-model
+            # mutation is required here.
+            return None
         if event.kind == "workspace":
-            return self._accept_workspace(run, event)
+            return partial(self._accept_workspace, event=event)
         if event.kind == "turn_completed":
-            return self._accept_turn_completed(run, event)
-        session = self.get_session(run.task_id)
+            return partial(self._accept_turn_completed, event=event)
+        return partial(self._accept_update, event=event)
+
+    def _accept_update(self, run: TaskRun, event: RuntimeEvent) -> None:
         pending_approval, coding_event = self._coding_event(run, event)
 
         def update(current: CodingSession) -> None:
@@ -77,11 +89,10 @@ class RemoteExecutionCoordinator:
                 else None
             )
 
-        self.store.append_event(session.id, coding_event, update)
+        self.store.append_event(run.task_id, coding_event, update)
         if run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
             self.control.release_workspaces(run.id)
             self.control.revoke_connector_grants(run.id)
-        return run
 
     def queue_turn(
         self,
@@ -265,7 +276,6 @@ class RemoteExecutionCoordinator:
         try:
             self.control.wait_for_command(run.id, command.id, timeout=5)
         except RuntimeError as exc:
-            self.control.set_run_status(run.id, RunStatus.interrupted, error="Workspace release was not acknowledged")
             raise RuntimeError(
                 "The selected computer did not release this task workspace; retry when it is online"
             ) from exc
@@ -381,7 +391,7 @@ class RemoteExecutionCoordinator:
             workspaces=self.control.store.list_workspaces(run.id),
         )
 
-    def _accept_workspace(self, run: TaskRun, event: RuntimeEvent) -> TaskRun:
+    def _accept_workspace(self, run: TaskRun, event: RuntimeEvent) -> None:
         raw_items = event.payload.get("items")
         if not isinstance(raw_items, list) or not raw_items:
             raise ValueError("Runtime workspace publication is empty")
@@ -421,13 +431,9 @@ class RemoteExecutionCoordinator:
             ),
             update,
         )
-        return run
 
-    def _accept_turn_completed(self, run: TaskRun, event: RuntimeEvent) -> TaskRun:
-        outcome = str(event.payload.get("status") or "completed")
-        if outcome not in {"completed", "cancelled"}:
-            raise ValueError("Runtime turn completion status is invalid")
-        run = self.control.set_run_status(run.id, RunStatus.ready)
+    def _accept_turn_completed(self, run: TaskRun, event: RuntimeEvent) -> None:
+        outcome = self._turn_outcome(event)
 
         def update(current: CodingSession) -> None:
             current.status = SessionStatus.cancelled if outcome == "cancelled" else SessionStatus.completed
@@ -447,10 +453,13 @@ class RemoteExecutionCoordinator:
             ),
             update,
         )
-        latest = self.store.load_session(run.task_id)
-        if outcome == "completed" and latest.queued_instructions:
-            self.start_next_queued(latest)
-        return run
+
+    @staticmethod
+    def _turn_outcome(event: RuntimeEvent) -> str:
+        outcome = str(event.payload.get("status") or "completed")
+        if outcome not in {"completed", "cancelled"}:
+            raise ValueError("Runtime turn completion status is invalid")
+        return outcome
 
     @staticmethod
     def _coding_event(run: TaskRun, event: RuntimeEvent) -> tuple[PendingApproval | None, CodingEvent]:
