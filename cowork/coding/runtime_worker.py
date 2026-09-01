@@ -544,7 +544,7 @@ def main() -> None:
     if registration_token:
         if not server_url:
             raise SystemExit("--server is required when connecting a computer")
-        client = RemoteRuntimeClient.register(server_url, registration_token, str(args.name).strip(), root)
+        client = RemoteRuntimeClient.register(server_url, registration_token, str(args.name).strip())
         save_runtime_identity(root, server_url, client.identity)
     elif stored:
         client = RemoteRuntimeClient(server_url or stored.server_url, stored.identity)
