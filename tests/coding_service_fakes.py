@@ -138,19 +138,24 @@ class FakeSession:
         self.engine.forked_additional_dirs.append(additional_dirs)
         return f"forked-engine-session-{len(self.engine.forked_workspaces)}"
 
-    def start_terminal(self, process_id, cols, rows, output_handler, exit_handler) -> None:
+    def start_terminal(self, process_id, cols, rows, shell, output_handler, exit_handler) -> None:
         if self.engine.terminal_start_error:
             raise RuntimeError("terminal secret-ish failure")
         self.engine.terminal_process_id = process_id
         self.engine.terminal_size = (cols, rows)
         self.engine.terminal_output = output_handler
         self.engine.terminal_exit = exit_handler
+        self.engine.terminal_process_ids.append(process_id)
+        self.engine.terminal_sizes[process_id] = (cols, rows)
+        self.engine.terminal_outputs[process_id] = output_handler
+        self.engine.terminal_exits[process_id] = exit_handler
 
     def write_terminal(self, process_id: str, data_base64: str) -> None:
         self.engine.terminal_writes.append((process_id, data_base64))
 
     def resize_terminal(self, process_id: str, cols: int, rows: int) -> None:
         self.engine.terminal_size = (cols, rows)
+        self.engine.terminal_sizes[process_id] = (cols, rows)
 
     def stop_terminal(self, process_id: str) -> None:
         self.engine.terminal_stops.append(process_id)
@@ -197,9 +202,13 @@ class FakeEngine:
         self.closed = 0
         self.is_closed = False
         self.terminal_process_id: str | None = None
+        self.terminal_process_ids: list[str] = []
         self.terminal_size: tuple[int, int] | None = None
+        self.terminal_sizes: dict[str, tuple[int, int]] = {}
         self.terminal_output = None
         self.terminal_exit = None
+        self.terminal_outputs = {}
+        self.terminal_exits = {}
         self.terminal_writes: list[tuple[str, str]] = []
         self.terminal_stops: list[str] = []
         self.terminal_start_error = False

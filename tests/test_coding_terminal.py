@@ -69,3 +69,46 @@ async def test_terminal_stream_completion_preserves_terminal_page_contract(monke
 
     assert payload["status"] == "exited"
     assert payload["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_named_terminal_stream_is_scoped_to_its_tab(monkeypatch) -> None:
+    page = TerminalPage(
+        process_id="process-2",
+        status=TerminalStatus.exited,
+        first_seq=4,
+        next_seq=4,
+        exit_code=0,
+    )
+
+    class Service:
+        def terminal_tab(self, session_id: str, terminal_id: str) -> TerminalPage:
+            assert (session_id, terminal_id) == ("task-1", "terminal-2")
+            return page
+
+        def wait_for_terminal_tab(
+            self,
+            session_id: str,
+            terminal_id: str,
+            after: int,
+            timeout: float,
+        ) -> TerminalPage:
+            assert (session_id, terminal_id, after, timeout) == (
+                "task-1", "terminal-2", 4, 15.0,
+            )
+            return page
+
+    class Request:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    monkeypatch.setattr(coding_endpoints, "_service", lambda: Service())
+    response = await coding_endpoints.stream_terminal_tab(
+        Request(), "task-1", "terminal-2", 4
+    )
+    chunks = [chunk async for chunk in response.body_iterator]
+    frame = b"".join(chunk if isinstance(chunk, bytes) else chunk.encode() for chunk in chunks).decode()
+    payload = json.loads(frame.split("data: ", 1)[1].strip())
+
+    assert payload["process_id"] == "process-2"
+    assert payload["status"] == "exited"
