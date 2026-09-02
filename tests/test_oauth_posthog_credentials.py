@@ -133,9 +133,12 @@ class _FakeJsonResponse:
 
 def test_fetch_userinfo_posthog_falls_back_to_eu_host_on_us_failure(monkeypatch):
     def _fake_urlopen(request, timeout=20):
-        if urlparse(request.full_url).hostname == "us.posthog.com":
+        hostname = urlparse(request.full_url).hostname
+        if hostname == "us.posthog.com":
             raise HTTPError(request.full_url, 401, "Unauthorized", {}, None)
-        assert urlparse(request.full_url).hostname == "eu.posthog.com"
+        assert hostname == "eu.posthog.com"
+        if request.full_url.endswith("/api/organizations/"):
+            return _FakeJsonResponse({"results": []})
         return _FakeJsonResponse({"email": "eu-user@example.com", "first_name": "EU", "last_name": "User"})
 
     monkeypatch.setattr(google_module, "urlopen", _fake_urlopen)
@@ -148,6 +151,8 @@ def test_fetch_userinfo_posthog_falls_back_to_eu_host_on_us_failure(monkeypatch)
 def test_fetch_userinfo_posthog_uses_us_host_when_it_succeeds(monkeypatch):
     def _fake_urlopen(request, timeout=20):
         assert urlparse(request.full_url).hostname == "us.posthog.com"
+        if request.full_url.endswith("/api/organizations/"):
+            return _FakeJsonResponse({"results": []})
         return _FakeJsonResponse({"email": "us-user@example.com", "first_name": "US", "last_name": "User"})
 
     monkeypatch.setattr(google_module, "urlopen", _fake_urlopen)
@@ -155,3 +160,25 @@ def test_fetch_userinfo_posthog_uses_us_host_when_it_succeeds(monkeypatch):
     identity = _fetch_userinfo_posthog("us-issued-token")
 
     assert identity == {"email": "us-user@example.com", "name": "US User"}
+
+
+def test_fetch_userinfo_posthog_organization_lookup_uses_same_region_as_user_lookup(monkeypatch):
+    """The organization lookup must hit whichever region the user lookup
+    actually succeeded against (EU here, after the US host failed) - not
+    always US - since a token issued for one region isn't guaranteed to be
+    accepted by the other's host."""
+
+    def _fake_urlopen(request, timeout=20):
+        hostname = urlparse(request.full_url).hostname
+        if hostname == "us.posthog.com":
+            raise HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+        assert hostname == "eu.posthog.com"
+        if request.full_url.endswith("/api/organizations/"):
+            return _FakeJsonResponse({"results": [{"id": "org-1", "name": "Acme"}]})
+        return _FakeJsonResponse({"email": "eu-user@example.com", "first_name": "EU", "last_name": "User"})
+
+    monkeypatch.setattr(google_module, "urlopen", _fake_urlopen)
+
+    identity = _fetch_userinfo_posthog("eu-issued-token")
+
+    assert identity == {"email": "eu-user@example.com:org-1", "name": "Acme"}
