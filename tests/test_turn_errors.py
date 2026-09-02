@@ -1349,6 +1349,21 @@ def test_remote_legacy_connection_error_still_maps_to_provider_auth():
     assert message == te.AUTH_ERROR_USER_MESSAGE
 
 
+def test_remote_unanchored_invalid_key_text_stays_generic():
+    """A tool's own 'invalid api key' mid-message must not select the auth card.
+
+    The classifier anchors with ``startswith`` precisely so an arbitrary tool
+    exception cannot borrow the Reconnect card. A substring check would map this
+    to ``provider_auth`` and tell the user to reconnect MindsHub over a failure
+    that has nothing to do with their session.
+    """
+    code, message = te.remote_turn_error(
+        "ConnectionError: Stripe rejected the request: invalid api key for account acct_1"
+    )
+    assert code == te.GENERIC_TURN_ERROR_CODE
+    assert message == te.GENERIC_TURN_ERROR_MESSAGE
+
+
 def test_remote_untyped_auth_lookalikes_are_redacted():
     """A 401 that is not anton's anchored invalid-key copy stays generic."""
     code, message = te.remote_turn_error(
