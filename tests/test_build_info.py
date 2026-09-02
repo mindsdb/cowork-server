@@ -391,26 +391,39 @@ class TestOverlayFallbackAtAnOldPin:
     values instead of losing them between this merge and the pin bump.
     """
 
-    def test_the_harness_falls_back_when_the_kwarg_is_dropped(self):
+    def test_the_turn_builder_routes_through_the_fallback(self):
+        """The helper is only useful if the turn builder actually calls it."""
         import inspect
 
         from cowork.harnesses.anton_harness.harness import AntonHarness
 
         src = inspect.getsource(AntonHarness._build_chat_session)
-        assert "if workspace_env_overlay and not overlay_kwargs:" in src
-        assert "workspace.apply_env_to_process()" in src
+        assert "_apply_overlay_fallback(" in src
 
-    def test_org_mode_never_reaches_the_fallback(self, monkeypatch, tmp_path):
-        """The fallback is gated on a non-empty overlay, and org mode returns
-        {}, so the untrusted shared .env is never applied to this process."""
-        monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-        from cowork.common.settings.app_settings import get_app_settings
-        get_app_settings.cache_clear()
-
-        from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
-
+    def test_the_fallback_applies_only_when_the_kwarg_was_dropped(self):
         from unittest.mock import Mock
+
+        from cowork.harnesses.anton_harness.harness import _apply_overlay_fallback
+
         workspace = Mock()
-        assert _load_workspace_env_if_safe(workspace) == {}
+        overlay = {"MY_PROJECT_VAR": "v"}
+
+        # Kwarg carried the overlay: nothing to fall back to.
+        assert _apply_overlay_fallback(workspace, overlay, {"workspace_env_overlay": overlay}) is False
         workspace.apply_env_to_process.assert_not_called()
-        get_app_settings.cache_clear()
+
+        # Kwarg dropped: load it the old way rather than losing it.
+        assert _apply_overlay_fallback(workspace, overlay, {}) is True
+        workspace.apply_env_to_process.assert_called_once()
+
+    def test_org_mode_cannot_reach_the_fallback(self):
+        """Org mode yields an empty overlay, and the guard needs a non-empty
+        one, so the untrusted shared .env is never applied to this process."""
+        from unittest.mock import Mock
+
+        from cowork.harnesses.anton_harness.harness import _apply_overlay_fallback
+
+        workspace = Mock()
+
+        assert _apply_overlay_fallback(workspace, {}, {}) is False
+        workspace.apply_env_to_process.assert_not_called()

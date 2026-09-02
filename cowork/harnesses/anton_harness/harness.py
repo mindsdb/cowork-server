@@ -156,6 +156,20 @@ def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
         return {}
 
 
+def _apply_overlay_fallback(workspace, overlay: dict[str, str], overlay_kwargs: dict) -> bool:
+    """Load the project .env the old way when the pinned anton cannot carry it.
+
+    Returns whether it applied. Extracted so the fallback is testable without
+    constructing a full ChatSession, like the org-mode guard above. Gated on a
+    non-empty overlay, which org mode never produces, so the untrusted shared
+    .env is not reachable from here.
+    """
+    if not (overlay and not overlay_kwargs):
+        return False
+    workspace.apply_env_to_process()
+    return True
+
+
 settings = AntonHarnessSettings()
 
 
@@ -847,10 +861,7 @@ class AntonHarness:
         overlay_kwargs = supported_kwargs(
             ChatSessionConfig, workspace_env_overlay=workspace_env_overlay
         )
-        if workspace_env_overlay and not overlay_kwargs:
-            # The pinned anton cannot carry the overlay to the scratchpad, so
-            # load it the old way rather than dropping the project's .env.
-            workspace.apply_env_to_process()
+        _apply_overlay_fallback(workspace, workspace_env_overlay, overlay_kwargs)
 
         anton_dir = base / ".anton"
 

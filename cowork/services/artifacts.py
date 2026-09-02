@@ -1736,12 +1736,21 @@ async def _launch_backend_locked(
     # didn't finish startup yet. 45s leaves room for retries without
     # making the user wait forever on a truly stuck script — anton
     # terminates the proc on timeout.
+    # ds_env replaces the inherited DS_* instead of merging over them, so the
+    # backend sees only what it declared. Absent on an older anton pin.
+    import inspect
+
+    if "ds_env" in inspect.signature(launch_artifact_backend).parameters:
+        env_kwargs = {"ds_env": extra_env}
+    else:
+        env_kwargs = {"extra_env": extra_env}
+
     result = await launch_artifact_backend(
         slug=slug,
         artifact_folder=artifact_dir,
         scratchpad_pool=pool,
         tracked_backends=_LAUNCHED_BACKENDS,
-        extra_env=extra_env,
+        **env_kwargs,
         health_timeout=45.0,
     )
     if isinstance(result, str):
