@@ -8,13 +8,36 @@ shared loopback port.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+from pydantic import SecretStr
+
+from cowork.common.settings.user_settings import Provider, UserSettings
+
+
+def _user_settings(**overrides):
+    """A stand-in with every attribute `health()` actually reads.
+
+    `_minds_runtime_credential_required` reads the resolved provider properties
+    directly rather than through `getattr(..., None)`: that default would turn a
+    future rename into a silent `False`, and `False` is what disables the
+    desktop's wake barrier. Fakes therefore have to carry the real shape.
+    """
+    fields = {
+        "config_status": {},
+        "resolved_planning_provider": Provider.OPENAI,
+        "resolved_coding_provider": Provider.OPENAI,
+        "resolved_router_provider": Provider.OPENAI,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
 
 def test_health_reports_owner_from_app_settings():
     from cowork.api.v1.endpoints import health
 
     with (
         patch.object(health, "get_app_settings", return_value=SimpleNamespace(owner="install-token-abc", tenancy_mode="local")),
-        patch.object(health, "get_user_settings", return_value=SimpleNamespace(config_status={})),
+        patch.object(health, "get_user_settings", return_value=_user_settings()),
     ):
         body = health.health()
 
@@ -28,7 +51,7 @@ def test_health_owner_empty_when_unset():
 
     with (
         patch.object(health, "get_app_settings", return_value=SimpleNamespace(owner="", tenancy_mode="local")),
-        patch.object(health, "get_user_settings", return_value=SimpleNamespace(config_status={})),
+        patch.object(health, "get_user_settings", return_value=_user_settings()),
     ):
         body = health.health()
 
@@ -43,7 +66,7 @@ def _health_with(tenancy_mode: str) -> dict:
         patch.object(
             health, "get_app_settings", return_value=SimpleNamespace(owner="", tenancy_mode=tenancy_mode)
         ),
-        patch.object(health, "get_user_settings", return_value=SimpleNamespace(config_status={})),
+        patch.object(health, "get_user_settings", return_value=_user_settings()),
     ):
         return health.health()
 
@@ -59,6 +82,71 @@ def test_health_reports_org_mode():
 
 def test_health_org_mode_false_on_desktop():
     assert _health_with("local")["org_mode"] is False
+
+
+@pytest.mark.parametrize(
+    ("planning", "coding", "expected"),
+    [
+        (Provider.MINDS_CLOUD, Provider.OPENAI, True),
+        (Provider.OPENAI, Provider.MINDS_CLOUD, True),
+        (Provider.OPENAI, Provider.OPENAI, False),
+    ],
+)
+def test_health_reports_when_required_roles_need_the_runtime_minds_credential(
+    planning, coding, expected
+):
+    from cowork.api.v1.endpoints import health
+
+    settings = _user_settings(
+        resolved_planning_provider=planning,
+        resolved_coding_provider=coding,
+    )
+    with (
+        patch.object(
+            health,
+            "get_app_settings",
+            return_value=SimpleNamespace(owner="", tenancy_mode="local"),
+        ),
+        patch.object(health, "get_user_settings", return_value=settings),
+    ):
+        body = health.health()
+
+    assert body["minds_runtime_credential_required"] is expected
+
+
+def test_health_runtime_requirement_uses_resolved_provider_fallback():
+    from cowork.api.v1.endpoints import health
+
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI,
+        coding_provider=Provider.OPENAI,
+        minds_api_key=SecretStr("mdb-runtime"),
+        openai_api_key=None,
+        minds_url="https://api.mindshub.ai",
+    )
+
+    assert settings.resolved_planning_provider is Provider.MINDS_CLOUD
+    assert settings.resolved_coding_provider is Provider.MINDS_CLOUD
+    assert health._minds_runtime_credential_required(settings, org_mode=False) is True
+
+
+def test_health_router_only_minds_use_does_not_gate_required_direct_roles():
+    from cowork.api.v1.endpoints import health
+
+    settings = _user_settings(resolved_router_provider=Provider.MINDS_CLOUD)
+
+    assert health._minds_runtime_credential_required(settings, org_mode=False) is False
+
+
+def test_health_org_mode_never_requires_the_desktop_runtime_credential():
+    from cowork.api.v1.endpoints import health
+
+    settings = _user_settings(
+        resolved_planning_provider=Provider.MINDS_CLOUD,
+        resolved_coding_provider=Provider.MINDS_CLOUD,
+    )
+
+    assert health._minds_runtime_credential_required(settings, org_mode=True) is False
 
 
 # ─── aid: the join key the desktop app cannot compute itself (ENG-1689) ───────
@@ -78,7 +166,7 @@ def test_health_serves_antons_install_id_on_desktop():
 
     with (
         patch.object(health, "get_app_settings", return_value=SimpleNamespace(owner="", tenancy_mode="local")),
-        patch.object(health, "get_user_settings", return_value=SimpleNamespace(config_status={})),
+        patch.object(health, "get_user_settings", return_value=_user_settings()),
         patch.object(health, "_anton_install_id", return_value="a1b2c3d4e5f60718"),
     ):
         body = health.health()
@@ -99,7 +187,7 @@ def test_health_withholds_the_id_in_org_mode():
 
     with (
         patch.object(health, "get_app_settings", return_value=SimpleNamespace(owner="", tenancy_mode="org")),
-        patch.object(health, "get_user_settings", return_value=SimpleNamespace(config_status={})),
+        patch.object(health, "get_user_settings", return_value=_user_settings()),
         patch.object(health, "_anton_install_id", return_value="a1b2c3d4e5f60718"),
     ):
         body = health.health()
@@ -125,7 +213,7 @@ def test_health_still_answers_when_the_id_cannot_be_resolved():
 
     with (
         patch.object(health, "get_app_settings", return_value=SimpleNamespace(owner="", tenancy_mode="local")),
-        patch.object(health, "get_user_settings", return_value=SimpleNamespace(config_status={})),
+        patch.object(health, "get_user_settings", return_value=_user_settings()),
         patch.object(
             anton.analytics, "get_installation_id", side_effect=RuntimeError("anton not importable")
         ),

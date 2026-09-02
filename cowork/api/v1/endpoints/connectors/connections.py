@@ -95,7 +95,9 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     """Persist credentials to the vault without running a probe.
     Used after an OAuth PKCE flow (Electron main-process PKCE) where the
     token exchange already succeeded. Electron verifies the token and resolves
-    account_email before calling this endpoint."""
+    account_email (and, where the provider's identity fetcher in
+    cowork/src/main/oauth-identity.ts supplies one, account_name) before
+    calling this endpoint."""
     return _persist_direct_connection(body, scope, dict(body.values))
 
 
@@ -131,12 +133,20 @@ def _persist_direct_connection(
     from anton.core.datasources.data_vault import LocalDataVault
     vault = LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
     try:
+        # default_label gives a brand-new OAuth connection's tile a
+        # meaningful title (the account/org/workspace name the provider
+        # returned) instead of the generic engine-id default — but only for
+        # a genuinely new connection; it can never clobber a label the user
+        # already set on a reconnect (see persist_connection's default_label
+        # docs). Mirrors the same wiring in oauth/google.py's callback(),
+        # the analogous save path for a non-Electron (web) OAuth flow.
         slug = persist_connection(
             body.connector_id,
             body.method,
             body.name,
             values,
             replace_existing=body.replace_existing,
+            default_label=str(values.get("account_name") or "").strip() or None,
             vault=vault,
         )
     except Exception:
