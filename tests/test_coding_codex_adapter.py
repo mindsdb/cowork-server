@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from cowork.coding.contracts import EventType, ExtensionInventory, PermissionMode
@@ -79,6 +80,36 @@ def test_codex_model_discovery_keeps_models_that_need_credits(monkeypatch) -> No
     )
 
     assert models == ["mindshub_air", "fable", "gpt-codex"]
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_codex_model_discovery_classifies_authentication_failures(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("GET", "https://api.mindshub.ai/v1/models"),
+    )
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, *_args, **_kwargs) -> httpx.Response:
+            return response
+
+    monkeypatch.setattr(codex_module.httpx, "Client", lambda **_kwargs: FakeClient())
+
+    with pytest.raises(
+        codex_module.ModelDiscoveryAuthenticationError,
+        match="sign-in does not match this server",
+    ):
+        codex_module.CodexEngine().discover_models(
+            EngineCredentials(minds_url="https://api.mindshub.ai", minds_api_key="mdb_test"),
+        )
 
 
 def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
