@@ -11,14 +11,16 @@ provider classes and capturing the constructor kwargs:
   - openai-compatible uses its dedicated key + its own base;
   - anthropic gets no base_url kwarg (its SDK has no such arg).
 """
-from types import SimpleNamespace
+import inspect
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import SecretStr
-
 from anton.core.llm.openai import OpenAIProvider as _RealOpenAIProvider
 from anton.core.llm.provider import ProviderAuthError
+from pydantic import SecretStr
+
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.services.providers import GEMINI_BASE_URL
@@ -55,6 +57,9 @@ def build(monkeypatch):
     _fake_openai.FLAVOR_OPENAI_COMPATIBLE_GENERIC = (
         _RealOpenAIProvider.FLAVOR_OPENAI_COMPATIBLE_GENERIC
     )
+    # Production capability-gates new Anton kwargs from the callable signature.
+    # Preserve the real constructor contract on this kwargs-capturing fake.
+    _fake_openai.__signature__ = inspect.signature(_RealOpenAIProvider)
     monkeypatch.setattr("anton.core.llm.openai.OpenAIProvider", _fake_openai)
     monkeypatch.setattr(
         "anton.core.llm.anthropic.AnthropicProvider", _capture("anthropic")
@@ -238,6 +243,70 @@ async def test_local_minds_cloud_provider_rereads_runtime_credential(build, monk
     for provider in credential_providers:
         with pytest.raises(ProviderAuthError):
             await provider()
+
+
+def test_old_anton_keeps_construction_time_credential_and_warns(
+    build, monkeypatch, caplog
+):
+    """An allowed older Anton has no supplier kwarg, so do not pass it."""
+    calls: list[dict] = []
+
+    class _OldOpenAIProvider:
+        FLAVOR_MINDS_PASSTHROUGH = _RealOpenAIProvider.FLAVOR_MINDS_PASSTHROUGH
+
+        def __init__(
+            self,
+            api_key=None,
+            base_url=None,
+            flavor=None,
+            reasoning_effort=None,
+        ):
+            calls.append(
+                {
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "flavor": flavor,
+                    "reasoning_effort": reasoning_effort,
+                }
+            )
+
+    monkeypatch.setattr(
+        "anton.core.llm.openai.OpenAIProvider", _OldOpenAIProvider
+    )
+    monkeypatch.setattr(
+        runtime_credential, "get_minds_credential", lambda: "token-A"
+    )
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("token-A"),
+        minds_url="https://api.mindshub.ai",
+    )
+
+    with caplog.at_level("WARNING", logger="cowork.services.providers"):
+        build(settings)
+
+    assert len(calls) == 3  # router, planning, and coding still construct
+    assert all(call["api_key"] == "token-A" for call in calls)
+    assert caplog.text.count("construction-time credential") == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_supplier_falls_back_when_anton_lacks_typed_auth_error(
+    monkeypatch,
+):
+    from cowork.services import providers
+
+    monkeypatch.setattr(runtime_credential, "get_minds_credential", lambda: None)
+    monkeypatch.setitem(
+        sys.modules, "anton.core.llm.provider", ModuleType("anton.core.llm.provider")
+    )
+
+    with pytest.raises(ConnectionError) as err:
+        await providers._current_runtime_minds_credential()
+
+    assert type(err.value) is ConnectionError
+    assert str(err.value).startswith("Invalid API key")
 
 
 # ── Reasoning effort follows the model, not the role (ENG-1632) ────────
