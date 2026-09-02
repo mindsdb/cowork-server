@@ -949,13 +949,8 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            # Registers each connection's DS_* var names for credential
-            # scrubbing — without it, scrub_credentials treats every field as
-            # unknown and redacts non-secret values like base_url into
-            # [DS_*] markers in user-facing output (ENG-688) — and records
-            # this turn's values for scrubbing. It touches no process state:
-            # the scratchpad derives its own DS_* from the same vault, so a
-            # concurrent turn's credentials are neither read nor destroyed.
+            # Registers this turn's DS_* names and values for scrubbing, and
+            # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
 
             restore_namespaced_env(data_vault)
@@ -969,9 +964,8 @@ class AntonHarness:
         # cowork/services/connectors/connections.py). A plain
         # files.list()/files.search() call does NOT return the latter, so
         # without calling them out by name here the agent has no way to
-        # know they're reachable at all — the scratchpad's own env only carries
-        # the raw JSON, which isn't enough on its own for the agent to notice
-        # or act on.
+        # know they're reachable at all — the scratchpad's env carries only the
+        # raw JSON, which isn't enough for the agent to notice or act on.
         #
         # Parsing `_picked_files` and applying the project-scoping rule is
         # connector logic, not agent logic, so it lives in
