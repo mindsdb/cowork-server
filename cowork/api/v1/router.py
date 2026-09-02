@@ -13,6 +13,8 @@ from cowork.api.v1.endpoints import (
     capabilities,
     channels,
     comments,
+    coding,
+    coding_runtime,
     conversations,
     files,
     health,
@@ -81,6 +83,8 @@ api_router.include_router(
     runtime_credential.router, prefix="/runtime-credential", tags=["runtime-credential"]
 )
 api_router.include_router(search.router, prefix="/search", tags=["search"])
+api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
+api_router.include_router(coding_runtime.router, prefix="/coding/runtime", tags=["coding-runtime"])
 api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
