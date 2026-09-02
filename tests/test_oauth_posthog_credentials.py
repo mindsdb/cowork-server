@@ -99,7 +99,7 @@ def test_callback_uses_cached_client_id_for_secret_less_provider(monkeypatch):
     )
     monkeypatch.setattr(
         "cowork.services.connectors.oauth.google.persist_connection",
-        lambda engine, method, name, fields: "posthog-conn",
+        lambda engine, method, name, fields, **kwargs: "posthog-conn",
     )
 
     # `_resolve_credentials` must not be reached — if the cached branch
