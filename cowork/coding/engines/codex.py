@@ -23,6 +23,7 @@ from cowork.coding.contracts import (
     RuntimePlatformStatus,
     TerminalShellPreference,
 )
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
     ApprovalHandler,
@@ -129,7 +130,15 @@ class CodexEngine:
                 f"{endpoint}/models",
                 headers={"Authorization": f"Bearer {credentials.minds_api_key}"},
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if response.status_code in {401, 403}:
+                    raise ModelDiscoveryAuthenticationError(
+                        "Your sign-in does not match this server. Sign in again, "
+                        "or switch back to the environment you signed into."
+                    ) from exc
+                raise
             payload = response.json()
         models: list[str] = []
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
