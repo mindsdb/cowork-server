@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from cowork.build_info import surface_kwarg
+from cowork.build_info import supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
@@ -1078,7 +1078,7 @@ class AntonHarness:
             ),
             workspace=workspace,
             data_vault=data_vault,
-            workspace_env_overlay=workspace_env_overlay,
+            **supported_kwargs(ChatSessionConfig, workspace_env_overlay=workspace_env_overlay),
             initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),

@@ -152,13 +152,13 @@ def test_load_workspace_env_refused_in_org_mode(org_mode):
     fake_workspace.load_env.assert_not_called()
 
 
-def test_load_workspace_env_still_works_on_desktop(monkeypatch):
+def test_load_workspace_env_still_works_on_desktop(monkeypatch, tmp_path):
     """Desktop still needs its own .env made available to the scratchpad
-    (e.g. a locally-set API key). Guard against the kill switch being
-    unconditional. It no longer mutates this process's own os.environ —
-    only the returned dict, threaded to the scratchpad, carries these
-    values now."""
-    from unittest.mock import Mock
+    (e.g. a locally-set API key), read off disk and returned rather than
+    applied to this process."""
+    import os
+
+    from anton.workspace import Workspace
 
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
     from cowork.common.settings.app_settings import get_app_settings
@@ -166,12 +166,16 @@ def test_load_workspace_env_still_works_on_desktop(monkeypatch):
 
     from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
 
-    fake_workspace = Mock()
-    fake_workspace.load_env.return_value = {"MY_PROJECT_VAR": "project-value"}
-    result = _load_workspace_env_if_safe(fake_workspace)
+    # A real workspace with a real .env, so this covers the read as well as
+    # the guard — a Mock returning what it was told proves neither.
+    workspace = Workspace(tmp_path)
+    workspace.initialize()
+    (tmp_path / ".anton" / ".env").write_text("MY_PROJECT_VAR=project-value\n")
 
-    assert result == {"MY_PROJECT_VAR": "project-value"}
-    fake_workspace.apply_env_to_process.assert_not_called()
+    result = _load_workspace_env_if_safe(workspace)
+
+    assert result["MY_PROJECT_VAR"] == "project-value"
+    assert "MY_PROJECT_VAR" not in os.environ
     get_app_settings.cache_clear()
 
 

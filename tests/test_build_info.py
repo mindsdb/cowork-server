@@ -343,3 +343,41 @@ class TestTheWebSurfaceIsNotReachableYet:
         # Local tenancy runs in-process, so the kwarg reaches a real turn.
         _patch_surface_inputs(monkeypatch, tenancy="local")
         assert build_info.surface() == "desktop"
+
+
+class TestSupportedKwargs:
+    """This server pins anton to a rev, so a config field it knows about can be
+    missing from the installed copy. Passing it anyway raises on every turn."""
+
+    def test_a_declared_field_is_passed_through(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class Config:
+            known: str | None = None
+
+        assert build_info.supported_kwargs(Config, known="v") == {"known": "v"}
+
+    def test_an_undeclared_field_is_dropped_not_raised(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class OldConfig:
+            other: str | None = None
+
+        kwargs = build_info.supported_kwargs(OldConfig, missing="v")
+
+        assert kwargs == {}
+        OldConfig(**kwargs)  # would be a TypeError without the gate
+
+    def test_the_turn_config_is_constructible_with_the_gated_kwarg(self):
+        """The real thing: whatever anton is installed, building the turn's
+        config with the overlay kwarg must not raise."""
+        from anton.core.session import ChatSessionConfig
+
+        ChatSessionConfig(
+            llm_client=None,
+            **build_info.supported_kwargs(
+                ChatSessionConfig, workspace_env_overlay={"A": "b"}
+            ),
+        )
