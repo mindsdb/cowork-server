@@ -22,14 +22,8 @@ dependencies = [
     "fastapi>=0.136.1",
     "hermes-agent>=0.15.2,<0.18",
     "httpx>=0.27",
-    # Structured app-server integration with a pinned, bundled Codex runtime;
-    # users do not need to install a separate CLI.
-    "openai-codex==0.147.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
-    # Used to terminate the complete coding-agent subprocess tree on both
-    # macOS and Windows; killing only the app-server can orphan commands.
-    "psutil>=7.0",
     "psycopg[binary]>=3.2",
     # psycopg 3 is what the code targets, but the hosted DB URIs come from the
     # shared mindsdb DB stack, which mints every service's URI as bare
