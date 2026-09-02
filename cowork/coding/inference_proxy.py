@@ -13,6 +13,11 @@ INFERENCE_PATHS = {"models", "responses", "responses/compact"}
 MAX_INFERENCE_BODY_BYTES = 16 * 1024 * 1024
 
 
+def inference_response_status(status_code: int) -> int:
+    """Stop the Codex transport retrying a deterministic credit rejection."""
+    return 400 if status_code == 402 else status_code
+
+
 def inference_url(minds_url: str, path: str, query: str = "") -> str:
     base = minds_url.rstrip("/")
     if not base.endswith("/v1"):
@@ -92,9 +97,12 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
         for name in ("content-type", "retry-after", "x-mindshub-dropped-params", "x-request-id")
         if (value := upstream.headers.get(name))
     }
+    if upstream.status_code == 402:
+        response_headers["x-mindshub-error-code"] = "insufficient_credits"
+        response_headers["x-mindshub-upstream-status"] = "402"
     return StreamingResponse(
         upstream.aiter_bytes(),
-        status_code=upstream.status_code,
+        status_code=inference_response_status(upstream.status_code),
         headers=response_headers,
         background=BackgroundTask(close_upstream),
     )

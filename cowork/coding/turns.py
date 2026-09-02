@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from cowork.coding.context import safe_engine_error
+from cowork.coding.context import EngineFailure, classify_engine_failure, safe_engine_error
 from cowork.coding.contracts import CodingEvent, CodingSession, EventType, SessionStatus
 from cowork.coding.engines.base import (
     EngineCredentials,
@@ -170,8 +170,10 @@ class TurnExecutor:
         turn_id = ""
         finished_status: SessionStatus | None = None
         reservation_released = False
+        model = ""
         try:
             session = self._get_session(session_id)
+            model = session.model
             engine_session = self._runtimes.open(session, credentials)
             self._store.update_session(
                 session_id,
@@ -228,7 +230,10 @@ class TurnExecutor:
                         pass
             finally:
                 with self._state_lock:
-                    self._record_failure(session_id, safe_engine_error(str(exc), credentials))
+                    self._record_failure(
+                        session_id,
+                        classify_engine_failure(str(exc), credentials, model),
+                    )
                     self._running.pop(session_id, None)
                     reservation_released = True
         finally:
@@ -319,7 +324,7 @@ class TurnExecutor:
             cancelled = bool(self._running.get(session_id) and self._running[session_id].cancel_requested)
         return terminal_status(final_status, cancelled), terminal_event
 
-    def _record_failure(self, session_id: str, message: str) -> None:
+    def _record_failure(self, session_id: str, failure: EngineFailure) -> None:
         with self._state_lock:
             running = self._running.get(session_id)
             cancelled = bool(running and running.cancel_requested)
@@ -332,10 +337,19 @@ class TurnExecutor:
             CodingEvent(
                 type=EventType.session if cancelled else EventType.error,
                 title="Task stopped" if cancelled else "Coding agent failed",
-                text="The active coding turn was cancelled." if cancelled else message,
+                text="The active coding turn was cancelled." if cancelled else failure.message,
                 phase="completed" if cancelled else "failed",
+                data={
+                    key: value
+                    for key, value in {
+                        "code": failure.code,
+                        "detail": failure.detail,
+                        "model": failure.model,
+                    }.items()
+                    if value
+                },
             ),
-            lambda current: fail_turn(current, cancelled, message),
+            lambda current: fail_turn(current, cancelled, failure.message),
         )
 
     def _interruption_requested(self, session_id: str) -> bool:
