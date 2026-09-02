@@ -63,6 +63,10 @@ api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["conne
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(project_files.router, prefix="/projects", tags=["project-files"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
+# `/tasks` is a branding alias for `/conversations` (ENG-2069) — same router,
+# same request/response schemas, mounted under a second prefix so it can
+# never drift from the canonical implementation.
+api_router.include_router(conversations.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(responses.router, prefix="/responses", tags=["responses"])
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
