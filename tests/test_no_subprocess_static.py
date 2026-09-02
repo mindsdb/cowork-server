@@ -130,18 +130,6 @@ BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 #: occurrence: two identical sites need two entries (see the module docstring).
 ALLOWLIST = (
     (
-        "coding/workspace.py",
-        "<module>",
-        "subprocess",
-        "import backing the local-only GitRunner; every run is refused by _org_mode()",
-    ),
-    (
-        "coding/workspace.py",
-        "GitRunner.run",
-        "subprocess.run(git)",
-        "shell-free local Git operations, refused before spawn by _org_mode()",
-    ),
-    (
         "services/artifacts.py",
         "<module>",
         "subprocess",
