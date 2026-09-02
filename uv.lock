@@ -143,12 +143,13 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.8.28.1rc5"
-source = { git = "https://github.com/mindsdb/anton.git?rev=61ec5db6a6fdbb868bb43c30c98b9c52dd542fa3#61ec5db6a6fdbb868bb43c30c98b9c52dd542fa3" }
+version = "2.26.8.31.3.dev1+g18b043f65"
+source = { git = "https://github.com/mindsdb/anton.git?branch=main#18b043f650f17f65234fe6a172f0be3484481bf9" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
     { name = "dill" },
+    { name = "httpx" },
     { name = "openai" },
     { name = "packaging" },
     { name = "prompt-toolkit" },
@@ -457,7 +458,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?rev=61ec5db6a6fdbb868bb43c30c98b9c52dd542fa3" },
+    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=main" },
     { name = "cryptography", specifier = ">=48.0.0,<49" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
