@@ -79,27 +79,21 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
-# Stacked feature dependency: cowork-server imports the artifact-identity
-# derivation (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`)
-# from Anton, and persists what Anton only derives in memory, so the two must
-# agree on the value or one artifact ends up with two identities. Anton `main`
-# carries those symbols, so this pin no longer holds the tree on a staging
-# commit the way it did while that feature was unreleased.
-#
-# This rev is the head of Anton's ENG-2116 hotfix branch
-# (`fix/eng-2116-refresh-active-jwt-main`), cut from Anton `main`. It adds the
-# typed provider-auth error and the per-request API-key supplier that refresh
-# desktop credentials without rebuilding an active session. It is not yet an
-# ancestor of Anton `main`, so merge mindsdb/anton#429 first, then re-pin to
-# the resulting Anton `main` commit, or back to `branch = "main"`, before this
-# PR merges: the image installs from this lockfile (`uv sync --frozen`), and a
-# rev on an unmerged branch must not reach a cowork-server main build.
+# cowork-server imports the artifact-identity derivation
+# (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`) from Anton
+# and persists what Anton only derives in memory, so the two must agree on the
+# value or one artifact ends up with two identities. Anton `main` defines all
+# three, and since mindsdb/anton#429 it also carries the typed provider-auth
+# error and the per-request API-key supplier that refresh desktop credentials
+# without rebuilding an active session (ENG-2116). Neither feature needs a rev
+# pin any more, so this tracks the branch and the lockfile records the resolved
+# commit that `uv sync --frozen` installs.
 #
 # Published package metadata still permits older Anton versions.
 # `services/providers.py` capability-gates the live supplier and logs when it
 # must retain the static construction-time key, and `handlers/turn_errors.py`
 # keeps the legacy 401 classifier available under that skew.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "303bf7c6991fd1bbdce70b73fc059b2ae4cd8341" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
