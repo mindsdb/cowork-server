@@ -39,9 +39,9 @@ class _FakeJsonResponse:
 
 
 @pytest.fixture(autouse=True)
-def _silence_diagnostic_log(monkeypatch):
-    # TEMP (ENG-2188): _fetch_linear_workspace logs the raw GraphQL response
-    # for live-verification purposes; keep test output clean.
+def _silence_failure_log(monkeypatch):
+    # _fetch_linear_workspace logs a warning when the workspace lookup fails;
+    # keep test output clean for the failure-path tests below.
     monkeypatch.setattr(google_module._log, "warning", lambda *a, **k: None)
 
 
