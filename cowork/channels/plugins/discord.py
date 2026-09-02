@@ -407,27 +407,27 @@ class DiscordBridge:
 
 
 async def verify_discord_credentials(credentials: Mapping[str, str]) -> VerifyResult:
-    """GET /users/@me is the cheapest real proof a bot token works — building
-    a DiscordBridge never rejects one on its own."""
+    """Verify the bot token works and get its application_id for webhook routing."""
     bot_token = (credentials.get("bot_token") or "").strip()
     if not bot_token:
         return VerifyResult(ok=False, detail="bot_token is not set")
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            # Get application info for the routing key (application_id), not the bot user.
             resp = await client.get(
-                f"{DISCORD_API_BASE}/users/@me",
+                f"{DISCORD_API_BASE}/oauth2/applications/@me",
                 headers={"Authorization": f"Bot {bot_token}"},
             )
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         return VerifyResult(ok=False, detail=f"could not reach Discord: {exc}")
     if resp.status_code == 200:
-        user_data = resp.json() or {}
-        username = user_data.get("username", "")
-        user_id = user_data.get("id", "")
+        app_data = resp.json() or {}
+        app_id = app_data.get("id", "")
+        app_name = app_data.get("name", "")
         return VerifyResult(
             ok=True,
-            detail=f"Connected as {username}" if username else "Connected",
-            routing_key=user_id or None,
+            detail=f"Connected as {app_name}" if app_name else "Connected",
+            routing_key=app_id or None,
         )
     return VerifyResult(ok=False, detail=f"Discord rejected the token: HTTP {resp.status_code}")
 

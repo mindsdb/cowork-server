@@ -39,26 +39,6 @@ class SignatureError(Exception):
     """Raised by :meth:`WebhookBridge.verify_signature` on a bad signature."""
 
 
-class _DummyBridge:
-    """Minimal bridge wrapper for platform handshakes that require no live adapter."""
-
-    def __init__(self, plugin: ChannelPlugin) -> None:
-        self.plugin = plugin
-
-    def try_handshake(
-        self,
-        *,
-        method: str,
-        body: bytes,
-        headers: Mapping[str, str],
-        query: Mapping[str, str],
-    ) -> WebhookHandshake:
-        """Delegate to plugin's own handshake method if it exists."""
-        if hasattr(self.plugin, "try_handshake"):
-            return self.plugin.try_handshake(body=body, headers=headers)
-        return WebhookHandshake(handled=False)
-
-
 class WebhookBridge(Protocol):
     """The minimum a live channel adapter exposes to the webhook route layer."""
 
@@ -178,16 +158,14 @@ def _add_webhook_route(
         # Handle platform handshakes (e.g. Slack url_verification) first,
         # before routing by org. Handshakes carry no org routing key and must
         # succeed in every deployment mode.
-        plugin_bridge = _DummyBridge(plugin)
-        handshake = plugin_bridge.try_handshake(
-            method=request.method, body=body, headers=headers, query=query,
-        )
-        if handshake.handled:
-            return Response(
-                content=handshake.response_body,
-                media_type=handshake.content_type,
-                status_code=handshake.status_code,
-            )
+        if plugin.handshake is not None:
+            handshake = plugin.handshake(body, headers, query)
+            if handshake is not None:
+                return Response(
+                    content=handshake.response_body,
+                    media_type=handshake.content_type,
+                    status_code=handshake.status_code,
+                )
 
         bridge, org_id = await resolve_bridge(
             channel_type=channel_type, plugin=plugin, body=body, headers=headers,

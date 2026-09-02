@@ -109,8 +109,10 @@ class ChannelConfigService:
         if plugin.verify is None:
             return VerifyResult(ok=False, detail=f"{plugin.display_name} has no connection test yet")
         result = await plugin.verify(self.load_credentials(channel_type))
-        # In org mode, stamp the discovered routing key onto the installation
-        # so webhooks can route to the right org without the key in the request.
+        # Stamp the discovered routing key onto the installation (in org mode, so
+        # webhooks can route to the right org; in local mode, for webhook deduping).
+        # If another org claimed this platform account, IntegrityError surfaces the
+        # conflict and the caller decides whether to proceed.
         if result.ok and result.routing_key:
             self.set_external_account_id(channel_type, result.routing_key)
         return result

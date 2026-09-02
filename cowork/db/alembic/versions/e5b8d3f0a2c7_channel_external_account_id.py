@@ -1,7 +1,7 @@
 """channel installation external_account_id
 
 Adds channel_installations.external_account_id — the pre-scope webhook-
-routing key (Slack team_id, Discord guild_id, WhatsApp phone_number_id, ...).
+routing key (Slack team_id, Discord application_id, WhatsApp phone_number_id, ...).
 An inbound webhook has no org scope yet, so this has to be looked up before
 any org context exists, and unique on its own (not per-org): two orgs must
 never claim the same platform account.

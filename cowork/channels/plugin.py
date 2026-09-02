@@ -117,3 +117,6 @@ class ChannelPlugin:
     # Calls the platform to verify credentials authenticate (None means no check available).
     # `_is_configured` only checks presence, not validity.
     verify: Callable[[Mapping[str, str]], Awaitable["VerifyResult"]] | None = None
+    # Handles platform handshakes (e.g. Slack url_verification, WhatsApp hub.challenge)
+    # that arrive before routing. Returns WebhookHandshake; None means no handshake applies.
+    handshake: Callable[[bytes, Mapping[str, str], Mapping[str, str]], WebhookHandshake | None] | None = None

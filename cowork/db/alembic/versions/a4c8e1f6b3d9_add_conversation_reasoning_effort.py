@@ -14,8 +14,8 @@ import sqlalchemy as sa
 # revision identifiers, used by Alembic.
 revision: str = "a4c8e1f6b3d9"
 # Keep original parent f1a3c9d7e2b5 (already on staging). The channel
-# org-scoping migrations (d4a7c2e9f1b3, e5b8d3f0a2c7) must NOT be inserted
-# before this; they form a separate migration branch. See ENG-1684.
+# org-scoping migrations (d4a7c2e9f1b3 → e5b8d3f0a2c7) follow this migration
+# to maintain consistency between fresh and upgraded databases. See ENG-1684.
 down_revision: Union[str, Sequence[str], None] = "f1a3c9d7e2b5"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

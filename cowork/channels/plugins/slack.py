@@ -368,6 +368,18 @@ async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
     return SlackBridge(credentials)
 
 
+def _handshake(body: bytes, headers: Mapping[str, str], query: Mapping[str, str]) -> "WebhookHandshake | None":
+    """Handle Slack's url_verification challenge without needing a live adapter."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if isinstance(data, dict) and data.get("type") == "url_verification":
+        from cowork.channels.webhooks import WebhookHandshake
+        return WebhookHandshake(handled=True, response_body=str(data.get("challenge", "")))
+    return None
+
+
 plugin = ChannelPlugin(
     channel_type=CHANNEL_TYPE,
     display_name="Slack",
@@ -395,4 +407,5 @@ plugin = ChannelPlugin(
     ),
     extract_routing_key=extract_team_id,
     verify=verify_slack_credentials,
+    handshake=_handshake,
 )
