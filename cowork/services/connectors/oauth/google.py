@@ -61,9 +61,51 @@ def _fetch_userinfo_google(access_token: str) -> dict[str, Any]:
     )
 
 
+def _fetch_linear_workspace(access_token: str) -> tuple[str, str]:
+    """Best-effort (workspace_id, workspace_name) for the token's Linear
+    workspace, or ("", "") on any failure.
+
+    Deliberately a separate request from `_fetch_userinfo_linear`'s viewer
+    query, not one combined query: `_json_request` only raises on a bad HTTP
+    status, but a GraphQL response can be HTTP 200 with an `errors` array
+    instead (e.g. an unknown field) — checked explicitly here, since bundling
+    this into the viewer query would make a broken/unverified organization
+    query capable of failing the whole Linear connection (auth's version of
+    this function raises on any `errors` array), not just miss the workspace
+    split.
+
+    TEMP (ENG-2188): the `organization { id name }` shape is unverified
+    against Linear's real schema. Logs the raw response once to confirm the
+    real shape from a live reconnect, then remove the log line."""
+    try:
+        result = _json_request(
+            "https://api.linear.app/graphql",
+            method="POST",
+            json_body={"query": "query { organization { id name } }"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _log.warning("Linear organization raw GraphQL response (TEMP diagnostic): %r", result)
+        if result.get("errors"):
+            raise ValueError(f"Linear organization query returned errors: {result['errors']!r}")
+        organization = (result.get("data") or {}).get("organization") or {}
+        return str(organization.get("id") or "").strip(), str(organization.get("name") or "").strip()
+    except Exception:
+        _log.warning("Could not fetch Linear workspace identity — falling back to bare email", exc_info=True)
+        return "", ""
+
+
 def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     """Linear has no REST userinfo endpoint — identity comes from a GraphQL
-    query against the authenticated user (`viewer`)."""
+    query against the authenticated user (`viewer`).
+
+    Unlike Google, a Linear account isn't one-account-one-email: the same
+    email can belong to several workspaces. Folding the workspace id (from
+    `_fetch_linear_workspace`, best-effort) into the returned identity — the
+    same trick `_fetch_userinfo_supabase` above uses for its own
+    per-organization identity, rather than a new persisted field — means
+    connecting a second workspace gets its own connection tile instead of
+    silently overwriting the first (both derive_connection_name's slug and
+    is_same_account's dedup key come from this function's return value)."""
     result = _json_request(
         "https://api.linear.app/graphql",
         method="POST",
@@ -71,7 +113,17 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
         headers={"Authorization": f"Bearer {access_token}"},
     )
     viewer = (result.get("data") or {}).get("viewer") or {}
-    return {"email": viewer.get("email", ""), "name": viewer.get("name", "")}
+    email = str(viewer.get("email") or "").strip()
+    name = str(viewer.get("name") or "").strip()
+    workspace_id, workspace_name = _fetch_linear_workspace(access_token)
+    return {
+        "email": f"{email}:{workspace_id}" if workspace_id else email,
+        # Workspace name first, matching _fetch_userinfo_supabase's
+        # per-organization identity convention above — the tile shows the
+        # workspace/org, not the connecting individual, the same way a
+        # Supabase tile shows the org rather than the person who authorized it.
+        "name": workspace_name or name,
+    }
 
 
 def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
@@ -445,7 +497,16 @@ class OAuthService:
             # identity-derived match (is_same_account) updates the existing record
             # in place, carrying forward Google Picker grants and any label,
             # instead of leaving a stale duplicate connection behind.
-            connection_name = persist_connection(cfg.engine, "browser_oauth_builtin", "", new_fields)
+            #
+            # default_label=account_name gives a brand-new connection's tile a
+            # meaningful title (the account/org/workspace name the provider
+            # returned) instead of the generic engine-id default — but only
+            # for a genuinely new connection; it can never clobber a label the
+            # user already set on a reconnect (see persist_connection's
+            # default_label docs).
+            connection_name = persist_connection(
+                cfg.engine, "browser_oauth_builtin", "", new_fields, default_label=account_name or None
+            )
         except HTTPException as exc:
             err_msg = str(exc.detail)
             store.clear_pending(service, error=err_msg)

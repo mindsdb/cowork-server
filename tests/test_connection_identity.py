@@ -591,6 +591,58 @@ class TestPersistConnectionUserLabel:
         assert "_user_label" not in record["fields"]
         assert len(vault.list_connections()) == 1
 
+    def test_new_connection_uses_default_label_over_generic_engine_id(self, tmp_path):
+        # ENG-2188: an OAuth connector's fetched account/org/workspace name
+        # (e.g. Linear's workspace, Supabase's organization) should title a
+        # brand-new connection's tile instead of the generic engine id.
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection(
+            "linear", "browser_oauth_builtin", "", {"account_email": "a@x.com:org-1"},
+            default_label="Acme Workspace", vault=vault,
+        )
+        record = vault.read_record("linear", slug)
+        assert record["fields"]["_user_label"] == "Acme Workspace"
+
+    def test_default_label_deduplicated_against_existing(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        persist_connection(
+            "linear", "browser_oauth_builtin", "", {"account_email": "a@x.com:org-1"},
+            default_label="Acme Workspace", vault=vault,
+        )
+        slug2 = persist_connection(
+            "linear", "browser_oauth_builtin", "", {"account_email": "a@x.com:org-2"},
+            default_label="Acme Workspace", vault=vault,
+        )
+        record2 = vault.read_record("linear", slug2)
+        assert record2["fields"]["_user_label"] == "Acme Workspace 2"
+
+    def test_default_label_never_overwrites_a_label_the_user_already_set(self, tmp_path):
+        # Unlike `user_label`, `default_label` must only ever apply to a
+        # genuinely new connection — a reconnect through the same OAuth
+        # browser flow (e.g. after a token expires) must not silently
+        # clobber a name the user typed in for the tile.
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection(
+            "linear", "browser_oauth_builtin", "", {"account_email": "a@x.com:org-1"},
+            default_label="Acme Workspace", vault=vault,
+        )
+        set_connection_label("linear", slug, "My Renamed Tile", vault=vault)
+        persist_connection(
+            "linear", "browser_oauth_builtin", slug, {"account_email": "a@x.com:org-1"},
+            default_label="Acme Workspace", vault=vault,
+        )
+        record = vault.read_record("linear", slug)
+        assert record["fields"]["_user_label"] == "My Renamed Tile"
+
+    def test_explicit_user_label_still_wins_over_default_label(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection(
+            "linear", "browser_oauth_builtin", "", {"account_email": "a@x.com:org-1"},
+            user_label="Explicit", default_label="Acme Workspace", vault=vault,
+        )
+        record = vault.read_record("linear", slug)
+        assert record["fields"]["_user_label"] == "Explicit"
+
 
 class TestSetConnectionLabelReturnsValue:
     def test_returns_stored_value(self, tmp_path):
