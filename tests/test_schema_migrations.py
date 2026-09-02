@@ -620,3 +620,51 @@ def test_project_display_name_downgrade_keeps_the_projects_indexes(tmp_path, mon
     _upgrade_to(engine, uri, "e2b7d4f9a1c3")
     assert "display_name" in _table_columns(db_path, "projects")
     assert _has_index(db_path, "uq_projects_default_per_org")
+
+
+def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monkeypatch):
+    """ENG-1676. The real production shape: rows already exist when it runs.
+
+    Every other test in this file migrates an empty database, so none of them
+    would notice a column addition that fails, or silently drops data, on a
+    table that already has rows — which is the only state any real install is
+    ever in. Adds the rows at the revision *before* this one, then upgrades.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "populated.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    # Stop one short of the display_name revision.
+    _upgrade_to(engine, uri, "a4c8e1f6b3d9")
+    assert "display_name" not in _table_columns(db_path, "projects")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects (id, name, path, is_active) VALUES "
+                "('11111111-1111-1111-1111-111111111111', 'reports', '/p/reports', 0),"
+                "('22222222-2222-2222-2222-222222222222', 'untitled-project', '/p/u', 1)"
+            )
+        )
+
+    _upgrade_to(engine, uri, "e2b7d4f9a1c3")
+
+    assert "display_name" in _table_columns(db_path, "projects")
+    with engine.begin() as connection:
+        rows = sorted(connection.execute(text("SELECT name, display_name FROM projects")).all())
+    # Both inserted rows survive with a NULL label — which `display_label`
+    # resolves to the slug, so they render exactly as they did before. Asserted
+    # by membership rather than equality: the chain seeds a `general` row, and
+    # pinning the whole set would fail on that rather than on anything real.
+    assert ("reports", None) in rows
+    assert ("untitled-project", None) in rows
+    assert all(label is None for _, label in rows), "the migration must not invent labels"
+
+    # And the downgrade leaves the rows alone too.
+    _downgrade_to(engine, uri, "a4c8e1f6b3d9")
+    with engine.begin() as connection:
+        names = sorted(r[0] for r in connection.execute(text("SELECT name FROM projects")).all())
+    assert "reports" in names and "untitled-project" in names
