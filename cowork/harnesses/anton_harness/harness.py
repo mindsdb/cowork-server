@@ -427,14 +427,14 @@ class AntonHarness:
             # code execution this whole EFS-hardening task exists to keep out
             # of cowork-server. The remote-turn producer normally routes
             # streaming requests to the worker over Redis (see
-            # handlers/responses.py's _select_producer), but three callers
+            # handlers/responses.py's _select_producer), but two callers
             # reach this method directly, bypassing that gate entirely: the
             # legacy non-streaming branch in handlers/responses.py.handle
             # (ResponsesRequest.stream defaults to False, and any client can
-            # leave it unset), _produce/_run_turn's in-process fallback
-            # whenever COWORK_TURN_BACKEND isn't "remote", and the
-            # channel-ingress runtime (cowork/channels/runtime.py). This
-            # refusal is the single point that closes all three.
+            # leave it unset), and _produce/_run_turn's in-process fallback
+            # whenever COWORK_TURN_BACKEND isn't "remote". The channel-ingress
+            # runtime (cowork/channels/runtime.py) now routes through the
+            # remote gate itself, so this refusal is just a safety net there.
             raise RuntimeError(
                 "Turns must run on the remote worker in this deployment; "
                 "in-process execution is disabled."

@@ -16,21 +16,24 @@ from uuid import UUID
 from anton.core.dispatch import OutboundMessage
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, scope_for_background_context
+from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context, scope_for_org
 from cowork.db.session import get_open_session
-from cowork.harnesses.base import ChannelContext, get_harness
+from cowork.handlers.responses import ResponsesHandler
+from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.models.project import Project
-from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import get_user_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
+from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
+from cowork.services.artifact_roots import conversation_artifacts_base
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
 from cowork.services.channel_bindings import ChannelBindingService
-from cowork.services.channels import ChannelConfigService
+from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.skills import SkillService
+from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +70,7 @@ TYPING_REFRESH_S = 4.0
 MAX_TURN_ATTACHMENTS = 3
 
 
-def artifacts_since(project_path: str, since: float) -> list[tuple[str, str]]:
+def artifacts_since(project_path: str, conversation_id: UUID, since: float) -> list[tuple[str, str]]:
     """(path, filename) of artifact primaries created/updated after ``since``
     in this project. Time-window based: concurrent turns in the same project
     could cross-attribute — acceptable for the single-operator v1."""
@@ -75,7 +78,7 @@ def artifacts_since(project_path: str, since: float) -> list[tuple[str, str]]:
     # This runs for one known project, so the root is built directly rather than
     # resolved — the channel already holds the project it is answering for.
     source = ProjectArtifacts(
-        base=Path(project_path) / ".anton" / "artifacts",
+        base=conversation_artifacts_base(project_path, conversation_id),
         project_id=None,
         project_name=Path(project_path).name,
     )
@@ -141,27 +144,65 @@ class _KeyedLocks:
 
 
 class LiveAdapterRegistry:
-    """Process-wide cache of live channel adapters keyed by ``channel_type``.
-    """
+    """Process-wide cache of live channel adapters, keyed by (channel_type,
+    org_id). org_id=None is the local/desktop installation — today's single-
+    instance-per-channel-type behavior verbatim; an org lookup never sees it."""
 
     def __init__(self, registry: PluginRegistry | None = None) -> None:
         self._registry = registry if registry is not None else get_registry()
-        self._cache: dict[str, Any] = {}
+        self._cache: dict[tuple[str, str | None], Any] = {}
 
-    def get(self, channel_type: str) -> Any | None:
-        """Live adapter for a channel, or None if not configured/active."""
-        return self._cache.get(channel_type)
+    def get(self, channel_type: str, org_id: str | None = None) -> Any | None:
+        """Live adapter for a channel/org, or None if not configured/active."""
+        return self._cache.get((channel_type, org_id))
 
-    async def refresh(self, channel_type: str, *, session: ScopedSession | None = None) -> bool:
+    async def get_or_refresh(
+        self, channel_type: str, org_id: str | None, *, session: ScopedSession | None = None
+    ) -> Any | None:
+        """Cache hit → return it, no session touched. Miss (first webhook for
+        an org this replica hasn't loaded yet) → refresh, then return the
+        result either way. Used by the webhook path, which has no prior
+        chance to have called refresh for an org it just resolved."""
+        cached = self.get(channel_type, org_id)
+        if cached is not None:
+            return cached
+        await self.refresh(channel_type, org_id, session=session)
+        return self.get(channel_type, org_id)
+
+    async def resolve_org_bridge(
+        self, channel_type: str, routing_key: str, *, session: Any | None = None
+    ) -> tuple[Any, str | None] | None:
+        """What the webhook path's org_resolver actually calls: unverified
+        routing key -> which installation claims it -> that installation's own
+        bridge. None means nothing claims this key. session is a raw Session,
+        for tests — production always opens its own."""
+        own_session = session is None
+        raw = session or get_open_session()
+        try:
+            install = resolve_installation_by_external_account(raw, channel_type, routing_key)
+            if install is None:
+                return None
+            scope = scope_for_org(install.org_id)
+            bridge = await self.get_or_refresh(
+                channel_type, install.org_id, session=ScopedSession(raw, scope)
+            )
+            return (bridge, install.org_id) if bridge is not None else None
+        finally:
+            if own_session:
+                raw.close()
+
+    async def refresh(
+        self, channel_type: str, org_id: str | None = None, *, session: ScopedSession | None = None
+    ) -> bool:
 
         plugin = self._registry.get(channel_type)
         if plugin is None:
-            self._cache.pop(channel_type, None)
+            self._cache.pop((channel_type, org_id), None)
             return False
         own_session = session is None
-        # Boot/background refresh reads deployment-level channel credentials
-        # (settings; scoping deferred) — SYSTEM_SCOPE like the scheduler loop.
-        s = session or ScopedSession(get_open_session(), SYSTEM_SCOPE)
+        # No caller-supplied session: LOCAL_SCOPE for local mode, org scope otherwise.
+        scope = scope_for_org(org_id)
+        s = session or ScopedSession(get_open_session(), scope)
         try:
             creds = ChannelConfigService(s, registry=self._registry).load_credentials(channel_type)
         finally:
@@ -170,24 +211,27 @@ class LiveAdapterRegistry:
         try:
             adapter = await plugin.factory(creds)
         except Exception:
-            log.exception("failed building live adapter for channel %s", channel_type)
+            log.exception("failed building live adapter for channel %s (org=%s)", channel_type, org_id)
             adapter = None
         if adapter is None:
-            self._cache.pop(channel_type, None)
+            self._cache.pop((channel_type, org_id), None)
             return False
-        self._cache[channel_type] = adapter
+        self._cache[(channel_type, org_id)] = adapter
         return True
 
     async def refresh_all(self) -> list[str]:
+        """Local-mode boot bootstrap: one adapter per plugin, org_id=None. Org
+        installations refresh lazily on first webhook — see the resolver in
+        webhooks.py — since channels aren't reachable in org mode yet anyway."""
         active: list[str] = []
         for plugin in self._registry.all():
             if await self.refresh(plugin.channel_type):
                 active.append(plugin.channel_type)
         return active
 
-    async def remove(self, channel_type: str) -> None:
+    async def remove(self, channel_type: str, org_id: str | None = None) -> None:
 
-        adapter = self._cache.pop(channel_type, None)
+        adapter = self._cache.pop((channel_type, org_id), None)
         if adapter is not None:
             try:
                 await adapter.shutdown()
@@ -230,20 +274,22 @@ class AntonChannelRuntime:
         thread_key = event.address.thread_id or _DEFAULT_THREAD_KEY
         return f"{channel_type}:{event.address.platform_id}:{thread_key}"
 
-    async def handle(self, channel_type: str, event: Any) -> None:
+    async def handle(self, channel_type: str, event: Any, org_id: str | None = None) -> None:
         log.info(
             "channel %s: runtime received inbound from %s thread=%s",
             channel_type, event.address.platform_id, event.address.thread_id,
         )
         async with self._locks.acquire(self._lock_key(channel_type, event)):
-            await self._handle_locked(channel_type, event)
+            await self._handle_locked(channel_type, event, org_id)
 
-    async def _handle_locked(self, channel_type: str, event: Any) -> None:
+    async def _handle_locked(self, channel_type: str, event: Any, org_id: str | None) -> None:
         session = get_open_session()
         try:
-            # One scope per turn. Org mode fails loudly here until the
-            # service-principal ticket lands — never a silent unscoped write.
-            scoped = ScopedSession(session, scope_for_background_context())
+            # One scope per turn. org_id comes from the webhook's own org
+            # resolution (resolve_bridge) — None means local mode, or (in org
+            # mode) a genuinely unresolved org, which still fails closed below.
+            scope = TenantScope(org_mode=True, org_id=org_id) if org_id else scope_for_background_context()
+            scoped = ScopedSession(session, scope)
             binding = self._resolve_or_create_binding(scoped, channel_type, event)
             log.info(
                 "channel %s: binding %s → project %s (trigger=%s)",
@@ -253,11 +299,11 @@ class AntonChannelRuntime:
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
             if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
-                await self._start_fresh(scoped, channel_type, binding, event)
+                await self._start_fresh(scoped, channel_type, binding, event, org_id)
                 return
             # Optional hook: adapters with set_typing show a typing indicator
             # for the duration of the turn; others are untouched.
-            adapter = self._adapters.get(channel_type)
+            adapter = self._adapters.get(channel_type, org_id)
             typing = None
             if adapter is not None and callable(getattr(adapter, "set_typing", None)):
                 typing = asyncio.create_task(typing_loop(adapter, event.address))
@@ -272,9 +318,12 @@ class AntonChannelRuntime:
                     display_name=binding.display_name,
                     instructions=binding.instructions,
                 )
-                reply, used_tools = await self._run_anton(
-                    scoped, conversation, event, adapter, channel_context=channel_context
-                )
+                # Nested get_user_settings() reads (model/provider, channels_harness)
+                # must resolve against this org, not fall back to local/global.
+                with use_settings_scope(scope):
+                    reply, used_tools = await self._run_anton(
+                        scoped, conversation, event, adapter, channel_context=channel_context
+                    )
             finally:
                 if typing is not None:
                     typing.cancel()
@@ -292,14 +341,17 @@ class AntonChannelRuntime:
                     link = conversation_link(conversation.id)
                     if link:
                         outbound = f"{reply}\n\n{link}"
-                await self._deliver(channel_type, event, outbound)
+                await self._deliver(channel_type, event, outbound, org_id)
             if used_tools:
                 await self.send_turn_artifacts(adapter, event, conversation, turn_started)
         finally:
             session.close()
 
 
-    async def _start_fresh(self, scoped: ScopedSession, channel_type: str, binding: ChannelBinding, event: Any) -> None:
+    async def _start_fresh(
+        self, scoped: ScopedSession, channel_type: str, binding: ChannelBinding, event: Any,
+        org_id: str | None,
+    ) -> None:
         """Handle /new: detach the pinned conversation and confirm deterministically instead of running a turn."""
         ChannelBindingService(scoped).detach_conversation(binding)
         project = scoped.get(Project, binding.anton_project_id or self._resolve_default_project_id(scoped))
@@ -308,6 +360,7 @@ class AntonChannelRuntime:
         await self._deliver(
             channel_type, event,
             f'Starting fresh — your next message begins a new conversation in the "{name}" project.',
+            org_id,
         )
 
     def _resolve_or_create_binding(self, scoped: ScopedSession, channel_type: str, event: Any) -> ChannelBinding:
@@ -409,6 +462,33 @@ class AntonChannelRuntime:
             return pinned
         return (get_user_settings().channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
 
+    async def _turn_stream(
+        self, harness: HarnessProvider, harness_id: str, scoped: ScopedSession,
+        conversation: Conversation, blocks: list[dict], text: str,
+        channel_context: ChannelContext | None, turn_rows: list,
+    ):
+        """The one place a channel turn picks in-process vs remote-worker
+        execution; the rest of _run_anton is identical either way."""
+        if not TurnQueueSettings().is_remote:
+            return harness.stream_response(
+                conversation=conversation, input=blocks, channel_context=channel_context,
+                trace_metadata=build_trace_metadata(),
+            )
+        await asyncio.to_thread(
+            ResponsesHandler._stage_remote_workspace_files, scoped, conversation.id,
+        )
+        # Known gap: channel_context (group/DM framing, per-channel instructions) has no
+        # remote job field yet, so it's dropped here — unused on this path in org mode.
+        return remote_turn_events(
+            session=scoped,
+            conv_id=conversation.id,
+            org_id=scoped.scope.org_id,
+            user_id=None,  # channel turns are org-scoped, not per-member
+            input_text=text,
+            model=None,  # deployment default, same as browser turns with no override
+            turn_rows=turn_rows,
+        )
+
     async def _run_anton(
         self, scoped: ScopedSession, conversation: Conversation, event: Any, adapter: Any = None,
         *, channel_context: ChannelContext | None = None,
@@ -452,18 +532,15 @@ class AntonChannelRuntime:
             if event_type == "response.output_text.delta":
                 collected.append(data.get("delta", ""))
 
-        stream = harness.stream_response(
-            conversation=conversation,
-            input=blocks,
-            channel_context=channel_context,
-            # Channel turns don't pass through ResponsesHandler, so they need
-            # their own build stamp (ENG-1279) — a bot turn is otherwise
-            # unattributable to the release that produced it.
-            trace_metadata=build_trace_metadata(),
+        stream = await self._turn_stream(
+            harness, harness_id, scoped, conversation, blocks, text, channel_context, turn_rows,
         )
+        remote_failure: RemoteTurnFailed | None = None
         try:
             async for _chunk in harness.formatter(stream, harness_id, event_sink):
                 pass
+        except RemoteTurnFailed as exc:
+            remote_failure = exc
         finally:
             # Persist the user message only after the harness has read this
             # turn's history (it reads via a fresh query). Persisting earlier
@@ -474,7 +551,7 @@ class AntonChannelRuntime:
                 conversation.id, content, created_at=sent_at
             )
 
-        reply = "".join(collected)
+        reply = remote_failure.message if remote_failure is not None else "".join(collected)
         ConversationService(scoped).save_assistant_turn(
             conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
         )
@@ -487,7 +564,10 @@ class AntonChannelRuntime:
 
     async def build_input_blocks(self, scoped: ScopedSession, adapter: Any, event: Any, text: str) -> list[dict]:
         """Harness input from the inbound event: stored media become image/file
-        blocks (same shapes the responses handler builds), text rides last."""
+        blocks (same shapes the responses handler builds), text rides last.
+
+        Known gap: these blocks aren't staged for the remote worker in org mode
+        (only browser-uploaded attachments are), so channel media is silently unavailable to the model there."""
         blocks: list[dict] = []
         fetch = getattr(adapter, "fetch_attachment", None) if adapter is not None else None
         for attachment in (event.message.attachments or []):
@@ -523,14 +603,14 @@ class AntonChannelRuntime:
         project = conversation.project
         if project is None:
             return
-        for path, filename in artifacts_since(project.path, since)[:MAX_TURN_ATTACHMENTS]:
+        for path, filename in artifacts_since(project.path, conversation.id, since)[:MAX_TURN_ATTACHMENTS]:
             try:
                 await sender(address=event.address, path=path, filename=filename)
             except Exception:
                 log.warning("channel %s: failed sending artifact %s", event.address.channel_type, filename)
 
-    async def _deliver(self, channel_type: str, event: Any, reply: str) -> None:
-        adapter = self._adapters.get(channel_type)
+    async def _deliver(self, channel_type: str, event: Any, reply: str, org_id: str | None = None) -> None:
+        adapter = self._adapters.get(channel_type, org_id)
         if adapter is None:
             log.warning("channel %s: no live adapter; reply not delivered", channel_type)
             return
