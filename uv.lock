@@ -143,8 +143,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.8.31.3rc2.dev2+g095c17ae3"
-source = { git = "https://github.com/mindsdb/anton.git?rev=095c17ae3fcb7d0e438add0fca61d05deab2ed36#095c17ae3fcb7d0e438add0fca61d05deab2ed36" }
+version = "2.26.8.31.3.dev3+gb4471472b"
+source = { git = "https://github.com/mindsdb/anton.git?rev=b4471472bcbc205661a339c1e67a48a2f804e6fe#b4471472bcbc205661a339c1e67a48a2f804e6fe" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -456,7 +456,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?rev=095c17ae3fcb7d0e438add0fca61d05deab2ed36" },
+    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?rev=b4471472bcbc205661a339c1e67a48a2f804e6fe" },
     { name = "cryptography", specifier = ">=48.0.0,<49" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
@@ -1198,7 +1198,7 @@ name = "portalocker"
 version = "3.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pywin32", marker = "sys_platform == 'win32'" },
+    { name = "pywin32" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5e/77/65b857a69ed876e1951e88aaba60f5ce6120c33703f7cb61a3c894b8c1b6/portalocker-3.2.0.tar.gz", hash = "sha256:1f3002956a54a8c3730586c5c77bf18fae4149e07eaf1c29fc3faf4d5a3f89ac", size = 95644, upload-time = "2025-06-14T13:20:40.03Z" }
 wheels = [
