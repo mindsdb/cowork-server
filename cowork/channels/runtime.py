@@ -70,7 +70,7 @@ TYPING_REFRESH_S = 4.0
 MAX_TURN_ATTACHMENTS = 3
 
 
-def artifacts_since(project_path: str, conversation_id, since: float) -> list[tuple[str, str]]:
+def artifacts_since(project_path: str, conversation_id: UUID, since: float) -> list[tuple[str, str]]:
     """(path, filename) of artifact primaries created/updated after ``since``
     in this project. Time-window based: concurrent turns in the same project
     could cross-attribute — acceptable for the single-operator v1."""

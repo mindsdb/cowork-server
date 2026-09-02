@@ -145,27 +145,19 @@ def _handle_missed_runs(session) -> None:
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:
     """Service principal for a scheduled run, derived from the schedule row.
 
-    A scheduled run has no HTTP request and so no gateway-injected principal, so
-    the owning identity comes from the row itself: ``org_id`` scopes the turn's
-    data and the per-tenant key the remote backend mints, and ``created_by``
-    attributes the rows it writes.
-
-    Local mode has no tenant context, so return None (unscoped). Org mode
-    requires both ids; a NULL is corrupt data that would write rows the owner
-    can't see, so fail loud instead.
+    Delegates to `service_principal_for` from the scoped module, which handles
+    the org vs. local mode logic. The custom error message below wraps it with
+    schedule-specific context.
     """
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.scoped import MissingTenantScopeError
-    from cowork.principal import Principal
+    from cowork.db.scoped import MissingTenantScopeError, service_principal_for
 
-    if get_app_settings().tenancy_mode != "org":
-        return None
-    if not schedule.org_id or not schedule.created_by:
+    try:
+        return service_principal_for(schedule.org_id, schedule.created_by)
+    except MissingTenantScopeError:
         raise MissingTenantScopeError(
             f"schedule {schedule.id} is missing org_id/created_by; "
             "cannot resolve a service principal to run it in org mode"
         )
-    return Principal(user_id=schedule.created_by, org_id=schedule.org_id)
 
 
 async def execute_schedule(

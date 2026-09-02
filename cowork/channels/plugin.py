@@ -109,11 +109,9 @@ class ChannelPlugin:
     connector_spec: dict[str, Any] | None = field(default=None)
     lifecycle: ChannelLifecycle | None = field(default=None)
     capabilities: ChannelCapabilities = field(default_factory=ChannelCapabilities)
-    # Pulls a pre-scope routing key (Slack team_id, ...) from an unverified
-    # inbound body/headers, for platforms that carry one. None (most plugins
-    # today) means: no per-org webhook routing, the plain resolver decides.
+    # Pulls a pre-scope routing key (Slack team_id, ...) from inbound
+    # body/headers, or None if no per-org webhook routing applies.
     extract_routing_key: Callable[[bytes, Mapping[str, str]], str | None] | None = None
-    # Calls the platform to check these credentials actually authenticate —
-    # `_is_configured` only checks presence, not validity. None means no live
-    # check is available yet for this channel.
+    # Calls the platform to verify credentials authenticate (None means no check available).
+    # `_is_configured` only checks presence, not validity.
     verify: Callable[[Mapping[str, str]], Awaitable["VerifyResult"]] | None = None

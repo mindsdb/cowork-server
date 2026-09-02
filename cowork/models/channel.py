@@ -11,11 +11,8 @@ from cowork.models.base import BaseSQLModel
 
 class ChannelInstallation(BaseSQLModel, table=True):
     __tablename__ = "channel_installations"
-    # Org-wide installations: one per channel_type when org_id is NULL
-    # (desktop/local, today's behavior verbatim), one per (channel_type,
-    # org_id) when it isn't (one org, one installation of a given channel
-    # type). Mirrors settings' own org/global partial-index split
-    # (models/setting.py).
+    # One per channel_type per org (or global if org_id is NULL).
+    # Mirrors settings' org/global partial-index split (models/setting.py).
     __table_args__ = (
         sa.Index(
             "uq_channel_installations_type_global",
@@ -56,7 +53,7 @@ class ChannelInstallation(BaseSQLModel, table=True):
         default=None,
         max_length=255,
         description="Platform account id used to route an inbound webhook to its "
-        "installation before any org scope exists (Slack team_id, Discord guild_id, "
+        "installation before any org scope exists (Slack team_id, Discord application_id, "
         "WhatsApp phone_number_id, ...); NULL until setup discovers it",
     )
 
@@ -127,10 +124,8 @@ class ChannelSession(BaseSQLModel, table=True):
 
 class ChannelEvent(BaseSQLModel, table=True):
     __tablename__ = "channel_events"
-    # Dedupe is per installation, not per channel_type alone (org-wide
-    # installations: org_id IS the installation anchor here). Split the same
-    # way as ChannelInstallation's own partial index, so a redelivered event
-    # id from org A's Slack workspace can never dedupe against org B's.
+    # Dedupe key per installation (org_id anchors the index).
+    # Prevents org A's redelivered event from deduping against org B's.
     __table_args__ = (
         sa.Index(
             "uq_channel_events_inbound_dedupe_global",

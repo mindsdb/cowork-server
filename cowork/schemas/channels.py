@@ -145,9 +145,7 @@ class PluginResponse(BaseModel):
     has_oauth: bool = False
     webhook_paths: list[str] = []
     capabilities: PluginCapabilities
-    # False for channels with no per-org webhook routing key (Telegram,
-    # WhatsApp): configuring them in org mode would silently never deliver.
-    # Always true in local mode, where there's only ever one tenant.
+    # False if no per-org webhook routing key (Telegram, WhatsApp); True in local mode.
     org_ready: bool = True
 
 
