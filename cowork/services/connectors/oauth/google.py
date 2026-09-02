@@ -63,15 +63,33 @@ def _fetch_userinfo_google(access_token: str) -> dict[str, Any]:
 
 def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     """Linear has no REST userinfo endpoint — identity comes from a GraphQL
-    query against the authenticated user (`viewer`)."""
+    query against the authenticated user (`viewer`) and their workspace
+    (`organization`).
+
+    Unlike Google, a Linear account isn't one-account-one-email: the same
+    email can belong to several workspaces. Folding the workspace id into the
+    returned identity — the same trick `_fetch_userinfo_supabase` above uses
+    for its own per-organization identity, rather than a new persisted field —
+    means connecting a second workspace gets its own connection tile instead
+    of silently overwriting the first (both derive_connection_name's slug and
+    is_same_account's dedup key come from this function's return value)."""
     result = _json_request(
         "https://api.linear.app/graphql",
         method="POST",
-        json_body={"query": "query { viewer { email name } }"},
+        json_body={"query": "query { viewer { email name } organization { id name } }"},
         headers={"Authorization": f"Bearer {access_token}"},
     )
-    viewer = (result.get("data") or {}).get("viewer") or {}
-    return {"email": viewer.get("email", ""), "name": viewer.get("name", "")}
+    data = result.get("data") or {}
+    viewer = data.get("viewer") or {}
+    organization = data.get("organization") or {}
+    email = str(viewer.get("email") or "").strip()
+    name = str(viewer.get("name") or "").strip()
+    workspace_id = str(organization.get("id") or "").strip()
+    workspace_name = str(organization.get("name") or "").strip()
+    return {
+        "email": f"{email}:{workspace_id}" if workspace_id else email,
+        "name": f"{name} — {workspace_name}" if workspace_name else name,
+    }
 
 
 def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
