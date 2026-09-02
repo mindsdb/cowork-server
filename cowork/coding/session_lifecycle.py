@@ -12,6 +12,7 @@ from cowork.coding.contracts import (
     TaskWorkspace,
     utc_now,
 )
+from cowork.coding.control_errors import StateConflict
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.control_models import RunStatus
 from cowork.coding.control_service import ControlPlaneService
@@ -107,6 +108,8 @@ class SessionLifecycleOperations:
                 session_id,
                 "Wait for the active turn to finish before forking this coding task",
             ) as parent:
+                if self.runtimes.terminal_is_running(parent.id):
+                    raise StateConflict("Stop running terminals before forking this coding task")
                 return self._fork_reserved(parent, credentials)
 
     def _fork_reserved(self, parent: CodingSession, credentials: EngineCredentials) -> CodingSession:
@@ -233,6 +236,11 @@ class SessionLifecycleOperations:
                 engine_workspace_path(child),
                 tuple(child.additional_dirs),
             )
+            # Codex keeps the forked thread under the app-server process that
+            # created it. Release that process before the child is opened so a
+            # second app server can resume the fork without an active-writer
+            # conflict. The parent is durable and reopens on its next action.
+            self.runtimes.close_locked(parent.id)
             self.store.save_session(child)
             self.control.attach_prepared_workspaces(
                 control_snapshot.run.id,
