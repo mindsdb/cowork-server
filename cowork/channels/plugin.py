@@ -72,10 +72,12 @@ class OAuthSpec:
 @dataclass(frozen=True)
 class VerifyResult:
     """Outcome of a plugin's `verify` hook: did these credentials actually
-    authenticate against the platform, not just get typed into the form."""
+    authenticate against the platform, not just get typed into the form. In org
+    mode, routing_key (if present) is stamped on the installation."""
 
     ok: bool
     detail: str = ""
+    routing_key: str | None = None
 
 
 @dataclass(frozen=True)

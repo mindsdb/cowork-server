@@ -348,8 +348,13 @@ async def verify_slack_credentials(credentials: Mapping[str, str]) -> VerifyResu
         return VerifyResult(ok=False, detail=f"could not reach Slack: {exc}")
     body = resp.json()
     if body.get("ok"):
-        team = body.get("team") or body.get("team_id") or ""
-        return VerifyResult(ok=True, detail=f"Connected to {team}" if team else "Connected")
+        team_id = body.get("team_id") or ""
+        team_name = body.get("team") or team_id or ""
+        return VerifyResult(
+            ok=True,
+            detail=f"Connected to {team_name}" if team_name else "Connected",
+            routing_key=team_id or None,
+        )
     return VerifyResult(ok=False, detail=f"Slack rejected the token: {body.get('error', 'unknown error')}")
 
 

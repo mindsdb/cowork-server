@@ -108,7 +108,12 @@ class ChannelConfigService:
         plugin = self._require_plugin(channel_type)
         if plugin.verify is None:
             return VerifyResult(ok=False, detail=f"{plugin.display_name} has no connection test yet")
-        return await plugin.verify(self.load_credentials(channel_type))
+        result = await plugin.verify(self.load_credentials(channel_type))
+        # In org mode, stamp the discovered routing key onto the installation
+        # so webhooks can route to the right org without the key in the request.
+        if result.ok and result.routing_key:
+            self.set_external_account_id(channel_type, result.routing_key)
+        return result
 
     def load_credentials(self, channel_type: str) -> dict[str, str]:
         """Decrypted credential values for internal runtime use only — building

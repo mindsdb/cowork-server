@@ -421,8 +421,14 @@ async def verify_discord_credentials(credentials: Mapping[str, str]) -> VerifyRe
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         return VerifyResult(ok=False, detail=f"could not reach Discord: {exc}")
     if resp.status_code == 200:
-        name = (resp.json() or {}).get("username", "")
-        return VerifyResult(ok=True, detail=f"Connected as {name}" if name else "Connected")
+        user_data = resp.json() or {}
+        username = user_data.get("username", "")
+        user_id = user_data.get("id", "")
+        return VerifyResult(
+            ok=True,
+            detail=f"Connected as {username}" if username else "Connected",
+            routing_key=user_id or None,
+        )
     return VerifyResult(ok=False, detail=f"Discord rejected the token: HTTP {resp.status_code}")
 
 
