@@ -9,7 +9,7 @@ from typing import Any, Protocol
 from fastapi import APIRouter, Request, Response
 
 from cowork.channels.plugin import ChannelPlugin
-from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope
+from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_org
 from cowork.db.session import get_open_session
 from cowork.services.channel_events import ChannelEventService
 
@@ -263,9 +263,9 @@ def intake_events(
     sched = scheduler or _default_scheduler
     session = get_open_session()
     try:
-        # Dedupe is per installation: SYSTEM_SCOPE when no org was resolved
+        # Dedupe is per installation: LOCAL_SCOPE when no org was resolved
         # (local/desktop's one installation), the resolved org's scope otherwise.
-        scope = SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+        scope = scope_for_org(org_id)
         channel_log = ChannelEventService(ScopedSession(session, scope))
         for event in events:
             key = bridge.dedupe_key(event)
@@ -289,7 +289,7 @@ async def _process_event(
     since it runs after the request's session is closed."""
     session = get_open_session()
     try:
-        scope = SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+        scope = scope_for_org(org_id)
         channel_log = ChannelEventService(ScopedSession(session, scope))
         try:
             await sink(channel_type, event, org_id)

@@ -16,7 +16,7 @@ from uuid import UUID
 from anton.core.dispatch import OutboundMessage
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context
+from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context, scope_for_org
 from cowork.db.session import get_open_session
 from cowork.handlers.responses import ResponsesHandler
 from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
@@ -182,7 +182,7 @@ class LiveAdapterRegistry:
             install = resolve_installation_by_external_account(raw, channel_type, routing_key)
             if install is None:
                 return None
-            scope = TenantScope(org_mode=True, org_id=install.org_id) if install.org_id else LOCAL_SCOPE
+            scope = scope_for_org(install.org_id)
             bridge = await self.get_or_refresh(
                 channel_type, install.org_id, session=ScopedSession(raw, scope)
             )
@@ -200,9 +200,8 @@ class LiveAdapterRegistry:
             self._cache.pop((channel_type, org_id), None)
             return False
         own_session = session is None
-        # No caller-supplied session: SYSTEM_SCOPE for local mode's one
-        # installation, a real org scope otherwise — never the other way.
-        scope = SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+        # No caller-supplied session: LOCAL_SCOPE for local mode, org scope otherwise.
+        scope = scope_for_org(org_id)
         s = session or ScopedSession(get_open_session(), scope)
         try:
             creds = ChannelConfigService(s, registry=self._registry).load_credentials(channel_type)

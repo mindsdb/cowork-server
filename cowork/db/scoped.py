@@ -65,6 +65,14 @@ def scope_from_principal(principal: Principal | None) -> TenantScope:
     )
 
 
+def scope_for_org(org_id: str | None) -> TenantScope:
+    """Scope for a background or webhook-routed operation with a known org_id.
+    Local mode (no org) returns LOCAL_SCOPE; org mode returns an org-scoped
+    TenantScope. Replaces the inline pattern:
+    `SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)`."""
+    return LOCAL_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+
+
 def get_tenant_scope(request: Request) -> TenantScope:
     """FastAPI dependency: the request's tenant scope."""
     return scope_from_principal(get_principal(request))
