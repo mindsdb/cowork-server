@@ -535,6 +535,20 @@ class SkillService:
         os.replace(self._skill_dir(old_slug), self._skill_dir(new_slug))
 
     # ── builtin seeding ──────────────────────────────────────────────────────
+    def _copy_builtin_skill(self, src: Path) -> bool:
+        """Copy one packaged builtin without replacing an existing skill."""
+        dest = self._skill_dir(src.name)
+        if dest.exists():
+            return False
+        # Copied file by file, each destination re-checked for containment
+        # with safe_join. copy2, not copyfile: a packaged executable helper
+        # must keep its +x bit.
+        for child in sorted(p for p in src.rglob("*") if p.is_file()):
+            target = safe_join(dest, *child.relative_to(src).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target)
+        return True
+
     def _copy_builtin_skills(self) -> int:
         """Copy packaged builtins into this store, skipping slugs it already has.
 
@@ -552,16 +566,8 @@ class SkillService:
             if not self.includes_packaged_builtin(src.name):
                 continue
             try:
-                dest = self._skill_dir(src.name)
-                if dest.exists():
+                if not self._copy_builtin_skill(src):
                     continue  # keep the user-editable copy untouched
-                # Copied file by file, each destination re-checked for containment
-                # with safe_join. copy2, not copyfile: copytree preserved mode, and a
-                # future builtin shipping an executable helper must keep its +x.
-                for child in sorted(p for p in src.rglob("*") if p.is_file()):
-                    target = safe_join(dest, *child.relative_to(src).parts)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(child, target)
             except ValueError:
                 # Either the slug resolves outside the store, or safe_join rejected a
                 # destination. The agent writes into its own org's tree on shared
@@ -642,3 +648,30 @@ class CodeSkillService(SkillService):
 
     def includes_packaged_builtin(self, slug: str) -> bool:
         return slug in CODE_ONLY_BUILTIN_SKILL_NAMES
+
+    def ensure_builtin_skills(self) -> bool:
+        """Seed Code builtins and repair directories left empty by an interrupted copy.
+
+        A current marker still represents a deliberate deletion when the whole
+        skill directory is absent. Only an existing, empty directory is known to
+        be an incomplete install, so repairing it does not resurrect deleted or
+        user-edited skills.
+        """
+        repaired = 0
+        try:
+            for slug in sorted(CODE_ONLY_BUILTIN_SKILL_NAMES):
+                src = self.builtin_skills_dir / slug
+                dest = self._skill_dir(slug)
+                if (
+                    src.is_dir()
+                    and (src / SKILL_FILE).is_file()
+                    and dest.is_dir()
+                    and not dest.is_symlink()
+                    and next(dest.iterdir(), None) is None
+                ):
+                    dest.rmdir()
+                    repaired += int(self._copy_builtin_skill(src))
+        except (OSError, ValueError):
+            logger.warning("Could not repair incomplete Code builtin skills in %s",
+                           self.root, exc_info=True)
+        return super().ensure_builtin_skills() or repaired > 0

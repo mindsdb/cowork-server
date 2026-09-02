@@ -2014,6 +2014,7 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
     assert child.pinned is False
     assert Path(child.workspace_path, "README.md").read_text(encoding="utf-8") == "forked work\n"
     assert child.engine_session_id == "forked-engine-session-1"
+    assert engine.closed == 1
     child_events = service.events(child.id).items
     assert any(event.text == "Build the feature" for event in child_events)
     assert child_events[-1].title == "Task forked"

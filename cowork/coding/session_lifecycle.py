@@ -233,6 +233,11 @@ class SessionLifecycleOperations:
                 engine_workspace_path(child),
                 tuple(child.additional_dirs),
             )
+            # Codex keeps the forked thread under the app-server process that
+            # created it. Release that process before the child is opened so a
+            # second app server can resume the fork without an active-writer
+            # conflict. The parent is durable and reopens on its next action.
+            self.runtimes.close_locked(parent.id)
             self.store.save_session(child)
             self.control.attach_prepared_workspaces(
                 control_snapshot.run.id,
