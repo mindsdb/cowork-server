@@ -373,6 +373,15 @@ def _harness_options() -> list[str]:
     return available_harness_ids()
 
 
+def _coding_engine_options() -> list[str]:
+    # Imported lazily so normal Cowork settings startup does not import or
+    # launch a coding runtime. The registry only reports functional adapters;
+    # future engines become additive here without UI conditionals.
+    from cowork.coding.engines.registry import engine_registry
+
+    return engine_registry.ids()
+
+
 # ── .env ↔ DB setting aliases ────────────────────────────────────────
 #
 # One canonical map of DB setting key → its ANTON_* .env variable name, for
@@ -520,6 +529,18 @@ class UserSettings(Settings):
         default=None,
         title="Coding Model",
         description="The coding model. Defaults to the recommended model for the selected provider.",
+    )
+    coding_agent_engine: Annotated[str, _DynamicOptions(_coding_engine_options)] = Field(
+        default="codex",
+        title="Coding Agent",
+        description="The agent engine used by the separate Code workspace.",
+    )
+    coding_agent_model: str = Field(
+        default="gpt-5.6-sol",
+        min_length=1,
+        max_length=256,
+        title="Coding Agent Model",
+        description="The MindsHub Inference model used by the selected coding agent.",
     )
     planning_reasoning_effort: str | None = Field(
         default=None,
@@ -901,6 +922,15 @@ class UserSettings(Settings):
             available = ", ".join(options) or "none"
             raise ValueError(f"Unknown harness '{v}'. Available: {available}")
         return v
+
+    @field_validator("coding_agent_engine")
+    @classmethod
+    def validate_coding_agent_engine(cls, value: str) -> str:
+        options = _coding_engine_options()
+        if value not in options:
+            available = ", ".join(options) or "none"
+            raise ValueError(f"Unknown coding agent '{value}'. Available: {available}")
+        return value
 
     def _minds_enabled_map(self) -> dict[str, bool]:
         """The cached MindsHub model-availability map (id → enabled), or {}.

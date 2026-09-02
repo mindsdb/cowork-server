@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cowork.api.v1.router import api_router
-from cowork.services.artifacts import serve_url_for
+from cowork.services.artifacts import _project_artifacts_base, serve_url_for
 
 
 def _get_artifacts_prefix() -> str:
@@ -50,3 +50,20 @@ def test_serve_url_prefix_matches_router():
         assert url.startswith(expected_prefix), (
             f"URL prefix mismatch: got {url!r}, expected to start with {expected_prefix!r}"
         )
+
+
+def test_project_base_accepts_registered_path_through_symlink(tmp_path):
+    real_root = tmp_path / "real-projects"
+    artifacts = real_root / "proj" / ".anton" / "artifacts"
+    artifacts.mkdir(parents=True)
+    alias_root = tmp_path / "projects-alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+
+    with patch(
+        "cowork.services.artifacts._registered_project_dirs",
+        return_value=[alias_root / "proj"],
+    ), patch(
+        "cowork.services.artifacts._projects_root",
+        return_value=alias_root,
+    ):
+        assert _project_artifacts_base("proj") == artifacts.resolve()
