@@ -36,7 +36,6 @@ class RunningTurn:
     turn_id: str
     thread: threading.Thread
     cancel_requested: bool = False
-    interruption_requested: bool = False
     pending_steers: list[tuple[str, tuple[EngineInputReference, ...]]] = field(default_factory=list)
 
     def route_steer(
@@ -81,13 +80,6 @@ def fail_turn(session: CodingSession, cancelled: bool, message: str) -> None:
     session.active_turn_id = None
     session.pending_approval = None
     session.last_error = None if cancelled else message
-
-
-def interrupt_turn(session: CodingSession) -> None:
-    session.status = SessionStatus.interrupted
-    session.active_turn_id = None
-    session.pending_approval = None
-    session.last_error = None
 
 
 class EventBuffer:
@@ -197,9 +189,6 @@ class TurnExecutor:
                     engine_session.steer(turn_id, pending_prompt, pending_attachments)
 
             status, terminal_event = self._collect_events(session_id, engine_session, turn_id)
-            if self._interruption_requested(session_id):
-                status = SessionStatus.interrupted
-                terminal_event = None
             finished_status = status
             if terminal_event is not None:
                 self._emit(session_id, terminal_event, lambda current: finish_turn(current, status))
@@ -228,29 +217,6 @@ class TurnExecutor:
                 self._runtimes.discard_if_closed(session_id, engine_session)
             if finished_status == SessionStatus.completed:
                 self._continue_queue(session_id, credentials)
-
-    def interrupt(self, session_ids: list[str]) -> int:
-        """Persist app-shutdown interruptions before closing owned runtimes."""
-        interrupted: list[str] = []
-        with self._state_lock:
-            for session_id in session_ids:
-                running = self._running.get(session_id)
-                if running is None or running.interruption_requested:
-                    continue
-                running.interruption_requested = True
-                interrupted.append(session_id)
-        for session_id in interrupted:
-            self._emit(
-                session_id,
-                CodingEvent(
-                    type=EventType.session,
-                    title="Task interrupted",
-                    text="Cowork closed while this task was running. Send a follow-up to resume from the preserved workspace.",
-                    phase="failed",
-                ),
-                interrupt_turn,
-            )
-        return len(interrupted)
 
     def _attach_runtime(self, session_id: str, engine_session: EngineSession) -> None:
         with self._state_lock:
@@ -310,12 +276,7 @@ class TurnExecutor:
 
     def _record_failure(self, session_id: str, message: str) -> None:
         with self._state_lock:
-            running = self._running.get(session_id)
-            cancelled = bool(running and running.cancel_requested)
-            interrupted = bool(running and running.interruption_requested)
-        if interrupted and not cancelled:
-            self._store.update_session(session_id, interrupt_turn)
-            return
+            cancelled = bool(self._running.get(session_id) and self._running[session_id].cancel_requested)
         self._emit(
             session_id,
             CodingEvent(
@@ -326,11 +287,6 @@ class TurnExecutor:
             ),
             lambda current: fail_turn(current, cancelled, message),
         )
-
-    def _interruption_requested(self, session_id: str) -> bool:
-        with self._state_lock:
-            running = self._running.get(session_id)
-            return bool(running and running.interruption_requested)
 
     def _continue_queue(self, session_id: str, credentials: EngineCredentials) -> None:
         try:

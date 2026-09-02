@@ -33,10 +33,6 @@ class EngineSessionConfig:
     network_access: bool = False
     web_search: bool = False
     additional_dirs: tuple[str, ...] = ()
-    developer_instructions: str = ""
-    environment: tuple[tuple[str, str], ...] = ()
-    session_id: str = ""
-    cowork_root: str = ""
 
 
 @dataclass(frozen=True)
@@ -84,7 +80,7 @@ class EngineSession(Protocol):
 
     def extension_inventory(self) -> ExtensionInventory: ...
 
-    def fork(self, workspace: str, additional_dirs: tuple[str, ...] = ()) -> str: ...
+    def fork(self, workspace: str) -> str: ...
 
     def platform_status(self) -> RuntimePlatformStatus: ...
 
