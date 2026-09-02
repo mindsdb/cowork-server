@@ -1,7 +1,7 @@
 """add conversation reasoning_effort
 
 Revision ID: a4c8e1f6b3d9
-Revises: e5b8d3f0a2c7
+Revises: f1a3c9d7e2b5
 Create Date: 2026-08-27 00:00:00.000000
 
 """
@@ -13,7 +13,11 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a4c8e1f6b3d9"
-down_revision: Union[str, Sequence[str], None] = "e5b8d3f0a2c7"
+# This migration landed on staging with f1a3c9d7e2b5 as its parent and is already
+# in the DB history. Keep the original parent to avoid breaking the migration chain
+# for DBs that already have it applied. The channel org-scoping migrations
+# (d4a7c2e9f1b3, e5b8d3f0a2c7) run BEFORE this one and don't conflict.
+down_revision: Union[str, Sequence[str], None] = "f1a3c9d7e2b5"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
