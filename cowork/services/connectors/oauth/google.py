@@ -123,7 +123,7 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
 
 def _fetch_posthog_organization(access_token: str, *, api_host: str) -> tuple[str, str]:
     """Best-effort (organization_id, organization_name) for the token's
-    PostHog organization, or ("", "") on any failure.
+    PostHog organization(s), or ("", "") on any failure.
 
     Deliberately a separate request from `_fetch_userinfo_posthog`'s user
     query, not one combined call: the organization lookup is best-effort, so
@@ -132,7 +132,16 @@ def _fetch_posthog_organization(access_token: str, *, api_host: str) -> tuple[st
     `_fetch_linear_workspace` above. Queries the SAME regional host the user
     lookup already succeeded against, for the reason `_fetch_userinfo_posthog`
     documents: a token issued for one region isn't guaranteed to be accepted
-    by the other's host."""
+    by the other's host.
+
+    PostHog's consent screen lets a user select multiple organizations in a
+    single authorization — unlike Linear, where one grant is exactly one
+    workspace — so `organization_name` joins every organization the token
+    can see (e.g. "Acme, Other Org"), not just the first, so the tile
+    accurately shows everything the connection actually covers.
+    `organization_id` still keys off the first organization only: it's used
+    solely for dedup, and a full multi-organization-aware dedup key is a
+    separate, not-yet-scoped improvement."""
     try:
         result = _json_request(
             f"{api_host}/api/organizations/",
@@ -141,8 +150,10 @@ def _fetch_posthog_organization(access_token: str, *, api_host: str) -> tuple[st
         organizations = result if isinstance(result, list) else (result.get("results") or [])
         if not organizations:
             return "", ""
-        organization = organizations[0]
-        return str(organization.get("id") or "").strip(), str(organization.get("name") or "").strip()
+        organization_id = str(organizations[0].get("id") or "").strip()
+        names = [str(org.get("name") or "").strip() for org in organizations]
+        organization_name = ", ".join(name for name in names if name)
+        return organization_id, organization_name
     except Exception:
         _log.warning("Could not fetch PostHog organization identity — falling back to bare email", exc_info=True)
         return "", ""
