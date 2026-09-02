@@ -397,3 +397,37 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode):
         assert exc.value.status_code == 501
     finally:
         responses_mod.ConversationService = original
+
+
+def test_load_workspace_env_degrades_when_anton_has_no_load_env(monkeypatch):
+    """This server pins anton to a moving rev. A Workspace without load_env
+    must cost the overlay, not every in-process turn."""
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+
+    from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
+
+    workspace = Mock(spec=[])  # no load_env at all
+
+    assert _load_workspace_env_if_safe(workspace) == {}
+    get_app_settings.cache_clear()
+
+
+def test_load_workspace_env_degrades_when_the_env_file_is_unreadable(monkeypatch):
+    """A malformed or unreadable .env must not take the turn down either."""
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+
+    from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
+
+    workspace = Mock()
+    workspace.load_env.side_effect = OSError("unreadable")
+
+    assert _load_workspace_env_if_safe(workspace) == {}
+    get_app_settings.cache_clear()

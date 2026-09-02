@@ -137,10 +137,23 @@ def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
     overlay`). The org-mode guard stays even though `_build_chat_session`
     itself is already unreachable in org mode (`stream_response`'s own
     check) — this is defense in depth, not the only line of defense.
+
+    Every failure here degrades to `{}`: this runs on the first line of every
+    in-process turn, so it must never be able to raise one.
     """
     if get_app_settings().tenancy_mode == "org":
         return {}
-    return workspace.load_env()
+    # This server pins anton to a moving rev, so degrade rather than raise:
+    # an absent overlay costs the project's .env, raising costs every turn.
+    loader = getattr(workspace, "load_env", None)
+    if loader is None:
+        logger.warning("installed anton has no Workspace.load_env; no project .env overlay")
+        return {}
+    try:
+        return loader() or {}
+    except Exception:
+        logger.warning("could not read the project .env; continuing without it", exc_info=True)
+        return {}
 
 
 settings = AntonHarnessSettings()
