@@ -26,6 +26,10 @@ class WorkspaceError(RuntimeError):
     pass
 
 
+class GitUnavailableError(WorkspaceError):
+    """Git is not installed or cannot be found by this runtime."""
+
+
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024
@@ -136,6 +140,8 @@ class GitRunner:
                 timeout=120,
                 shell=False,
             )
+        except FileNotFoundError as exc:
+            raise GitUnavailableError("Git is not installed or is not available on PATH") from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise WorkspaceError(f"Git could not run: {exc}") from exc
         if check and result.returncode != 0:
@@ -742,7 +748,12 @@ class WorkspaceManager:
         return entries
 
     def _git_root(self, path: Path) -> Path | None:
-        result = self.git.run(path, "rev-parse", "--show-toplevel", check=False)
+        try:
+            result = self.git.run(path, "rev-parse", "--show-toplevel", check=False)
+        except GitUnavailableError:
+            # Git is an enhancement for repository-backed folders, not a
+            # prerequisite for using an ordinary local folder.
+            return None
         if result.returncode != 0:
             return None
         return Path(result.stdout.strip()).resolve()

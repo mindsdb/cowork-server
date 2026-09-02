@@ -8,7 +8,7 @@ import pytest
 
 from cowork.coding import workspace as workspace_module
 from cowork.coding.contracts import WorkspaceKind
-from cowork.coding.workspace import GitRunner, WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -30,6 +30,10 @@ def repository(tmp_path: Path) -> Path:
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
     return repo
+
+
+def missing_git(*_args, **_kwargs):
+    raise FileNotFoundError(2, "not found", "git")
 
 
 def test_prepare_uses_detached_worktree_and_preserves_dirty_source(tmp_path: Path) -> None:
@@ -364,6 +368,32 @@ def test_git_runner_rejects_an_unavailable_working_directory_before_spawning(
 
     with pytest.raises(WorkspaceError, match="available local folder"):
         GitRunner().run(tmp_path / "missing", "status")
+
+
+def test_local_folder_does_not_require_git_to_be_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "hello.txt").write_text("hello\n", encoding="utf-8")
+    monkeypatch.setattr(subprocess, "run", missing_git)
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    inspection = manager.inspect(str(source))
+    prepared = manager.prepare("session-without-git", str(source), allow_direct_folder=True)
+
+    assert inspection.is_git is False
+    assert prepared.kind == WorkspaceKind.local_copy
+    assert (prepared.workspace_path / "hello.txt").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_explicit_git_operations_still_report_when_git_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(subprocess, "run", missing_git)
+
+    with pytest.raises(GitUnavailableError, match="not installed"):
+        GitRunner().run(tmp_path, "status")
 
 
 @pytest.mark.parametrize(
