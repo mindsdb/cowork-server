@@ -2014,12 +2014,31 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
     assert child.pinned is False
     assert Path(child.workspace_path, "README.md").read_text(encoding="utf-8") == "forked work\n"
     assert child.engine_session_id == "forked-engine-session-1"
+    assert engine.closed == 1
     child_events = service.events(child.id).items
     assert any(event.text == "Build the feature" for event in child_events)
     assert child_events[-1].title == "Task forked"
 
     service.delete_session(parent.id)
     assert Path(child.workspace_path).is_dir()
+
+
+def test_fork_refuses_to_stop_a_running_parent_terminal(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    parent = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Build the feature"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, parent.id, SessionStatus.completed)
+    terminal = service.create_terminal_tab(parent.id)
+    service.start_terminal_tab(parent.id, terminal.id, CREDS, 100, 30)
+
+    with pytest.raises(StateConflict, match="Stop running terminals before forking"):
+        service.fork_session(parent.id, CREDS)
+
+    assert service.terminal_tab(parent.id, terminal.id).status.value == "running"
+    assert engine.closed == 0
 
 
 def test_fork_writes_the_durable_session_without_the_control_plane_projection(tmp_path: Path) -> None:
