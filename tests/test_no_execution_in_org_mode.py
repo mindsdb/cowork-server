@@ -182,6 +182,29 @@ def test_load_workspace_env_still_works_on_desktop(monkeypatch, tmp_path):
     get_app_settings.cache_clear()
 
 
+def test_code_project_commands_refused_in_org_mode(org_mode, monkeypatch):
+    """Project-configured commands are local desktop behavior, never org execution."""
+    from cowork.coding import project_workspaces
+    from cowork.coding.project_models import CodeProject, ProjectFolder
+
+    monkeypatch.setattr(
+        project_workspaces.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("subprocess must not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="not available"):
+        project_workspaces.ProjectCommandRunner().run(
+            CodeProject(
+                id="blocked",
+                name="Blocked",
+                folders=[ProjectFolder(id="folder", name="Folder", path="/tmp/folder")],
+            ),
+            (),
+            "validate",
+            {},
+        )
+
 # ─── C3: stream_response is the single choke point for in-process turns ──
 
 @pytest.mark.asyncio

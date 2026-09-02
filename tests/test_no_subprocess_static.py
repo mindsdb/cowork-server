@@ -130,6 +130,48 @@ BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 #: occurrence: two identical sites need two entries (see the module docstring).
 ALLOWLIST = (
     (
+        "coding/project_actions.py",
+        "<module>",
+        "subprocess",
+        "import used only for Windows command-line serialization; task execution still routes through the guarded terminal service",
+    ),
+    (
+        "coding/project_actions.py",
+        "terminal_command_line",
+        "subprocess.list2cmdline",
+        "serialize the trusted working-directory argument for cmd.exe without starting a process",
+    ),
+    (
+        "coding/project_actions.py",
+        "terminal_command_line",
+        "subprocess.list2cmdline",
+        "serialize trusted project-action arguments for cmd.exe without starting a process",
+    ),
+    (
+        "coding/project_workspaces.py",
+        "<module>",
+        "subprocess",
+        "import backing desktop-only Code Project setup and validation commands",
+    ),
+    (
+        "coding/project_workspaces.py",
+        "ProjectCommandRunner._run_one",
+        "subprocess.run",
+        "shell-free local Code Project commands, refused before execution in org mode",
+    ),
+    (
+        "coding/workspace.py",
+        "<module>",
+        "subprocess",
+        "import backing the local-only GitRunner; every run is refused by _org_mode()",
+    ),
+    (
+        "coding/workspace.py",
+        "GitRunner.run",
+        "subprocess.run(git)",
+        "shell-free local Git operations, refused before spawn by _org_mode()",
+    ),
+    (
         "services/artifacts.py",
         "<module>",
         "subprocess",

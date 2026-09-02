@@ -1,18 +1,10 @@
 import sqlite3
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlmodel import SQLModel
-
 from alembic import command
 from alembic.script import ScriptDirectory
-
-from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.migrations import (
-    DatabaseSchemaAheadError,
-    _alembic_config,
-    run_schema_migrations,
-)
+from sqlalchemy import create_engine, text
+from sqlmodel import SQLModel
 
 # Import models so SQLModel.metadata can create a pre-Alembic legacy schema.
 import cowork.models.conversation  # noqa: F401
@@ -24,6 +16,12 @@ import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
 import cowork.models.skill  # noqa: F401
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.migrations import (
+    DatabaseSchemaAheadError,
+    _alembic_config,
+    run_schema_migrations,
+)
 
 
 def _sqlite_uri(path) -> str:
@@ -111,6 +109,48 @@ def test_schema_migrations_rerun_on_up_to_date_database_is_noop(tmp_path, monkey
     run_schema_migrations(engine, uri)  # should not raise
 
     assert _alembic_version(db_path) == expected_head()
+
+
+def test_code_control_migration_backfills_parent_projection_for_existing_records(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "code-control-upgrade.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "a4c8e1f6b3d9")
+
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE code_control_records (
+                namespace_id VARCHAR(128) NOT NULL,
+                collection VARCHAR(32) NOT NULL,
+                document_id VARCHAR(160) NOT NULL,
+                payload JSON NOT NULL,
+                assigned_computer_id VARCHAR(128),
+                lifecycle_status VARCHAR(32),
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace_id, collection, document_id)
+            )
+        """))
+        connection.execute(
+            text("""
+                INSERT INTO code_control_records
+                    (namespace_id, collection, document_id, payload)
+                VALUES (:namespace_id, 'runs', 'run-one', :payload)
+            """),
+            {"namespace_id": "org", "payload": '{"id":"run-one","task_id":"task-one"}'},
+        )
+
+    _upgrade_to(engine, uri, "head")
+
+    with engine.begin() as connection:
+        parent_id = connection.execute(text("""
+            SELECT parent_id FROM code_control_records
+            WHERE namespace_id = 'org' AND collection = 'runs' AND document_id = 'run-one'
+        """)).scalar_one()
+    assert parent_id == "task-one"
 
 
 def test_schema_migrations_rejects_database_from_newer_build(tmp_path, monkeypatch):
@@ -402,3 +442,64 @@ def test_settings_scope_split_downgrade_preflights_duplicates(tmp_path, monkeypa
             )
         }
     assert {"uq_settings_key_global", "uq_settings_key_org", "uq_settings_key_user"} <= names
+
+
+def _insert_channel_installation(connection, *, channel_type, org_id=None):
+    connection.execute(
+        text(
+            "INSERT INTO channel_installations (id, channel_type, display_name, enabled, status, org_id) "
+            "VALUES (lower(hex(randomblob(16))), :channel_type, :channel_type, 0, 'disconnected', :org_id)"
+        ),
+        {"channel_type": channel_type, "org_id": org_id},
+    )
+
+
+def test_channel_installations_per_org_allows_one_per_org(tmp_path, monkeypatch):
+    import sqlalchemy
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db = tmp_path / "channels.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "head")
+
+    with engine.begin() as c:
+        _insert_channel_installation(c, channel_type="slack", org_id="A")
+        _insert_channel_installation(c, channel_type="slack", org_id="B")
+
+    # but a duplicate within one org (or within local mode) is still rejected
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as c:
+            _insert_channel_installation(c, channel_type="slack", org_id="A")
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as c:
+            _insert_channel_installation(c, channel_type="telegram")
+            _insert_channel_installation(c, channel_type="telegram")
+
+
+def test_channel_installations_per_org_downgrade_preflights_duplicates(tmp_path, monkeypatch):
+    # Same shape as the settings scope split: a downgrade that can't restore
+    # the single global UniqueConstraint(channel_type) must abort BEFORE
+    # touching the schema, leaving the DB intact at head.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db = tmp_path / "channels-dg.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as c:
+        _insert_channel_installation(c, channel_type="slack", org_id="A")
+        _insert_channel_installation(c, channel_type="slack", org_id="B")
+
+    with pytest.raises(Exception, match="cannot downgrade"):
+        _downgrade_to(engine, uri, "c3f8a2b6d1e4")
+
+    assert _alembic_version(db) == expected_head()
+    with sqlite3.connect(db) as conn:
+        names = {
+            r[0] for r in conn.execute(
+                "select name from sqlite_master where type='index' and tbl_name='channel_installations'"
+            )
+        }
+    assert {"uq_channel_installations_type_global", "uq_channel_installations_type_org"} <= names
