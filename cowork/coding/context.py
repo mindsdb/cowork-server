@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import os
 import hashlib
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from cowork.coding.contracts import CodingSession, InputReference
@@ -129,6 +130,39 @@ def safe_engine_error(message: str, credentials: EngineCredentials) -> str:
     safe = message[:8_192] or "Unknown coding-agent error"
     secrets = (credentials.minds_api_key,) if credentials.minds_api_key else ()
     return redact_text(safe, secrets)
+
+
+@dataclass(frozen=True)
+class EngineFailure:
+    message: str
+    code: str = ""
+    detail: str = ""
+    model: str = ""
+
+
+def classify_engine_failure(
+    message: str,
+    credentials: EngineCredentials,
+    model: str = "",
+) -> EngineFailure:
+    """Turn known terminal failures into stable, actionable UI contracts."""
+    safe = safe_engine_error(message, credentials)
+    normalized = safe.casefold()
+    insufficient_credits = any(marker in normalized for marker in (
+        "402 payment required",
+        "insufficient_credits",
+        "insufficient credits",
+        "wallet_empty",
+        "weighted tokens left",
+    ))
+    if insufficient_credits:
+        return EngineFailure(
+            message="This model needs credits. Add credits or choose another model.",
+            code="insufficient_credits",
+            detail=safe,
+            model=model,
+        )
+    return EngineFailure(message=safe)
 
 
 def is_context_exhaustion_error(message: str | None) -> bool:

@@ -1147,6 +1147,30 @@ def test_failed_adapter_stream_closes_the_runtime_before_another_turn_can_reuse_
     assert service.get_session(created.id).last_error == "adapter stream disconnected"
 
 
+def test_credit_exhaustion_is_actionable_and_keeps_the_technical_detail(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.events_error = True
+    engine.events_error_message = "server returned 402 Payment Required: You have 0 weighted tokens left"
+    service = service_with(tmp_path, engine)
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt-5.6-sol"
+    )
+    wait_for_status(service, created.id, SessionStatus.failed)
+
+    failed = service.get_session(created.id)
+    error = [event for event in service.events(created.id).items if event.type == EventType.error][-1]
+    assert failed.last_error == "This model needs credits. Add credits or choose another model."
+    assert error.text == failed.last_error
+    assert error.data == {
+        "code": "insufficient_credits",
+        "detail": "server returned 402 Payment Required: You have 0 weighted tokens left",
+        "model": "gpt-5.6-sol",
+    }
+    assert engine.closed == 1
+
+
 def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()

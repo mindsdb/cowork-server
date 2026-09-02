@@ -11,7 +11,11 @@ from cowork.api.v1.endpoints.coding import (
     _require_inference_client,
 )
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
-from cowork.coding.inference_proxy import MAX_INFERENCE_BODY_BYTES, read_inference_body
+from cowork.coding.inference_proxy import (
+    MAX_INFERENCE_BODY_BYTES,
+    inference_response_status,
+    read_inference_body,
+)
 
 
 def _request(headers: list[tuple[bytes, bytes]], body: bytes = b"") -> Request:
@@ -77,6 +81,12 @@ def test_inference_body_preserves_non_json_and_unrelated_payloads() -> None:
     assert _inference_body(b"") == b""
     assert _inference_body(b"not-json") == b"not-json"
     assert _inference_body(b'{"model":"fable"}') == b'{"model":"fable"}'
+
+
+def test_credit_rejections_are_non_retryable_for_the_codex_transport() -> None:
+    assert inference_response_status(402) == 400
+    assert inference_response_status(429) == 429
+    assert inference_response_status(503) == 503
 
 
 @pytest.mark.asyncio
