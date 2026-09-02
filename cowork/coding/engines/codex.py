@@ -140,13 +140,17 @@ class CodexEngineSession:
         codex_home.mkdir(parents=True, exist_ok=True)
         self._config_path = codex_home / "config.toml"
         self._config_path.touch(exist_ok=True)
-        endpoint = codex_config.local_inference_base_url(get_app_settings().port)
+        endpoint = config.inference_base_url or codex_config.local_inference_base_url(get_app_settings().port)
         launch = codex_config.prepare_launch(config, workspace, endpoint)
         client_config = CodexConfig(
             cwd=str(workspace),
             # Codex talks only to Cowork's loopback inference proxy. Keep the
             # real credential in the server process, outside agent commands.
-            env=codex_config.client_environment(codex_home, config.environment),
+            env=codex_config.client_environment(
+                codex_home,
+                config.environment,
+                config.inference_api_key or codex_config.LOCAL_PROXY_TOKEN,
+            ),
             config_overrides=launch.config_overrides,
             client_name="mindshub_cowork",
             client_title="MindsHub Cowork",

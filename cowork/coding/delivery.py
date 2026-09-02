@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
-from cowork.coding.contracts import CodingSession, WorkspaceKind
+from cowork.coding.contracts import CodingSession, TaskWorkspace, WorkspaceKind
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.project_models import (
     CodeProject,
@@ -26,13 +27,29 @@ class ProjectDeliveryService:
         project: CodeProject | None = None,
         integrations: DeveloperIntegrationService | None = None,
     ) -> DeliveryPlan:
+        return self.plan_workspaces(
+            session.workspaces,
+            session.deliveries,
+            project,
+            integrations,
+        )
+
+    def plan_workspaces(
+        self,
+        workspaces: Sequence[TaskWorkspace],
+        deliveries: list[DeliveryRecord],
+        project: CodeProject | None = None,
+        integrations: DeveloperIntegrationService | None = None,
+    ) -> DeliveryPlan:
+        """Build review/delivery state where the workspaces actually live."""
+
         items: list[DeliveryPlanItem] = []
         published = {
             str(item.folder_id): item
-            for item in session.deliveries
+            for item in deliveries
             if item.action == "draft_pull_request" and item.status == "published" and item.folder_id
         }
-        for workspace in session.workspaces:
+        for workspace in workspaces:
             if workspace.workspace_kind != WorkspaceKind.git_worktree:
                 continue
             state = self._state(workspace.workspace_path)
