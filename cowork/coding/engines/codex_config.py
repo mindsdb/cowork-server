@@ -43,6 +43,7 @@ def user_skills_root() -> Path:
 def client_environment(
     codex_home: Path,
     project_environment: tuple[tuple[str, str], ...] = (),
+    inference_api_key: str = LOCAL_PROXY_TOKEN,
 ) -> dict[str, str]:
     """Build the child env without placing the user's MindsHub key in it."""
     environment = dict(project_environment)
@@ -51,7 +52,7 @@ def client_environment(
     # loopback credential used by the inference proxy.
     environment.update({
         "CODEX_HOME": str(codex_home),
-        "MINDSHUB_CODEX_API_KEY": LOCAL_PROXY_TOKEN,
+        "MINDSHUB_CODEX_API_KEY": inference_api_key,
     })
     return environment
 
@@ -191,7 +192,14 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         overrides.append(f'service_tier="{config.service_tier}"')
     if config.personality and config.personality != "none":
         overrides.append(f'personality="{config.personality}"')
-    if config.session_id and config.cowork_root:
+    if config.mcp_servers:
+        for server in config.mcp_servers:
+            safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", server.name)
+            overrides.extend([
+                f"mcp_servers.{safe_name}.command={toml_string(server.command)}",
+                f"mcp_servers.{safe_name}.args={toml_array(server.args)}",
+            ])
+    elif config.session_id and config.cowork_root:
         overrides.extend([
             f"mcp_servers.mindshub_code.command={toml_string(sys.executable)}",
             "mcp_servers.mindshub_code.args=" + toml_array((
