@@ -626,16 +626,7 @@ def _project_artifacts_base(project_name: str) -> Path | None:
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
         return None
-    # Compare canonical paths on both sides. On macOS, temporary and user
-    # paths commonly cross aliases such as /var -> /private/var; comparing a
-    # resolved candidate with raw registry entries incorrectly rejects a
-    # genuinely registered project in that case.
-    registered: set[Path] = set()
-    for project_dir in _registered_project_dirs():
-        try:
-            registered.add(project_dir.resolve(strict=False))
-        except (OSError, ValueError):
-            continue
+    registered = set(_registered_project_dirs())
     root = _projects_root().resolve(strict=False)
     try:
         candidate = (root / project_name).resolve(strict=False)
