@@ -831,6 +831,14 @@ class AntonHarness:
         workspace.initialize()
         workspace_env_overlay = _load_workspace_env_if_safe(workspace)
 
+        overlay_kwargs = supported_kwargs(
+            ChatSessionConfig, workspace_env_overlay=workspace_env_overlay
+        )
+        if workspace_env_overlay and not overlay_kwargs:
+            # The pinned anton cannot carry the overlay to the scratchpad, so
+            # load it the old way rather than dropping the project's .env.
+            workspace.apply_env_to_process()
+
         anton_dir = base / ".anton"
 
         def _settings_path(value: object, fallback: Path) -> Path:
@@ -1072,7 +1080,7 @@ class AntonHarness:
             ),
             workspace=workspace,
             data_vault=data_vault,
-            **supported_kwargs(ChatSessionConfig, workspace_env_overlay=workspace_env_overlay),
+            **overlay_kwargs,
             initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),

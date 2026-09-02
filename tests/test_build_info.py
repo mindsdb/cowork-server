@@ -381,3 +381,36 @@ class TestSupportedKwargs:
                 ChatSessionConfig, workspace_env_overlay={"A": "b"}
             ),
         )
+
+
+class TestOverlayFallbackAtAnOldPin:
+    """Dropping the kwarg must not silently discard the project's .env.
+
+    With an anton that cannot carry the overlay, the harness falls back to
+    loading it the old way, so a desktop scratchpad keeps seeing project
+    values instead of losing them between this merge and the pin bump.
+    """
+
+    def test_the_harness_falls_back_when_the_kwarg_is_dropped(self):
+        import inspect
+
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        src = inspect.getsource(AntonHarness._build_chat_session)
+        assert "if workspace_env_overlay and not overlay_kwargs:" in src
+        assert "workspace.apply_env_to_process()" in src
+
+    def test_org_mode_never_reaches_the_fallback(self, monkeypatch, tmp_path):
+        """The fallback is gated on a non-empty overlay, and org mode returns
+        {}, so the untrusted shared .env is never applied to this process."""
+        monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+        from cowork.common.settings.app_settings import get_app_settings
+        get_app_settings.cache_clear()
+
+        from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
+
+        from unittest.mock import Mock
+        workspace = Mock()
+        assert _load_workspace_env_if_safe(workspace) == {}
+        workspace.apply_env_to_process.assert_not_called()
+        get_app_settings.cache_clear()

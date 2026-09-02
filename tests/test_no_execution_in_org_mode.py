@@ -171,6 +171,9 @@ def test_load_workspace_env_still_works_on_desktop(monkeypatch, tmp_path):
     workspace = Workspace(tmp_path)
     workspace.initialize()
     (tmp_path / ".anton" / ".env").write_text("MY_PROJECT_VAR=project-value\n")
+    # A developer shell or CI may already export it; the assertion below is
+    # about this function not setting it.
+    monkeypatch.delenv("MY_PROJECT_VAR", raising=False)
 
     result = _load_workspace_env_if_safe(workspace)
 
