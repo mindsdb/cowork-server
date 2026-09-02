@@ -73,6 +73,22 @@ def test_organization_name_used_over_person_name(monkeypatch):
     assert identity == {"email": "user@example.com:org-123", "name": "Acme Org"}
 
 
+def test_multiple_selected_organizations_are_all_named(monkeypatch):
+    # ENG-2240 follow-up: PostHog's consent screen lets a user select several
+    # organizations in one authorization (unlike Linear, one grant = one
+    # workspace) - the tile must name all of them, not just the first.
+    _stub_us_calls(
+        monkeypatch,
+        user={"email": "user@example.com", "first_name": "User", "last_name": "Name"},
+        organization={"results": [{"id": "org-123", "name": "Acme Org"}, {"id": "org-456", "name": "Other Org"}]},
+    )
+
+    identity = _fetch_userinfo_posthog("access-token")
+
+    # Dedup key still keys off the first organization only.
+    assert identity == {"email": "user@example.com:org-123", "name": "Acme Org, Other Org"}
+
+
 def test_second_organization_gets_a_distinct_identity(monkeypatch):
     _stub_us_calls(
         monkeypatch,
@@ -155,6 +171,21 @@ def test_fetch_posthog_organization_returns_id_and_name_on_success(monkeypatch):
     )
 
     assert _fetch_posthog_organization("access-token", api_host="https://us.posthog.com") == ("org-1", "Acme")
+
+
+def test_fetch_posthog_organization_joins_all_names_keys_off_first_id(monkeypatch):
+    monkeypatch.setattr(
+        google_module,
+        "urlopen",
+        lambda request, timeout=20: _FakeJsonResponse(
+            {"results": [{"id": "org-1", "name": "Acme"}, {"id": "org-2", "name": "Other Org"}]}
+        ),
+    )
+
+    assert _fetch_posthog_organization("access-token", api_host="https://us.posthog.com") == (
+        "org-1",
+        "Acme, Other Org",
+    )
 
 
 def test_fetch_posthog_organization_accepts_a_raw_list_response(monkeypatch):
