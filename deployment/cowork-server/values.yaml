@@ -14,6 +14,110 @@ sharedStorage:
   storageClassName: efs-cowork-env
   size: 1Gi
 
+# Who may open a connection to the cowork-server pods. See
+# templates/network-policy.yaml for why this is the boundary the identity
+# headers depend on.
+#
+# Off by default so a bare install, a desktop chart or an environment nobody
+# has validated yet cannot lock itself out. Turn it on one environment at a
+# time and watch pod readiness while it rolls: rule (b) is what keeps the
+# kubelet's probes working, and a wrong CIDR there fails the readiness probe
+# rather than anything a user would notice first.
+#
+# Enforcement is not the same on both clusters. newdev runs the AWS VPC CNI's
+# policy controller AND Cilium; newprod runs Cilium alone, installed 2026-08-20.
+# Cilium recomputes policy for the endpoints it already manages, so a running pod
+# is covered by a policy applied after it. The only pod it never covers is one
+# that started before Cilium itself was installed, because that pod has no
+# Cilium-managed endpoint. Prove the policy after enabling rather than assuming.
+#
+# BEFORE ENABLING THIS IN A NEW ENVIRONMENT, CHECK THREE THINGS, ALL OUTSIDE
+# THIS CHART. The first and third fail loudly. The second does not fail at all
+# until users notice.
+#
+#   1. The CI deploy identity can create the kind. `helm upgrade` runs
+#      in-cluster as `system:serviceaccount:infrastructure:<env>-gha-runner`,
+#      which holds `create networkpolicies` only in the namespaces listed under
+#      `runner_deploy_namespaces` in Kubernetes-Foundational-Services. staging
+#      and prod are in that set and a PR environment is not. Where it is
+#      missing, the release fails and `--atomic` rolls the whole deploy back.
+#        kubectl --context <ctx> -n <ns> auth can-i create networkpolicies \
+#          --as=system:serviceaccount:infrastructure:<env>-gha-runner
+#   2. That cluster's ingress controller actually matches the selectors below,
+#      and its namespace carries the label they select on. This one fails
+#      SILENTLY: the release succeeds, both replicas stay Ready because the
+#      kubelet is still allowed, and every real request is dropped.
+#        kubectl --context <ctx> -n infrastructure get pods -l nginx-ingress-controller=true
+#        kubectl --context <ctx> get ns infrastructure -o jsonpath='{.metadata.labels}{"\n"}'
+#   3. No NetworkPolicy of this name is in the namespace already. Helm will not
+#      adopt an object it does not own, so a leftover from a hand-applied test
+#      fails the release.
+#        kubectl --context <ctx> -n <ns> get networkpolicies
+#
+# There is still no canary. `kubectl port-forward` cannot observe this policy at
+# all: containerd's CRI PortForward enters the pod's network namespace and dials
+# localhost, so the bytes never cross the veth where Cilium or the VPC CNI agent
+# enforces ingress. Pod readiness is a real signal and the integration job's
+# cross-replica test is not. So the probe that actually proves this works is the
+# forged-header curl from a pod in another namespace, run by hand after a
+# rollout.
+networkPolicy:
+  enabled: false
+
+  # Both default off the values the deployment itself uses, so neither can
+  # drift. Set them only to deviate deliberately.
+  #
+  # Drift in either fails SILENTLY and in opposite directions: a port nothing
+  # listens on drops every legitimate request, and a podSelector matching no pod
+  # makes the policy a no-op that still reads as enabled.
+  port: ""            # defaults to deployment.service.targetPort
+  podSelectorLabels: {}   # defaults to {app: deployment.name}
+
+  # The nginx ingress controller, which is the only thing that should ever
+  # reach these pods over the network. It runs in `infrastructure`, NOT in
+  # `ingress-nginx`. Kubernetes stamps kubernetes.io/metadata.name on every
+  # namespace, so that label needs nothing added to the cluster. Confirm with:
+  #   kubectl get ns -L kubernetes.io/metadata.name | grep -i infra
+  #
+  # The podSelector is not optional in practice. A namespaceSelector on its own
+  # admits every pod in `infrastructure`, and that namespace also runs the
+  # GitHub Actions runners and openvpn, which MASQUERADEs VPN client traffic to
+  # its own pod IP. Either could then send forged identity headers, which is the
+  # exact caller this policy exists to refuse. The label below is stamped by
+  # Kubernetes-Foundational-Services (nginx-ingress values `controller.podLabels`)
+  # with no per-environment override, so nothing needs adding to the cluster:
+  #   kubectl -n infrastructure get pods -l nginx-ingress-controller=true
+  ingressController:
+    enabled: true
+    namespaceSelector:
+      kubernetes.io/metadata.name: infrastructure
+    podSelector:
+      nginx-ingress-controller: "true"
+
+  # Escape hatch for traffic that arrives from a node rather than a pod, which
+  # is what kubelet probes and `kubectl port-forward` do. Empty on purpose, and
+  # it should stay empty.
+  #
+  # Both enforcers already allow a node to reach a pod it hosts, because a
+  # policy that refused the kubelet would fail every readiness probe in the
+  # cluster. So probes are expected to keep working with no rule here. Verify
+  # that when enabling an environment rather than trusting it: watch the pods
+  # stay Ready through the rollout. Do NOT read the integration job's
+  # cross-replica test as the signal, whichever way it goes, for the reason in
+  # the header above.
+  #
+  # READ THIS BEFORE FILLING IT IN. The VPC CNI gives pods addresses out of the
+  # same VPC subnets the nodes use: in newdev both nodes and pods sit in
+  # 10.105.0.0/16. So "the node CIDR" is also every pod's CIDR, and putting it
+  # here re-admits the arbitrary in-cluster caller this whole policy exists to
+  # refuse. If probes really do need a rule, use the individual node addresses
+  # as /32s, and treat needing that at all as a reason to go back and find out
+  # why the CNI is not exempting host traffic.
+  nodeCidrs: []
+
+  # Verbatim extra ingress rules, for anything the three above do not cover.
+  extraIngress: []
+
 # Default values for deployment, this is necessary because we're using a unified helm subchart
 deployment:
   # This is the name of the deployment, this is used in a _lot_ of places in the helm charts so lets just specify it
@@ -78,10 +182,10 @@ deployment:
   resources:
     limits:
       cpu: 1
-      memory: 256Mi
+      memory: 512Mi
     requests:
       cpu: 1
-      memory: 256Mi
+      memory: 512Mi
 
   autoscaling:
     enabled: false
@@ -101,7 +205,8 @@ deployment:
       nginx.ingress.kubernetes.io/cors-allow-headers: >-
         DNT,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,
         Authorization,X-CSRF-Token,Accept,Origin,Access-Control-Allow-Origin,X-File-Name,Set-Cookie,X-User-Id,X-User-Email,
-        X-Organization-Id,X-User-Roles,X-Forwarded-User
+        X-Organization-Id,X-User-Roles,X-Forwarded-User,X-Cowork-Expected-Organization-Id
+      nginx.ingress.kubernetes.io/cors-expose-headers: "X-Cowork-Organization-Reload"
       nginx.ingress.kubernetes.io/cors-max-age: "3600"
       nginx.ingress.kubernetes.io/use-regex: "true"
       nginx.ingress.kubernetes.io/auth-url: "auth-url" # Modify per environment

@@ -1089,7 +1089,7 @@ async def validate_provider(provider: str, api_key: str,
     return {"ok": False, "error": "Unknown provider"}
 
 
-def build_llm_client():
+def build_llm_client(effort_override: str | None = None):
     """Build an Anton LLMClient from the current user settings.
 
     Shared by the main responses handler and the credential probe handler
@@ -1101,6 +1101,13 @@ def build_llm_client():
     level is forwarded in the provider's native shape (Anthropic
     ``output_config``, OpenAI ``reasoning`` / ``reasoning_effort``); None leaves
     the model's own default.
+
+    `effort_override`, when set, is the composer's per-task Effort pick — it
+    takes precedence over the persisted per-role setting for BOTH planning and
+    coding roles for this call, bypassing the stored-vs-resolved staleness
+    guard below (an explicit per-task pick is inherently valid for the model
+    actually in use this turn, unlike a stale persisted choice that may have
+    been made for a different model).
     """
     from anton.core.llm.client import LLMClient
     from anton.core.llm.anthropic import AnthropicProvider
@@ -1231,6 +1238,17 @@ def build_llm_client():
     def _effort_for(stored: str | None, resolved: str | None, effort: str | None):
         return effort if effort and stored == resolved else None
 
+    planning_effort = effort_override or _effort_for(
+        settings.planning_model,
+        settings.resolved_planning_model,
+        settings.planning_reasoning_effort,
+    )
+    coding_effort = effort_override or _effort_for(
+        settings.coding_model,
+        settings.resolved_coding_model,
+        settings.coding_reasoning_effort,
+    )
+
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at
     # a keyless provider — the same resolution config_status reports, so the
@@ -1238,20 +1256,12 @@ def build_llm_client():
     return LLMClient(
         planning_provider=_make_provider(
             settings.resolved_planning_provider,
-            _effort_for(
-                settings.planning_model,
-                settings.resolved_planning_model,
-                settings.planning_reasoning_effort,
-            ),
+            planning_effort,
         ),
         planning_model=settings.resolved_planning_model,
         coding_provider=_make_provider(
             settings.resolved_coding_provider,
-            _effort_for(
-                settings.coding_model,
-                settings.resolved_coding_model,
-                settings.coding_reasoning_effort,
-            ),
+            coding_effort,
         ),
         coding_model=settings.resolved_coding_model,
         **router_kw,

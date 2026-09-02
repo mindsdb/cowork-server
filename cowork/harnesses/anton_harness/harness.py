@@ -405,6 +405,10 @@ class AntonHarness:
         # Per-conversation model pick (the composer's dropdown) — overrides
         # planning/coding/router for this call only; see _build_chat_session.
         model: str | None = None,
+        # Per-task reasoning-effort pick (the composer's Effort sub-picker) —
+        # overrides planning/coding effort for this call only; see
+        # _build_chat_session and providers.build_llm_client's effort_override.
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Observability pass-through (see ResponsesRequest / HarnessProvider):
         # forwarded to Anton's per-turn TraceContext so they land on the
@@ -482,6 +486,7 @@ class AntonHarness:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
@@ -593,10 +598,25 @@ class AntonHarness:
         output — most visible on short turns like "hi"/"who are you?" with
         little else to anchor generation.
 
+        Also scrubs plain-text content before replay: anton only scrubs a
+        user turn's OWN input as it arrives, not history read back from
+        storage, so a credential typed in an earlier turn would otherwise
+        reappear unmasked here on every later turn (ENG-1849). Vault
+        secrets for the whole conversation are already registered by the
+        time this runs (`restore_namespaced_env` above, in
+        `_build_chat_session`), so this catches anything vaulted since the
+        message was first persisted, not just what was known at persist
+        time. List-shaped content (tool_use/tool_result blocks) is left
+        alone — that's already scrubbed at generation time.
+
         Extracted (not an inline closure) so this can be unit-tested
         directly against fake messages, same reasoning as _seed_history.
         """
+        from anton.utils.datasources import scrub_credentials
+
         om = m.to_openai_message().model_dump()
+        if isinstance(om.get("content"), str) and om["content"]:
+            om["content"] = scrub_credentials(om["content"])
         ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
@@ -628,7 +648,9 @@ class AntonHarness:
 
         tail = [stamp(m) for m in ordered_messages[tail_start:]]
         if history_summary:
-            summary_msg = {"role": "user", "content": history_summary}
+            from anton.utils.datasources import scrub_credentials
+
+            summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
                 # Same fix anton's own _summarize_history applies: two
                 # consecutive user messages break/degrade most providers.
@@ -710,6 +732,7 @@ class AntonHarness:
         self,
         conversation: Conversation,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
     ):
@@ -828,7 +851,7 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client()
+        llm_client = self._build_llm_client(effort=reasoning_effort)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -1099,6 +1122,6 @@ class AntonHarness:
         return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(effort: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
+        return build_llm_client(effort_override=effort)
