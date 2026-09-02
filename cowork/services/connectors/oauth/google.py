@@ -121,6 +121,33 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     }
 
 
+def _fetch_posthog_organization(access_token: str, *, api_host: str) -> tuple[str, str]:
+    """Best-effort (organization_id, organization_name) for the token's
+    PostHog organization, or ("", "") on any failure.
+
+    Deliberately a separate request from `_fetch_userinfo_posthog`'s user
+    query, not one combined call: the organization lookup is best-effort, so
+    an unexpected response shape degrades to "no organization split" instead
+    of failing the whole PostHog connection — same reasoning as
+    `_fetch_linear_workspace` above. Queries the SAME regional host the user
+    lookup already succeeded against, for the reason `_fetch_userinfo_posthog`
+    documents: a token issued for one region isn't guaranteed to be accepted
+    by the other's host."""
+    try:
+        result = _json_request(
+            f"{api_host}/api/organizations/",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        organizations = result if isinstance(result, list) else (result.get("results") or [])
+        if not organizations:
+            return "", ""
+        organization = organizations[0]
+        return str(organization.get("id") or "").strip(), str(organization.get("name") or "").strip()
+    except Exception:
+        _log.warning("Could not fetch PostHog organization identity — falling back to bare email", exc_info=True)
+        return "", ""
+
+
 def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
     """PostHog's own user object — email plus optional first/last name.
     PostHog's OAuth authorize/token endpoints are region-agnostic
@@ -128,22 +155,39 @@ def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
     (us.posthog.com / eu.posthog.com) and a token issued for one region is
     not guaranteed to be accepted by the other's host. Try US Cloud first
     (the default/most common case) and fall back to EU Cloud on failure,
-    rather than requiring the caller to know the account's region upfront."""
+    rather than requiring the caller to know the account's region upfront.
+
+    Unlike Google, a PostHog account isn't one-account-one-email: the same
+    email can belong to several organizations. Folding the organization id
+    (from `_fetch_posthog_organization`, best-effort) into the returned
+    identity — the same trick `_fetch_userinfo_supabase`/`_fetch_userinfo_linear`
+    above use for their own per-organization identity — means connecting a
+    second organization gets its own connection tile instead of silently
+    overwriting the first."""
+    api_host = "https://us.posthog.com"
     try:
         result = _json_request(
-            "https://us.posthog.com/api/users/@me/",
+            f"{api_host}/api/users/@me/",
             headers={"Authorization": f"Bearer {access_token}"},
         )
     except HTTPException:
+        api_host = "https://eu.posthog.com"
         result = _json_request(
-            "https://eu.posthog.com/api/users/@me/",
+            f"{api_host}/api/users/@me/",
             headers={"Authorization": f"Bearer {access_token}"},
         )
     email = str(result.get("email") or "").strip()
     first_name = str(result.get("first_name") or "").strip()
     last_name = str(result.get("last_name") or "").strip()
     name = " ".join(part for part in (first_name, last_name) if part)
-    return {"email": email, "name": name or email}
+    org_id, org_name = _fetch_posthog_organization(access_token, api_host=api_host)
+    return {
+        "email": f"{email}:{org_id}" if org_id else email,
+        # Organization name first, matching _fetch_userinfo_supabase's/
+        # _fetch_userinfo_linear's per-organization identity convention
+        # above — the tile shows the org, not the connecting individual.
+        "name": org_name or name or email,
+    }
 
 
 def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
