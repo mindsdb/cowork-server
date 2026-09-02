@@ -5,11 +5,12 @@ staging: e2c4a6f8b1d3 (tenant-namespaced Code control-plane records) and
 d4a7c2e9f1b3 -> e5b8d3f0a2c7 (channel installation and event org scoping).
 That leaves the graph with two heads, so ``alembic upgrade head`` errors out
 and every code path that calls it fails, including server startup. This is an
-empty merge revision that rejoins them into a single head -- it touches no
-schema (each branch's own upgrade already did its work) and rewrites neither
-branch's down_revision, so databases already stamped at either head stay
-consistent. The two branches touch disjoint tables (code_control_records vs
-channel_installations and channel_events), so their apply order is irrelevant.
+empty merge revision that rejoins them into a single head. It touches no
+schema, because each branch's own upgrade already did its work, and it
+rewrites neither branch's down_revision, so databases already stamped at
+either head stay consistent. The two branches touch disjoint tables
+(code_control_records vs channel_installations and channel_events), so their
+apply order is irrelevant.
 
 Revision ID: cfbc79856e9e
 Revises: e2c4a6f8b1d3, e5b8d3f0a2c7
