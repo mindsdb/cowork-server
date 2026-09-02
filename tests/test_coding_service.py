@@ -2136,7 +2136,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert child.allocated_ports["PORT"] != parent.allocated_ports["PORT"]
     assert child.workspaces[1].workspace_path in child.additional_dirs
     assert child.workspaces[1].workspace_path in child.developer_instructions
-    assert engine.forked_workspaces[-1] == str(Path(child.workspaces[0].workspace_path).parent)
+    assert engine.forked_workspaces[-1] == child.workspaces[0].workspace_path
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
 
 
@@ -2217,7 +2217,7 @@ def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path
     assert child.run_id != parent.run_id
 
 
-def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(tmp_path: Path) -> None:
+def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_available(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     notes = tmp_path / "notes"
     notes.mkdir()
@@ -2244,10 +2244,10 @@ def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(t
     )
     wait_for_status(service, task.id, SessionStatus.completed)
 
-    expected_root = Path(task.workspaces[0].workspace_path).parent
-    assert expected_root.name == task.id
-    assert {Path(item.workspace_path).parent for item in task.workspaces} == {expected_root}
-    assert engine.opened_workspaces[-1] == str(expected_root)
+    primary = task.workspaces[0].workspace_path
+    secondary = task.workspaces[1].workspace_path
+    assert engine.opened_workspaces[-1] == primary
+    assert engine.configs[-1].additional_dirs == (secondary,)
 
 
 def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_path: Path) -> None:

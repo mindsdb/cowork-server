@@ -20,19 +20,14 @@ ApprovalRequest = Callable[[str, str, dict[str, Any] | None], dict[str, str]]
 
 
 def engine_workspace_path(session: CodingSession) -> str:
-    """Return the narrow task root presented to an agent runtime.
+    """Start the agent in the primary, reviewable task workspace.
 
-    The persisted ``workspace_path`` remains the primary folder for review and
-    handoff. Project runtimes instead start at the common, task-owned parent so
-    thread-level operations such as Codex goals can write every project folder.
+    Other project resources remain available through ``additional_dirs``. The
+    shared parent is an implementation detail: starting there allowed
+    ambiguous relative writes to land outside every resource, where Files,
+    Review, and delivery could not see them.
     """
-    if not session.workspaces:
-        return session.workspace_path
-    parents = {Path(item.workspace_path).resolve().parent for item in session.workspaces}
-    if len(parents) != 1:
-        return session.workspace_path
-    root = parents.pop()
-    return str(root) if root.name == session.id else session.workspace_path
+    return session.workspace_path
 
 
 class RuntimeManager:
