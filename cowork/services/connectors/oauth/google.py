@@ -72,11 +72,7 @@ def _fetch_linear_workspace(access_token: str) -> tuple[str, str]:
     this into the viewer query would make a broken/unverified organization
     query capable of failing the whole Linear connection (auth's version of
     this function raises on any `errors` array), not just miss the workspace
-    split.
-
-    TEMP (ENG-2188): the `organization { id name }` shape is unverified
-    against Linear's real schema. Logs the raw response once to confirm the
-    real shape from a live reconnect, then remove the log line."""
+    split."""
     try:
         result = _json_request(
             "https://api.linear.app/graphql",
@@ -84,7 +80,6 @@ def _fetch_linear_workspace(access_token: str) -> tuple[str, str]:
             json_body={"query": "query { organization { id name } }"},
             headers={"Authorization": f"Bearer {access_token}"},
         )
-        _log.warning("Linear organization raw GraphQL response (TEMP diagnostic): %r", result)
         if result.get("errors"):
             raise ValueError(f"Linear organization query returned errors: {result['errors']!r}")
         organization = (result.get("data") or {}).get("organization") or {}

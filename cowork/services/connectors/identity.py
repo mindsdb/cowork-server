@@ -128,16 +128,18 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     *subtitle* source only. Returns None when there's nothing meaningful —
     the caller then falls back to the slug.
 
-    ``account_name`` is checked first only for ``supabase``: its
-    ``account_email`` is a synthetic ``org:<slug>`` placeholder (see
-    ``_fetch_userinfo_supabase``), not a real email, so the human org name is
-    more useful there. Every other engine populates a real ``account_email``
-    already, and ``account_name`` there is just a free-text display name —
-    preferring it for all engines would collapse the subtitle for any two
-    accounts that share a name but have different emails.
+    ``account_name`` is checked first only for ``supabase`` and ``linear``:
+    their ``account_email`` is a synthetic placeholder — ``org:<slug>`` (see
+    ``_fetch_userinfo_supabase``) or ``<email>:<workspace_id>`` (see
+    ``_fetch_userinfo_linear``) — not a real email/display value, so the
+    human org/workspace name is more useful there. Every other engine
+    populates a real ``account_email`` already, and ``account_name`` there is
+    just a free-text display name — preferring it for all engines would
+    collapse the subtitle for any two accounts that share a name but have
+    different emails.
     """
     f = fields or {}
-    keys = ("account_name", "email", "account_email") if engine == "supabase" else ("email", "account_email")
+    keys = ("account_name", "email", "account_email") if engine in ("supabase", "linear") else ("email", "account_email")
     for key in keys:
         val = str(f.get(key, "")).strip()
         if val:
