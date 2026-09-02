@@ -949,13 +949,13 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            # restore_namespaced_env (instead of a bare inject_env loop) also
-            # registers each connection's DS_* var names for credential
+            # Registers each connection's DS_* var names for credential
             # scrubbing — without it, scrub_credentials treats every field as
             # unknown and redacts non-secret values like base_url into
-            # [DS_*] markers in user-facing output (ENG-688). It also clears
-            # stale DS_* vars a previous turn injected for now-disabled
-            # connections.
+            # [DS_*] markers in user-facing output (ENG-688) — and records
+            # this turn's values for scrubbing. It touches no process state:
+            # the scratchpad derives its own DS_* from the same vault, so a
+            # concurrent turn's credentials are neither read nor destroyed.
             from anton.utils.datasources import restore_namespaced_env
 
             restore_namespaced_env(data_vault)
@@ -969,19 +969,16 @@ class AntonHarness:
         # cowork/services/connectors/connections.py). A plain
         # files.list()/files.search() call does NOT return the latter, so
         # without calling them out by name here the agent has no way to
-        # know they're reachable at all — inject_env() below only puts the
-        # raw JSON in an env var, which isn't enough on its own for the
-        # agent to notice or act on.
+        # know they're reachable at all — the scratchpad's own env only carries
+        # the raw JSON, which isn't enough on its own for the agent to notice
+        # or act on.
         #
         # Parsing `_picked_files` and applying the project-scoping rule is
         # connector logic, not agent logic, so it lives in
-        # ConnectionsService.picked_files_by_project(); this loop only
-        # injects env vars and turns the result into agent-facing prompt text.
+        # ConnectionsService.picked_files_by_project().
         integration_guidance = ""
         picked_by_connection: dict[str, list[dict]] = {}
         if data_vault is not None:
-            for conn in data_vault.list_connections():
-                data_vault.inject_env(conn["engine"], conn["name"])
             picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
 
             if picked_by_connection:
