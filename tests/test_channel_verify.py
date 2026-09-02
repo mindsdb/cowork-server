@@ -85,26 +85,27 @@ def test_verify_slack_credentials_network_error(monkeypatch):
     assert result.ok is False
 
 
-# --- Discord: GET /users/@me is the cheapest real proof a token works ------
+# --- Discord: GET /oauth2/applications/@me provides the application_id ------
 
 def test_verify_discord_credentials_ok(monkeypatch):
     from cowork.channels.plugins.discord import verify_discord_credentials
 
     async def fake_get(self, url, headers=None, **kw):
-        assert url.endswith("/users/@me")
+        assert url.endswith("/oauth2/applications/@me")
         assert headers["Authorization"] == "Bot real-token"
 
         class R:
             status_code = 200
 
             def json(self):
-                return {"username": "cowork-bot"}
+                return {"id": "1234567890", "name": "cowork-bot"}
         return R()
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
     result = _run(verify_discord_credentials({"bot_token": "real-token"}))
     assert result.ok is True
     assert "cowork-bot" in result.detail
+    assert result.routing_key == "1234567890"
 
 
 def test_verify_discord_credentials_rejected(monkeypatch):
