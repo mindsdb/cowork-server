@@ -46,6 +46,7 @@ def persist_connection(
     *,
     label: str | None = None,
     user_label: str | None = None,
+    default_label: str | None = None,
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -65,7 +66,12 @@ def persist_connection(
     field in ``credentials`` — is the newer, globally-unique, de-duplicated
     replacement for ``label``; stored as ``_user_label`` and carried forward
     the same way. A brand-new connection that doesn't set one gets a computed
-    default (the engine id, de-duplicated).
+    default: ``default_label`` if the caller supplied one (e.g. an OAuth
+    connector's fetched account/org/workspace name), else the engine id.
+
+    ``default_label`` only ever applies to a genuinely new connection (see the
+    ``existing is None`` branch below) — unlike ``user_label``, it can never
+    overwrite a name the user already set on a reconnect/re-save.
     """
     if vault is None:
         vault = vault_for_scope(scope)
@@ -130,7 +136,7 @@ def persist_connection(
             # pre-existing record via `resolve_unique_slug()`'s
             # `is_same_account()` check, and `existing` correctly reflects
             # that (non-None) even though `is_edit` would be False.
-            user_label = default_user_label(vault, connector_id)
+            user_label = str(default_label or "").strip() or default_user_label(vault, connector_id)
         if user_label:
             payload["_user_label"] = ensure_unique_user_label(
                 vault, user_label, exclude=(connector_id, slug)
