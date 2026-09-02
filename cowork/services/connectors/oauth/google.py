@@ -79,6 +79,14 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
         json_body={"query": "query { viewer { email name } organization { id name } }"},
         headers={"Authorization": f"Bearer {access_token}"},
     )
+    # TEMP (ENG-2188): the `organization { id name }` shape is unverified
+    # against Linear's real schema. _json_request only raises on an HTTP
+    # error status, so a GraphQL-level failure (200 + an `errors` array, or a
+    # field that doesn't exist) would otherwise fail silently and this
+    # function would quietly fall back to bare-email identity, defeating the
+    # multi-workspace dedup fix below. Log the raw response once to confirm
+    # the real shape, then remove this line.
+    _log.warning("Linear userinfo raw GraphQL response (TEMP diagnostic): %r", result)
     data = result.get("data") or {}
     viewer = data.get("viewer") or {}
     organization = data.get("organization") or {}
@@ -88,7 +96,11 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     workspace_name = str(organization.get("name") or "").strip()
     return {
         "email": f"{email}:{workspace_id}" if workspace_id else email,
-        "name": f"{name} — {workspace_name}" if workspace_name else name,
+        # Workspace name first, matching _fetch_userinfo_supabase's
+        # per-organization identity convention above — the tile shows the
+        # workspace/org, not the connecting individual, the same way a
+        # Supabase tile shows the org rather than the person who authorized it.
+        "name": workspace_name or name,
     }
 
 
@@ -463,7 +475,16 @@ class OAuthService:
             # identity-derived match (is_same_account) updates the existing record
             # in place, carrying forward Google Picker grants and any label,
             # instead of leaving a stale duplicate connection behind.
-            connection_name = persist_connection(cfg.engine, "browser_oauth_builtin", "", new_fields)
+            #
+            # default_label=account_name gives a brand-new connection's tile a
+            # meaningful title (the account/org/workspace name the provider
+            # returned) instead of the generic engine-id default — but only
+            # for a genuinely new connection; it can never clobber a label the
+            # user already set on a reconnect (see persist_connection's
+            # default_label docs).
+            connection_name = persist_connection(
+                cfg.engine, "browser_oauth_builtin", "", new_fields, default_label=account_name or None
+            )
         except HTTPException as exc:
             err_msg = str(exc.detail)
             store.clear_pending(service, error=err_msg)
