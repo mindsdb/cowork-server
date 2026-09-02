@@ -130,18 +130,6 @@ BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 #: occurrence: two identical sites need two entries (see the module docstring).
 ALLOWLIST = (
     (
-        "coding/project_workspaces.py",
-        "<module>",
-        "subprocess",
-        "import backing desktop-only Code Project setup and validation commands",
-    ),
-    (
-        "coding/project_workspaces.py",
-        "ProjectCommandRunner._run_one",
-        "subprocess.run",
-        "shell-free local Code Project commands, refused before execution in org mode",
-    ),
-    (
         "coding/workspace.py",
         "<module>",
         "subprocess",

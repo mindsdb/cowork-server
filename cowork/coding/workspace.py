@@ -14,8 +14,6 @@ from cowork.coding.contracts import (
     WorkspaceInspection,
     WorkspaceKind,
 )
-from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
-from cowork.coding.workspace_key import managed_key
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -26,7 +24,6 @@ class WorkspaceError(RuntimeError):
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024
-_TASK_ROOT_METADATA = (".DS_Store", "Thumbs.db", "desktop.ini")
 
 
 def _org_mode() -> bool:
@@ -70,22 +67,17 @@ class GitRunner:
         *args: str,
         check: bool = True,
         input_text: str | None = None,
-        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         if _org_mode():
             raise WorkspaceError("Local coding workspaces are not available on this deployment")
         working_directory = self._working_directory(cwd)
         try:
-            child_environment = os.environ.copy()
-            child_environment["GIT_TERMINAL_PROMPT"] = "0"
-            child_environment.update(environment or {})
             result = subprocess.run(
                 ["git", *args],
                 # The directory is an explicit desktop capability selected by
                 # the user and validated above. Git is fixed, arguments are an
                 # argv array, and shell execution is disabled.
                 cwd=str(working_directory),  # lgtm[py/path-injection]
-                env=child_environment,
                 input=input_text,
                 text=True,
                 encoding="utf-8",
@@ -106,14 +98,9 @@ class GitRunner:
 class WorkspaceManager:
     def __init__(self, root: Path, git: GitRunner | None = None) -> None:
         self.root = root
-        # Git worktrees and local folder copies share a per-task parent. Codex
-        # goal turns receive only a thread-level workspace root, so this layout
-        # lets one narrowly scoped root cover every folder in a Code Project.
-        self.worktrees_root = root / "workspaces"
-        self.legacy_worktrees_root = root / "worktrees"
+        self.worktrees_root = root / "worktrees"
         self.snapshots_root = root / "snapshots"
         self.git = git or GitRunner()
-        self.local_copies = LocalCopyManager(root, self.worktrees_root)
         self._mutation_lock = threading.RLock()
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
         self.snapshots_root.mkdir(parents=True, exist_ok=True)
@@ -152,13 +139,7 @@ class WorkspaceManager:
             ),
         )
 
-    def prepare(
-        self,
-        session_id: str,
-        raw_path: str,
-        allow_direct_folder: bool,
-        base_branch: str | None = None,
-    ) -> PreparedWorkspace:
+    def prepare(self, session_id: str, raw_path: str, allow_direct_folder: bool) -> PreparedWorkspace:
         with self._mutation_lock:
             inspection = self.inspect(raw_path)
             if not inspection.exists or not inspection.is_directory:
@@ -166,39 +147,28 @@ class WorkspaceManager:
             source = Path(inspection.path)
             if not inspection.is_git:
                 if not allow_direct_folder:
-                    raise WorkspaceError("Local folder isolation was not enabled for this request")
-                try:
-                    prepared = self.local_copies.prepare(session_id, source)
-                except LocalCopyError as exc:
-                    raise WorkspaceError(str(exc)) from exc
+                    raise WorkspaceError("Direct-folder mode was not enabled for this request")
                 return PreparedWorkspace(
                     source_path=source,
-                    workspace_path=prepared.workspace,
-                    kind=WorkspaceKind.local_copy,
+                    workspace_path=source,
+                    kind=WorkspaceKind.direct_folder,
                     repository_root=None,
                     base_revision=None,
                     source_dirty=False,
-                    warning=None,
+                    warning=inspection.warning,
                 )
 
             repo = Path(inspection.repository_root or inspection.path)
-            worktree = self.worktrees_root / managed_key(session_id)
+            worktree = self.worktrees_root / session_id
             if worktree.exists():
                 raise WorkspaceError("A managed worktree already exists for this task")
-            worktree.parent.mkdir(parents=True, exist_ok=True)
-            revision = inspection.revision or "HEAD"
-            if base_branch:
-                resolved = self.branch_revision(repo, base_branch)
-                if resolved is None:
-                    raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
-                revision = resolved
-            self.git.run(repo, "worktree", "add", "--detach", str(worktree), revision)
+            self.git.run(repo, "worktree", "add", "--detach", str(worktree), inspection.revision or "HEAD")
             return PreparedWorkspace(
                 source_path=repo,
                 workspace_path=worktree,
                 kind=WorkspaceKind.git_worktree,
                 repository_root=repo,
-                base_revision=revision,
+                base_revision=inspection.revision,
                 source_dirty=inspection.dirty,
                 warning=inspection.warning,
             )
@@ -245,22 +215,7 @@ class WorkspaceManager:
                     warning=None,
                 )
 
-            if kind == WorkspaceKind.local_copy:
-                try:
-                    prepared = self.local_copies.fork(session_id, source, current)
-                except LocalCopyError as exc:
-                    raise WorkspaceError(str(exc)) from exc
-                return PreparedWorkspace(
-                    source_path=prepared.source,
-                    workspace_path=prepared.workspace,
-                    kind=kind,
-                    repository_root=None,
-                    base_revision=None,
-                    source_dirty=False,
-                    warning=None,
-                )
-
-            target = self.worktrees_root / managed_key(session_id)
+            target = self.worktrees_root / session_id
             if target.exists():
                 raise WorkspaceError("A managed worktree already exists for this task")
             revision = self.git.run(current, "rev-parse", "HEAD").stdout.strip()
@@ -291,12 +246,7 @@ class WorkspaceManager:
 
     def diff(self, workspace_path: str, base_revision: str | None) -> list[DiffFile]:
         root = Path(workspace_path)
-        if not base_revision:
-            try:
-                return self.local_copies.diff(root)
-            except LocalCopyError:
-                return []
-        if self._git_root(root) is None:
+        if not base_revision or self._git_root(root) is None:
             return []
         changes = self._changes_since(root, base_revision)
         files: list[DiffFile] = []
@@ -412,15 +362,6 @@ class WorkspaceManager:
             self.git.run(root, "switch", "-c", name)
             return self.git_state(str(root), str(root))
 
-    def branch_revision(self, repository_root: str | Path, name: str) -> str | None:
-        """Resolve a validated branch name without allowing ref option injection."""
-        root = Path(repository_root)
-        valid = self.git.run(root, "check-ref-format", "--branch", name, check=False)
-        if valid.returncode != 0:
-            return None
-        resolved = self.git.run(root, "rev-parse", "--verify", name, check=False)
-        return resolved.stdout.strip() if resolved.returncode == 0 else None
-
     def commit(self, workspace_path: str, message: str) -> GitState:
         with self._mutation_lock:
             root = Path(workspace_path)
@@ -432,60 +373,21 @@ class WorkspaceManager:
 
     def apply_to_source(self, session_id: str, source_path: str, workspace_path: str, base_revision: str | None) -> Path | None:
         with self._mutation_lock:
-            plan = self.preflight_apply(session_id, source_path, workspace_path, base_revision)
-            self.apply_checked(source_path, workspace_path, base_revision, plan)
-            return plan if isinstance(plan, Path) else None
+            if not base_revision:
+                raise WorkspaceError("Direct folders do not support Git handoff")
+            source = Path(source_path)
+            workspace = Path(workspace_path)
+            snapshot = self._snapshot_changes(session_id, workspace, base_revision, "handoff.patch")
+            if snapshot is None:
+                return None
+            patch = snapshot.read_text(encoding="utf-8")
 
-    def preflight_apply(
-        self,
-        session_id: str,
-        source_path: str,
-        workspace_path: str,
-        base_revision: str | None,
-    ) -> Path | list[str] | None:
-        if not base_revision:
-            try:
-                return self.local_copies.preflight(Path(source_path), Path(workspace_path))
-            except LocalCopyError as exc:
-                raise WorkspaceError(str(exc)) from exc
-        source = Path(source_path)
-        workspace = Path(workspace_path)
-        snapshot = self._snapshot_changes(session_id, workspace, base_revision, "handoff.patch")
-        if snapshot is None:
-            return None
-        patch = snapshot.read_text(encoding="utf-8")
-        check = self.git.run(source, "apply", "--check", "--whitespace=nowarn", "-", check=False, input_text=patch)
-        if check.returncode != 0:
-            detail = (check.stderr or check.stdout or "The changes conflict with the source working tree").strip()
-            raise WorkspaceError(f"Handoff stopped before changing the source: {detail[:2_000]}")
-        return snapshot
-
-    def apply_checked(
-        self,
-        source_path: str,
-        workspace_path: str,
-        base_revision: str | None,
-        plan: Path | list[str] | None,
-    ) -> None:
-        if plan is None:
-            return
-        if not base_revision:
-            if not isinstance(plan, list):
-                raise WorkspaceError("Invalid local-copy handoff plan")
-            try:
-                self.local_copies.apply_checked(Path(source_path), Path(workspace_path), plan)
-            except LocalCopyError as exc:
-                raise WorkspaceError(str(exc)) from exc
-            return
-        if not isinstance(plan, Path):
-            raise WorkspaceError("Invalid Git handoff plan")
-        self.git.run(
-            Path(source_path),
-            "apply",
-            "--whitespace=nowarn",
-            "-",
-            input_text=plan.read_text(encoding="utf-8"),
-        )
+            check = self.git.run(source, "apply", "--check", "--whitespace=nowarn", "-", check=False, input_text=patch)
+            if check.returncode != 0:
+                detail = (check.stderr or check.stdout or "The changes conflict with the source working tree").strip()
+                raise WorkspaceError(f"Handoff stopped before changing the source: {detail[:2_000]}")
+            self.git.run(source, "apply", "--whitespace=nowarn", "-", input_text=patch)
+            return snapshot
 
     def cleanup(
         self,
@@ -496,21 +398,11 @@ class WorkspaceManager:
         base_revision: str | None,
     ) -> None:
         with self._mutation_lock:
-            if kind == WorkspaceKind.local_copy:
-                try:
-                    self.local_copies.cleanup(session_id, Path(workspace_path))
-                except LocalCopyError as exc:
-                    raise WorkspaceError(str(exc)) from exc
-                return
             if kind != WorkspaceKind.git_worktree:
                 return
-            relative = managed_key(session_id)
-            expected = {
-                (self.worktrees_root / relative).resolve(),
-                (self.legacy_worktrees_root / relative).resolve(),
-            }
+            expected = (self.worktrees_root / session_id).resolve()
             actual = Path(workspace_path).resolve()
-            if actual not in expected:
+            if actual != expected:
                 raise WorkspaceError("Refusing to remove an unmanaged worktree path")
             source = Path(source_path)
             if actual.exists():
@@ -518,35 +410,6 @@ class WorkspaceManager:
                     self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch")
                 self.git.run(source, "worktree", "remove", "--force", str(actual))
             self.git.run(source, "worktree", "prune")
-
-    def prune_task_root(self, session_id: str) -> None:
-        """Remove an empty project-task parent without discarding task files."""
-        relative = managed_key(session_id)
-        if len(relative.parts) != 1:
-            raise WorkspaceError("Invalid project task workspace key")
-        managed_roots = (
-            self.worktrees_root,
-            self.legacy_worktrees_root,
-            self.local_copies.legacy_copies_root,
-            self.local_copies.baselines_root,
-        )
-        for workspace_root in managed_roots:
-            task_root = workspace_root / relative
-            if task_root.is_symlink() or not task_root.is_dir():
-                continue
-            for filename in _TASK_ROOT_METADATA:
-                metadata = task_root / filename
-                try:
-                    if metadata.is_file() or metadata.is_symlink():
-                        metadata.unlink()
-                except OSError:
-                    # A concurrent OS metadata write must not make task deletion fail.
-                    pass
-            try:
-                task_root.rmdir()
-            except OSError:
-                # Preserve the root when it still contains any real task files.
-                pass
 
     def _snapshot_changes(
         self,

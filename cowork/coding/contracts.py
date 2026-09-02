@@ -27,7 +27,6 @@ class SessionStatus(str, Enum):
 
 class WorkspaceKind(str, Enum):
     git_worktree = "git_worktree"
-    local_copy = "local_copy"
     direct_folder = "direct_folder"
 
 
@@ -173,44 +172,6 @@ class QueuedInstruction(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class TaskWorkspace(BaseModel):
-    folder_id: str
-    folder_name: str
-    source_path: str
-    workspace_path: str
-    workspace_kind: WorkspaceKind
-    repository_root: str | None = None
-    base_revision: str | None = None
-    base_branch: str | None = None
-    task_branch: str | None = None
-    source_dirty: bool = False
-
-
-class SourceContext(BaseModel):
-    provider: Literal["github", "linear", "slack"]
-    kind: Literal["issue", "pull_request", "conversation"]
-    url: str = Field(min_length=1, max_length=8_192)
-    title: str = Field(default="", max_length=512)
-    external_id: str = Field(default="", max_length=512)
-    connection_name: str | None = Field(default=None, max_length=512)
-    body: str = Field(default="", max_length=100_000)
-
-
-class DeliveryRecord(BaseModel):
-    provider: Literal["github", "linear", "slack"]
-    action: Literal["progress", "result", "draft_pull_request"]
-    target_url: str
-    status: Literal["pending", "published", "failed"] = "pending"
-    external_url: str | None = None
-    detail: str = ""
-    folder_id: str | None = None
-    folder_name: str | None = None
-    base_branch: str | None = None
-    task_branch: str | None = None
-    connection_name: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
-
-
 class CodingSession(BaseModel):
     schema_version: int = SCHEMA_VERSION
     id: str
@@ -226,22 +187,13 @@ class CodingSession(BaseModel):
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list)
     status: SessionStatus = SessionStatus.ready
-    project_id: str | None = None
-    project_name: str | None = None
     source_path: str
     workspace_path: str
     workspace_kind: WorkspaceKind
-    workspaces: list[TaskWorkspace] = Field(default_factory=list)
     repository_root: str | None = None
     base_revision: str | None = None
     source_dirty: bool = False
     workspace_warning: str | None = None
-    guidance_summary: str | None = None
-    developer_instructions: str = ""
-    environment: dict[str, str] = Field(default_factory=dict)
-    allocated_ports: dict[str, int] = Field(default_factory=dict)
-    source_contexts: list[SourceContext] = Field(default_factory=list)
-    deliveries: list[DeliveryRecord] = Field(default_factory=list)
     engine_session_id: str | None = None
     active_turn_id: str | None = None
     pending_approval: PendingApproval | None = None
@@ -266,8 +218,6 @@ class WorkspaceInspection(BaseModel):
 
 
 class DiffFile(BaseModel):
-    folder_id: str | None = None
-    folder_name: str | None = None
     path: str
     status: str
     additions: int = 0
@@ -285,8 +235,6 @@ class DiffFile(BaseModel):
 
 
 class GitState(BaseModel):
-    folder_id: str | None = None
-    folder_name: str | None = None
     is_git: bool
     branch: str | None = None
     revision: str | None = None
@@ -298,8 +246,7 @@ class GitState(BaseModel):
 
 
 class SessionCreateRequest(BaseModel):
-    path: str | None = Field(default=None, min_length=1, max_length=32_768)
-    project_id: str | None = Field(default=None, min_length=1, max_length=128)
+    path: str = Field(min_length=1, max_length=32_768)
     prompt: str = Field(min_length=1, max_length=200_000)
     engine_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: str | None = Field(default=None, min_length=1, max_length=256)
@@ -312,13 +259,6 @@ class SessionCreateRequest(BaseModel):
     additional_dirs: list[str] = Field(default_factory=list, max_length=16)
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
     allow_direct_folder: bool = False
-    source_contexts: list[SourceContext] = Field(default_factory=list, max_length=12)
-
-    @model_validator(mode="after")
-    def require_workspace_source(self) -> SessionCreateRequest:
-        if bool(self.path) == bool(self.project_id):
-            raise ValueError("Choose exactly one Code Project or folder")
-        return self
 
 
 class SessionUpdateRequest(BaseModel):

@@ -23,33 +23,41 @@ _MAX_WORKSPACE_FILES_SCANNED = 20_000
 
 def workspace_files(session: CodingSession, query: str = "", limit: int = 40) -> list[dict[str, str]]:
     """Return bounded, deterministic file suggestions from a task workspace."""
-    roots = [
-        (item.folder_name, Path(item.workspace_path).resolve())
-        for item in session.workspaces
-    ] or [("", Path(session.workspace_path).resolve())]
+    root = Path(session.workspace_path).resolve()
     needle = query.casefold().strip()
     matches: list[dict[str, str]] = []
     visited = 0
     requested = max(1, min(limit, 100))
-    for folder_name, root in roots:
-        for current_root, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = sorted(name for name in dirs if name not in _EXCLUDED_WORKSPACE_DIRECTORIES)
-            entries = [(item, True) for item in dirs] + [(item, False) for item in sorted(files)]
-            for name, is_directory in entries:
-                visited += 1
-                if visited > _MAX_WORKSPACE_FILES_SCANNED:
-                    return matches
-                path = Path(current_root, name)
-                try:
-                    relative = path.relative_to(root).as_posix() + ("/" if is_directory else "")
-                except ValueError:
-                    continue
-                label = f"{folder_name}/{relative}" if folder_name else relative
-                if needle and needle not in label.casefold():
-                    continue
-                matches.append({"name": label, "path": str(path), "kind": "mention"})
-                if len(matches) >= requested:
-                    return matches
+    for current_root, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(name for name in dirs if name not in _EXCLUDED_WORKSPACE_DIRECTORIES)
+        for dirname in dirs:
+            visited += 1
+            if visited > _MAX_WORKSPACE_FILES_SCANNED:
+                return matches
+            path = Path(current_root, dirname)
+            try:
+                relative = path.relative_to(root).as_posix() + "/"
+            except ValueError:
+                continue
+            if needle and needle not in relative.casefold():
+                continue
+            matches.append({"name": relative, "path": str(path), "kind": "mention"})
+            if len(matches) >= requested:
+                return matches
+        for filename in sorted(files):
+            visited += 1
+            if visited > _MAX_WORKSPACE_FILES_SCANNED:
+                return matches
+            path = Path(current_root, filename)
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if needle and needle not in relative.casefold():
+                continue
+            matches.append({"name": relative, "path": str(path), "kind": "mention"})
+            if len(matches) >= requested:
+                return matches
     return matches
 
 
@@ -59,11 +67,8 @@ def validate_references(
 ) -> tuple[EngineInputReference, ...]:
     """Resolve attachments and map source paths into an isolated worktree."""
     resolved: list[EngineInputReference] = []
-    mappings = [
-        (Path(item.source_path).resolve(), Path(item.workspace_path).resolve())
-        for item in session.workspaces
-    ] or [(Path(session.source_path).resolve(), Path(session.workspace_path).resolve())]
-    workspace = mappings[0][1]
+    workspace = Path(session.workspace_path).resolve()
+    source = Path(session.source_path).resolve()
     for item in attachments:
         path = Path(item.path)
         if not path.is_absolute():
@@ -76,15 +81,14 @@ def validate_references(
             raise ValueError(f"Image attachment is not a file: {item.name}")
         if item.kind == "mention" and not (path.is_file() or path.is_dir()):
             raise ValueError(f"Referenced path is not a file or folder: {item.name}")
-        for source, mapped_workspace in mappings:
-            try:
-                relative = path.relative_to(source)
-            except ValueError:
-                continue
-            workspace_file = mapped_workspace / relative
+        try:
+            relative = path.relative_to(source)
+        except ValueError:
+            pass
+        else:
+            workspace_file = workspace / relative
             if workspace_file.is_file() or workspace_file.is_dir():
                 path = workspace_file
-            break
         resolved.append(EngineInputReference(name=item.name, path=str(path), kind=item.kind))
     return tuple(resolved)
 

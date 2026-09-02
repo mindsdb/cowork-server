@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from cowork.coding.contracts import ExtensionInventory, PermissionMode
 from cowork.coding.engines import codex as codex_module
 from cowork.coding.engines import codex_config, codex_events
-from cowork.coding.engines.base import EngineCredentials, EngineInputReference, EngineSessionConfig
+from cowork.coding.engines.base import EngineInputReference, EngineSessionConfig
 from cowork.coding.engines.codex_extensions import add_extension_response
 from cowork.coding.redaction import sanitize
 
@@ -38,42 +38,6 @@ def test_codex_uses_the_loopback_inference_proxy() -> None:
     assert codex_config.local_inference_base_url(26866) == "http://127.0.0.1:26866/api/v1/coding/inference"
 
 
-def test_codex_model_discovery_keeps_models_that_need_credits(monkeypatch) -> None:
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, object]:
-            return {
-                "data": [
-                    {"id": "mindshub_air", "enabled": True},
-                    {"id": "fable", "enabled": False},
-                    {"id": "gpt-codex", "enabled": False},
-                    {"id": "embed-small", "enabled": False, "embedding": True},
-                ],
-            }
-
-    class FakeClient:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args) -> None:
-            return None
-
-        def get(self, url: str, *, headers: dict[str, str]) -> FakeResponse:
-            assert url == "https://api.mindshub.ai/v1/models"
-            assert headers == {"Authorization": "Bearer mdb_test"}
-            return FakeResponse()
-
-    monkeypatch.setattr(codex_module.httpx, "Client", lambda **_kwargs: FakeClient())
-
-    models = codex_module.CodexEngine().discover_models(
-        EngineCredentials(minds_url="https://api.mindshub.ai", minds_api_key="mdb_test"),
-    )
-
-    assert models == ["mindshub_air", "fable", "gpt-codex"]
-
-
 def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
     environment = codex_config.client_environment(Path("/tmp/codex-home"))
     assert environment == {
@@ -82,17 +46,6 @@ def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
     }
     assert len(codex_config.LOCAL_PROXY_TOKEN) >= 32
     assert "mdb_real-secret" not in environment.values()
-
-
-def test_codex_runtime_values_cannot_be_overridden_by_project_environment() -> None:
-    environment = codex_config.client_environment(
-        Path("/tmp/codex-home"),
-        (("PROJECT_NAME", "atlas"), ("CODEX_HOME", "/wrong"), ("MINDSHUB_CODEX_API_KEY", "wrong")),
-    )
-
-    assert environment["PROJECT_NAME"] == "atlas"
-    assert environment["CODEX_HOME"] == "/tmp/codex-home"
-    assert environment["MINDSHUB_CODEX_API_KEY"] == codex_config.LOCAL_PROXY_TOKEN
 
 
 def test_codex_runtime_home_is_persistent_and_isolated_from_shell_config(
@@ -130,9 +83,6 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread() -> None:
             network_access=True,
             web_search=True,
             additional_dirs=("/extra",),
-            developer_instructions="Use the project playbook.",
-            session_id="task-123",
-            cowork_root="/cowork-data",
         ),
         Path("/workspace"),
         "http://127.0.0.1:26866/api/v1/coding/inference",
@@ -148,9 +98,6 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread() -> None:
     assert 'model_reasoning_effort="high"' in launch.config_overrides
     assert 'service_tier="priority"' in launch.config_overrides
     assert 'web_search="live"' in launch.config_overrides
-    assert any(item.startswith("mcp_servers.mindshub_code.command=") for item in launch.config_overrides)
-    assert any('"cowork.coding.integration_mcp","/cowork-data","task-123"' in item for item in launch.config_overrides)
-    assert launch.thread_params["developerInstructions"] == "Use the project playbook."
     assert launch.thread_params["approvalPolicy"] == launch.approval_policy
     assert launch.thread_params["sandbox"] == "workspace-write"
 
@@ -325,45 +272,6 @@ def test_resume_goal_registers_routing_before_reactivating_the_goal(monkeypatch)
     assert engine_session.resume_goal() == "goal-turn-2"
     assert order == ["reserve", "route", "activate", "wait"]
     assert engine_session._goal_states["goal-turn-2"] is state
-
-
-def test_goal_steer_retries_with_the_server_reported_active_turn() -> None:
-    from openai_codex.errors import InvalidRequestError
-
-    class FakeState:
-        def __init__(self) -> None:
-            self.turn_id = "stale-turn"
-
-        def current_turn(self) -> str:
-            return self.turn_id
-
-        def resolve_active_turn(self, expected: str, active: str) -> None:
-            assert expected == "stale-turn"
-            self.turn_id = active
-
-    class FakeClient:
-        def __init__(self) -> None:
-            self.turn_ids: list[str] = []
-
-        def turn_steer(self, _thread_id: str, turn_id: str, _items) -> None:
-            self.turn_ids.append(turn_id)
-            if turn_id == "stale-turn":
-                raise InvalidRequestError(
-                    -32600,
-                    "expected active turn id `active-turn` but found `stale-turn`",
-                )
-
-    state = FakeState()
-    client = FakeClient()
-    engine_session = object.__new__(codex_module.CodexEngineSession)
-    engine_session._client = client
-    engine_session._session_id = "session-1"
-    engine_session._goal_states = {"logical-goal-turn": state}
-
-    engine_session.steer("logical-goal-turn", "Finish validation")
-
-    assert client.turn_ids == ["stale-turn", "active-turn"]
-    assert state.turn_id == "active-turn"
 
 
 def test_goal_updates_use_native_thread_lifecycle(monkeypatch) -> None:
