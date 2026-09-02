@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 
 if TYPE_CHECKING:
@@ -109,6 +111,35 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+
+async def _current_runtime_minds_credential() -> str:
+    """Return the desktop's current MindsHub credential for one LLM request.
+
+    Providers built from a handed-over runtime credential must not fall back to
+    the seed captured when the chat session was created. That seed can be an
+    expired access token after the desktop refreshes or signs out.
+    """
+    credential = runtime_credential.get_minds_credential()
+    if credential is None:
+        raise _provider_auth_error(
+            "The MindsHub session credential is no longer available."
+        )
+    return credential
+
+
+def _provider_auth_error(message: str) -> ConnectionError:
+    """Anton's typed 401, or the bare ConnectionError an older anton maps to.
+
+    Imported lazily so a version-skewed anton loses the typed discriminator
+    rather than failing this module's import and taking the whole server's boot
+    with it. `handlers/turn_errors.is_auth_error` reads both shapes.
+    """
+    try:
+        from anton.core.llm.provider import ProviderAuthError
+
+        return ProviderAuthError(message)
+    except Exception:
+        return ConnectionError(f"Invalid API key — {message}")
 
 
 def provider_base_url(
@@ -1109,19 +1140,32 @@ def build_llm_client(effort_override: str | None = None):
     actually in use this turn, unlike a stale persisted choice that may have
     been made for a different model).
     """
-    from anton.core.llm.client import LLMClient
     from anton.core.llm.anthropic import AnthropicProvider
+    from anton.core.llm.client import LLMClient
     from anton.core.llm.openai import OpenAIProvider
 
     from cowork.common.settings.user_settings import (
+        Provider,
         get_user_settings,
         provider_api_key,
-        Provider,
     )
 
     settings = get_user_settings()
 
+    # The published package still permits Anton releases from before ENG-2116.
+    # Inspect the constructor once per client build so those versions keep
+    # working without pretending they can refresh a credential per request.
+    # A signature we cannot inspect is treated as unsupported: omitting a new
+    # kwarg is safer than raising TypeError on every MindsHub turn.
+    try:
+        openai_provider_params = inspect.signature(OpenAIProvider).parameters
+    except (TypeError, ValueError):
+        openai_provider_params = {}
+    supports_api_key_provider = "api_key_provider" in openai_provider_params
+    warned_about_static_runtime_credential = False
+
     def _make_provider(role: Provider, effort: str | None = None):
+        nonlocal warned_about_static_runtime_credential
         # Only pass reasoning_effort when it's actually set. This keeps
         # build_llm_client compatible with anton builds whose provider __init__
         # predates the kwarg (passing reasoning_effort=None unconditionally would
@@ -1144,6 +1188,34 @@ def build_llm_client(effort_override: str | None = None):
         if role == Provider.MINDS_CLOUD:
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
+            # The runtime credential is local-only by contract. A static
+            # settings/env key and every org-mode per-turn credential leave
+            # this callback unset and keep their existing lifetime.
+            #
+            # The live supplier is available only when Anton advertises the
+            # constructor kwarg. Older versions allowed by the package metadata
+            # keep the construction-time credential and log that they cannot
+            # adopt desktop refreshes; passing the unsupported kwarg would
+            # TypeError on every signed-in MindsHub turn.
+            #
+            # This refreshes the MAIN-PROCESS provider only. anton snapshots
+            # export_connection_info().api_key once per ChatSession and hands
+            # that string to the scratchpad subprocess, which has no supplier —
+            # so a pad-side LLM call still runs on the construction-time token.
+            # ENG-2116 scopes that out; it needs a pad IPC contract.
+            credential_kw: dict = {}
+            if runtime_credential.get_minds_credential() is not None:
+                if supports_api_key_provider:
+                    credential_kw["api_key_provider"] = (
+                        _current_runtime_minds_credential
+                    )
+                elif not warned_about_static_runtime_credential:
+                    logger.warning(
+                        "Installed anton does not support a per-request API-key "
+                        "supplier; active MindsHub providers will keep their "
+                        "construction-time credential until anton is upgraded"
+                    )
+                    warned_about_static_runtime_credential = True
             # The MindsHub gateway executes web_search / web_fetch server-side
             # over its chat.completions passthrough:
             # - the flavor must be set, or OpenAIProvider defaults to generic,
@@ -1157,6 +1229,7 @@ def build_llm_client(effort_override: str | None = None):
                 api_key=key.get_secret_value(),
                 base_url=base,
                 flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
+                **credential_kw,
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
@@ -1216,11 +1289,9 @@ def build_llm_client(effort_override: str | None = None):
     # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
     # would TypeError, taking the whole agent down. When absent, anton falls
     # back to the coding role internally, so behavior is preserved.
-    import inspect as _inspect
-
     router_kw: dict = {}
     try:
-        _params = _inspect.signature(LLMClient.__init__).parameters
+        _params = inspect.signature(LLMClient.__init__).parameters
         if "router_provider" in _params:
             router_kw = {
                 "router_provider": _make_provider(settings.resolved_router_provider, None),

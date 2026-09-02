@@ -174,6 +174,22 @@ travels the same way, which is what keeps a long-lived `mdb_` key out of both
 mode: an org deployment mints a per-turn credential in the turn producer and its
 pods are never handed one.
 
+**A live turn re-reads it per request, with one exception.** The overlay alone
+was not enough: a turn copied the credential into its provider once, so a turn
+running across a hand-over kept sending the token it started with and took a
+gateway 401 that looked like a dead account. `build_llm_client` now passes an
+`api_key_provider` into MindsHub-backed providers, so each outbound model call
+reads the current in-memory value. Two limits are deliberate. Static
+organization-mode and user-supplied keys keep their construction-time value,
+because nothing rotates them. And the **scratchpad subprocess keeps the token it
+was started with** — `export_connection_info()` hands it a string once and it
+has no supplier, so a pad-side model call still runs on that value. Refreshing
+it needs a pad IPC contract, which ENG-2116 scoped out.
+
+`build_llm_client` capability-gates the kwarg on `inspect.signature`, so an
+older Anton keeps the static key and logs the degradation rather than failing
+every turn.
+
 ## API
 
 All endpoints live under `/api/v1/`. Key resource groups:
