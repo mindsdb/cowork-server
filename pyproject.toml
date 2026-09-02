@@ -99,7 +99,7 @@ override-dependencies = ["pillow>=12.3.0"]
 # `services/providers.py` capability-gates the live supplier and logs when it
 # must retain the static construction-time key, and `handlers/turn_errors.py`
 # keeps the legacy 401 classifier available under that skew.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "b4471472bcbc205661a339c1e67a48a2f804e6fe" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "303bf7c6991fd1bbdce70b73fc059b2ae4cd8341" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
