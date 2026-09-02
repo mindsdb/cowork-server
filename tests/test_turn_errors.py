@@ -14,15 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from types import ModuleType
 from uuid import uuid4
 
 import pytest
+from anton.core.llm.provider import ProviderAuthError
 from fastapi import HTTPException
 
-from anton.core.llm.provider import ProviderAuthError
 from cowork.handlers import turn_errors as te
 from cowork.handlers.responses import ResponsesHandler
-
 
 # ── Detection / mapping policy ────────────────────────────────────
 
@@ -449,6 +450,17 @@ def test_detects_canonical_provider_auth_error():
     assert te.is_auth_error(exc) is True
 
 
+def test_legacy_auth_fallback_when_anton_lacks_typed_error(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "anton.core.llm.provider", ModuleType("anton.core.llm.provider")
+    )
+    exc = ConnectionError(
+        "Invalid API key — check your OpenAI API key configuration."
+    )
+
+    assert te.is_auth_error(exc) is True
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -519,6 +531,31 @@ async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
     assert payload["code"] == te.AUTH_ERROR_CODE
     assert payload["reconnectable"] is False
     assert payload["provider_label"] == Provider.ANTHROPIC.label
+
+
+async def test_auth_reconnectable_uses_planning_role_in_a_mixed_config():
+    from unittest.mock import patch
+
+    from cowork.common.settings.user_settings import Provider
+
+    class _MixedSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+        resolved_router_provider = Provider.OPENAI
+
+    exc = ProviderAuthError("provider rejected the credential")
+    exc.role = "planning"
+    with patch(
+        "cowork.handlers.responses.get_user_settings",
+        return_value=_MixedSettings(),
+    ):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    failed = next(f for f in frames if "response.failed" in f)
+    payload = json.loads(failed.split("data: ", 1)[1].strip())
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert payload["reconnectable"] is True
+    assert payload["provider_label"] == Provider.MINDS_CLOUD.label
 
 
 async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():

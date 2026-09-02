@@ -16,6 +16,8 @@ classifiers = [
 ]
 dependencies = [
     "alembic>=1.17.0",
+    # Releases before ENG-2116 remain allowed until Anton ships the supplier;
+    # build_llm_client capability-gates that kwarg and reports the degradation.
     "anton-agent>=2.26.8.23.1,<3",
     # Capped <49: 49+ drops the macOS universal2 wheel, breaking Intel-Mac installs.
     "cryptography>=48.0.0,<49",
@@ -83,18 +85,18 @@ override-dependencies = ["pillow>=12.3.0"]
 # two must agree on the value or one artifact ends up with two identities.
 # This rev ALSO supplies the typed provider-auth error and the per-request
 # API-key supplier that refresh desktop credentials without rebuilding an active
-# session (ENG-2116). Unlike the artifact-identity pin above, it is NOT a
-# staging commit: it is the head of mindsdb/anton#421, which is not an ancestor
-# of Anton's `staging` or `main`. Re-pin to the resulting staging commit once
-# that PR merges, and do not merge this PR before it.
+# session (ENG-2116). It is the current head of mindsdb/anton#421, not a staging
+# commit or an ancestor of Anton's `staging`/`main`. Re-pin to the resulting
+# staging commit once that PR merges, and do not merge this PR before it.
 #
-# Neither feature is on `main`, so the flip back to `branch = "main"` at Anton's
-# next staging → main release still applies: the image installs from this
-# lockfile (`uv sync --frozen`), so a rev on an unreleased commit must not reach
-# a cowork-server main build. That flip no longer breaks the boot — the anton
-# imports in `handlers/turn_errors.py` and `services/providers.py` are lazy with
-# fallbacks — but it does silently retire the typed 401 discriminator.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "a38aa2315767ba4355fdd9bd50bd04171e9bc948" }
+# Flip back to `branch = "main"` only after the feature reaches Anton main: the
+# image installs from this lockfile (`uv sync --frozen`), so a rev on an
+# unreleased commit must not reach a cowork-server main build. Published package
+# metadata still permits older Anton versions; `services/providers.py`
+# capability-gates the live supplier and logs when it must retain the static
+# construction-time key, while `handlers/turn_errors.py` keeps the legacy 401
+# classifier available under that skew.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "095c17ae3fcb7d0e438add0fca61d05deab2ed36" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
