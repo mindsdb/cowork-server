@@ -171,6 +171,38 @@ async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id)
         logger.exception("[responses] could not seal unterminated turn buffer")
 
 
+def _auth_failure_provider(settings, role: str | None) -> Provider | None:
+    """Whose credential the failing call was using, or None if unattributable.
+
+    Anton's `LLMClient` stamps the role on every confirmed refusal that leaves
+    it, so the three named roles cover normal operation. An unstamped auth error
+    can still arrive from a version-skewed anton, whose 401 is an untyped
+    `ConnectionError` that `turn_errors.is_auth_error` still recognizes. Guessing
+    "planning" there would name the wrong provider and offer the wrong remedy in
+    a mixed configuration — a MindsHub "Reconnect" card for a failing BYOK
+    Anthropic key, or the reverse.
+
+    When the required roles resolve to the same provider there is nothing to get
+    wrong, so answer. When they disagree, decline and let the caller fall back to
+    the generic auth copy.
+    """
+    if role == "coding":
+        return settings.resolved_coding_provider
+    if role == "router":
+        # Defensive, and not reachable today: every router call site swallows a
+        # confirmed refusal rather than propagating it — `summarize()` at
+        # anton/core/session.py:2366, `gate()` inside `_gate_turn` at
+        # anton/core/session.py:3515, and `_route_decision` below. The turn
+        # falls back to planning instead, which `tests/test_thalamus.py` pins in
+        # anton. Kept so a future propagating router path attributes the card to
+        # the provider that actually failed rather than defaulting to planning.
+        return settings.resolved_router_provider
+    if role == "planning":
+        return settings.resolved_planning_provider
+    planning = settings.resolved_planning_provider
+    return planning if planning == settings.resolved_coding_provider else None
+
+
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
@@ -1221,11 +1253,16 @@ class ResponsesHandler:
                 # if it raises we just fall back to the generic auth message
                 # (no reconnectable flag), so the stream still closes cleanly.
                 try:
-                    from cowork.common.settings.user_settings import Provider
-                    provider = get_user_settings().resolved_planning_provider
-                    reconnectable = provider == Provider.MINDS_CLOUD
-                    message = auth_error_detail(provider.label, reconnectable)
-                    extra = {"reconnectable": reconnectable, "provider_label": provider.label}
+                    provider = _auth_failure_provider(
+                        get_user_settings(), getattr(exc, "role", None)
+                    )
+                    # An unattributable failure keeps the generic auth copy with
+                    # no provider fields, rather than naming a provider that may
+                    # not be the one that failed.
+                    if provider is not None:
+                        reconnectable = provider == Provider.MINDS_CLOUD
+                        message = auth_error_detail(provider.label, reconnectable)
+                        extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
             elif code in MODEL_UNAVAILABLE_CODES:
@@ -1279,7 +1316,6 @@ class ResponsesHandler:
                 failed_model = overloaded_info[1] if overloaded_info else ""
                 extra = {"model": failed_model}
                 try:
-                    from cowork.common.settings.user_settings import Provider
                     s = get_user_settings()
                     # The nudge keys on WHICH provider overloaded. anton passes the
                     # actual failing model (planning OR coding); map it back to its
