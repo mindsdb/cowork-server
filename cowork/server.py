@@ -151,12 +151,10 @@ async def lifespan(app: FastAPI):
         from cowork.common.http_client import close_proxy_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
-        from cowork.coding.service import get_coding_service
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
         await app.state.channel_adapters.shutdown()
-        get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
