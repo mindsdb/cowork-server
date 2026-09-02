@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import os
+import re
 import sys
 import threading
 from collections.abc import Iterator
@@ -34,6 +35,8 @@ from cowork.coding.redaction import redact_text, sanitize
 from cowork.common.settings.app_settings import get_app_settings
 
 ADAPTER_VERSION = "1"
+
+_EXPECTED_ACTIVE_TURN = re.compile(r"expected active turn id `([^`]+)`")
 
 
 class CodexEngine:
@@ -103,8 +106,12 @@ class CodexEngine:
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                 continue
-            if row.get("enabled") is False:
+            if row.get("embedding") is True:
                 continue
+            # Discovery describes what the MindsHub Responses API can run, not
+            # what the current wallet can start right now. Keep disabled rows
+            # so Code can mirror Cowork's catalogue and explain "Needs
+            # credits" instead of making paid models appear not to exist.
             models.append(row["id"])
         return models
 
@@ -138,7 +145,7 @@ class CodexEngineSession:
             cwd=str(workspace),
             # Codex talks only to Cowork's loopback inference proxy. Keep the
             # real credential in the server process, outside agent commands.
-            env=codex_config.client_environment(codex_home),
+            env=codex_config.client_environment(codex_home, config.environment),
             config_overrides=launch.config_overrides,
             client_name="mindshub_cowork",
             client_title="MindsHub Cowork",
@@ -306,11 +313,33 @@ class CodexEngineSession:
         expected_turn_id = goal_state.current_turn() if goal_state is not None else turn_id
         if not expected_turn_id:
             raise RuntimeError("The goal is between turns; queue this guidance for the next turn")
-        self._client.turn_steer(
-            self._session_id,
-            expected_turn_id,
-            codex_config.turn_input(prompt, attachments),
-        )
+        turn_input = codex_config.turn_input(prompt, attachments)
+        if goal_state is None:
+            self._client.turn_steer(self._session_id, expected_turn_id, turn_input)
+            return
+
+        from openai_codex.errors import InvalidRequestError
+
+        try:
+            self._client.turn_steer(self._session_id, expected_turn_id, turn_input)
+        except InvalidRequestError as exc:
+            # A goal can roll into its next physical turn between reading the
+            # routed state and sending guidance. Adopt the server's canonical
+            # active id and retry once instead of presenting a spurious 500.
+            match = _EXPECTED_ACTIVE_TURN.search(exc.message)
+            active_turn_id = match.group(1) if match is not None else None
+            if active_turn_id and active_turn_id != expected_turn_id:
+                goal_state.resolve_active_turn(expected_turn_id, active_turn_id)
+                try:
+                    self._client.turn_steer(self._session_id, active_turn_id, turn_input)
+                    return
+                except InvalidRequestError as retry_exc:
+                    raise RuntimeError(
+                        "The goal advanced again before guidance arrived. Queue this instruction for the next turn."
+                    ) from retry_exc
+            raise RuntimeError(
+                "The active goal could not accept guidance. Queue this instruction for the next turn."
+            ) from exc
 
     def cancel(self, turn_id: str) -> None:
         # Arm the process-tree watchdog before the cooperative RPC. If the
@@ -377,7 +406,10 @@ class CodexEngineSession:
                 inventory.errors.append(f"{kind}: {redact_text(str(exc), self._secrets)[:1_000]}")
         return inventory
 
-    def fork(self, workspace: str) -> str:
+    def fork(self, workspace: str, additional_dirs: tuple[str, ...] = ()) -> str:
+        sandbox_policy = dict(self._sandbox_policy)
+        if sandbox_policy.get("type") == "workspaceWrite":
+            sandbox_policy["writableRoots"] = [workspace, *additional_dirs]
         response = self._client.thread_fork(
             self._session_id,
             {
@@ -385,7 +417,7 @@ class CodexEngineSession:
                 "model": self._model,
                 "approvalPolicy": self._approval_policy,
                 "approvalsReviewer": "user",
-                "sandboxPolicy": self._sandbox_policy,
+                "sandboxPolicy": sandbox_policy,
             },
         )
         return response.thread.id
