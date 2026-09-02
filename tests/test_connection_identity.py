@@ -320,7 +320,7 @@ class TestDisplayName:
         assert connection_display_name({"host": "h", "database": "d"}) == "h/d"
         assert connection_display_name({"client_id": "x"}) is None
 
-    def test_account_name_preferred_for_supabase_and_linear(self):
+    def test_account_name_preferred_for_supabase_linear_and_posthog(self):
         # Supabase's account_email is a synthetic `org:<slug>` placeholder, so
         # the human org name is the more useful subtitle there.
         fields = {"account_name": "Acme", "account_email": "org:acme"}
@@ -330,10 +330,14 @@ class TestDisplayName:
         # subtitle, not the raw colon-joined identity string.
         linear_fields = {"account_name": "Acme Workspace", "account_email": "user@example.com:org-1"}
         assert connection_display_name(linear_fields, "linear") == "Acme Workspace"
+        # PostHog's account_email is likewise synthetic (`<email>:<organization_id>`,
+        # see _fetch_userinfo_posthog).
+        posthog_fields = {"account_name": "Acme Org", "account_email": "user@example.com:org-1"}
+        assert connection_display_name(posthog_fields, "posthog") == "Acme Org"
         # Every other engine populates a real account_email — account_name is
         # just a free-text display name there, and preferring it would make
         # two accounts with the same name but different emails
-        # indistinguishable (e.g. google/github/posthog).
+        # indistinguishable (e.g. google/github).
         assert connection_display_name(fields, "google") == "org:acme"
         assert connection_display_name(fields) == "org:acme"
 
