@@ -247,10 +247,13 @@ def create_app() -> FastAPI:
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
+            organization_boundary_mode=settings.organization_boundary_mode,
         )
         logger.info(
-            "auth: org tenancy mode — principal middleware enabled (%s)",
+            "auth: org tenancy mode — principal middleware enabled "
+            "(identity=%s, organization-boundary=%s)",
             settings.identity_enforce,
+            settings.organization_boundary_mode,
         )
         # No explicit shared root → org data sits on the ephemeral pod FS.
         # Warn, don't fail: dev deployments predate the mount. model_fields_set
@@ -285,7 +288,8 @@ def create_app() -> FastAPI:
         )
         logger.info("auth: bearer-token authentication enabled")
 
-    # Configure CORS middleware (added last → outermost)
+    # Configure CORS outside the authentication and principal layers. The
+    # no-store wrapper added below remains outermost.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -301,8 +305,16 @@ def create_app() -> FastAPI:
     # and submission SSE streams set no-store at their own routes. OAuth is
     # swept in too: GET .../oauth/{engine}/credentials returns a raw
     # client_secret and, being a plain GET with no explicit cache directive,
-    # is cacheable by default wherever it's fetched from.
-    app.add_middleware(_NoStoreMiddleware, prefixes=("/api/v1/settings", "/api/v1/connectors/oauth"))
+    # is cacheable by default wherever it's fetched from. Capabilities are
+    # included so a browser never reuses a stale rollout state.
+    app.add_middleware(
+        _NoStoreMiddleware,
+        prefixes=(
+            "/api/v1/settings",
+            "/api/v1/connectors/oauth",
+            "/api/v1/capabilities",
+        ),
+    )
 
     # Include v1 API routes
     app.include_router(v1_router)

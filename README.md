@@ -160,6 +160,20 @@ Agents (via their harness) have read/write access to their project's working dir
 
 **Settings** use a hybrid approach: user preferences and API keys are stored in the `settings` DB table (with Fernet encryption for secrets), while connector credentials live in the filesystem vault (`data-vault/`).
 
+**The MindsHub credential is the exception, and it is stored nowhere.** On the
+desktop it is the user's own session token, which lives ten minutes, so the
+Electron app hands it over at runtime through `PUT /api/v1/runtime-credential/minds`
+and this process keeps it in memory. `SettingService._raw_data` overlays it onto
+the stored rows, so every reader of `get_user_settings()` sees it without
+knowing where it came from, and a value handed over beats any stored row.
+
+Two properties follow. **Nothing survives a restart**, so the desktop app
+re-pushes on every start of this process. And a key the user supplied by hand
+travels the same way, which is what keeps a long-lived `mdb_` key out of both
+`.env` and the settings table. The route is loopback-only and refuses in org
+mode: an org deployment mints a per-turn credential in the turn producer and its
+pods are never handed one.
+
 ## API
 
 All endpoints live under `/api/v1/`. Key resource groups:
@@ -178,17 +192,18 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/publish` | Publish HTML artifacts to 4nton.ai |
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
+| `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
 
 ### The MindsHub workspace selector
 
-`/api/v1/hub/workspaces` backs the workspace group in the desktop app's account
-menu. A **MindsHub Workspace** is an org-internal container that owns hub
+`/api/v1/hub/workspaces` backs the workspace selector at the top of the desktop
+app's sidebar. A **MindsHub Workspace** is an org-internal container that owns hub
 resources (API keys, artifacts, model entitlements) and lives in the auth
 service. It has nothing to do with the filesystem directories this repo calls
 workspaces, which is why the stored key is `hub_workspace_id`.
 
-Three things about it are worth knowing before changing it.
+Five things about it are worth knowing before changing it.
 
 **The sidecar makes the call, not the renderer.** Auth's ingress allows three
 console origins per environment and no Cowork host, and a per-PR Cowork host
@@ -203,10 +218,13 @@ an org admin can set.
 **The credential arrives in its own header, `X-MindsHub-Authorization`.** It
 cannot use `Authorization`: Electron's main process overwrites that on every
 request to the loopback server with the server's own token, so the caller's
-Keycloak JWT can never arrive under that name in the desktop shell. `Authorization`
-is still the fallback, which is what the web shell uses. `hub_credential` reads
-both, and it is deliberately a different function from `caller_bearer` so a client
-cannot steer the credential on the org model-catalog fetch by setting a header.
+Keycloak JWT can never arrive under that name in the desktop shell.
+`Authorization` is still the fallback **in org mode only**, where the ingress put
+the caller's JWT there; on a desktop install that header holds this server's own
+bearer, and forwarding it to auth would leak the one credential the main process
+scopes to the loopback origin. `hub_credential` reads both, and it is
+deliberately a different function from `caller_bearer` so a client cannot steer
+the credential on the org model-catalog fetch by setting a header.
 
 **The switch is auth's Statsig gate, not a local setting.** Auth declares
 `authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its
@@ -218,11 +236,41 @@ auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is a
 ON-only development override for walking the surface where no rule targets you;
 it cannot switch the surface off, so it cannot escape the kill switch.
 
+**Both caches are keyed on the credential, not just the caller.** Auth answers
+the listing and the gate per caller: an owner or admin sees every workspace in
+the organization, a member only the ones they hold a grant on, and
+`authorization_ui` declares `idType: userID`. So an organization-keyed cache
+served one admin's menu to every member for the whole TTL, and the grant check on
+`PUT /active` reads the same entry. The key is
+`(auth host, organization, user, credential digest)`. The digest is not
+belt-and-braces: `user_id` comes from the gateway-set principal and is `None` on
+every desktop request, because `scope_from_principal` returns `LOCAL_SCOPE`
+outside org mode, so identity alone collapses to one shared entry and a
+sign-out/sign-in as another account would be served the previous one's
+workspaces. A new session means a new token means a new entry. Entries are swept
+on write, since nothing re-reads a departed caller's key and the dicts would
+otherwise grow for the process lifetime. The TTL follows whether **auth
+answered**, not what it said: a gate auth evaluated as off is a real answer and
+keeps the long TTL, which matters because off is the state this ships in.
+
+**Two refusals on `PUT /active`, and neither may read the stored pick.** A
+workspace missing from the caller's listing is a 403; one in the listing but
+stamped archived is a 409, so the client can say retrying will not help instead
+of offering a loop with no exit. The archived check reads the target row's own
+`archived_at` rather than asking whether it is in the set the menu offered, and
+that distinction is load-bearing. `hub_workspace_id` is an untagged
+`UserSettings` field, so `PUT /api/v1/settings/hub_workspace_id` writes it with
+no gate and no listing check, and `selectable` keeps the active row even when
+archived. A refusal phrased against the offered set would therefore have been
+talked into accepting an archived workspace by one call to the settings route.
+Nothing that refuses a request may read a value any caller can write.
+
 **Picking a workspace changes what the client shows, not what a turn is billed
-to.** Neither turn credential carries a workspace: a desktop turn presents a
-long-lived key bound to a user and an organization, and a cloud turn presents a
-minted key whose request body has no workspace field. So nothing on the turn path
-reads `hub_workspace_id`, and a test asserts that.
+to.** Neither turn credential carries a workspace: a desktop turn presents the
+user's own session credential, whose organization comes from the token's
+active-organization claim, and a cloud turn presents a minted key whose request
+body has no workspace field. So nothing on the turn path reads
+`hub_workspace_id`, and a test asserts that.
 
 The pick is stored as an untagged `UserSettings` field, so it lands per `(org,
 user)` in org mode and in the single global row on a desktop install. That is
@@ -240,10 +288,49 @@ whether that user is still a member of that organization, and injects
 `X-User-Id` and `X-Organization-Id`. cowork-server validates the shape of those
 headers and then trusts them, so **the gateway being the only route to the pod is
 what makes them trustworthy**, and that is a NetworkPolicy rather than
-anything in this codebase.
+anything in this codebase. `deployment/cowork-server/templates/network-policy.yaml`
+is that policy, on in staging and prod, and it admits only the nginx ingress
+controller pods in the `infrastructure` namespace on port 9010. It is off in PR
+environments, which take base values, so a PR environment does not enforce this
+boundary and a forged-header caller inside one is served.
 A request with no valid pair is answered 401 before any route runs, except on
 `/api/v1/health/`, which the kubelet probes with no headers, and the channel
 webhook paths, which third parties call.
+
+### How the browser stays in one organization
+
+Canonical Cowork web sends `X-Cowork-Expected-Organization-Id` with every
+authenticated browser API request.
+`TrustedHeaderMiddleware._organization_boundary_response` compares it with the
+normalized `X-Organization-Id` supplied by the auth gateway before the route
+runs. It applies only to Keycloak-shaped bearer JWTs. MindsDB API keys, opaque
+service credentials, requests without a bearer, CORS preflights, health checks,
+and channel webhooks keep their existing behavior.
+
+`COWORK_ORGANIZATION_BOUNDARY_MODE=audit` logs a missing, malformed, or changed
+expected organization and lets the request continue. In `enforce` mode, a
+missing header returns 426 and a malformed or changed value returns 409. Both
+responses carry `X-Cowork-Organization-Reload: required`, a JSON `code` and
+`detail`, and `Cache-Control: no-store`. The browser reloads instead of letting
+an old document continue under a new Keycloak organization. A request already
+inside a route keeps the `Principal` created at its start, so a concurrent
+session change cannot retarget that in-flight operation.
+
+`GET /api/v1/capabilities/organization-switch` is authenticated and returns
+protocol version 1. It reports `expectedOrganizationEnforced: true` only when
+both identity and expected-organization enforcement are active. It reports
+`enabled: true` only when those boundaries are active and
+`COWORK_ORGANIZATION_SWITCH_ENABLED=true`.
+
+Roll this out in four separate steps:
+
+1. Deploy the capability-aware Cowork client. The picker stays hidden.
+2. Deploy cowork-server with the organization boundary in `audit` and switching
+   disabled.
+3. Set the boundary to `enforce` on every replica while switching remains
+   disabled, then verify the capability still reports `enabled: false`.
+4. Enable switching separately and verify the capability reports all three
+   required values.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
@@ -265,6 +352,19 @@ another member's conversation directory, and `artifact_roots` drops another
 member's conversation directories before the artifact list or delete ever sees
 them, because those routes are addressed by project and slug and never receive a
 conversation id.
+
+One artifact at a time can leave the private group, and only its owner can put it
+there. `POST /artifacts/workspace/{project}/{artifact}/comments-access` records a
+grant in that artifact's `.revisions/draft-review.json` and mints the matching
+rule in auth. A co-member then resolves that one artifact by id —
+`artifact_scope.review_artifact_for_request` searches other members' workspaces
+only after the caller's own, and only accepts a folder that carries the grant —
+and gets the draft preview and comments, never the source, the edit routes or the
+delete. Without a grant the answer is 404, so a private draft still cannot be
+told apart from one that does not exist; with a grant the owner-only routes
+answer 403 instead, because to a client already looking at the draft a 404 would
+read as deleted. The artifacts list is unaffected either way: a co-member's
+artifact never appears in it, so review starts from the link the owner shares.
 
 Both of those decide from a resolved path and the route then opens that path, so
 the decision is carried to the open rather than trusted afterwards: every
@@ -424,6 +524,8 @@ Environment variables fall into two namespaces:
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
 | `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |
 | `COWORK_IDENTITY_ENFORCE` | `enforce` | Org mode only. `enforce` answers 401 to a request carrying no valid identity headers. `audit` logs it and lets it through, which is the rollout mode the org cutover used; it now has to be asked for. |
+| `COWORK_ORGANIZATION_BOUNDARY_MODE` | `enforce` | Canonical web only. `enforce` requires a browser JWT request to name the trusted organization it expects. `audit` logs violations and accepts them for a staged rollout. Long-lived Helm environments explicitly start in `audit`. |
+| `COWORK_ORGANIZATION_SWITCH_ENABLED` | `false` | Enables the version 1 organization-switch capability only while identity and expected-organization enforcement are both active. |
 | `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
