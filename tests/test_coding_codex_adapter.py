@@ -931,3 +931,60 @@ def test_steer_relays_the_codex_error_when_it_answers_in_time() -> None:
 
     with pytest.raises(RuntimeError, match="turn is not active"):
         engine_session.steer("turn-1", "Change direction")
+
+
+def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeypatch) -> None:
+    """WIN-QA-007: the app-server stays open between turns, so the turn's own
+    processes must be ended when it completes, without touching the MCP servers
+    and code-mode host Codex keeps for the next turn."""
+    import threading
+    from types import SimpleNamespace
+
+    from cowork.coding.engines import codex as codex_module
+    from cowork.coding.engines.codex import CodexEngineSession
+
+    class FakeClient:
+        _proc = SimpleNamespace(pid=4242)
+
+        def __init__(self) -> None:
+            self.notifications = iter([
+                SimpleNamespace(method="item/agentMessage/delta", payload={"delta": "hi"}),
+                SimpleNamespace(method="turn/completed", payload={"turn": {"id": "turn-1", "status": "completed"}}),
+            ])
+            self.unregistered: list[str] = []
+
+        def next_turn_notification(self, turn_id: str):
+            return next(self.notifications)
+
+        def unregister_turn_notifications(self, turn_id: str) -> None:
+            self.unregistered.append(turn_id)
+
+    session = object.__new__(CodexEngineSession)
+    session._client = FakeClient()
+    session._secrets = ()
+    session._closed = threading.Event()
+    session._cancel_watchdogs = {}
+    session._cancel_lock = threading.Lock()
+    session._goal_states = {}
+    session._mcp_servers = (("node", ("mcp.js",)),)
+
+    reaped: list[tuple[int | None, object]] = []
+    monkeypatch.setattr(codex_module, "terminate_command_trees", lambda pid, *, protected: reaped.append((pid, protected)) or 3)
+
+    list(session.events("turn-1"))
+
+    assert session._client.unregistered == ["turn-1"]
+    assert [pid for pid, _ in reaped] == [4242]
+    protected = reaped[0][1]
+    assert protected(SimpleNamespace(name=lambda: "codex-code-mode-host.exe", cmdline=lambda: ["codex-code-mode-host.exe"]))
+    assert protected(SimpleNamespace(name=lambda: "python", cmdline=lambda: ["python", "-m", "cowork.coding.integration_mcp", "/root", "task"]))
+    assert protected(SimpleNamespace(name=lambda: "node", cmdline=lambda: ["/usr/bin/node", "mcp.js"]))
+    assert not protected(SimpleNamespace(name=lambda: "node", cmdline=lambda: ["node", "server.js"]))
+    assert not protected(SimpleNamespace(name=lambda: "cmd.exe", cmdline=lambda: ["cmd.exe", "/c", "npm test"]))
+
+    # Once the session is closed, close() has already torn everything down.
+    session._closed.set()
+    list(FakeClient().notifications)  # unused; keeps the fake independent
+    session._client = FakeClient()
+    list(session.events("turn-2"))
+    assert len(reaped) == 1
