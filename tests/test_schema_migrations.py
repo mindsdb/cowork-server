@@ -82,6 +82,17 @@ def expected_head() -> str:
     return ScriptDirectory.from_config(_alembic_config("sqlite://")).get_current_head()
 
 
+def test_migration_graph_has_single_head():
+    # Two migrations forking off one parent leave `upgrade head` unresolvable,
+    # which breaks server startup and the deploy migrate step, not just tests.
+    heads = ScriptDirectory.from_config(_alembic_config("sqlite://")).get_heads()
+    assert len(heads) == 1, (
+        f"migration graph has {len(heads)} heads ({', '.join(sorted(heads))}). "
+        "Add a merge revision joining them: alembic merge -m '<why>' "
+        + " ".join(sorted(heads))
+    )
+
+
 def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
