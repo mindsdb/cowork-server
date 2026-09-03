@@ -471,6 +471,45 @@ def test_runtime_checkpoint_and_error_payloads_are_sanitized_before_persistence(
     assert failed.last_error == "Authorization: Bearer [redacted]"
 
 
+def test_a_classified_runtime_failure_keeps_its_user_message_as_the_run_error(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    service.create_task_run(
+        task_id="task-credits",
+        title="Credits",
+        prompt="Build",
+        project=CodeProject(
+            id="credits-project",
+            name="Credits",
+            resources=[RepositoryResource(id="repo", name="Repo", source_url="https://example.test/repo.git")],
+        ),
+        requested_resource_ids=None,
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+    leased = service.acquire_lease(remote.id)
+    assert leased is not None
+    run, lease_id = leased
+
+    failed = service.accept_event(RuntimeEvent(
+        run_id=run.id,
+        computer_id=remote.id,
+        lease_id=lease_id,
+        epoch=run.epoch,
+        seq=1,
+        kind="error",
+        payload={
+            "message": "This model needs credits. Add credits or choose another model.",
+            "detail": "unexpected status 402 Payment Required: wallet empty",
+            "code": "insufficient_credits",
+            "model": "gpt",
+        },
+    ))
+
+    assert failed.status is RunStatus.failed
+    assert failed.last_error == "This model needs credits. Add credits or choose another model."
+
+
 def test_only_one_concurrent_runtime_claim_can_acquire_a_queued_run(tmp_path: Path) -> None:
     service = ControlPlaneService(tmp_path, capabilities())
     remote, _ = register(service)

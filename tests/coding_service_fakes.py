@@ -104,7 +104,7 @@ class FakeSession:
 
     def events(self, turn_id: str):
         if self.engine.events_error:
-            raise RuntimeError("adapter stream disconnected")
+            raise RuntimeError(self.engine.events_error_message)
         if self.engine.block_until_release:
             self.engine.release_events.wait(timeout=2)
         if self.engine.block_until_cancel:
@@ -175,6 +175,7 @@ class FakeEngine:
         self.block_until_cancel = block_until_cancel
         self.block_until_release = False
         self.events_error = False
+        self.events_error_message = "adapter stream disconnected"
         self.block_compact = False
         self.compact_started = threading.Event()
         self.release_compact = threading.Event()

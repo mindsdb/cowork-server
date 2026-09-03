@@ -1191,3 +1191,26 @@ def test_approval_ids_are_unique_per_request(tmp_path: Path) -> None:
     assert len(set(approval_ids)) == 2
     for approval_id in approval_ids:
         uuid.UUID(approval_id.removeprefix(f"approval-{lease.run.id}-"))
+
+
+def test_a_failed_remote_turn_reports_its_classified_failure_to_the_control_plane(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "no-credits")
+    client = FakeRuntimeClient(lease, start)
+    engine = FakeEngine()
+    engine.events_error = True
+    engine.events_error_message = (
+        '{"error": {"message": "Your wallet has no balance to cover the model \'gpt\'.", '
+        '"type": "invalid_request_error", "code": "insufficient_credits", "upstream_status": 402}}'
+    )
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+
+    with pytest.raises(RuntimeError):
+        CodeOnlyRuntime(tmp_path / "runtime", client, registry).run_once()
+
+    kind, payload = next(item for item in client.events if item[0] == "error")
+    assert kind == "error"
+    assert payload["code"] == "insufficient_credits"
+    assert payload["message"] == "This model needs credits. Add credits or choose another model."
+    assert payload["detail"] == engine.events_error_message
+    assert payload["model"] == "fake-model"

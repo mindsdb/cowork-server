@@ -5,12 +5,24 @@ import json
 import httpx
 from fastapi import HTTPException, Request
 from starlette.background import BackgroundTask
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 from cowork.coding.engines.base import EngineCredentials
 
 INFERENCE_PATHS = {"models", "responses", "responses/compact"}
 MAX_INFERENCE_BODY_BYTES = 16 * 1024 * 1024
+MAX_REJECTION_BODY_BYTES = 64 * 1024
+
+# Codex retries every non-2xx response except 400, so a deterministic upstream
+# rejection (bad credential, empty wallet, unknown model) is otherwise repeated
+# five times before the task fails with the raw status line. These are rewritten
+# to a single terminal 400 whose body names the failure.
+TERMINAL_UPSTREAM_CODES = {
+    401: "model_authentication_failed",
+    402: "insufficient_credits",
+    403: "model_authentication_failed",
+    404: "model_unavailable",
+}
 
 
 def inference_url(minds_url: str, path: str, query: str = "") -> str:
@@ -31,6 +43,39 @@ def inference_body(body: bytes) -> bytes:
         return body
     payload.pop("client_metadata")
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def upstream_error_message(body: bytes) -> str:
+    """Extract the human-readable message from an upstream error body."""
+    text = body[:MAX_REJECTION_BODY_BYTES].decode("utf-8", errors="replace").strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or text)
+    if isinstance(error, str):
+        return error
+    if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+        return payload["detail"]
+    return text
+
+
+def terminal_rejection(status_code: int, body: bytes) -> tuple[str, bytes] | None:
+    """Return the (code, body) of a non-retryable 400 for a deterministic upstream rejection."""
+    code = TERMINAL_UPSTREAM_CODES.get(status_code)
+    if code is None:
+        return None
+    payload = {
+        "error": {
+            "message": upstream_error_message(body) or f"MindsHub inference rejected the request ({status_code})",
+            "type": "invalid_request_error",
+            "code": code,
+            "upstream_status": status_code,
+        }
+    }
+    return code, json.dumps(payload, ensure_ascii=False).encode()
 
 
 def inference_headers(request: Request, api_key: str) -> dict[str, str]:
@@ -92,9 +137,28 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
         for name in ("content-type", "retry-after", "x-mindshub-dropped-params", "x-request-id")
         if (value := upstream.headers.get(name))
     }
+    if upstream.status_code in TERMINAL_UPSTREAM_CODES:
+        try:
+            raw = await _read_bounded(upstream, MAX_REJECTION_BODY_BYTES)
+        finally:
+            await close_upstream()
+        code, body = terminal_rejection(upstream.status_code, raw)
+        response_headers.pop("content-type", None)
+        response_headers["x-mindshub-error-code"] = code
+        response_headers["x-mindshub-upstream-status"] = str(upstream.status_code)
+        return Response(content=body, status_code=400, media_type="application/json", headers=response_headers)
     return StreamingResponse(
         upstream.aiter_bytes(),
         status_code=upstream.status_code,
         headers=response_headers,
         background=BackgroundTask(close_upstream),
     )
+
+
+async def _read_bounded(upstream: httpx.Response, limit: int) -> bytes:
+    body = bytearray()
+    async for chunk in upstream.aiter_bytes():
+        body.extend(chunk[: max(0, limit - len(body))])
+        if len(body) >= limit:
+            break
+    return bytes(body)
