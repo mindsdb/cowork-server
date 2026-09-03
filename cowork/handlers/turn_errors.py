@@ -278,23 +278,54 @@ MISSING_ORGANIZATION_SUFFIX = (
     "has no organization_id; refusing to run a turn without an "
     "organization-scoped workspace"
 )
+# Anchored at the front as well, because the suffix test alone is the one
+# match here that a scrubbed "TypeName: message" could satisfy: an exception
+# whose message merely ENDS with the controller's phrasing would take this
+# branch ahead of its own, trading (say) the provider-auth card for workspace
+# copy.
+#
+# "job " is what the live path sends: _run_job catches MissingOrganization
+# while resolving the scratchpad id and publishes the message verbatim, then
+# returns before dispatching, so the exception never reaches _fail_job and
+# _handle_anton_turn_k8s's own guard never fires. The typed shape is kept as
+# defensive cover for a controller change that lets it through, not because
+# anything emits it today.
+MISSING_ORGANIZATION_PREFIXES = ("job ", "MissingOrganization:")
 MISSING_ORGANIZATION_USER_MESSAGE = (
     "This task's workspace couldn't be set up. Please try again — if it "
     "keeps happening, contact support."
 )
+# The two failures whose user-facing sentence we author ourselves: anton's
+# no-terminal-event fallback (anton/cloud_turn/__main__.py) and
+# scratchpad-controller's PEL reclaim (pel_reclaim.py's ORPHANED_ERROR).
+# Both are fixed constants at their source with nothing interpolated, so they
+# are matched WHOLE rather than on the "TypeName:" prefix — an exception class
+# of either name wrapping provider text then cannot ride the prefix through to
+# the user, and this module keeps its promise never to pass raw provider text
+# on. Drift at either source falls through to the generic message, which is
+# the safe direction to fail.
+SELF_AUTHORED_TURN_FAILURES = frozenset({
+    "TurnInterrupted: The turn ended unexpectedly. Please try again.",
+    "TurnWorkerLost: the worker running this turn stopped before it finished; "
+    "the turn was not retried",
+})
+
 # scratchpad-controller publishes a cancel two ways. main.py's own cancel
-# branch sends the bare literal; a keepalive-driven cancel instead unwinds
-# through _run_job's CancelledError handler into _fail_job, which shapes it
-# as "ExceptionType: message". The second is the only shape reachable while
-# the pod is still starting, because the per-stream-line cancel check needs
-# stream lines to run and none exist before the pod is Running.
+# branch sends this bare literal, and nothing else produces it, so it is
+# proof of a cancel on its own.
+REMOTE_CANCEL_LITERAL = "cancelled"
+# A keepalive-driven cancel instead unwinds through _run_job's CancelledError
+# handler into _fail_job, which shapes it as "ExceptionType: message". That
+# is the only shape reachable while the pod is still starting, because the
+# per-stream-line cancel check needs stream lines to run and none exist
+# before the pod is Running.
 #
-# Deliberate: a controller shutdown abort unwinds through that same handler
-# and so is read as a cancel here — such a turn ends with its partial text
-# and no error frame. That is the better failure mode than the alternative,
-# a persisted red "An unexpected error occurred." row on every Stop pressed
-# during the pod-startup window.
-REMOTE_CANCEL_ERRORS = frozenset({"cancelled", "RuntimeError: cancelled"})
+# Ambiguous on its own: a replica taking SIGTERM during a rolling deploy
+# unwinds through the same handler, and reading that as a cancel would end
+# the turn with partial text, no error frame and no lookup id — the one
+# failure class that would come out of this change LESS visible. Callers
+# confirm it against the cancel flag before treating it as a Stop.
+REMOTE_CANCEL_VIA_FAIL_JOB = "RuntimeError: cancelled"
 
 # live_pod.py raises a bare RuntimeError from two places when the pod never
 # reaches Running: a terminal phase before Running (kubelet rejected or
@@ -1010,6 +1041,11 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     gets the generic redacted message — never the raw provider text.
     """
     text = (error or "").strip()
+    # Our own curated sentences, matched whole. Same generic code as any other
+    # unmapped failure (no card exists for either), but the sentence survives
+    # instead of being discarded for the fully generic message.
+    if text in SELF_AUTHORED_TURN_FAILURES:
+        return GENERIC_TURN_ERROR_CODE, text.partition(":")[2].strip()
     # Matched ahead of the type-name parse below: none of these carry a
     # "TypeName:" prefix, so that parse would never recognize them. Prefix
     # matched (not exact), each can carry an optional "; stderr tail: ..."
@@ -1021,7 +1057,9 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
-    if text.endswith(MISSING_ORGANIZATION_SUFFIX):
+    if text.startswith(MISSING_ORGANIZATION_PREFIXES) and text.endswith(
+        MISSING_ORGANIZATION_SUFFIX
+    ):
         return GENERIC_TURN_ERROR_CODE, MISSING_ORGANIZATION_USER_MESSAGE
     if text.startswith(LIVE_POD_PREFIX) and any(
         marker in text for marker in LIVE_POD_NEVER_RAN_MARKERS
@@ -1072,15 +1110,6 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         # keys its (different, "already fixed") copy on, so return the
         # stable curated constant rather than passing `message` through.
         return CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
-    # TurnInterrupted (the pod's own no-terminal-event fallback) and
-    # TurnWorkerLost (scratchpad-controller's pel_reclaim.py, a fixed
-    # constant with no interpolation) are both our own authored strings,
-    # never provider/attacker text — safe to pass through. Same generic code
-    # as any other unmapped failure (no card exists for either), but the
-    # curated sentence survives instead of being discarded for the fully
-    # generic message just because it lacked a dedicated mapping.
-    if type_name in ("TurnInterrupted", "TurnWorkerLost"):
-        return GENERIC_TURN_ERROR_CODE, message or GENERIC_TURN_ERROR_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
 
