@@ -886,7 +886,7 @@ class _Payload:
         return self.data
 
 
-def test_steer_does_not_wait_forever_when_codex_never_answers(monkeypatch) -> None:
+def test_steer_past_the_deadline_is_followed_not_rejected(monkeypatch) -> None:
     release = threading.Event()
 
     class HangingClient:
@@ -900,11 +900,23 @@ def test_steer_does_not_wait_forever_when_codex_never_answers(monkeypatch) -> No
     engine_session._goal_states = {}
 
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match="did not accept the instruction in time"):
-        engine_session.steer("turn-1", "Change direction")
-    release.set()
-
+    outcome = engine_session.steer("turn-1", "Change direction")
     assert time.monotonic() - started < 2
+    # The request is still in flight: the caller gets something to follow, not
+    # a rejection, and a second steer for the same turn is refused meanwhile.
+    assert outcome is not None and outcome.settled is None
+    with pytest.raises(RuntimeError, match="still being delivered"):
+        engine_session.steer("turn-1", "Change direction again")
+
+    settled: list[tuple[bool, str]] = []
+    outcome.on_settled(lambda ok, detail: settled.append((ok, detail)))
+    release.set()
+    deadline = time.monotonic() + 2
+    while not settled and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert settled == [(True, "")]
+    # Once settled, the turn accepts new instructions again.
+    assert engine_session.steer("turn-1", "Next instruction") is None
 
 
 def test_steer_relays_the_codex_error_when_it_answers_in_time() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -66,6 +67,42 @@ class EngineInputReference:
     content_hash: str | None = None
 
 
+
+class SteerOutcome:
+    """A steer the engine has not confirmed within the deadline.
+
+    The instruction may still be applied once the engine answers, so the
+    caller records it as unconfirmed and learns the result through
+    ``on_settled`` instead of reporting a rejection that could turn out wrong.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._settled: tuple[bool, str] | None = None
+        self._callbacks: list[Callable[[bool, str], None]] = []
+
+    @property
+    def settled(self) -> tuple[bool, str] | None:
+        with self._lock:
+            return self._settled
+
+    def settle(self, ok: bool, detail: str = "") -> None:
+        with self._lock:
+            if self._settled is not None:
+                return
+            self._settled = (ok, detail)
+            callbacks, self._callbacks = self._callbacks, []
+        for callback in callbacks:
+            callback(ok, detail)
+
+    def on_settled(self, callback: Callable[[bool, str], None]) -> None:
+        with self._lock:
+            if self._settled is None:
+                self._callbacks.append(callback)
+                return
+            ok, detail = self._settled
+        callback(ok, detail)
+
 class EngineSession(Protocol):
     @property
     def session_id(self) -> str: ...
@@ -94,7 +131,13 @@ class EngineSession(Protocol):
         turn_id: str,
         prompt: str,
         attachments: tuple[EngineInputReference, ...] = (),
-    ) -> None: ...
+    ) -> SteerOutcome | None:
+        """Deliver guidance to the active turn.
+
+        Returns None once the engine confirmed it, or a SteerOutcome when the
+        engine has not answered within its deadline.
+        """
+        ...
 
     def cancel(self, turn_id: str) -> None: ...
 
