@@ -350,19 +350,6 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
-class CodingSettings(Settings):
-    root_dir: str = Field(
-        default_factory=lambda: str(cowork_home() / "coding"),
-        validation_alias=AliasChoices("COWORK_CODING_DIR", "CODING_ROOT_DIR"),
-        description=(
-            "Root directory for coding sessions, cloned workspaces, code "
-            "projects, playbooks, and the skill library. Unlike the stores "
-            "above this one has no org-mode keying, so the default is the same "
-            "path it has always been and org deployments are unaffected."
-        ),
-    )  # COWORK_CODING_DIR or CODING_ROOT_DIR
-
-
 class StorageSettings(Settings):
     # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
     # mountable subtree per org). Local mode never reads this; in org mode the
@@ -448,16 +435,8 @@ class OAuthSettings(Settings):
     )
     state_path: str = Field(
         default_factory=lambda: str(cowork_home() / "oauth_state.json"),
-        # STATE_PATH stays first-class: the cowork-server Helm values file sets it
-        # to keep OAuth state off the shared EFS tree, and adding an alias would
-        # otherwise drop the bare field-name fallback it relies on.
-        validation_alias=AliasChoices("COWORK_OAUTH_STATE_PATH", "STATE_PATH"),
-        description=(
-            "Path to the file used to persist pending OAuth state. Overridable so a "
-            "desktop with several accounts does not let one account's in-flight "
-            "authorization complete into another account's vault."
-        ),
-    )  # COWORK_OAUTH_STATE_PATH or STATE_PATH
+        description="Path to the file used to persist pending OAuth state",
+    )
     auth_service_base_url: str = Field(
         default="",
         validation_alias=AliasChoices("AUTH_SERVICE_BASE_URL", "COWORK_TURN_AUTH_INTERNAL_BASE_URL"),
@@ -649,19 +628,6 @@ class AppSettings(Settings):
             "multi-tenant cloud deployment behind the auth gateway — requests "
             "carry trusted identity headers (X-User-Id / X-Organization-Id) "
             "from which a per-request principal is built."
-        ),
-    )
-    account_id: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("COWORK_ACCOUNT_ID"),
-        description=(
-            "Desktop only: which signed-in account's data root this process was "
-            "pointed at. Set by the desktop shell when it hands the sidecar "
-            "per-account store paths, absent when the process runs on the "
-            "default (adopted) root. NOT an identity and NOT an authorization "
-            "input: it never builds a Principal or a TenantScope, and nothing "
-            "grants access on it. It only tells store-seeding code whether the "
-            "legacy files under COWORK_HOME belong to this root."
         ),
     )
     pod_scratch_dir: str = Field(
@@ -881,7 +847,6 @@ class AppSettings(Settings):
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
-    coding: CodingSettings = Field(default_factory=CodingSettings)  # CODING_*
 
 
 @lru_cache

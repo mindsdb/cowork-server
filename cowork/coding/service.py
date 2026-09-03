@@ -63,7 +63,7 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor
 from cowork.coding.workspace import WorkspaceManager
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.paths import cowork_home
 
 logger = logging.getLogger(__name__)
 
@@ -600,4 +600,4 @@ class CodingService(
 
 @lru_cache(maxsize=1)
 def get_coding_service() -> CodingService:
-    return CodingService(Path(get_app_settings().coding.root_dir))
+    return CodingService(cowork_home() / "coding")

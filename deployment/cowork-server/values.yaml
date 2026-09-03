@@ -262,12 +262,10 @@ deployment:
 
     # Stays off the shared tree: it is this deployment's own state, not any
     # org's, and the shared root is where org directories live. Note the env
-    # var is STATE_PATH, not a COWORK_-prefixed name. It is kept as an explicit
-    # alias choice on OAuthSettings.state_path in
-    # cowork/common/settings/app_settings.py so this value keeps working; the
-    # field also accepts COWORK_OAUTH_STATE_PATH, which the desktop sets per
-    # account. MASTER_KEY_PATH below still relies on the bare field-name
-    # fallback, having no alias of its own.
+    # var is STATE_PATH, not a COWORK_-prefixed name: OAuthSettings.state_path
+    # has no validation_alias in cowork/common/settings/app_settings.py, so
+    # pydantic-settings falls back to the bare uppercased field name (same
+    # pattern as MASTER_KEY_PATH below).
     - name: STATE_PATH
       value: "/home/app/oauth_state.json"
 
