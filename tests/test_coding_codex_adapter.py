@@ -938,9 +938,14 @@ def test_codex_is_an_optional_extra_and_reports_itself_missing_plainly(monkeypat
 
     from cowork.coding.engines import codex as codex_module
 
-    project = tomllib.load(open("pyproject.toml", "rb"))["project"]
+    pyproject = tomllib.load(open("pyproject.toml", "rb"))
+    project = pyproject["project"]
     assert not any(dep.startswith("openai-codex") for dep in project["dependencies"]), "openai-codex must stay out of the core install"
-    assert any(dep.startswith("openai-codex==") for dep in project["optional-dependencies"]["code"])
+    extra = project["optional-dependencies"]["code"]
+    assert any(dep.startswith("openai-codex==") for dep in extra)
+    # Developer checkouts get the same runtime through a default dependency group.
+    assert pyproject["dependency-groups"]["code"] == extra
+    assert "code" in pyproject["tool"]["uv"]["default-groups"]
 
     monkeypatch.setattr(codex_module.importlib.util, "find_spec", lambda name: None)
     capabilities = codex_module.CodexEngine().capabilities()

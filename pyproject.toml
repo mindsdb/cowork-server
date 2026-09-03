@@ -91,6 +91,10 @@ packages = ["cowork"]
 # upstream commit), which blocks picking up Pillow security fixes. Override
 # it project-wide so the resolver isn't held back by that inner pin.
 override-dependencies = ["pillow>=12.3.0"]
+# Source checkouts keep the Codex runtime: `uv run` / `uv sync` install the
+# default groups but never an extra, so the `code` group below mirrors the
+# `code` extra for developers and the desktop's dev mode.
+default-groups = ["dev", "code"]
 
 [tool.uv.sources]
 # cowork-server imports the artifact-identity derivation
@@ -112,6 +116,10 @@ anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
 [dependency-groups]
+# Same pin as the `code` extra; keep the two in step.
+code = [
+    "openai-codex==0.147.0",
+]
 dev = [
     "alembic>=1.18.4",
     "fakeredis>=2.37.0",
