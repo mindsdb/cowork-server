@@ -531,6 +531,9 @@ class WorkspaceManager:
             root = Path(workspace_path)
             if not message.strip():
                 raise WorkspaceError("Commit message cannot be empty")
+            # Before staging anything: a direct-folder task commits through
+            # here without the project-level preflight.
+            self.check_git_identity(str(root))
             self.git.run(root, "add", "--all")
             self.git.run(root, "commit", "-m", message.strip())
             return self.git_state(str(root), str(root))
@@ -538,14 +541,20 @@ class WorkspaceManager:
     def check_git_identity(self, workspace_path: str) -> None:
         """Raise GitIdentityMissingError unless Git can name an author for this repository.
 
-        ``git var GIT_AUTHOR_IDENT`` applies exactly the rules ``git commit``
-        would (environment, repository, global and system configuration, and
-        Git's own guess where it allows one), so this never blocks a commit
-        Git would accept and never lets one through that Git would reject.
+        ``git var GIT_AUTHOR_IDENT`` and ``GIT_COMMITTER_IDENT`` apply exactly
+        the rules ``git commit`` would (environment, repository, global and
+        system configuration, and Git's own guess where it allows one), so this
+        never blocks a commit Git would accept and never lets one through that
+        Git would reject.
         """
         root = Path(workspace_path)
-        probe = self.git.run(root, "var", "GIT_AUTHOR_IDENT", check=False)
-        if probe.returncode == 0 and probe.stdout.strip():
+        # Git needs both identities; an environment that supplies only the
+        # author's would pass an author-only probe and still fail the commit.
+        for ident in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+            probe = self.git.run(root, "var", ident, check=False)
+            if probe.returncode != 0 or not probe.stdout.strip():
+                break
+        else:
             return
         missing = [
             field
