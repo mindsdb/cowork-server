@@ -24,9 +24,6 @@ dependencies = [
     "fastapi>=0.136.1",
     "hermes-agent>=0.15.2,<0.18",
     "httpx>=0.27",
-    # Structured app-server integration with a pinned, bundled Codex runtime;
-    # users do not need to install a separate CLI.
-    "openai-codex==0.147.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
     "python-dotenv>=1.2.2",
@@ -63,6 +60,15 @@ cowork-dev-setup = "cowork.cli:dev_setup_main"
 cowork-code-runtime = "cowork.coding.runtime_worker:main"
 
 [project.optional-dependencies]
+# Code Mode's engine: the pinned Codex app-server runtime and its native
+# binary (over 100 MB per platform). Not a core dependency, so a first install
+# stays small and never fetches the binary; the desktop adds `cowork-server[code]`
+# when Code Mode is switched on. Without it the Codex engine reports itself
+# unavailable and everything else runs as before. Remote runtimes
+# (`cowork-code-runtime`) need this extra too.
+code = [
+    "openai-codex==0.147.0",
+]
 channels = [
     "slack-sdk>=3.27.0",
     "aiohttp>=3.9.0",
