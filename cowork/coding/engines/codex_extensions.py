@@ -11,6 +11,14 @@ from cowork.coding.contracts import ExtensionEntry, ExtensionInventory
 from cowork.coding.engines import codex_config
 from cowork.coding.engines.codex_events import enum_value
 
+_MCP_AUTH_STATUS_LABELS = {
+    "unknown": "Sign-in status unknown",
+    "unsupported": "No sign-in needed",
+    "notLoggedIn": "Sign-in required",
+    "bearerToken": "Signed in",
+    "oAuth": "Signed in",
+}
+
 
 def add_extension_response(
     inventory: ExtensionInventory,
@@ -92,11 +100,12 @@ def _add_mcp_servers(inventory: ExtensionInventory, response: Any) -> None:
         info = server.server_info
         label = (info.title or info.name) if info else server.name
         description = (info.description or "") if info else ""
+        auth_status = enum_value(server.auth_status)
         inventory.mcp_servers.append(ExtensionEntry(
             id=server.name,
             label=label,
             description=description,
-            status=enum_value(server.auth_status),
+            status=_MCP_AUTH_STATUS_LABELS.get(auth_status, auth_status),
             detail=f"{len(server.tools)} tools · {len(server.resources)} resources",
         ))
 

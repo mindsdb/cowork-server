@@ -311,6 +311,24 @@ def test_extension_inventory_normalizes_codex_skills_and_mcp_servers() -> None:
     assert inventory.mcp_servers[0].detail == "2 tools · 0 resources"
 
 
+def test_extension_inventory_describes_mcp_sign_in_state_in_plain_words() -> None:
+    from openai_codex.generated.v2_all import McpAuthStatus
+
+    inventory = ExtensionInventory()
+    servers = [
+        SimpleNamespace(name=name, server_info=None, auth_status=auth_status, tools={"a": 1, "b": 2}, resources=[])
+        for name, auth_status in (
+            ("mindshub-code", McpAuthStatus.unsupported),
+            ("github", McpAuthStatus.not_logged_in),
+            ("linear", McpAuthStatus.o_auth),
+        )
+    ]
+    add_extension_response(inventory, "mcp", SimpleNamespace(data=servers))
+
+    assert [entry.status for entry in inventory.mcp_servers] == ["No sign-in needed", "Sign-in required", "Signed in"]
+    assert inventory.mcp_servers[0].detail == "2 tools · 0 resources"
+
+
 def _codex_skill(name: str, path: Path | None, scope: str) -> SimpleNamespace:
     from openai_codex.generated.v2_all import AbsolutePathBuf
 
