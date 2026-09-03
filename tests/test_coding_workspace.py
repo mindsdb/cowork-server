@@ -498,3 +498,31 @@ def test_setting_the_identity_fills_only_what_is_unset(monkeypatch: pytest.Monke
     git(repo, "config", "--unset", "user.email")
     git(repo, "config", "--unset", "user.name")
     manager.check_git_identity(str(repo))
+
+
+def test_a_direct_folder_commit_stops_before_staging_without_an_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_git_identity(monkeypatch, tmp_path)
+    repo = repository(tmp_path)
+    git(repo, "config", "--unset", "user.email")
+    (repo / "keep.txt").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(GitIdentityMissingError):
+        WorkspaceManager(tmp_path / "coding").commit(str(repo), "Change keep")
+
+    # Nothing was staged, so the working tree reads exactly as before.
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+    assert git(repo, "status", "--short") == "M keep.txt"
+
+
+def test_an_author_only_environment_is_still_a_missing_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_git_identity(monkeypatch, tmp_path)
+    repo = repository(tmp_path)
+    git(repo, "config", "--unset", "user.name")
+    git(repo, "config", "--unset", "user.email")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Only Author")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "author@example.invalid")
+
+    with pytest.raises(GitIdentityMissingError) as raised:
+        WorkspaceManager(tmp_path / "coding").check_git_identity(str(repo))
+
+    assert raised.value.missing == ["user.name", "user.email"]
