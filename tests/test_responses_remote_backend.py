@@ -9,6 +9,7 @@ the persistence layer inside _produce_remote) are stubbed.
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -290,6 +291,46 @@ async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_
     assert frames[-1] == "CLOSE:cancelled"
     assert not any("response.failed" in f for f in frames)
     assert saved["assistant"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_frame_and_log_both_carry_the_request_id(monkeypatch, caplog):
+    # The id is only useful if BOTH ends hold it: the SSE frame is what the
+    # client turns into the "Reference" a user quotes, and a log line at or
+    # above WARNING is what support can search for — the deployed environments
+    # run at WARNING, so an INFO-only record resolves to nothing there.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=RecBuffer(),
+            turn_llm={"correlation_id": "corr-both-ends"},
+        )
+
+    failed = [f for f in frames if "response.failed" in f]
+    assert failed and "corr-both-ends" in failed[-1]
+    assert any(
+        "corr-both-ends" in r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    )
 
 
 @pytest.mark.asyncio

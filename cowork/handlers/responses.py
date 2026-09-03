@@ -166,8 +166,9 @@ async def _seal_unterminated_buffer(
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
     logger.error(
-        "[responses] turn for conversation %s ended without a terminal record; "
-        "sealing the buffer so the client releases its stream slot", conv_id,
+        "[responses] turn for conversation %s (correlation_id=%s) ended without a "
+        "terminal record; sealing the buffer so the client releases its stream slot",
+        conv_id, request_id,
     )
     try:
         await buffer.append("sse", {"sse": response_failed_sse(
@@ -882,12 +883,10 @@ class ResponsesHandler:
         failure: dict = {}
         # Resolved once, up front — not left for stream_remote_replies to mint
         # internally on a None — so every failure branch below (classified or
-        # not) can attach the SAME id a support/log lookup would use. Logged
-        # here too, not only on failure: a turn that fails before
-        # stream_remote_replies is ever called (workspace staging, artifact
-        # context resolution) would otherwise mint an id that appears in no
-        # log line at all, making the request_id a client shows the user
-        # unfindable.
+        # not) can attach the SAME id a support/log lookup would use. Each of
+        # those branches logs the id at WARNING or above, which is the floor
+        # the deployed environments run at; this INFO line is only the
+        # per-turn breadcrumb that ties a successful turn to its id in dev.
         corr = (turn_llm or {}).get("correlation_id") or str(uuid4())
         logger.info(
             "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
@@ -1080,6 +1079,14 @@ class ResponsesHandler:
         except _RemoteTurnFailed:
             message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
+            # At WARNING because that is the floor the deployed environments
+            # run at: the id below is what the client shows the user as a
+            # Reference, so a line carrying it has to survive prod's log level
+            # or support has nothing to search for.
+            logger.warning(
+                "[responses] remote turn reported a failure for conversation %s "
+                "correlation_id=%s code=%s", conv_id, corr, code,
+            )
             collected_events.append(response_failed_payload(message, code, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
             if code == CONTENT_RECOVERY_CODE:
