@@ -138,7 +138,9 @@ def test_windows_skips_the_legacy_wsl_bash_launcher() -> None:
     assert shells._windows_bash_is_compatible(r"C:\Windows\System32\bash.exe") is False
 
 
-def test_bash_terminal_suppresses_the_misleading_macos_zsh_notice() -> None:
+def test_bash_terminal_suppresses_the_misleading_macos_zsh_notice(monkeypatch) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
     assert codex_config.interactive_shell_environment(["/bin/bash", "--login"]) == {
         "BASH_SILENCE_DEPRECATION_WARNING": "1",
         "PREFIX": "",
