@@ -1411,7 +1411,12 @@ class ResponsesHandler:
                             "[responses] failed to repair conversation %s after content validation error",
                             conversation_id,
                         )
-                raise HTTPException(status_code=400, detail=message)
+                # The ladder already produced a code; carry it instead of dropping
+                # it here. Same wire shape the streaming twin emits.
+                raise HTTPException(
+                    status_code=400,
+                    detail=response_failed_payload(message, code),
+                )
             logger.exception("[responses] turn failed")
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
 

@@ -276,7 +276,11 @@ def test_collect_raises_400_with_curated_message_for_image_error():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert "PNG or JPEG" in err.value.detail
+    # detail is the response.failed payload, not bare prose: the ladder's code
+    # has to reach the caller or no card can be drawn from it.
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == te.IMAGE_FORMAT_CODE
+    assert "PNG or JPEG" in err.value.detail["error"]
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
@@ -439,7 +443,8 @@ def test_collect_raises_400_with_curated_message_for_token_limit():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert err.value.detail == te.TOKEN_LIMIT_USER_MESSAGE
+    assert err.value.detail["code"] == te.TOKEN_LIMIT_CODE
+    assert err.value.detail["error"] == te.TOKEN_LIMIT_USER_MESSAGE
 
 
 # ── Provider auth (401) → provider_auth ──────────────────────────────
@@ -709,7 +714,8 @@ def test_collect_raises_400_with_plan_message_for_model_403():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert err.value.detail == _PLAN_MSG
+    assert err.value.detail["code"] == "model_access_denied"
+    assert err.value.detail["error"] == _PLAN_MSG
 
 
 # ── Wallet-model gateway mapping (402/429/404/503 + X-MindsHub-Reason) ─
