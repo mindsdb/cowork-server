@@ -1622,6 +1622,27 @@ def test_status_and_compact_commands_do_not_start_model_turns(tmp_path: Path) ->
     assert "compacting the task context" in text
 
 
+def test_a_queued_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) -> None:
+    # The queued form of D7: /status typed while the task was still working is
+    # delivered after the turn completes and must leave the task Completed.
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt")
+    wait_for_status(service, created.id, SessionStatus.completed)
+    before = service.get_session(created.id)
+    queued = QueuedInstruction(id="queued-status", prompt="/status")
+    service.store.update_session(created.id, lambda session: session.queued_instructions.append(queued))
+
+    after = service.run_next_queued(created.id, CREDS, queued.id)
+
+    assert after.status == SessionStatus.completed
+    assert after.run_id == before.run_id
+    assert after.queued_instructions == []
+    status_events = [event for event in service.events(created.id).items if event.title == "Task status"]
+    assert len(status_events) == 1
+    assert status_events[0].text.startswith("Status: completed")
+
+
 def test_queue_continues_after_an_immediate_command_without_reusing_its_id(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()

@@ -384,12 +384,17 @@ class CodingTurnOperations:
         ):
             expected_instruction_id = instruction_id
             while True:
-                session = self._continue_completed_task(self.get_session(session_id))
+                session = self.get_session(session_id)
                 self._require_queue_head(session, expected_instruction_id)
                 expected_instruction_id = None
                 if not session.queued_instructions:
                     return session
                 instruction = session.queued_instructions[0]
+                intent = self._validated_command_intent(session, instruction.prompt, instruction.attachments)
+                if not intent.runs_immediately:
+                    # Same rule as submit_turn: a queued /status or /compact
+                    # must not roll a finished task into a fresh run.
+                    session = self._continue_completed_task(session)
                 target_id = instruction.id
                 self.store.update_session(
                     session_id,
