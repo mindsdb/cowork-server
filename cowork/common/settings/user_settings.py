@@ -373,6 +373,15 @@ def _harness_options() -> list[str]:
     return available_harness_ids()
 
 
+def _coding_engine_options() -> list[str]:
+    # Imported lazily so normal Cowork settings startup does not import or
+    # launch a coding runtime. The registry only reports functional adapters;
+    # future engines become additive here without UI conditionals.
+    from cowork.coding.engines.registry import engine_registry
+
+    return engine_registry.ids()
+
+
 # ── .env ↔ DB setting aliases ────────────────────────────────────────
 #
 # One canonical map of DB setting key → its ANTON_* .env variable name, for
@@ -521,6 +530,18 @@ class UserSettings(Settings):
         title="Coding Model",
         description="The coding model. Defaults to the recommended model for the selected provider.",
     )
+    coding_agent_engine: Annotated[str, _DynamicOptions(_coding_engine_options)] = Field(
+        default="codex",
+        title="Coding Agent",
+        description="The agent engine used by the separate Code workspace.",
+    )
+    coding_agent_model: str = Field(
+        default="gpt",
+        min_length=1,
+        max_length=256,
+        title="Coding Agent Model",
+        description="The MindsHub Inference model used by the selected coding agent.",
+    )
     planning_reasoning_effort: str | None = Field(
         default=None,
         title="Planning Reasoning Effort",
@@ -552,10 +573,12 @@ class UserSettings(Settings):
         default=None,
         title="Routing & Summarization Model",
         description=(
-            "The cheap model used for respond-vs-delegate routing and history "
-            "summarization. Defaults to the recommended model for the selected "
-            "provider (MindsHub → MindsHub Air; other providers → their smallest "
-            "model)."
+            "The cheap model used for history summarization. The pre-Anton route "
+            "gate does NOT run on it — it takes the role's fast default for the "
+            "provider (see resolved_gate_model), except on openai-compatible, "
+            "where this is the only model there is. Defaults to the recommended "
+            "model for the selected provider (MindsHub → MindsHub Air; other "
+            "providers → their smallest model)."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -635,6 +658,29 @@ class UserSettings(Settings):
         default=True,
         title="Memory Enabled",
         description="Enable conversation memory.",
+    )
+    # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
+    # means a filesystem location (the per-conversation private directory, the
+    # project tree, the paths on AntonSettings), and that meaning is load-bearing
+    # in dozens of places. This field holds a MindsHub Workspace uuid, an
+    # org-internal container that owns hub resources and lives in the auth
+    # service. The two concepts share nothing but a word.
+    #
+    # Untagged, so it writes per-user: `SettingService._new_row` files an
+    # untagged key at (org, user) scope in org mode and in the single global row
+    # on a desktop install, which is the right answer for both. It carries no
+    # ORG marker deliberately: which workspace a person is looking at is their
+    # own preference, not org configuration an admin sets for everyone.
+    hub_workspace_id: str = Field(
+        default="",
+        title="Active MindsHub Workspace",
+        description=(
+            "Which MindsHub workspace this person is working in, as a uuid. "
+            "Empty means no pick has been made, and readers fall back to the "
+            "organization's default workspace. Interim storage: the shared "
+            "per-user preference the console reads has no route in auth yet, and "
+            "this field is what a follow-up migrates onto it."
+        ),
     )
     coding_mode_enabled: bool = Field(
         default=False,
@@ -877,6 +923,24 @@ class UserSettings(Settings):
             raise ValueError(f"Unknown harness '{v}'. Available: {available}")
         return v
 
+    @field_validator("coding_agent_model")
+    @classmethod
+    def _canonical_coding_agent_model(cls, value: str) -> str:
+        # Installations that saved the retired "gpt-5.6-sol" id keep working:
+        # the stored row is read back as the catalogue id the model list uses.
+        from cowork.coding.project_models import canonical_model_id
+
+        return canonical_model_id(value)
+
+    @field_validator("coding_agent_engine")
+    @classmethod
+    def validate_coding_agent_engine(cls, value: str) -> str:
+        options = _coding_engine_options()
+        if value not in options:
+            available = ", ".join(options) or "none"
+            raise ValueError(f"Unknown coding agent '{value}'. Available: {available}")
+        return value
+
     def _minds_enabled_map(self) -> dict[str, bool]:
         """The cached MindsHub model-availability map (id → enabled), or {}.
 
@@ -1095,8 +1159,8 @@ class UserSettings(Settings):
     @property
     def resolved_router_model(self) -> str | None:
         # wallet_aware: same rationale as resolved_coding_model — the router
-        # role (respond-vs-delegate gating, history summarization) is invisible
-        # in default mode (ENG-1632).
+        # role (history summarization; the route gate resolves its own model,
+        # see resolved_gate_model) is invisible in default mode (ENG-1632).
         return _resolved_model(
             self.resolved_router_provider,
             self.router_provider,
@@ -1104,6 +1168,33 @@ class UserSettings(Settings):
             self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
+        )
+
+    @property
+    def resolved_gate_model(self) -> str | None:
+        """The model the pre-Anton route gate runs on (ENG-1851).
+
+        Deliberately NOT the user's ``router_model``. The gate sits ahead of
+        every turn with a budget measured in seconds, so it has one requirement
+        the router role's other consumer (history summarization) does not:
+        speed. A user who picks a large model for "routing and summarization"
+        is choosing it for the summaries; applied to the gate it times out on
+        every turn and bills for the attempt. So the gate takes the role's
+        *default* for the resolved provider — the catalog's declared default
+        for minds-cloud, the compiled one for the direct providers — which are
+        all chosen to be fast, availability-adjusted like every other default.
+
+        openai-compatible is the exception: it has no canonical model (it is a
+        BYO endpoint), so the user's own pick is the only model that exists
+        there and the gate uses it. The Settings UI carries the speed note.
+        """
+        provider = self.resolved_router_provider
+        if provider is Provider.OPENAI_COMPATIBLE:
+            return self.resolved_router_model
+        return _enabled_aware_default(
+            provider.value,
+            self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
+            self._minds_enabled_map(),
         )
 
     @property

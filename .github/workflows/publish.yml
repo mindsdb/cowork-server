@@ -91,6 +91,21 @@ jobs:
       - name: Build package
         run: uv build
 
+      # This pipeline has no anton-agent pin (unlike publish-staging.yml): the
+      # wheel ships whatever satisfies the loose floor in pyproject.toml, which
+      # can be a stable anton release that predates a symbol this commit's code
+      # already imports at module scope (ENG-2065). Import the wheel we are
+      # about to ship, from outside the checkout so a local cowork/ package
+      # can't shadow it (see the identical check in publish-staging.yml and its
+      # review discussion for why that matters).
+      - name: Verify anton-agent satisfies this build
+        run: |
+          set -euo pipefail
+          uv venv .smoke-venv
+          uv pip install --python .smoke-venv "$(ls dist/*.whl)"
+          VENV_PY="$(pwd)/.smoke-venv/bin/python"
+          cd /tmp && "$VENV_PY" -c "import cowork.server"
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # Trusted publisher (OIDC) — publish.yml must be registered at the

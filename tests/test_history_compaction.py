@@ -6,6 +6,7 @@ and `AntonHarness._stamp_message` (per-message timestamp prefix).
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from types import SimpleNamespace
 from uuid import uuid4
@@ -13,6 +14,7 @@ from uuid import uuid4
 import pytest
 from sqlmodel import Session
 
+from anton.utils.datasources import _DS_KNOWN_VARS, _DS_SECRET_VARS
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import UserSettings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
@@ -20,6 +22,23 @@ from cowork.db.session import get_engine
 from cowork.harnesses.anton_harness.harness import AntonHarness
 from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT_ID
+
+
+@pytest.fixture(autouse=True)
+def clean_ds_state():
+    """Clear anton's registered-secret globals around each test — several
+    tests below register a fake DS_* secret to exercise the ENG-1849 replay
+    scrub, and that state is process-global."""
+    def _clean():
+        _DS_SECRET_VARS.clear()
+        _DS_KNOWN_VARS.clear()
+        for k in list(os.environ):
+            if k.startswith("DS_"):
+                del os.environ[k]
+
+    _clean()
+    yield
+    _clean()
 
 
 def _stamp(m):
@@ -102,6 +121,25 @@ class TestSeedHistory:
         assert seed_info["tail_start"] == 0
         assert seed_info["synthetic_prefix_len"] == 0
 
+    def test_summary_is_scrubbed_of_vaulted_secrets(self, monkeypatch):
+        """A compacted summary can bake in a credential mentioned in the
+        turns it covers (ENG-1849) — it must be scrubbed like any other
+        replayed text, not just the tail."""
+        _DS_SECRET_VARS.add("DS_POSTGRES_ABC12__PASSWORD")
+        monkeypatch.setenv("DS_POSTGRES_ABC12__PASSWORD", "SuperSecret123!")
+        messages = _fake_messages(4)
+        cutoff_id = messages[1].id
+
+        initial_history, _ = AntonHarness._seed_history(
+            messages,
+            "User connected postgres with password SuperSecret123!",
+            cutoff_id,
+            _stamp,
+        )
+
+        assert "SuperSecret123!" not in initial_history[0]["content"]
+        assert "[DS_POSTGRES_ABC12__PASSWORD]" in initial_history[0]["content"]
+
 
 class TestStampMessage:
     """A leaked timestamp bug: an earlier version of `_stamp_message`
@@ -145,6 +183,39 @@ class TestStampMessage:
     def test_no_created_at_leaves_content_untouched(self):
         m = self._msg("user", "hi", None)
         assert AntonHarness._stamp_message(m) == {"role": "user", "content": "hi"}
+
+    def test_scrubs_a_vaulted_secret_from_replayed_user_content(self, monkeypatch):
+        """ENG-1849: a credential typed in an earlier turn and since vaulted
+        must not reappear raw when that turn's message is replayed into a
+        later turn's history — anton only scrubs the CURRENT turn's input,
+        not history read back from storage."""
+        _DS_SECRET_VARS.add("DS_POSTGRES_ABC12__PASSWORD")
+        monkeypatch.setenv("DS_POSTGRES_ABC12__PASSWORD", "SuperSecret123!")
+        ts = datetime(2026, 8, 18, 17, 41)
+        m = self._msg(
+            "user", "connect postgres, password: SuperSecret123!", ts,
+        )
+
+        result = AntonHarness._stamp_message(m)
+
+        assert "SuperSecret123!" not in result["content"]
+        assert "[DS_POSTGRES_ABC12__PASSWORD]" in result["content"]
+        # Timestamp prefix still applies on top of the scrubbed text.
+        assert result["content"].startswith("[2026-08-18 17:41] ")
+
+    def test_scrubs_a_vaulted_secret_from_replayed_assistant_content(self, monkeypatch):
+        """Same protection for assistant text — no timestamp prefix here,
+        just the scrub."""
+        _DS_SECRET_VARS.add("DS_POSTGRES_ABC12__PASSWORD")
+        monkeypatch.setenv("DS_POSTGRES_ABC12__PASSWORD", "SuperSecret123!")
+        ts = datetime(2026, 8, 18, 17, 41)
+        m = self._msg("assistant", "Using password SuperSecret123! now.", ts)
+
+        result = AntonHarness._stamp_message(m)
+
+        assert result == {
+            "role": "assistant", "content": "Using password [DS_POSTGRES_ABC12__PASSWORD] now.",
+        }
 
 
 class TestPersistHistoryCompaction:

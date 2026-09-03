@@ -46,6 +46,8 @@ def persist_connection(
     *,
     label: str | None = None,
     user_label: str | None = None,
+    replace_existing: bool = False,
+    default_label: str | None = None,
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -65,7 +67,16 @@ def persist_connection(
     field in ``credentials`` — is the newer, globally-unique, de-duplicated
     replacement for ``label``; stored as ``_user_label`` and carried forward
     the same way. A brand-new connection that doesn't set one gets a computed
-    default (the engine id, de-duplicated).
+    default: ``default_label`` if the caller supplied one (e.g. an OAuth
+    connector's fetched account/org/workspace name), else the engine id.
+
+    ``default_label`` only ever applies to a genuinely new connection (see the
+    ``existing is None`` branch below) — unlike ``user_label``, it can never
+    overwrite a name the user already set on a reconnect/re-save.
+
+    ``replace_existing`` is reserved for an explicit reconnect of the named
+    record. It replaces that record atomically after the caller has validated
+    the new credential, while retaining its label and picked-file metadata.
     """
     if vault is None:
         vault = vault_for_scope(scope)
@@ -99,7 +110,8 @@ def persist_connection(
         if method:
             payload["_method"] = method
         secure_keys = secure_keys_for(connector_id, method, payload)
-        if is_edit:
+        reconnecting_named_record = replace_existing and bool((name or "").strip()) and target is not None
+        if is_edit or reconnecting_named_record:
             slug = base_slug  # an edit targets the named connection — update in place
         else:
             slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
@@ -130,7 +142,7 @@ def persist_connection(
             # pre-existing record via `resolve_unique_slug()`'s
             # `is_same_account()` check, and `existing` correctly reflects
             # that (non-None) even though `is_edit` would be False.
-            user_label = default_user_label(vault, connector_id)
+            user_label = str(default_label or "").strip() or default_user_label(vault, connector_id)
         if user_label:
             payload["_user_label"] = ensure_unique_user_label(
                 vault, user_label, exclude=(connector_id, slug)

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.paths import cowork_home, pod_local_only
@@ -38,6 +39,28 @@ def _probe_tmp_dir() -> Path:
     first time this module was imported.
     """
     return pod_local_only(cowork_home() / "tmp", "tmp")
+
+
+# WHICH agent runs the probe, as reported on its traces. Must equal
+# `AntonHarness.id` — the probe is anton doing a job, not a different agent
+# (ENG-1694's agent-identity vocabulary). A literal rather than an import
+# because the harness package is not a dependency of the connectors service;
+# `tests/test_trace_stamp_seams.py` pins the two values equal so a rename of
+# either fails a test instead of silently splitting one population in two.
+PROBE_HARNESS = "anton"
+
+# Langfuse tag on every probe turn so probe traces stay separable from user
+# turns now that both report harness="anton" (ENG-1941). Rides the
+# `Langfuse-Tags` header, so it lands on every trace family the gateway
+# creates for the turn (`anton:turn-N`, `tool:*`, `llm-usage`).
+# `.claude/skills/harness-measure` excludes this tag from its turn
+# denominator — rename both or neither.
+#
+# Langfuse ONLY. anton's PostHog events (`turn_completed`, `tool_completed`)
+# carry no trace tags; there the probe is separable by a different fact —
+# it is the one anton turn with NO `conversation_id` and `llm_calls > 0`
+# (the quadrant ENG-1692 / anton#379 documented as "the connector probe").
+PROBE_TRACE_TAG = "connector-probe"
 
 
 @dataclass
@@ -416,10 +439,24 @@ class CredentialProbe:
 
         config = ChatSessionConfig(
             llm_client=self.llm_client,
-            # This runs a real turn (see turn_stream below), so it needs the
-            # same surface attribution as a UI turn — the connector path is
-            # explicitly one of the things ENG-1459 wants compared between web
-            # and desktop.
+            # An empty vault, so the manager derives an empty DS_* set and the
+            # runtime strips the inherited ones: the probe tests the candidate
+            # credentials it writes to its own env file, and must not be able
+            # to read a saved connection's.
+            data_vault=LocalDataVault(_probe_tmp_dir() / "empty-vault"),
+            # WHICH agent ran: anton, same as a UI turn — the probe is anton
+            # doing a job, not a different agent (ENG-1694's definition of
+            # `harness` as agent identity). Without this the probe's traces
+            # reached Langfuse with a surface and an EMPTY harness, the only
+            # anton-originated traffic that did, and read as direct-API
+            # callers in every harness filter (ENG-1941). Probe calls stay
+            # separable from user turns via the `connector-probe` trace tag
+            # passed to turn_stream below.
+            harness=PROBE_HARNESS,
+            # WHERE the user was. This runs a real turn (see turn_stream
+            # below), so it needs the same surface attribution as a UI turn —
+            # the connector path is explicitly one of the things ENG-1459
+            # wants compared between web and desktop.
             **surface_kwarg(ChatSessionConfig),
             system_prompt_context=SystemPromptContext(
                 runtime_context="",
@@ -472,7 +509,15 @@ class CredentialProbe:
 
         try:
             async def _drive():
-                async for event in probe_session.turn_stream(prompt):
+                # Tagged so probe traces can be told apart from user turns in
+                # Langfuse now that both report harness="anton" (ENG-1941). A
+                # tag, not a distinct harness value: the harness vocabulary is
+                # agent identity, and a fourth value would be one the
+                # dashboards and turns.py don't know. See PROBE_TRACE_TAG for
+                # why this does not cover PostHog.
+                async for event in probe_session.turn_stream(
+                    prompt, trace_tags=[PROBE_TRACE_TAG]
+                ):
                     while self._pending:
                         yield self._pending.pop(0)
 

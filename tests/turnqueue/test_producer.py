@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
 
 
@@ -153,6 +154,93 @@ async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_mint(**kw):
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+
+    async def fake_list_active_connections(**kw):
+        assert kw["org_id"] == "o1" and kw["user_id"] == "u1"
+        return [{"engine": "google_drive", "name": "work"}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    # Reuses the same turn key minted for the llm block — never a second mint.
+    # No base_url (ENG-2128): anton's TurnKeyDataVault only ever resolves the
+    # auth host from its own ANTON_CLOUD_AUTH_BASE_URL env var, so a wire
+    # value here was dead — see _mint_oauth_block.
+    assert params["oauth"] == {
+        "turn_key": "mdb_turnkey",
+        "connections": [{"engine": "google_drive", "name": "work"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_mint(**kw):
+        return "mdb_turnkey"
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "oauth" not in params
+
+
+@pytest.mark.asyncio
+async def test_llm_mint_and_oauth_connections_fetch_run_concurrently(monkeypatch):
+    """Both are independent network round trips (turn-key mint, active-
+    connections list) — sequencing them costs an extra full round trip on
+    every turn's hot path. Wired so a regression to sequential execution
+    deadlocks (caught via wait_for) rather than silently passing: the llm
+    mint can't return until the oauth fetch has already started."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    oauth_started = asyncio.Event()
+
+    async def slow_mint(**kw):
+        await oauth_started.wait()
+        return "mdb_turnkey"
+
+    async def tracking_list_active_connections(**kw):
+        oauth_started.set()
+        return []
+
+    monkeypatch.setattr(prod, "mint_turn_key", slow_mint)
+    monkeypatch.setattr(prod, "list_active_connections", tracking_list_active_connections)
+
+    try:
+        await asyncio.wait_for(_drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        )), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("deadlocked: the oauth connections fetch never started before the llm mint awaited it")
+
+
+@pytest.mark.asyncio
 async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
@@ -283,7 +371,9 @@ async def test_unresponsive_worker_fails_the_turn_instead_of_spinning(monkeypatc
     # and the caller persists a failure so a reload shows the error card.
     kind, data = items[-1]
     assert kind == "turn_failed"
-    assert data["code"] == "anton_error"
+    # Its own code, not the generic one (ENG-2126): nothing ran, so the card
+    # has to say the turn never started rather than blame the agent.
+    assert data["code"] == te.WORKER_UNRESPONSIVE_CODE
     assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
 
 

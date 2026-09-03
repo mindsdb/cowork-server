@@ -36,6 +36,19 @@ IMAGE_FORMAT_USER_MESSAGE = (
 # Wire-level code for the unsupported-image case.
 IMAGE_FORMAT_CODE = "image_format"
 
+# ENG-1992: distinct from IMAGE_FORMAT_CODE on purpose. That copy tells the
+# user to re-upload as PNG/JPEG — correct for an actually-malformed image
+# file, wrong here: the failure is an internal serialization mismatch, not
+# anything wrong with the image itself, and by the time this code reaches
+# the client the conversation has ALREADY been repaired server-side. Telling
+# the user to re-upload would be both inaccurate and unnecessary.
+CONTENT_RECOVERY_CODE = "content_recovery"
+CONTENT_RECOVERY_USER_MESSAGE = (
+    "An image earlier in this conversation couldn't be sent to the model "
+    "due to an internal formatting issue. I've fixed it automatically — "
+    "you can keep going."
+)
+
 # Curated copy for the out-of-credits case. In the wallet billing model this
 # fires when either the org's wallet is empty (gateway 402 `wallet_empty`) or
 # the free monthly included-token allowance is spent (gateway 429
@@ -158,6 +171,24 @@ AUTH_ERROR_USER_MESSAGE = (
 # "Reconnect" action (re-provision the key in place) instead of "Subscribe".
 AUTH_ERROR_CODE = "provider_auth"
 
+# Canonical Anton exception name after its remote scrubber converts an
+# exception to ``"TypeName: message"``. Remote errors no longer carry Python
+# type identity, so an exact name is the only typed discriminator left.
+PROVIDER_AUTH_ERROR_TYPE_NAME = "ProviderAuthError"
+
+# Anton's pre-typed 401 copy, still emitted by the remote worker pods. Those run
+# the `minds-anton-scratchpad` image, whose anton is pinned in
+# scratchpad-controller (`values-staging.yaml`, `values-prod.yaml`) and bumped
+# independently of this server's vendored dep — `turnqueue/producer.py` says so
+# and relies on it to let the repos deploy in any order. Until both pins carry
+# anton's ProviderAuthError, dropping this prefix would silently downgrade every
+# hosted 401 to the generic code and take the Reconnect card with it.
+#
+# Safe here in a way the in-process `is_auth_error` is not: `remote_turn_error`
+# only ever reads anton's own `_scrub` output, never an arbitrary tool
+# exception, and the match is anchored to the start of the message.
+LEGACY_AUTH_ERROR_MESSAGE_PREFIX = "invalid api key"
+
 # Wire-level codes for the model-403 case — the gateway rejected the requested
 # MODEL (the credential itself is fine). Only older pre-wallet gateway/anton
 # versions emit these: access_denied meant a plan/tier exclusion and disabled an
@@ -263,6 +294,25 @@ LIVE_POD_TERMINAL_BEFORE_RUNNING_USER_MESSAGE = (
     "This task's sandbox failed to start. Please try again."
 )
 
+# The exception-shaped type name the remote producer sends when no reply
+# arrives for a turn. `cowork.turnqueue.producer.UNRESPONSIVE_WORKER_ERROR` is
+# built from this constant, so the string it puts on the reply stream and the
+# branch below cannot drift apart.
+WORKER_UNRESPONSIVE_TYPE_NAME = "TurnWorkerUnresponsive"
+
+# Wire-level code for "the worker never answered". Distinct from
+# GENERIC_TURN_ERROR_CODE on purpose: this one means the turn never ran, which
+# is an infrastructure fault, while anton_error means anton ran and raised
+# something we don't recognise. They were indistinguishable until 2026-08-31,
+# when every scratchpad pod failed to start and the resulting outage read as an
+# agent bug for four hours.
+WORKER_UNRESPONSIVE_CODE = "worker_unresponsive"
+
+WORKER_UNRESPONSIVE_MESSAGE = (
+    "The agent didn't start, so this turn never ran. That's a fault on our "
+    "side rather than a problem with your request. Try again in a moment."
+)
+
 
 def is_image_format_error(exc: Exception) -> bool:
     """Detect the Anthropic 400 raised when an image reaches the model as
@@ -281,6 +331,38 @@ def is_image_format_error(exc: Exception) -> bool:
         return True
     # Other phrasings of "this image content block was rejected".
     return "image" in s and ("unsupported image" in s or "could not process image" in s)
+
+
+def is_content_validation_error(exc: Exception) -> bool:
+    """Detect a permanent, content-SHAPED provider rejection — a content block
+    in conversation history reached the model in a shape it doesn't parse
+    (ENG-1992), not a provider-availability issue. Retrying the identical
+    request fails identically every time, since the same translation runs
+    fresh from stored history on every call — the request never changes
+    between attempts.
+
+    A strict superset of the older, narrower `is_image_format_error`: this
+    recognizes BOTH known dialects (OpenAI Responses' "Invalid value: 'x'.
+    Supported values are: ..." and Anthropic's "Input tag 'x' found using
+    'type' does not match any of the expected tags"), and the caller that
+    detects this repairs the conversation's stored history (unlike
+    `is_image_format_error`, whose own docstring says it can't).
+    """
+    try:
+        from anton.core.llm.provider import ContentValidationError
+
+        if isinstance(exc, ContentValidationError):
+            return True
+    except Exception:
+        # anton not importable / the type moved — fall back to the stable
+        # provider-message phrasings below.
+        pass
+    s = str(exc).lower()
+    if "supported values are" in s:
+        return True
+    if "does not match any of the expected tags" in s:
+        return True
+    return False
 
 
 def is_token_limit_error(exc: Exception) -> bool:
@@ -363,19 +445,29 @@ def provider_overloaded_info(exc: Exception) -> tuple[str, str] | None:
 
 
 def is_auth_error(exc: Exception) -> bool:
-    """Detect an **LLM-provider** auth failure — a 401 from the model gateway
-    because the credential it sees is invalid (revoked / rotated / never
-    provisioned / wrong org).
+    """Whether ``exc`` is Anton's canonical LLM-provider auth failure.
 
-    Matched narrowly on anton's specific 401 copy — both providers raise a
-    ``ConnectionError`` whose message starts ``Invalid API key — …``
-    (``openai.py`` / ``anthropic.py``). Deliberately does NOT match a bare
-    "401"/"unauthorized" anywhere in the text: that would mislabel an unrelated
-    failure (e.g. a connector/tool API 401 that bubbles up) as a provider-auth
-    error and pop the wrong "Reconnect" card. Credit/quota exhaustion (402/429)
-    is handled by ``is_token_limit_error`` (checked first).
+    Provider and tool errors can contain arbitrary 401 or invalid-key text. Only
+    Anton's typed exception proves the failed credential belongs to the active
+    LLM provider and may select the reconnect/update-key card.
+
+    Imported lazily like every other anton type in this module
+    (``ContentValidationError``, ``TokenLimitExceeded``, ``ModelUnavailableError``,
+    ``ProviderOverloadedError``). A module-scope import would turn an anton
+    without this symbol — staging and main today, and the ``branch = "main"``
+    pin this repo's pyproject documents — into a failed app import rather than
+    one missing error card.
     """
-    return "invalid api key" in str(exc).lower()
+    try:
+        from anton.core.llm.provider import ProviderAuthError
+
+        return isinstance(exc, ProviderAuthError)
+    except Exception:
+        # A version-skewed anton predates the typed error, so its 401 still
+        # arrives as the bare ConnectionError copy the pods emit.
+        return isinstance(exc, ConnectionError) and str(exc).lower().startswith(
+            LEGACY_AUTH_ERROR_MESSAGE_PREFIX
+        )
 
 
 def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
@@ -867,6 +959,13 @@ def friendly_turn_error(
     overloaded = provider_overloaded_info(exc)
     if overloaded is not None:
         return overloaded[0], str(exc) or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
+    # Checked before is_image_format_error: a content-SHAPE mismatch (this
+    # detector) and a genuinely corrupt/unsupported image FILE (that one)
+    # are different failures with different correct copy — this one has
+    # already been auto-repaired server-side, that one needs the user to
+    # re-upload. The two detectors' phrasings don't overlap.
+    if is_content_validation_error(exc):
+        return CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
     if is_image_format_error(exc):
         return IMAGE_FORMAT_CODE, IMAGE_FORMAT_USER_MESSAGE
     return None
@@ -900,6 +999,11 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return GENERIC_TURN_ERROR_CODE, LIVE_POD_TERMINAL_BEFORE_RUNNING_USER_MESSAGE
     type_name, _, message = text.partition(":")
     message = message.strip()
+    if type_name == WORKER_UNRESPONSIVE_TYPE_NAME:
+        # Not a model or provider failure: nothing ran. The producer synthesises
+        # this when the reply stream stays silent past its idle bound, so the
+        # remedy is to look at the worker, not at the turn's content.
+        return WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
     if type_name == "TokenLimitExceeded":
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if type_name == "ProviderOverloadedError":
@@ -923,17 +1027,27 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         # turn still shows the UNNAMED copy. Naming it needs anton to carry the
         # code+model through _scrub's wire format (tracked separately).
         return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
-    if type_name == "ConnectionError" and "api key" in message.lower():
+    if type_name == PROVIDER_AUTH_ERROR_TYPE_NAME or (
+        type_name == "ConnectionError"
+        and message.lower().startswith(LEGACY_AUTH_ERROR_MESSAGE_PREFIX)
+    ):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
-    # TurnInterrupted (the pod's own no-terminal-event fallback),
-    # TurnWorkerUnresponsive (producer.py's idle-timeout synthesis), and
+    if type_name == "ContentValidationError":
+        # ENG-1992: the repair itself (stripping the offending image blocks
+        # from stored history) is triggered by the caller, keyed on this
+        # same code — see producer.py. The curated message anton constructs
+        # is already safe to show verbatim, but the code is what the client
+        # keys its (different, "already fixed") copy on, so return the
+        # stable curated constant rather than passing `message` through.
+        return CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
+    # TurnInterrupted (the pod's own no-terminal-event fallback) and
     # TurnWorkerLost (scratchpad-controller's pel_reclaim.py, a fixed
-    # constant with no interpolation) are all our own authored strings,
+    # constant with no interpolation) are both our own authored strings,
     # never provider/attacker text — safe to pass through. Same generic code
-    # as any other unmapped failure (no card exists for any of them), but
-    # the curated sentence survives instead of being discarded for the fully
+    # as any other unmapped failure (no card exists for either), but the
+    # curated sentence survives instead of being discarded for the fully
     # generic message just because it lacked a dedicated mapping.
-    if type_name in ("TurnInterrupted", "TurnWorkerUnresponsive", "TurnWorkerLost"):
+    if type_name in ("TurnInterrupted", "TurnWorkerLost"):
         return GENERIC_TURN_ERROR_CODE, message or GENERIC_TURN_ERROR_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 

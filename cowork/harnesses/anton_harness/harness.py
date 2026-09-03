@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from cowork.build_info import surface_kwarg
+from cowork.build_info import supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
@@ -118,9 +118,8 @@ def _apply_model_override(anton_settings, model: str | None) -> list[str]:
     return applied
 
 
-def _apply_workspace_env_if_safe(workspace) -> bool:
-    """Load `<project>/.anton/.env` into this process's environment, unless
-    org mode. Returns whether it applied.
+def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
+    """Read `<project>/.anton/.env`, unless org mode. Returns {} in org mode.
 
     `workspace` is an `anton.workspace.Workspace`; left unannotated since that
     type is only ever imported locally in `_build_chat_session`, not at
@@ -129,16 +128,43 @@ def _apply_workspace_env_if_safe(workspace) -> bool:
     Extracted from `_build_chat_session` so the guard is testable without
     constructing a full ChatSession.
 
-    `Workspace.apply_env_to_process` (anton's workspace.py) loads every key
-    from that file that isn't already set into THIS PROCESS's os.environ,
-    not a child process's, cowork-server's own, for the rest of its life. In
-    org mode that .env lives on shared EFS and any org's agent can write it;
-    a PYTHONPATH or LD_PRELOAD entry there would turn the next subprocess
-    this pod spawns into arbitrary code execution, and the mutation outlives
-    this turn, reaching every later request from every tenant this pod
-    serves.
+    Does NOT call `Workspace.apply_env_to_process()` — that would load every
+    key from the file into THIS PROCESS's os.environ, not a child process's,
+    cowork-server's own, for the rest of its life, which two turns on
+    different projects can race on. `Workspace.load_env()` reads the file
+    without touching os.environ; the returned dict is threaded to the
+    scratchpad subprocess instead (see `ChatSessionConfig.workspace_env_
+    overlay`). The org-mode guard stays even though `_build_chat_session`
+    itself is already unreachable in org mode (`stream_response`'s own
+    check) — this is defense in depth, not the only line of defense.
+
+    Every failure here degrades to `{}`: this runs on the first line of every
+    in-process turn, so it must never be able to raise one.
     """
     if get_app_settings().tenancy_mode == "org":
+        return {}
+    # This server pins anton to a moving rev, so degrade rather than raise:
+    # an absent overlay costs the project's .env, raising costs every turn.
+    loader = getattr(workspace, "load_env", None)
+    if loader is None:
+        logger.warning("installed anton has no Workspace.load_env; no project .env overlay")
+        return {}
+    try:
+        return loader() or {}
+    except Exception:
+        logger.warning("could not read the project .env; continuing without it", exc_info=True)
+        return {}
+
+
+def _apply_overlay_fallback(workspace, overlay: dict[str, str], overlay_kwargs: dict) -> bool:
+    """Load the project .env the old way when the pinned anton cannot carry it.
+
+    Returns whether it applied. Extracted so the fallback is testable without
+    constructing a full ChatSession, like the org-mode guard above. Gated on a
+    non-empty overlay, which org mode never produces, so the untrusted shared
+    .env is not reachable from here.
+    """
+    if not (overlay and not overlay_kwargs):
         return False
     workspace.apply_env_to_process()
     return True
@@ -406,6 +432,10 @@ class AntonHarness:
         # Per-conversation model pick (the composer's dropdown) — overrides
         # planning/coding/router for this call only; see _build_chat_session.
         model: str | None = None,
+        # Per-task reasoning-effort pick (the composer's Effort sub-picker) —
+        # overrides planning/coding effort for this call only; see
+        # _build_chat_session and providers.build_llm_client's effort_override.
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Observability pass-through (see ResponsesRequest / HarnessProvider):
         # forwarded to Anton's per-turn TraceContext so they land on the
@@ -423,23 +453,27 @@ class AntonHarness:
             # code execution this whole EFS-hardening task exists to keep out
             # of cowork-server. The remote-turn producer normally routes
             # streaming requests to the worker over Redis (see
-            # handlers/responses.py's _select_producer), but three callers
+            # handlers/responses.py's _select_producer), but two callers
             # reach this method directly, bypassing that gate entirely: the
             # legacy non-streaming branch in handlers/responses.py.handle
             # (ResponsesRequest.stream defaults to False, and any client can
-            # leave it unset), _produce/_run_turn's in-process fallback
-            # whenever COWORK_TURN_BACKEND isn't "remote", and the
-            # channel-ingress runtime (cowork/channels/runtime.py). This
-            # refusal is the single point that closes all three.
+            # leave it unset), and _produce/_run_turn's in-process fallback
+            # whenever COWORK_TURN_BACKEND isn't "remote". The channel-ingress
+            # runtime (cowork/channels/runtime.py) now routes through the
+            # remote gate itself, so this refusal is just a safety net there.
             raise RuntimeError(
                 "Turns must run on the remote worker in this deployment; "
                 "in-process execution is disabled."
             )
         temp_vault_dir: Path | None = None
-        # Attribute + surface any artifact created during this turn. Anton runs
-        # with its own session id and doesn't tag artifacts with the cowork
-        # conversation_id, so we diff the project's artifacts dir around the run
-        # (see services.task_objects.finalize_turn_artifacts).
+        # Attribute + surface any artifact this turn created or edited. Anton's
+        # artifact tools record what they touch as they run
+        # (ChatSession.artifacts_touched), and that set — not a bare diff of the
+        # artifacts dir — is what bounds the turn's cards: every conversation in
+        # a project shares one artifacts directory, so a concurrent sibling
+        # turn's brand-new artifact would otherwise land in this turn's diff and
+        # be carded onto the wrong conversation (ENG-1933). The dir snapshot is
+        # still taken, to tell CREATED from EDITED within that set.
         from cowork.services.task_objects import (
             finalize_turn_skill_drafts,
             index_turn_artifacts,
@@ -479,6 +513,7 @@ class AntonHarness:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
             )
@@ -541,6 +576,15 @@ class AntonHarness:
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 conversation, conv_id, conv_project_id, artifacts_base,
                 before_slugs, before_mtimes,
+                # Anton reports both: `create_artifact` and `open_artifact`
+                # (the only way to get a path to write into) both record, so
+                # the same set bounds created AND edited. Read defensively —
+                # on an early failure `session` is None, and an anton build
+                # predating the field has no `artifacts_touched`; both degrade
+                # to the pre-existing diff-only behaviour rather than dropping
+                # the turn's cards entirely.
+                tracked_new=getattr(session, "artifacts_touched", None),
+                tracked_edits=getattr(session, "artifacts_touched", None),
             )
             skill_drafts = finalize_turn_skill_drafts(
                 project_path, before_drafts, before_strays,
@@ -581,10 +625,25 @@ class AntonHarness:
         output — most visible on short turns like "hi"/"who are you?" with
         little else to anchor generation.
 
+        Also scrubs plain-text content before replay: anton only scrubs a
+        user turn's OWN input as it arrives, not history read back from
+        storage, so a credential typed in an earlier turn would otherwise
+        reappear unmasked here on every later turn (ENG-1849). Vault
+        secrets for the whole conversation are already registered by the
+        time this runs (`restore_namespaced_env` above, in
+        `_build_chat_session`), so this catches anything vaulted since the
+        message was first persisted, not just what was known at persist
+        time. List-shaped content (tool_use/tool_result blocks) is left
+        alone — that's already scrubbed at generation time.
+
         Extracted (not an inline closure) so this can be unit-tested
         directly against fake messages, same reasoning as _seed_history.
         """
+        from anton.utils.datasources import scrub_credentials
+
         om = m.to_openai_message().model_dump()
+        if isinstance(om.get("content"), str) and om["content"]:
+            om["content"] = scrub_credentials(om["content"])
         ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
@@ -616,7 +675,9 @@ class AntonHarness:
 
         tail = [stamp(m) for m in ordered_messages[tail_start:]]
         if history_summary:
-            summary_msg = {"role": "user", "content": history_summary}
+            from anton.utils.datasources import scrub_credentials
+
+            summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
                 # Same fix anton's own _summarize_history applies: two
                 # consecutive user messages break/degrade most providers.
@@ -698,6 +759,7 @@ class AntonHarness:
         self,
         conversation: Conversation,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
     ):
@@ -794,7 +856,12 @@ class AntonHarness:
 
         workspace = Workspace(base)
         workspace.initialize()
-        _apply_workspace_env_if_safe(workspace)
+        workspace_env_overlay = _load_workspace_env_if_safe(workspace)
+
+        overlay_kwargs = supported_kwargs(
+            ChatSessionConfig, workspace_env_overlay=workspace_env_overlay
+        )
+        _apply_overlay_fallback(workspace, workspace_env_overlay, overlay_kwargs)
 
         anton_dir = base / ".anton"
 
@@ -816,7 +883,7 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client()
+        llm_client = self._build_llm_client(effort=reasoning_effort)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -914,13 +981,8 @@ class AntonHarness:
                 data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
             else:
                 data_vault = source_vault
-            # restore_namespaced_env (instead of a bare inject_env loop) also
-            # registers each connection's DS_* var names for credential
-            # scrubbing — without it, scrub_credentials treats every field as
-            # unknown and redacts non-secret values like base_url into
-            # [DS_*] markers in user-facing output (ENG-688). It also clears
-            # stale DS_* vars a previous turn injected for now-disabled
-            # connections.
+            # Registers this turn's DS_* names and values for scrubbing, and
+            # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
 
             restore_namespaced_env(data_vault)
@@ -934,19 +996,15 @@ class AntonHarness:
         # cowork/services/connectors/connections.py). A plain
         # files.list()/files.search() call does NOT return the latter, so
         # without calling them out by name here the agent has no way to
-        # know they're reachable at all — inject_env() below only puts the
-        # raw JSON in an env var, which isn't enough on its own for the
-        # agent to notice or act on.
+        # know they're reachable at all — the scratchpad's env carries only the
+        # raw JSON, which isn't enough for the agent to notice or act on.
         #
         # Parsing `_picked_files` and applying the project-scoping rule is
         # connector logic, not agent logic, so it lives in
-        # ConnectionsService.picked_files_by_project(); this loop only
-        # injects env vars and turns the result into agent-facing prompt text.
+        # ConnectionsService.picked_files_by_project().
         integration_guidance = ""
         picked_by_connection: dict[str, list[dict]] = {}
         if data_vault is not None:
-            for conn in data_vault.list_connections():
-                data_vault.inject_env(conn["engine"], conn["name"])
             picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
 
             if picked_by_connection:
@@ -1046,6 +1104,7 @@ class AntonHarness:
             ),
             workspace=workspace,
             data_vault=data_vault,
+            **overlay_kwargs,
             initial_history=initial_history,
             # history_store=history_store,
             session_id=str(conversation.id),
@@ -1086,6 +1145,6 @@ class AntonHarness:
         return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(effort: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
+        return build_llm_client(effort_override=effort)

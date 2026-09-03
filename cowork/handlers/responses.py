@@ -32,6 +32,8 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming.backend import get_backend
+from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.schemas.responses import (
     Content,
@@ -46,6 +48,7 @@ from cowork.schemas.responses import (
 from cowork.handlers._turn_history import sanitize_turn_history_rows
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
+    CONTENT_RECOVERY_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
@@ -176,6 +179,37 @@ async def _seal_unterminated_buffer(
         logger.exception("[responses] could not seal unterminated turn buffer")
 
 
+def _auth_failure_provider(settings, role: str | None) -> Provider | None:
+    """Whose credential the failing call was using, or None if unattributable.
+
+    Anton's `LLMClient` stamps the role on every confirmed refusal that leaves
+    it, so the three named roles cover normal operation. An unstamped auth error
+    can still arrive from a version-skewed anton, whose 401 is an untyped
+    `ConnectionError` that `turn_errors.is_auth_error` still recognizes. Guessing
+    "planning" there would name the wrong provider and offer the wrong remedy in
+    a mixed configuration — a MindsHub "Reconnect" card for a failing BYOK
+    Anthropic key, or the reverse.
+
+    When the required roles resolve to the same provider there is nothing to get
+    wrong, so answer. When they disagree, decline and let the caller fall back to
+    the generic auth copy.
+    """
+    if role == "coding":
+        return settings.resolved_coding_provider
+    if role == "router":
+        # Defensive, and not reachable today: every router call site swallows a
+        # confirmed refusal rather than propagating it — `summarize()` at
+        # anton/core/session.py:2366, `gate()` inside `_gate_turn` at
+        # anton/core/session.py:3515, and `_route_decision` below. The turn
+        # falls back to planning instead, which `tests/test_thalamus.py` pins in
+        # anton. Kept so a future propagating router path attributes the card to
+        # the provider that actually failed rather than defaulting to planning.
+        return settings.resolved_router_provider
+    if role == "planning":
+        return settings.resolved_planning_provider
+    planning = settings.resolved_planning_provider
+    return planning if planning == settings.resolved_coding_provider else None
+
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
@@ -239,6 +273,7 @@ class ResponsesHandler:
                         conversation_id=conv_id,
                         harness=self.harness_name,
                         model=request.model,
+                        reasoning_effort=request.reasoning_effort,
                     )
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
@@ -250,6 +285,7 @@ class ResponsesHandler:
                     project_id=self._resolve_project_id(request),
                     harness=self.harness_name,
                     model=request.model,
+                    reasoning_effort=request.reasoning_effort,
                 )
                 self._relink_attachments(request.conversation, conversation)
         else:
@@ -258,6 +294,7 @@ class ResponsesHandler:
                 project_id=self._resolve_project_id(request),
                 harness=self.harness_name,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
             )
 
         self.last_conversation_id = str(conversation.id)
@@ -280,7 +317,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=bool(disabled),
-            model=request.model,
+            trace_metadata=trace_metadata,
         )
         trace_metadata = {
             **trace_metadata,
@@ -332,6 +369,7 @@ class ResponsesHandler:
                 harness_input=harness_input,
                 original_content=original_content,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
                 disabled=disabled,
                 harness_name=self.harness_name,
                 harness_id=getattr(harness, "id", None),
@@ -381,6 +419,7 @@ class ResponsesHandler:
                 conversation=conversation,
                 input=harness_input,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
                 disabled_connections=disabled,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
@@ -394,9 +433,13 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
-        model: str | None = None,
+        trace_metadata: dict[str, str] | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        The composer's per-conversation model pick (`request.model`) is
+        deliberately not passed down: it drives Anton's turn, not the gate
+        (see `UserSettings.resolved_gate_model`).
 
         Returns the decision plus pre-minted turn credentials
         (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
@@ -416,17 +459,37 @@ class ResponsesHandler:
                 if message.role in {"user", "assistant"}
             ]
             history.append({"role": "user", "content": self._prompt_text(harness_input)})
-            # The gate resolves the router role + key ambiently; bind the org scope.
-            with use_settings_scope(self.scope):
-                binding, turn_llm = await self._router_binding()
-                decision = await decide_route(
-                    history=history,
-                    has_non_text_input=has_non_text_input,
-                    has_attachments=has_attachments,
-                    has_disabled_connections=has_disabled_connections,
-                    binding=binding,
-                    model_override=model,
-                )
+            # The gate's LLM call is the only one a direct turn makes, and it
+            # is made outside any ChatSession — so without a trace context it
+            # reaches MindsHub anonymous, and a direct turn leaves no trace to
+            # count (ENG-1851 Done-when #1). Installing one attributes the call
+            # to the conversation and stamps the build (ENG-1279), which is what
+            # makes the direct/delegated share answerable from traces.
+            from anton.core.llm.tracing import (
+                TraceContext,
+                reset_trace_context,
+                set_trace_context,
+            )
+
+            trace_token = set_trace_context(TraceContext(
+                session_id=str(conversation_id),
+                harness=self.harness_name,
+                tags=("cowork-gate",),
+                metadata=dict(trace_metadata or {}),
+            ))
+            try:
+                # The gate resolves the router role + key ambiently; bind the org scope.
+                with use_settings_scope(self.scope):
+                    binding, turn_llm = await self._router_binding()
+                    decision = await decide_route(
+                        history=history,
+                        has_non_text_input=has_non_text_input,
+                        has_attachments=has_attachments,
+                        has_disabled_connections=has_disabled_connections,
+                        binding=binding,
+                    )
+            finally:
+                reset_trace_context(trace_token)
             return decision, turn_llm
         except Exception:
             # Any gate-path failure (history query, mint, settings) fails open.
@@ -439,7 +502,7 @@ class ResponsesHandler:
         """Hosted orgs keep no stored Minds key (remote turns mint one), so the
         gate mints its own per-turn key here and hands it back for the
         delegated turn to reuse. Everywhere else the stored settings apply."""
-        if TurnQueueSettings().backend != "remote":
+        if not TurnQueueSettings().is_remote:
             return None, None
         settings = get_user_settings(self.scope)
         if (settings.resolved_router_provider is not Provider.MINDS_CLOUD
@@ -462,7 +525,7 @@ class ResponsesHandler:
         )
         binding = RouterBinding(
             provider=provider,
-            model=settings.resolved_router_model or MINDS_FREE_MODEL,
+            model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
         return binding, {"correlation_id": corr, "llm": block}
@@ -478,28 +541,29 @@ class ResponsesHandler:
     ) -> AsyncGenerator[str, None] | Response:
         """Return the router model's direct answer without initializing Anton."""
         if not request.stream:
+            text = route.text
             user_message = ConversationService(self.scoped).save_user_message(
                 conversation_id, original_content,
             )
             events = [{
                 "type": "response.output_text.delta",
-                "delta": route.text,
+                "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }, {"type": "response.completed"}]
             ConversationService(self.scoped).save_assistant_turn(
-                conversation_id, route.text, events, harness="cowork-direct",
+                conversation_id, text, events, harness="cowork-direct",
             )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(str(user_message.id), route.text)],
+                output=[self._build_output(str(user_message.id), text)],
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
         buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
-        await registry.start(
+        handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
             buffer=buffer,
@@ -514,6 +578,19 @@ class ResponsesHandler:
             ),
             lifecycle=lifecycle,
         )
+        # A direct answer still uses the shared Redis buffer in a multi-replica
+        # deployment. Register it just like a delegated turn so another replica
+        # can locate and replay that buffer. Do this only when start accepted our
+        # buffer: a duplicate send returns the existing handle and must not
+        # overwrite its index entry with the discarded turn.
+        if get_backend() == "redis" and handle.buffer is buffer:
+            await record_turn(
+                str(conversation_id),
+                turn_id=turn_id,
+                correlation_id=f"direct-{uuid4()}",
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+            )
         return sse_from_buffer(buffer, 0)
 
     async def _produce_direct(
@@ -527,9 +604,10 @@ class ResponsesHandler:
     ) -> None:
         """Persist and emit a direct answer using the normal detached lifecycle.
 
-        The full answer exists up front, so persistence happens before any
-        frame is emitted — the client can never see a completed turn the DB
-        does not have, and no pending row is needed."""
+        The full answer exists up front — the gate does not return until its
+        stream ends — so persistence happens before any frame is emitted: the
+        client can never see a completed turn the DB does not have, and no
+        pending row is needed."""
         producer_session = None
         try:
             producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
@@ -593,6 +671,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         original_content,
         model: str,
+        reasoning_effort: str | None = None,
         disabled: list[dict] | None,
         harness_name: str,
         harness_id: str | None,
@@ -616,7 +695,7 @@ class ResponsesHandler:
         read.
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-        if TurnQueueSettings().backend == "remote":
+        if TurnQueueSettings().is_remote:
             return self._produce_remote(
                 lifecycle=lifecycle,
                 conv_id=conv_id,
@@ -627,6 +706,7 @@ class ResponsesHandler:
                 buffer=buffer,
                 turn_id=turn_id,
                 turn_llm=turn_llm,
+                disabled=disabled,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -634,6 +714,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             original_content=original_content,
             model=model,
+            reasoning_effort=reasoning_effort,
             disabled=disabled,
             harness_name=harness_name,
             harness_id=harness_id,
@@ -780,6 +861,7 @@ class ResponsesHandler:
         turn_id: int = 0,
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
+        disabled: list[dict] | None = None,
     ) -> None:
         """Remote-backend counterpart of _produce: pipe the turn's replies
         through the same SSE formatter as the in-process path (full step /
@@ -865,6 +947,7 @@ class ResponsesHandler:
                     **self._remote_workspace(producer_session, conv_id),
                     correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
+                    disabled=disabled,
                 ):
                     if kind == "turn_delta":
                         yield StreamTextDelta(text=data.get("text", ""))
@@ -998,6 +1081,23 @@ class ResponsesHandler:
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
             collected_events.append(response_failed_payload(message, code, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
+            if code == CONTENT_RECOVERY_CODE:
+                # ENG-1992: the remote/org path's twin of the streaming
+                # handler's repair — producer.py already classified this via
+                # remote_turn_error from the pod's scrubbed error string, so
+                # `code` alone is enough to act on here.
+                try:
+                    repaired = ConversationService(producer_session).repair_image_content(conv_id)
+                    logger.warning(
+                        "[responses] content validation error on remote conversation %s — "
+                        "repaired %d message(s) with image content: %s",
+                        conv_id, len(repaired), failure.get("error"),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to repair conversation %s after remote content validation error",
+                        conv_id,
+                    )
             persist()
             await buffer.close("error")
         except asyncio.CancelledError:
@@ -1036,6 +1136,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         original_content,
         model: str,
+        reasoning_effort: str | None = None,
         disabled: list[dict] | None,
         harness_name: str,
         harness_id: str | None,
@@ -1114,7 +1215,8 @@ class ResponsesHandler:
             ).id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=conv, input=harness_input, model=model, disabled_connections=disabled,
+                conversation=conv, input=harness_input, model=model,
+                reasoning_effort=reasoning_effort, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
             event_count = 0
@@ -1157,6 +1259,24 @@ class ResponsesHandler:
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
                 logger.exception("[responses] turn failed for conversation %s", conv_id)
+            if code == CONTENT_RECOVERY_CODE:
+                # ENG-1992: the provider permanently rejected an image block in
+                # this conversation's stored history — repair the DATA once,
+                # here, rather than special-case every future replay. Never
+                # lets a repair failure mask the turn's real outcome; the
+                # user-facing message above already went out either way.
+                try:
+                    repaired = ConversationService(producer_session).repair_image_content(conv_id)
+                    logger.warning(
+                        "[responses] content validation error on conversation %s — "
+                        "repaired %d message(s) with image content: %s",
+                        conv_id, len(repaired), exc,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to repair conversation %s after content validation error",
+                        conv_id,
+                    )
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
             # re-provision the key in place), "Open Settings" for a BYOK key the
@@ -1168,11 +1288,16 @@ class ResponsesHandler:
                 # if it raises we just fall back to the generic auth message
                 # (no reconnectable flag), so the stream still closes cleanly.
                 try:
-                    from cowork.common.settings.user_settings import Provider
-                    provider = get_user_settings().resolved_planning_provider
-                    reconnectable = provider == Provider.MINDS_CLOUD
-                    message = auth_error_detail(provider.label, reconnectable)
-                    extra = {"reconnectable": reconnectable, "provider_label": provider.label}
+                    provider = _auth_failure_provider(
+                        get_user_settings(), getattr(exc, "role", None)
+                    )
+                    # An unattributable failure keeps the generic auth copy with
+                    # no provider fields, rather than naming a provider that may
+                    # not be the one that failed.
+                    if provider is not None:
+                        reconnectable = provider == Provider.MINDS_CLOUD
+                        message = auth_error_detail(provider.label, reconnectable)
+                        extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
                     logger.exception("[responses] could not resolve provider for auth error")
             elif code in MODEL_UNAVAILABLE_CODES:
@@ -1226,7 +1351,6 @@ class ResponsesHandler:
                 failed_model = overloaded_info[1] if overloaded_info else ""
                 extra = {"model": failed_model}
                 try:
-                    from cowork.common.settings.user_settings import Provider
                     s = get_user_settings()
                     # The nudge keys on WHICH provider overloaded. anton passes the
                     # actual failing model (planning OR coding); map it back to its
@@ -1305,8 +1429,24 @@ class ResponsesHandler:
             # leak. (cowork PR #156.)
             friendly = friendly_turn_error(exc)
             if friendly is not None:
-                _, message = friendly
+                code, message = friendly
                 logger.info("[responses] user-facing turn error: %s", exc)
+                if code == CONTENT_RECOVERY_CODE:
+                    # ENG-1992: see the streaming path's twin for the full
+                    # rationale — repair the conversation's stored history
+                    # once here rather than special-case every future replay.
+                    try:
+                        repaired = ConversationService(self.scoped).repair_image_content(conversation_id)
+                        logger.warning(
+                            "[responses] content validation error on conversation %s — "
+                            "repaired %d message(s) with image content: %s",
+                            conversation_id, len(repaired), exc,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[responses] failed to repair conversation %s after content validation error",
+                            conversation_id,
+                        )
                 raise HTTPException(status_code=400, detail=message)
             logger.exception("[responses] turn failed")
             raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)

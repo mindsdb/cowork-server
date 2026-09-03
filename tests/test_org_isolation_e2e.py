@@ -10,8 +10,13 @@ nonexistent identifier. Destructive probes must also leave the owning
 organisation's resource unchanged.
 
 This suite assumes the identity headers were supplied by a trusted gateway. It
-does not test gateway header spoofing, Kubernetes/S3 isolation, or user-private
-resources within the same organisation.
+does not test gateway header spoofing or Kubernetes/S3 isolation.
+
+The other axis, one member of an organisation against another member of the
+same one, lives beside it rather than here: tests/test_project_files_tenancy.py
+for the file and preview routes, tests/test_artifacts_api_tenancy.py and
+tests/test_artifact_roots.py for live artifacts, and the per-service
+tests/test_*_tenancy.py files for conversations, files, schedules and settings.
 """
 from __future__ import annotations
 
