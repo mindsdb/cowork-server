@@ -55,6 +55,7 @@ from cowork.handlers.turn_errors import (
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
+    REMOTE_CANCEL_ERRORS,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
@@ -133,7 +134,9 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
     return synthesized
 
 
-async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id) -> None:
+async def _seal_unterminated_buffer(
+    buffer, lifecycle: "TurnLifecycle", conv_id, *, request_id: str | None = None,
+) -> None:
     """Guarantee a terminal record so a producer that ended WITHOUT closing its
     buffer can't leave the client's tail (and its shared stream slot) hanging
     forever.
@@ -153,16 +156,23 @@ async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id)
     abstract on ``StreamBuffer`` but a minimal test double may lack it — treat an
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
+
+    ``request_id`` is the remote producer's own correlation id, passed by
+    ``_produce_remote`` only — this is the hardest-failing turn (one that
+    escaped every named ``except``), so it's exactly the one a user is most
+    likely to report; omitted (``None``) by the in-process/direct producers,
+    which have no such id to offer.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
     logger.error(
-        "[responses] turn for conversation %s ended without a terminal record; "
-        "sealing the buffer so the client releases its stream slot", conv_id,
+        "[responses] turn for conversation %s (correlation_id=%s) ended without a "
+        "terminal record; sealing the buffer so the client releases its stream slot",
+        conv_id, request_id,
     )
     try:
         await buffer.append("sse", {"sse": response_failed_sse(
-            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)})
     except Exception:
         logger.exception("[responses] could not emit terminal error frame while sealing")
     try:
@@ -871,6 +881,16 @@ class ResponsesHandler:
         persisted = False
         pending_message_id: UUID | None = None
         failure: dict = {}
+        # Resolved once, up front — not left for stream_remote_replies to mint
+        # internally on a None — so every failure branch below (classified or
+        # not) can attach the SAME id a support/log lookup would use. Each of
+        # those branches logs the id at WARNING or above, which is the floor
+        # the deployed environments run at; this INFO line is only the
+        # per-turn breadcrumb that ties a successful turn to its id in dev.
+        corr = (turn_llm or {}).get("correlation_id") or str(uuid4())
+        logger.info(
+            "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
+        )
 
         def event_sink(event_type: str, data: dict) -> None:
             # Same event log the in-process path records, so the client
@@ -925,7 +945,7 @@ class ResponsesHandler:
                     # Skills and memory are NOT sent: the pod reads them off the
                     # shared mount. Only the org-relative project path travels.
                     **self._remote_workspace(producer_session, conv_id),
-                    correlation_id=(turn_llm or {}).get("correlation_id"),
+                    correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
                 ):
@@ -964,6 +984,19 @@ class ResponsesHandler:
                         # try must still run on a clean finish.
                         break
                     elif kind == "turn_failed":
+                        if data.get("error") in REMOTE_CANCEL_ERRORS:
+                            # The controller's own cancel paths — a /cancel
+                            # that reached a replica which doesn't own the
+                            # producer sets the Redis flag only, so the
+                            # controller discards the pod and reports it as
+                            # a turn_failed carrying one of two literals
+                            # (see REMOTE_CANCEL_ERRORS; neither reaches
+                            # remote_turn_error, which would collapse them
+                            # to anton_error). Route them through the same
+                            # path a locally-aborted turn takes: partial
+                            # text persists, no response.failed frame, no
+                            # error bubble on reload.
+                            raise asyncio.CancelledError()
                         failure.update(data)
                         raise _RemoteTurnFailed()
             finally:
@@ -1046,8 +1079,16 @@ class ResponsesHandler:
         except _RemoteTurnFailed:
             message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
-            collected_events.append(response_failed_payload(message, code))
-            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            # At WARNING because that is the floor the deployed environments
+            # run at: the id below is what the client shows the user as a
+            # Reference, so a line carrying it has to survive prod's log level
+            # or support has nothing to search for.
+            logger.warning(
+                "[responses] remote turn reported a failure for conversation %s "
+                "correlation_id=%s code=%s", conv_id, corr, code,
+            )
+            collected_events.append(response_failed_payload(message, code, request_id=corr))
+            await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
             if code == CONTENT_RECOVERY_CODE:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
@@ -1076,15 +1117,18 @@ class ResponsesHandler:
             persist()
             await buffer.close("cancelled")
         except Exception:
-            logger.exception("[responses] remote turn failed for conversation %s", conv_id)
+            logger.exception(
+                "[responses] remote turn failed for conversation %s correlation_id=%s",
+                conv_id, corr,
+            )
             collected_events.append(response_failed_payload(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE))
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr)})
             persist()
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
             producer_session.close()
 
     async def _produce(self, **kwargs) -> None:

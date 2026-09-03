@@ -1333,6 +1333,120 @@ def test_remote_error_auth():
     assert code == AUTH_ERROR_CODE
 
 
+def test_remote_error_turn_interrupted_keeps_its_curated_copy():
+    # The pod's own no-terminal-event fallback (a pod torn down mid-turn).
+    # Same generic code as any unmapped failure — no dedicated card exists
+    # for this — but the curated sentence must survive instead of being
+    # discarded for the fully generic message.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "TurnInterrupted: The turn ended unexpectedly. Please try again.")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+
+
+def test_remote_error_turn_worker_lost_keeps_its_curated_copy():
+    # pel_reclaim.py's ORPHANED_ERROR — a worker died mid-turn and the entry
+    # was reclaimed from Redis's PEL rather than retried (retrying would bill
+    # the tenant's tokens twice). Already correctly shaped; just missing from
+    # the allowlist.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "TurnWorkerLost: the worker running this turn stopped before it "
+        "finished; the turn was not retried")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "the turn was not retried" in msg
+
+
+def test_remote_error_pod_stream_ended_without_terminal_gets_curated_copy():
+    # scratchpad-controller's own literal (main.py) — an OOM-killed pod or a
+    # dropped exec channel. No "TypeName:" prefix at all, so the generic
+    # type_name parse below would never match it; matched directly instead.
+    # The optional stderr tail must never reach the user verbatim.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error("pod stream ended without a terminal event")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+
+    code, msg = remote_turn_error(
+        "pod stream ended without a terminal event; stderr tail: Traceback ...")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+    assert "Traceback" not in msg
+
+
+def test_remote_error_turn_aborted_on_hard_timeout_gets_curated_copy():
+    # scratchpad-controller's with_limits() hard wall-clock deadline.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error("turn aborted: hard turn timeout")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "too long" in msg
+
+
+def test_remote_error_turn_aborted_on_stall_gets_curated_copy():
+    # scratchpad-controller's with_limits() no-output stall detector.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "turn aborted: no output within stall window; stderr tail: boom")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "stopped producing output" in msg
+    assert "boom" not in msg
+
+
+def test_remote_error_missing_organization_gets_curated_copy():
+    # scratchpad-controller's MissingOrganization (_scratchpad_id_for_job) —
+    # a job dispatched with no organization_id, so it can't be routed to an
+    # EFS access point. The message's own correlation_id prefix varies per
+    # job; matched on the static suffix, which never changes.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "job corr-123 has no organization_id; refusing to run a turn "
+        "without an organization-scoped workspace")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "workspace" in msg
+    assert "support" in msg
+    # The raw correlation_id in the source message must not leak — request_id
+    # already carries it, separately and reliably, on the payload.
+    assert "corr-123" not in msg
+
+
+@pytest.mark.parametrize("wire_error", [
+    # scratchpad-controller's live_pod.py raises a bare RuntimeError from two
+    # places when the pod never reaches Running: a terminal phase reached
+    # first (kubelet rejected or evicted it), and the poll deadline expiring
+    # (no gVisor capacity, a quota block, a cold node still pulling the
+    # image). Only the first was recognised; the second is the class that
+    # clusters, which is the shape a "1 in 10 turns" report is made of.
+    "live pod sp-abc123 reached terminal phase 'Failed' before Running",
+    "live pod sp-abc123 did not reach Running within 120s",
+])
+def test_remote_error_live_pod_never_reached_running_gets_curated_copy(wire_error):
+    # Both are caught by _handle_anton_turn_k8s's own generic `except
+    # Exception`, so neither carries a type prefix. The pod name is
+    # k8s-controlled (safe), but a fixed message is still returned rather
+    # than echoing it to the user.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(wire_error)
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "sandbox" in msg
+    assert "sp-abc123" not in msg
+
+
+def test_remote_error_pod_identity_mismatch_gets_curated_copy():
+    # live_pod.py's PodIdentityMismatch — a pod holding our name belongs to a
+    # different scratchpad, so the turn is refused rather than run in someone
+    # else's workspace. The squatting pod is not discarded, so the copy
+    # steers to support instead of promising a retry will clear it, and the
+    # two scratchpad ids in the raw message must not reach the user.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "pod sp-abc123 belongs to scratchpad 'conv-other', not 'conv-mine'")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "support" in msg
+    assert "conv-other" not in msg
+    assert "sp-abc123" not in msg
+
+
 def test_remote_legacy_connection_error_still_maps_to_provider_auth():
     """The remote worker pods still emit anton's pre-typed 401 copy.
 
