@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -152,13 +153,25 @@ FAILURE_MESSAGES = {
         "Your sign-in does not match this server. Sign in again, or switch back to the environment you signed into."
     ),
     "model_unavailable": "This model is not available to your account. Choose another model.",
+    "model_upstream_unavailable": "The model service is temporarily unavailable. Try again in a moment.",
 }
 
 _FAILURE_MARKERS = (
     ("insufficient_credits", ("402 payment required", "wallet has no balance", "insufficient credits")),
     ("model_authentication_failed", ("401 unauthorized", "403 forbidden", "invalid api key")),
     ("model_unavailable", ("404 not found: the model",)),
+    (
+        "model_upstream_unavailable",
+        (
+            "unexpected status 500", "unexpected status 502", "unexpected status 503", "unexpected status 504",
+            "service unavailable", "bad gateway", "gateway timeout",
+        ),
+    ),
 )
+
+# Codex appends the request URL to its status lines; for a transient upstream
+# failure that is our own loopback proxy address, which tells the user nothing.
+_URL_SUFFIX = re.compile(r",?\s*url:\s*\S+")
 
 
 def classify_engine_failure(
@@ -180,7 +193,8 @@ def classify_engine_failure(
     )
     if code not in FAILURE_MESSAGES:
         return EngineFailure(message=safe)
-    return EngineFailure(message=FAILURE_MESSAGES[code], code=code, detail=safe, model=model)
+    detail = _URL_SUFFIX.sub("", safe).strip() if code == "model_upstream_unavailable" else safe
+    return EngineFailure(message=FAILURE_MESSAGES[code], code=code, detail=detail, model=model)
 
 
 def _embedded_error_code(text: str) -> str:

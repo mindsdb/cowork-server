@@ -56,3 +56,22 @@ def test_unknown_embedded_codes_are_not_promoted_to_a_contract() -> None:
 
     assert failure.code == ""
     assert failure.message == '{"error": {"code": "something_new", "message": "x"}}'
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unexpected status 503 Service Unavailable: fake, url: http://127.0.0.1:27968/api/v1/coding/inference/responses",
+        "unexpected status 502 Bad Gateway: <html>upstream error</html>, url: http://127.0.0.1:27966/api/v1/coding/inference/responses",
+        "unexpected status 504 Gateway Timeout, url: http://x",
+    ],
+)
+def test_transient_upstream_failures_get_plain_copy_without_the_proxy_url(message: str) -> None:
+    failure = classify_engine_failure(message, CREDS, model="gpt")
+
+    assert failure.code == "model_upstream_unavailable"
+    assert failure.message == "The model service is temporarily unavailable. Try again in a moment."
+    assert "url:" not in failure.detail
+    assert "127.0.0.1" not in failure.detail
+    assert failure.detail.startswith("unexpected status 50")
+    assert failure.model == "gpt"
