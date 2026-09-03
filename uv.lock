@@ -143,7 +143,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.8.31.3.dev1+g18b043f65"
+version = "2.26.9.2.1"
 source = { git = "https://github.com/mindsdb/anton.git?branch=main#18b043f650f17f65234fe6a172f0be3484481bf9" }
 dependencies = [
     { name = "aiohttp" },
@@ -423,7 +423,6 @@ dependencies = [
     { name = "htmldocx" },
     { name = "httpx" },
     { name = "markdown" },
-    { name = "openai-codex" },
     { name = "psutil" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg2-binary" },
@@ -445,8 +444,14 @@ channels = [
     { name = "discord-py" },
     { name = "slack-sdk" },
 ]
+code = [
+    { name = "openai-codex" },
+]
 
 [package.dev-dependencies]
+code = [
+    { name = "openai-codex" },
+]
 dev = [
     { name = "alembic" },
     { name = "fakeredis" },
@@ -467,7 +472,7 @@ requires-dist = [
     { name = "htmldocx", specifier = ">=0.0.6" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "markdown", specifier = ">=3.7" },
-    { name = "openai-codex", specifier = "==0.147.0" },
+    { name = "openai-codex", marker = "extra == 'code'", specifier = "==0.147.0" },
     { name = "psutil", specifier = ">=7.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "psycopg2-binary", specifier = ">=2.9" },
@@ -483,9 +488,10 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.47.0" },
     { name = "xhtml2pdf", specifier = ">=0.2.16" },
 ]
-provides-extras = ["channels"]
+provides-extras = ["channels", "code"]
 
 [package.metadata.requires-dev]
+code = [{ name = "openai-codex", specifier = "==0.147.0" }]
 dev = [
     { name = "alembic", specifier = ">=1.18.4" },
     { name = "fakeredis", specifier = ">=2.37.0" },
