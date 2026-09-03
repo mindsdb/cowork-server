@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import shlex
 import socket
 import subprocess
@@ -37,15 +38,28 @@ def _powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def terminal_command_line(
     *,
     argv: list[str],
     cwd: str,
     computer: Computer,
     shell: TerminalShellPreference,
+    environment: dict[str, str] | None = None,
 ) -> str:
-    """Serialize one trusted structured project action for its chosen shell."""
+    """Serialize one trusted structured project action for its chosen shell.
 
+    ``environment`` holds the project's variables and the task's allocated
+    ports (PORT=4173 …); a dev server has to see the same port the preview
+    will open, so it travels with the command, scoped to that command only.
+    """
+
+    environment = dict(environment or {})
+    for name in environment:
+        if not _ENV_NAME.match(name):
+            raise WorkspaceError(f"Project environment variable name is not valid: {name!r}")
     windows = computer.capabilities.platform == "windows"
     shells = set(computer.capabilities.shells)
     resolved = shell
@@ -65,13 +79,16 @@ def terminal_command_line(
         )
     posix = not windows or resolved == TerminalShellPreference.bash
     if posix:
-        return f"cd {shlex.quote(cwd)} && {shlex.join(argv)}\n"
+        prefix = "".join(f"{name}={shlex.quote(value)} " for name, value in environment.items())
+        return f"cd {shlex.quote(cwd)} && {prefix}{shlex.join(argv)}\n"
     if resolved == TerminalShellPreference.cmd:
-        if any(any(character in value for character in "&|<>^%\r\n") for value in (cwd, *argv)):
+        if any(any(character in value for character in "&|<>^%\r\n") for value in (cwd, *argv, *environment.values())):
             raise WorkspaceError("Managed project actions need Bash or PowerShell when values contain shell metacharacters")
-        return f"cd /d {subprocess.list2cmdline([cwd])} && {subprocess.list2cmdline(argv)}\r\n"
+        sets = "".join(f'set "{name}={value}" && ' for name, value in environment.items())
+        return f"cd /d {subprocess.list2cmdline([cwd])} && {sets}{subprocess.list2cmdline(argv)}\r\n"
+    assignments = "".join(f"$env:{name} = {_powershell_quote(value)}; " for name, value in environment.items())
     return (
-        f"Set-Location -LiteralPath {_powershell_quote(cwd)}; "
+        f"Set-Location -LiteralPath {_powershell_quote(cwd)}; {assignments}"
         f"& {_powershell_quote(argv[0])} {' '.join(_powershell_quote(value) for value in argv[1:])}\r\n"
     )
 
@@ -173,6 +190,10 @@ class ProjectActionService:
             cwd=workspace.workspace_path,
             computer=computer,
             shell=request.shell,
+            environment={
+                **project.environment.variables,
+                **{name: str(value) for name, value in session.allocated_ports.items()},
+            },
         )
         tab = self.terminals.create(
             session_id,
