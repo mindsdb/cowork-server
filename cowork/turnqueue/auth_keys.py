@@ -48,9 +48,11 @@ async def revoke_turn_key(*, instance_id: str, settings) -> None:
     """Revoke every active turn key for `instance_id`.
 
     Idempotent on the auth side: the endpoint answers 204 even when no key
-    exists, so callers do not need to know whether a mint happened.
+    exists, so callers do not need to know whether a mint happened. Like mint,
+    revoke uses auth's ClusterIP-only top-level ``/internal/`` route; the public
+    edge deliberately has no turn-key surface.
     """
-    url = f"{settings.auth_internal_base_url.rstrip('/')}/v1/internal/turn-keys/{instance_id}/"
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/turn-keys/{instance_id}/"
     headers = {"X-Internal-Auth": settings.auth_internal_secret}
     async with httpx.AsyncClient(timeout=5.0) as client:
         resp = await client.delete(url, headers=headers)
