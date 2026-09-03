@@ -25,6 +25,7 @@ from coding_service_fakes import (
     wait_for_steers,
 )
 
+from cowork.coding.engines.base import SteerOutcome
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -1791,6 +1792,46 @@ def test_steering_reaches_active_engine_and_is_recorded(tmp_path: Path) -> None:
     wait_for_steers(engine)
     assert engine.steers == [("turn-1", "Focus on tests")]
     assert service.events(created.id).items[-1].text == "Focus on tests"
+    service.cancel(created.id)
+    wait_for_status(service, created.id, SessionStatus.cancelled)
+
+
+def test_a_steer_codex_has_not_confirmed_is_recorded_and_followed(tmp_path: Path) -> None:
+    # When Codex does not answer turn/steer in time the instruction is still in
+    # flight. Record it as unconfirmed and report what finally happened, rather
+    # than rejecting it and inviting the user to send it twice.
+    repo = repository(tmp_path)
+    engine = FakeEngine(block_until_cancel=True)
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
+    )
+    assert engine.started.wait(timeout=1)
+
+    engine.steer_pending = SteerOutcome()
+    service.steer(created.id, "Focus on tests")
+    recorded = service.events(created.id).items[-1]
+    assert recorded.type == EventType.user_message
+    assert recorded.title == "Follow-up (unconfirmed)"
+    assert recorded.phase == "pending"
+    assert recorded.text == "Focus on tests"
+
+    engine.steer_pending.settle(False, "turn is not active")
+    failed = service.events(created.id).items[-1]
+    assert failed.type == EventType.error
+    assert failed.title == "Follow-up not delivered"
+    assert "Send it again" in failed.text
+
+    engine.steer_pending = SteerOutcome()
+    queued = service.queue_turn(created.id, "Also add a README")
+    instruction_id = queued.queued_instructions[0].id
+    after = service.steer_queued_turn(created.id, instruction_id)
+    assert after.queued_instructions == []  # in flight, not re-queued: it must not run twice
+    engine.steer_pending.settle(True)
+    delivered = service.events(created.id).items[-1]
+    assert delivered.type == EventType.command_result
+    assert delivered.title == "Follow-up delivered"
+
     service.cancel(created.id)
     wait_for_status(service, created.id, SessionStatus.cancelled)
 

@@ -261,13 +261,51 @@ class CodingTurnOperations:
                     intent.goal_objective,
                 )
             return self.get_session(session_id)
-        if engine is not None:
-            engine.steer(turn_id, prompt, engine_attachments)
+        outcome = engine.steer(turn_id, prompt, engine_attachments) if engine is not None else None
+        if outcome is None:
+            self._emit(
+                session.id,
+                CodingEvent(type=EventType.user_message, title="Follow-up", text=prompt, phase="completed"),
+            )
+            return self.get_session(session_id)
+        # Codex has not answered within its deadline. The instruction is in
+        # flight and may still land, so record it as unconfirmed rather than
+        # rejecting it (which would invite the user to send it twice), and
+        # report the result when the engine finally answers.
         self._emit(
             session.id,
-            CodingEvent(type=EventType.user_message, title="Follow-up", text=prompt, phase="completed"),
+            CodingEvent(
+                type=EventType.user_message,
+                title="Follow-up (unconfirmed)",
+                text=prompt,
+                phase="pending",
+                data={"delivery": "unconfirmed"},
+            ),
         )
+        outcome.on_settled(lambda ok, detail: self._record_late_steer(session_id, prompt, ok, detail))
         return self.get_session(session_id)
+
+    def _record_late_steer(self, session_id: str, prompt: str, ok: bool, detail: str) -> None:
+        if ok:
+            event = CodingEvent(
+                type=EventType.command_result,
+                title="Follow-up delivered",
+                text="Codex accepted the instruction after the deadline; it is now guiding the turn.",
+                phase="completed",
+                data={"delivery": "confirmed", "prompt": prompt[:200]},
+            )
+        else:
+            event = CodingEvent(
+                type=EventType.error,
+                title="Follow-up not delivered",
+                text=f"Codex did not accept the instruction ({detail or 'no reason given'}). Send it again.",
+                phase="failed",
+                data={"delivery": "failed", "prompt": prompt[:200]},
+            )
+        try:
+            self._emit(session_id, event)
+        except Exception:  # noqa: BLE001 - a settled steer must never take the worker thread down.
+            pass
 
     def queue_turn(
         self,

@@ -118,11 +118,12 @@ class FakeSession:
             return
         yield CodingEvent(type=EventType.session, data={"status": "completed"})
 
-    def steer(self, turn_id: str, prompt: str, attachments=()) -> None:
+    def steer(self, turn_id: str, prompt: str, attachments=()):
         if self.engine.steer_error:
             raise RuntimeError("adapter rejected steer")
         self.engine.steers.append((turn_id, prompt))
         self.engine.steer_attachments.append(attachments)
+        return self.engine.steer_pending
 
     def cancel(self, turn_id: str) -> None:
         self.engine.cancels.append(turn_id)
@@ -202,6 +203,7 @@ class FakeEngine:
         self.opened_workspaces: list[str] = []
         self.compactions = 0
         self.steers: list[tuple[str, str]] = []
+        self.steer_pending = None  # a SteerOutcome to hand back as "not confirmed yet"
         self.steer_error = False
         self.steer_attachments = []
         self.cancels: list[str] = []
