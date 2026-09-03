@@ -153,6 +153,7 @@ def classify_engine_failure(
         "insufficient_credits",
         "insufficient credits",
         "wallet_empty",
+        "wallet has no balance",
         "weighted tokens left",
     ))
     if insufficient_credits:

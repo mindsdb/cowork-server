@@ -1151,7 +1151,10 @@ def test_credit_exhaustion_is_actionable_and_keeps_the_technical_detail(tmp_path
     repo = repository(tmp_path)
     engine = FakeEngine()
     engine.events_error = True
-    engine.events_error_message = "server returned 402 Payment Required: You have 0 weighted tokens left"
+    engine.events_error_message = (
+        "unexpected status 400 Bad Request: "
+        "Your wallet has no balance to cover the model 'gpt'."
+    )
     service = service_with(tmp_path, engine)
 
     created = service.create_session(
@@ -1165,7 +1168,10 @@ def test_credit_exhaustion_is_actionable_and_keeps_the_technical_detail(tmp_path
     assert error.text == failed.last_error
     assert error.data == {
         "code": "insufficient_credits",
-        "detail": "server returned 402 Payment Required: You have 0 weighted tokens left",
+        "detail": (
+            "unexpected status 400 Bad Request: "
+            "Your wallet has no balance to cover the model 'gpt'."
+        ),
         "model": "gpt-5.6-sol",
     }
     assert engine.closed == 1
