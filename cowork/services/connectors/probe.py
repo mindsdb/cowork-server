@@ -443,7 +443,7 @@ class CredentialProbe:
             # runtime strips the inherited ones: the probe tests the candidate
             # credentials it writes to its own env file, and must not be able
             # to read a saved connection's.
-            data_vault=LocalDataVault(vault_dir=_probe_tmp_dir() / "empty-vault"),
+            data_vault=LocalDataVault(_probe_tmp_dir() / "empty-vault"),
             # WHICH agent ran: anton, same as a UI turn — the probe is anton
             # doing a job, not a different agent (ENG-1694's definition of
             # `harness` as agent identity). Without this the probe's traces
