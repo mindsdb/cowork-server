@@ -2116,6 +2116,32 @@ def test_fork_writes_the_durable_session_without_the_control_plane_projection(tm
     assert child.run_status == "completed"
 
 
+def test_tasks_inheriting_a_legacy_default_model_run_with_the_catalog_id(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Legacy model",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        default_engine_id="fake",
+        default_model="gpt-5.6-sol",
+    ))
+
+    from_project = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Use the project default"),
+        CREDS,
+        "fake",
+        "gpt-5.6-sol",
+    )
+    from_settings = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Use the settings default"), CREDS, "fake", "gpt-5.6-sol"
+    )
+    explicit = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Use an unknown id", model="fable"), CREDS, "fake", "gpt"
+    )
+
+    assert (from_project.model, from_settings.model, explicit.model) == ("gpt", "gpt", "fable")
+
+
 def test_failed_fork_preparation_does_not_leave_control_records(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2660,3 +2686,21 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
     assert loaded.allocated_ports == original_ports
     assert restarted_engine.existing_ids[0] == original_engine_session_id
     assert next_task.allocated_ports["PORT"] != original_ports["PORT"]
+
+
+def test_steering_while_an_approval_is_pending_is_refused_and_keeps_the_queue(tmp_path: Path) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.ready)
+    service = service_with(tmp_path, FakeEngine())
+    pending = PendingApproval(id="approval-1", method="command", kind="command", title="Run it", detail="npm install", risk="low", scope="once")
+    service._emit(session.id, CodingEvent(type=EventType.session, phase="started"), mark_running)
+    service._emit(session.id, CodingEvent(type=EventType.approval, phase="pending"), lambda current: service._open_approval(current, pending))
+    queued = QueuedInstruction(id="queued-readme", prompt="Also add a README")
+    service.store.update_session(session.id, lambda current: current.queued_instructions.append(queued))
+
+    with pytest.raises(StateConflict, match="Resolve the pending approval first"):
+        service.steer(session.id, "Change direction")
+
+    current = service.get_session(session.id)
+    assert current.pending_approval is not None
+    assert [item.id for item in current.queued_instructions] == [queued.id]
+    assert current.status == SessionStatus.awaiting_approval
