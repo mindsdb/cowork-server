@@ -26,6 +26,7 @@ from cowork.coding.control_models import (
     ComputerStatus,
     ConnectorGrant,
     ExecutionWorkspace,
+    PendingComputer,
     RecoveryPlan,
     ResourceAvailability,
     ResourceAvailabilityPage,
@@ -63,6 +64,8 @@ if TYPE_CHECKING:
 
 
 _OFFLINE_AFTER = timedelta(seconds=35)
+# One-time connection codes live long enough to paste into another computer.
+REGISTRATION_CODE_LIFETIME = timedelta(minutes=10)
 _LEASE_DURATION = timedelta(seconds=30)
 _COMMAND_CLAIM_DURATION = timedelta(seconds=20)
 _SESSION_STATUS: dict[SessionStatus, RunStatus] = {
@@ -115,7 +118,61 @@ class ControlPlaneService:
     def list_computers(self) -> ComputerPage:
         self.heartbeat(self.local_computer.id, active_run_count=self._active_count(self.local_computer.id))
         self.expire_stale_computers()
-        return ComputerPage(items=[item for item in self.store.list_computers() if item.revoked_at is None])
+        return ComputerPage(
+            items=[item for item in self.store.list_computers() if item.revoked_at is None],
+            pending=self.list_pending_computers(),
+        )
+
+    def list_pending_computers(self) -> list[PendingComputer]:
+        """Computers the user has named whose runtime has not connected yet."""
+        now = utc_now()
+        return sorted(
+            (
+                self._pending_computer(credential, now)
+                for credential in self.store.list_registration_credentials()
+                if credential.name and credential.consumed_at is None
+            ),
+            key=lambda item: item.created_at,
+        )
+
+    def invite_computer(
+        self,
+        name: str,
+        platform: str,
+        replaces_id: str | None = None,
+    ) -> tuple[str, PendingComputer]:
+        """Name a computer now and hand back the one-time code its runtime connects with.
+
+        Re-issuing a code for an existing pending computer (`replaces_id`) drops
+        the previous credential so only the newest code works.
+        """
+        if replaces_id is not None:
+            self.remove_pending_computer(replaces_id)
+        token, credential = self._issue_registration_credential(
+            name=self._computer_name(name),
+            platform=platform,
+        )
+        return token, self._pending_computer(credential, utc_now())
+
+    def remove_pending_computer(self, pending_id: str) -> None:
+        credential = next(
+            (item for item in self.store.list_registration_credentials() if item.id == pending_id and item.name),
+            None,
+        )
+        if credential is None:
+            raise KeyError("Pending computer not found")
+        self.store.delete_registration_credential(credential.id)
+
+    @staticmethod
+    def _pending_computer(credential: RuntimeRegistrationCredential, now: datetime) -> PendingComputer:
+        return PendingComputer(
+            id=credential.id,
+            name=credential.name or "",
+            platform=credential.platform or "linux",
+            created_at=credential.created_at,
+            expires_at=credential.expires_at,
+            expired=credential.expires_at <= now,
+        )
 
     def heartbeat(self, computer_id: str, active_run_count: int = 0) -> Computer:
         computer = self.store.get_computer(computer_id)
@@ -155,14 +212,24 @@ class ControlPlaneService:
         self.store.save_computer(computer)
 
     def issue_registration_token(self) -> str:
+        token, _credential = self._issue_registration_credential()
+        return token
+
+    def _issue_registration_credential(
+        self,
+        name: str | None = None,
+        platform: str | None = None,
+    ) -> tuple[str, RuntimeRegistrationCredential]:
         token = secrets.token_urlsafe(36)
         digest = self._digest(token)
-        self.store.save_registration_credential(RuntimeRegistrationCredential(
+        credential = self.store.save_registration_credential(RuntimeRegistrationCredential(
             id=digest,
             token_hash=digest,
-            expires_at=utc_now() + timedelta(minutes=10),
+            expires_at=utc_now() + REGISTRATION_CODE_LIFETIME,
+            name=name,
+            platform=platform,  # type: ignore[arg-type]  # validated by the request model
         ))
-        return token
+        return token, credential
 
     def register_runtime(
         self,
@@ -172,12 +239,15 @@ class ControlPlaneService:
     ) -> tuple[Computer, str]:
         self._require_protocol(capabilities.protocol_versions)
         token_hash = self._digest(registration_token)
-        if not self.store.consume_registration_credential(token_hash, utc_now()):
+        credential = self.store.consume_registration_credential(token_hash, utc_now())
+        if credential is None:
             raise RuntimeAuthenticationError("Runtime registration expired or was already used")
         identifier = f"computer-{uuid.uuid4().hex}"
         computer = Computer(
             id=identifier,
-            name=self._computer_name(name),
+            # The name the user typed in "Connect a computer" wins over the
+            # runtime's own; the pending entry becomes this computer.
+            name=self._computer_name(credential.name or name),
             is_local=False,
             capabilities=capabilities,
         )

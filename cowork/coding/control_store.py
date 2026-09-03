@@ -57,7 +57,9 @@ class ControlPlaneStore(Protocol):
     def save_runtime_credential(self, credential: RuntimeCredential) -> RuntimeCredential: ...
     def get_runtime_credential(self, computer_id: str) -> RuntimeCredential: ...
     def save_registration_credential(self, credential: RuntimeRegistrationCredential) -> RuntimeRegistrationCredential: ...
-    def consume_registration_credential(self, token_hash: str, now: datetime) -> bool: ...
+    def consume_registration_credential(self, token_hash: str, now: datetime) -> RuntimeRegistrationCredential | None: ...
+    def list_registration_credentials(self) -> list[RuntimeRegistrationCredential]: ...
+    def delete_registration_credential(self, credential_id: str) -> None: ...
     def save_run_credential(self, credential: TaskRunCredential) -> TaskRunCredential: ...
     def get_run_credential(self, run_id: str) -> TaskRunCredential: ...
     def save_audit_event(self, event: SecurityAuditEvent) -> SecurityAuditEvent: ...
@@ -185,20 +187,26 @@ class LocalControlPlaneStore:
     def get_runtime_credential(self, computer_id: str) -> RuntimeCredential:
         return self._get("runtime_credentials", computer_id, RuntimeCredential)
 
+    def list_registration_credentials(self) -> list[RuntimeRegistrationCredential]:
+        return self._list("registration_credentials", RuntimeRegistrationCredential)
+
+    def delete_registration_credential(self, credential_id: str) -> None:
+        self._delete("registration_credentials", credential_id)
+
     def save_registration_credential(self, credential: RuntimeRegistrationCredential) -> RuntimeRegistrationCredential:
         return self._save("registration_credentials", credential)
 
-    def consume_registration_credential(self, token_hash: str, now: datetime) -> bool:
+    def consume_registration_credential(self, token_hash: str, now: datetime) -> RuntimeRegistrationCredential | None:
         with self._lock:
             try:
                 credential = self._get("registration_credentials", token_hash, RuntimeRegistrationCredential)
             except KeyError:
-                return False
+                return None
             if credential.consumed_at is not None or credential.expires_at <= now:
-                return False
+                return None
             credential.consumed_at = now
             self._save("registration_credentials", credential)
-            return True
+            return credential
 
     def save_run_credential(self, credential: TaskRunCredential) -> TaskRunCredential:
         return self._save("run_credentials", credential)
