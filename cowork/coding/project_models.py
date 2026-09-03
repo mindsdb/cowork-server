@@ -59,6 +59,9 @@ class ProjectActionRunResponse(BaseModel):
     terminal_id: str
     label: str
     preview_url: str | None = None
+    # A run action is live but nothing answers on its port yet (still booting,
+    # or already dead behind a shell that is still open).
+    preview_pending: bool = False
 
 
 class ProjectActionSummary(BaseModel):
@@ -71,6 +74,7 @@ class ProjectActionSummary(BaseModel):
 class ProjectActionPage(BaseModel):
     items: list[ProjectActionSummary] = Field(default_factory=list)
     preview_url: str | None = None
+    preview_pending: bool = False
 
 
 class ReviewFileActionRequest(BaseModel):

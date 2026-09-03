@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import shlex
+import socket
 import subprocess
 from collections.abc import Callable
 
@@ -18,6 +19,18 @@ from cowork.coding.project_models import (
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.workspace import WorkspaceError
+
+
+PORT_PROBE_TIMEOUT_SECONDS = 0.15
+
+
+def port_is_listening(port: int) -> bool:
+    """True when something accepts TCP connections on the loopback port."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=PORT_PROBE_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
 
 
 def _powershell_quote(value: str) -> str:
@@ -75,6 +88,7 @@ class ProjectActionService:
         get_computer: Callable[[str], Computer],
         local_computer_id: str,
         execution_project: Callable[[CodingSession], CodeProject | None],
+        port_open: Callable[[int], bool] = port_is_listening,
     ) -> None:
         self.get_session = get_session
         self.projects = projects
@@ -82,6 +96,7 @@ class ProjectActionService:
         self.get_computer = get_computer
         self.local_computer_id = local_computer_id
         self.execution_project = execution_project
+        self.port_open = port_open
 
     def list(self, session_id: str) -> ProjectActionPage:
         session = self.get_session(session_id)
@@ -112,9 +127,15 @@ class ProjectActionService:
         }
         has_active_run = any((item.resource_id, item.id) in active_actions for item in items)
         port = next(iter(session.allocated_ports.values()), None) if has_active_run else None
+        # The action runs inside an interactive shell, so its terminal stays
+        # "running" after the command has exited. Only offer a preview while
+        # something actually answers on the port; until then it is pending.
+        previewable = bool(port) and session.computer_is_local
+        listening = previewable and self.port_open(port)
         return ProjectActionPage(
             items=items,
-            preview_url=f"http://127.0.0.1:{port}" if port and session.computer_is_local else None,
+            preview_url=f"http://127.0.0.1:{port}" if listening else None,
+            preview_pending=previewable and not listening,
         )
 
     def run(
@@ -180,9 +201,10 @@ class ProjectActionService:
                 pass
             raise
 
-        preview_url = self.list(session_id).preview_url
+        page = self.list(session_id)
         return ProjectActionRunResponse(
             terminal_id=tab.id,
             label=command.label,
-            preview_url=preview_url,
+            preview_url=page.preview_url,
+            preview_pending=page.preview_pending,
         )
