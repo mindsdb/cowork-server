@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from cowork.coding.context import safe_engine_error
+from cowork.coding.context import EngineFailure, classify_engine_failure, safe_engine_error
 from cowork.coding.contracts import CodingEvent, CodingSession, EventType, SessionStatus
 from cowork.coding.engines.base import (
     EngineCredentials,
@@ -170,8 +170,10 @@ class TurnExecutor:
         turn_id = ""
         finished_status: SessionStatus | None = None
         reservation_released = False
+        model = ""
         try:
             session = self._get_session(session_id)
+            model = session.model
             engine_session = self._runtimes.open(session, credentials)
             self._store.update_session(
                 session_id,
@@ -197,17 +199,24 @@ class TurnExecutor:
                 for pending_prompt, pending_attachments in pending_steers:
                     engine_session.steer(turn_id, pending_prompt, pending_attachments)
 
-            status, terminal_event = self._collect_events(session_id, engine_session, turn_id)
+            status, terminal_event, error_text = self._collect_events(session_id, engine_session, turn_id)
             if self._interruption_requested(session_id):
                 status = SessionStatus.interrupted
                 terminal_event = None
             finished_status = status
+            finish: Callable[[CodingSession], None] = lambda current: finish_turn(current, status)
+            if status == SessionStatus.failed and terminal_event is not None:
+                failure = classify_engine_failure(error_text or terminal_event.text, credentials, model)
+                terminal_event = terminal_event.model_copy(
+                    update={"text": failure.message, "data": {**terminal_event.data, **failure.event_data()}},
+                )
+                finish = lambda current: fail_turn(current, False, failure.message)
             # Make the terminal status and turn-slot release one observable
             # transition. Otherwise the UI can see "Completed" and offer
             # fork/archive immediately while the reservation still rejects it.
             with self._state_lock:
                 if terminal_event is not None:
-                    self._emit(session_id, terminal_event, lambda current: finish_turn(current, status))
+                    self._emit(session_id, terminal_event, finish)
                 else:
                     self._store.update_session(session_id, lambda current: finish_turn(current, status))
                 self._running.pop(session_id, None)
@@ -228,7 +237,7 @@ class TurnExecutor:
                         pass
             finally:
                 with self._state_lock:
-                    self._record_failure(session_id, safe_engine_error(str(exc), credentials))
+                    self._record_failure(session_id, classify_engine_failure(str(exc), credentials, model))
                     self._running.pop(session_id, None)
                     reservation_released = True
         finally:
@@ -304,22 +313,26 @@ class TurnExecutor:
         session_id: str,
         engine_session: EngineSession,
         turn_id: str,
-    ) -> tuple[SessionStatus, CodingEvent | None]:
+    ) -> tuple[SessionStatus, CodingEvent | None, str]:
+        """Stream the turn's events; return its terminal status, the terminal event and the last error text."""
         buffer = EventBuffer(lambda event: self._emit(session_id, event))
         final_status = "completed"
         terminal_event: CodingEvent | None = None
+        error_text = ""
         for event in engine_session.events(turn_id):
             if event.type == EventType.session and event.data.get("status"):
                 final_status = str(event.data["status"])
                 terminal_event = event
             else:
+                if event.type == EventType.error and event.text:
+                    error_text = event.text
                 buffer.add(event)
         buffer.flush()
         with self._state_lock:
             cancelled = bool(self._running.get(session_id) and self._running[session_id].cancel_requested)
-        return terminal_status(final_status, cancelled), terminal_event
+        return terminal_status(final_status, cancelled), terminal_event, error_text
 
-    def _record_failure(self, session_id: str, message: str) -> None:
+    def _record_failure(self, session_id: str, failure: EngineFailure) -> None:
         with self._state_lock:
             running = self._running.get(session_id)
             cancelled = bool(running and running.cancel_requested)
@@ -332,10 +345,11 @@ class TurnExecutor:
             CodingEvent(
                 type=EventType.session if cancelled else EventType.error,
                 title="Task stopped" if cancelled else "Coding agent failed",
-                text="The active coding turn was cancelled." if cancelled else message,
+                text="The active coding turn was cancelled." if cancelled else failure.message,
                 phase="completed" if cancelled else "failed",
+                data={} if cancelled else failure.event_data(),
             ),
-            lambda current: fail_turn(current, cancelled, message),
+            lambda current: fail_turn(current, cancelled, failure.message),
         )
 
     def _interruption_requested(self, session_id: str) -> bool:

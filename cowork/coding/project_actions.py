@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import re
 import shlex
+import socket
 import subprocess
 from collections.abc import Callable
 
@@ -20,8 +22,23 @@ from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.workspace import WorkspaceError
 
 
+PORT_PROBE_TIMEOUT_SECONDS = 0.15
+
+
+def port_is_listening(port: int) -> bool:
+    """True when something accepts TCP connections on the loopback port."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=PORT_PROBE_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
 def _powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def terminal_command_line(
@@ -30,9 +47,19 @@ def terminal_command_line(
     cwd: str,
     computer: Computer,
     shell: TerminalShellPreference,
+    environment: dict[str, str] | None = None,
 ) -> str:
-    """Serialize one trusted structured project action for its chosen shell."""
+    """Serialize one trusted structured project action for its chosen shell.
 
+    ``environment`` holds the project's variables and the task's allocated
+    ports (PORT=4173 …); a dev server has to see the same port the preview
+    will open, so it travels with the command, scoped to that command only.
+    """
+
+    environment = dict(environment or {})
+    for name in environment:
+        if not _ENV_NAME.match(name):
+            raise WorkspaceError(f"Project environment variable name is not valid: {name!r}")
     windows = computer.capabilities.platform == "windows"
     shells = set(computer.capabilities.shells)
     resolved = shell
@@ -52,13 +79,16 @@ def terminal_command_line(
         )
     posix = not windows or resolved == TerminalShellPreference.bash
     if posix:
-        return f"cd {shlex.quote(cwd)} && {shlex.join(argv)}\n"
+        prefix = "".join(f"{name}={shlex.quote(value)} " for name, value in environment.items())
+        return f"cd {shlex.quote(cwd)} && {prefix}{shlex.join(argv)}\n"
     if resolved == TerminalShellPreference.cmd:
-        if any(any(character in value for character in "&|<>^%\r\n") for value in (cwd, *argv)):
+        if any(any(character in value for character in "&|<>^%\r\n") for value in (cwd, *argv, *environment.values())):
             raise WorkspaceError("Managed project actions need Bash or PowerShell when values contain shell metacharacters")
-        return f"cd /d {subprocess.list2cmdline([cwd])} && {subprocess.list2cmdline(argv)}\r\n"
+        sets = "".join(f'set "{name}={value}" && ' for name, value in environment.items())
+        return f"cd /d {subprocess.list2cmdline([cwd])} && {sets}{subprocess.list2cmdline(argv)}\r\n"
+    assignments = "".join(f"$env:{name} = {_powershell_quote(value)}; " for name, value in environment.items())
     return (
-        f"Set-Location -LiteralPath {_powershell_quote(cwd)}; "
+        f"Set-Location -LiteralPath {_powershell_quote(cwd)}; {assignments}"
         f"& {_powershell_quote(argv[0])} {' '.join(_powershell_quote(value) for value in argv[1:])}\r\n"
     )
 
@@ -75,6 +105,7 @@ class ProjectActionService:
         get_computer: Callable[[str], Computer],
         local_computer_id: str,
         execution_project: Callable[[CodingSession], CodeProject | None],
+        port_open: Callable[[int], bool] = port_is_listening,
     ) -> None:
         self.get_session = get_session
         self.projects = projects
@@ -82,6 +113,7 @@ class ProjectActionService:
         self.get_computer = get_computer
         self.local_computer_id = local_computer_id
         self.execution_project = execution_project
+        self.port_open = port_open
 
     def list(self, session_id: str) -> ProjectActionPage:
         session = self.get_session(session_id)
@@ -112,9 +144,15 @@ class ProjectActionService:
         }
         has_active_run = any((item.resource_id, item.id) in active_actions for item in items)
         port = next(iter(session.allocated_ports.values()), None) if has_active_run else None
+        # The action runs inside an interactive shell, so its terminal stays
+        # "running" after the command has exited. Only offer a preview while
+        # something actually answers on the port; until then it is pending.
+        previewable = bool(port) and session.computer_is_local
+        listening = previewable and self.port_open(port)
         return ProjectActionPage(
             items=items,
-            preview_url=f"http://127.0.0.1:{port}" if port and session.computer_is_local else None,
+            preview_url=f"http://127.0.0.1:{port}" if listening else None,
+            preview_pending=previewable and not listening,
         )
 
     def run(
@@ -152,6 +190,10 @@ class ProjectActionService:
             cwd=workspace.workspace_path,
             computer=computer,
             shell=request.shell,
+            environment={
+                **project.environment.variables,
+                **{name: str(value) for name, value in session.allocated_ports.items()},
+            },
         )
         tab = self.terminals.create(
             session_id,
@@ -180,9 +222,10 @@ class ProjectActionService:
                 pass
             raise
 
-        preview_url = self.list(session_id).preview_url
+        page = self.list(session_id)
         return ProjectActionRunResponse(
             terminal_id=tab.id,
             label=command.label,
-            preview_url=preview_url,
+            preview_url=page.preview_url,
+            preview_pending=page.preview_pending,
         )
