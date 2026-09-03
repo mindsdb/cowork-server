@@ -59,9 +59,13 @@ class CodingTurnOperations:
         credentials: EngineCredentials,
         attachments: list[InputReference] | tuple[InputReference, ...] = (),
     ) -> CodingSession:
-        session = self._continue_completed_task(self.get_session(session_id))
+        session = self.get_session(session_id)
+        intent = self._validated_command_intent(session, prompt, attachments)
+        if not intent.runs_immediately:
+            # A read-only command such as /status must not roll a finished task
+            # into a fresh run; only real turns continue the task.
+            session = self._continue_completed_task(session)
         if self._is_remote(session):
-            intent = self._validated_command_intent(session, prompt, attachments)
             return self.remote.queue_turn(session, prompt, attachments, intent)
         return self._submit_turn(session_id, prompt, credentials, attachments)
 

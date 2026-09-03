@@ -2704,3 +2704,20 @@ def test_steering_while_an_approval_is_pending_is_refused_and_keeps_the_queue(tm
     assert current.pending_approval is not None
     assert [item.id for item in current.queued_instructions] == [queued.id]
     assert current.status == SessionStatus.awaiting_approval
+
+
+def test_a_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt")
+    wait_for_status(service, created.id, SessionStatus.completed)
+    before = service.get_session(created.id)
+
+    service.submit_turn(created.id, "/status", CREDS)
+
+    after = service.get_session(created.id)
+    status_events = [event for event in service.events(created.id).items if event.title == "Task status"]
+    assert after.status == SessionStatus.completed
+    assert after.run_id == before.run_id
+    assert len(status_events) == 1
+    assert status_events[0].text.startswith("Status: completed")
