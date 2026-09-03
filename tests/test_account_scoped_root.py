@@ -11,9 +11,12 @@ skip cannot be mistaken for a migration that never did anything.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import (
     AppSettings,
     MemorySettings,
@@ -121,3 +124,40 @@ def test_memory_migration_still_runs_on_the_default_root(
     assert migrate_harness_memory_to_shared(session) is True
     store = GlobalMemoryStore(root=account_memory_root)
     assert "ExampleCorp" in store.read(MemorySlot.PROFILE)
+
+
+def test_coding_root_follows_its_env_override(tmp_path, monkeypatch):
+    """The coding store had no override at all, so a second account inherited the
+    first account's sessions and cloned repos."""
+    from cowork.coding import service as coding_service
+
+    root = tmp_path / "account-coding"
+    captured: list[Path] = []
+
+    def _capture(passed_root):
+        captured.append(passed_root)
+        return object()
+
+    monkeypatch.setenv("COWORK_CODING_DIR", str(root))
+    monkeypatch.setattr(coding_service, "CodingService", _capture)
+    get_app_settings.cache_clear()
+    coding_service.get_coding_service.cache_clear()
+    try:
+        coding_service.get_coding_service()
+    finally:
+        coding_service.get_coding_service.cache_clear()
+        get_app_settings.cache_clear()
+
+    assert captured == [root]
+
+
+def test_coding_root_defaults_to_the_shared_home(monkeypatch):
+    """Unset, the path must stay exactly where it has always been, so org
+    deployments and single-account desktops are untouched."""
+    monkeypatch.delenv("COWORK_CODING_DIR", raising=False)
+    monkeypatch.delenv("CODING_ROOT_DIR", raising=False)
+    get_app_settings.cache_clear()
+    try:
+        assert Path(get_app_settings().coding.root_dir) == cowork_home() / "coding"
+    finally:
+        get_app_settings.cache_clear()
