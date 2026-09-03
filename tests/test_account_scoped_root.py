@@ -246,3 +246,31 @@ def test_every_store_rooted_at_cowork_home_is_overridable(default_root):
         aliases = getattr(field, "validation_alias", None)
         names = {str(c) for c in getattr(aliases, "choices", [aliases] if aliases else [])}
         assert alias in names, f"{group_name}.{field_name} does not accept {alias}"
+
+
+def test_raw_settings_ignore_the_shared_dotenv_on_an_account_root(
+    tmp_path, monkeypatch, account_scoped
+):
+    """`GET /settings/raw` returns the dotenv verbatim, all provider secrets
+    included, and `POST` merges it into whichever database is current. On a
+    per-account root that dotenv belongs to the owning account, so a sign-out
+    scrub that missed a key would hand it to the next account to onboard."""
+    from cowork.api.v1.endpoints import settings as settings_api
+
+    shared = tmp_path / ".env"
+    shared.write_text("ANTON_ANTHROPIC_API_KEY=not-a-real-key\n", encoding="utf-8")
+    monkeypatch.setattr(settings_api, "_ENV_PATH", shared)
+
+    assert settings_api._read_env_dict() == {}
+
+
+def test_raw_settings_still_read_the_dotenv_on_the_shared_root(
+    tmp_path, monkeypatch, default_root
+):
+    from cowork.api.v1.endpoints import settings as settings_api
+
+    shared = tmp_path / ".env"
+    shared.write_text("ANTON_ANTHROPIC_API_KEY=not-a-real-key\n", encoding="utf-8")
+    monkeypatch.setattr(settings_api, "_ENV_PATH", shared)
+
+    assert settings_api._read_env_dict() == {"ANTON_ANTHROPIC_API_KEY": "not-a-real-key"}

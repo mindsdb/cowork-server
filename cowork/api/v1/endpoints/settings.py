@@ -51,6 +51,7 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
+    get_app_settings,
 )
 from cowork.common.settings.user_settings import (
     Provider,
@@ -635,7 +636,20 @@ def _parse_dotenv_content(content: str) -> dict[str, str]:
     return result
 
 
+def _on_shared_root() -> bool:
+    """Whether this process serves the machine's shared data root.
+
+    `_ENV_PATH` is under COWORK_HOME and so belongs to whichever account owns
+    that root. A sidecar pointed at a per-account root must not read it or write
+    to it: reading hands one account another's provider secrets, and writing puts
+    this account's secrets where the other one can read them.
+    """
+    return get_app_settings().account_id is None
+
+
 def _read_env_dict() -> dict[str, str]:
+    if not _on_shared_root():
+        return {}
     if not _ENV_PATH.exists():
         return {}
     try:
@@ -680,6 +694,14 @@ async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, reques
     incoming = _parse_dotenv_content(body.content)
 
     try:
+        if not _on_shared_root():
+            # A per-account sidecar syncs only what the caller sent, and leaves
+            # the shared dotenv alone in both directions. Merging it in would
+            # import the owning account's leftover keys into this account's
+            # database, which is what happens when a sign-out scrub misses.
+            sync_env_vars_to_db(session, incoming)
+            return {"ok": True}
+
         existing = _read_env_dict()
         existing.update(incoming)
 
