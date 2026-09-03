@@ -42,6 +42,8 @@ from cowork.coding.contracts import (
     TerminalTabPage,
     TerminalTabState,
     TurnRequest,
+    GitIdentity,
+    GitIdentityRequest,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
 from cowork.coding.control_models import TaskResourceScope
@@ -96,7 +98,7 @@ from cowork.coding.skill_models import (
     SkillSourceCreateRequest,
     SkillSourceItemsRequest,
 )
-from cowork.coding.workspace import WorkspaceError
+from cowork.coding.workspace import GitIdentityMissingError, WorkspaceError
 from cowork.coding.workspace_models import (
     WorkspaceEntryPage,
     WorkspaceFileContent,
@@ -155,6 +157,12 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ModelDiscoveryAuthenticationError):
         return HTTPException(
             status_code=401,
+            detail=str(exc),
+            headers={"X-MindsHub-Error-Code": exc.code},
+        )
+    if isinstance(exc, GitIdentityMissingError):
+        return HTTPException(
+            status_code=409,
             detail=str(exc),
             headers={"X-MindsHub-Error-Code": exc.code},
         )
@@ -920,6 +928,18 @@ def create_branch(session_id: str, body: BranchRequest):
 @router.post("/sessions/{session_id}/commit")
 def commit(session_id: str, body: CommitRequest):
     return _call(_service().commit, session_id, body.message)
+
+
+@router.get("/git/identity", response_model=GitIdentity)
+def git_identity():
+    """The author identity Git would use for commits on this computer."""
+    return _call(_service().workspaces.git_identity)
+
+
+@router.put("/git/identity", response_model=GitIdentity)
+def set_git_identity(body: GitIdentityRequest):
+    """Fill in whichever of user.name / user.email is unset; configured values are kept."""
+    return _call(_service().workspaces.set_git_identity, body.name, body.email)
 
 
 @router.post("/sessions/{session_id}/apply")

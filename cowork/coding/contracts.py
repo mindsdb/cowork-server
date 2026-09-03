@@ -472,6 +472,38 @@ class GitState(BaseModel):
     source_path: str
 
 
+class GitIdentity(BaseModel):
+    """The author identity Git would use for commits on this computer."""
+
+    name: str | None = None
+    email: str | None = None
+
+    @property
+    def missing(self) -> list[str]:
+        return [field for field, value in (("user.name", self.name), ("user.email", self.email)) if not value]
+
+
+class GitIdentityRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("name", "email")
+    @classmethod
+    def strip_and_require(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Name and email are required")
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def looks_like_an_address(cls, value: str) -> str:
+        local, at, domain = value.partition("@")
+        if not at or not local or not domain or any(ch.isspace() for ch in value):
+            raise ValueError("Enter an email address")
+        return value
+
+
 class SessionCreateRequest(BaseModel):
     path: str | None = Field(default=None, min_length=1, max_length=32_768)
     project_id: str | None = Field(default=None, min_length=1, max_length=128)
