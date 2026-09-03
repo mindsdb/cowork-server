@@ -30,7 +30,7 @@ from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.session_factory import project_instructions, task_title
-from cowork.coding.workspace import GitRunner, WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import GitIdentityMissingError, GitRunner, WorkspaceError, WorkspaceManager
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -464,13 +464,56 @@ def test_multi_repository_commit_rolls_back_commits_without_losing_changes(
 
     monkeypatch.setattr(manager.workspaces, "commit", fail_second_commit)
 
-    with pytest.raises(WorkspaceError, match="No repositories were committed"):
+    with pytest.raises(WorkspaceError, match="No repositories were committed: simulated commit failure. All task changes"):
         manager.commit(list(prepared.workspaces), "Prepare change")
 
     for workspace in prepared.workspaces:
         root = Path(workspace.workspace_path)
         assert git(root, "rev-parse", "HEAD") == original_revisions[workspace.folder_id]
         assert (root / "README.md").read_text(encoding="utf-8") == "task\n"
+        assert git(root, "status", "--short") == "M README.md"
+
+
+def test_multi_repository_commit_asks_for_a_git_identity_before_touching_any_repository(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # A fresh Windows account: no user.name or user.email anywhere Git looks.
+    global_config = tmp_path / "gitconfig"
+    global_config.write_text("[user]\n\tuseConfigOnly = true\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for variable in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+        monkeypatch.delenv(variable, raising=False)
+    repositories = [repository(tmp_path, name) for name in ("frontend", "server")]
+    project = CodeProject(
+        id="project-commit-identity",
+        name="Commit identity",
+        folders=[
+            ProjectFolder(id=name, name=name.title(), path=str(repo))
+            for name, repo in zip(("frontend", "server"), repositories, strict=True)
+        ],
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = manager.prepare("session-commit-identity", project)
+    # Only the second repository lacks an identity; the first must not be committed either.
+    second = Path(prepared.workspaces[1].workspace_path)
+    git(second, "config", "--unset", "user.name")
+    git(second, "config", "--unset", "user.email")
+    for workspace in prepared.workspaces:
+        (Path(workspace.workspace_path) / "README.md").write_text("task\n", encoding="utf-8")
+    original_revisions = {
+        workspace.folder_id: git(Path(workspace.workspace_path), "rev-parse", "HEAD")
+        for workspace in prepared.workspaces
+    }
+
+    with pytest.raises(GitIdentityMissingError) as raised:
+        manager.commit(list(prepared.workspaces), "Prepare change")
+
+    assert raised.value.missing == ["user.name", "user.email"]
+    for workspace in prepared.workspaces:
+        root = Path(workspace.workspace_path)
+        assert git(root, "rev-parse", "HEAD") == original_revisions[workspace.folder_id]
         assert git(root, "status", "--short") == "M README.md"
 
 
