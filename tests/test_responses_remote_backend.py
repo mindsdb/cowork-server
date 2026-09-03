@@ -9,6 +9,7 @@ the persistence layer inside _produce_remote) are stubbed.
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -186,6 +187,7 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
     await handler._produce_remote(
         conv_id=uuid4(), input_text="hi", original_content="hi",
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        turn_llm={"correlation_id": "corr-remote-failure"},
     )
 
     assert saved["user"] == "hi"
@@ -193,9 +195,169 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
     assert saved["finalized"] is True
     assert saved["finalized_id"] == saved["user_id"]
     assert saved["assistant"] == "partial"
-    # Persisted events mirror the streamed response.failed frame.
+    # Persisted events mirror the streamed response.failed frame, now with the
+    # turn's own correlation id — so a report of "An unexpected error
+    # occurred" can be pinned to this turn's server logs.
     assert saved["events"][-1] == {"type": "response.failed", "code": "anton_error",
-                                   "error": "An unexpected error occurred."}
+                                   "error": "An unexpected error occurred.",
+                                   "request_id": "corr-remote-failure"}
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_mints_a_request_id_when_none_was_resolved_upstream(monkeypatch):
+    # Most turns never go through the router gate that pre-mints a correlation
+    # id (_router_binding) — turn_llm is usually None. The failure frame must
+    # still carry SOME id rather than silently going without.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    request_id = saved["events"][-1]["request_id"]
+    assert isinstance(request_id, str) and request_id
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_request_id_matches_the_turns_own_correlation_id(monkeypatch):
+    # The whole point of request_id is that it's a lookup key into THIS turn's
+    # own server-side logs/Redis keys — which are all keyed off the exact
+    # correlation_id stream_remote_replies was called with. A mismatch here
+    # would make the "Reference: ..." the user sees point at nothing.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert captured["correlation_id"]
+    assert saved["events"][-1]["request_id"] == captured["correlation_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_error", ["cancelled", "RuntimeError: cancelled"])
+async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_failure(
+    monkeypatch, wire_error,
+):
+    # scratchpad-controller publishes a cancel two ways when a /cancel reaches
+    # the wrong replica and it discards the pod after the fact: the bare
+    # literal from its own cancel branch, and the _fail_job-shaped one a
+    # keepalive-driven cancel unwinds into — the only shape reachable while
+    # the pod is still starting. Neither carries a type prefix this classifier
+    # maps, so without this both fall to the fully generic anton_error and a
+    # routine Stop persists as a red error row that survives reload — the
+    # opposite of the live path, which silently swallows a cancel.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": wire_error}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+
+    assert frames[-1] == "CLOSE:cancelled"
+    assert not any("response.failed" in f for f in frames)
+    assert saved["assistant"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_frame_and_log_both_carry_the_request_id(monkeypatch, caplog):
+    # The id is only useful if BOTH ends hold it: the SSE frame is what the
+    # client turns into the "Reference" a user quotes, and a log line at or
+    # above WARNING is what support can search for — the deployed environments
+    # run at WARNING, so an INFO-only record resolves to nothing there.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=RecBuffer(),
+            turn_llm={"correlation_id": "corr-both-ends"},
+        )
+
+    failed = [f for f in frames if "response.failed" in f]
+    assert failed and "corr-both-ends" in failed[-1]
+    assert any(
+        "corr-both-ends" in r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    )
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_unclassified_crash_still_carries_a_request_id(monkeypatch):
+    # A crash in cowork-server's OWN consumption of the reply stream (a bug in
+    # the formatter, a dropped Redis connection) never goes through
+    # remote_turn_error at all — it lands in the flat `except Exception`
+    # below. That path must still attach a request id, same as a classified
+    # turn_failed reply.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        raise RuntimeError("formatter blew up")
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        turn_llm={"correlation_id": "corr-unclassified-crash"},
+    )
+
+    assert saved["events"][-1] == {"type": "response.failed", "code": "anton_error",
+                                   "error": "An unexpected error occurred.",
+                                   "request_id": "corr-unclassified-crash"}
 
 
 @pytest.mark.asyncio
