@@ -35,6 +35,7 @@ from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.backend import get_backend
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -55,7 +56,8 @@ from cowork.handlers.turn_errors import (
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
-    REMOTE_CANCEL_ERRORS,
+    REMOTE_CANCEL_LITERAL,
+    REMOTE_CANCEL_VIA_FAIL_JOB,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
@@ -132,6 +134,37 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
             "text": "",
         })
     return synthesized
+
+
+async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bool:
+    """Whether a remote ``turn_failed`` is the user's own Stop, not a failure.
+
+    ``REMOTE_CANCEL_LITERAL`` is proof on its own. ``REMOTE_CANCEL_VIA_FAIL_JOB``
+    is not: a controller replica taking SIGTERM mid-turn unwinds through the
+    same handler that a keepalive-driven cancel does, so the string cannot tell
+    a Stop from a rolling deploy killing the turn.
+
+    The cancel flag separates them. ``/cancel`` writes it, the producer clears
+    a stale one before each turn, and the keepalive-driven path never clears
+    it — so its presence means a user asked for this turn to stop. A shutdown
+    abort leaves no flag and stays a failure, which is the outcome that earns
+    an error frame and a lookup id.
+    """
+    if error == REMOTE_CANCEL_LITERAL:
+        return True
+    if error != REMOTE_CANCEL_VIA_FAIL_JOB:
+        return False
+    try:
+        return bool(await get_redis().exists(cancel_flag_key(correlation_id)))
+    except Exception:
+        # Redis is how the reply being classified arrived, so this is close to
+        # unreachable. Read as a failure rather than a cancel: a visible error
+        # carrying an id is the recoverable way to be wrong here.
+        logger.exception(
+            "[responses] could not read the cancel flag for correlation_id=%s; "
+            "treating the turn as failed", correlation_id,
+        )
+        return False
 
 
 async def _seal_unterminated_buffer(
@@ -984,18 +1017,17 @@ class ResponsesHandler:
                         # try must still run on a clean finish.
                         break
                     elif kind == "turn_failed":
-                        if data.get("error") in REMOTE_CANCEL_ERRORS:
-                            # The controller's own cancel paths — a /cancel
-                            # that reached a replica which doesn't own the
-                            # producer sets the Redis flag only, so the
-                            # controller discards the pod and reports it as
-                            # a turn_failed carrying one of two literals
-                            # (see REMOTE_CANCEL_ERRORS; neither reaches
-                            # remote_turn_error, which would collapse them
-                            # to anton_error). Route them through the same
-                            # path a locally-aborted turn takes: partial
-                            # text persists, no response.failed frame, no
-                            # error bubble on reload.
+                        if await _remote_cancel_confirmed(data.get("error"), corr):
+                            # A /cancel that reached a replica which doesn't
+                            # own the producer sets the Redis flag only, so
+                            # the controller is what discards the pod and it
+                            # reports the stop as a turn_failed. Neither of
+                            # its cancel literals reaches remote_turn_error,
+                            # which would collapse them to anton_error.
+                            # Route them through the same path a locally
+                            # aborted turn takes: partial text persists, no
+                            # response.failed frame, no error bubble on
+                            # reload.
                             raise asyncio.CancelledError()
                         failure.update(data)
                         raise _RemoteTurnFailed()

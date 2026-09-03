@@ -20,7 +20,7 @@ from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
@@ -260,7 +260,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line.
-    await r.delete(f"cowork:cancel:{corr}")
+    await r.delete(cancel_flag_key(corr))
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
     # No client-picked model → the deployment's resolved default (org mode: the
