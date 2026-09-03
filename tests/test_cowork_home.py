@@ -109,16 +109,24 @@ def test_explicit_database_uri_still_overrides_cowork_home(monkeypatch, tmp_path
 
 
 def test_explicit_state_path_still_overrides_cowork_home(monkeypatch, tmp_path):
-    # OAuthSettings.state_path has no validation_alias, so pydantic-settings
-    # falls back to the bare uppercased field name: STATE_PATH, not a
-    # COWORK_-prefixed name (same pattern as MASTER_KEY_PATH). The cowork-server
-    # Helm values file relies on this exact name to keep OAuth state off the
-    # shared EFS tree; this pins it so a future validation_alias addition
-    # can't silently change the env var cloud config depends on.
+    # OAuthSettings.state_path now carries a validation_alias, and STATE_PATH is
+    # deliberately kept as one of its choices: the cowork-server Helm values file
+    # sets that exact name to keep OAuth state off the shared EFS tree, and an
+    # alias list without it would drop the bare field-name fallback cloud config
+    # depends on. This pins both names.
     monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("STATE_PATH", "/home/app/oauth_state.json")
 
     assert OAuthSettings(_env_file=None).state_path == "/home/app/oauth_state.json"
+
+
+def test_cowork_oauth_state_path_overrides_cowork_home(monkeypatch, tmp_path):
+    # The desktop sets this per account, so one account's in-flight connector
+    # authorization cannot complete into another account's vault.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_OAUTH_STATE_PATH", str(tmp_path / "acct" / "oauth_state.json"))
+
+    assert OAuthSettings(_env_file=None).state_path == str(tmp_path / "acct" / "oauth_state.json")
 
 
 # pod_local_only, the mechanism that keeps scratch/deployment-local state

@@ -448,8 +448,16 @@ class OAuthSettings(Settings):
     )
     state_path: str = Field(
         default_factory=lambda: str(cowork_home() / "oauth_state.json"),
-        description="Path to the file used to persist pending OAuth state",
-    )
+        # STATE_PATH stays first-class: the cowork-server Helm values file sets it
+        # to keep OAuth state off the shared EFS tree, and adding an alias would
+        # otherwise drop the bare field-name fallback it relies on.
+        validation_alias=AliasChoices("COWORK_OAUTH_STATE_PATH", "STATE_PATH"),
+        description=(
+            "Path to the file used to persist pending OAuth state. Overridable so a "
+            "desktop with several accounts does not let one account's in-flight "
+            "authorization complete into another account's vault."
+        ),
+    )  # COWORK_OAUTH_STATE_PATH or STATE_PATH
     auth_service_base_url: str = Field(
         default="",
         validation_alias=AliasChoices("AUTH_SERVICE_BASE_URL", "COWORK_TURN_AUTH_INTERNAL_BASE_URL"),

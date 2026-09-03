@@ -161,3 +161,88 @@ def test_coding_root_defaults_to_the_shared_home(monkeypatch):
         assert Path(get_app_settings().coding.root_dir) == cowork_home() / "coding"
     finally:
         get_app_settings.cache_clear()
+
+
+def test_every_store_rooted_at_cowork_home_is_overridable(default_root):
+    """A store whose default hangs off cowork_home() is shared by every account
+    on the machine unless the desktop can point it elsewhere. This enumerates
+    them so ADDING one fails here instead of silently leaking, and so each new
+    one forces a decision about whether it is per-account.
+
+    The desktop's own map lives in cowork/src/main/account-data.ts; the values
+    below are the env aliases it sets.
+    """
+    from pydantic_settings import BaseSettings
+
+    import cowork.harnesses.anton_harness.settings as anton_settings
+    import cowork.harnesses.hermes_harness.settings as hermes_settings
+    from cowork.common.settings import app_settings as app
+
+    # group/field -> the env alias the desktop sets, or None when the store is
+    # deliberately left shared (with the reason).
+    overridable: dict[tuple[str, str], str | None] = {
+        ("DatabaseSettings", "uri"): "DATABASE_URI",
+        ("ProjectSettings", "root_dir"): "COWORK_PROJECTS_DIR",
+        ("FileSettings", "root_dir"): "COWORK_FILES_DIR",
+        ("MemorySettings", "root_dir"): "COWORK_MEMORY_DIR",
+        ("ConnectorSettings", "vault_dir"): "COWORK_VAULT_DIR",
+        ("StreamSettings", "dir"): "COWORK_STREAMS_DIR",
+        ("CodingSettings", "root_dir"): "COWORK_CODING_DIR",
+        ("SkillSettings", "root_dir"): "COWORK_SKILLS_DIR",
+        ("OAuthSettings", "state_path"): "COWORK_OAUTH_STATE_PATH",
+        ("HermesHarnessSettings", "root_dir"): "HERMES_ROOT_DIR",
+        ("AntonHarnessSettings", "skills_root_dir"): "ANTON_SKILLS_ROOT_DIR",
+        # Shared on purpose: one key per machine. A per-account key would orphan
+        # vault contents on any path that crosses roots, and the vault directory
+        # itself is per-account above.
+        ("AppSettings", "master_key_path"): None,
+        # Org mode only; local mode never reads it.
+        ("StorageSettings", "shared_root"): None,
+    }
+
+    groups = [
+        getattr(app, name)
+        for name in dir(app)
+        if isinstance(getattr(app, name), type)
+        and issubclass(getattr(app, name), BaseSettings)
+    ]
+    groups += [
+        hermes_settings.HermesHarnessSettings,
+        anton_settings.AntonHarnessSettings,
+    ]
+
+    home = str(cowork_home())
+    found: set[tuple[str, str]] = set()
+    for group in groups:
+        for field_name, field in getattr(group, "model_fields", {}).items():
+            factory = getattr(field, "default_factory", None)
+            if factory is None:
+                continue
+            try:
+                value = factory()
+            except Exception:
+                continue
+            # The aggregate fields on AppSettings build a whole settings group;
+            # only their own leaf paths matter, and those are reached directly.
+            if isinstance(value, BaseSettings):
+                continue
+            if home in str(value):
+                found.add((group.__name__, field_name))
+
+    unexpected = found - set(overridable)
+    assert not unexpected, (
+        "store(s) rooted at cowork_home() with no per-account decision: "
+        f"{sorted(unexpected)}. Add an override in "
+        "cowork/src/main/account-data.ts and list it here, or record why it "
+        "stays shared."
+    )
+
+    # Every alias we claim to use must really be accepted by that field.
+    by_name = {g.__name__: g for g in groups}
+    for (group_name, field_name), alias in overridable.items():
+        if alias is None or group_name == "DatabaseSettings":
+            continue  # nested: DATABASE_URI resolves via env_nested_delimiter
+        field = by_name[group_name].model_fields[field_name]
+        aliases = getattr(field, "validation_alias", None)
+        names = {str(c) for c in getattr(aliases, "choices", [aliases] if aliases else [])}
+        assert alias in names, f"{group_name}.{field_name} does not accept {alias}"
