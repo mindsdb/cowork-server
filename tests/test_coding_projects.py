@@ -108,11 +108,14 @@ def test_a_project_can_carry_a_default_reasoning_effort(tmp_path: Path) -> None:
     cleared = service.update(project.id, ProjectUpdateRequest(default_reasoning_effort=None))
     assert cleared.default_reasoning_effort is None
 
+    # Levels are the gateway's vocabulary (GPT 5.6 Sol goes up to "max"), so the
+    # request type only pins the shape of a level; the model's own list decides.
+    assert ProjectUpdateRequest(default_reasoning_effort="max").default_reasoning_effort == "max"
     with pytest.raises(ValidationError):
         ProjectCreateRequest(
             name="Effort",
             folders=[ProjectFolder(id="project", name="Project", path=str(folder))],
-            default_reasoning_effort="extreme",
+            default_reasoning_effort="Extra high",
         )
 
 

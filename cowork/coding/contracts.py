@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from cowork.coding.redaction import redact_text, sanitize
 
@@ -38,7 +38,11 @@ class PermissionMode(str, Enum):
     full_access = "full_access"
 
 
-ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+# A reasoning effort is the model gateway's word for a level, advertised per
+# model by MindsHub's /v1/models (GPT 5.6 Sol: none … max; Claude: low … max;
+# Gemini: low … high). The server passes it through, so this only pins the shape
+# of a level; cowork.coding.reasoning checks it against the chosen model's list.
+ReasoningEffort = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
 ServiceTier = Literal["standard", "priority"]
 Personality = Literal["none", "friendly", "pragmatic"]
 

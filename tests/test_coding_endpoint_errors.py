@@ -101,3 +101,66 @@ def test_registration_tokens_without_a_body_stay_anonymous(monkeypatch: pytest.M
     assert issued.pending is None
     assert coding.coding_computers().pending == []
 
+# gemini advertises three levels; gpt is deliberately absent from the listing, so
+# the gateway remains the judge for it.
+LEVELS = SimpleNamespace(ids=["gemini"], efforts={"gemini": {"efforts": ["low", "medium", "high"], "default": "high"}})
+
+
+def _settings_with(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(coding, "_settings", lambda _session, _scope: SimpleNamespace(minds_url="https://api.mindshub.ai/v1", coding_agent_model="gpt"))
+    monkeypatch.setattr(coding, "cached_minds_models", lambda _url: LEVELS)
+
+
+def test_a_project_default_effort_its_model_lacks_is_refused_before_saving(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding.project_models import ProjectUpdateRequest
+
+    _settings_with(monkeypatch)
+    saved: list = []
+    projects = SimpleNamespace(
+        get=lambda _id: SimpleNamespace(default_model="gemini"),
+        update=lambda *args: saved.append(args),
+    )
+    monkeypatch.setattr(coding, "_service", lambda: SimpleNamespace(projects=projects))
+
+    with pytest.raises(HTTPException) as raised:
+        coding.update_code_project("p1", ProjectUpdateRequest(default_reasoning_effort="max"), session=None, scope=None)
+
+    assert raised.value.status_code == 400
+    assert raised.value.detail == 'Reasoning effort "max" isn\'t available for gemini. It offers: low, medium, high.'
+    assert saved == []
+
+
+def test_a_project_default_effort_its_model_offers_is_saved(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding.project_models import ProjectUpdateRequest
+
+    _settings_with(monkeypatch)
+    projects = SimpleNamespace(
+        get=lambda _id: SimpleNamespace(default_model="gpt"),
+        update=lambda project_id, body: {"id": project_id, "default_reasoning_effort": body.default_reasoning_effort},
+    )
+    monkeypatch.setattr(coding, "_service", lambda: SimpleNamespace(projects=projects))
+
+    # gemini's levels apply when the same request moves the project onto gemini.
+    with pytest.raises(HTTPException):
+        coding.update_code_project("p1", ProjectUpdateRequest(default_model="gemini", default_reasoning_effort="max"), session=None, scope=None)
+    # gpt isn't in the listing, so the gateway remains the judge and the save goes through.
+    assert coding.update_code_project("p1", ProjectUpdateRequest(default_reasoning_effort="max"), session=None, scope=None)["default_reasoning_effort"] == "max"
+
+
+def test_task_controls_check_the_effort_against_the_model_they_switch_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding.contracts import SessionUpdateRequest
+
+    _settings_with(monkeypatch)
+    applied: list = []
+    service = SimpleNamespace(
+        get_session=lambda _id: SimpleNamespace(model="gpt"),
+        update_session_config=lambda session_id, body: applied.append((session_id, body.reasoning_effort)),
+    )
+    monkeypatch.setattr(coding, "_service", lambda: service)
+
+    with pytest.raises(HTTPException) as raised:
+        coding.update_session("s1", SessionUpdateRequest(model="gemini", reasoning_effort="max"), session=None, scope=None)
+    assert raised.value.status_code == 400
+
+    coding.update_session("s1", SessionUpdateRequest(model="gemini", reasoning_effort="low"), session=None, scope=None)
+    assert applied == [("s1", "low")]
