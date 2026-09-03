@@ -2721,3 +2721,4 @@ def test_a_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) 
     assert after.run_id == before.run_id
     assert len(status_events) == 1
     assert status_events[0].text.startswith("Status: completed")
+    assert status_events[0].data["command"] == "status"
