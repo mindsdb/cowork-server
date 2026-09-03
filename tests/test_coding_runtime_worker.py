@@ -875,6 +875,9 @@ def test_code_only_runtime_routes_steering_and_cancellation_without_losing_claim
         for kind, payload in client.events
     )
     assert ("turn_completed", {"status": "cancelled"}) in client.events
+    status_payload = next(payload for kind, payload in client.events if kind == "event" and (payload.get("event") or {}).get("title") == "Task status")
+    assert status_payload["event"]["data"]["command"] == "status"
+
 
 
 def _remote_lease(tmp_path: Path, name: str) -> tuple[RuntimeLease, RuntimeCommand]:
