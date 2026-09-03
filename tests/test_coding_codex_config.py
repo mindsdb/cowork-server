@@ -54,3 +54,15 @@ def test_every_codex_override_is_a_single_toml_assignment() -> None:
     assert parsed["service_tier"] == INJECTED_EFFORT
     assert parsed["personality"] == INJECTED_EFFORT
     assert parsed["model"] == "fable"
+
+
+def test_codex_retry_budget_is_bounded_on_the_mindshub_provider() -> None:
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(model="gpt", permission_mode=PermissionMode.supervised),
+        Path("/tmp/workspace"),
+        "http://127.0.0.1:1/api/v1/coding/inference",
+    )
+
+    assert "model_providers.mindshub.request_max_retries=1" in launch.config_overrides
+    assert "model_providers.mindshub.stream_max_retries=2" in launch.config_overrides
+    assert (codex_config.REQUEST_MAX_RETRIES + 1) * (codex_config.STREAM_MAX_RETRIES + 1) <= 6

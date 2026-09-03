@@ -597,7 +597,7 @@ class ControlPlaneService:
             transition_run(
                 run,
                 RunStatus.failed,
-                error=redact_text(str(event.payload.get("detail", "Runtime failed")))[:4_000],
+                error=redact_text(str(event.payload.get("message") or event.payload.get("detail") or "Runtime failed"))[:4_000],
             )
 
     def queue_command(
