@@ -343,3 +343,87 @@ class TestTheWebSurfaceIsNotReachableYet:
         # Local tenancy runs in-process, so the kwarg reaches a real turn.
         _patch_surface_inputs(monkeypatch, tenancy="local")
         assert build_info.surface() == "desktop"
+
+
+class TestSupportedKwargs:
+    """This server pins anton to a rev, so a config field it knows about can be
+    missing from the installed copy. Passing it anyway raises on every turn."""
+
+    def test_a_declared_field_is_passed_through(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class Config:
+            known: str | None = None
+
+        assert build_info.supported_kwargs(Config, known="v") == {"known": "v"}
+
+    def test_an_undeclared_field_is_dropped_not_raised(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class OldConfig:
+            other: str | None = None
+
+        kwargs = build_info.supported_kwargs(OldConfig, missing="v")
+
+        assert kwargs == {}
+        OldConfig(**kwargs)  # would be a TypeError without the gate
+
+    def test_the_turn_config_is_constructible_with_the_gated_kwarg(self):
+        """The real thing: whatever anton is installed, building the turn's
+        config with the overlay kwarg must not raise."""
+        from anton.core.session import ChatSessionConfig
+
+        ChatSessionConfig(
+            llm_client=None,
+            **build_info.supported_kwargs(
+                ChatSessionConfig, workspace_env_overlay={"A": "b"}
+            ),
+        )
+
+
+class TestOverlayFallbackAtAnOldPin:
+    """Dropping the kwarg must not silently discard the project's .env.
+
+    With an anton that cannot carry the overlay, the harness falls back to
+    loading it the old way, so a desktop scratchpad keeps seeing project
+    values instead of losing them between this merge and the pin bump.
+    """
+
+    def test_the_turn_builder_routes_through_the_fallback(self):
+        """The helper is only useful if the turn builder actually calls it."""
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        # Compiled names rather than source text: a commented-out call still
+        # reads as present in the source, and renames are not the risk here.
+        names = AntonHarness._build_chat_session.__code__.co_names
+        assert "_apply_overlay_fallback" in names
+
+    def test_the_fallback_applies_only_when_the_kwarg_was_dropped(self):
+        from unittest.mock import Mock
+
+        from cowork.harnesses.anton_harness.harness import _apply_overlay_fallback
+
+        workspace = Mock()
+        overlay = {"MY_PROJECT_VAR": "v"}
+
+        # Kwarg carried the overlay: nothing to fall back to.
+        assert _apply_overlay_fallback(workspace, overlay, {"workspace_env_overlay": overlay}) is False
+        workspace.apply_env_to_process.assert_not_called()
+
+        # Kwarg dropped: load it the old way rather than losing it.
+        assert _apply_overlay_fallback(workspace, overlay, {}) is True
+        workspace.apply_env_to_process.assert_called_once()
+
+    def test_org_mode_cannot_reach_the_fallback(self):
+        """Org mode yields an empty overlay, and the guard needs a non-empty
+        one, so the untrusted shared .env is never applied to this process."""
+        from unittest.mock import Mock
+
+        from cowork.harnesses.anton_harness.harness import _apply_overlay_fallback
+
+        workspace = Mock()
+
+        assert _apply_overlay_fallback(workspace, {}, {}) is False
+        workspace.apply_env_to_process.assert_not_called()
