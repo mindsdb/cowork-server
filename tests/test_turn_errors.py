@@ -1462,6 +1462,34 @@ def test_no_return_emits_a_literal_code():
     assert offenders == []
 
 
+# ── The non-streaming path carries the code too ───────────────────────────
+# The streaming twin has a per-code test each. This sweeps the same codes
+# through _collect so its raise cannot drop one while those stay green.
+
+@pytest.mark.parametrize(
+    "exc, expected_code",
+    [
+        (Exception(_TOKEN_LIMIT_MESSAGE), te.TOKEN_LIMIT_CODE),
+        (ProviderAuthError("provider rejected the credential"), te.AUTH_ERROR_CODE),
+        (_FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet"), te.MODEL_ACCESS_DENIED_CODE),
+        (_FakeModelErr("", "model_disabled", "sonnet"), te.MODEL_DISABLED_CODE),
+        (_FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet"), te.PROVIDER_OVERLOADED_CODE),
+    ],
+)
+def test_collect_400_carries_the_code_for_each_carded_code(exc, expected_code):
+    handler = _handler_with_raising_formatter(exc)
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(
+            handler._collect(
+                stream=None, conversation_id=uuid4(), model="anton", original_content="hi"
+            )
+        )
+    assert err.value.status_code == 400
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == expected_code
+    assert err.value.detail["error"]
+
+
 # ── Wiring coverage (ENG-1537 review finding 3) ────────────────────────────
 # Four mutations survived the full suite: the reset_at and retry_after extras
 # in responses.py, the never-throttle exemption, and PHASE_LABELS.
