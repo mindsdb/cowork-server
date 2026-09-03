@@ -923,6 +923,15 @@ class UserSettings(Settings):
             raise ValueError(f"Unknown harness '{v}'. Available: {available}")
         return v
 
+    @field_validator("coding_agent_model")
+    @classmethod
+    def _canonical_coding_agent_model(cls, value: str) -> str:
+        # Installations that saved the retired "gpt-5.6-sol" id keep working:
+        # the stored row is read back as the catalogue id the model list uses.
+        from cowork.coding.project_models import canonical_model_id
+
+        return canonical_model_id(value)
+
     @field_validator("coding_agent_engine")
     @classmethod
     def validate_coding_agent_engine(cls, value: str) -> str:
