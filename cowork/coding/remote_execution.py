@@ -543,16 +543,21 @@ class RemoteExecutionCoordinator:
                 phase="pending",
             )
         title = _STATUS_TITLES.get(run.status, "Task updated")
+        failure = {
+            key: redact_text(str(event.payload[key]))[:4_000]
+            for key in ("code", "detail", "model")
+            if run.status == RunStatus.failed and event.payload.get(key)
+        }
         return None, CodingEvent(
             type=EventType.error if run.status == RunStatus.failed else EventType.session,
             title=title,
-            text=redact_text(str(event.payload.get("detail") or run.last_error or "")),
+            text=redact_text(str(event.payload.get("message") or event.payload.get("detail") or run.last_error or "")),
             phase=(
                 "failed" if run.status in {RunStatus.failed, RunStatus.interrupted}
                 else "completed" if run.status in {RunStatus.completed, RunStatus.cancelled}
                 else "pending"
             ),
-            data={"computerId": run.computer_id, "runId": run.id, "runStatus": run.status.value},
+            data={"computerId": run.computer_id, "runId": run.id, "runStatus": run.status.value, **failure},
         )
 
 

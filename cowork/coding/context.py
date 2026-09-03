@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import os
 import hashlib
+import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from cowork.coding.contracts import CodingSession, InputReference
@@ -125,10 +127,73 @@ def validate_directories(directories: list[str]) -> list[str]:
     return resolved
 
 
-def safe_engine_error(message: str, credentials: EngineCredentials) -> str:
+def safe_engine_error(message: str, credentials: EngineCredentials | None) -> str:
     safe = message[:8_192] or "Unknown coding-agent error"
-    secrets = (credentials.minds_api_key,) if credentials.minds_api_key else ()
+    secrets = (credentials.minds_api_key,) if credentials and credentials.minds_api_key else ()
     return redact_text(safe, secrets)
+
+
+@dataclass(frozen=True)
+class EngineFailure:
+    """A terminal engine failure as the UI should present it."""
+
+    message: str
+    code: str = ""
+    detail: str = ""
+    model: str = ""
+
+    def event_data(self) -> dict[str, str]:
+        return {key: value for key, value in (("code", self.code), ("detail", self.detail), ("model", self.model)) if value}
+
+
+FAILURE_MESSAGES = {
+    "insufficient_credits": "This model needs credits. Add credits or choose another model.",
+    "model_authentication_failed": (
+        "Your sign-in does not match this server. Sign in again, or switch back to the environment you signed into."
+    ),
+    "model_unavailable": "This model is not available to your account. Choose another model.",
+}
+
+_FAILURE_MARKERS = (
+    ("insufficient_credits", ("402 payment required", "wallet has no balance", "insufficient credits")),
+    ("model_authentication_failed", ("401 unauthorized", "403 forbidden", "invalid api key")),
+    ("model_unavailable", ("404 not found: the model",)),
+)
+
+
+def classify_engine_failure(
+    message: str,
+    credentials: EngineCredentials | None = None,
+    model: str = "",
+) -> EngineFailure:
+    """Map a raw engine error onto a stable code with a user-facing message.
+
+    The inference proxy answers deterministic upstream rejections with a JSON
+    error body carrying one of the ``FAILURE_MESSAGES`` codes; Codex surfaces
+    that body verbatim. The prose markers cover the status lines Codex reports
+    for responses that reached it without the rewrite.
+    """
+    safe = safe_engine_error(message, credentials)
+    code = _embedded_error_code(safe) or next(
+        (code for code, markers in _FAILURE_MARKERS if any(marker in safe.casefold() for marker in markers)),
+        "",
+    )
+    if code not in FAILURE_MESSAGES:
+        return EngineFailure(message=safe)
+    return EngineFailure(message=FAILURE_MESSAGES[code], code=code, detail=safe, model=model)
+
+
+def _embedded_error_code(text: str) -> str:
+    start = text.find("{")
+    if start < 0:
+        return ""
+    try:
+        payload = json.loads(text[start:])
+    except json.JSONDecodeError:
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else ""
 
 
 def is_context_exhaustion_error(message: str | None) -> bool:

@@ -1147,6 +1147,33 @@ def test_failed_adapter_stream_closes_the_runtime_before_another_turn_can_reuse_
     assert service.get_session(created.id).last_error == "adapter stream disconnected"
 
 
+def test_credit_exhaustion_is_reported_with_a_stable_code_and_the_technical_detail(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.events_error = True
+    engine.events_error_message = (
+        '{"error": {"message": "Your wallet has no balance to cover the model \'gpt\'.", '
+        '"type": "invalid_request_error", "code": "insufficient_credits", "upstream_status": 402}}'
+    )
+    service = service_with(tmp_path, engine)
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt"
+    )
+    wait_for_status(service, created.id, SessionStatus.failed)
+
+    failed = service.get_session(created.id)
+    error = [event for event in service.events(created.id).items if event.type == EventType.error][-1]
+    assert failed.last_error == "This model needs credits. Add credits or choose another model."
+    assert error.text == failed.last_error
+    assert error.data == {
+        "code": "insufficient_credits",
+        "detail": engine.events_error_message,
+        "model": "gpt",
+    }
+    assert engine.closed == 1
+
+
 def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
