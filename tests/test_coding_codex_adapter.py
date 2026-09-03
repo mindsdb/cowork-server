@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -309,14 +311,16 @@ def test_extension_inventory_normalizes_codex_skills_and_mcp_servers() -> None:
     assert inventory.mcp_servers[0].detail == "2 tools · 0 resources"
 
 
-def _codex_skill(name: str, path: Path, scope: str) -> SimpleNamespace:
+def _codex_skill(name: str, path: Path | None, scope: str) -> SimpleNamespace:
+    from openai_codex.generated.v2_all import AbsolutePathBuf
+
     return SimpleNamespace(
         name=name,
         description=f"{name} skill",
         short_description=None,
         enabled=True,
         scope=scope,
-        path=path,
+        path=AbsolutePathBuf(str(path)) if path else None,
     )
 
 
@@ -331,20 +335,21 @@ def _skills_inventory(skills: list[SimpleNamespace], skill_roots: tuple[Path, ..
     return inventory
 
 
-def test_extension_inventory_folds_a_skill_installed_in_both_skill_roots(tmp_path: Path) -> None:
+def test_extension_inventory_folds_a_skill_installed_in_both_skill_roots(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     snapshot_root = tmp_path / "snapshot"
     user_root = tmp_path / "codex" / "skills"
     user_copy = _codex_skill("Thermo Nuclear Review", user_root / "thermo-nuclear-review" / "SKILL.md", "user")
-    snapshot_copy = _codex_skill("thermo-nuclear-review", snapshot_root / "thermo-nuclear-review" / "SKILL.md", "repo")
+    snapshot_copy = _codex_skill("thermo-nuclear-review", snapshot_root / "thermo-nuclear-review" / "SKILL.md", "user")
 
     inventory = _skills_inventory([user_copy, snapshot_copy], (snapshot_root,))
 
-    assert [entry.path for entry in inventory.skills] == [str(snapshot_copy.path)]
+    assert [entry.path for entry in inventory.skills] == [str(snapshot_root / "thermo-nuclear-review" / "SKILL.md")]
     surviving = inventory.skills[0]
-    assert [hidden.path for hidden in surviving.supersedes] == [str(user_copy.path)]
+    assert [hidden.path for hidden in surviving.supersedes] == [str(user_root / "thermo-nuclear-review" / "SKILL.md")]
     assert surviving.supersedes[0].label == "Thermo Nuclear Review"
     assert surviving.supersedes[0].description == "Thermo Nuclear Review skill"
-    assert surviving.detail == "repo · also installed in user"
+    assert surviving.detail == "Task snapshot · also installed in your Codex skills folder"
     assert len({entry.id for entry in inventory.skills}) == len(inventory.skills)
 
 
@@ -367,7 +372,7 @@ def test_extension_inventory_keeps_a_pathless_skill_out_of_the_snapshot_root(tmp
 
     inventory = _skills_inventory([pathless, snapshot_copy], (snapshot_root,))
 
-    assert [entry.path for entry in inventory.skills] == [str(snapshot_copy.path)]
+    assert [entry.path for entry in inventory.skills] == [str(snapshot_root / "review" / "SKILL.md")]
     assert inventory.skills[0].supersedes[0].path is None
 
 
@@ -382,7 +387,24 @@ def test_extension_inventory_keeps_distinct_skills_and_single_user_skills_untouc
     assert [entry.id for entry in inventory.skills] == ["review", "deploy"]
     assert all(entry.supersedes == [] for entry in inventory.skills)
     assert inventory.skills[0].detail == "user"
-    assert inventory.skills[1].detail == "repo"
+    assert inventory.skills[1].detail == "Task snapshot"
+
+
+def test_extension_inventory_renders_hook_and_plugin_paths_as_plain_paths(tmp_path: Path) -> None:
+    from openai_codex.generated.v2_all import AbsolutePathBuf
+
+    inventory = ExtensionInventory()
+    hook = SimpleNamespace(
+        key="format", event_name="PostToolUse", enabled=True, source="user", trust_status="trusted",
+        source_path=AbsolutePathBuf(str(tmp_path / "hooks.json")),
+    )
+    add_extension_response(inventory, "hooks", SimpleNamespace(data=[SimpleNamespace(hooks=[hook])]))
+    plugin = SimpleNamespace(id="lint", name="lint", installed=True, enabled=True, interface=None)
+    marketplace = SimpleNamespace(name="Team", path=AbsolutePathBuf(str(tmp_path / "marketplace")), plugins=[plugin])
+    add_extension_response(inventory, "plugins", SimpleNamespace(marketplaces=[marketplace]))
+
+    assert inventory.hooks[0].path == str(tmp_path / "hooks.json")
+    assert inventory.plugins[0].path == str(tmp_path / "marketplace")
 
 
 def test_code_and_user_skill_roots_use_current_codex_rpc_name(monkeypatch, tmp_path: Path) -> None:
@@ -844,3 +866,38 @@ class _Payload:
 
     def model_dump(self, **_kwargs):
         return self.data
+
+
+def test_steer_does_not_wait_forever_when_codex_never_answers(monkeypatch) -> None:
+    release = threading.Event()
+
+    class HangingClient:
+        def turn_steer(self, _thread_id: str, _turn_id: str, _items) -> None:
+            release.wait(timeout=5)
+
+    monkeypatch.setattr(codex_module, "_STEER_TIMEOUT_SECONDS", 0.05)
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = HangingClient()
+    engine_session._session_id = "session-1"
+    engine_session._goal_states = {}
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="did not accept the instruction in time"):
+        engine_session.steer("turn-1", "Change direction")
+    release.set()
+
+    assert time.monotonic() - started < 2
+
+
+def test_steer_relays_the_codex_error_when_it_answers_in_time() -> None:
+    class RejectingClient:
+        def turn_steer(self, _thread_id: str, _turn_id: str, _items) -> None:
+            raise RuntimeError("turn is not active")
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = RejectingClient()
+    engine_session._session_id = "session-1"
+    engine_session._goal_states = {}
+
+    with pytest.raises(RuntimeError, match="turn is not active"):
+        engine_session.steer("turn-1", "Change direction")

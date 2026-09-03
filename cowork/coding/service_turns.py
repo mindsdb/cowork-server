@@ -190,6 +190,10 @@ class CodingTurnOperations:
         attachments: list[InputReference] | tuple[InputReference, ...] = (),
     ) -> CodingSession:
         session = self.get_session(session_id)
+        if session.pending_approval is not None:
+            # Codex does not accept turn/steer while the turn waits on an
+            # approval, so the request would hang until the decision arrives.
+            raise StateConflict("Resolve the pending approval first; the instruction can be queued meanwhile")
         if self._is_remote(session):
             if not session.run_id:
                 raise RuntimeError("Remote task is missing its Task Run")
