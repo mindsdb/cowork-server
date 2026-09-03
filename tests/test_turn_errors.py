@@ -376,6 +376,7 @@ def test_collect_repairs_conversation_on_content_validation_error():
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(stream=None, conversation_id=conv_id, model="anton", original_content="hi"))
         assert err.value.status_code == 400
+        assert err.value.detail["code"] == te.CONTENT_RECOVERY_CODE
         conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
 
 
@@ -1526,9 +1527,11 @@ def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, ex
 def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
     """The rungs below the gateway header, asserted on the 400 it raises.
 
-    Two of the inventory's codes are deliberately absent from both sweeps.
-    ``content_recovery`` runs the conversation-repair branch and has its own
-    test above, which already pins the 400. ``worker_unresponsive`` comes from
+    Three of the inventory's codes are absent from both sweeps, each pinned
+    elsewhere or unreachable. ``content_recovery`` runs the conversation-repair
+    branch and is pinned by its own test above. ``anton_error`` is the
+    unmapped fallback, pinned by the 500 test above and by the wire test's
+    ``unmapped-500`` row. ``worker_unresponsive`` comes from
     ``remote_turn_error``, a different mapper that this path never calls.
     """
     handler = _handler_with_raising_formatter(exc)
