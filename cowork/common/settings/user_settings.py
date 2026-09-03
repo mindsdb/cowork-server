@@ -536,7 +536,7 @@ class UserSettings(Settings):
         description="The agent engine used by the separate Code workspace.",
     )
     coding_agent_model: str = Field(
-        default="gpt-5.6-sol",
+        default="gpt",
         min_length=1,
         max_length=256,
         title="Coding Agent Model",

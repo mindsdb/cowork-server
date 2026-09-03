@@ -43,7 +43,7 @@ def test_show_dots_default_is_true():
 def test_coding_agent_defaults_are_codex_over_mindshub() -> None:
     settings = UserSettings.model_validate({})
     assert settings.coding_agent_engine == "codex"
-    assert settings.coding_agent_model == "gpt-5.6-sol"
+    assert settings.coding_agent_model == "gpt"
 
 
 def test_unknown_coding_agent_engine_is_rejected() -> None:
