@@ -112,6 +112,10 @@ class FakeSession:
             yield CodingEvent(type=EventType.session, data={"status": "interrupted"})
             return
         yield CodingEvent(type=EventType.agent_message, text="done", item_id="message-1")
+        if self.engine.turn_failure_message:
+            yield CodingEvent(type=EventType.error, title="Agent error", text=self.engine.turn_failure_message, phase="failed")
+            yield CodingEvent(type=EventType.session, title="Task failed", phase="failed", data={"status": "failed"})
+            return
         yield CodingEvent(type=EventType.session, data={"status": "completed"})
 
     def steer(self, turn_id: str, prompt: str, attachments=()) -> None:
@@ -176,6 +180,7 @@ class FakeEngine:
         self.block_until_release = False
         self.events_error = False
         self.events_error_message = "adapter stream disconnected"
+        self.turn_failure_message = ""
         self.block_compact = False
         self.compact_started = threading.Event()
         self.release_compact = threading.Event()

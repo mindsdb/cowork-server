@@ -1174,6 +1174,38 @@ def test_credit_exhaustion_is_reported_with_a_stable_code_and_the_technical_deta
     assert engine.closed == 1
 
 
+def test_a_turn_codex_reports_as_failed_is_classified_at_its_terminal_event(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.turn_failure_message = (
+        '{"error": {"message": "Invalid API key", "type": "invalid_request_error", '
+        '"code": "model_authentication_failed", "upstream_status": 401}}'
+    )
+    service = service_with(tmp_path, engine)
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt"
+    )
+    wait_for_status(service, created.id, SessionStatus.failed)
+
+    failed = service.get_session(created.id)
+    events = service.events(created.id).items
+    terminal = [event for event in events if event.type == EventType.session and event.data.get("status") == "failed"][-1]
+    raw = [event for event in events if event.type == EventType.error][-1]
+    assert failed.last_error == (
+        "Your sign-in does not match this server. Sign in again, or switch back to the environment you signed into."
+    )
+    assert terminal.text == failed.last_error
+    assert terminal.data == {
+        "status": "failed",
+        "code": "model_authentication_failed",
+        "detail": engine.turn_failure_message,
+        "model": "gpt",
+    }
+    assert raw.text == engine.turn_failure_message
+    assert raw.data == {}
+
+
 def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
