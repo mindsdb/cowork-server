@@ -418,3 +418,27 @@ def test_git_reported_paths_are_revalidated_before_file_operations(
             manager._changes_since(tmp_path, "base")
         else:
             manager._status_entries(tmp_path)
+
+
+def test_a_local_copy_is_reviewable_and_applies_back_without_git(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    monkeypatch.setattr(subprocess, "run", missing_git)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-review-without-git", str(source), allow_direct_folder=True)
+
+    (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
+    (prepared.workspace_path / "added.txt").write_text("new\n", encoding="utf-8")
+
+    state = manager.git_state(str(source), str(prepared.workspace_path))
+    changed = {item.path: item.status for item in manager.diff(str(prepared.workspace_path), base_revision=None)}
+    applied = manager.local_copies.apply(source, prepared.workspace_path)
+
+    assert state.is_git is False
+    assert changed == {"notes.txt": "M", "added.txt": "A"}
+    assert sorted(applied) == ["added.txt", "notes.txt"]
+    assert (source / "notes.txt").read_text(encoding="utf-8") == "v2\n"
+    assert (source / "added.txt").read_text(encoding="utf-8") == "new\n"
