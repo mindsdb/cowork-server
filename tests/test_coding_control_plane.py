@@ -576,6 +576,30 @@ def test_recovered_run_can_be_leased_for_workspace_preparation(tmp_path: Path) -
     )).status == RunStatus.ready
 
 
+def test_recovery_plan_describes_reopening_not_resuming_the_turn(tmp_path: Path) -> None:
+    # Recovery re-provisions the run to ready; it never replays the interrupted
+    # turn, so the option copy must not promise that the work resumes.
+    service = ControlPlaneService(tmp_path, capabilities())
+    computer, _ = register(service, "Laptop")
+    snapshot = service.create_task_run(
+        task_id="reopen-run",
+        title="Reopen run",
+        prompt="Keep going",
+        project=None,
+        requested_resource_ids=None,
+        computer_id=computer.id,
+        engine_id="codex",
+    )
+    assert service.acquire_lease(computer.id) is not None
+    service.set_run_status(snapshot.run.id, RunStatus.interrupted)
+
+    plan = service.recovery_plan(snapshot.run.id)
+
+    assert [option.mode for option in plan.options] == ["restore"]
+    assert plan.options[0].detail.startswith("Reopen the saved working copy")
+    assert "Resume" not in plan.options[0].detail
+
+
 def test_cross_computer_recovery_recreates_only_portable_scoped_resources(tmp_path: Path) -> None:
     service = ControlPlaneService(tmp_path, capabilities())
     first_computer, _ = register(service, "First")

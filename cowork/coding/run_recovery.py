@@ -104,7 +104,7 @@ def _option(computer: Computer, *, preserves_changes: bool) -> RecoveryOption:
         preserves_workspace_changes=preserves_changes,
         recommended=preserves_changes,
         detail=(
-            "Resume the saved working copy and its current changes."
+            "Reopen the saved working copy and its current changes."
             if preserves_changes
             else "Create a fresh isolated working copy from the task's saved repository definitions. "
             "Changes that were not pushed are not carried over."

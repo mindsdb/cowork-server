@@ -86,7 +86,7 @@ class RemoteExecutionCoordinator:
             if run.status == RunStatus.awaiting_approval:
                 current.status = SessionStatus.awaiting_approval
             current.workspace_warning = (
-                "The computer stopped responding. Resume this task when it is available."
+                "The computer stopped responding. Reopen this task when it is available."
                 if run.status == RunStatus.recovering
                 else None
             )
