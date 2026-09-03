@@ -278,6 +278,19 @@ MISSING_ORGANIZATION_SUFFIX = (
     "has no organization_id; refusing to run a turn without an "
     "organization-scoped workspace"
 )
+# Anchored at the front as well, because the suffix test alone is the one
+# match here that a scrubbed "TypeName: message" could satisfy: an exception
+# whose message merely ENDS with the controller's phrasing would take this
+# branch ahead of its own, trading (say) the provider-auth card for workspace
+# copy.
+#
+# "job " is what the live path sends: _run_job catches MissingOrganization
+# while resolving the scratchpad id and publishes the message verbatim, then
+# returns before dispatching, so the exception never reaches _fail_job and
+# _handle_anton_turn_k8s's own guard never fires. The typed shape is kept as
+# defensive cover for a controller change that lets it through, not because
+# anything emits it today.
+MISSING_ORGANIZATION_PREFIXES = ("job ", "MissingOrganization:")
 MISSING_ORGANIZATION_USER_MESSAGE = (
     "This task's workspace couldn't be set up. Please try again — if it "
     "keeps happening, contact support."
@@ -1044,7 +1057,9 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
-    if text.endswith(MISSING_ORGANIZATION_SUFFIX):
+    if text.startswith(MISSING_ORGANIZATION_PREFIXES) and text.endswith(
+        MISSING_ORGANIZATION_SUFFIX
+    ):
         return GENERIC_TURN_ERROR_CODE, MISSING_ORGANIZATION_USER_MESSAGE
     if text.startswith(LIVE_POD_PREFIX) and any(
         marker in text for marker in LIVE_POD_NEVER_RAN_MARKERS

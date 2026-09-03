@@ -1416,21 +1416,42 @@ def test_remote_error_turn_aborted_on_stall_gets_curated_copy():
     assert "boom" not in msg
 
 
-def test_remote_error_missing_organization_gets_curated_copy():
-    # scratchpad-controller's MissingOrganization (_scratchpad_id_for_job) —
-    # a job dispatched with no organization_id, so it can't be routed to an
-    # EFS access point. The message's own correlation_id prefix varies per
-    # job; matched on the static suffix, which never changes.
+@pytest.mark.parametrize("wire_error", [
+    # What _run_job's own MissingOrganization handler publishes: the message
+    # verbatim, no type prefix.
+    "job corr-123 has no organization_id; refusing to run a turn "
+    "without an organization-scoped workspace",
+    # Defensive only. Nothing emits this today (see the constant's comment),
+    # but the classifier accepts it so a controller change that lets the
+    # exception reach _fail_job does not silently lose the curated copy.
+    "MissingOrganization: job corr-123 has no organization_id; refusing to "
+    "run a turn without an organization-scoped workspace",
+])
+def test_remote_error_missing_organization_gets_curated_copy(wire_error):
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
-    code, msg = remote_turn_error(
-        "job corr-123 has no organization_id; refusing to run a turn "
-        "without an organization-scoped workspace")
+    code, msg = remote_turn_error(wire_error)
     assert code == GENERIC_TURN_ERROR_CODE
     assert "workspace" in msg
+    # A data-integrity condition a plain retry is not guaranteed to fix, so
+    # the copy has to steer to support rather than promise a retry works.
     assert "support" in msg
     # The raw correlation_id in the source message must not leak — request_id
     # already carries it, separately and reliably, on the payload.
     assert "corr-123" not in msg
+
+
+def test_remote_error_mapped_type_is_not_shadowed_by_the_organization_suffix():
+    # Every other pre-parse branch is front-anchored on a lowercase literal
+    # containing a space ("pod ", "live pod ", "turn aborted: ", "pod stream
+    # ended ..."), which any "TypeName: " prefix defeats. This one tested the
+    # tail alone, so without the front anchor an exception whose message
+    # merely ENDS with the controller's phrasing takes the workspace branch
+    # ahead of its own — costing this one its Reconnect card.
+    from cowork.handlers.turn_errors import remote_turn_error, AUTH_ERROR_CODE
+    code, _ = remote_turn_error(
+        "ProviderAuthError: job corr-123 has no organization_id; refusing to "
+        "run a turn without an organization-scoped workspace")
+    assert code == AUTH_ERROR_CODE
 
 
 @pytest.mark.parametrize("wire_error", [
