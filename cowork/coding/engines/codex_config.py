@@ -196,6 +196,15 @@ def toml_array(values: tuple[str, ...]) -> str:
     return "[" + ",".join(toml_string(value) for value in values) + "]"
 
 
+# Codex retries a failed request at two layers: `request_max_retries` HTTP
+# attempts per stream attempt, and `stream_max_retries` stream attempts per turn.
+# Its defaults (4 and 5) multiply to 30 requests against an upstream that is
+# down. Every request already passes through the loopback proxy, so keep the
+# product small: one HTTP retry, two stream reconnects.
+REQUEST_MAX_RETRIES = 1
+STREAM_MAX_RETRIES = 2
+
+
 def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) -> CodexLaunchConfig:
     """Translate Cowork runtime controls into one consistent Codex launch policy."""
     resolved_approval = approval_policy(config.permission_mode)
@@ -213,6 +222,8 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         f"model_providers.mindshub.base_url={toml_string(endpoint)}",
         'model_providers.mindshub.env_key="MINDSHUB_CODEX_API_KEY"',
         'model_providers.mindshub.wire_api="responses"',
+        f"model_providers.mindshub.request_max_retries={REQUEST_MAX_RETRIES}",
+        f"model_providers.mindshub.stream_max_retries={STREAM_MAX_RETRIES}",
         f"model_auto_compact_token_limit={auto_compact_token_limit()}",
         f"approval_policy={toml_string(resolved_approval)}",
         f"sandbox_mode={toml_string(resolved_sandbox)}",

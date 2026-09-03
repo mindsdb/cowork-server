@@ -18,6 +18,14 @@ from cowork.coding.contracts import (  # noqa: F401
 from cowork.coding.git_transport import validate_git_source
 from cowork.coding.skill_models import ProjectSkillSource
 
+# MindsHub Inference exposes GPT 5.6 Sol through the stable ``gpt`` catalogue
+# id; older desktop settings and stored projects still carry the descriptive id.
+LEGACY_MODEL_IDS = {"gpt-5.6-sol": "gpt"}
+
+
+def canonical_model_id(model: str) -> str:
+    return LEGACY_MODEL_IDS.get(model, model)
+
 
 def _valid_environment_name(name: str) -> bool:
     return bool(name) and name.replace("_", "a").isalnum() and name[0].isalpha()
@@ -51,6 +59,9 @@ class ProjectActionRunResponse(BaseModel):
     terminal_id: str
     label: str
     preview_url: str | None = None
+    # A run action is live but nothing answers on its port yet (still booting,
+    # or already dead behind a shell that is still open).
+    preview_pending: bool = False
 
 
 class ProjectActionSummary(BaseModel):
@@ -63,6 +74,7 @@ class ProjectActionSummary(BaseModel):
 class ProjectActionPage(BaseModel):
     items: list[ProjectActionSummary] = Field(default_factory=list)
     preview_url: str | None = None
+    preview_pending: bool = False
 
 
 class ReviewFileActionRequest(BaseModel):
@@ -231,6 +243,11 @@ class CodeProject(BaseModel):
     permission_mode: PermissionMode = PermissionMode.supervised
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("default_model")
+    @classmethod
+    def canonicalize_default_model(cls, value: str) -> str:
+        return canonical_model_id(value)
 
     @model_validator(mode="before")
     @classmethod

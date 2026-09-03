@@ -75,3 +75,23 @@ def test_linux_inventory_only_lists_installed_shells() -> None:
         (TerminalShellPreference.fish, "fish"),
         (TerminalShellPreference.system, "System default — fish"),
     ]
+
+
+def test_shell_environment_defaults_a_terminal_type_for_the_pty(monkeypatch) -> None:
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.delenv("COLORTERM", raising=False)
+
+    environment = shells.shell_environment(["/bin/zsh", "--login"])
+
+    assert environment["TERM"] == "xterm-256color"
+    assert environment["COLORTERM"] == "truecolor"
+
+
+def test_shell_environment_keeps_the_users_terminal_type(monkeypatch) -> None:
+    monkeypatch.setenv("TERM", "screen-256color")
+    monkeypatch.setenv("COLORTERM", "24bit")
+
+    environment = shells.shell_environment(["/bin/zsh", "--login"])
+
+    assert "TERM" not in environment
+    assert "COLORTERM" not in environment

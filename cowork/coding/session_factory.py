@@ -23,7 +23,7 @@ from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_models import CodeProject
+from cowork.coding.project_models import CodeProject, canonical_model_id
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.skill_models import SkillResolution
@@ -140,7 +140,7 @@ class CodingSessionFactory:
     ) -> CodingSession:
         project = self.projects.get(request.project_id) if request.project_id else None
         engine_id = request.engine_id or (project.default_engine_id if project else default_engine)
-        model = request.model or (project.default_model if project else default_model)
+        model = canonical_model_id(request.model or (project.default_model if project else default_model))
         capabilities = self.registry.get(engine_id).capabilities()
         if not capabilities.available:
             raise RuntimeError(capabilities.reason or f"{capabilities.label} is unavailable")
