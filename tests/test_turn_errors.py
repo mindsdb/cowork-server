@@ -1466,20 +1466,71 @@ def test_no_return_emits_a_literal_code():
 
 
 # ── The non-streaming path carries the code too ───────────────────────────
-# The streaming twin has a per-code test each. This sweeps the same codes
-# through _collect so its raise cannot drop one while those stay green.
+# The streaming twin has a per-code test each. These sweep them through
+# _collect so its raise cannot drop one while those per-code tests stay green.
+#
+# Split by rung on purpose. The gateway rows must build their exception INSIDE
+# the test: the request URL comes from `minds_url` in settings, so a URL baked
+# in at collection time stops matching once another test changes that setting,
+# and the ladder then silently declines to map it.
+
 
 @pytest.mark.parametrize(
-    "exc, expected_code",
+    ("status", "reason", "expected_code"),
     [
-        (Exception(_TOKEN_LIMIT_MESSAGE), te.TOKEN_LIMIT_CODE),
-        (ProviderAuthError("provider rejected the credential"), te.AUTH_ERROR_CODE),
-        (_FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet"), te.MODEL_ACCESS_DENIED_CODE),
-        (_FakeModelErr("", "model_disabled", "sonnet"), te.MODEL_DISABLED_CODE),
-        (_FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet"), te.PROVIDER_OVERLOADED_CODE),
+        # The rung the ticket's headline case takes.
+        (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
+        (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "rate_limited", te.RATE_LIMITED_CODE),
+        (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
+        (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
     ],
 )
-def test_collect_400_carries_the_code_for_each_carded_code(exc, expected_code):
+def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, expected_code):
+    handler = _handler_with_raising_formatter(_gateway_failure(status, reason=reason))
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(
+            handler._collect(
+                stream=None, conversation_id=uuid4(), model="anton", original_content="hi"
+            )
+        )
+    assert err.value.status_code == 400
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == expected_code
+    assert err.value.detail["error"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_code"),
+    [
+        pytest.param(Exception(_TOKEN_LIMIT_MESSAGE), te.TOKEN_LIMIT_CODE, id="token_limit"),
+        pytest.param(ProviderAuthError("provider rejected the credential"), te.AUTH_ERROR_CODE, id="auth"),
+        pytest.param(
+            _FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet"),
+            te.MODEL_ACCESS_DENIED_CODE, id="model_access_denied",
+        ),
+        pytest.param(
+            _FakeModelErr("", "model_disabled", "sonnet"),
+            te.MODEL_DISABLED_CODE, id="model_disabled",
+        ),
+        pytest.param(
+            _FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet"),
+            te.PROVIDER_OVERLOADED_CODE, id="provider_overloaded",
+        ),
+        pytest.param(
+            Exception("'image_url' does not match the expected tags: 'image'"),
+            te.IMAGE_FORMAT_CODE, id="image_format",
+        ),
+    ],
+)
+def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
+    """The rungs below the gateway header, asserted on the 400 it raises.
+
+    Two of the inventory's codes are deliberately absent from both sweeps.
+    ``content_recovery`` runs the conversation-repair branch and has its own
+    test above, which already pins the 400. ``worker_unresponsive`` comes from
+    ``remote_turn_error``, a different mapper that this path never calls.
+    """
     handler = _handler_with_raising_formatter(exc)
     with pytest.raises(HTTPException) as err:
         asyncio.run(
