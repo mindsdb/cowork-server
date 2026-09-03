@@ -1355,6 +1355,19 @@ def test_remote_error_turn_interrupted_keeps_its_curated_copy():
     assert msg == "The turn ended unexpectedly. Please try again."
 
 
+def test_remote_error_self_authored_lookalike_is_still_redacted():
+    # The two curated sentences are matched whole, not on their type name, so
+    # a future exception class of the same name wrapping provider text cannot
+    # ride the prefix through to the user.
+    from cowork.handlers.turn_errors import (
+        remote_turn_error, GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE)
+    code, msg = remote_turn_error(
+        "TurnInterrupted: upstream said sk-live-abc is not authorized for gpt-9")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == GENERIC_TURN_ERROR_MESSAGE
+    assert "sk-live" not in msg
+
+
 def test_remote_error_turn_worker_lost_keeps_its_curated_copy():
     # pel_reclaim.py's ORPHANED_ERROR — a worker died mid-turn and the entry
     # was reclaimed from Redis's PEL rather than retried (retrying would bill

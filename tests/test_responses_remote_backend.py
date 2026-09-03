@@ -252,6 +252,30 @@ async def test_produce_remote_request_id_matches_the_turns_own_correlation_id(mo
     assert saved["events"][-1]["request_id"] == captured["correlation_id"]
 
 
+class _RecBuffer:
+    def __init__(self):
+        self.frames = []
+
+    async def append(self, kind, record):
+        self.frames.append(record["sse"])
+
+    async def close(self, reason):
+        self.frames.append(f"CLOSE:{reason}")
+
+
+def _fake_redis(monkeypatch, *, flag_set: bool):
+    """Stand in for the cancel flag, recording whether it was consulted."""
+    reads = []
+
+    class FakeRedis:
+        async def exists(self, key):
+            reads.append(key)
+            return 1 if flag_set else 0
+
+    monkeypatch.setattr(responses_mod, "get_redis", lambda: FakeRedis())
+    return reads
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wire_error", ["cancelled", "RuntimeError: cancelled"])
 async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_failure(
@@ -267,6 +291,7 @@ async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_
     # opposite of the live path, which silently swallows a cancel.
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=True)
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "partial"}
@@ -274,23 +299,69 @@ async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_
 
     monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 
-    frames = []
-
-    class RecBuffer:
-        async def append(self, kind, record):
-            frames.append(record["sse"])
-
-        async def close(self, reason):
-            frames.append(f"CLOSE:{reason}")
-
+    buffer = _RecBuffer()
     await handler._produce_remote(
         conv_id=uuid4(), input_text="hi", original_content="hi",
-        model="anton", harness_id="anton", buffer=RecBuffer(),
+        model="anton", harness_id="anton", buffer=buffer,
     )
 
-    assert frames[-1] == "CLOSE:cancelled"
-    assert not any("response.failed" in f for f in frames)
+    assert buffer.frames[-1] == "CLOSE:cancelled"
+    assert not any("response.failed" in f for f in buffer.frames)
     assert saved["assistant"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_keeps_a_shutdown_abort_a_failure_not_a_cancel(monkeypatch):
+    # _fail_job shapes a shutdown abort exactly like a keepalive-driven
+    # cancel, so the string alone cannot tell a rolling deploy killing the
+    # turn from a user pressing Stop. Reading it as a cancel would end the
+    # turn with partial text, no error frame and no lookup id — a half-written
+    # answer the user cannot tell from a finished one. The cancel flag is what
+    # separates them, and no user asked for this one.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=False)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": "RuntimeError: cancelled"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+        turn_llm={"correlation_id": "corr-shutdown-abort"},
+    )
+
+    assert buffer.frames[-1] == "CLOSE:error"
+    failed = [f for f in buffer.frames if "response.failed" in f]
+    assert failed and "corr-shutdown-abort" in failed[-1]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_does_not_consult_the_flag_for_the_unambiguous_literal(monkeypatch):
+    # Only main.py's own cancel branch can emit the bare literal, so it is
+    # proof on its own — and it must stay a cancel even when the flag has
+    # already been cleared or has expired.
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    reads = _fake_redis(monkeypatch, flag_set=False)
+
+    async def fake_replies(**kwargs):
+        yield "turn_failed", {"error": "cancelled"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert buffer.frames[-1] == "CLOSE:cancelled"
+    assert reads == []
 
 
 @pytest.mark.asyncio
