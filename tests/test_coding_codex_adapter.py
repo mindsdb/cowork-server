@@ -931,3 +931,19 @@ def test_steer_relays_the_codex_error_when_it_answers_in_time() -> None:
 
     with pytest.raises(RuntimeError, match="turn is not active"):
         engine_session.steer("turn-1", "Change direction")
+
+
+def test_codex_is_an_optional_extra_and_reports_itself_missing_plainly(monkeypatch) -> None:
+    import tomllib
+
+    from cowork.coding.engines import codex as codex_module
+
+    project = tomllib.load(open("pyproject.toml", "rb"))["project"]
+    assert not any(dep.startswith("openai-codex") for dep in project["dependencies"]), "openai-codex must stay out of the core install"
+    assert any(dep.startswith("openai-codex==") for dep in project["optional-dependencies"]["code"])
+
+    monkeypatch.setattr(codex_module.importlib.util, "find_spec", lambda name: None)
+    capabilities = codex_module.CodexEngine().capabilities()
+
+    assert capabilities.available is False
+    assert capabilities.reason == "Code Mode components are not installed on this computer yet."

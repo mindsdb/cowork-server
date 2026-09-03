@@ -60,6 +60,11 @@ class _CancelWatch:
         self.finished.set()
 
 
+# What the desktop shows, with a "Set up Code Mode" action, when the `code`
+# extra (openai-codex and its native binary) has not been installed yet.
+CODEX_RUNTIME_MISSING_REASON = "Code Mode components are not installed on this computer yet."
+
+
 class CodexEngine:
     id = "codex"
 
@@ -70,7 +75,7 @@ class CodexEngine:
             label="Codex",
             adapter_version=ADAPTER_VERSION,
             available=available,
-            reason=None if available else "The bundled Codex runtime is unavailable.",
+            reason=None if available else CODEX_RUNTIME_MISSING_REASON,
             supports_steering=True,
             supports_approvals=True,
             supports_reasoning=True,
