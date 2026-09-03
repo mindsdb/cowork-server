@@ -7,7 +7,7 @@ existed"; readers resolve it as `display_name or name`, so every existing
 project renders exactly as it did (ENG-1676).
 
 Revision ID: e2b7d4f9a1c3
-Revises: a4c8e1f6b3d9
+Revises: cfbc79856e9e
 Create Date: 2026-09-01 00:00:00.000000
 
 """
@@ -19,7 +19,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "e2b7d4f9a1c3"
-down_revision: Union[str, Sequence[str], None] = "a4c8e1f6b3d9"
+down_revision: Union[str, Sequence[str], None] = "b7f4d2c9a3e1"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

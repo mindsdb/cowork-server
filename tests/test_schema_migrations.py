@@ -577,6 +577,13 @@ def test_migrated_schema_enforces_one_attribution_row_per_resource(
     )
 
 
+# The revision immediately before projects.display_name. Named rather than
+# inlined: this has now moved TWICE while the branch was open (cfbc79856e9e,
+# then b7f4d2c9a3e1 when ENG-1911 merged its two heads), and a rebase that
+# forgets it forks the graph.
+PRIOR_TO_DISPLAY_NAME = "b7f4d2c9a3e1"
+
+
 def _table_columns(path, table_name: str) -> set[str]:
     with sqlite3.connect(path) as connection:
         rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
@@ -610,14 +617,14 @@ def test_project_display_name_downgrade_keeps_the_projects_indexes(tmp_path, mon
     assert "display_name" in _table_columns(db_path, "projects")
     assert _has_index(db_path, "uq_projects_default_per_org")
 
-    _downgrade_to(engine, uri, "a4c8e1f6b3d9")
+    _downgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
 
     assert "display_name" not in _table_columns(db_path, "projects")
     # The whole point: the index survives the column drop.
     assert _has_index(db_path, "uq_projects_default_per_org")
 
     # And the chain still runs forward again afterwards.
-    _upgrade_to(engine, uri, "e2b7d4f9a1c3")
+    _upgrade_to(engine, uri, expected_head())
     assert "display_name" in _table_columns(db_path, "projects")
     assert _has_index(db_path, "uq_projects_default_per_org")
 
@@ -638,7 +645,7 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     engine = create_engine(uri)
 
     # Stop one short of the display_name revision.
-    _upgrade_to(engine, uri, "a4c8e1f6b3d9")
+    _upgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
     assert "display_name" not in _table_columns(db_path, "projects")
 
     with engine.begin() as connection:
@@ -650,7 +657,7 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
             )
         )
 
-    _upgrade_to(engine, uri, "e2b7d4f9a1c3")
+    _upgrade_to(engine, uri, expected_head())
 
     assert "display_name" in _table_columns(db_path, "projects")
     with engine.begin() as connection:
@@ -664,7 +671,7 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     assert all(label is None for _, label in rows), "the migration must not invent labels"
 
     # And the downgrade leaves the rows alone too.
-    _downgrade_to(engine, uri, "a4c8e1f6b3d9")
+    _downgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
     with engine.begin() as connection:
         names = sorted(r[0] for r in connection.execute(text("SELECT name FROM projects")).all())
     assert "reports" in names and "untitled-project" in names
