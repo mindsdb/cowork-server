@@ -177,6 +177,38 @@ class ScheduleRunService:
         self.session.refresh(run)
         return run
 
+    def try_claim_run(self, schedule_id: UUID, is_manual: bool = False) -> ScheduleRun | None:
+        """Atomically create the single in-flight run for a schedule, or return
+        None if one is already running.
+
+        The partial unique index ``uq_schedule_runs_one_active`` (one row per
+        schedule WHERE status='running') makes the INSERT itself the claim: a
+        concurrent second insert loses with an IntegrityError. This is the
+        shared single-flight guard for both the cron dispatch and the manual
+        run-now path, closing the select-then-run TOCTOU where overlapping
+        ticks — or a manual click racing a cron tick — could double-dispatch
+        the same schedule. The pre-existing ``has_active_run`` checks are a
+        non-atomic fast path; this is the atomic backstop.
+        """
+        run = ScheduleRun(
+            schedule_id=schedule_id,
+            started_at=datetime.now(timezone.utc),
+            status=RunStatus.running,
+            is_manual=is_manual,
+        )
+        self.session.add(run)
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # Lost the race: another run already holds the slot.
+            self.session.rollback()
+            return None
+        self.session.refresh(run)
+        return run
+
+    def get_run(self, run_id: UUID) -> ScheduleRun | None:
+        return self.session.get(ScheduleRun, run_id)
+
     def has_running_run(self, schedule_id: UUID) -> bool:
         """
         Check if the schedule has a running non-manual (cron) run.

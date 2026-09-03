@@ -96,6 +96,27 @@ def _apply_success_write_back(
     session.add(schedule)
 
 
+def _consume_slot(schedule: Schedule, is_manual: bool, session) -> None:
+    """Advance/disable a schedule's slot after a run so the same slot isn't
+    picked up again.
+
+    A cron run consumes every cadence (recurring advances to its next
+    occurrence, a one-off is disabled). A manual "run now" consumes only a
+    one-off — otherwise the one-off's real scheduled slot would still fire a
+    second time — and never shifts a recurring schedule, whose imminent cron
+    slot is instead suppressed by the freshness guard.
+
+    An already-disabled schedule needs no consuming: it won't be re-selected,
+    so leave its slot where it is. This also preserves the corrupt-row handling
+    (NULL org in org mode), which disables without advancing so the stale slot
+    isn't silently moved past its original time.
+    """
+    if not schedule.enabled:
+        return
+    if not is_manual or schedule.cadence == Cadence.once:
+        _advance_next_run_at(schedule, session)
+
+
 def _handle_missed_runs(session) -> None:
     now = datetime.now(timezone.utc)
     schedules = ScheduleService(session).list_schedules()
@@ -164,6 +185,7 @@ async def execute_schedule(
     schedule_id: UUID,
     is_manual: bool = False,
     conversation_id: UUID | None = None,
+    run_id: UUID | None = None,
 ) -> None:
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
@@ -173,7 +195,27 @@ async def execute_schedule(
     run_service = ScheduleRunService(session)
     schedule_service = ScheduleService(session)
 
-    run = run_service.create_run(schedule_id, is_manual=is_manual)
+    if run_id is None:
+        # Cron dispatch: claim the slot atomically. If a concurrent dispatch
+        # (overlapping tick, or a manual run-now) already claimed it, don't
+        # double-run — the other run owns this slot.
+        run = run_service.try_claim_run(schedule_id, is_manual=is_manual)
+        if run is None:
+            logger.info(
+                f"Schedule {schedule_id}: a run is already in flight, skipping dispatch"
+            )
+            session.close()
+            return
+    else:
+        # Manual run-now already claimed the run before handing it off, so the
+        # 409 could be returned synchronously; adopt that claim here.
+        run = run_service.get_run(run_id)
+        if run is None:
+            logger.warning(
+                f"Schedule {schedule_id}: claimed run {run_id} not found, skipping"
+            )
+            session.close()
+            return
 
     error: str | None = None
     final_status: RunStatus | None = None
@@ -273,12 +315,12 @@ async def execute_schedule(
         else:
             _apply_success_write_back(schedule, run_service, conversation_id, session)
 
-        # Always consume the cron slot: the schedule stays due otherwise and
-        # the loop would immediately restart the run the user killed (a
-        # cancelled/failed run isn't a success, so the freshness guard
-        # wouldn't block the restart).
-        if not is_manual:
-            _advance_next_run_at(schedule, session)
+        # Always consume the slot: the schedule stays due otherwise and the
+        # loop would immediately restart the run the user killed (a
+        # cancelled/failed run isn't a success, so the freshness guard wouldn't
+        # block the restart). A manual run consumes only a one-off's slot, so a
+        # preview "run now" doesn't leave the real scheduled slot to fire again.
+        _consume_slot(schedule, is_manual, session)
 
         try:
             session.commit()
@@ -306,9 +348,17 @@ async def execute_schedule(
             schedule = schedule_service.get_schedule(schedule_id)
             schedule.last_error = error
             session.add(schedule)
+            # Consume the slot on failure too. Without this a due one-off is
+            # left enabled with its slot in the past, so it is re-selected and
+            # re-run on every 30s poll until the catch-up window disables it;
+            # a recurring slot would likewise restart at once. A failed run
+            # isn't a success, so the freshness guard can't stand in.
+            _consume_slot(schedule, is_manual, session)
             session.commit()
         except Exception:
-            pass
+            logger.exception(
+                f"Failed to persist failure state for schedule {schedule_id}"
+            )
     finally:
         try:
             # Same guard for the run record: a swallowed failure above can

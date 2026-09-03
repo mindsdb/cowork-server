@@ -95,8 +95,12 @@ def test_last_successful_finish_ignores_failures_and_running():
 
     failed = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(failed.id, error="boom")
-    run_service.create_run(schedule.id, is_manual=False)  # still running
+    running = run_service.create_run(schedule.id, is_manual=False)  # still running
     assert run_service.last_successful_finish(schedule.id) is None
+    # Release the running row before the next run: the single-flight index
+    # allows only one running run per schedule. Finishing it as a failure keeps
+    # the "ignores failures" half of this test intact.
+    run_service.finish_run(running.id, error="boom")
 
     ok = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(ok.id)
@@ -502,7 +506,14 @@ def test_turn_terminal_reason_none_without_handle(monkeypatch):
     assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
 
 
-def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
+def _execute_with_terminal(
+    monkeypatch,
+    reason,
+    *,
+    is_manual=False,
+    cadence="daily",
+    next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+):
     """Run execute_schedule with a no-op turn and a forced terminal reason;
     return the resulting run/schedule state as plain values."""
     import asyncio
@@ -536,8 +547,8 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
         title="terminal mapping test",
         prompt="do the thing",
-        cadence="daily",
-        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        cadence=cadence,
+        next_run_at=next_run_at,
         model="default",
         timezone="UTC",
         project_id=GENERAL_PROJECT_ID,
@@ -558,6 +569,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
             "run_conversation_id": run.conversation_id,
             "last_error": fresh.last_error,
             "last_run_at": fresh.last_run_at,
+            "enabled": fresh.enabled,
             "next_advanced": ensure_utc(fresh.next_run_at) > original_next,
         }
         check.close()
@@ -894,3 +906,204 @@ def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
     assert svc("bob").delete_schedule(a.id) is False
     assert svc("alice").get_schedule(a.id).id == a.id
     get_app_settings.cache_clear()
+
+
+# --- Single-flight claim and dispatch TOCTOU, plus consuming a `once` slot on
+# the non-happy paths (a failed run, and a manual run-now).
+
+def test_try_claim_run_is_single_flight():
+    session = _session()
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+
+    first = run_service.try_claim_run(schedule.id, is_manual=False)
+    assert first is not None
+    # A second claim while one is in flight loses the race atomically.
+    assert run_service.try_claim_run(schedule.id, is_manual=True) is None
+    # Finished runs don't hold the slot: it can be claimed again afterwards.
+    run_service.finish_run(first.id)
+    second = run_service.try_claim_run(schedule.id, is_manual=True)
+    assert second is not None
+    assert second.id != first.id
+
+
+def test_execute_schedule_skips_when_run_already_active(monkeypatch):
+    """Dispatch TOCTOU: if a run is already in flight when a cron dispatch
+    fires, the claim loses and execute_schedule must not run a second turn or
+    create a second run."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.services.schedules import ScheduleService
+
+    called = {"handled": False}
+
+    class FakeHandler:
+        def __init__(self, session):
+            pass
+
+        async def handle(self, request):
+            called["handled"] = True
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="already-claimed test",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    # Another dispatch already claimed the slot.
+    existing = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).create_run(
+        schedule_id, is_manual=False
+    )
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert called["handled"] is False
+        check = get_open_session()
+        runs = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)
+        # No second run was created; the pre-existing claim is untouched.
+        assert [r.id for r in runs] == [existing.id]
+        assert runs[0].status == RunStatus.running
+        check.close()
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
+def test_execute_schedule_exception_consumes_once_slot(monkeypatch):
+    """A `once` run that raises must be consumed (disabled), else it is
+    re-selected and re-run on every poll until the catch-up window expires."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.services.schedules import ScheduleService
+
+    class BoomHandler:
+        def __init__(self, session):
+            pass
+
+        async def handle(self, request):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", BoomHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="failing once",
+        prompt="do the thing",
+        cadence="once",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        check = get_open_session()
+        fresh = ScheduleService(ScopedSession(check, SYSTEM_SCOPE)).get_schedule(schedule_id)
+        run = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)[0]
+        assert fresh.enabled is False  # slot consumed → not re-picked next poll
+        assert fresh.last_error
+        assert run.status == RunStatus.failed
+        check.close()
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
+def test_manual_run_consumes_once_slot(monkeypatch):
+    """A manual "run now" of a one-off uses up its single firing, so the real
+    scheduled slot can't also fire later."""
+    state = _execute_with_terminal(monkeypatch, "completed", is_manual=True, cadence="once")
+    assert state["run_status"] == RunStatus.success
+    assert state["enabled"] is False
+
+
+def test_manual_run_leaves_recurring_slot_to_freshness_guard(monkeypatch):
+    """A manual run must NOT shift a recurring schedule — the freshness guard
+    suppresses the imminent cron slot instead."""
+    state = _execute_with_terminal(monkeypatch, "completed", is_manual=True, cadence="daily")
+    assert state["run_status"] == RunStatus.success
+    assert state["enabled"] is True
+    assert state["next_advanced"] is False
+
+
+def test_run_now_rejects_when_run_already_active():
+    """The manual endpoint must refuse to start a run that races a concurrent
+    (cron or manual) run of the same schedule — and not leave an orphan
+    run/conversation behind."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from cowork.api.v1.endpoints.schedules import run_schedule_now
+
+    session = _session()
+    schedule = _schedule(session)
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    ScheduleRunService(scoped).create_run(schedule.id, is_manual=False)  # in flight
+
+    bt = BackgroundTasks()
+    try:
+        run_schedule_now(schedule.id, scoped, bt)
+        assert False, "expected HTTPException 409"
+    except HTTPException as exc:
+        assert exc.status_code == 409
+
+    assert len(bt.tasks) == 0
+    assert len(ScheduleRunService(scoped).list_runs(schedule.id)) == 1
+
+
+def test_run_now_claims_and_blocks_double_click():
+    """Happy path: the endpoint claims exactly one run, links it to the new
+    conversation, queues the dispatch, and rejects a second click while the
+    first run is still in flight."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from cowork.api.v1.endpoints.schedules import run_schedule_now
+
+    session = _session()
+    schedule = _schedule(session)
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    bt = BackgroundTasks()
+    result = run_schedule_now(schedule.id, scoped, bt)
+    assert result["conversation_id"]
+    assert len(bt.tasks) == 1
+
+    runs = ScheduleRunService(scoped).list_runs(schedule.id)
+    assert len(runs) == 1
+    assert runs[0].status == RunStatus.running
+    assert runs[0].is_manual is True
+    assert str(runs[0].conversation_id) == result["conversation_id"]
+
+    # Second click while the first run is still claimed → 409, no extra run.
+    try:
+        run_schedule_now(schedule.id, scoped, BackgroundTasks())
+        assert False, "expected HTTPException 409"
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    assert len(ScheduleRunService(scoped).list_runs(schedule.id)) == 1
