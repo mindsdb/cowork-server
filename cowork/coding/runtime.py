@@ -25,7 +25,10 @@ def engine_workspace_path(session: CodingSession) -> str:
     Other project resources remain available through ``additional_dirs``. The
     shared parent is an implementation detail: starting there allowed
     ambiguous relative writes to land outside every resource, where Files,
-    Review, and delivery could not see them.
+    Review, and delivery could not see them. The trade-off is that Codex reads
+    project-level configuration (``.codex/config.toml``, skills, hooks) from
+    its working directory, so only the primary resource's configuration is
+    layered onto a multi-resource task.
     """
     return session.workspace_path
 
