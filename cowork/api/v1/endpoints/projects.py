@@ -494,6 +494,7 @@ def update_project(
                         project_id,
                         resolved_name=resolved_name,
                         is_active=body.is_active,
+                        display_label=body.name,
                         skill_rewrites=rewrites,
                     )
                     try:

@@ -333,3 +333,49 @@ def test_org_same_slug_rename_moves_the_label_and_stays_gated(org_engine):
     # Identity untouched: same slug, same directory. That is the design.
     assert renamed["name"] == created["name"]
     assert renamed["path"] == created["path"]
+
+
+def test_org_slug_changing_rename_also_moves_the_label(org_engine):
+    """The OTHER org branch: a rename where the slug really does change.
+
+    Found in review. `stage_project_update` grew a `display_label` parameter,
+    and the endpoint has two call sites: the same-slug branch (covered above)
+    and this one, which moves the directory and rewrites skill references. Only
+    the first was passing it, so an org rename updated `name`, `path` and every
+    skill reference while leaving `display_name` frozen at the old label -- the
+    sidebar kept showing the previous name.
+
+    Both directions matter, and the second is this ticket's own case:
+      * Latin -> Latin, where the slug tracks the label anyway.
+      * Latin -> Cyrillic, where the slug collapses to `untitled-project` and
+        `display_name` is the ONLY thing carrying the new name.
+    """
+    from cowork.api.v1.endpoints import projects as project_endpoints
+    from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
+
+    alice = _org_scoped(org_engine, ALICE)
+    created = project_endpoints.create_project(
+        ProjectCreateRequest(name="Report"), alice, _org_principal(ALICE),
+    )
+    assert created["name"] == "Report"
+    assert created["display_name"] == "Report"
+
+    renamed = project_endpoints.update_project(
+        created["id"],
+        ProjectUpdateRequest(name="Quarterly Report"),
+        alice,
+        _org_principal(ALICE),
+    )
+    assert renamed["name"] == "Quarterly-Report"
+    assert renamed["display_name"] == "Quarterly Report"
+
+    # And the case the ticket exists for: the slug carries nothing, so if the
+    # label does not follow, the rename is invisible to the user.
+    cyrillic = project_endpoints.update_project(
+        created["id"],
+        ProjectUpdateRequest(name="Мій проєкт"),
+        alice,
+        _org_principal(ALICE),
+    )
+    assert cyrillic["name"].startswith("untitled-project")
+    assert cyrillic["display_name"] == "Мій проєкт"

@@ -685,7 +685,12 @@ class ProjectService:
         *,
         resolved_name: str | None,
         is_active: bool | None,
-        display_label: str | None = None,
+        # No default on purpose. Both endpoint branches call this, and only one
+        # of them passed a label -- so an org rename moved the directory and
+        # rewrote every skill reference while `display_name` stayed frozen at
+        # the old name. Requiring it makes that omission a TypeError instead of
+        # a stale label, and matches the two parameters above.
+        display_label: str | None,
         skill_rewrites: list["ProjectReferenceRewrite"] | None = None,
     ) -> tuple[Project, ProjectRenameStage | None]:
         """Stage a project update without committing its DB transaction.
