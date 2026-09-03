@@ -1493,6 +1493,42 @@ def test_collect_400_carries_the_code_for_each_carded_code(exc, expected_code):
     assert err.value.detail["error"]
 
 
+def test_the_non_streaming_400_carries_the_code_on_the_wire():
+    """Pins the serialized body, not just the raised exception.
+
+    Every assertion above reads ``HTTPException.detail`` in process, so they
+    would all stay green if FastAPI stopped rendering a mapping ``detail`` as
+    JSON — and the body is the contract this change actually altered.
+    """
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    class _FailingHarness:
+        id = "stub"
+
+        def stream_response(self, **kwargs):
+            return None
+
+        async def formatter(self, stream, model, event_sink):
+            if False:
+                yield
+            raise Exception(_TOKEN_LIMIT_MESSAGE)
+
+    with patch("cowork.handlers.responses.get_harness", return_value=_FailingHarness()):
+        client = TestClient(create_app())
+        res = client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
+
+    assert res.status_code == 400, res.text
+    assert res.json()["detail"] == {
+        "type": "response.failed",
+        "code": te.TOKEN_LIMIT_CODE,
+        "error": te.TOKEN_LIMIT_USER_MESSAGE,
+    }
+
+
 # ── Wiring coverage (ENG-1537 review finding 3) ────────────────────────────
 # Four mutations survived the full suite: the reset_at and retry_after extras
 # in responses.py, the never-throttle exemption, and PHASE_LABELS.
