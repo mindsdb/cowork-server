@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Iterator, Literal
+from typing import TYPE_CHECKING, Annotated, Iterator, Literal
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -22,10 +21,15 @@ from cowork.harnesses.memory.store import (
     GlobalMemoryStore,
     PROJECT_SLOTS,
     ProjectMemoryStore,
+    SlotRead,
 )
 from cowork.models.project import Project
 from cowork.principal import Principal
 from cowork.schemas.memory import MemoryResponse, MemoryScope
+from cowork.schemas.shared_resources import (
+    MutableResourceCapabilities,
+    ResourceAttribution,
+)
 from cowork.services.shared_resources import (
     PROJECT,
     PROJECT_MEMORY,
@@ -33,6 +37,9 @@ from cowork.services.shared_resources import (
     project_memory_resource_key,
     project_resource_key,
 )
+
+if TYPE_CHECKING:
+    from anton.core.memory.hippocampus import Hippocampus
 
 
 logger = logging.getLogger(__name__)
@@ -65,14 +72,35 @@ def _project_slot_coordination(
             yield project, store, key
 
 
+def _slot_holds_content(state: SlotRead) -> bool:
+    """Whether a slot holds something a first-author claim must not overwrite.
+
+    Blank bytes count as unwritten, which is what lets the first real writer
+    claim a slot anton created empty. A slot that cannot be read still occupies
+    the name and still hides an authorship nobody can establish, so it counts as
+    written rather than free.
+    """
+    return not state.readable or bool(state.content.strip())
+
+
 def _restore_project_slot(
     store: ProjectMemoryStore,
     slot: MemorySlot,
-    content: str,
-    *,
-    existed: bool,
+    snapshot: SlotRead,
 ) -> None:
-    store.restore_exact(slot, content, existed=existed)
+    """Put back the exact bytes a failed mutation replaced.
+
+    A snapshot taken from a slot that could not be read holds no bytes to put
+    back. Writing it anyway would truncate whatever is still there, so the
+    failed mutation stands and the caller sees the original error.
+    """
+    if not snapshot.readable:
+        logger.warning(
+            "Project memory slot %s had no readable snapshot to restore",
+            slot.value,
+        )
+        return
+    store.restore_exact(slot, snapshot.content, existed=snapshot.exists)
 
 
 def build_turn_memory(
@@ -136,6 +164,15 @@ class _WireEngram(BaseModel):
         # the memory is the part worth keeping. Hippocampus slugifies the charset.
         return value[:64]
 
+    @property
+    def targets_project(self) -> bool:
+        """Identity is global-only; everything else honours the declared scope."""
+        return self.kind != "profile" and self.scope == "project"
+
+    @property
+    def slot(self) -> MemorySlot:
+        return MemorySlot.LESSONS if self.kind == "lesson" else MemorySlot.RULES
+
 
 def _one_line(text: str) -> str:
     """Neutralize forged structure before it reaches the slot files, which store
@@ -147,6 +184,46 @@ def _one_line(text: str) -> str:
     """
     text = text.replace("<!--", "<!-").replace("-->", "->")
     return " ".join(line.strip() for line in text.splitlines()).strip()
+
+
+def _validated_engrams(entries: list[dict]) -> list[_WireEngram]:
+    """The entries worth writing, with their text already neutralized.
+
+    A pod's payload is untrusted, so anything unparseable, and anything whose
+    text is only forged structure, is skipped here rather than at a slot file.
+    """
+    validated: list[_WireEngram] = []
+    for raw in entries:
+        try:
+            entry = _WireEngram.model_validate(raw)
+        except ValidationError:
+            continue
+        text = _one_line(entry.text)
+        if not text:
+            continue
+        validated.append(entry.model_copy(update={"text": text}))
+    return validated
+
+
+def _encode_engram(hippocampus: "Hippocampus", entry: _WireEngram) -> None:
+    """Write one entry through anton's own encoder for its kind."""
+    if entry.kind == "profile":
+        hippocampus.rewrite_identity([entry.text])
+    elif entry.kind == "lesson":
+        hippocampus.encode_lesson(entry.text, topic=entry.topic, source=entry.source)
+    else:
+        hippocampus.encode_rule(
+            entry.text,
+            kind=entry.kind,
+            confidence=entry.confidence,
+            source=entry.source,
+        )
+
+
+def _drop_project_engram(reason: str, key: str) -> bool:
+    """Record why a shared entry was refused, and report it as not applied."""
+    logger.warning("Dropped a remote-turn project memory entry for %s: %s", key, reason)
+    return False
 
 
 def apply_turn_memory(
@@ -164,210 +241,203 @@ def apply_turn_memory(
     written, and it goes through the caller's `scope`, so a compromised pod can't
     reach another org. Writes via anton's own Hippocampus rather than reproducing
     its markdown format.
+
+    The caller's private global memory is written first and on its own. The two
+    tiers answer to different owners: a shared project slot the caller may not
+    touch, or one whose write fails, must not cost that caller the personal half
+    of the same turn.
     """
     from anton.core.memory.hippocampus import Hippocampus
 
+    validated = _validated_engrams(entries)
+
     global_hc = Hippocampus(GlobalMemoryStore(scope=scope).root)
-    project_store = ProjectMemoryStore(Path(project_path)) if project_path else None
-    project_hc = Hippocampus(project_store.root) if project_store else None
-
     applied = 0
-    for raw in entries:
+    for entry in validated:
+        if entry.targets_project:
+            continue
+        _encode_engram(global_hc, entry)
+        applied += 1
+
+    project_entries = [entry for entry in validated if entry.targets_project]
+    if not project_entries:
+        return applied
+    if project_path is None:
+        logger.warning(
+            "Dropped %d remote-turn project memory entr(ies): the turn has no project",
+            len(project_entries),
+        )
+        return applied
+
+    project_store = ProjectMemoryStore(Path(project_path))
+    if not scope.org_mode:
+        project_hc = Hippocampus(project_store.root)
+        for entry in project_entries:
+            _encode_engram(project_hc, entry)
+            applied += 1
+        return applied
+
+    # Cloud turns must carry the request's trusted identity all the way to this
+    # detached write. A bare TenantScope has no admin role, so it is not enough
+    # to authorize a shared mutation.
+    if access is None or project_id is None or not access.has_trusted_actor:
+        logger.warning(
+            "Dropped %d remote-turn project memory entr(ies): "
+            "the turn carries no trusted organization identity",
+            len(project_entries),
+        )
+        return applied
+    for entry in project_entries:
+        if _apply_project_engram(access, project_id, entry):
+            applied += 1
+    return applied
+
+
+def _apply_project_engram(
+    access: SharedResourceAccess,
+    project_id: UUID,
+    entry: _WireEngram,
+) -> bool:
+    """Persist one shared entry under the slot's authorship gate.
+
+    Returns whether it reached disk. A slot the caller may not write is dropped
+    and logged rather than raised, so one refused entry costs only itself.
+    """
+    from anton.core.memory.hippocampus import Hippocampus
+
+    slot = entry.slot
+    with ExitStack() as coordination:
         try:
-            entry = _WireEngram.model_validate(raw)
-        except ValidationError:
-            continue
-
-        text = _one_line(entry.text)
-        # Identity is global-only; everything else honours the declared scope.
-        project_entry = entry.kind != "profile" and entry.scope == "project"
-        target = project_hc if project_entry else global_hc
-        if not text or target is None:
-            continue
-
-        slot = MemorySlot.LESSONS if entry.kind == "lesson" else MemorySlot.RULES
-        attribution_exists = False
-        claim_token = None
-        claimed = None
-        before = ""
-        before_exists = False
-        key = ""
-        coordination_context: ExitStack | None = None
-        if project_entry and scope.org_mode:
-            # Cloud turns must carry the request's trusted identity all the way
-            # to this detached write.  A bare TenantScope has no admin role, so
-            # it is not enough to authorize a shared mutation.
-            if (
-                access is None
-                or project_id is None
-                or project_store is None
-                or not access.has_trusted_actor
-            ):
-                continue
-            coordination_context = ExitStack()
-            try:
-                _project, project_store, key = coordination_context.enter_context(
-                    _project_slot_coordination(
-                        access.session,
-                        access,
-                        project_id,
-                        slot,
+            _project, store, key = coordination.enter_context(
+                _project_slot_coordination(
+                    access.session,
+                    access,
+                    project_id,
+                    slot,
+                )
+            )
+            before = store.read_state(slot)
+            access.recover_stale_claim(
+                PROJECT_MEMORY,
+                key,
+                resource_exists=lambda: _slot_holds_content(store.read_state(slot)),
+            )
+            attribution_exists = access.has_attribution(PROJECT_MEMORY, key)
+            claimed = None
+            claim_token = None
+            if _slot_holds_content(before) or attribution_exists:
+                if not access.can_change(access.creator_id(PROJECT_MEMORY, key)):
+                    return _drop_project_engram(
+                        "the turn's actor is not its author",
+                        key,
+                    )
+                if access.claim_is_pending(PROJECT_MEMORY, key):
+                    return _drop_project_engram(
+                        "another write is establishing it",
+                        key,
+                    )
+                attribution = coordination.enter_context(
+                    access.mutation_lock(
+                        PROJECT_MEMORY,
+                        key,
+                        resource_exists=lambda: _slot_holds_content(
+                            store.read_state(slot)
+                        ),
                     )
                 )
-                project_hc = Hippocampus(project_store.root)
-                target = project_hc
-                before_exists, before = project_store.read_checked(slot)
-                has_meaningful_content = bool(before.strip())
-                access.recover_stale_claim(
-                    PROJECT_MEMORY,
-                    key,
-                    resource_exists=lambda: bool(
-                        project_store.read_checked(slot)[1].strip()
-                    ),
-                )
-                creator_id = access.creator_id(PROJECT_MEMORY, key)
-                attribution_exists = access.has_attribution(PROJECT_MEMORY, key)
-                if has_meaningful_content or attribution_exists:
-                    if not access.can_change(creator_id):
-                        coordination_context.close()
-                        continue
-                    if access.claim_is_pending(PROJECT_MEMORY, key):
-                        coordination_context.close()
-                        continue
-                    attribution = coordination_context.enter_context(
+                if attribution is None or not access.can_change(
+                    attribution.created_by_id
+                ):
+                    return _drop_project_engram(
+                        "the turn's actor is not its author",
+                        key,
+                    )
+                before = store.read_state(slot)
+            else:
+                claimed, claim_token = access.reserve_claim(PROJECT_MEMORY, key)
+                if claimed is None or not access.can_change(claimed.created_by_id):
+                    return _drop_project_engram("another member became its author", key)
+                if claim_token is None:
+                    if claimed.pending_claim_token:
+                        return _drop_project_engram(
+                            "another write is establishing it",
+                            key,
+                        )
+                    attribution = coordination.enter_context(
                         access.mutation_lock(
                             PROJECT_MEMORY,
                             key,
-                            resource_exists=lambda: bool(
-                                project_store.read_checked(slot)[1].strip()
+                            resource_exists=lambda: _slot_holds_content(
+                                store.read_state(slot)
                             ),
                         )
                     )
                     if attribution is None or not access.can_change(
                         attribution.created_by_id
                     ):
-                        coordination_context.close()
-                        continue
-                    before_exists, before = project_store.read_checked(slot)
-                else:
-                    claimed, claim_token = access.reserve_claim(
-                        PROJECT_MEMORY,
-                        key,
-                    )
-                    if claimed is None or not access.can_change(claimed.created_by_id):
-                        coordination_context.close()
-                        continue
-                    if claim_token is None:
-                        if claimed.pending_claim_token:
-                            coordination_context.close()
-                            continue
-                        attribution = coordination_context.enter_context(
-                            access.mutation_lock(
-                                PROJECT_MEMORY,
-                                key,
-                                resource_exists=lambda: bool(
-                                    project_store.read_checked(slot)[1].strip()
-                                ),
-                            )
+                        return _drop_project_engram(
+                            "the turn's actor is not its author",
+                            key,
                         )
-                        if attribution is None or not access.can_change(
-                            attribution.created_by_id
-                        ):
-                            coordination_context.close()
-                            continue
-                        before_exists, before = project_store.read_checked(slot)
-            except Exception:
-                try:
-                    access.session.rollback()
-                finally:
-                    coordination_context.close()
-                raise
+                    before = store.read_state(slot)
+        except Exception:
+            access.session.rollback()
+            raise
 
         try:
-            if entry.kind == "profile":
-                target.rewrite_identity([text])
-            elif entry.kind == "lesson":
-                target.encode_lesson(text, topic=entry.topic, source=entry.source)
-            else:
-                target.encode_rule(
-                    text,
-                    kind=entry.kind,
-                    confidence=entry.confidence,
-                    source=entry.source,
-                )
+            _encode_engram(Hippocampus(store.root), entry)
         except Exception:
-            if project_entry and scope.org_mode and project_store is not None:
-                try:
-                    _restore_project_slot(
-                        project_store,
-                        slot,
-                        before,
-                        existed=before_exists,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not restore project memory after a failed write"
-                    )
+            try:
+                _restore_project_slot(store, slot, before)
+            except Exception:
+                logger.exception(
+                    "Could not restore project memory after a failed write"
+                )
             if claim_token is not None and claimed is not None:
                 try:
                     access.release_claim(claimed, claim_token=claim_token)
                 except Exception:
                     logger.exception("Could not release a failed project-memory claim")
-            if coordination_context is not None:
-                coordination_context.close()
             raise
-        if project_entry and scope.org_mode and project_store is not None:
-            try:
-                after_exists, after = project_store.read_checked(slot)
-                if after != before or after_exists != before_exists:
-                    if claim_token is not None and claimed is not None:
-                        finalized = access.finalize_claim(
-                            claimed,
-                            claim_token,
-                            action="create",
-                        )
-                        if finalized is None:
-                            raise RuntimeError(
-                                "Project-memory claim changed before it could be finalized"
-                            )
-                    else:
-                        # Attributed slots, legacy slots, and a race whose
-                        # winner finalized before this write all record the
-                        # current actor as an editor.
-                        access.record_update(
-                            PROJECT_MEMORY,
-                            key,
-                            action="update",
-                        )
-                elif claim_token is not None and claimed is not None:
-                    access.release_claim(claimed, claim_token=claim_token)
-            except Exception:
-                try:
-                    _restore_project_slot(
-                        project_store,
-                        slot,
-                        before,
-                        existed=before_exists,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not restore project memory after an audit failure"
-                    )
-                if claim_token is not None and claimed is not None:
-                    try:
-                        access.release_claim(claimed, claim_token=claim_token)
-                    except Exception:
-                        logger.exception(
-                            "Could not release a failed project-memory claim"
-                        )
-                if coordination_context is not None:
-                    coordination_context.close()
-                raise
-        if coordination_context is not None:
-            coordination_context.close()
-        applied += 1
 
-    return applied
+        try:
+            after = store.read_state(slot)
+            if after.content != before.content or after.exists != before.exists:
+                if claim_token is not None and claimed is not None:
+                    finalized = access.finalize_claim(
+                        claimed,
+                        claim_token,
+                        action="create",
+                    )
+                    if finalized is None:
+                        raise RuntimeError(
+                            "Project-memory claim changed before it could be finalized"
+                        )
+                else:
+                    # Attributed slots, legacy slots, and a race whose winner
+                    # finalized before this write all record the current actor
+                    # as an editor.
+                    access.record_update(
+                        PROJECT_MEMORY,
+                        key,
+                        action="update",
+                    )
+            elif claim_token is not None and claimed is not None:
+                access.release_claim(claimed, claim_token=claim_token)
+        except Exception:
+            try:
+                _restore_project_slot(store, slot, before)
+            except Exception:
+                logger.exception(
+                    "Could not restore project memory after an audit failure"
+                )
+            if claim_token is not None and claimed is not None:
+                try:
+                    access.release_claim(claimed, claim_token=claim_token)
+                except Exception:
+                    logger.exception("Could not release a failed project-memory claim")
+            raise
+    return True
 
 
 class MemoryService:
@@ -397,13 +467,13 @@ class MemoryService:
     ) -> MemoryResponse:
         scope = MemoryScope(scope)
         category = MemorySlot(category)
-        content, read_verified = self._read_for_response(scope, category, project_id)
+        state = self._read_for_response(scope, category, project_id)
         return self._response(
             scope,
             category,
-            content,
+            state.content,
             project_id,
-            read_verified=read_verified,
+            read_verified=state.readable,
         )
 
     async def update_memory(
@@ -471,19 +541,14 @@ class MemoryService:
         for project in projects:
             store = ProjectMemoryStore(Path(project.path))
             for category in PROJECT_SLOTS:
-                try:
-                    _exists, content = store.read_checked(category)
-                    read_verified = True
-                except (OSError, UnicodeError):
-                    content = ""
-                    read_verified = False
+                state = store.read_state(category)
                 items.append(
                     self._response(
                         MemoryScope.project,
                         category,
-                        content,
+                        state.content,
                         project.id,
-                        read_verified=read_verified,
+                        read_verified=state.readable,
                     )
                 )
 
@@ -509,20 +574,15 @@ class MemoryService:
         scope: MemoryScope,
         category: MemorySlot,
         project_id: UUID | None,
-    ) -> tuple[str, bool]:
+    ) -> SlotRead:
         if scope == MemoryScope.global_:
-            return self._global_store.read(category), True
+            content = self._global_store.read(category)
+            return SlotRead(exists=bool(content), readable=True, content=content)
         project = self._resolve_project(project_id)
-        try:
-            _exists, content = ProjectMemoryStore(Path(project.path)).read_checked(
-                category
-            )
-        except (OSError, UnicodeError):
-            # Preserve the historical fail-soft read body, but do not advertise
-            # a mutation capability when authorization could not establish
-            # whether a legacy shared slot exists.
-            return "", False
-        return content, True
+        # An unreadable slot keeps the historical fail-soft read body, but the
+        # response must not advertise a mutation capability when authorization
+        # could not establish whether a legacy shared slot exists.
+        return ProjectMemoryStore(Path(project.path)).read_state(category)
 
     def _write(
         self,
@@ -545,17 +605,18 @@ class MemoryService:
                 store.write(category, content)
                 return
 
-            before_exists, before = store.read_checked(category)
-            has_meaningful_content = bool(before.strip())
+            # This read fails closed on purpose: a slot whose bytes cannot be
+            # read is a slot whose author cannot be established, and a write
+            # must not proceed on the assumption that it is empty.
+            exists, content_before = store.read_checked(category)
+            before = SlotRead(exists=exists, readable=True, content=content_before)
             self.access.recover_stale_claim(
                 PROJECT_MEMORY,
                 key,
-                resource_exists=lambda: bool(
-                    store.read_checked(category)[1].strip()
-                ),
+                resource_exists=lambda: _slot_holds_content(store.read_state(category)),
             )
             attribution_exists = self.access.has_attribution(PROJECT_MEMORY, key)
-            if has_meaningful_content or attribution_exists:
+            if _slot_holds_content(before) or attribution_exists:
                 self.access.require_change(
                     self.access.creator_id(PROJECT_MEMORY, key),
                     detail="Only the project-memory author or an organization admin can edit this slot",
@@ -594,12 +655,7 @@ class MemoryService:
                     )
             except Exception:
                 try:
-                    _restore_project_slot(
-                        store,
-                        category,
-                        before,
-                        existed=before_exists,
-                    )
+                    _restore_project_slot(store, category, before)
                 except Exception:
                     logger.exception(
                         "Could not restore project memory after a failed mutation"
@@ -621,7 +677,7 @@ class MemoryService:
         with self.access.mutation_lock(
             PROJECT_MEMORY,
             key,
-            resource_exists=lambda: bool(store.read_checked(category)[1].strip()),
+            resource_exists=lambda: _slot_holds_content(store.read_state(category)),
         ) as attribution:
             if attribution is None:
                 raise RuntimeError("Project-memory mutation lock was not established")
@@ -629,7 +685,7 @@ class MemoryService:
                 attribution.created_by_id,
                 detail="Only the project-memory author or an organization admin can edit this slot",
             )
-            before_exists, before = store.read_checked(category)
+            before = store.read_state(category)
             try:
                 store.write(category, content)
                 self.access.record_update(
@@ -639,12 +695,7 @@ class MemoryService:
                 )
             except Exception:
                 try:
-                    _restore_project_slot(
-                        store,
-                        category,
-                        before,
-                        existed=before_exists,
-                    )
+                    _restore_project_slot(store, category, before)
                 except Exception:
                     logger.exception(
                         "Could not restore project memory after a failed mutation"
@@ -670,17 +721,18 @@ class MemoryService:
             if not self.session.scope.org_mode:
                 store.delete(category)
                 return
-            before_exists, before = store.read_checked(category)
-            has_meaningful_content = bool(before.strip())
+            # A delete never decodes the slot: a symlink squatting the name, or
+            # bytes that are not UTF-8, still gets unlinked for whoever owns the
+            # slot, and is still refused to everyone else. Reading it as content
+            # would only turn a squatted slot into a failed request.
+            before = store.read_state(category)
             self.access.recover_stale_claim(
                 PROJECT_MEMORY,
                 key,
-                resource_exists=lambda: bool(
-                    store.read_checked(category)[1].strip()
-                ),
+                resource_exists=lambda: _slot_holds_content(store.read_state(category)),
             )
             attribution_exists = self.access.has_attribution(PROJECT_MEMORY, key)
-            if not has_meaningful_content and not attribution_exists:
+            if not _slot_holds_content(before) and not attribution_exists:
                 store.delete(category)
                 return
             self.access.require_change(
@@ -690,9 +742,7 @@ class MemoryService:
             with self.access.mutation_lock(
                 PROJECT_MEMORY,
                 key,
-                resource_exists=lambda: bool(
-                    store.read_checked(category)[1].strip()
-                ),
+                resource_exists=lambda: _slot_holds_content(store.read_state(category)),
             ) as attribution:
                 if attribution is None:
                     raise RuntimeError(
@@ -702,7 +752,7 @@ class MemoryService:
                     attribution.created_by_id,
                     detail="Only the project-memory author or an organization admin can delete this slot",
                 )
-                before_exists, before = store.read_checked(category)
+                before = store.read_state(category)
                 try:
                     store.delete(category)
                     self.access.record_update(
@@ -712,12 +762,7 @@ class MemoryService:
                     )
                 except Exception:
                     try:
-                        _restore_project_slot(
-                            store,
-                            category,
-                            before,
-                            existed=before_exists,
-                        )
+                        _restore_project_slot(store, category, before)
                     except Exception:
                         logger.exception(
                             "Could not restore project memory after a failed clear"
@@ -742,117 +787,74 @@ class MemoryService:
         read_verified: bool = True,
     ) -> MemoryResponse:
         if scope == MemoryScope.global_:
+            # Private per-member memory: nobody else can see it, so there is no
+            # shared authorship to report and nothing to gate.
             return MemoryResponse(
                 scope=scope,
                 category=category,
                 content=content,
                 project_id=None,
-                attribution={
-                    "createdBy": None,
-                    "lastModifiedBy": None,
-                    "lastModifiedAt": None,
-                },
-                capabilities={"canEdit": True, "canDelete": True},
+                attribution=ResourceAttribution(
+                    created_by=None,
+                    last_modified_by=None,
+                    last_modified_at=None,
+                ),
+                capabilities=MutableResourceCapabilities(
+                    can_edit=True,
+                    can_delete=True,
+                ),
             )
 
         if project_id is None:
             raise ValueError("project_id is required for project-scoped memory.")
         key = project_memory_resource_key(project_id, category.value)
-
-        def build_project_response(
-            store: ProjectMemoryStore,
-            current_content: str,
-            current_read_verified: bool,
-            *,
-            recover: bool,
-        ) -> MemoryResponse:
-            if recover:
-                self.access.recover_stale_claim(
-                    PROJECT_MEMORY,
-                    key,
-                    resource_exists=lambda: bool(
-                        store.read_checked(category)[1].strip()
-                    ),
-                )
-            pending = self.access.claim_is_pending(PROJECT_MEMORY, key)
-            creator_id = self.access.creator_id(PROJECT_MEMORY, key)
-            attribution_exists = self.access.has_attribution(PROJECT_MEMORY, key)
-            can_change = self.access.can_change(creator_id)
-            # An empty, never-authored slot is open for a member to become its
-            # first author. A non-empty unattributed slot is legacy/admin-only.
-            if (
-                current_read_verified
-                and creator_id is None
-                and not current_content.strip()
-                and not attribution_exists
-            ):
-                can_change = self.access.has_trusted_actor
-            # A live reservation is not authorship yet. It cannot advertise a
-            # capability to its reserver (or an admin) that PUT will reject.
-            if not current_read_verified or pending:
-                can_change = False
-            modified_at = None
-            try:
-                slot_path = store.root / (
-                    "lessons.md" if category == MemorySlot.LESSONS else "rules.md"
-                )
-                if slot_path.is_file():
-                    modified_at = datetime.fromtimestamp(
-                        slot_path.stat().st_mtime,
-                        tz=timezone.utc,
-                    )
-            except OSError:
-                pass
-            attribution = (
-                {
-                    "createdBy": None,
-                    "lastModifiedBy": None,
-                    "lastModifiedAt": None,
-                }
-                if pending
-                else self.access.attribution(
-                    PROJECT_MEMORY,
-                    key,
-                    fallback_modified_at=modified_at,
-                )
-            )
-            return MemoryResponse(
-                scope=scope,
-                category=category,
-                content=current_content,
-                project_id=project_id,
-                attribution=attribution,
-                capabilities={"canEdit": can_change, "canDelete": can_change},
-            )
+        store = ProjectMemoryStore(Path(self._resolve_project(project_id).path))
 
         if (
             self.session.scope.org_mode
             and read_verified
             and self.access.has_trusted_actor
         ):
-            with _project_slot_coordination(
-                self.session,
-                self.access,
-                project_id,
-                category,
-            ) as (_project, store, _key):
-                try:
-                    _exists, content = store.read_checked(category)
-                except (OSError, UnicodeError):
-                    content = ""
-                    read_verified = False
-                return build_project_response(
-                    store,
-                    content,
-                    read_verified,
-                    recover=read_verified,
-                )
-
-        project = self._resolve_project(project_id)
-        store = ProjectMemoryStore(Path(project.path))
-        return build_project_response(
-            store,
-            content,
-            read_verified,
-            recover=False,
+            # A read takes no resource lock of its own. It reports the content
+            # the caller already read, and recovery only reaches for the
+            # coordination lock once a claim's lease has actually run out, so a
+            # listing costs neither a lock nor a connection per slot.
+            self.access.recover_stale_claim(
+                PROJECT_MEMORY,
+                key,
+                resource_exists=lambda: _slot_holds_content(store.read_state(category)),
+            )
+        pending = self.access.claim_is_pending(PROJECT_MEMORY, key)
+        creator_id = self.access.creator_id(PROJECT_MEMORY, key)
+        attribution_exists = self.access.has_attribution(PROJECT_MEMORY, key)
+        can_change = self.access.can_change(creator_id)
+        # An empty, never-authored slot is open for a member to become its
+        # first author. A non-empty unattributed slot is legacy/admin-only.
+        if (
+            read_verified
+            and creator_id is None
+            and not content.strip()
+            and not attribution_exists
+        ):
+            can_change = self.access.has_trusted_actor
+        # A live reservation is not authorship yet. It cannot advertise a
+        # capability to its reserver (or an admin) that PUT will reject.
+        if not read_verified or pending:
+            can_change = False
+        return MemoryResponse(
+            scope=scope,
+            category=category,
+            content=content,
+            project_id=project_id,
+            # A pending claim is hidden by `attribution` itself; an unattributed
+            # slot falls back to the file's own mtime.
+            attribution=self.access.attribution(
+                PROJECT_MEMORY,
+                key,
+                fallback_modified_at=store.modified_at(category),
+            ),
+            capabilities=MutableResourceCapabilities(
+                can_edit=can_change,
+                can_delete=can_change,
+            ),
         )

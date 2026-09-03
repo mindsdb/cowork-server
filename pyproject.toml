@@ -16,14 +16,23 @@ classifiers = [
 ]
 dependencies = [
     "alembic>=1.17.0",
+    # Releases before ENG-2116 remain allowed until Anton ships the supplier;
+    # build_llm_client capability-gates that kwarg and reports the degradation.
     "anton-agent>=2.26.8.23.1,<3",
     # Capped <49: 49+ drops the macOS universal2 wheel, breaking Intel-Mac installs.
     "cryptography>=48.0.0,<49",
     "fastapi>=0.136.1",
     "hermes-agent>=0.15.2,<0.18",
     "httpx>=0.27",
+    # Structured app-server integration with a pinned, bundled Codex runtime;
+    # users do not need to install a separate CLI.
+    "openai-codex==0.147.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+    # Used to terminate the complete coding-agent subprocess tree on both
+    # macOS and Windows; killing only the app-server can orphan commands.
+    "psutil>=7.0",
     "psycopg[binary]>=3.2",
     # psycopg 3 is what the code targets, but the hosted DB URIs come from the
     # shared mindsdb DB stack, which mints every service's URI as bare
@@ -51,6 +60,7 @@ Issues = "https://github.com/mindsdb/cowork-server/issues"
 [project.scripts]
 cowork-server = "cowork.cli:main"
 cowork-dev-setup = "cowork.cli:dev_setup_main"
+cowork-code-runtime = "cowork.coding.runtime_worker:main"
 
 [project.optional-dependencies]
 channels = [
@@ -77,17 +87,21 @@ packages = ["cowork"]
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
-# Stacked feature dependency: cowork-server imports the artifact-identity
-# derivation (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`)
-# from this Anton commit, and persists what Anton only derives in memory — the
-# two must agree on the value or one artifact ends up with two identities.
-# This is Anton's staging head (mindsdb/anton#407); `main` has none of those
-# symbols yet, so pinning back to `branch = "main"` before Anton's next
-# staging → main release makes every artifact endpoint fail to import.
-# Flip it back in that release: the image installs from this lockfile
-# (`uv sync --frozen`), so a rev on a staging commit must not reach a
-# cowork-server main build.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "61ec5db6a6fdbb868bb43c30c98b9c52dd542fa3" }
+# cowork-server imports the artifact-identity derivation
+# (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`) from Anton
+# and persists what Anton only derives in memory, so the two must agree on the
+# value or one artifact ends up with two identities. Anton `main` defines all
+# three, and since mindsdb/anton#429 it also carries the typed provider-auth
+# error and the per-request API-key supplier that refresh desktop credentials
+# without rebuilding an active session (ENG-2116). Neither feature needs a rev
+# pin any more, so this tracks the branch and the lockfile records the resolved
+# commit that `uv sync --frozen` installs.
+#
+# Published package metadata still permits older Anton versions.
+# `services/providers.py` capability-gates the live supplier and logs when it
+# must retain the static construction-time key, and `handlers/turn_errors.py`
+# keeps the legacy 401 classifier available under that skew.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 # pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 

@@ -31,9 +31,7 @@ class SharedResourceAttribution(BaseSQLModel, table=True):
     resource_kind: str = Field(index=True, max_length=32)
     resource_key: str = Field(max_length=255)
     created_by_id: str | None = Field(default=None, max_length=36)
-    created_by_email: str | None = Field(default=None, max_length=320)
     updated_by_id: str | None = Field(default=None, max_length=36)
-    updated_by_email: str | None = Field(default=None, max_length=320)
     pending_claim_token: str | None = Field(default=None, max_length=36)
     pending_claim_expires_at: datetime | None = Field(
         default=None,
@@ -59,4 +57,3 @@ class SharedResourceMutation(BaseSQLModel, table=True):
     resource_key: str = Field(max_length=255)
     action: str = Field(max_length=32)
     actor_id: str = Field(max_length=36)
-    actor_email: str | None = Field(default=None, max_length=320)

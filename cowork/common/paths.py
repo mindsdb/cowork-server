@@ -134,10 +134,45 @@ def dir_stat(
 
 
 def dir_unlink(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Unlink path must be a direct-child name")
     if d.fd is not None:
-        os.unlink(name, dir_fd=d.fd)
+        os.unlink(safe_name, dir_fd=d.fd)
     else:
-        os.unlink(d.path / name)
+        os.unlink(d.path / safe_name)
+
+
+def dir_replace(d: PinnedDir, source_name: str, destination_name: str) -> None:
+    """Atomically replace one pinned direct child with another.
+
+    ``dir_rename`` maps to ``os.rename``, which refuses an existing destination
+    on Windows. A durable write always lands on a file that already exists, so
+    that path needs ``os.replace`` instead, pinned the same way so the
+    destination cannot be swapped for a link between the check and the write.
+    """
+    safe_source = os.path.basename(source_name)
+    safe_destination = os.path.basename(destination_name)
+    for candidate, original in (
+        (safe_source, source_name),
+        (safe_destination, destination_name),
+    ):
+        if (
+            candidate != original
+            or candidate in {"", ".", ".."}
+            or "\\" in candidate
+            or "\0" in candidate
+        ):
+            raise ValueError("Replace paths must be direct-child names")
+    if d.fd is not None:
+        os.replace(safe_source, safe_destination, src_dir_fd=d.fd, dst_dir_fd=d.fd)
+    else:
+        os.replace(d.path / safe_source, d.path / safe_destination)
 
 
 def dir_mkdir(d: PinnedDir, name: str) -> None:

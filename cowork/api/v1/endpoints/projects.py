@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from cowork.db.scoped import ScopedSessionDep
+from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import PROJECT_SLOTS, ProjectMemoryStore
 from cowork.models.project import Project
 from cowork.principal import Principal, get_principal
@@ -25,6 +26,7 @@ from cowork.services.shared_resources import (
     PROJECT_MEMORY,
     SKILL,
     SKILL_PROJECT_REFERENCES,
+    ResourceDeletion,
     SharedResourceAccess,
     project_memory_resource_key,
     project_resource_key,
@@ -33,6 +35,25 @@ from cowork.services.skills import SkillService
 
 
 router = APIRouter()
+
+
+def _project_memory_slot_has_content(
+    store: ProjectMemoryStore,
+    slot: MemorySlot,
+) -> bool:
+    """Whether a project-memory slot holds content, counting unreadable bytes.
+
+    The agent writes these slots, so a slot can hold non-UTF-8 bytes or be a
+    planted symlink. ``read_state`` reports that as present but unreadable,
+    which still has ownership to guard, so it answers True. Reading through the
+    raising helper instead turned a rename or a delete into a 404 carrying a
+    decoder message, or a 500, and because this inventory runs on every attempt
+    the project could then never be renamed or deleted at all.
+    """
+    state = store.read_state(slot)
+    if not state.readable:
+        return True
+    return bool(state.content.strip())
 
 
 def _guard_project_instructions_for_move(
@@ -117,10 +138,9 @@ def _guard_project_memory_for_move(
         locks.enter_context(access.coordination_lock(PROJECT_MEMORY, key))
 
         def exists_check(slot=slot):
-            return bool(store.read_checked(slot)[1].strip())
+            return _project_memory_slot_has_content(store, slot)
 
-        _exists, content = store.read_checked(slot)
-        meaningful = bool(content.strip())
+        meaningful = _project_memory_slot_has_content(store, slot)
         access.recover_stale_claim(
             PROJECT_MEMORY,
             key,
@@ -189,16 +209,12 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
     creator_id = project.created_by
     is_general = project.name == GENERAL_PROJECT
     can_change = not pending and not is_general and access.can_change(creator_id)
-    creator_email = (
-        access.actor_email if creator_id and creator_id == access.actor_id else None
-    )
     return {
         **project.model_dump(),
         "attribution": access.attribution(
             PROJECT,
             key,
             fallback_creator_id=project.created_by,
-            fallback_creator_email=creator_email,
             fallback_modified_at=project.modified_at,
         ),
         "capabilities": ProjectCapabilities(
@@ -377,6 +393,14 @@ def update_project(
 
                     skill_service = SkillService(session.scope)
                     locked_slugs: set[str] = set()
+                    # Slugs the listing keeps returning but that no longer
+                    # resolve to a complete skill. They must be remembered, or
+                    # the re-scan below offers them forever: `list_skills` only
+                    # needs a directory holding SKILL.md, while
+                    # `has_complete_skill` also rejects symlinks and frontmatter
+                    # whose identity has drifted from the directory, so the two
+                    # disagree permanently on a half-written skill.
+                    skipped_slugs: set[str] = set()
                     # Re-scan after each lock batch. A skill mutation that
                     # started before this rename is either observed here or
                     # completes before its own resource lock is acquired.
@@ -384,6 +408,7 @@ def update_project(
                         unlocked = sorted(
                             set(skill_service.project_reference_slugs(current.name))
                             - locked_slugs
+                            - skipped_slugs
                         )
                         if not unlocked:
                             break
@@ -408,6 +433,7 @@ def update_project(
                                 )
                             except HTTPException as exc:
                                 if exc.status_code == status.HTTP_404_NOT_FOUND:
+                                    skipped_slugs.add(slug)
                                     continue
                                 raise
                             locked_slugs.add(slug)
@@ -555,9 +581,7 @@ def delete_project(
                 )
             if created:
                 legacy_guards.append(row)
-                preexisting_attribution.add((PROJECT_INSTRUCTIONS, instructions_key))
-            else:
-                preexisting_attribution.add((PROJECT_INSTRUCTIONS, instructions_key))
+            preexisting_attribution.add((PROJECT_INSTRUCTIONS, instructions_key))
             child_locks.append(
                 (
                     PROJECT_INSTRUCTIONS,
@@ -595,11 +619,13 @@ def delete_project(
             child_coordination.enter_context(
                 access.coordination_lock(PROJECT_MEMORY, memory_key)
             )
-            _memory_exists, memory_content = memory_store.read_checked(slot)
-            has_meaningful_memory = bool(memory_content.strip())
+            has_meaningful_memory = _project_memory_slot_has_content(
+                memory_store,
+                slot,
+            )
 
             def exists_check(slot=slot):
-                return bool(memory_store.read_checked(slot)[1].strip())
+                return _project_memory_slot_has_content(memory_store, slot)
 
             access.recover_stale_claim(
                 PROJECT_MEMORY,
@@ -623,9 +649,7 @@ def delete_project(
                     )
                 if created:
                     legacy_guards.append(row)
-                    preexisting_attribution.add((PROJECT_MEMORY, memory_key))
-                else:
-                    preexisting_attribution.add((PROJECT_MEMORY, memory_key))
+                preexisting_attribution.add((PROJECT_MEMORY, memory_key))
                 child_locks.append((PROJECT_MEMORY, memory_key, exists_check))
             else:
                 row, token = access.reserve_claim(PROJECT_MEMORY, memory_key)
@@ -680,24 +704,25 @@ def delete_project(
                 in preexisting_attribution
             ):
                 child_deletions.append(
-                    (PROJECT_INSTRUCTIONS, instructions_key, "delete")
+                    ResourceDeletion(PROJECT_INSTRUCTIONS, instructions_key, "delete")
                 )
             for slot in PROJECT_SLOTS:
                 memory_key = project_memory_resource_key(project.id, slot.value)
-                _exists, content = memory_store.read_checked(slot)
                 if (
-                    bool(content.strip())
+                    _project_memory_slot_has_content(memory_store, slot)
                     or (
                         PROJECT_MEMORY,
                         memory_key,
                     )
                     in preexisting_attribution
                 ):
-                    child_deletions.append((PROJECT_MEMORY, memory_key, "clear"))
+                    child_deletions.append(
+                        ResourceDeletion(PROJECT_MEMORY, memory_key, "clear")
+                    )
 
             deletion_resources = [
                 *child_deletions,
-                (PROJECT, resource_key, "delete"),
+                ResourceDeletion(PROJECT, resource_key, "delete"),
             ]
             found = service.delete_project(
                 project_id,
@@ -711,7 +736,10 @@ def delete_project(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Project not found",
                 )
-    except ValueError as e:
+    # Only a genuinely absent project is a 404. A blanket ValueError handler
+    # also swallowed decode and validation faults raised while inventorying the
+    # children, which then answered "not found" for a project that exists.
+    except ProjectNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     finally:
         for row, token in pending_guards:

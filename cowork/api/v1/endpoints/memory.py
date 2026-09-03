@@ -54,6 +54,15 @@ def update_memory(
                 content=body.content,
                 project_id=body.project_id,
             )
+    except UnicodeError as e:
+        # A slot whose stored bytes do not decode is a broken shared resource,
+        # not a bad request. UnicodeDecodeError is a ValueError, so without this
+        # the unknown-project mapping below would answer 400 and name the
+        # decoder's offset as if the caller had sent something wrong.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This memory slot exists but its stored bytes cannot be read",
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 

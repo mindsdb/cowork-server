@@ -53,6 +53,7 @@ from cowork.services.shared_resources import (
 from cowork.services.skills import (
     BUILTIN_SKILLS_DIR,
     BUILTIN_SKILL_SLUGS,
+    CODE_ONLY_BUILTIN_SKILL_NAMES,
     SkillService,
 )
 
@@ -223,7 +224,7 @@ def test_audit_service_keeps_delete_event_and_drops_current_attribution(org_engi
     access.register(SKILL, "quarterly-report")
     row = scoped.exec(scoped.select(SharedResourceAttribution)).one()
     assert row.created_by_id == ALICE
-    assert row.created_by_email == "1@example.com"
+    assert not hasattr(row, "created_by_email")  # addresses are not persisted
 
     member = _scoped(org_engine, BOB)
     member_access = SharedResourceAccess(member, _principal(BOB))
@@ -300,7 +301,6 @@ def test_project_creator_admin_and_general_policy(org_engine):
         "project",
         str(project.id),
         creator_id=project.created_by,
-        creator_email="1@example.com",
     )
 
     bob = _scoped(org_engine, BOB)
@@ -487,7 +487,9 @@ def test_project_rename_cannot_claim_the_unprovisioned_general_name(org_engine):
     assert general is not None
     assert general.id != renamed["id"]
     assert general.name == GENERAL_PROJECT
-    assert general.created_by is None
+    # General carries the member who provisioned it, so its instructions are
+    # editable without an admin. Rename and delete stay refused for every role.
+    assert general.created_by == ALICE
 
 
 def test_concurrent_project_renames_allocate_distinct_names(
@@ -1452,11 +1454,13 @@ def test_two_members_cannot_both_create_the_same_skill(
 def test_packaged_skills_are_immutable_for_every_org_role(org_engine):
     alice = _scoped(org_engine, ALICE)
     SkillService(alice.scope).ensure_builtin_skills()
+    # The packaged directory ships both stores' builtins. Each store owns its
+    # own immutable manifest, so the directory is their union.
     assert {
         entry.name
         for entry in BUILTIN_SKILLS_DIR.iterdir()
         if entry.is_dir() and (entry / "SKILL.md").is_file()
-    } == BUILTIN_SKILL_SLUGS
+    } == BUILTIN_SKILL_SLUGS | CODE_ONLY_BUILTIN_SKILL_NAMES
     victim = next(
         entry.name
         for entry in sorted(BUILTIN_SKILLS_DIR.iterdir())
@@ -1987,7 +1991,10 @@ def test_stale_memory_claim_releases_empty_or_recovers_surviving_bytes(org_engin
     assert recovered.pending_claim_token is None
     assert recovered.created_by_id == ALICE
     events = alice.exec(alice.select(SharedResourceMutation)).all()
-    assert [(event.action, event.actor_id) for event in events] == [("create", ALICE)]
+    # A crash-recovered claim is audited as a recovery, not an ordinary create.
+    assert [(event.action, event.actor_id) for event in events] == [
+        ("recover", ALICE)
+    ]
 
 
 @pytest.mark.asyncio
@@ -2459,7 +2466,7 @@ def test_stale_complete_skill_claim_is_recovered_before_mutations(org_engine):
         )
     ).all()
     assert [(event.action, event.actor_id) for event in update_events] == [
-        ("create", ALICE),
+        ("recover", ALICE),
         ("update", ALICE),
     ]
 
@@ -2477,7 +2484,7 @@ def test_stale_complete_skill_claim_is_recovered_before_mutations(org_engine):
         )
     ).all()
     assert [(event.action, event.actor_id) for event in delete_events] == [
-        ("create", ALICE),
+        ("recover", ALICE),
         ("delete", ADMIN),
     ]
 
@@ -3154,7 +3161,6 @@ def test_project_delete_cleans_a_legacy_memory_identity_cleared_before_lock(
         if kind == PROJECT_MEMORY and key == memory_key and created:
             store.delete(MemorySlot.RULES)
             row.updated_by_id = ADMIN
-            row.updated_by_email = "admin@example.com"
             access.session.add(row)
             access.session.commit()
         return row, created
@@ -3521,3 +3527,260 @@ def test_compat_move_rejects_reserved_anton_without_consuming_attachment(org_eng
     assert source.read_bytes() == b"must remain an attachment"
     assert FileService(alice).get_file_row(attachment.id).id == attachment.id
     assert not (Path(project.path) / ".anton").exists()
+
+
+def test_project_rename_terminates_when_a_referencing_skill_never_resolves(
+    org_engine,
+):
+    """A drifted skill directory must not spin the rename re-scan forever.
+
+    `list_skills` accepts any directory holding SKILL.md and canonicalises the
+    name to the directory, while `has_complete_skill` also requires the parsed
+    frontmatter identity to match. A skill whose frontmatter name drifted sits
+    on the wrong side of both, so the re-scan kept re-offering a slug whose
+    mutation lock always 404s while holding the org-wide namespace lock.
+    """
+    alice = _scoped(org_engine, ALICE)
+    project = projects.create_project(
+        ProjectCreateRequest(name="rename-with-drifted-skill"),
+        alice,
+        _principal(ALICE),
+    )
+    created = skills.create_skill(
+        SkillCreateRequest(
+            label="drifted skill",
+            instructions="references the project",
+            projects=[project["name"]],
+        ),
+        alice,
+        _principal(ALICE),
+    )
+    service = SkillService(alice.scope)
+    slug = created["id"]
+
+    # Drift the declared identity away from the directory and drop the
+    # attribution row, which is the state every skill predating this migration
+    # is already in.
+    skill_file = service._skill_dir(slug) / "SKILL.md"
+    skill_file.write_text(
+        skill_file.read_text(encoding="utf-8").replace(
+            f"name: {slug}", "name: some-other-identity"
+        ),
+        encoding="utf-8",
+    )
+    row = SharedResourceAccess(alice, _principal(ALICE))._find(SKILL, slug)
+    if row is not None:
+        alice.delete(row)
+        alice.commit()
+
+    assert slug in service.project_reference_slugs(project["name"])
+    assert service.has_complete_skill(slug) is False
+
+    renamed = projects.update_project(
+        project["id"],
+        ProjectUpdateRequest(name="renamed-past-the-drift"),
+        alice,
+        _principal(ALICE),
+    )
+    assert renamed["name"] == "renamed-past-the-drift"
+
+
+# ── AC7: a peer member's read must report every capability as false ──────────
+
+@pytest.mark.asyncio
+async def test_a_peer_member_reads_every_shared_resource_with_no_capabilities(
+    org_engine,
+):
+    """The read contract the whole frontend gates on.
+
+    Every other false assertion in this suite fires for a pending claim, a
+    packaged skill or unreadable bytes, so replacing `can_change(creator_id)`
+    with `has_trusted_actor` left the suite green while handing every member a
+    fully enabled UI.
+    """
+    alice = _scoped(org_engine, ALICE)
+    bob = _scoped(org_engine, BOB)
+
+    project = projects.create_project(
+        ProjectCreateRequest(name="alice-owns-this"),
+        alice,
+        _principal(ALICE),
+    )
+    skill = skills.create_skill(
+        SkillCreateRequest(label="alice skill", instructions="hers"),
+        alice,
+        _principal(ALICE),
+    )
+    await MemoryService(alice, _principal(ALICE)).update_memory(
+        scope="project",
+        category=MemorySlot.RULES,
+        content="Alice authored this slot",
+        project_id=project["id"],
+    )
+
+    peer_projects = projects.list_projects(bob, _principal(BOB))
+    peer_project = next(p for p in peer_projects if p["id"] == project["id"])
+    assert peer_project["capabilities"].can_rename is False
+    assert peer_project["capabilities"].can_delete is False
+    assert peer_project["capabilities"].can_edit_instructions is False
+
+    peer_skill = skills.get_skill(skill["id"], bob, _principal(BOB))
+    assert jsonable_encoder(peer_skill)["capabilities"] == {
+        "canEdit": False,
+        "canDelete": False,
+        "canDisable": False,
+    }
+
+    peer_memory = await MemoryService(bob, _principal(BOB)).get_memory(
+        scope="project",
+        category=MemorySlot.RULES,
+        project_id=project["id"],
+    )
+    assert peer_memory.capabilities.can_edit is False
+    assert peer_memory.capabilities.can_delete is False
+
+    # The creator still sees the allow side, or a gate that denied everyone
+    # would satisfy the assertions above.
+    own_skill = skills.get_skill(skill["id"], alice, _principal(ALICE))
+    assert jsonable_encoder(own_skill)["capabilities"]["canEdit"] is True
+
+
+# ── AC5: a legacy slot holding real bytes is admin-only ─────────────────────
+
+@pytest.mark.asyncio
+async def test_a_legacy_readable_memory_slot_is_admin_only(org_engine):
+    """A pre-migration slot with real content must not be claimable.
+
+    Written straight through the store, so no attribution row exists, which is
+    the state every slot predating this migration is in. Dropping the
+    `has_meaningful_content` term would let the next member become its author
+    and overwrite the bytes.
+    """
+    alice = _scoped(org_engine, ALICE)
+    bob = _scoped(org_engine, BOB)
+    admin = _scoped(org_engine, ADMIN)
+
+    project = ProjectService(alice).create_project("legacy-readable-memory")
+    ProjectMemoryStore(Path(project.path)).write(
+        MemorySlot.RULES, "Legacy rules that predate attribution"
+    )
+
+    peer_view = await MemoryService(bob, _principal(BOB)).get_memory(
+        scope="project",
+        category=MemorySlot.RULES,
+        project_id=project.id,
+    )
+    assert peer_view.content.strip()
+    assert peer_view.capabilities.can_edit is False
+
+    with pytest.raises(HTTPException) as denied:
+        await MemoryService(bob, _principal(BOB)).update_memory(
+            scope="project",
+            category=MemorySlot.RULES,
+            content="Bob claims the legacy slot",
+            project_id=project.id,
+        )
+    assert denied.value.status_code == 403
+    assert (
+        ProjectMemoryStore(Path(project.path)).read(MemorySlot.RULES).strip()
+        == "Legacy rules that predate attribution"
+    )
+
+    updated = await MemoryService(admin, _principal(ADMIN, admin=True)).update_memory(
+        scope="project",
+        category=MemorySlot.RULES,
+        content="Admin may rewrite it",
+        project_id=project.id,
+    )
+    # An admin edit never claims or transfers the stable creator.
+    assert updated.attribution.created_by is None
+    assert updated.attribution.last_modified_by.user_id == ADMIN
+
+
+# ── AC4: a packaged slug cannot be squatted through create or upload ─────────
+
+def test_a_packaged_skill_slug_cannot_be_squatted(org_engine):
+    """Immutability is only real if the slug cannot be taken in the first place.
+
+    The suite covered edit, disable and delete of an existing packaged skill,
+    but not the two paths that would let a member occupy the identity and
+    inherit its authority over every org member's turns.
+    """
+    alice = _scoped(org_engine, ALICE)
+    service = SkillService(alice.scope)
+    service.ensure_builtin_skills()
+    packaged = sorted(BUILTIN_SKILL_SLUGS)[0]
+
+    with pytest.raises((HTTPException, PermissionError, ValueError)) as created:
+        skills.create_skill(
+            SkillCreateRequest(label=packaged, instructions="squatted"),
+            alice,
+            _principal(ALICE),
+        )
+    if isinstance(created.value, HTTPException):
+        assert created.value.status_code in (403, 409)
+
+    # An org admin is refused for the same reason: packaged means immutable for
+    # every role, not merely for non-creators.
+    admin = _scoped(org_engine, ADMIN)
+    with pytest.raises((HTTPException, PermissionError, ValueError)):
+        skills.create_skill(
+            SkillCreateRequest(label=packaged, instructions="squatted by admin"),
+            admin,
+            _principal(ADMIN, admin=True),
+        )
+
+    # The packaged bytes are untouched and the identity still reports built-in.
+    still = skills.get_skill(packaged, alice, _principal(ALICE))
+    encoded = jsonable_encoder(still)
+    assert encoded["isBuiltin"] is True
+    assert encoded["capabilities"] == {
+        "canEdit": False,
+        "canDelete": False,
+        "canDisable": False,
+    }
+
+
+# ── the in-process lock registry must not grow forever ──────────────────────
+
+def test_the_process_lock_registry_is_pruned_when_nobody_holds_a_key():
+    """A long-lived worker must not keep an RLock per key it ever touched.
+
+    The entry has to survive while a thread holds or waits on it, so this
+    checks both directions rather than only that the dict shrinks.
+    """
+    registry = shared_resource_module._PROCESS_LOCKS
+    identity = ("org-prune", SKILL, "some-slug")
+    assert identity not in registry
+
+    with shared_resource_module._process_lock(*identity, timeout=1.0):
+        assert identity in registry, "a held key must keep its entry"
+        assert registry[identity].users == 1
+        # Reentrancy is real: a rename locks a parent then its children.
+        with shared_resource_module._process_lock(*identity, timeout=1.0):
+            assert registry[identity].users == 2
+        assert registry[identity].users == 1
+
+    assert identity not in registry, "a released key must not linger"
+
+
+def test_dir_unlink_refuses_a_name_that_is_not_a_direct_child(tmp_path):
+    """The destructive helpers all repeat this check beside their sink.
+
+    `dir_unlink` skipped it, so a future caller passing a traversing name would
+    have escaped the pinned directory the other helpers cannot be talked out of.
+    """
+    from cowork.common.paths import dir_unlink, pinned_dir
+
+    victim = tmp_path / "inside.txt"
+    victim.write_text("keep me", encoding="utf-8")
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("must survive", encoding="utf-8")
+
+    with pinned_dir(tmp_path) as pinned:
+        for bad in ("../outside.txt", "nested/inside.txt", "..", ".", ""):
+            with pytest.raises(ValueError, match="direct-child"):
+                dir_unlink(pinned, bad)
+        assert outside.exists()
+        dir_unlink(pinned, "inside.txt")
+    assert not victim.exists()

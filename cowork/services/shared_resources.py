@@ -8,12 +8,13 @@ behavior and does not write audit rows.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 from threading import Lock, RLock
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, NamedTuple
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
@@ -39,7 +40,37 @@ CLAIM_TTL = timedelta(minutes=5)
 RESOURCE_LOCK_TIMEOUT_SECONDS = 10.0
 ADVISORY_LOCK_RETRY_SECONDS = 0.05
 
-_PROCESS_LOCKS: dict[tuple[str, str, str], RLock] = {}
+
+class ResourceDeletion(NamedTuple):
+    """One resource in a deletion cascade: the row to drop and its audit action.
+
+    A ``NamedTuple`` rather than a bare 3-tuple so the cascade reads as named
+    fields on both sides of the service boundary, and rather than a pydantic
+    model because nothing here is validated or serialized.
+    """
+
+    kind: str
+    key: str
+    action: str
+
+
+class _KeyedProcessLock:
+    """One resource key's in-process lock plus the number of threads on it.
+
+    ``users`` counts the threads holding or waiting for ``lock``, which is what
+    lets the registry discard an entry nobody is inside. Without that count the
+    registry kept one ``RLock`` forever for every resource key the process ever
+    touched, deleted resources included.
+    """
+
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.users = 0
+
+
+_PROCESS_LOCKS: dict[tuple[str, str, str], _KeyedProcessLock] = {}
 _PROCESS_LOCKS_GUARD = Lock()
 _DATABASE_LOCK_ENGINES: dict[object, Any] = {}
 _DATABASE_LOCK_ENGINES_GUARD = Lock()
@@ -64,10 +95,40 @@ def _next_modified_at(previous: datetime | None) -> datetime:
     return now
 
 
-def _process_lock(org_id: str, kind: str, key: str) -> RLock:
+@contextmanager
+def _process_lock(
+    org_id: str,
+    kind: str,
+    key: str,
+    *,
+    timeout: float,
+) -> Iterator[None]:
+    """Hold the process-wide lock for one resource key, then release its entry.
+
+    Registering and discarding both happen under the registry guard, and an
+    entry is only discarded once its last user has released the lock. So a key
+    that is held or waited on always keeps its entry, and two threads can never
+    serialize on two different locks for the same key.
+    """
     identity = (org_id, kind, key)
     with _PROCESS_LOCKS_GUARD:
-        return _PROCESS_LOCKS.setdefault(identity, RLock())
+        entry = _PROCESS_LOCKS.get(identity)
+        if entry is None:
+            entry = _KeyedProcessLock()
+            _PROCESS_LOCKS[identity] = entry
+        entry.users += 1
+    try:
+        if not entry.lock.acquire(timeout=timeout):
+            raise _resource_busy()
+        try:
+            yield
+        finally:
+            entry.lock.release()
+    finally:
+        with _PROCESS_LOCKS_GUARD:
+            entry.users -= 1
+            if entry.users == 0 and _PROCESS_LOCKS.get(identity) is entry:
+                del _PROCESS_LOCKS[identity]
 
 
 def _resource_busy() -> HTTPException:
@@ -119,7 +180,6 @@ class _DatabaseResourceLocks:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
         self.connection: Any | None = None
-        self.depth = 0
 
     @contextmanager
     def lock(
@@ -141,7 +201,6 @@ class _DatabaseResourceLocks:
         connection = self.connection or _database_lock_engine(bind).connect()
         if owns_connection:
             self.connection = connection
-        self.depth += 1
         identity = f"{org_id}\0{kind}\0{key}".encode()
         lock_key = int.from_bytes(
             hashlib.blake2b(identity, digest_size=8).digest(),
@@ -172,7 +231,6 @@ class _DatabaseResourceLocks:
                         {"lock_key": lock_key},
                     )
             finally:
-                self.depth -= 1
                 if owns_connection:
                     self.connection = None
                     connection.close()
@@ -187,6 +245,11 @@ def project_memory_resource_key(project_id: UUID | str, slot: str) -> str:
 
 
 def actor_payload(user_id: str | None, email: str | None) -> AttributionActor | None:
+    """One attribution actor.
+
+    ``email`` is only ever the viewer's own address. Rows store an id and no
+    address, so another member's email is never read back out of the database.
+    """
     if not user_id:
         return None
     return AttributionActor(user_id=user_id, email=email or "")
@@ -211,6 +274,16 @@ class SharedResourceAccess:
     @property
     def actor_id(self) -> str | None:
         return self.session.scope.user_id
+
+    def _email_if_self(self, user_id: str | None) -> str | None:
+        """The viewer's own address, or None for anyone else.
+
+        Attribution must not disclose another member's email. The frontend
+        falls back to the user id for every other actor.
+        """
+        if user_id and user_id == self.actor_id:
+            return self.actor_email
+        return None
 
     @property
     def actor_email(self) -> str | None:
@@ -262,7 +335,6 @@ class SharedResourceAccess:
         key: str,
         *,
         fallback_creator_id: str | None = None,
-        fallback_creator_email: str | None = None,
         fallback_modified_at: datetime | None = None,
     ) -> ResourceAttribution:
         row = self._find(kind, key) if self.org_mode else None
@@ -274,12 +346,18 @@ class SharedResourceAccess:
                     last_modified_at=None,
                 )
             return ResourceAttribution(
-                created_by=actor_payload(row.created_by_id, row.created_by_email),
-                last_modified_by=actor_payload(row.updated_by_id, row.updated_by_email),
+                created_by=actor_payload(
+                    row.created_by_id, self._email_if_self(row.created_by_id)
+                ),
+                last_modified_by=actor_payload(
+                    row.updated_by_id, self._email_if_self(row.updated_by_id)
+                ),
                 last_modified_at=row.modified_at,
             )
         return ResourceAttribution(
-            created_by=actor_payload(fallback_creator_id, fallback_creator_email),
+            created_by=actor_payload(
+                fallback_creator_id, self._email_if_self(fallback_creator_id)
+            ),
             last_modified_by=None,
             last_modified_at=fallback_modified_at,
         )
@@ -303,6 +381,24 @@ class SharedResourceAccess:
         row = self._find(kind, key) if self.org_mode else None
         return bool(row is not None and row.pending_claim_token)
 
+    def _claim_may_be_recoverable(self, kind: str, key: str) -> bool:
+        """Whether ``key`` might hold an expired claim, read without locking.
+
+        A false answer is authoritative: no row, no pending claim, or a lease
+        that has not run out yet all mean there is nothing to recover. A true
+        answer is only a hint, and ``recover_stale_claim`` re-decides under the
+        coordination lock.
+        """
+        row = self._find(kind, key)
+        if row is None or not row.pending_claim_token:
+            return False
+        expires_at = row.pending_claim_expires_at
+        if expires_at is None:
+            return True
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return expires_at <= datetime.now(timezone.utc)
+
     def recover_stale_claim(
         self,
         kind: str,
@@ -320,6 +416,16 @@ class SharedResourceAccess:
         if not self.org_mode:
             return False
         self._require_actor()
+        # Read before locking. Every response renders through here, so taking the
+        # cross-replica lock first made a plain listing acquire one lock and one
+        # pooled connection per row, and serialised reads behind every writer
+        # holding the same key. Skipping on this snapshot is safe because a claim
+        # is always written with a future expiry: a row with no pending claim, or
+        # one whose lease is still live, cannot need recovery yet, and anything
+        # created after this read cannot already have expired. The authoritative
+        # decision is still made under the lock below.
+        if not self._claim_may_be_recoverable(kind, key):
+            return False
         # The filesystem observation is part of the recovery decision. Evaluate
         # it only after acquiring the same cross-replica identity used by every
         # writer, otherwise an expired empty claim can be released from a stale
@@ -344,16 +450,14 @@ class SharedResourceAccess:
                 if current.created_by_id is None:
                     raise RuntimeError("Pending claim has no reserved actor")
                 current.updated_by_id = current.created_by_id
-                current.updated_by_email = current.created_by_email
                 current.pending_claim_token = None
                 current.pending_claim_expires_at = None
                 self.session.add(current)
                 self._append_event_as(
                     current.resource_kind,
                     current.resource_key,
-                    "create",
+                    "recover",
                     actor_id=current.created_by_id,
-                    actor_email=current.created_by_email,
                 )
             else:
                 self.session.delete(current)
@@ -385,11 +489,12 @@ class SharedResourceAccess:
         key: str,
     ) -> Iterator[None]:
         deadline = time.monotonic() + RESOURCE_LOCK_TIMEOUT_SECONDS
-        process_lock = _process_lock(org_id, kind, key)
-        remaining = max(0.0, deadline - time.monotonic())
-        if not process_lock.acquire(timeout=remaining):
-            raise _resource_busy()
-        try:
+        with _process_lock(
+            org_id,
+            kind,
+            key,
+            timeout=max(0.0, deadline - time.monotonic()),
+        ):
             with self._database_locks.lock(
                 org_id,
                 kind,
@@ -397,8 +502,6 @@ class SharedResourceAccess:
                 deadline=deadline,
             ):
                 yield
-        finally:
-            process_lock.release()
 
     @contextmanager
     def mutation_lock(
@@ -407,15 +510,18 @@ class SharedResourceAccess:
         key: str,
         *,
         fallback_creator_id: str | None = None,
-        fallback_creator_email: str | None = None,
         resource_exists: Callable[[], bool] | None = None,
     ) -> Iterator[SharedResourceAttribution | None]:
         """Serialize read, filesystem mutation, and audit for one resource.
 
-        PostgreSQL's row lock coordinates replicas. The keyed process lock
-        supplies equivalent behavior for SQLite tests and same-process local
-        concurrency. A legacy filesystem resource gets a null-owner row before
-        the lock so concurrent admins share the same serialization identity.
+        A PostgreSQL session advisory lock keyed on ``(org, kind, key)`` is
+        what coordinates replicas: it is taken before anything is read, so two
+        replicas cannot both enter the read-modify-write window. The row lock
+        taken inside it only pins this transaction's own copy of the row. The
+        keyed process lock supplies the same serialization for SQLite tests and
+        same-process local concurrency. A legacy filesystem resource gets a
+        null-owner row before the lock so concurrent admins share the same
+        serialization identity.
         """
         if not self.org_mode:
             yield None
@@ -442,7 +548,6 @@ class SharedResourceAccess:
                     resource_kind=kind,
                     resource_key=key,
                     created_by_id=fallback_creator_id,
-                    created_by_email=fallback_creator_email,
                 )
                 try:
                     self.session.add(row)
@@ -490,7 +595,6 @@ class SharedResourceAccess:
         *,
         action: str = "create",
         creator_id: str | None = None,
-        creator_email: str | None = None,
     ) -> SharedResourceAttribution | None:
         """Register a newly created resource and append its first event."""
         row, _created = self.claim(
@@ -498,7 +602,6 @@ class SharedResourceAccess:
             key,
             action=action,
             creator_id=creator_id,
-            creator_email=creator_email,
         )
         return row
 
@@ -509,7 +612,6 @@ class SharedResourceAccess:
         *,
         action: str = "create",
         creator_id: str | None = None,
-        creator_email: str | None = None,
     ) -> tuple[SharedResourceAttribution | None, bool]:
         """Atomically create attribution and its first event.
 
@@ -524,14 +626,11 @@ class SharedResourceAccess:
         if existing is not None:
             return existing, False
         created_by_id = creator_id if creator_id is not None else actor_id
-        created_by_email = creator_email if creator_id is not None else self.actor_email
         row = SharedResourceAttribution(
             resource_kind=kind,
             resource_key=key,
             created_by_id=created_by_id,
-            created_by_email=created_by_email,
             updated_by_id=actor_id,
-            updated_by_email=self.actor_email,
         )
         try:
             self.session.add(row)
@@ -551,7 +650,6 @@ class SharedResourceAccess:
         key: str,
         *,
         creator_id: str | None = None,
-        creator_email: str | None = None,
     ) -> tuple[SharedResourceAttribution | None, str | None]:
         """Reserve an unowned key, returning ``(row, private claim token)``.
 
@@ -567,13 +665,11 @@ class SharedResourceAccess:
             # Do not let a create-shaped retry seize an existing resource.
             return existing, None
         created_by_id = creator_id if creator_id is not None else actor_id
-        created_by_email = creator_email if creator_id is not None else self.actor_email
         claim_token = str(uuid4())
         row = SharedResourceAttribution(
             resource_kind=kind,
             resource_key=key,
             created_by_id=created_by_id,
-            created_by_email=created_by_email,
             pending_claim_token=claim_token,
             pending_claim_expires_at=datetime.now(timezone.utc) + CLAIM_TTL,
         )
@@ -650,7 +746,6 @@ class SharedResourceAccess:
         current.pending_claim_token = None
         current.pending_claim_expires_at = None
         current.updated_by_id = actor_id
-        current.updated_by_email = self.actor_email
         self.session.add(current)
         self._append_event(current.resource_kind, current.resource_key, action)
         self.session.commit()
@@ -663,7 +758,6 @@ class SharedResourceAccess:
         *,
         action: str,
         fallback_creator_id: str | None = None,
-        fallback_creator_email: str | None = None,
         new_key: str | None = None,
     ) -> SharedResourceAttribution | None:
         return self.record_updates(
@@ -671,7 +765,6 @@ class SharedResourceAccess:
             key,
             actions=[action],
             fallback_creator_id=fallback_creator_id,
-            fallback_creator_email=fallback_creator_email,
             new_key=new_key,
         )
 
@@ -682,7 +775,6 @@ class SharedResourceAccess:
         *,
         actions: list[str],
         fallback_creator_id: str | None = None,
-        fallback_creator_email: str | None = None,
         new_key: str | None = None,
     ) -> SharedResourceAttribution | None:
         """Record all semantic actions from one filesystem mutation atomically."""
@@ -696,7 +788,6 @@ class SharedResourceAccess:
             key,
             actions=actions,
             fallback_creator_id=fallback_creator_id,
-            fallback_creator_email=fallback_creator_email,
             new_key=new_key,
         )
         self.session.commit()
@@ -709,7 +800,6 @@ class SharedResourceAccess:
         *,
         action: str,
         fallback_creator_id: str | None = None,
-        fallback_creator_email: str | None = None,
         new_key: str | None = None,
     ) -> SharedResourceAttribution | None:
         """Stage one event without committing the surrounding transaction."""
@@ -718,7 +808,6 @@ class SharedResourceAccess:
             key,
             actions=[action],
             fallback_creator_id=fallback_creator_id,
-            fallback_creator_email=fallback_creator_email,
             new_key=new_key,
         )
 
@@ -729,7 +818,6 @@ class SharedResourceAccess:
         *,
         actions: list[str],
         fallback_creator_id: str | None = None,
-        fallback_creator_email: str | None = None,
         new_key: str | None = None,
     ) -> SharedResourceAttribution | None:
         """Stage events and attribution in the caller's current transaction."""
@@ -754,13 +842,11 @@ class SharedResourceAccess:
                 resource_kind=kind,
                 resource_key=key,
                 created_by_id=fallback_creator_id,
-                created_by_email=fallback_creator_email,
             )
             self.session.add(row)
         if new_key is not None:
             row.resource_key = new_key
         row.updated_by_id = actor_id
-        row.updated_by_email = self.actor_email
         # Assign explicitly even when the same actor edits twice. Updating only
         # the actor columns leaves SQLAlchemy with no dirty attribution fields,
         # so the model's server/on-update timestamp would not run.
@@ -797,19 +883,12 @@ class SharedResourceAccess:
         self.session.commit()
         return True
 
-    def record_delete(
-        self,
-        kind: str,
-        key: str,
-        *,
-        fallback_creator_id: str | None = None,
-        fallback_creator_email: str | None = None,
-    ) -> None:
-        self.record_deletes([(kind, key, "delete")])
+    def record_delete(self, kind: str, key: str) -> None:
+        self.record_deletes([ResourceDeletion(kind, key, "delete")])
 
     def record_deletes(
         self,
-        resources: list[tuple[str, str, str]],
+        resources: Sequence[ResourceDeletion | tuple[str, str, str]],
         *,
         pending_claim_tokens: set[str] | None = None,
     ) -> None:
@@ -824,7 +903,7 @@ class SharedResourceAccess:
 
     def stage_deletes(
         self,
-        resources: list[tuple[str, str, str]],
+        resources: Sequence[ResourceDeletion | tuple[str, str, str]],
         *,
         pending_claim_tokens: set[str] | None = None,
     ) -> None:
@@ -832,9 +911,12 @@ class SharedResourceAccess:
         if not self.org_mode:
             return
         self._require_actor()
+        # Coerce here so callers that still pass plain 3-tuples keep working
+        # while everything below reads named fields.
+        deletions = [ResourceDeletion(*resource) for resource in resources]
         rows: dict[UUID, SharedResourceAttribution] = {}
-        for kind, key, _action in resources:
-            row = self._find(kind, key)
+        for deletion in deletions:
+            row = self._find(deletion.kind, deletion.key)
             if (
                 row is not None
                 and row.pending_claim_token
@@ -848,8 +930,8 @@ class SharedResourceAccess:
                 rows[row.id] = row
         # Events survive after current attribution disappears. A later
         # resource may reuse a human key with a new owner and clean history.
-        for kind, key, action in resources:
-            self._append_event(kind, key, action)
+        for deletion in deletions:
+            self._append_event(deletion.kind, deletion.key, deletion.action)
         for row in rows.values():
             self.session.delete(row)
         self.session.flush()
@@ -891,7 +973,6 @@ class SharedResourceAccess:
             key,
             action,
             actor_id=actor_id,
-            actor_email=self.actor_email,
         )
 
     def _append_event_as(
@@ -901,7 +982,6 @@ class SharedResourceAccess:
         action: str,
         *,
         actor_id: str,
-        actor_email: str | None,
     ) -> None:
         self.session.add(
             SharedResourceMutation(
@@ -909,6 +989,5 @@ class SharedResourceAccess:
                 resource_key=key,
                 action=action,
                 actor_id=actor_id,
-                actor_email=actor_email,
             )
         )

@@ -15,7 +15,7 @@ from sqlmodel import select
 import cowork.channels.plugins.telegram as telegram_plugin
 import cowork.channels.runtime as runtime_mod
 from cowork.channels.registry import PluginRegistry, load_first_party_plugins
-from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
+from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry, artifacts_since
 from cowork.channels.webhooks import drain_background_tasks
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import ChannelContext
@@ -197,7 +197,7 @@ def test_rich_turn_appends_conversation_link(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = FakeAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     chat_id, delivered = adapter.delivered[0]
@@ -233,7 +233,7 @@ def test_channel_turn_persists_tool_rows_and_hides_history_event(monkeypatch):
     ))[0]
 
     adapters = LiveAdapterRegistry(registry)
-    adapters._cache["telegram"] = FakeAdapter()
+    adapters._cache[("telegram", None)] = FakeAdapter()
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     s = get_open_session()
@@ -274,7 +274,7 @@ def test_typing_indicator_runs_during_turn(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = TypingAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     # Indicator refreshed while the turn ran, on the right chat, then stopped.
@@ -382,7 +382,7 @@ def test_inbound_media_becomes_harness_blocks(monkeypatch, tmp_path):
     ))[0]
 
     adapters = LiveAdapterRegistry(registry)
-    adapters._cache["telegram"] = MediaAdapter()
+    adapters._cache[("telegram", None)] = MediaAdapter()
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     blocks = harness.inputs[0]
@@ -480,7 +480,7 @@ def test_turn_artifacts_delivered(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = ArtifactAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
 
     # Text reply (with link) lands first, then exactly the fresh artifact.
@@ -488,6 +488,28 @@ def test_turn_artifacts_delivered(monkeypatch):
     assert len(adapter.sent) == 1
     chat_id, path, filename = adapter.sent[0]
     assert chat_id == "555" and path.endswith("dashboard.html") and filename == "dashboard.html"
+
+
+def test_artifacts_since_uses_the_conversation_scoped_root_in_org_mode(monkeypatch, tmp_path):
+    """Org mode's remote worker writes turn artifacts under conversations/<id>/,
+    not the project-wide root — the old hardcoded path would have missed this."""
+    import time as time_mod
+    from uuid import uuid4
+
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: True)
+    conv_id = uuid4()
+    project_path = tmp_path / "proj"
+    scoped_dir = project_path / "conversations" / str(conv_id) / ".anton" / "artifacts" / "demo"
+    scoped_dir.mkdir(parents=True)
+    (scoped_dir / "metadata.json").write_text(json.dumps({"name": "Demo", "type": "html"}))
+    (scoped_dir / "dashboard.html").write_text("<html/>")
+
+    since = time_mod.time() - 3600
+    found = artifacts_since(str(project_path), conv_id, since)
+
+    assert found == [(str(scoped_dir / "dashboard.html"), "dashboard.html")]
+    # The old hardcoded project-wide root has nothing in it at all.
+    assert not (project_path / ".anton" / "artifacts").exists()
 
 
 def test_slack_parses_shared_files(monkeypatch):
@@ -684,7 +706,7 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
     load_first_party_plugins(registry)
     bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s"})
     adapters = LiveAdapterRegistry(registry)
-    adapters._cache["telegram"] = FakeAdapter()
+    adapters._cache[("telegram", None)] = FakeAdapter()
     runtime = AntonChannelRuntime(adapters)
 
     def turn(chat_id, update_id):
@@ -744,13 +766,13 @@ def test_channel_agent_endpoint_validates_and_persists():
     try:
         # Unknown harness is rejected, not persisted.
         with pytest.raises(HTTPException) as exc:
-            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session, scoped)
+            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session, scoped, None)
         assert exc.value.status_code == 400
 
-        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session, scoped)
+        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session, scoped, None)
         assert resp.harness == "hermes"
         assert "anton" in resp.options and "hermes" in resp.options
-        assert get_channel_agent().harness == "hermes"
+        assert get_channel_agent(scoped).harness == "hermes"
         assert get_user_settings().channels_harness == "hermes"
     finally:
         session.close()
@@ -834,7 +856,7 @@ def test_new_command_starts_fresh_conversation(monkeypatch):
 
     adapters = LiveAdapterRegistry(registry)
     adapter = FakeAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     runtime = AntonChannelRuntime(adapters)
 
     asyncio.run(runtime.handle("telegram", event(100, "hi")))
@@ -980,7 +1002,7 @@ def test_telegram_group_mention_only_flow(monkeypatch):
     bridge = telegram_plugin.TelegramBridge({"bot_token": "x"})
     adapters = LiveAdapterRegistry(registry)
     adapter = FakeAdapter()
-    adapters._cache["telegram"] = adapter
+    adapters._cache[("telegram", None)] = adapter
     runtime = AntonChannelRuntime(adapters)
 
     async def inbound(body):
