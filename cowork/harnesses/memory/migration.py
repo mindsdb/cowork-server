@@ -13,6 +13,7 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from cowork.common.paths import cowork_home
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.models.setting import Setting
@@ -44,8 +45,14 @@ def _combine_slot_memory(chunks: list[str]) -> str:
 def migrate_harness_memory_to_shared(session: Session) -> bool:
     """Copy legacy harness memory into the canonical store if not already migrated.
 
-    Returns True if migration ran, False if the sentinel indicates it already ran.
+    Returns True if migration ran, False if the sentinel indicates it already ran
+    or this process is on a per-account root.
     """
+    # _MIGRATION_SOURCES are under the shared COWORK_HOME while the sentinel is a DB
+    # row, so a per-account root would import the previous account's profile.
+    if get_app_settings().account_id is not None:
+        return False
+
     if session.exec(
         select(Setting).where(Setting.key == _MEMORY_MIGRATION_SENTINEL)
     ).first() is not None:

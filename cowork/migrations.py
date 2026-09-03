@@ -25,7 +25,7 @@ import datetime as dt
 import logging
 from pathlib import Path
 
-from cowork.common.settings.app_settings import default_minds_api_host
+from cowork.common.settings.app_settings import default_minds_api_host, get_app_settings
 
 from sqlmodel import Session, select
 from pydantic import ValidationError
@@ -123,6 +123,11 @@ def migrate_env_to_db(session: Session) -> bool:
     Returns True if the migration ran, False if it was already done or
     there was nothing to migrate.
     """
+    # The sentinel is a DB row but _ENV_PATH is under the shared COWORK_HOME, so
+    # a per-account root arrives sentinel-free and would seed another account's keys.
+    if get_app_settings().account_id is not None:
+        return False
+
     svc = SettingService(session)
 
     # Check the persistent sentinel — survives server restarts.

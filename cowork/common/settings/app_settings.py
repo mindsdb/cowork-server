@@ -630,6 +630,19 @@ class AppSettings(Settings):
             "from which a per-request principal is built."
         ),
     )
+    account_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_ACCOUNT_ID"),
+        description=(
+            "Desktop only: which signed-in account's data root this process was "
+            "pointed at. Set by the desktop shell when it hands the sidecar "
+            "per-account store paths, absent when the process runs on the "
+            "default (adopted) root. NOT an identity and NOT an authorization "
+            "input: it never builds a Principal or a TenantScope, and nothing "
+            "grants access on it. It only tells store-seeding code whether the "
+            "legacy files under COWORK_HOME belong to this root."
+        ),
+    )
     pod_scratch_dir: str = Field(
         default_factory=lambda: str(Path(tempfile.gettempdir()) / "cowork"),
         validation_alias=AliasChoices("COWORK_POD_SCRATCH_DIR"),
