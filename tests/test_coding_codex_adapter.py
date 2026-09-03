@@ -862,6 +862,7 @@ def test_user_terminal_is_not_restricted_by_agent_permissions() -> None:
     engine_session._sandbox_policy = {"type": "readOnly", "networkAccess": False}
     engine_session._terminal_handlers = {"process-1": lambda *_args: None}
     engine_session._terminal_lock = codex_module.threading.Lock()
+    engine_session._terminal_commands = set()
     engine_session._secrets = ()
     exits: list[tuple[int | None, str | None]] = []
 
@@ -967,6 +968,7 @@ def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeyp
     session._cancel_lock = threading.Lock()
     session._goal_states = {}
     session._mcp_servers = (("node", ("mcp.js",)),)
+    session._terminal_commands = {("/bin/bash", "--login")}
 
     reaped: list[tuple[int | None, object]] = []
     monkeypatch.setattr(codex_module, "terminate_command_trees", lambda pid, *, protected: reaped.append((pid, protected)) or 3)
@@ -983,8 +985,11 @@ def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeyp
     assert protected(proc("codex-code-mode-host.exe", ["codex-code-mode-host.exe"]))
     assert protected(proc("python", ["python", "-m", "cowork.coding.integration_mcp", "/root", "task"]))
     assert protected(proc("node", ["/usr/bin/node", "mcp.js"]))
-    # A terminal tab or Run action: the sidecar marks its environment.
+    # A terminal tab or Run action: the sidecar marks its environment, and on
+    # macOS, where a PTY shell's environment is unreadable, its argv is known.
     assert protected(proc("zsh", ["/bin/zsh", "-il"], {"COWORK_CODE_TERMINAL": "terminal-1", "TERM": "xterm-256color"}))
+    assert protected(proc("bash", ["/bin/bash", "--login"], {}))
+    assert not protected(proc("bash", ["/bin/bash", "-lc", "npm test"], {}))
     assert not protected(proc("node", ["node", "server.js"]))
     assert not protected(proc("cmd.exe", ["cmd.exe", "/c", "npm test"]))
     assert not protected(proc("zsh", ["/bin/zsh", "-lc", "npm run dev"], {"TERM": "xterm-256color"}))
@@ -1031,6 +1036,7 @@ def test_terminal_tabs_are_marked_so_a_finished_turn_leaves_them_running(tmp_pat
     session._terminal_lock = threading.Lock()
     session._secrets = ()
     session._closed = threading.Event()
+    session._terminal_commands = set()
     exits: list[tuple[int | None, str | None]] = []
 
     session._run_terminal("terminal-7", 120, 40, TerminalShellPreference.bash, lambda code, error: exits.append((code, error)))
@@ -1039,4 +1045,5 @@ def test_terminal_tabs_are_marked_so_a_finished_turn_leaves_them_running(tmp_pat
     assert method == "command/exec"
     assert params["processId"] == "terminal-7"
     assert params["env"][TERMINAL_ENV_MARKER] == "terminal-7"
+    assert tuple(params["command"]) in session._terminal_commands
     assert exits == [(0, None)]
