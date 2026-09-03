@@ -1455,9 +1455,19 @@ class ResponsesHandler:
                             "[responses] failed to repair conversation %s after content validation error",
                             conversation_id,
                         )
-                raise HTTPException(status_code=400, detail=message)
+                # The ladder already produced a code; carry it instead of dropping
+                # it here. Same wire shape the streaming twin emits.
+                raise HTTPException(
+                    status_code=400,
+                    detail=response_failed_payload(message, code),
+                )
             logger.exception("[responses] turn failed")
-            raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
+            # Same shape as the 400 above: one body for every turn failure, so a
+            # caller never has to branch on status to know how to read `detail`.
+            raise HTTPException(
+                status_code=500,
+                detail=response_failed_payload(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE),
+            )
 
         assistant_text = "".join(collected_text)
         # Persist the user message now — after the harness has read history for
