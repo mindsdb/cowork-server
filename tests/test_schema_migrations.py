@@ -15,6 +15,7 @@ import cowork.models.pin  # noqa: F401
 import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
+import cowork.models.shared_resource  # noqa: F401
 import cowork.models.skill  # noqa: F401
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import (
@@ -286,6 +287,27 @@ def test_task_objects_downgrade_guards_missing_table(tmp_path, monkeypatch):
     assert _alembic_version(db_path) == "c4e7a1b9d2f0"
 
 
+def test_shared_resource_audit_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "shared-resources.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert _has_table(db_path, "shared_resource_attributions")
+    assert _has_table(db_path, "shared_resource_mutations")
+
+    _downgrade_to(engine, uri, "a4c8e1f6b3d9")
+    assert not _has_table(db_path, "shared_resource_attributions")
+    assert not _has_table(db_path, "shared_resource_mutations")
+
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "shared_resource_attributions")
+    assert _has_table(db_path, "shared_resource_mutations")
+
+
 # ── ENG-338: attachment purpose re-keying (f7d2b9e4a1c6) ─────────────────
 
 ATTACH_REKEY_REV = "f7d2b9e4a1c6"
@@ -514,3 +536,42 @@ def test_channel_installations_per_org_downgrade_preflights_duplicates(tmp_path,
             )
         }
     assert {"uq_channel_installations_type_global", "uq_channel_installations_type_org"} <= names
+
+
+def test_migrated_schema_enforces_one_attribution_row_per_resource(
+    tmp_path, monkeypatch
+):
+    """The unique key the whole first-writer race design rests on.
+
+    Two replicas can both pass the pre-check at READ COMMITTED, so the loser is
+    supposed to lose on this constraint and adopt the winner's row. Without it
+    a resource ends up with two creator rows and the authorization read becomes
+    nondeterministic. The suite builds its schema from the models, so only a
+    real migration run proves the constraint actually ships.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "attribution.db"
+    uri = _sqlite_uri(db_path)
+    run_schema_migrations(create_engine(uri), uri)
+
+    with sqlite3.connect(db_path) as connection:
+        indexes = connection.execute(
+            "select name, \"unique\" from pragma_index_list('shared_resource_attributions')"
+        ).fetchall()
+        unique_columns = {
+            tuple(
+                row[2]
+                for row in connection.execute(
+                    f"select * from pragma_index_info('{name}')"
+                ).fetchall()
+            )
+            for name, is_unique in indexes
+            if is_unique
+        }
+
+    assert ("org_id", "resource_kind", "resource_key") in unique_columns, (
+        "shared_resource_attributions lost its unique key; concurrent creates "
+        f"can now record two creators. Unique indexes found: {unique_columns}"
+    )
