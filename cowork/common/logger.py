@@ -35,7 +35,13 @@ class EventLoopClosedFilter(logging.Filter):
 
 
 class CustomFormatter(logging.Formatter):
-    """Custom formatter with enhanced formatting"""
+    """Formatter that renders the optional ``user_id`` / ``request_id`` a call
+    site may attach via ``extra=``.
+
+    Both render as an empty string when absent, which is what lets a format
+    string reference ``%(request_context)s`` unconditionally — the vast
+    majority of records carry neither.
+    """
 
     def format(self, record):
         # Add extra context to the record
@@ -94,9 +100,14 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
     all_logs_handler = logging.handlers.RotatingFileHandler(
         log_path / "minds.log", maxBytes=max_bytes, backupCount=backup_count
     )
+    # CustomFormatter, not logging.Formatter: it is what defines
+    # %(request_context)s, and it renders an empty string for the records that
+    # carry no request_id — which is most of them. A plain Formatter would
+    # raise KeyError on every such line.
     all_logs_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)8s] %(name)s [%(filename)s:%(lineno)d] %(message)s",
+        CustomFormatter(
+            "%(asctime)s [%(levelname)8s] %(name)s%(request_context)s "
+            "[%(filename)s:%(lineno)d] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
@@ -108,8 +119,9 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
     )
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)8s] %(name)s [%(filename)s:%(lineno)d] %(message)s\n%(stack_info)s",
+        CustomFormatter(
+            "%(asctime)s [%(levelname)8s] %(name)s%(request_context)s "
+            "[%(filename)s:%(lineno)d] %(message)s\n%(stack_info)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
