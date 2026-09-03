@@ -288,8 +288,11 @@ def test_collect_raises_500_generic_for_unmapped_error():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 500
-    assert err.value.detail == te.GENERIC_TURN_ERROR_MESSAGE
-    assert "secret-token" not in err.value.detail
+    assert err.value.detail["code"] == te.GENERIC_TURN_ERROR_CODE
+    assert err.value.detail["error"] == te.GENERIC_TURN_ERROR_MESSAGE
+    # Targets the message, not the mapping: `not in` on a dict tests keys and
+    # would pass vacuously, retiring the leak guard without failing.
+    assert "secret-token" not in err.value.detail["error"]
 
 
 # ── Conversation repair on content validation error (ENG-1992) ────
