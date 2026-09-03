@@ -45,6 +45,7 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
 from cowork.coding.control_models import TaskResourceScope
+from cowork.coding.control_service import REGISTRATION_CODE_LIFETIME
 from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
@@ -82,6 +83,7 @@ from cowork.coding.project_models import (
 from cowork.coding.redaction import redact_text
 from cowork.coding.runtime_protocol import (
     ComputerUpdateRequest,
+    RegistrationTokenRequest,
     RegistrationTokenResponse,
 )
 from cowork.coding.service import CodingService, get_coding_service
@@ -210,12 +212,27 @@ def update_coding_computer(computer_id: str, body: ComputerUpdateRequest):
 
 @router.delete("/computers/{computer_id}", status_code=204)
 def revoke_coding_computer(computer_id: str):
-    _call(_service().control.revoke_computer, computer_id)
+    control = _service().control
+    try:
+        _call(control.revoke_computer, computer_id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        # Not a registered computer: it may be a pending one that never connected.
+        _call(control.remove_pending_computer, computer_id)
 
 
 @router.post("/runtime/registration-token", response_model=RegistrationTokenResponse)
-def runtime_registration_token():
-    return RegistrationTokenResponse(registration_token=_service().control.issue_registration_token())
+def runtime_registration_token(body: RegistrationTokenRequest | None = None):
+    control = _service().control
+    if body is None:
+        return RegistrationTokenResponse(registration_token=control.issue_registration_token())
+    token, pending = _call(control.invite_computer, body.name, body.platform, body.replaces)
+    return RegistrationTokenResponse(
+        registration_token=token,
+        expires_in_seconds=int(REGISTRATION_CODE_LIFETIME.total_seconds()),
+        pending=pending,
+    )
 
 
 @router.post("/runs/{run_id}/connector-capabilities", response_model=ConnectorCapability)

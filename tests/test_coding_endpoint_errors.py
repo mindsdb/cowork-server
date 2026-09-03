@@ -8,6 +8,9 @@ from fastapi import HTTPException
 
 from cowork.api.v1.endpoints import coding
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
+from cowork.coding.control_models import ComputerCapabilities
+from cowork.coding.control_service import ControlPlaneService
+from cowork.coding.runtime_protocol import RegistrationTokenRequest
 from cowork.coding.run_recovery import NoEligibleComputer
 from cowork.coding.run_state import InvalidRunTransition
 from cowork.coding.workspace import WorkspaceError
@@ -61,3 +64,40 @@ def test_unknown_upstream_failure_remains_a_safe_500() -> None:
 
     assert error.status_code == 500
     assert error.detail == "Coding operation failed"
+
+
+def _control(tmp_path) -> ControlPlaneService:
+    return ControlPlaneService(
+        tmp_path,
+        ComputerCapabilities(platform="darwin", architecture="arm64", runtime_version="test"),
+    )
+
+
+def test_connect_computer_names_a_pending_computer_and_the_list_shows_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    control = _control(tmp_path)
+    monkeypatch.setattr(coding, "_service", lambda: SimpleNamespace(control=control))
+
+    issued = coding.runtime_registration_token(RegistrationTokenRequest(name="Build box", platform="linux"))
+
+    assert issued.pending is not None and issued.pending.name == "Build box"
+    assert issued.expires_in_seconds == 600
+    assert [item.name for item in coding.coding_computers().pending] == ["Build box"]
+
+    coding.revoke_coding_computer(issued.pending.id)
+    assert coding.coding_computers().pending == []
+    with pytest.raises(HTTPException) as raised:
+        coding.revoke_coding_computer(issued.pending.id)
+    assert raised.value.status_code == 404
+
+
+def test_registration_tokens_without_a_body_stay_anonymous(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    control = _control(tmp_path)
+    monkeypatch.setattr(coding, "_service", lambda: SimpleNamespace(control=control))
+
+    issued = coding.runtime_registration_token(None)
+
+    assert issued.pending is None
+    assert coding.coding_computers().pending == []
+

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from cowork.coding.connector_capabilities import ConnectorCapability
@@ -10,6 +12,7 @@ from cowork.coding.control_models import (
     Computer,
     ComputerCapabilities,
     ExecutionWorkspace,
+    PendingComputer,
     RuntimeCommand,
     TaskRun,
 )
@@ -80,9 +83,18 @@ class RuntimeCommandAckRequest(RuntimeFenceRequest):
     error: str | None = Field(default=None, max_length=4_000)
 
 
+class RegistrationTokenRequest(BaseModel):
+    """Optional details from the desktop's "Connect a computer" form."""
+
+    name: str = Field(min_length=1, max_length=120)
+    platform: Literal["darwin", "windows", "linux"]
+    replaces: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class RegistrationTokenResponse(BaseModel):
     registration_token: str
     expires_in_seconds: int = 600
+    pending: PendingComputer | None = None
 
 
 class ComputerUpdateRequest(BaseModel):
