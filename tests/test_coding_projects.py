@@ -89,6 +89,33 @@ def test_saving_a_project_stores_the_canonical_model_id(tmp_path: Path) -> None:
     assert passthrough.default_model == "fable"
 
 
+def test_a_project_can_carry_a_default_reasoning_effort(tmp_path: Path) -> None:
+    folder = tmp_path / "project"
+    folder.mkdir()
+    service = CodeProjectService(tmp_path / "coding")
+
+    project = service.create(ProjectCreateRequest(
+        name="Effort",
+        folders=[ProjectFolder(id="project", name="Project", path=str(folder))],
+        default_reasoning_effort="low",
+    ))
+    assert project.default_reasoning_effort == "low"
+
+    updated = service.update(project.id, ProjectUpdateRequest(default_reasoning_effort="xhigh"))
+    assert updated.default_reasoning_effort == "xhigh"
+    assert service.get(project.id).default_reasoning_effort == "xhigh"
+
+    cleared = service.update(project.id, ProjectUpdateRequest(default_reasoning_effort=None))
+    assert cleared.default_reasoning_effort is None
+
+    with pytest.raises(ValidationError):
+        ProjectCreateRequest(
+            name="Effort",
+            folders=[ProjectFolder(id="project", name="Project", path=str(folder))],
+            default_reasoning_effort="extreme",
+        )
+
+
 def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path) -> None:
     repo = repository(tmp_path, "legacy-repo")
     notes = tmp_path / "legacy-notes"
