@@ -6,6 +6,12 @@ from pathlib import PurePath
 
 import psutil
 
+# Set in the environment of every terminal tab and Run action the sidecar
+# starts through the app-server, so a turn-completion reap can tell them
+# apart from the commands the agent ran. Inherited by whatever the user
+# starts inside the terminal, which is exactly the tree to keep.
+TERMINAL_ENV_MARKER = "COWORK_CODE_TERMINAL"
+
 
 def _end(processes: Iterable[psutil.Process], timeout: float) -> None:
     """Terminate, then kill what is still alive after ``timeout`` seconds."""
